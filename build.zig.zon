@@ -1,0 +1,12 @@
+.{
+    .name = .wamr,
+    .version = "0.1.0",
+    .fingerprint = 0xf0e1e3d4e985a2fc,
+    .minimum_zig_version = "0.16.0-dev.3061+9b1eaad13",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

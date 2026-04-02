@@ -1,0 +1,56 @@
+//! WebAssembly Micro Runtime (WAMR) - Zig Implementation
+//!
+//! A lightweight standalone WebAssembly runtime with support for
+//! interpreter, AOT, and JIT execution modes.
+
+const std = @import("std");
+
+/// Compile-time configuration (feature flags and constants).
+pub const config = @import("config.zig");
+
+/// C-compatible API for embedding (matches wasm_export.h).
+pub const c_api = @import("api/c_api.zig");
+
+/// Core WebAssembly types.
+pub const types = @import("runtime/common/types.zig");
+
+/// Execution environment (operand stack, call frames).
+pub const exec_env = @import("runtime/common/exec_env.zig");
+
+/// Wasm opcode definitions.
+pub const opcode = @import("runtime/interpreter/opcode.zig");
+
+/// Wasm binary loader.
+pub const loader = @import("runtime/interpreter/loader.zig");
+
+/// Module instantiation.
+pub const instance = @import("runtime/interpreter/instance.zig");
+
+/// Bytecode interpreter.
+pub const interp = @import("runtime/interpreter/interp.zig");
+
+// Phase 1: Foundation layer
+/// Platform abstraction (mmap, threads, time, cache flush).
+pub const platform = @import("platform/platform.zig");
+
+/// Memory allocators (EMS pool allocator, default allocator).
+pub const mem_alloc = @import("shared/mem_alloc/allocator.zig");
+
+/// Shared utilities (logging, LEB128, hashmap, file I/O, crypto).
+pub const utils = @import("shared/utils/utils.zig");
+
+/// Cryptographic hashing (SHA-256, replaces BoringSSL).
+pub const crypto = @import("shared/utils/crypto.zig");
+
+/// WAMR version information.
+pub const version = .{
+    .major = 0,
+    .minor = 1,
+    .patch = 0,
+    .string = "0.1.0-zig",
+};
+
+test {
+    std.testing.refAllDecls(@This());
+}
+
