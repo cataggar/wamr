@@ -86,3 +86,53 @@ test "c_api: version string" {
     const slice = std.mem.span(ver);
     try std.testing.expectEqualStrings("0.1.0-zig", slice);
 }
+
+// ---------------------------------------------------------------------------
+// Extended C API stubs (to be connected in a future phase)
+// ---------------------------------------------------------------------------
+
+/// Load a module from binary data.
+export fn wasm_runtime_load(buf: [*]const u8, size: u32, error_buf: [*]u8, error_buf_size: u32) ?*WasmModule {
+    // TODO: implement using loader
+    _ = .{ buf, size, error_buf, error_buf_size };
+    return null;
+}
+
+/// Instantiate a loaded module.
+export fn wasm_runtime_instantiate(module: *WasmModule, stack_size: u32, heap_size: u32, error_buf: [*]u8, error_buf_size: u32) ?*WasmModuleInstance {
+    _ = .{ module, stack_size, heap_size, error_buf, error_buf_size };
+    return null;
+}
+
+/// Deinstantiate a module instance.
+export fn wasm_runtime_deinstantiate(inst: *WasmModuleInstance) void {
+    _ = inst;
+}
+
+/// Unload a module.
+export fn wasm_runtime_unload(module: *WasmModule) void {
+    _ = module;
+}
+
+/// Look up an exported function.
+export fn wasm_runtime_lookup_function(inst: *WasmModuleInstance, name: [*:0]const u8) ?*anyopaque {
+    _ = .{ inst, name };
+    return null;
+}
+
+test "c_api: load stub returns null" {
+    var err_buf: [64]u8 = undefined;
+    const result = wasm_runtime_load("", 0, &err_buf, err_buf.len);
+    try std.testing.expect(result == null);
+}
+
+test "c_api: instantiate stub returns null" {
+    var err_buf: [64]u8 = undefined;
+    const result = wasm_runtime_instantiate(undefined, 0, 0, &err_buf, err_buf.len);
+    try std.testing.expect(result == null);
+}
+
+test "c_api: lookup function stub returns null" {
+    const result = wasm_runtime_lookup_function(undefined, "test");
+    try std.testing.expect(result == null);
+}

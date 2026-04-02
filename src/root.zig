@@ -11,6 +11,9 @@ pub const config = @import("config.zig");
 /// C-compatible API for embedding (matches wasm_export.h).
 pub const c_api = @import("api/c_api.zig");
 
+/// Idiomatic Zig embedding API.
+pub const wamr = @import("api/wamr.zig");
+
 /// Core WebAssembly types.
 pub const types = @import("runtime/common/types.zig");
 
@@ -28,6 +31,17 @@ pub const instance = @import("runtime/interpreter/instance.zig");
 
 /// Bytecode interpreter.
 pub const interp = @import("runtime/interpreter/interp.zig");
+
+/// AOT binary loader.
+pub const aot_loader = @import("runtime/aot/loader.zig");
+
+/// AOT runtime.
+pub const aot_runtime = @import("runtime/aot/runtime.zig");
+
+/// WASI preview1 implementation.
+/// Note: Uses std.Io; tests require async IO-aware runner.
+/// Excluded from refAllDecls to avoid test runner hang.
+const _wasi = @import("wasi/wasi.zig");
 
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).

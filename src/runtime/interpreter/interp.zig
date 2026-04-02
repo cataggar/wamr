@@ -43,39 +43,42 @@ fn readU32(code: []const u8, ip: *usize) u32 {
 
 fn readI32(code: []const u8, ip: *usize) i32 {
     var result: u32 = 0;
-    var shift: u5 = 0;
+    var shift: u32 = 0;
     var byte: u8 = 0;
     while (true) {
         if (ip.* >= code.len) return @bitCast(result);
         byte = code[ip.*];
         ip.* += 1;
-        result |= @as(u32, byte & 0x7F) << shift;
+        result |= @as(u32, byte & 0x7F) << @intCast(shift);
         if (byte & 0x80 == 0) break;
-        if (shift >= 28) break;
-        shift +|= 7;
+        shift += 7;
+        if (shift >= 35) break;
     }
-    // sign-extend
-    if (shift < 32 and (byte & 0x40) != 0) {
-        result |= @as(u32, 0xFFFFFFFF) << shift;
+    // Sign-extend from the bit above the last data septet.
+    const sign_shift = shift + 7;
+    if (sign_shift < 32 and (byte & 0x40) != 0) {
+        result |= ~@as(u32, 0) << @intCast(sign_shift);
     }
     return @bitCast(result);
 }
 
 fn readI64(code: []const u8, ip: *usize) i64 {
     var result: u64 = 0;
-    var shift: u6 = 0;
+    var shift: u32 = 0;
     var byte: u8 = 0;
     while (true) {
         if (ip.* >= code.len) return @bitCast(result);
         byte = code[ip.*];
         ip.* += 1;
-        result |= @as(u64, byte & 0x7F) << shift;
+        result |= @as(u64, byte & 0x7F) << @intCast(shift);
         if (byte & 0x80 == 0) break;
-        if (shift >= 63) break;
-        shift +|= 7;
+        shift += 7;
+        if (shift >= 70) break;
     }
-    if (shift < 64 and (byte & 0x40) != 0) {
-        result |= @as(u64, 0xFFFFFFFFFFFFFFFF) << shift;
+    // Sign-extend from the bit above the last data septet.
+    const sign_shift = shift + 7;
+    if (sign_shift < 64 and (byte & 0x40) != 0) {
+        result |= ~@as(u64, 0) << @intCast(sign_shift);
     }
     return @bitCast(result);
 }
@@ -445,12 +448,128 @@ test "interp: select false" {
 }
 
 test "interp: i32.and/or/xor" {
-    // 0xFF & 0x0F = 0x0F
-    const and_result = try runCode(&.{ 0x41, 0xFF, 0x00, 0x41, 0x0F, 0x71, 0x0B });
+    // 0xFF & 0x0F = 0x0F  (255 as signed LEB128 = 0xFF, 0x01)
+    const and_result = try runCode(&.{ 0x41, 0xFF, 0x01, 0x41, 0x0F, 0x71, 0x0B });
     try testing.expectEqual(@as(i32, 0x0F), and_result);
 }
 
 test "interp: nop" {
     const result = try runCode(&.{ 0x41, 42, 0x01, 0x0B });
     try testing.expectEqual(@as(i32, 42), result);
+}
+
+test "interp: i32.div_s traps on overflow" {
+    // INT32_MIN / -1 overflows.
+    // INT32_MIN as signed LEB128: 0x80, 0x80, 0x80, 0x80, 0x78
+    // -1 as signed LEB128: 0x7F
+    try runCodeExpectTrap(&.{
+        0x41, 0x80, 0x80, 0x80, 0x80, 0x78, // i32.const -2147483648
+        0x41, 0x7F, // i32.const -1
+        0x6D, // i32.div_s
+    }, error.IntegerOverflow);
+}
+
+test "interp: local.get and local.set" {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+
+    // Reserve 2 locals on the stack and push a frame.
+    try env.pushI32(0); // local 0
+    try env.pushI32(0); // local 1
+    try env.pushFrame(.{
+        .func_idx = 0,
+        .ip = 0,
+        .stack_base = 0,
+        .local_count = 2,
+        .return_arity = 0,
+        .prev_sp = 2,
+    });
+
+    // i32.const 42; local.set 1; local.get 1; end
+    try dispatchLoop(&env, &.{
+        0x41, 42, // i32.const 42
+        0x21, 1, // local.set 1
+        0x20, 1, // local.get 1
+        0x0B, // end
+    });
+
+    _ = try env.popFrame();
+    try testing.expectEqual(@as(i32, 42), try env.popI32());
+}
+
+test "interp: i32.rem_s" {
+    // 10 % 3 = 1
+    const result = try runCode(&.{ 0x41, 10, 0x41, 3, 0x6F, 0x0B });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: i32.rem_u traps on zero" {
+    try runCodeExpectTrap(&.{ 0x41, 10, 0x41, 0, 0x70, 0x0B }, error.IntegerDivisionByZero);
+}
+
+test "interp: i32.shl" {
+    // 1 << 4 = 16
+    const result = try runCode(&.{ 0x41, 1, 0x41, 4, 0x74, 0x0B });
+    try testing.expectEqual(@as(i32, 16), result);
+}
+
+test "interp: unknown opcode traps" {
+    // 0x06 = try opcode (not implemented)
+    try runCodeExpectTrap(&.{0x06}, error.UnknownOpcode);
+}
+
+test "LEB128: readI32 decodes -129 correctly" {
+    // -129 as signed LEB128 = 0xFF, 0x7E
+    var ip: usize = 0;
+    const code = [_]u8{ 0xFF, 0x7E };
+    try testing.expectEqual(@as(i32, -129), readI32(&code, &ip));
+    try testing.expectEqual(@as(usize, 2), ip);
+}
+
+test "LEB128: readI32 decodes INT32_MIN correctly" {
+    // -2147483648 as signed LEB128 = 0x80, 0x80, 0x80, 0x80, 0x78
+    var ip: usize = 0;
+    const code = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x78 };
+    try testing.expectEqual(@as(i32, -2147483648), readI32(&code, &ip));
+}
+
+test "LEB128: readU32 single byte" {
+    var ip: usize = 0;
+    const code = [_]u8{42};
+    try testing.expectEqual(@as(u32, 42), readU32(&code, &ip));
+    try testing.expectEqual(@as(usize, 1), ip);
+}
+
+test "LEB128: readU32 multi-byte 128" {
+    var ip: usize = 0;
+    const code = [_]u8{ 0x80, 0x01 };
+    try testing.expectEqual(@as(u32, 128), readU32(&code, &ip));
+}
+
+test "LEB128: readI64 single byte" {
+    var ip: usize = 0;
+    const code = [_]u8{0x01};
+    try testing.expectEqual(@as(i64, 1), readI64(&code, &ip));
+}
+
+test "LEB128: readI64 negative" {
+    var ip: usize = 0;
+    // -1 as signed LEB128 i64 = 0x7F
+    const code = [_]u8{0x7F};
+    try testing.expectEqual(@as(i64, -1), readI64(&code, &ip));
 }
