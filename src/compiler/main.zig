@@ -5,6 +5,7 @@
 const std = @import("std");
 const wamr = @import("wamr");
 const emit_aot = wamr.emit_aot;
+const compile = @import("codegen/x86_64/compile.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -79,17 +80,15 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Lowered {d} functions to IR\n", .{ir_module.functions.items.len});
 
-    // 4–5. TODO: optimisation passes + native codegen
-    // For now, emit a placeholder int3 per function.
-    var code_buf: std.ArrayList(u8) = .empty;
-    defer code_buf.deinit(allocator);
-    var offsets: std.ArrayList(u32) = .empty;
-    defer offsets.deinit(allocator);
+    // 4–5. Compile IR to native x86-64 code
+    const compiled = compile.compileModule(&ir_module, allocator) catch |err| {
+        std.debug.print("Error compiling to native code: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer allocator.free(compiled.code);
+    defer allocator.free(compiled.offsets);
 
-    for (0..ir_module.functions.items.len) |_| {
-        try offsets.append(allocator, @intCast(code_buf.items.len));
-        try code_buf.append(allocator, 0xCC); // int3 placeholder
-    }
+    std.debug.print("Generated {d} bytes of native code\n", .{compiled.code.len});
 
     // Build export entries
     var exports: std.ArrayList(emit_aot.ExportEntry) = .empty;
@@ -108,8 +107,8 @@ pub fn main(init: std.process.Init) !void {
 
     const aot_binary = try emit_aot.emit(
         allocator,
-        code_buf.items,
-        offsets.items,
+        compiled.code,
+        compiled.offsets,
         exports.items,
         .{ .arch = arch_name },
     );
