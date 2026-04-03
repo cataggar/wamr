@@ -556,7 +556,3 @@ test "full prologue + epilogue round-trip" {
         0x48, 0x89, 0xEC, 0x5D, 0xC3, // epilogue
     });
 }
-
-test {
-    _ = @import("compile.zig");
-}

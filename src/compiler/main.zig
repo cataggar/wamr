@@ -5,7 +5,7 @@
 const std = @import("std");
 const wamr = @import("wamr");
 const emit_aot = wamr.emit_aot;
-const compile = @import("codegen/x86_64/compile.zig");
+const compile = wamr.x86_64_compile;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;

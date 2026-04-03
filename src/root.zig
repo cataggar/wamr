@@ -51,6 +51,9 @@ pub const emit_aot = @import("compiler/emit_aot.zig");
 /// x86-64 machine code emitter.
 pub const x86_64_emit = @import("compiler/codegen/x86_64/emit.zig");
 
+/// x86-64 IR-to-native compiler.
+pub const x86_64_compile = @import("compiler/codegen/x86_64/compile.zig");
+
 // Testing
 /// Spec test runner infrastructure.
 pub const spec_runner = @import("tests/spec_runner.zig");
