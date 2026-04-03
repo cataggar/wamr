@@ -45,6 +45,9 @@ pub const ir = @import("compiler/ir/ir.zig");
 /// Wasm → IR frontend (lowering).
 pub const frontend = @import("compiler/frontend.zig");
 
+/// AOT binary file emitter.
+pub const emit_aot = @import("compiler/emit_aot.zig");
+
 /// x86-64 machine code emitter.
 pub const x86_64_emit = @import("compiler/codegen/x86_64/emit.zig");
 

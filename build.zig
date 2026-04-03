@@ -111,6 +111,21 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // ── wamrc AOT compiler ────────────────────────────────────────────
+    const wamrc_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wamrc_module.addImport("config", config_module);
+    wamrc_module.addImport("wamr", lib_module);
+
+    const wamrc = b.addExecutable(.{
+        .name = "wamrc",
+        .root_module = wamrc_module,
+    });
+    b.installArtifact(wamrc);
+
     // ── Tests ──────────────────────────────────────────────────────────
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
