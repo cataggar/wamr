@@ -109,79 +109,136 @@ fn buildImportContext(
     module: *const types.WasmModule,
     module_registry: *const std.StringHashMap(*types.ModuleInstance),
     allocator: std.mem.Allocator,
-) ?instance_mod.ImportContext {
+) error{ImportResolutionFailed}!?instance_mod.ImportContext {
     if (module.import_global_count == 0 and
         module.import_memory_count == 0 and
         module.import_table_count == 0 and
         module.import_function_count == 0) return null;
 
-    // Build imported globals from the module's import descriptors
     var globals: std.ArrayList(types.GlobalInstance) = .empty;
     defer globals.deinit(allocator);
     var memories: std.ArrayList(types.MemoryInstance) = .empty;
-    defer memories.deinit(allocator);
+    defer {
+        for (memories.items) |m| allocator.free(m.data);
+        memories.deinit(allocator);
+    }
     var tables: std.ArrayList(types.TableInstance) = .empty;
-    defer tables.deinit(allocator);
-    defer tables.deinit(allocator);
+    defer {
+        for (tables.items) |t| allocator.free(t.elements);
+        tables.deinit(allocator);
+    }
 
     for (module.imports) |imp| {
+        const is_spectest = std.mem.eql(u8, imp.module_name, "spectest");
+        const reg_inst = module_registry.get(imp.module_name);
+
+        if (!is_spectest and reg_inst == null)
+            return error.ImportResolutionFailed;
+
         switch (imp.kind) {
             .global => {
-                const gt = imp.global_type orelse continue;
-                // Try spectest first
-                if (std.mem.eql(u8, imp.module_name, "spectest")) {
+                const gt = imp.global_type orelse return error.ImportResolutionFailed;
+                if (is_spectest) {
+                    const sgt = spectestGlobalType(imp.field_name) orelse
+                        return error.ImportResolutionFailed;
+                    if (sgt.val_type != gt.val_type or sgt.mutability != gt.mutability)
+                        return error.ImportResolutionFailed;
                     globals.append(allocator, .{
                         .global_type = gt,
                         .value = getSpectestGlobal(imp.field_name, gt.val_type),
-                    }) catch return null;
-                } else if (module_registry.get(imp.module_name)) |reg_inst| {
-                    // Try to find the export in a registered module
-                    if (findExportedGlobal(reg_inst, imp.field_name)) |g| {
-                        globals.append(allocator, g) catch return null;
-                    } else {
-                        globals.append(allocator, .{ .global_type = gt, .value = defaultValue(gt.val_type) }) catch return null;
-                    }
+                    }) catch return error.ImportResolutionFailed;
                 } else {
-                    globals.append(allocator, .{ .global_type = gt, .value = defaultValue(gt.val_type) }) catch return null;
+                    const ri = reg_inst.?;
+                    const exp = ri.module.findExport(imp.field_name, .global) orelse
+                        return error.ImportResolutionFailed;
+                    if (exp.index >= ri.globals.len) return error.ImportResolutionFailed;
+                    const eg = ri.globals[exp.index];
+                    if (eg.global_type.val_type != gt.val_type or
+                        eg.global_type.mutability != gt.mutability)
+                        return error.ImportResolutionFailed;
+                    globals.append(allocator, eg) catch return error.ImportResolutionFailed;
                 }
             },
             .memory => {
-                if (std.mem.eql(u8, imp.module_name, "spectest")) {
-                    memories.append(allocator, makeSpectestMemory(allocator) orelse return null) catch return null;
-                } else if (module_registry.get(imp.module_name)) |reg_inst| {
-                    if (reg_inst.memories.len > 0) {
-                        memories.append(allocator, copyMemory(reg_inst.memories[0], allocator) orelse return null) catch return null;
-                    } else {
-                        memories.append(allocator, makeDefaultMemory(imp.memory_type, allocator) orelse return null) catch return null;
-                    }
+                if (is_spectest) {
+                    if (!std.mem.eql(u8, imp.field_name, "memory"))
+                        return error.ImportResolutionFailed;
+                    const imp_limits = if (imp.memory_type) |mt| mt.limits else types.Limits{ .min = 1 };
+                    if (!limitsMatch(.{ .min = 1, .max = @as(?u32, 2) }, imp_limits))
+                        return error.ImportResolutionFailed;
+                    memories.append(allocator, makeSpectestMemory(allocator) orelse
+                        return error.ImportResolutionFailed) catch return error.ImportResolutionFailed;
                 } else {
-                    memories.append(allocator, makeDefaultMemory(imp.memory_type, allocator) orelse return null) catch return null;
+                    const ri = reg_inst.?;
+                    const exp = ri.module.findExport(imp.field_name, .memory) orelse
+                        return error.ImportResolutionFailed;
+                    if (exp.index >= ri.memories.len) return error.ImportResolutionFailed;
+                    const em = ri.memories[exp.index];
+                    if (imp.memory_type) |mt| {
+                        if (!limitsMatch(em.memory_type.limits, mt.limits))
+                            return error.ImportResolutionFailed;
+                    }
+                    memories.append(allocator, copyMemory(em, allocator) orelse
+                        return error.ImportResolutionFailed) catch return error.ImportResolutionFailed;
                 }
             },
             .table => {
-                if (std.mem.eql(u8, imp.module_name, "spectest")) {
-                    tables.append(allocator, makeSpectestTable(allocator) orelse return null) catch return null;
-                } else if (module_registry.get(imp.module_name)) |reg_inst| {
-                    if (reg_inst.tables.len > 0) {
-                        tables.append(allocator, copyTable(reg_inst.tables[0], allocator) orelse return null) catch return null;
-                    } else {
-                        tables.append(allocator, makeDefaultTable(imp.table_type, allocator) orelse return null) catch return null;
-                    }
+                if (is_spectest) {
+                    if (!std.mem.eql(u8, imp.field_name, "table"))
+                        return error.ImportResolutionFailed;
+                    const tt = imp.table_type orelse types.TableType{ .elem_type = .funcref, .limits = .{ .min = 10 } };
+                    if (tt.elem_type != .funcref) return error.ImportResolutionFailed;
+                    if (!limitsMatch(.{ .min = 10, .max = @as(?u32, 20) }, tt.limits))
+                        return error.ImportResolutionFailed;
+                    tables.append(allocator, makeSpectestTable(allocator) orelse
+                        return error.ImportResolutionFailed) catch return error.ImportResolutionFailed;
                 } else {
-                    tables.append(allocator, makeDefaultTable(imp.table_type, allocator) orelse return null) catch return null;
+                    const ri = reg_inst.?;
+                    const exp = ri.module.findExport(imp.field_name, .table) orelse
+                        return error.ImportResolutionFailed;
+                    if (exp.index >= ri.tables.len) return error.ImportResolutionFailed;
+                    const et = ri.tables[exp.index];
+                    if (imp.table_type) |tt| {
+                        if (et.table_type.elem_type != tt.elem_type)
+                            return error.ImportResolutionFailed;
+                        if (!limitsMatch(et.table_type.limits, tt.limits))
+                            return error.ImportResolutionFailed;
+                    }
+                    tables.append(allocator, copyTable(et, allocator) orelse
+                        return error.ImportResolutionFailed) catch return error.ImportResolutionFailed;
                 }
             },
             .function => {
-                // Functions are counted but not bound; the interpreter will
-                // return UnknownFunction if a test actually calls one.
+                if (is_spectest) {
+                    if (!isSpectestFunction(imp.field_name))
+                        return error.ImportResolutionFailed;
+                    if (imp.func_type_idx) |tidx| {
+                        if (tidx < module.types.len) {
+                            if (!spectestFuncTypeMatches(imp.field_name, module.types[tidx]))
+                                return error.ImportResolutionFailed;
+                        }
+                    }
+                } else {
+                    const ri = reg_inst.?;
+                    const exp = ri.module.findExport(imp.field_name, .function) orelse
+                        return error.ImportResolutionFailed;
+                    if (imp.func_type_idx) |tidx| {
+                        if (tidx < module.types.len) {
+                            if (ri.module.getFuncType(exp.index)) |export_ft| {
+                                if (!funcTypesMatch(module.types[tidx], export_ft))
+                                    return error.ImportResolutionFailed;
+                            }
+                        }
+                    }
+                }
             },
         }
     }
 
     return .{
-        .globals = globals.toOwnedSlice(allocator) catch return null,
-        .memories = memories.toOwnedSlice(allocator) catch return null,
-        .tables = tables.toOwnedSlice(allocator) catch return null,
+        .globals = globals.toOwnedSlice(allocator) catch return error.ImportResolutionFailed,
+        .memories = memories.toOwnedSlice(allocator) catch return error.ImportResolutionFailed,
+        .tables = tables.toOwnedSlice(allocator) catch return error.ImportResolutionFailed,
     };
 }
 
@@ -217,6 +274,49 @@ fn findExportedGlobal(inst: *types.ModuleInstance, name: []const u8) ?types.Glob
     const exp = inst.module.findExport(name, .global) orelse return null;
     if (exp.index < inst.globals.len) return inst.globals[exp.index];
     return null;
+}
+
+fn limitsMatch(exported: types.Limits, imported: types.Limits) bool {
+    if (exported.min < imported.min) return false;
+    if (imported.max) |imp_max| {
+        const exp_max = exported.max orelse return false;
+        if (exp_max > imp_max) return false;
+    }
+    return true;
+}
+
+fn isSpectestFunction(name: []const u8) bool {
+    const known = [_][]const u8{ "print", "print_i32", "print_i64", "print_f32", "print_f64", "print_i32_f32", "print_f64_f64" };
+    for (known) |k| {
+        if (std.mem.eql(u8, name, k)) return true;
+    }
+    return false;
+}
+
+fn spectestGlobalType(name: []const u8) ?types.GlobalType {
+    if (std.mem.eql(u8, name, "global_i32")) return .{ .val_type = .i32, .mutability = .immutable };
+    if (std.mem.eql(u8, name, "global_i64")) return .{ .val_type = .i64, .mutability = .immutable };
+    if (std.mem.eql(u8, name, "global_f32")) return .{ .val_type = .f32, .mutability = .immutable };
+    if (std.mem.eql(u8, name, "global_f64")) return .{ .val_type = .f64, .mutability = .immutable };
+    return null;
+}
+
+fn spectestFuncTypeMatches(name: []const u8, ft: types.FuncType) bool {
+    if (std.mem.eql(u8, name, "print")) return ft.params.len == 0 and ft.results.len == 0;
+    if (std.mem.eql(u8, name, "print_i32")) return ft.params.len == 1 and ft.params[0] == .i32 and ft.results.len == 0;
+    if (std.mem.eql(u8, name, "print_i64")) return ft.params.len == 1 and ft.params[0] == .i64 and ft.results.len == 0;
+    if (std.mem.eql(u8, name, "print_f32")) return ft.params.len == 1 and ft.params[0] == .f32 and ft.results.len == 0;
+    if (std.mem.eql(u8, name, "print_f64")) return ft.params.len == 1 and ft.params[0] == .f64 and ft.results.len == 0;
+    if (std.mem.eql(u8, name, "print_i32_f32")) return ft.params.len == 2 and ft.params[0] == .i32 and ft.params[1] == .f32 and ft.results.len == 0;
+    if (std.mem.eql(u8, name, "print_f64_f64")) return ft.params.len == 2 and ft.params[0] == .f64 and ft.params[1] == .f64 and ft.results.len == 0;
+    return false;
+}
+
+fn funcTypesMatch(a: types.FuncType, b: types.FuncType) bool {
+    if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
+    for (a.params, b.params) |pa, pb| { if (pa != pb) return false; }
+    for (a.results, b.results) |ra, rb| { if (ra != rb) return false; }
+    return true;
 }
 
 fn makeSpectestMemory(allocator: std.mem.Allocator) ?types.MemoryInstance {
@@ -316,10 +416,23 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
         registry_names.deinit(allocator);
     }
 
+    // Keep registered modules alive so cross-module import pointers stay valid.
+    var reg_mod_ptrs: std.ArrayList(*wamr.Module) = .empty;
+    var reg_instances: std.ArrayList(wamr.Instance) = .empty;
+    var reg_wasm_data: std.ArrayList([]u8) = .empty;
+
     defer {
         if (current_instance) |*i| i.deinit();
         if (current_module) |*m| m.deinit();
         if (current_wasm_data) |d| allocator.free(d);
+    }
+    defer {
+        for (reg_instances.items) |*i| @constCast(i).deinit();
+        reg_instances.deinit(allocator);
+        for (reg_mod_ptrs.items) |p| { p.deinit(); allocator.destroy(p); }
+        reg_mod_ptrs.deinit(allocator);
+        for (reg_wasm_data.items) |d| allocator.free(d);
+        reg_wasm_data.deinit(allocator);
     }
 
     for (commands) |cmd| {
@@ -360,7 +473,10 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             current_wasm_data = wasm_data;
 
             // Try to instantiate with import resolution
-            const import_ctx = buildImportContext(&current_module.?.inner, &module_registry, allocator);
+            const import_ctx = buildImportContext(&current_module.?.inner, &module_registry, allocator) catch {
+                result.skipped += 1;
+                continue;
+            };
             if (import_ctx) |ctx| {
                 current_instance = current_module.?.instantiateWithImports(ctx) catch {
                     freeImportContext(ctx, allocator);
@@ -380,7 +496,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
                 result.skipped += 1;
                 continue;
             };
-            if (current_instance) |*inst| {
+            if (current_instance) |inst| {
                 const name_copy = allocator.dupe(u8, reg_name) catch {
                     result.skipped += 1;
                     continue;
@@ -394,6 +510,32 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
                     result.skipped += 1;
                     continue;
                 };
+                // Heap-allocate Module so WasmModule address stays stable
+                if (current_module) |mod| {
+                    const mod_heap = allocator.create(wamr.Module) catch {
+                        result.skipped += 1;
+                        continue;
+                    };
+                    mod_heap.* = mod;
+                    inst.inner.module = &mod_heap.inner;
+                    reg_mod_ptrs.append(allocator, mod_heap) catch {
+                        result.skipped += 1;
+                        continue;
+                    };
+                    current_module = null;
+                }
+                reg_instances.append(allocator, inst) catch {
+                    result.skipped += 1;
+                    continue;
+                };
+                current_instance = null;
+                if (current_wasm_data) |wd| {
+                    reg_wasm_data.append(allocator, wd) catch {
+                        result.skipped += 1;
+                        continue;
+                    };
+                    current_wasm_data = null;
+                }
                 result.passed += 1;
             } else {
                 result.skipped += 1;
@@ -560,7 +702,11 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             };
 
             // Try instantiation — it should fail because imports can't be resolved
-            const import_ctx = buildImportContext(&mod.inner, &module_registry, allocator);
+            const import_ctx = buildImportContext(&mod.inner, &module_registry, allocator) catch {
+                mod.deinit();
+                result.passed += 1;
+                continue;
+            };
             if (import_ctx) |ctx| {
                 var inst_or_err = mod.instantiateWithImports(ctx);
                 if (inst_or_err) |*inst| {
@@ -611,7 +757,11 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
                 continue;
             };
 
-            const import_ctx = buildImportContext(&mod.inner, &module_registry, allocator);
+            const import_ctx = buildImportContext(&mod.inner, &module_registry, allocator) catch {
+                mod.deinit();
+                result.passed += 1;
+                continue;
+            };
             if (import_ctx) |ctx| {
                 var inst_or_err = mod.instantiateWithImports(ctx);
                 if (inst_or_err) |*inst| {
