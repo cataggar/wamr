@@ -55,6 +55,12 @@ pub const Module = struct {
         return .{ .inner = inst, .allocator = self.allocator };
     }
 
+    /// Instantiate with pre-resolved imports.
+    pub fn instantiateWithImports(self: *Module, import_ctx: instance_mod.ImportContext) !Instance {
+        const inst = try instance_mod.instantiateWithImports(&self.inner, self.allocator, import_ctx);
+        return .{ .inner = inst, .allocator = self.allocator };
+    }
+
     /// Find an exported function by name.
     pub fn findExport(self: *const Module, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
         return self.inner.findExport(name, kind);

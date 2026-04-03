@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const types = @import("../common/types.zig");
+const ExecEnv = @import("../common/exec_env.zig").ExecEnv;
+const interp = @import("interp.zig");
 
 pub const InstantiationError = error{
     OutOfMemory,
@@ -17,10 +19,39 @@ pub const InstantiationError = error{
     ImportResolutionFailed,
     InvalidGlobalIndex,
     UnknownImport,
+    StartFunctionFailed,
+};
+
+/// Resolved imports passed during instantiation.
+/// When a module has imports, the caller must supply this context
+/// with enough entries to cover each import category count.
+pub const ImportContext = struct {
+    globals: []const types.GlobalInstance = &.{},
+    memories: []const types.MemoryInstance = &.{},
+    tables: []const types.TableInstance = &.{},
 };
 
 /// Instantiate a module, producing a runnable ModuleInstance.
+/// If the module has imports and no `import_ctx` is provided, returns ImportResolutionFailed.
 pub fn instantiate(module: *const types.WasmModule, allocator: std.mem.Allocator) InstantiationError!*types.ModuleInstance {
+    return instantiateWithImports(module, allocator, null);
+}
+
+/// Instantiate a module with optional pre-resolved imports.
+pub fn instantiateWithImports(
+    module: *const types.WasmModule,
+    allocator: std.mem.Allocator,
+    import_ctx: ?ImportContext,
+) InstantiationError!*types.ModuleInstance {
+    const has_imports = module.import_function_count > 0 or
+        module.import_global_count > 0 or
+        module.import_memory_count > 0 or
+        module.import_table_count > 0;
+
+    if (has_imports and import_ctx == null) {
+        return error.ImportResolutionFailed;
+    }
+
     var inst = allocator.create(types.ModuleInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(inst);
 
@@ -32,17 +63,26 @@ pub fn instantiate(module: *const types.WasmModule, allocator: std.mem.Allocator
         .allocator = allocator,
     };
 
-    inst.memories = try allocateMemories(module, allocator);
+    inst.memories = try allocateMemories(module, allocator, import_ctx);
     errdefer freeMemories(inst.memories, allocator);
 
-    inst.tables = try allocateTables(module, allocator);
+    inst.tables = try allocateTables(module, allocator, import_ctx);
     errdefer freeTables(inst.tables, allocator);
 
-    inst.globals = try initializeGlobals(module, allocator);
+    inst.globals = try initializeGlobals(module, allocator, import_ctx);
     errdefer freeGlobals(inst.globals, allocator);
 
     try applyDataSegments(module, inst.memories);
     try applyElemSegments(module, inst.tables);
+
+    // Execute start function if present (§4.5.4 step 15)
+    if (module.start_function) |start_idx| {
+        if (start_idx >= module.import_function_count) {
+            var env = ExecEnv.create(inst, 4096, allocator) catch return error.StartFunctionFailed;
+            defer env.destroy();
+            interp.executeFunction(env, start_idx) catch return error.StartFunctionFailed;
+        }
+    }
 
     return inst;
 }
@@ -58,16 +98,40 @@ pub fn destroy(inst: *types.ModuleInstance) void {
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
 
-fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocator) InstantiationError![]types.MemoryInstance {
-    if (module.memories.len == 0) return &.{};
+fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]types.MemoryInstance {
+    const import_count = module.import_memory_count;
+    const total_count = import_count + @as(u32, @intCast(module.memories.len));
+    if (total_count == 0) return &.{};
 
-    const mems = allocator.alloc(types.MemoryInstance, module.memories.len) catch
+    const mems = allocator.alloc(types.MemoryInstance, total_count) catch
         return error.MemoryAllocationFailed;
     errdefer allocator.free(mems);
 
     var initialized: usize = 0;
     errdefer for (mems[0..initialized]) |*m| allocator.free(m.data);
 
+    // Copy imported memories
+    if (import_count > 0) {
+        if (import_ctx) |ctx| {
+            if (ctx.memories.len >= import_count) {
+                for (0..import_count) |i| {
+                    const src = ctx.memories[i];
+                    const data = allocator.alloc(u8, src.data.len) catch
+                        return error.MemoryAllocationFailed;
+                    @memcpy(data, src.data);
+                    mems[i] = .{
+                        .memory_type = src.memory_type,
+                        .data = data,
+                        .current_pages = src.current_pages,
+                        .max_pages = src.max_pages,
+                    };
+                    initialized += 1;
+                }
+            }
+        }
+    }
+
+    // Allocate local memories
     for (module.memories, 0..) |mem_type, i| {
         const min_pages = mem_type.limits.min;
         const max_pages = mem_type.limits.max orelse 65536;
@@ -77,7 +141,7 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
             return error.MemoryAllocationFailed;
         @memset(data, 0);
 
-        mems[i] = .{
+        mems[import_count + i] = .{
             .memory_type = mem_type,
             .data = data,
             .current_pages = min_pages,
@@ -89,23 +153,45 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
     return mems;
 }
 
-fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator) InstantiationError![]types.TableInstance {
-    if (module.tables.len == 0) return &.{};
+fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]types.TableInstance {
+    const import_count = module.import_table_count;
+    const total_count = import_count + @as(u32, @intCast(module.tables.len));
+    if (total_count == 0) return &.{};
 
-    const tables = allocator.alloc(types.TableInstance, module.tables.len) catch
+    const tables = allocator.alloc(types.TableInstance, total_count) catch
         return error.TableAllocationFailed;
     errdefer allocator.free(tables);
 
     var initialized: usize = 0;
     errdefer for (tables[0..initialized]) |*t| allocator.free(t.elements);
 
+    // Copy imported tables
+    if (import_count > 0) {
+        if (import_ctx) |ctx| {
+            if (ctx.tables.len >= import_count) {
+                for (0..import_count) |i| {
+                    const src = ctx.tables[i];
+                    const elems = allocator.alloc(?u32, src.elements.len) catch
+                        return error.TableAllocationFailed;
+                    @memcpy(elems, src.elements);
+                    tables[i] = .{
+                        .table_type = src.table_type,
+                        .elements = elems,
+                    };
+                    initialized += 1;
+                }
+            }
+        }
+    }
+
+    // Allocate local tables
     for (module.tables, 0..) |table_type, i| {
         const min_elems = table_type.limits.min;
         const elems = allocator.alloc(?u32, min_elems) catch
             return error.TableAllocationFailed;
         @memset(elems, null);
 
-        tables[i] = .{
+        tables[import_count + i] = .{
             .table_type = table_type,
             .elements = elems,
         };
@@ -115,16 +201,29 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator)
     return tables;
 }
 
-fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocator) InstantiationError![]types.GlobalInstance {
-    if (module.globals.len == 0) return &.{};
+fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]types.GlobalInstance {
+    const import_count = module.import_global_count;
+    const total_count = import_count + @as(u32, @intCast(module.globals.len));
+    if (total_count == 0) return &.{};
 
-    const globals = allocator.alloc(types.GlobalInstance, module.globals.len) catch
+    const globals = allocator.alloc(types.GlobalInstance, total_count) catch
         return error.OutOfMemory;
 
+    // Copy imported globals
+    if (import_count > 0) {
+        if (import_ctx) |ctx| {
+            const count = @min(import_count, @as(u32, @intCast(ctx.globals.len)));
+            for (0..count) |i| {
+                globals[i] = ctx.globals[i];
+            }
+        }
+    }
+
+    // Initialize local globals (can reference imported globals via global.get)
     for (module.globals, 0..) |global, i| {
-        globals[i] = .{
+        globals[import_count + i] = .{
             .global_type = global.global_type,
-            .value = try evalInitExpr(global.init_expr, globals[0..i]),
+            .value = try evalInitExpr(global.init_expr, globals[0 .. import_count + i]),
         };
     }
 
