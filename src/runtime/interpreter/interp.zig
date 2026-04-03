@@ -170,15 +170,16 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
             },
             // Skip LEB128 immediates
             .br, .br_if, .local_get, .local_set, .local_tee,
-            .global_get, .global_set, .i32_const, .call,
+            .global_get, .global_set, .i32_const, .call, .return_call,
             .ref_null, .ref_func,
+            .table_get, .table_set,
             => {
                 pos = skipLeb128(code, pos);
             },
             .i64_const => {
                 pos = skipLeb128(code, pos);
             },
-            .call_indirect => {
+            .call_indirect, .return_call_indirect => {
                 pos = skipLeb128(code, pos); // type_idx
                 pos = skipLeb128(code, pos); // table_idx
             },
@@ -249,15 +250,16 @@ fn findElse(code: []const u8, start: usize) ?usize {
                 if (depth == 1) return pos;
             },
             .br, .br_if, .local_get, .local_set, .local_tee,
-            .global_get, .global_set, .i32_const, .call,
+            .global_get, .global_set, .i32_const, .call, .return_call,
             .ref_null, .ref_func,
+            .table_get, .table_set,
             => {
                 pos = skipLeb128(code, pos);
             },
             .i64_const => {
                 pos = skipLeb128(code, pos);
             },
-            .call_indirect => {
+            .call_indirect, .return_call_indirect => {
                 pos = skipLeb128(code, pos);
                 pos = skipLeb128(code, pos);
             },
@@ -567,6 +569,31 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
                 frame.ip = @intCast(ip);
                 try executeFunction(env, func_idx);
+            },
+
+            .return_call => {
+                const func_idx = readU32(code, &ip);
+                try executeFunction(env, func_idx);
+                return;
+            },
+
+            .return_call_indirect => {
+                const type_idx = readU32(code, &ip);
+                const table_idx = readU32(code, &ip);
+                const elem_idx: u32 = @bitCast(try env.popI32());
+
+                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
+                const func_idx = table.elements[elem_idx] orelse return error.UninitializedElement;
+
+                const module = env.module_inst.module;
+                if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
+                const expected_type = module.types[type_idx];
+                const actual_type = module.getFuncType(func_idx) orelse return error.UnknownFunction;
+                if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
+
+                try executeFunction(env, func_idx);
+                return;
             },
 
             // ── Constants ──
@@ -1375,8 +1402,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             // ── Reference types ──
             .ref_null => {
                 const ref_type = readU32(code, &ip);
-                _ = ref_type;
-                try env.push(.{ .funcref = null });
+                if (ref_type == @intFromEnum(types.ValType.externref)) {
+                    try env.push(.{ .externref = null });
+                } else {
+                    try env.push(.{ .funcref = null });
+                }
             },
             .ref_is_null => {
                 const val = try env.pop();
@@ -1390,6 +1420,32 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             .ref_func => {
                 const func_idx = readU32(code, &ip);
                 try env.push(.{ .funcref = func_idx });
+            },
+
+            // ── Table ops ──
+            .table_get => {
+                const table_idx = readU32(code, &ip);
+                const elem_idx: u32 = @bitCast(try env.popI32());
+                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
+                const ref = table.elements[elem_idx];
+                if (table.table_type.elem_type == .externref) {
+                    try env.push(.{ .externref = ref });
+                } else {
+                    try env.push(.{ .funcref = ref });
+                }
+            },
+            .table_set => {
+                const table_idx = readU32(code, &ip);
+                const ref = try env.pop();
+                const elem_idx: u32 = @bitCast(try env.popI32());
+                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
+                table.elements[elem_idx] = switch (ref) {
+                    .funcref => |r| r,
+                    .externref => |r| r,
+                    else => null,
+                };
             },
 
             // ── Misc prefix (0xFC) ──
@@ -1521,29 +1577,90 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                         @memset(mem.data[d .. d + len], val);
                     },
                     12 => { // table.init
-                        _ = readU32(code, &ip); // elem_idx
-                        _ = readU32(code, &ip); // table_idx
-                        return error.UnknownOpcode;
+                        const elem_idx = readU32(code, &ip);
+                        const table_idx = readU32(code, &ip);
+                        const n: u32 = @bitCast(try env.popI32());
+                        const s: u32 = @bitCast(try env.popI32());
+                        const d: u32 = @bitCast(try env.popI32());
+                        const module = env.module_inst.module;
+                        if (elem_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
+                        const elem = &module.elements[elem_idx];
+                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                        if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
+                        for (0..n) |i| {
+                            table.elements[d + @as(u32, @intCast(i))] = elem.func_indices[s + @as(u32, @intCast(i))];
+                        }
                     },
                     13 => { // elem.drop
                         _ = readU32(code, &ip);
+                        // TODO: mark element segment as dropped
                     },
                     14 => { // table.copy
-                        _ = readU32(code, &ip); // dst table
-                        _ = readU32(code, &ip); // src table
-                        return error.UnknownOpcode;
+                        const dst_table_idx = readU32(code, &ip);
+                        const src_table_idx = readU32(code, &ip);
+                        const n: u32 = @bitCast(try env.popI32());
+                        const s: u32 = @bitCast(try env.popI32());
+                        const d: u32 = @bitCast(try env.popI32());
+                        const dst_table = if (dst_table_idx < env.module_inst.tables.len) &env.module_inst.tables[dst_table_idx] else return error.OutOfBoundsTableAccess;
+                        const src_table = if (src_table_idx < env.module_inst.tables.len) &env.module_inst.tables[src_table_idx] else return error.OutOfBoundsTableAccess;
+                        if (@as(u64, s) + n > src_table.elements.len or @as(u64, d) + n > dst_table.elements.len) return error.OutOfBoundsTableAccess;
+                        if (d <= s) {
+                            for (0..n) |i| dst_table.elements[d + @as(u32, @intCast(i))] = src_table.elements[s + @as(u32, @intCast(i))];
+                        } else {
+                            var i: u32 = n;
+                            while (i > 0) {
+                                i -= 1;
+                                dst_table.elements[d + i] = src_table.elements[s + i];
+                            }
+                        }
                     },
                     15 => { // table.grow
-                        _ = readU32(code, &ip);
-                        return error.UnknownOpcode;
+                        const table_idx = readU32(code, &ip);
+                        const delta: u32 = @bitCast(try env.popI32());
+                        const init_ref = try env.pop();
+                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else {
+                            try env.pushI32(-1);
+                            continue;
+                        };
+                        const old_size: u32 = @intCast(table.elements.len);
+                        const new_size = @as(u64, old_size) + delta;
+                        if (table.table_type.limits.max) |max| {
+                            if (new_size > max) {
+                                try env.pushI32(-1);
+                                continue;
+                            }
+                        }
+                        const new_elems = env.module_inst.allocator.realloc(table.elements, @intCast(new_size)) catch {
+                            try env.pushI32(-1);
+                            continue;
+                        };
+                        const init_val: ?u32 = switch (init_ref) {
+                            .funcref => |r| r,
+                            .externref => |r| r,
+                            else => null,
+                        };
+                        for (new_elems[old_size..]) |*e| e.* = init_val;
+                        table.elements = new_elems;
+                        try env.pushI32(@bitCast(old_size));
                     },
                     16 => { // table.size
-                        _ = readU32(code, &ip);
-                        return error.UnknownOpcode;
+                        const table_idx = readU32(code, &ip);
+                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                        try env.pushI32(@intCast(table.elements.len));
                     },
                     17 => { // table.fill
-                        _ = readU32(code, &ip);
-                        return error.UnknownOpcode;
+                        const table_idx = readU32(code, &ip);
+                        const n: u32 = @bitCast(try env.popI32());
+                        const val = try env.pop();
+                        const offset: u32 = @bitCast(try env.popI32());
+                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                        if (@as(u64, offset) + n > table.elements.len) return error.OutOfBoundsTableAccess;
+                        const ref_val: ?u32 = switch (val) {
+                            .funcref => |r| r,
+                            .externref => |r| r,
+                            else => null,
+                        };
+                        for (table.elements[offset..][0..n]) |*e| e.* = ref_val;
                     },
                     else => return error.UnknownOpcode,
                 }

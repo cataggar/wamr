@@ -66,6 +66,14 @@ fn parseValue(arg: Arg) ?types.Value {
     } else if (std.mem.eql(u8, arg.type, "f64")) {
         const bits = std.fmt.parseUnsigned(u64, val_str, 10) catch return null;
         return .{ .f64 = @bitCast(bits) };
+    } else if (std.mem.eql(u8, arg.type, "funcref")) {
+        if (std.mem.eql(u8, val_str, "null")) return .{ .funcref = null };
+        const idx = std.fmt.parseUnsigned(u32, val_str, 10) catch return null;
+        return .{ .funcref = idx };
+    } else if (std.mem.eql(u8, arg.type, "externref")) {
+        if (std.mem.eql(u8, val_str, "null")) return .{ .externref = null };
+        const idx = std.fmt.parseUnsigned(u32, val_str, 10) catch return null;
+        return .{ .externref = idx };
     }
     return null;
 }
@@ -77,6 +85,8 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
         .i64 => |v| b == .i64 and b.i64 == v,
         .f32 => |v| b == .f32 and @as(u32, @bitCast(b.f32)) == @as(u32, @bitCast(v)),
         .f64 => |v| b == .f64 and @as(u64, @bitCast(b.f64)) == @as(u64, @bitCast(v)),
+        .funcref => |v| b == .funcref and b.funcref == v,
+        .externref => |v| b == .externref and b.externref == v,
         else => false,
     };
 }
@@ -427,7 +437,8 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             }
             defer if (expected_vals) |ev| allocator.free(ev);
 
-            const actual = inst.call(field, args) catch {
+            const actual = inst.call(field, args) catch |err| {
+                std.debug.print("  FAIL assert_return line {d}: {s} call error: {}\n", .{ cmd.line, field, err });
                 result.failed += 1;
                 continue;
             };
@@ -435,6 +446,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
 
             const expected = expected_vals orelse &[_]types.Value{};
             if (actual.len != expected.len) {
+                std.debug.print("  FAIL assert_return line {d}: {s} result count mismatch: got {d}, expected {d}\n", .{ cmd.line, field, actual.len, expected.len });
                 result.failed += 1;
                 continue;
             }
@@ -450,6 +462,9 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             if (all_match) {
                 result.passed += 1;
             } else {
+                if (actual.len > 0 and expected.len > 0) {
+                    std.debug.print("  FAIL assert_return line {d}: {s} value mismatch\n", .{ cmd.line, field });
+                }
                 result.failed += 1;
             }
         } else if (std.mem.eql(u8, cmd.type, "assert_trap")) {
@@ -654,8 +669,37 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             } else |_| {
                 result.passed += 1; // exhaustion trap expected
             }
+        } else if (std.mem.eql(u8, cmd.type, "action")) {
+            const action = cmd.action orelse {
+                result.skipped += 1;
+                continue;
+            };
+            if (!std.mem.eql(u8, action.type, "invoke")) {
+                result.skipped += 1;
+                continue;
+            }
+            var inst = current_instance orelse {
+                result.skipped += 1;
+                continue;
+            };
+            const field = action.field orelse {
+                result.skipped += 1;
+                continue;
+            };
+            const args_json = action.args orelse &[_]Arg{};
+            const args = parseArgs(args_json, allocator) orelse {
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(args);
+            if (inst.call(field, args)) |results| {
+                allocator.free(results);
+                result.passed += 1;
+            } else |_| {
+                result.failed += 1;
+            }
         } else {
-            // action, etc.
+            // unknown command type
             result.skipped += 1;
         }
     }
