@@ -38,6 +38,20 @@ pub const aot_loader = @import("runtime/aot/loader.zig");
 /// AOT runtime.
 pub const aot_runtime = @import("runtime/aot/runtime.zig");
 
+// Compiler
+/// Compiler IR (SSA-form intermediate representation).
+pub const ir = @import("compiler/ir/ir.zig");
+
+/// Wasm → IR frontend (lowering).
+pub const frontend = @import("compiler/frontend.zig");
+
+/// x86-64 machine code emitter.
+pub const x86_64_emit = @import("compiler/codegen/x86_64/emit.zig");
+
+// Testing
+/// Spec test runner infrastructure.
+pub const spec_runner = @import("tests/spec_runner.zig");
+
 /// WASI preview1 implementation.
 /// Note: Uses std.Io; tests require async IO-aware runner.
 /// Excluded from refAllDecls to avoid test runner hang.
