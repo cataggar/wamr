@@ -171,8 +171,18 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
             .i64_const => {
                 pos = skipLeb128(code, pos);
             },
-            .i32_load, .i32_store => {
+            .i32_load, .i64_load, .f32_load, .f64_load,
+            .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
+            .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u,
+            .i64_load32_s, .i64_load32_u,
+            .i32_store, .i64_store, .f32_store, .f64_store,
+            .i32_store8, .i32_store16,
+            .i64_store8, .i64_store16, .i64_store32,
+            => {
                 pos = skipLeb128(code, pos);
+                pos = skipLeb128(code, pos);
+            },
+            .memory_size, .memory_grow => {
                 pos = skipLeb128(code, pos);
             },
             .f32_const => pos += 4,
@@ -215,8 +225,18 @@ fn findElse(code: []const u8, start: usize) ?usize {
             .i64_const => {
                 pos = skipLeb128(code, pos);
             },
-            .i32_load, .i32_store => {
+            .i32_load, .i64_load, .f32_load, .f64_load,
+            .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
+            .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u,
+            .i64_load32_s, .i64_load32_u,
+            .i32_store, .i64_store, .f32_store, .f64_store,
+            .i32_store8, .i32_store16,
+            .i64_store8, .i64_store16, .i64_store32,
+            => {
                 pos = skipLeb128(code, pos);
+                pos = skipLeb128(code, pos);
+            },
+            .memory_size, .memory_grow => {
                 pos = skipLeb128(code, pos);
             },
             .f32_const => pos += 4,
@@ -640,9 +660,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 try env.pushI32(@bitCast(std.math.rotr(u32, a, b % 32)));
             },
 
-            // ── Memory (i32 only) ──
+            // ── Memory ──
+
+            // i32 loads
             .i32_load => {
-                _ = readU32(code, &ip); // alignment hint
+                _ = readU32(code, &ip);
                 const offset = readU32(code, &ip);
                 const base: u32 = @bitCast(try env.popI32());
                 const addr = @as(u64, base) + offset;
@@ -651,6 +673,49 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 const a: usize = @intCast(addr);
                 try env.pushI32(std.mem.readInt(i32, mem.data[a..][0..4], .little));
             },
+            .i32_load8_s => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const signed_byte: i8 = @bitCast(mem.data[@intCast(addr)]);
+                try env.pushI32(@as(i32, signed_byte));
+            },
+            .i32_load8_u => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                try env.pushI32(@as(i32, @intCast(mem.data[@intCast(addr)])));
+            },
+            .i32_load16_s => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                const val: i16 = std.mem.readInt(i16, mem.data[a..][0..2], .little);
+                try env.pushI32(@as(i32, val));
+            },
+            .i32_load16_u => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                const val: u16 = std.mem.readInt(u16, mem.data[a..][0..2], .little);
+                try env.pushI32(@as(i32, @intCast(val)));
+            },
+
+            // i32 stores
             .i32_store => {
                 _ = readU32(code, &ip);
                 const offset = readU32(code, &ip);
@@ -661,6 +726,213 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
                 std.mem.writeInt(i32, mem.data[a..][0..4], val, .little);
+            },
+            .i32_store8 => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popI32();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                mem.data[@intCast(addr)] = @truncate(@as(u32, @bitCast(val)));
+            },
+            .i32_store16 => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popI32();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                std.mem.writeInt(u16, mem.data[a..][0..2], @truncate(@as(u32, @bitCast(val))), .little);
+            },
+
+            // i64 loads
+            .i64_load => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                try env.pushI64(std.mem.readInt(i64, mem.data[a..][0..8], .little));
+            },
+            .i64_load8_s => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const signed_byte: i8 = @bitCast(mem.data[@intCast(addr)]);
+                try env.pushI64(@as(i64, signed_byte));
+            },
+            .i64_load8_u => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                try env.pushI64(@as(i64, @intCast(mem.data[@intCast(addr)])));
+            },
+            .i64_load16_s => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                const val: i16 = std.mem.readInt(i16, mem.data[a..][0..2], .little);
+                try env.pushI64(@as(i64, val));
+            },
+            .i64_load16_u => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                const val: u16 = std.mem.readInt(u16, mem.data[a..][0..2], .little);
+                try env.pushI64(@as(i64, @intCast(val)));
+            },
+            .i64_load32_s => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                const val: i32 = std.mem.readInt(i32, mem.data[a..][0..4], .little);
+                try env.pushI64(@as(i64, val));
+            },
+            .i64_load32_u => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                const val: u32 = std.mem.readInt(u32, mem.data[a..][0..4], .little);
+                try env.pushI64(@as(i64, @intCast(val)));
+            },
+
+            // i64 stores
+            .i64_store => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popI64();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                std.mem.writeInt(i64, mem.data[a..][0..8], val, .little);
+            },
+            .i64_store8 => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popI64();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                mem.data[@intCast(addr)] = @truncate(@as(u64, @bitCast(val)));
+            },
+            .i64_store16 => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popI64();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                std.mem.writeInt(u16, mem.data[a..][0..2], @truncate(@as(u64, @bitCast(val))), .little);
+            },
+            .i64_store32 => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popI64();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                std.mem.writeInt(u32, mem.data[a..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
+            },
+
+            // f32 load/store
+            .f32_load => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                try env.pushF32(@bitCast(std.mem.readInt(u32, mem.data[a..][0..4], .little)));
+            },
+            .f32_store => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popF32();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                std.mem.writeInt(u32, mem.data[a..][0..4], @bitCast(val), .little);
+            },
+
+            // f64 load/store
+            .f64_load => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                try env.pushF64(@bitCast(std.mem.readInt(u64, mem.data[a..][0..8], .little)));
+            },
+            .f64_store => {
+                _ = readU32(code, &ip);
+                const offset = readU32(code, &ip);
+                const val = try env.popF64();
+                const base: u32 = @bitCast(try env.popI32());
+                const addr = @as(u64, base) + offset;
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                const a: usize = @intCast(addr);
+                std.mem.writeInt(u64, mem.data[a..][0..8], @bitCast(val), .little);
+            },
+
+            // memory.size / memory.grow
+            .memory_size => {
+                _ = readU32(code, &ip); // memory index (always 0 for MVP)
+                const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                try env.pushI32(@intCast(mem.current_pages));
+            },
+            .memory_grow => {
+                _ = readU32(code, &ip); // memory index
+                const delta: u32 = @bitCast(try env.popI32());
+                const mem = env.module_inst.getMemory(0) orelse {
+                    try env.pushI32(-1);
+                    continue;
+                };
+                const old_pages = mem.grow(delta, env.module_inst.allocator) catch {
+                    try env.pushI32(-1);
+                    continue;
+                };
+                try env.pushI32(@bitCast(old_pages));
             },
 
             // ── i64 comparison ──
@@ -1933,4 +2205,286 @@ test "interp: f32.demote_f64" {
         0x0B,
     });
     try testing.expectApproxEqAbs(@as(f32, 1.5), result, 0.001);
+}
+
+// ── Memory-aware test helpers ──
+
+fn runCodeWithMem(code: []const u8) !i32 {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
+    defer alloc.free(mem_data);
+    @memset(mem_data, 0);
+    var mem_inst = [_]types.MemoryInstance{.{
+        .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
+        .data = mem_data,
+        .current_pages = 1,
+        .max_pages = 4,
+    }};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &mem_inst,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    try dispatchLoop(&env, code);
+    return env.popI32();
+}
+
+fn runCodeWithMemI64(code: []const u8) !i64 {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
+    defer alloc.free(mem_data);
+    @memset(mem_data, 0);
+    var mem_inst = [_]types.MemoryInstance{.{
+        .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
+        .data = mem_data,
+        .current_pages = 1,
+        .max_pages = 4,
+    }};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &mem_inst,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    try dispatchLoop(&env, code);
+    return env.popI64();
+}
+
+fn runCodeWithMemF32(code: []const u8) !f32 {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
+    defer alloc.free(mem_data);
+    @memset(mem_data, 0);
+    var mem_inst = [_]types.MemoryInstance{.{
+        .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
+        .data = mem_data,
+        .current_pages = 1,
+        .max_pages = 4,
+    }};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &mem_inst,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    try dispatchLoop(&env, code);
+    return env.popF32();
+}
+
+fn runCodeWithMemF64(code: []const u8) !f64 {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
+    defer alloc.free(mem_data);
+    @memset(mem_data, 0);
+    var mem_inst = [_]types.MemoryInstance{.{
+        .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
+        .data = mem_data,
+        .current_pages = 1,
+        .max_pages = 4,
+    }};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &mem_inst,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    try dispatchLoop(&env, code);
+    return env.popF64();
+}
+
+// ── Memory opcode tests ──
+
+test "interp: memory.size on 1-page memory" {
+    // memory.size (0x3F) with mem index 0x00; end → 1
+    const result = try runCodeWithMem(&.{ 0x3F, 0x00, 0x0B });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: memory.grow returns old page count" {
+    // i32.const 1; memory.grow 0x00; end → 1 (old pages)
+    // Then memory.size → 2
+    // We test grow returns old=1 first:
+    const result = try runCodeWithMem(&.{
+        0x41, 1, // i32.const 1
+        0x40, 0x00, // memory.grow
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: memory.grow then memory.size" {
+    // i32.const 1; memory.grow; drop; memory.size; end → 2
+    const result = try runCodeWithMem(&.{
+        0x41, 1, // i32.const 1
+        0x40, 0x00, // memory.grow
+        0x1A, // drop
+        0x3F, 0x00, // memory.size
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 2), result);
+}
+
+test "interp: memory.grow beyond max returns -1" {
+    // max_pages=4, current=1, grow by 10 → -1
+    const result = try runCodeWithMem(&.{
+        0x41, 10, // i32.const 10
+        0x40, 0x00, // memory.grow
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, -1), result);
+}
+
+test "interp: i32.load8_s with 0xFF" {
+    // store 0xFF at addr 0, load8_s → -1
+    const result = try runCodeWithMem(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x41, 0xFF, 0x01, // i32.const 255
+        0x3A, 0x00, 0x00, // i32.store8 align=0 offset=0
+        0x41, 0, // i32.const 0 (addr)
+        0x2C, 0x00, 0x00, // i32.load8_s align=0 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, -1), result);
+}
+
+test "interp: i32.load8_u with 0xFF" {
+    // store 0xFF at addr 0, load8_u → 255
+    const result = try runCodeWithMem(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x41, 0xFF, 0x01, // i32.const 255
+        0x3A, 0x00, 0x00, // i32.store8 align=0 offset=0
+        0x41, 0, // i32.const 0 (addr)
+        0x2D, 0x00, 0x00, // i32.load8_u align=0 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 255), result);
+}
+
+test "interp: i32.store16/load16_s/load16_u roundtrip" {
+    // store 0xFFFE (-2 as i16) at addr 0 via store16, then load16_s → -2, load16_u → 65534
+    // Test load16_s:
+    const result_s = try runCodeWithMem(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x41, 0xFE, 0xFF, 0x03, // i32.const 0xFFFE (65534)
+        0x3B, 0x01, 0x00, // i32.store16 align=1 offset=0
+        0x41, 0, // i32.const 0
+        0x2E, 0x01, 0x00, // i32.load16_s align=1 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, -2), result_s);
+
+    // Test load16_u:
+    const result_u = try runCodeWithMem(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x41, 0xFE, 0xFF, 0x03, // i32.const 0xFFFE (65534)
+        0x3B, 0x01, 0x00, // i32.store16 align=1 offset=0
+        0x41, 0, // i32.const 0
+        0x2F, 0x01, 0x00, // i32.load16_u align=1 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 65534), result_u);
+}
+
+test "interp: i64.store/load roundtrip" {
+    // i64.const 0x0102030405060708; i64.store at addr 0; i64.load from addr 0 → same value
+    // 0x0102030405060708 as LEB128: 0x88 0x8E 0x98 0xA0 0xC1 0x82 0x84 0x88 0x01
+    const result = try runCodeWithMemI64(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x42, 0x88, 0x8E, 0x98, 0xA0, 0xC1, 0x82, 0x84, 0x88, 0x01, // i64.const 0x0102030405060708
+        0x37, 0x03, 0x00, // i64.store align=3 offset=0
+        0x41, 0, // i32.const 0 (addr)
+        0x29, 0x03, 0x00, // i64.load align=3 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i64, 0x0102030405060708), result);
+}
+
+test "interp: f32.store/load roundtrip" {
+    // f32.const 3.14; f32.store at addr 0; f32.load from addr 0
+    // 3.14f ≈ 0x4048F5C3 LE: C3 F5 48 40
+    const result = try runCodeWithMemF32(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x43, 0xC3, 0xF5, 0x48, 0x40, // f32.const 3.14
+        0x38, 0x02, 0x00, // f32.store align=2 offset=0
+        0x41, 0, // i32.const 0 (addr)
+        0x2A, 0x02, 0x00, // f32.load align=2 offset=0
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f32, 3.14), result, 0.001);
+}
+
+test "interp: f64.store/load roundtrip" {
+    // f64.const 2.718281828; f64.store; f64.load
+    // 2.718281828 f64 LE: 0x4005BF0A8B125769 → 69 57 12 8B 0A BF 05 40
+    const result = try runCodeWithMemF64(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x44, 0x69, 0x57, 0x12, 0x8B, 0x0A, 0xBF, 0x05, 0x40, // f64.const 2.718281828
+        0x39, 0x03, 0x00, // f64.store align=3 offset=0
+        0x41, 0, // i32.const 0 (addr)
+        0x2B, 0x03, 0x00, // f64.load align=3 offset=0
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 2.718281828), result, 0.000001);
+}
+
+test "interp: i64.store8/load8_u roundtrip" {
+    // i64.const 0x1FF (511); i64.store8 at addr 0 → stores 0xFF; i64.load8_u → 255
+    const result = try runCodeWithMemI64(&.{
+        0x41, 0, // i32.const 0 (addr)
+        0x42, 0xFF, 0x03, // i64.const 511
+        0x3C, 0x00, 0x00, // i64.store8 align=0 offset=0
+        0x41, 0, // i32.const 0 (addr)
+        0x31, 0x00, 0x00, // i64.load8_u align=0 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i64, 255), result);
 }

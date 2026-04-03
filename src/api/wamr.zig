@@ -70,6 +70,43 @@ pub const Instance = struct {
         instance_mod.destroy(self.inner);
     }
 
+    /// Call an exported function with typed arguments, returning typed results.
+    /// Caller owns the returned slice and must free it with `self.allocator`.
+    pub fn call(self: *Instance, name: []const u8, args: []const types.Value) ![]types.Value {
+        const exp = self.inner.module.findExport(name, .function) orelse return error.FunctionNotFound;
+        const func_idx = exp.index;
+
+        var env = try ExecEnv.create(self.inner, 4096, self.allocator);
+        defer env.destroy();
+
+        for (args) |arg| {
+            try env.push(arg);
+        }
+
+        try interp.executeFunction(env, func_idx);
+
+        const module = self.inner.module;
+        const func_type = module.getFuncType(func_idx) orelse return error.FunctionNotFound;
+        const result_count = func_type.results.len;
+
+        var results = try self.allocator.alloc(types.Value, result_count);
+        errdefer self.allocator.free(results);
+
+        var i: usize = result_count;
+        while (i > 0) {
+            i -= 1;
+            results[i] = try env.pop();
+        }
+
+        return results;
+    }
+
+    /// Call a void-returning exported function with typed arguments.
+    pub fn callVoid(self: *Instance, name: []const u8, args: []const types.Value) !void {
+        const results = try self.call(name, args);
+        self.allocator.free(results);
+    }
+
     /// Call an exported function by name with i32 arguments, returning i32.
     pub fn callI32(self: *Instance, name: []const u8, args: []const i32) !i32 {
         const exp = self.inner.module.findExport(name, .function) orelse return error.FunctionNotFound;

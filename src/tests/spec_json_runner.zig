@@ -7,6 +7,7 @@
 const std = @import("std");
 const root = @import("wamr");
 const wamr = root.wamr;
+const types = root.types;
 
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -46,16 +47,48 @@ const SpecJson = struct {
     commands: []const Command,
 };
 
-fn parseI32(val_str: []const u8) ?i32 {
-    // Spec tests encode i32 values as unsigned decimal strings.
-    // e.g. "4294967295" represents -1 as i32.
-    if (std.fmt.parseUnsigned(u32, val_str, 10)) |v| {
-        return @bitCast(v);
-    } else |_| {}
-    if (std.fmt.parseInt(i32, val_str, 10)) |v| {
-        return v;
-    } else |_| {}
+/// Parse a spec-test JSON value object into a types.Value.
+/// The spec encodes all values as unsigned decimal bit patterns.
+fn parseValue(arg: Arg) ?types.Value {
+    const val_str = arg.value orelse return null;
+    if (std.mem.eql(u8, arg.type, "i32")) {
+        const bits = std.fmt.parseUnsigned(u32, val_str, 10) catch return null;
+        return .{ .i32 = @bitCast(bits) };
+    } else if (std.mem.eql(u8, arg.type, "i64")) {
+        const bits = std.fmt.parseUnsigned(u64, val_str, 10) catch return null;
+        return .{ .i64 = @bitCast(bits) };
+    } else if (std.mem.eql(u8, arg.type, "f32")) {
+        const bits = std.fmt.parseUnsigned(u32, val_str, 10) catch return null;
+        return .{ .f32 = @bitCast(bits) };
+    } else if (std.mem.eql(u8, arg.type, "f64")) {
+        const bits = std.fmt.parseUnsigned(u64, val_str, 10) catch return null;
+        return .{ .f64 = @bitCast(bits) };
+    }
     return null;
+}
+
+/// Bit-exact comparison of two Values (handles NaN correctly).
+fn valuesEqual(a: types.Value, b: types.Value) bool {
+    return switch (a) {
+        .i32 => |v| b == .i32 and b.i32 == v,
+        .i64 => |v| b == .i64 and b.i64 == v,
+        .f32 => |v| b == .f32 and @as(u32, @bitCast(b.f32)) == @as(u32, @bitCast(v)),
+        .f64 => |v| b == .f64 and @as(u64, @bitCast(b.f64)) == @as(u64, @bitCast(v)),
+        else => false,
+    };
+}
+
+/// Parse a slice of JSON args into a caller-owned slice of Values.
+/// Returns null if any arg has an unsupported type.
+fn parseArgs(args_json: []const Arg, allocator: std.mem.Allocator) ?[]types.Value {
+    const args = allocator.alloc(types.Value, args_json.len) catch return null;
+    for (args_json, 0..) |arg, i| {
+        args[i] = parseValue(arg) orelse {
+            allocator.free(args);
+            return null;
+        };
+    }
+    return args;
 }
 
 pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: Io) !SpecTestResult {
@@ -148,61 +181,46 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
                 result.skipped += 1;
                 continue;
             };
-            const expected = cmd.expected orelse &[_]Arg{};
+            const expected_json = cmd.expected orelse &[_]Arg{};
             const args_json = action.args orelse &[_]Arg{};
 
-            var args_buf: [16]i32 = undefined;
-            var arg_count: usize = 0;
-            var all_i32 = true;
-
-            for (args_json) |arg| {
-                if (!std.mem.eql(u8, arg.type, "i32")) {
-                    all_i32 = false;
-                    break;
-                }
-                const val_str = arg.value orelse {
-                    all_i32 = false;
-                    break;
-                };
-                args_buf[arg_count] = parseI32(val_str) orelse {
-                    all_i32 = false;
-                    break;
-                };
-                arg_count += 1;
-            }
-
-            if (!all_i32) {
-                result.skipped += 1;
-                continue;
-            }
-
-            // Handle void return (no expected values) — skip for now
-            if (expected.len == 0) {
-                result.skipped += 1;
-                continue;
-            }
-
-            // Handle single i32 return
-            if (expected.len != 1 or !std.mem.eql(u8, expected[0].type, "i32")) {
-                result.skipped += 1;
-                continue;
-            }
-
-            const expected_val_str = expected[0].value orelse {
+            const args = parseArgs(args_json, allocator) orelse {
                 result.skipped += 1;
                 continue;
             };
-            const expected_val = parseI32(expected_val_str) orelse {
-                result.skipped += 1;
-                continue;
-            };
+            defer allocator.free(args);
 
-            const actual = inst.callI32(field, args_buf[0..arg_count]) catch {
+            // Parse expected values
+            var expected_vals: ?[]types.Value = null;
+            if (expected_json.len > 0) {
+                expected_vals = parseArgs(expected_json, allocator) orelse {
+                    result.skipped += 1;
+                    continue;
+                };
+            }
+            defer if (expected_vals) |ev| allocator.free(ev);
+
+            const actual = inst.call(field, args) catch {
                 result.failed += 1;
                 continue;
             };
+            defer allocator.free(actual);
 
-            if (actual == expected_val) {
+            const expected = expected_vals orelse &[_]types.Value{};
+            if (actual.len != expected.len) {
+                result.failed += 1;
+                continue;
+            }
+
+            var all_match = true;
+            for (actual, expected) |a, e| {
+                if (!valuesEqual(a, e)) {
+                    all_match = false;
+                    break;
+                }
+            }
+
+            if (all_match) {
                 result.passed += 1;
             } else {
                 result.failed += 1;
@@ -229,36 +247,18 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             };
             const args_json = action.args orelse &[_]Arg{};
 
-            var args_buf: [16]i32 = undefined;
-            var arg_count: usize = 0;
-            var all_i32 = true;
-
-            for (args_json) |arg| {
-                if (!std.mem.eql(u8, arg.type, "i32")) {
-                    all_i32 = false;
-                    break;
-                }
-                const val_str = arg.value orelse {
-                    all_i32 = false;
-                    break;
-                };
-                args_buf[arg_count] = parseI32(val_str) orelse {
-                    all_i32 = false;
-                    break;
-                };
-                arg_count += 1;
-            }
-
-            if (!all_i32) {
+            const args = parseArgs(args_json, allocator) orelse {
                 result.skipped += 1;
                 continue;
-            }
-
-            _ = inst.callI32(field, args_buf[0..arg_count]) catch {
-                result.passed += 1; // trap expected
-                continue;
             };
-            result.failed += 1; // should have trapped
+            defer allocator.free(args);
+
+            if (inst.call(field, args)) |results| {
+                allocator.free(results);
+                result.failed += 1; // should have trapped
+            } else |_| {
+                result.passed += 1; // trap expected
+            }
         } else if (std.mem.eql(u8, cmd.type, "assert_invalid") or
             std.mem.eql(u8, cmd.type, "assert_malformed"))
         {
