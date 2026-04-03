@@ -20,6 +20,9 @@ pub const TrapError = error{
     CallStackOverflow,
     CallStackUnderflow,
     OutOfBoundsMemoryAccess,
+    OutOfBoundsTableAccess,
+    UninitializedElement,
+    IndirectCallTypeMismatch,
     UnknownFunction,
     UnknownOpcode,
 };
@@ -157,7 +160,10 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
         const b = code[pos];
         pos += 1;
         switch (@as(Opcode, @enumFromInt(b))) {
-            .block, .loop, .@"if" => depth += 1,
+            .block, .loop, .@"if" => {
+                depth += 1;
+                pos += 1; // skip block-type byte
+            },
             .end => {
                 depth -= 1;
                 if (depth == 0) return pos;
@@ -165,11 +171,21 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
             // Skip LEB128 immediates
             .br, .br_if, .local_get, .local_set, .local_tee,
             .global_get, .global_set, .i32_const, .call,
+            .ref_null, .ref_func,
             => {
                 pos = skipLeb128(code, pos);
             },
             .i64_const => {
                 pos = skipLeb128(code, pos);
+            },
+            .call_indirect => {
+                pos = skipLeb128(code, pos); // type_idx
+                pos = skipLeb128(code, pos); // table_idx
+            },
+            .select_t => {
+                const cnt = readU32Static(code, &pos);
+                var j: u32 = 0;
+                while (j < cnt) : (j += 1) pos = skipLeb128(code, pos);
             },
             .i32_load, .i64_load, .f32_load, .f64_load,
             .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
@@ -193,6 +209,18 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                 var i: u32 = 0;
                 while (i < cnt) : (i += 1) pos = skipLeb128(code, pos);
             },
+            .misc_prefix => {
+                const sub_op = readU32Static(code, &pos);
+                switch (sub_op) {
+                    0...7 => {},
+                    9, 11, 13, 15, 16, 17 => pos = skipLeb128(code, pos),
+                    8, 10, 12, 14 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
+                    else => {},
+                }
+            },
             else => {},
         }
     }
@@ -209,7 +237,10 @@ fn findElse(code: []const u8, start: usize) ?usize {
         const b = code[pos];
         pos += 1;
         switch (@as(Opcode, @enumFromInt(b))) {
-            .block, .loop, .@"if" => depth += 1,
+            .block, .loop, .@"if" => {
+                depth += 1;
+                pos += 1; // skip block-type byte
+            },
             .end => {
                 depth -= 1;
                 if (depth == 0) return null; // hit end without else
@@ -219,11 +250,21 @@ fn findElse(code: []const u8, start: usize) ?usize {
             },
             .br, .br_if, .local_get, .local_set, .local_tee,
             .global_get, .global_set, .i32_const, .call,
+            .ref_null, .ref_func,
             => {
                 pos = skipLeb128(code, pos);
             },
             .i64_const => {
                 pos = skipLeb128(code, pos);
+            },
+            .call_indirect => {
+                pos = skipLeb128(code, pos);
+                pos = skipLeb128(code, pos);
+            },
+            .select_t => {
+                const cnt = readU32Static(code, &pos);
+                var j: u32 = 0;
+                while (j < cnt) : (j += 1) pos = skipLeb128(code, pos);
             },
             .i32_load, .i64_load, .f32_load, .f64_load,
             .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
@@ -247,6 +288,18 @@ fn findElse(code: []const u8, start: usize) ?usize {
                 var i: u32 = 0;
                 while (i < cnt) : (i += 1) pos = skipLeb128(code, pos);
             },
+            .misc_prefix => {
+                const sub_op = readU32Static(code, &pos);
+                switch (sub_op) {
+                    0...7 => {},
+                    9, 11, 13, 15, 16, 17 => pos = skipLeb128(code, pos),
+                    8, 10, 12, 14 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
+                    else => {},
+                }
+            },
             else => {},
         }
     }
@@ -257,7 +310,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
 fn blockArity(bt: u8) u32 {
     return switch (bt) {
         0x40 => 0, // void
-        0x7F, 0x7E, 0x7D, 0x7C => 1, // i32, i64, f32, f64
+        0x7F, 0x7E, 0x7D, 0x7C, 0x70, 0x6F => 1, // i32, i64, f32, f64, funcref, externref
         else => 0,
     };
 }
@@ -277,6 +330,15 @@ const Label = struct {
 };
 
 const MAX_LABELS = 256;
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+fn funcTypesEqual(a: types.FuncType, b: types.FuncType) bool {
+    if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
+    for (a.params, b.params) |ap, bp| if (ap != bp) return false;
+    for (a.results, b.results) |ar, br| if (ar != br) return false;
+    return true;
+}
 
 // ── Dispatch loop ────────────────────────────────────────────────────────
 
@@ -487,6 +549,26 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 try executeFunction(env, func_idx);
             },
 
+            .call_indirect => {
+                const type_idx = readU32(code, &ip);
+                const table_idx = readU32(code, &ip);
+                const elem_idx: u32 = @bitCast(try env.popI32());
+
+                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
+                const func_idx = table.elements[elem_idx] orelse return error.UninitializedElement;
+
+                const module = env.module_inst.module;
+                if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
+                const expected_type = module.types[type_idx];
+                const actual_type = module.getFuncType(func_idx) orelse return error.UnknownFunction;
+                if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
+
+                const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
+                frame.ip = @intCast(ip);
+                try executeFunction(env, func_idx);
+            },
+
             // ── Constants ──
             .i32_const => try env.pushI32(readI32(code, &ip)),
             .i64_const => try env.pushI64(readI64(code, &ip)),
@@ -535,6 +617,15 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             // ── Parametric ──
             .drop => _ = try env.pop(),
             .select => {
+                const c = try env.popI32();
+                const b = try env.pop();
+                const a = try env.pop();
+                try env.push(if (c != 0) a else b);
+            },
+            .select_t => {
+                const num_types = readU32(code, &ip);
+                var j: u32 = 0;
+                while (j < num_types) : (j += 1) _ = readU32(code, &ip);
                 const c = try env.popI32();
                 const b = try env.pop();
                 const a = try env.pop();
@@ -1257,6 +1348,205 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             .f64_reinterpret_i64 => {
                 const v = try env.popI64();
                 try env.pushF64(@bitCast(v));
+            },
+
+            // ── Sign-extension operators ──
+            .i32_extend8_s => {
+                const val = try env.popI32();
+                try env.pushI32(@as(i32, @as(i8, @truncate(val))));
+            },
+            .i32_extend16_s => {
+                const val = try env.popI32();
+                try env.pushI32(@as(i32, @as(i16, @truncate(val))));
+            },
+            .i64_extend8_s => {
+                const val = try env.popI64();
+                try env.pushI64(@as(i64, @as(i8, @truncate(val))));
+            },
+            .i64_extend16_s => {
+                const val = try env.popI64();
+                try env.pushI64(@as(i64, @as(i16, @truncate(val))));
+            },
+            .i64_extend32_s => {
+                const val = try env.popI64();
+                try env.pushI64(@as(i64, @as(i32, @truncate(val))));
+            },
+
+            // ── Reference types ──
+            .ref_null => {
+                const ref_type = readU32(code, &ip);
+                _ = ref_type;
+                try env.push(.{ .funcref = null });
+            },
+            .ref_is_null => {
+                const val = try env.pop();
+                const is_null: bool = switch (val) {
+                    .funcref => |r| r == null,
+                    .externref => |r| r == null,
+                    else => false,
+                };
+                try env.pushI32(@intFromBool(is_null));
+            },
+            .ref_func => {
+                const func_idx = readU32(code, &ip);
+                try env.push(.{ .funcref = func_idx });
+            },
+
+            // ── Misc prefix (0xFC) ──
+            .misc_prefix => {
+                const sub_op = readU32(code, &ip);
+                switch (sub_op) {
+                    0 => { // i32.trunc_sat_f32_s
+                        const v = try env.popF32();
+                        if (std.math.isNan(v)) {
+                            try env.pushI32(0);
+                        } else if (v >= 2147483648.0) {
+                            try env.pushI32(std.math.maxInt(i32));
+                        } else if (v < -2147483648.0) {
+                            try env.pushI32(std.math.minInt(i32));
+                        } else {
+                            try env.pushI32(@intFromFloat(v));
+                        }
+                    },
+                    1 => { // i32.trunc_sat_f32_u
+                        const v = try env.popF32();
+                        if (std.math.isNan(v) or v < 0.0) {
+                            try env.pushI32(0);
+                        } else if (v >= 4294967296.0) {
+                            try env.pushI32(@as(i32, @bitCast(@as(u32, std.math.maxInt(u32)))));
+                        } else {
+                            try env.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
+                        }
+                    },
+                    2 => { // i32.trunc_sat_f64_s
+                        const v = try env.popF64();
+                        if (std.math.isNan(v)) {
+                            try env.pushI32(0);
+                        } else if (v >= 2147483648.0) {
+                            try env.pushI32(std.math.maxInt(i32));
+                        } else if (v < -2147483648.0) {
+                            try env.pushI32(std.math.minInt(i32));
+                        } else {
+                            try env.pushI32(@intFromFloat(v));
+                        }
+                    },
+                    3 => { // i32.trunc_sat_f64_u
+                        const v = try env.popF64();
+                        if (std.math.isNan(v) or v < 0.0) {
+                            try env.pushI32(0);
+                        } else if (v >= 4294967296.0) {
+                            try env.pushI32(@as(i32, @bitCast(@as(u32, std.math.maxInt(u32)))));
+                        } else {
+                            try env.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
+                        }
+                    },
+                    4 => { // i64.trunc_sat_f32_s
+                        const v = try env.popF32();
+                        if (std.math.isNan(v)) {
+                            try env.pushI64(0);
+                        } else if (v >= 9223372036854775808.0) {
+                            try env.pushI64(std.math.maxInt(i64));
+                        } else if (v < -9223372036854775808.0) {
+                            try env.pushI64(std.math.minInt(i64));
+                        } else {
+                            try env.pushI64(@intFromFloat(v));
+                        }
+                    },
+                    5 => { // i64.trunc_sat_f32_u
+                        const v = try env.popF32();
+                        if (std.math.isNan(v) or v < 0.0) {
+                            try env.pushI64(0);
+                        } else if (v >= 18446744073709551616.0) {
+                            try env.pushI64(@as(i64, @bitCast(@as(u64, std.math.maxInt(u64)))));
+                        } else {
+                            try env.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
+                        }
+                    },
+                    6 => { // i64.trunc_sat_f64_s
+                        const v = try env.popF64();
+                        if (std.math.isNan(v)) {
+                            try env.pushI64(0);
+                        } else if (v >= 9223372036854775808.0) {
+                            try env.pushI64(std.math.maxInt(i64));
+                        } else if (v < -9223372036854775808.0) {
+                            try env.pushI64(std.math.minInt(i64));
+                        } else {
+                            try env.pushI64(@intFromFloat(v));
+                        }
+                    },
+                    7 => { // i64.trunc_sat_f64_u
+                        const v = try env.popF64();
+                        if (std.math.isNan(v) or v < 0.0) {
+                            try env.pushI64(0);
+                        } else if (v >= 18446744073709551616.0) {
+                            try env.pushI64(@as(i64, @bitCast(@as(u64, std.math.maxInt(u64)))));
+                        } else {
+                            try env.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
+                        }
+                    },
+                    8 => { // memory.init
+                        _ = readU32(code, &ip); // data_idx
+                        _ = readU32(code, &ip); // memory index
+                        return error.UnknownOpcode;
+                    },
+                    9 => { // data.drop
+                        _ = readU32(code, &ip);
+                    },
+                    10 => { // memory.copy
+                        _ = readU32(code, &ip); // dst mem
+                        _ = readU32(code, &ip); // src mem
+                        const n: u32 = @bitCast(try env.popI32());
+                        const src: u32 = @bitCast(try env.popI32());
+                        const dst: u32 = @bitCast(try env.popI32());
+                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                        if (@as(u64, dst) + n > mem.data.len or @as(u64, src) + n > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        const d: usize = dst;
+                        const s: usize = src;
+                        const len: usize = n;
+                        if (d <= s) {
+                            std.mem.copyForwards(u8, mem.data[d .. d + len], mem.data[s .. s + len]);
+                        } else {
+                            std.mem.copyBackwards(u8, mem.data[d .. d + len], mem.data[s .. s + len]);
+                        }
+                    },
+                    11 => { // memory.fill
+                        _ = readU32(code, &ip); // memory index
+                        const n: u32 = @bitCast(try env.popI32());
+                        const val: u8 = @truncate(@as(u32, @bitCast(try env.popI32())));
+                        const dst: u32 = @bitCast(try env.popI32());
+                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                        if (@as(u64, dst) + n > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        const d: usize = dst;
+                        const len: usize = n;
+                        @memset(mem.data[d .. d + len], val);
+                    },
+                    12 => { // table.init
+                        _ = readU32(code, &ip); // elem_idx
+                        _ = readU32(code, &ip); // table_idx
+                        return error.UnknownOpcode;
+                    },
+                    13 => { // elem.drop
+                        _ = readU32(code, &ip);
+                    },
+                    14 => { // table.copy
+                        _ = readU32(code, &ip); // dst table
+                        _ = readU32(code, &ip); // src table
+                        return error.UnknownOpcode;
+                    },
+                    15 => { // table.grow
+                        _ = readU32(code, &ip);
+                        return error.UnknownOpcode;
+                    },
+                    16 => { // table.size
+                        _ = readU32(code, &ip);
+                        return error.UnknownOpcode;
+                    },
+                    17 => { // table.fill
+                        _ = readU32(code, &ip);
+                        return error.UnknownOpcode;
+                    },
+                    else => return error.UnknownOpcode,
+                }
             },
 
             else => return error.UnknownOpcode,
