@@ -126,6 +126,23 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(wamrc);
 
+    // ── Spec test runner ─────────────────────────────────────────────
+    // Built in ReleaseFast to avoid safety panics from unimplemented
+    // interpreter opcodes — the runner reports failures instead of crashing.
+    const spec_runner_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/run_spec_tests.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    spec_runner_module.addImport("config", config_module);
+    spec_runner_module.addImport("wamr", lib_module);
+
+    const spec_runner_exe = b.addExecutable(.{
+        .name = "spec-test-runner",
+        .root_module = spec_runner_module,
+    });
+    b.installArtifact(spec_runner_exe);
+
     // ── Tests ──────────────────────────────────────────────────────────
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
