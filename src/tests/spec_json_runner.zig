@@ -61,9 +61,20 @@ fn parseValue(arg: Arg) ?types.Value {
         const bits = std.fmt.parseUnsigned(u64, val_str, 10) catch return null;
         return .{ .i64 = @bitCast(bits) };
     } else if (std.mem.eql(u8, arg.type, "f32")) {
+        if (std.mem.eql(u8, val_str, "nan:canonical")) {
+            return .{ .f32 = @bitCast(@as(u32, 0x7FC00000)) };
+        } else if (std.mem.eql(u8, val_str, "nan:arithmetic")) {
+            // Sentinel: arithmetic NaN = any NaN is OK, use 0x7FC00001 as marker
+            return .{ .f32 = @bitCast(@as(u32, 0x7FC00001)) };
+        }
         const bits = std.fmt.parseUnsigned(u32, val_str, 10) catch return null;
         return .{ .f32 = @bitCast(bits) };
     } else if (std.mem.eql(u8, arg.type, "f64")) {
+        if (std.mem.eql(u8, val_str, "nan:canonical")) {
+            return .{ .f64 = @bitCast(@as(u64, 0x7FF8000000000000)) };
+        } else if (std.mem.eql(u8, val_str, "nan:arithmetic")) {
+            return .{ .f64 = @bitCast(@as(u64, 0x7FF8000000000001)) };
+        }
         const bits = std.fmt.parseUnsigned(u64, val_str, 10) catch return null;
         return .{ .f64 = @bitCast(bits) };
     } else if (std.mem.eql(u8, arg.type, "funcref")) {
@@ -83,8 +94,28 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
     return switch (a) {
         .i32 => |v| b == .i32 and b.i32 == v,
         .i64 => |v| b == .i64 and b.i64 == v,
-        .f32 => |v| b == .f32 and @as(u32, @bitCast(b.f32)) == @as(u32, @bitCast(v)),
-        .f64 => |v| b == .f64 and @as(u64, @bitCast(b.f64)) == @as(u64, @bitCast(v)),
+        .f32 => |v| blk: {
+            if (b != .f32) break :blk false;
+            const e_bits: u32 = @bitCast(v);
+            const a_bits: u32 = @bitCast(b.f32);
+            // canonical NaN: accept either sign canonical
+            if (e_bits == 0x7FC00000 or e_bits == 0xFFC00000)
+                break :blk (a_bits == 0x7FC00000 or a_bits == 0xFFC00000);
+            // arithmetic NaN marker (0x7FC00001): any NaN passes
+            if (e_bits == 0x7FC00001)
+                break :blk std.math.isNan(b.f32);
+            break :blk a_bits == e_bits;
+        },
+        .f64 => |v| blk: {
+            if (b != .f64) break :blk false;
+            const e_bits: u64 = @bitCast(v);
+            const a_bits: u64 = @bitCast(b.f64);
+            if (e_bits == 0x7FF8000000000000 or e_bits == 0xFFF8000000000000)
+                break :blk (a_bits == 0x7FF8000000000000 or a_bits == 0xFFF8000000000000);
+            if (e_bits == 0x7FF8000000000001)
+                break :blk std.math.isNan(b.f64);
+            break :blk a_bits == e_bits;
+        },
         .funcref => |v| b == .funcref and b.funcref == v,
         .externref => |v| b == .externref and b.externref == v,
         else => false,

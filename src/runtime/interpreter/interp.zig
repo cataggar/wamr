@@ -8,6 +8,14 @@ const std = @import("std");
 const types = @import("../common/types.zig");
 const ExecEnv = @import("../common/exec_env.zig").ExecEnv;
 const CallFrame = @import("../common/exec_env.zig").CallFrame;
+
+// NaN canonicalization per Wasm spec
+inline fn canonF32(val: f32) f32 {
+    return if (std.math.isNan(val)) @as(f32, @bitCast(@as(u32, 0x7FC00000))) else val;
+}
+inline fn canonF64(val: f64) f64 {
+    return if (std.math.isNan(val)) @as(f64, @bitCast(@as(u64, 0x7FF8000000000000))) else val;
+}
 const Opcode = @import("opcode.zig").Opcode;
 
 pub const TrapError = error{
@@ -1236,26 +1244,26 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             // ── f32 unary ──
             .f32_abs => try env.pushF32(@abs(try env.popF32())),
             .f32_neg => try env.pushF32(-(try env.popF32())),
-            .f32_ceil => try env.pushF32(@ceil(try env.popF32())),
-            .f32_floor => try env.pushF32(@floor(try env.popF32())),
-            .f32_trunc => try env.pushF32(@trunc(try env.popF32())),
-            .f32_nearest => try env.pushF32(@round(try env.popF32())),
-            .f32_sqrt => try env.pushF32(@sqrt(try env.popF32())),
+            .f32_ceil => try env.pushF32(canonF32(@ceil(try env.popF32()))),
+            .f32_floor => try env.pushF32(canonF32(@floor(try env.popF32()))),
+            .f32_trunc => try env.pushF32(canonF32(@trunc(try env.popF32()))),
+            .f32_nearest => try env.pushF32(canonF32(@round(try env.popF32()))),
+            .f32_sqrt => try env.pushF32(canonF32(@sqrt(try env.popF32()))),
 
             // ── f32 arithmetic ──
-            .f32_add => { const b = try env.popF32(); try env.pushF32(try env.popF32() + b); },
-            .f32_sub => { const b = try env.popF32(); try env.pushF32(try env.popF32() - b); },
-            .f32_mul => { const b = try env.popF32(); try env.pushF32(try env.popF32() * b); },
-            .f32_div => { const b = try env.popF32(); try env.pushF32(try env.popF32() / b); },
+            .f32_add => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() + b)); },
+            .f32_sub => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() - b)); },
+            .f32_mul => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() * b)); },
+            .f32_div => { const b = try env.popF32(); try env.pushF32(canonF32(try env.popF32() / b)); },
             .f32_min => {
                 const b = try env.popF32();
                 const a = try env.popF32();
-                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f32) else @min(a, b));
+                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) canonF32(std.math.nan(f32)) else @min(a, b));
             },
             .f32_max => {
                 const b = try env.popF32();
                 const a = try env.popF32();
-                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f32) else @max(a, b));
+                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) canonF32(std.math.nan(f32)) else @max(a, b));
             },
             .f32_copysign => {
                 const b = try env.popF32();
@@ -1298,26 +1306,26 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             // ── f64 unary ──
             .f64_abs => try env.pushF64(@abs(try env.popF64())),
             .f64_neg => try env.pushF64(-(try env.popF64())),
-            .f64_ceil => try env.pushF64(@ceil(try env.popF64())),
-            .f64_floor => try env.pushF64(@floor(try env.popF64())),
-            .f64_trunc => try env.pushF64(@trunc(try env.popF64())),
-            .f64_nearest => try env.pushF64(@round(try env.popF64())),
-            .f64_sqrt => try env.pushF64(@sqrt(try env.popF64())),
+            .f64_ceil => try env.pushF64(canonF64(@ceil(try env.popF64()))),
+            .f64_floor => try env.pushF64(canonF64(@floor(try env.popF64()))),
+            .f64_trunc => try env.pushF64(canonF64(@trunc(try env.popF64()))),
+            .f64_nearest => try env.pushF64(canonF64(@round(try env.popF64()))),
+            .f64_sqrt => try env.pushF64(canonF64(@sqrt(try env.popF64()))),
 
             // ── f64 arithmetic ──
-            .f64_add => { const b = try env.popF64(); try env.pushF64(try env.popF64() + b); },
-            .f64_sub => { const b = try env.popF64(); try env.pushF64(try env.popF64() - b); },
-            .f64_mul => { const b = try env.popF64(); try env.pushF64(try env.popF64() * b); },
+            .f64_add => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() + b)); },
+            .f64_sub => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() - b)); },
+            .f64_mul => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() * b)); },
             .f64_div => { const b = try env.popF64(); try env.pushF64(try env.popF64() / b); },
             .f64_min => {
                 const b = try env.popF64();
                 const a = try env.popF64();
-                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f64) else @min(a, b));
+                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) canonF64(std.math.nan(f64)) else @min(a, b));
             },
             .f64_max => {
                 const b = try env.popF64();
                 const a = try env.popF64();
-                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f64) else @max(a, b));
+                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) canonF64(std.math.nan(f64)) else @max(a, b));
             },
             .f64_copysign => {
                 const b = try env.popF64();
