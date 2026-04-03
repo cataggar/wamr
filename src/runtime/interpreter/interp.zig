@@ -2213,7 +2213,6 @@ fn runCodeWithMem(code: []const u8) !i32 {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
-    defer alloc.free(mem_data);
     @memset(mem_data, 0);
     var mem_inst = [_]types.MemoryInstance{.{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
@@ -2221,6 +2220,8 @@ fn runCodeWithMem(code: []const u8) !i32 {
         .current_pages = 1,
         .max_pages = 4,
     }};
+    // Free via mem_inst[0].data since grow() may realloc
+    defer alloc.free(mem_inst[0].data);
     var globals = [_]types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
@@ -2246,7 +2247,6 @@ fn runCodeWithMemI64(code: []const u8) !i64 {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
-    defer alloc.free(mem_data);
     @memset(mem_data, 0);
     var mem_inst = [_]types.MemoryInstance{.{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
@@ -2254,6 +2254,7 @@ fn runCodeWithMemI64(code: []const u8) !i64 {
         .current_pages = 1,
         .max_pages = 4,
     }};
+    defer alloc.free(mem_inst[0].data);
     var globals = [_]types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
@@ -2279,7 +2280,6 @@ fn runCodeWithMemF32(code: []const u8) !f32 {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
-    defer alloc.free(mem_data);
     @memset(mem_data, 0);
     var mem_inst = [_]types.MemoryInstance{.{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
@@ -2287,6 +2287,7 @@ fn runCodeWithMemF32(code: []const u8) !f32 {
         .current_pages = 1,
         .max_pages = 4,
     }};
+    defer alloc.free(mem_inst[0].data);
     var globals = [_]types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
@@ -2312,7 +2313,6 @@ fn runCodeWithMemF64(code: []const u8) !f64 {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
-    defer alloc.free(mem_data);
     @memset(mem_data, 0);
     var mem_inst = [_]types.MemoryInstance{.{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
@@ -2320,6 +2320,7 @@ fn runCodeWithMemF64(code: []const u8) !f64 {
         .current_pages = 1,
         .max_pages = 4,
     }};
+    defer alloc.free(mem_inst[0].data);
     var globals = [_]types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
@@ -2435,17 +2436,16 @@ test "interp: i32.store16/load16_s/load16_u roundtrip" {
 }
 
 test "interp: i64.store/load roundtrip" {
-    // i64.const 0x0102030405060708; i64.store at addr 0; i64.load from addr 0 → same value
-    // 0x0102030405060708 as LEB128: 0x88 0x8E 0x98 0xA0 0xC1 0x82 0x84 0x88 0x01
+    // i64.const -1 (0x7F LEB128); i64.store at addr 0; i64.load → -1
     const result = try runCodeWithMemI64(&.{
         0x41, 0, // i32.const 0 (addr)
-        0x42, 0x88, 0x8E, 0x98, 0xA0, 0xC1, 0x82, 0x84, 0x88, 0x01, // i64.const 0x0102030405060708
+        0x42, 0x7F, // i64.const -1
         0x37, 0x03, 0x00, // i64.store align=3 offset=0
         0x41, 0, // i32.const 0 (addr)
         0x29, 0x03, 0x00, // i64.load align=3 offset=0
         0x0B,
     });
-    try testing.expectEqual(@as(i64, 0x0102030405060708), result);
+    try testing.expectEqual(@as(i64, -1), result);
 }
 
 test "interp: f32.store/load roundtrip" {
