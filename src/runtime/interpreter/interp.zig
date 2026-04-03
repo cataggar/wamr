@@ -1,8 +1,8 @@
 //! WebAssembly bytecode interpreter.
 //!
 //! Executes Wasm functions using a switch-based dispatch loop.
-//! Supports MVP i32 arithmetic, comparisons, locals, globals,
-//! memory load/store, and parametric instructions.
+//! Supports MVP i32/i64/f32/f64 arithmetic, comparisons, conversions,
+//! locals, globals, memory load/store, and parametric instructions.
 
 const std = @import("std");
 const types = @import("../common/types.zig");
@@ -663,8 +663,329 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 std.mem.writeInt(i32, mem.data[a..][0..4], val, .little);
             },
 
-            // ── Conversions (subset) ──
+            // ── i64 comparison ──
+            .i64_eqz => try env.pushI32(@intFromBool(try env.popI64() == 0)),
+            .i64_eq => {
+                const b = try env.popI64();
+                try env.pushI32(@intFromBool(try env.popI64() == b));
+            },
+            .i64_ne => {
+                const b = try env.popI64();
+                try env.pushI32(@intFromBool(try env.popI64() != b));
+            },
+            .i64_lt_s => {
+                const b = try env.popI64();
+                try env.pushI32(@intFromBool(try env.popI64() < b));
+            },
+            .i64_lt_u => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI32(@intFromBool(a < b));
+            },
+            .i64_gt_s => {
+                const b = try env.popI64();
+                try env.pushI32(@intFromBool(try env.popI64() > b));
+            },
+            .i64_gt_u => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI32(@intFromBool(a > b));
+            },
+            .i64_le_s => {
+                const b = try env.popI64();
+                try env.pushI32(@intFromBool(try env.popI64() <= b));
+            },
+            .i64_le_u => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI32(@intFromBool(a <= b));
+            },
+            .i64_ge_s => {
+                const b = try env.popI64();
+                try env.pushI32(@intFromBool(try env.popI64() >= b));
+            },
+            .i64_ge_u => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI32(@intFromBool(a >= b));
+            },
+
+            // ── i64 unary ──
+            .i64_clz => {
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI64(@bitCast(@as(u64, @clz(a))));
+            },
+            .i64_ctz => {
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI64(@bitCast(@as(u64, @ctz(a))));
+            },
+            .i64_popcnt => {
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI64(@bitCast(@as(u64, @popCount(a))));
+            },
+
+            // ── i64 arithmetic ──
+            .i64_add => { const b = try env.popI64(); try env.pushI64((try env.popI64()) +% b); },
+            .i64_sub => { const b = try env.popI64(); try env.pushI64((try env.popI64()) -% b); },
+            .i64_mul => { const b = try env.popI64(); try env.pushI64((try env.popI64()) *% b); },
+            .i64_div_s => {
+                const b = try env.popI64();
+                const a = try env.popI64();
+                if (b == 0) return error.IntegerDivisionByZero;
+                if (a == std.math.minInt(i64) and b == -1) return error.IntegerOverflow;
+                try env.pushI64(@divTrunc(a, b));
+            },
+            .i64_div_u => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                if (b == 0) return error.IntegerDivisionByZero;
+                try env.pushI64(@bitCast(a / b));
+            },
+            .i64_rem_s => {
+                const b = try env.popI64();
+                const a = try env.popI64();
+                if (b == 0) return error.IntegerDivisionByZero;
+                try env.pushI64(if (a == std.math.minInt(i64) and b == -1) 0 else @rem(a, b));
+            },
+            .i64_rem_u => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                if (b == 0) return error.IntegerDivisionByZero;
+                try env.pushI64(@bitCast(a % b));
+            },
+            .i64_and => { const b = try env.popI64(); try env.pushI64((try env.popI64()) & b); },
+            .i64_or => { const b = try env.popI64(); try env.pushI64((try env.popI64()) | b); },
+            .i64_xor => { const b = try env.popI64(); try env.pushI64((try env.popI64()) ^ b); },
+            .i64_shl => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI64(@bitCast(a << @intCast(b % 64)));
+            },
+            .i64_shr_s => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a = try env.popI64();
+                try env.pushI64(a >> @intCast(b % 64));
+            },
+            .i64_shr_u => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI64(@bitCast(a >> @intCast(b % 64)));
+            },
+            .i64_rotl => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI64(@bitCast(std.math.rotl(u64, a, b % 64)));
+            },
+            .i64_rotr => {
+                const b: u64 = @bitCast(try env.popI64());
+                const a: u64 = @bitCast(try env.popI64());
+                try env.pushI64(@bitCast(std.math.rotr(u64, a, b % 64)));
+            },
+
+            // ── f32 comparison ──
+            .f32_eq => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushI32(@intFromBool(a == b));
+            },
+            .f32_ne => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushI32(@intFromBool(a != b));
+            },
+            .f32_lt => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushI32(@intFromBool(a < b));
+            },
+            .f32_gt => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushI32(@intFromBool(a > b));
+            },
+            .f32_le => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushI32(@intFromBool(a <= b));
+            },
+            .f32_ge => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushI32(@intFromBool(a >= b));
+            },
+
+            // ── f32 unary ──
+            .f32_abs => try env.pushF32(@abs(try env.popF32())),
+            .f32_neg => try env.pushF32(-(try env.popF32())),
+            .f32_ceil => try env.pushF32(@ceil(try env.popF32())),
+            .f32_floor => try env.pushF32(@floor(try env.popF32())),
+            .f32_trunc => try env.pushF32(@trunc(try env.popF32())),
+            .f32_nearest => try env.pushF32(@round(try env.popF32())),
+            .f32_sqrt => try env.pushF32(@sqrt(try env.popF32())),
+
+            // ── f32 arithmetic ──
+            .f32_add => { const b = try env.popF32(); try env.pushF32(try env.popF32() + b); },
+            .f32_sub => { const b = try env.popF32(); try env.pushF32(try env.popF32() - b); },
+            .f32_mul => { const b = try env.popF32(); try env.pushF32(try env.popF32() * b); },
+            .f32_div => { const b = try env.popF32(); try env.pushF32(try env.popF32() / b); },
+            .f32_min => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f32) else @min(a, b));
+            },
+            .f32_max => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f32) else @max(a, b));
+            },
+            .f32_copysign => {
+                const b = try env.popF32();
+                const a = try env.popF32();
+                try env.pushF32(std.math.copysign(a, b));
+            },
+
+            // ── f64 comparison ──
+            .f64_eq => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushI32(@intFromBool(a == b));
+            },
+            .f64_ne => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushI32(@intFromBool(a != b));
+            },
+            .f64_lt => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushI32(@intFromBool(a < b));
+            },
+            .f64_gt => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushI32(@intFromBool(a > b));
+            },
+            .f64_le => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushI32(@intFromBool(a <= b));
+            },
+            .f64_ge => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushI32(@intFromBool(a >= b));
+            },
+
+            // ── f64 unary ──
+            .f64_abs => try env.pushF64(@abs(try env.popF64())),
+            .f64_neg => try env.pushF64(-(try env.popF64())),
+            .f64_ceil => try env.pushF64(@ceil(try env.popF64())),
+            .f64_floor => try env.pushF64(@floor(try env.popF64())),
+            .f64_trunc => try env.pushF64(@trunc(try env.popF64())),
+            .f64_nearest => try env.pushF64(@round(try env.popF64())),
+            .f64_sqrt => try env.pushF64(@sqrt(try env.popF64())),
+
+            // ── f64 arithmetic ──
+            .f64_add => { const b = try env.popF64(); try env.pushF64(try env.popF64() + b); },
+            .f64_sub => { const b = try env.popF64(); try env.pushF64(try env.popF64() - b); },
+            .f64_mul => { const b = try env.popF64(); try env.pushF64(try env.popF64() * b); },
+            .f64_div => { const b = try env.popF64(); try env.pushF64(try env.popF64() / b); },
+            .f64_min => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f64) else @min(a, b));
+            },
+            .f64_max => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) std.math.nan(f64) else @max(a, b));
+            },
+            .f64_copysign => {
+                const b = try env.popF64();
+                const a = try env.popF64();
+                try env.pushF64(std.math.copysign(a, b));
+            },
+
+            // ── Conversions ──
             .i32_wrap_i64 => try env.pushI32(@truncate(try env.popI64())),
+            .i64_extend_i32_s => try env.pushI64(@as(i64, try env.popI32())),
+            .i64_extend_i32_u => try env.pushI64(@as(i64, @as(u32, @bitCast(try env.popI32())))),
+            .f32_convert_i32_s => try env.pushF32(@floatFromInt(try env.popI32())),
+            .f32_convert_i32_u => try env.pushF32(@floatFromInt(@as(u32, @bitCast(try env.popI32())))),
+            .f64_convert_i32_s => try env.pushF64(@floatFromInt(try env.popI32())),
+            .f64_convert_i32_u => try env.pushF64(@floatFromInt(@as(u32, @bitCast(try env.popI32())))),
+            .f32_convert_i64_s => try env.pushF32(@floatFromInt(try env.popI64())),
+            .f32_convert_i64_u => try env.pushF32(@floatFromInt(@as(u64, @bitCast(try env.popI64())))),
+            .f64_convert_i64_s => try env.pushF64(@floatFromInt(try env.popI64())),
+            .f64_convert_i64_u => try env.pushF64(@floatFromInt(@as(u64, @bitCast(try env.popI64())))),
+            .f32_demote_f64 => try env.pushF32(@floatCast(try env.popF64())),
+            .f64_promote_f32 => try env.pushF64(@as(f64, try env.popF32())),
+            .i32_trunc_f32_s => {
+                const v = try env.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 2147483648.0 or v < -2147483648.0) return error.IntegerOverflow;
+                try env.pushI32(@intFromFloat(v));
+            },
+            .i32_trunc_f32_u => {
+                const v = try env.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 4294967296.0 or v < 0.0) return error.IntegerOverflow;
+                try env.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
+            },
+            .i32_trunc_f64_s => {
+                const v = try env.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 2147483648.0 or v < -2147483648.0) return error.IntegerOverflow;
+                try env.pushI32(@intFromFloat(v));
+            },
+            .i32_trunc_f64_u => {
+                const v = try env.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 4294967296.0 or v < 0.0) return error.IntegerOverflow;
+                try env.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
+            },
+            .i64_trunc_f32_s => {
+                const v = try env.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 9223372036854775808.0 or v < -9223372036854775808.0) return error.IntegerOverflow;
+                try env.pushI64(@intFromFloat(v));
+            },
+            .i64_trunc_f32_u => {
+                const v = try env.popF32();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 18446744073709551616.0 or v < 0.0) return error.IntegerOverflow;
+                try env.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
+            },
+            .i64_trunc_f64_s => {
+                const v = try env.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 9223372036854775808.0 or v < -9223372036854775808.0) return error.IntegerOverflow;
+                try env.pushI64(@intFromFloat(v));
+            },
+            .i64_trunc_f64_u => {
+                const v = try env.popF64();
+                if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
+                if (v >= 18446744073709551616.0 or v < 0.0) return error.IntegerOverflow;
+                try env.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
+            },
+
+            // ── Reinterpretations ──
+            .i32_reinterpret_f32 => {
+                const v = try env.popF32();
+                try env.pushI32(@bitCast(v));
+            },
+            .i64_reinterpret_f64 => {
+                const v = try env.popF64();
+                try env.pushI64(@bitCast(v));
+            },
+            .f32_reinterpret_i32 => {
+                const v = try env.popI32();
+                try env.pushF32(@bitCast(v));
+            },
+            .f64_reinterpret_i64 => {
+                const v = try env.popI64();
+                try env.pushF64(@bitCast(v));
+            },
 
             else => return error.UnknownOpcode,
         }
@@ -1196,4 +1517,420 @@ test "interp: br_table dispatch" {
     try testing.expectEqual(@as(i32, 0), try T.run(&dummy_inst, 2));
     // idx=50 (out of range → default) → br to L2 → local stays 0
     try testing.expectEqual(@as(i32, 0), try T.run(&dummy_inst, 50));
+}
+
+// ── Helpers for i64/f32/f64 tests ────────────────────────────────────────
+
+fn runCodeI64(code: []const u8) !i64 {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    var memories = [_]types.MemoryInstance{};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &memories,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    try dispatchLoop(&env, code);
+    return env.popI64();
+}
+
+fn runCodeF32(code: []const u8) !f32 {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    var memories = [_]types.MemoryInstance{};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &memories,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    try dispatchLoop(&env, code);
+    return env.popF32();
+}
+
+fn runCodeF64(code: []const u8) !f64 {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    var memories = [_]types.MemoryInstance{};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &memories,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    try dispatchLoop(&env, code);
+    return env.popF64();
+}
+
+fn runCodeExpectTrapAny(code: []const u8, expected: TrapError) !void {
+    const alloc = testing.allocator;
+    var dummy_module = types.WasmModule{};
+    var memories = [_]types.MemoryInstance{};
+    var globals = [_]types.GlobalInstance{};
+    var dummy_inst = types.ModuleInstance{
+        .module = &dummy_module,
+        .memories = &memories,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &dummy_inst,
+        .operand_stack = try alloc.alloc(types.Value, 256),
+        .call_stack = try alloc.alloc(CallFrame, 64),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    const result = dispatchLoop(&env, code);
+    try testing.expectError(expected, result);
+}
+
+// ── i64 tests ──
+
+test "interp: i64.add" {
+    // i64.const 3; i64.const 4; i64.add; end
+    const result = try runCodeI64(&.{ 0x42, 3, 0x42, 4, 0x7C, 0x0B });
+    try testing.expectEqual(@as(i64, 7), result);
+}
+
+test "interp: i64.sub" {
+    const result = try runCodeI64(&.{ 0x42, 10, 0x42, 3, 0x7D, 0x0B });
+    try testing.expectEqual(@as(i64, 7), result);
+}
+
+test "interp: i64.mul" {
+    const result = try runCodeI64(&.{ 0x42, 6, 0x42, 7, 0x7E, 0x0B });
+    try testing.expectEqual(@as(i64, 42), result);
+}
+
+test "interp: i64.div_s by zero traps" {
+    try runCodeExpectTrapAny(&.{ 0x42, 1, 0x42, 0, 0x7F, 0x0B }, error.IntegerDivisionByZero);
+}
+
+test "interp: i64.div_u by zero traps" {
+    try runCodeExpectTrapAny(&.{ 0x42, 1, 0x42, 0, 0x80, 0x0B }, error.IntegerDivisionByZero);
+}
+
+test "interp: i64.eqz true" {
+    // i64.const 0; i64.eqz; end → 1 (as i32)
+    const result = try runCode(&.{ 0x42, 0, 0x50, 0x0B });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: i64.eqz false" {
+    const result = try runCode(&.{ 0x42, 5, 0x50, 0x0B });
+    try testing.expectEqual(@as(i32, 0), result);
+}
+
+test "interp: i64.eq" {
+    // i64.const 42; i64.const 42; i64.eq; end → 1
+    const result = try runCode(&.{ 0x42, 42, 0x42, 42, 0x51, 0x0B });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: i64.lt_s" {
+    // i64.const -1 (0x7F); i64.const 1; i64.lt_s; end → 1
+    const result = try runCode(&.{ 0x42, 0x7F, 0x42, 1, 0x53, 0x0B });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: i64.gt_u" {
+    // i64.const -1 (0x7F as LEB128 sign-extends to max u64); i64.const 1; i64.gt_u → 1
+    const result = try runCode(&.{ 0x42, 0x7F, 0x42, 1, 0x56, 0x0B });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: i64.clz" {
+    // i64.const 1; i64.clz; end → 63
+    const result = try runCodeI64(&.{ 0x42, 1, 0x79, 0x0B });
+    try testing.expectEqual(@as(i64, 63), result);
+}
+
+// ── f32 tests ──
+
+test "interp: f32.add" {
+    // f32.const 1.0; f32.const 2.0; f32.add; end
+    // 1.0f = 0x3F800000 LE: 00 00 80 3F
+    // 2.0f = 0x40000000 LE: 00 00 00 40
+    const result = try runCodeF32(&.{
+        0x43, 0x00, 0x00, 0x80, 0x3F, // f32.const 1.0
+        0x43, 0x00, 0x00, 0x00, 0x40, // f32.const 2.0
+        0x92, // f32.add
+        0x0B, // end
+    });
+    try testing.expectApproxEqAbs(@as(f32, 3.0), result, 0.001);
+}
+
+test "interp: f32.sub" {
+    const result = try runCodeF32(&.{
+        0x43, 0x00, 0x00, 0x20, 0x41, // f32.const 10.0
+        0x43, 0x00, 0x00, 0x80, 0x40, // f32.const 4.0
+        0x93, // f32.sub
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f32, 6.0), result, 0.001);
+}
+
+test "interp: f32.mul" {
+    const result = try runCodeF32(&.{
+        0x43, 0x00, 0x00, 0x40, 0x40, // f32.const 3.0
+        0x43, 0x00, 0x00, 0x80, 0x40, // f32.const 4.0
+        0x94, // f32.mul
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f32, 12.0), result, 0.001);
+}
+
+test "interp: f32.div" {
+    const result = try runCodeF32(&.{
+        0x43, 0x00, 0x00, 0x20, 0x41, // f32.const 10.0
+        0x43, 0x00, 0x00, 0x00, 0x40, // f32.const 2.0
+        0x95, // f32.div
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f32, 5.0), result, 0.001);
+}
+
+test "interp: f32.eq" {
+    const result = try runCode(&.{
+        0x43, 0x00, 0x00, 0x80, 0x3F, // f32.const 1.0
+        0x43, 0x00, 0x00, 0x80, 0x3F, // f32.const 1.0
+        0x5B, // f32.eq
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: f32.ne" {
+    const result = try runCode(&.{
+        0x43, 0x00, 0x00, 0x80, 0x3F, // f32.const 1.0
+        0x43, 0x00, 0x00, 0x00, 0x40, // f32.const 2.0
+        0x5C, // f32.ne
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: f32.lt" {
+    const result = try runCode(&.{
+        0x43, 0x00, 0x00, 0x80, 0x3F, // f32.const 1.0
+        0x43, 0x00, 0x00, 0x00, 0x40, // f32.const 2.0
+        0x5D, // f32.lt
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+// ── f64 tests ──
+
+test "interp: f64.add" {
+    // 1.0 as f64 LE = 0x3FF0000000000000 → 00 00 00 00 00 00 F0 3F
+    // 2.0 as f64 LE = 0x4000000000000000 → 00 00 00 00 00 00 00 40
+    const result = try runCodeF64(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x3F, // f64.const 1.0
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // f64.const 2.0
+        0xA0, // f64.add
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 3.0), result, 0.001);
+}
+
+test "interp: f64.sub" {
+    // 10.0 f64 LE: 00 00 00 00 00 00 24 40
+    // 4.0 f64 LE: 00 00 00 00 00 00 10 40
+    const result = try runCodeF64(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x40, // f64.const 10.0
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x40, // f64.const 4.0
+        0xA1, // f64.sub
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 6.0), result, 0.001);
+}
+
+test "interp: f64.mul" {
+    // 3.0 f64 LE: 00 00 00 00 00 00 08 40
+    // 4.0 f64 LE: 00 00 00 00 00 00 10 40
+    const result = try runCodeF64(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40, // f64.const 3.0
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x40, // f64.const 4.0
+        0xA2, // f64.mul
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 12.0), result, 0.001);
+}
+
+test "interp: f64.div" {
+    const result = try runCodeF64(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x40, // f64.const 10.0
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // f64.const 2.0
+        0xA3, // f64.div
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 5.0), result, 0.001);
+}
+
+test "interp: f64.sqrt" {
+    // 9.0 f64 LE: 00 00 00 00 00 00 22 40
+    const result = try runCodeF64(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x40, // f64.const 9.0
+        0x9F, // f64.sqrt
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 3.0), result, 0.001);
+}
+
+test "interp: f64.abs" {
+    // -5.0 f64 LE: 00 00 00 00 00 00 14 C0
+    const result = try runCodeF64(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0xC0, // f64.const -5.0
+        0x99, // f64.abs
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 5.0), result, 0.001);
+}
+
+test "interp: f64.neg" {
+    // 5.0 f64 LE: 00 00 00 00 00 00 14 40
+    const result = try runCodeF64(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x40, // f64.const 5.0
+        0x9A, // f64.neg
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, -5.0), result, 0.001);
+}
+
+// ── Conversion tests ──
+
+test "interp: i64.extend_i32_s" {
+    // i32.const -1 (0x7F); i64.extend_i32_s; end → -1 as i64
+    const result = try runCodeI64(&.{ 0x41, 0x7F, 0xAC, 0x0B });
+    try testing.expectEqual(@as(i64, -1), result);
+}
+
+test "interp: i64.extend_i32_u" {
+    // i32.const -1 (0x7F); i64.extend_i32_u; end → 0xFFFFFFFF as i64
+    const result = try runCodeI64(&.{ 0x41, 0x7F, 0xAD, 0x0B });
+    try testing.expectEqual(@as(i64, 0xFFFFFFFF), result);
+}
+
+test "interp: i32.wrap_i64" {
+    // i64.const 0x1_0000_0001 (LEB128); i32.wrap_i64; end → 1
+    // 0x1_0000_0001 = 4294967297
+    // LEB128: 0x81 0x80 0x80 0x80 0x10
+    const result = try runCode(&.{
+        0x42, 0x81, 0x80, 0x80, 0x80, 0x10, // i64.const 4294967297
+        0xA7, // i32.wrap_i64
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 1), result);
+}
+
+test "interp: f32_reinterpret_i32 and i32_reinterpret_f32 roundtrip" {
+    // i32.const 42; f32.reinterpret_i32; i32.reinterpret_f32; end → 42
+    const result = try runCode(&.{
+        0x41, 42, // i32.const 42
+        0xBE, // f32.reinterpret_i32
+        0xBC, // i32.reinterpret_f32
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 42), result);
+}
+
+test "interp: f64_reinterpret_i64 and i64_reinterpret_f64 roundtrip" {
+    // i64.const 42; f64.reinterpret_i64; i64.reinterpret_f64; end → 42
+    const result = try runCodeI64(&.{
+        0x42, 42, // i64.const 42
+        0xBF, // f64.reinterpret_i64
+        0xBD, // i64.reinterpret_f64
+        0x0B,
+    });
+    try testing.expectEqual(@as(i64, 42), result);
+}
+
+test "interp: i32_trunc_f32_s NaN traps" {
+    // f32.const NaN; i32.trunc_f32_s → InvalidConversionToInteger
+    // NaN f32 LE: 00 00 C0 7F
+    try runCodeExpectTrapAny(&.{
+        0x43, 0x00, 0x00, 0xC0, 0x7F, // f32.const NaN
+        0xA8, // i32.trunc_f32_s
+        0x0B,
+    }, error.InvalidConversionToInteger);
+}
+
+test "interp: f32.convert_i32_s" {
+    // i32.const -3; f32.convert_i32_s → -3.0
+    const result = try runCodeF32(&.{
+        0x41, 0x7D, // i32.const -3 (LEB128)
+        0xB2, // f32.convert_i32_s
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f32, -3.0), result, 0.001);
+}
+
+test "interp: f64.convert_i32_u" {
+    // i32.const 100 (LEB128: 0xE4, 0x00); f64.convert_i32_u → 100.0
+    const result = try runCodeF64(&.{
+        0x41, 0xE4, 0x00, // i32.const 100
+        0xB8, // f64.convert_i32_u
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 100.0), result, 0.001);
+}
+
+test "interp: f64.promote_f32" {
+    // f32.const 1.5; f64.promote_f32 → 1.5
+    // 1.5f = 0x3FC00000 LE: 00 00 C0 3F
+    const result = try runCodeF64(&.{
+        0x43, 0x00, 0x00, 0xC0, 0x3F, // f32.const 1.5
+        0xBB, // f64.promote_f32
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f64, 1.5), result, 0.001);
+}
+
+test "interp: f32.demote_f64" {
+    // f64.const 1.5; f32.demote_f64 → 1.5
+    // 1.5 f64 LE: 00 00 00 00 00 00 F8 3F
+    const result = try runCodeF32(&.{
+        0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x3F, // f64.const 1.5
+        0xB6, // f32.demote_f64
+        0x0B,
+    });
+    try testing.expectApproxEqAbs(@as(f32, 1.5), result, 0.001);
 }
