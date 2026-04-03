@@ -88,6 +88,35 @@ fn readI64(code: []const u8, ip: *usize) i64 {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
+/// Execute a tail call: replace the current frame with a call to `func_idx`.
+/// Moves the new function's parameters to the current frame's stack base,
+/// pops the current frame, then calls the target function normally.
+fn executeTailCall(env: *ExecEnv, func_idx: u32) TrapError!void {
+    const module = env.module_inst.module;
+    if (func_idx < module.import_function_count) return error.UnknownFunction;
+    const local_idx = func_idx - module.import_function_count;
+    if (local_idx >= module.functions.len) return error.UnknownFunction;
+
+    const func = &module.functions[local_idx];
+    const func_type = module.types[func.type_idx];
+    const new_param_count: u32 = @intCast(func_type.params.len);
+
+    const old_frame = env.currentFrame() orelse return error.CallStackUnderflow;
+    const old_stack_base = old_frame.stack_base;
+
+    // Move the new function's params from the top of the stack down
+    // to the current frame's stack_base, then reset sp.
+    const src_start = env.sp - new_param_count;
+    for (0..new_param_count) |i| {
+        env.operand_stack[old_stack_base + @as(u32, @intCast(i))] =
+            env.operand_stack[src_start + @as(u32, @intCast(i))];
+    }
+    env.sp = old_stack_base + new_param_count;
+
+    _ = try env.popFrame();
+    try executeFunction(env, func_idx);
+}
+
 /// Execute a function by index within the module instance.
 pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
     const module = env.module_inst.module;
@@ -573,7 +602,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
 
             .return_call => {
                 const func_idx = readU32(code, &ip);
-                try executeFunction(env, func_idx);
+                try executeTailCall(env, func_idx);
                 return;
             },
 
@@ -592,7 +621,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 const actual_type = module.getFuncType(func_idx) orelse return error.UnknownFunction;
                 if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
 
-                try executeFunction(env, func_idx);
+                try executeTailCall(env, func_idx);
                 return;
             },
 
