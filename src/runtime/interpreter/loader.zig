@@ -25,6 +25,17 @@ pub const LoadError = error{
     TooManyLocals,
     Overflow,
     OutOfMemory,
+    InvalidUtf8,
+    DuplicateExportName,
+    UnknownFunction,
+    UnknownTable,
+    UnknownMemory,
+    UnknownGlobal,
+    TooManyMemories,
+    TooManyTables,
+    InvalidStartFunction,
+    InvalidAlignment,
+    DataCountMismatch,
 };
 
 /// A streaming reader over the Wasm binary.
@@ -107,7 +118,9 @@ const BinaryReader = struct {
 
     fn readName(self: *BinaryReader) LoadError![]const u8 {
         const len = try self.readU32();
-        return try self.readBytes(len);
+        const bytes = try self.readBytes(len);
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+        return bytes;
     }
 
     fn skip(self: *BinaryReader, n: usize) LoadError!void {
@@ -499,7 +512,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
             try reader.skip(section_size);
         } else {
             switch (@as(types.SectionId, @enumFromInt(section_id))) {
-                .custom => try reader.skip(section_size),
+                .custom => {
+                    // Parse the custom section name to validate UTF-8
+                    _ = try reader.readName();
+                    if (reader.pos > section_start + section_size) return error.InvalidSectionSize;
+                    reader.pos = section_start + section_size;
+                },
                 .type => module.types = try parseTypeSection(&reader, allocator),
                 .import => {
                     module.imports = try parseImportSection(&reader, allocator);
@@ -529,7 +547,338 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
     }
 
+    // Function section count must match code section count
+    if (func_type_indices.len != module.functions.len) return error.InvalidSectionSize;
+
+    // Validate function type indices from function section
+    for (func_type_indices) |type_idx| {
+        if (type_idx >= module.types.len) return error.InvalidTypeIndex;
+    }
+
+    try validateModule(&module);
+
     return module;
+}
+
+/// Post-parse module validation per WebAssembly MVP spec.
+fn validateModule(module: *const types.WasmModule) LoadError!void {
+    const total_funcs: u32 = module.import_function_count + @as(u32, @intCast(module.functions.len));
+    const total_tables: u32 = module.import_table_count + @as(u32, @intCast(module.tables.len));
+    const total_memories: u32 = module.import_memory_count + @as(u32, @intCast(module.memories.len));
+    const total_globals: u32 = module.import_global_count + @as(u32, @intCast(module.globals.len));
+
+    // Validate memory limits
+    for (module.memories) |mem| {
+        try validateMemoryLimits(mem.limits);
+    }
+
+    // Validate table limits
+    for (module.tables) |table| {
+        if (table.limits.max) |max| {
+            if (table.limits.min > max) return error.InvalidLimits;
+        }
+    }
+
+    // Validate import types and limits
+    for (module.imports) |imp| {
+        switch (imp.kind) {
+            .function => {
+                if (imp.func_type_idx) |idx| {
+                    if (idx >= module.types.len) return error.InvalidTypeIndex;
+                }
+            },
+            .memory => {
+                if (imp.memory_type) |mem| {
+                    try validateMemoryLimits(mem.limits);
+                }
+            },
+            .table => {
+                if (imp.table_type) |table| {
+                    if (table.limits.max) |max| {
+                        if (table.limits.min > max) return error.InvalidLimits;
+                    }
+                }
+            },
+            .global => {},
+        }
+    }
+
+    // Validate export index bounds
+    for (module.exports) |exp| {
+        switch (exp.kind) {
+            .function => {
+                if (exp.index >= total_funcs) return error.UnknownFunction;
+            },
+            .table => {
+                if (exp.index >= total_tables) return error.UnknownTable;
+            },
+            .memory => {
+                if (exp.index >= total_memories) return error.UnknownMemory;
+            },
+            .global => {
+                if (exp.index >= total_globals) return error.UnknownGlobal;
+            },
+        }
+    }
+
+    // Duplicate export names
+    for (module.exports, 0..) |a, i| {
+        for (module.exports[i + 1 ..]) |b| {
+            if (std.mem.eql(u8, a.name, b.name)) return error.DuplicateExportName;
+        }
+    }
+
+    // Start function validation
+    if (module.start_function) |start_idx| {
+        if (start_idx >= total_funcs) return error.InvalidStartFunction;
+        const func_type = getFuncType(module, start_idx) orelse return error.InvalidStartFunction;
+        if (func_type.params.len != 0 or func_type.results.len != 0) return error.InvalidStartFunction;
+    }
+
+    // Data count section must match data segment count
+    if (module.data_count) |dc| {
+        if (dc != @as(u32, @intCast(module.data_segments.len))) return error.DataCountMismatch;
+    }
+
+    // Validate data segment memory indices
+    for (module.data_segments) |seg| {
+        if (!seg.is_passive and seg.memory_idx >= total_memories) return error.UnknownMemory;
+    }
+
+    // Validate global init expressions - global_get must reference imported globals
+    for (module.globals) |g| {
+        switch (g.init_expr) {
+            .global_get => |idx| {
+                if (idx >= module.import_global_count) return error.UnknownGlobal;
+            },
+            else => {},
+        }
+    }
+
+    // Validate function bodies (alignment, index bounds)
+    for (module.functions) |func| {
+        const total_locals = @as(u32, @intCast(func.func_type.params.len)) + func.local_count;
+        try validateFunctionBody(func.code, module.types.len, total_funcs, total_globals, total_locals);
+    }
+}
+
+fn validateMemoryLimits(limits: types.Limits) LoadError!void {
+    if (limits.min > 65536) return error.InvalidLimits;
+    if (limits.max) |max| {
+        if (max > 65536) return error.InvalidLimits;
+        if (limits.min > max) return error.InvalidLimits;
+    }
+}
+
+fn getFuncType(module: *const types.WasmModule, func_idx: u32) ?types.FuncType {
+    if (func_idx < module.import_function_count) {
+        var import_func_i: u32 = 0;
+        for (module.imports) |imp| {
+            if (imp.kind == .function) {
+                if (import_func_i == func_idx) {
+                    const type_idx = imp.func_type_idx orelse return null;
+                    if (type_idx >= module.types.len) return null;
+                    return module.types[type_idx];
+                }
+                import_func_i += 1;
+            }
+        }
+        return null;
+    }
+    const local_idx = func_idx - module.import_function_count;
+    if (local_idx < module.functions.len) {
+        return module.functions[local_idx].func_type;
+    }
+    return null;
+}
+
+/// Validate a function body: alignment, index bounds for locals/globals/funcs/types.
+fn validateFunctionBody(
+    code: []const u8,
+    num_types: usize,
+    total_funcs: u32,
+    total_globals: u32,
+    total_locals: u32,
+) LoadError!void {
+    var i: usize = 0;
+    while (i < code.len) {
+        const op = code[i];
+        i += 1;
+
+        const max_align: ?u8 = switch (op) {
+            0x28, 0x2A, 0x36, 0x38 => 2, // i32.load, f32.load, i32.store, f32.store
+            0x29, 0x2B, 0x37, 0x39 => 3, // i64.load, f64.load, i64.store, f64.store
+            0x2C, 0x2D, 0x30, 0x31, 0x3A, 0x3C => 0, // *load8*, *store8
+            0x2E, 0x2F, 0x32, 0x33, 0x3B, 0x3D => 1, // *load16*, *store16
+            0x34, 0x35, 0x3E => 2, // i64.load32*, i64.store32
+            else => null,
+        };
+
+        if (max_align) |ma| {
+            const align_result = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+            i += align_result.bytes_read;
+            if (align_result.value > ma) return error.InvalidAlignment;
+            const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+            i += offset_result.bytes_read;
+            continue;
+        }
+
+        switch (op) {
+            // Block/loop/if: blocktype
+            0x02, 0x03, 0x04 => {
+                if (i >= code.len) return;
+                const bt = code[i];
+                if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
+                    i += 1;
+                } else {
+                    const r = leb128_mod.readSigned(i64, code[i..]) catch return;
+                    i += r.bytes_read;
+                }
+            },
+
+            // br, br_if: labelidx
+            0x0C, 0x0D => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+
+            // br_table
+            0x0E => {
+                const count_r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += count_r.bytes_read;
+                var j: u32 = 0;
+                while (j <= count_r.value) : (j += 1) {
+                    const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                    i += lr.bytes_read;
+                }
+            },
+
+            // call, return_call: funcidx
+            0x10, 0x12 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+                if (r.value >= total_funcs) return error.UnknownFunction;
+            },
+
+            // call_indirect, return_call_indirect: typeidx + tableidx
+            0x11, 0x13 => {
+                const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r1.bytes_read;
+                if (r1.value >= num_types) return error.InvalidTypeIndex;
+                const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r2.bytes_read;
+            },
+
+            // select_t: vec(valtype)
+            0x1C => {
+                const count_r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += count_r.bytes_read;
+                i += count_r.value; // each valtype is one byte
+            },
+
+            // local.get, local.set, local.tee
+            0x20, 0x21, 0x22 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+                if (r.value >= total_locals) return error.UnknownFunction; // reuse error for unknown local
+            },
+
+            // global.get, global.set
+            0x23, 0x24 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+                if (r.value >= total_globals) return error.UnknownGlobal;
+            },
+
+            // memory.size, memory.grow: memidx (u32 LEB)
+            0x3F, 0x40 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+
+            // i32.const
+            0x41 => {
+                const r = leb128_mod.readSigned(i32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+
+            // i64.const
+            0x42 => {
+                const r = leb128_mod.readSigned(i64, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+
+            // f32.const
+            0x43 => i += 4,
+
+            // f64.const
+            0x44 => i += 8,
+
+            // 0xFC prefix
+            0xFC => {
+                const sub_r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += sub_r.bytes_read;
+                switch (sub_r.value) {
+                    0...7 => {},
+                    8 => { // memory.init: dataidx + memidx
+                        const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r.bytes_read;
+                        const m = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += m.bytes_read;
+                    },
+                    9 => { // data.drop
+                        const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r.bytes_read;
+                    },
+                    10 => { // memory.copy: memidx + memidx
+                        const m1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += m1.bytes_read;
+                        const m2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += m2.bytes_read;
+                    },
+                    11 => { // memory.fill: memidx
+                        const m = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += m.bytes_read;
+                    },
+                    12 => { // table.init
+                        const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r1.bytes_read;
+                        const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r2.bytes_read;
+                    },
+                    13 => { // elem.drop
+                        const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r.bytes_read;
+                    },
+                    14 => { // table.copy
+                        const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r1.bytes_read;
+                        const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r2.bytes_read;
+                    },
+                    15, 16, 17 => { // table.grow, table.size, table.fill
+                        const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += r.bytes_read;
+                    },
+                    else => {},
+                }
+            },
+
+            // ref.null: heaptype (1 byte)
+            0xD0 => {
+                if (i < code.len) i += 1;
+            },
+
+            // ref.func: funcidx (u32 LEB)
+            0xD2 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+
+            // All other opcodes have no immediates (0xD1=ref.is_null, numerics, etc.)
+            else => {},
+        }
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
