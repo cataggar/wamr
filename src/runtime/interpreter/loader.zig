@@ -37,6 +37,10 @@ pub const LoadError = error{
     InvalidAlignment,
     DataCountMismatch,
     TypeMismatch,
+    MalformedSectionId,
+    DataCountRequired,
+    IllegalOpcode,
+    UndeclaredFuncRef,
 };
 
 /// A streaming reader over the Wasm binary.
@@ -324,59 +328,73 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator) Load
     const elements = try allocator.alloc(types.ElemSegment, count);
     for (elements) |*elem| {
         const flags = try reader.readU32();
-        switch (flags) {
-            0 => {
-                // Active, table 0, offset expr, vec(funcidx)
-                const offset = try parseInitExpr(reader);
-                const num_elems = try reader.readU32();
-                const func_indices: []const u32 = if (num_elems > 0) blk: {
-                    const fi = try allocator.alloc(u32, num_elems);
-                    for (fi) |*f| f.* = try reader.readU32();
-                    break :blk fi;
-                } else &[_]u32{};
-                elem.* = .{
-                    .table_idx = 0,
-                    .offset = offset,
-                    .kind = .func_ref,
-                    .func_indices = func_indices,
-                };
-            },
-            1 => {
-                // Passive, elemkind, vec(funcidx)
+        if (flags > 7) return error.InvalidElemSegment;
+        const is_passive = (flags & 1) != 0 and (flags & 2) == 0;
+        const is_declarative = (flags & 1) != 0 and (flags & 2) != 0;
+        const has_table_idx = (flags & 2) != 0 and (flags & 1) == 0; // active with explicit table
+        const has_exprs = (flags & 4) != 0;
+
+        // Table index (only for active segments with flag bit 1 clear, bit 2 set = flags 2 or 6)
+        var table_idx: u32 = 0;
+        if (has_table_idx) {
+            table_idx = try reader.readU32();
+        }
+
+        // Offset expression (only for active segments: flags 0,2,4,6)
+        var offset: ?types.InitExpr = null;
+        if (!is_passive and !is_declarative) {
+            offset = try parseInitExpr(reader);
+        }
+
+        if (has_exprs) {
+            // flags 4,5,6,7: reftype + vec(expr)
+            const ref_byte = try reader.readByte();
+            const kind: types.ElemSegment.ElemKind = switch (ref_byte) {
+                0x70 => .func_ref,
+                0x6F => .extern_ref,
+                else => return error.InvalidElemSegment,
+            };
+            const num_elems = try reader.readU32();
+            // Parse and collect func indices from expressions
+            var func_indices_list: std.ArrayList(u32) = .empty;
+            var j: u32 = 0;
+            while (j < num_elems) : (j += 1) {
+                // Each element is a constant expression (ref.func idx / ref.null)
+                const expr = try parseInitExpr(reader);
+                switch (expr) {
+                    .ref_func => |fidx| try func_indices_list.append(allocator, fidx),
+                    .ref_null => {}, // null ref — no function index to track
+                    else => {},
+                }
+            }
+            elem.* = .{
+                .table_idx = table_idx,
+                .offset = offset,
+                .kind = kind,
+                .func_indices = try func_indices_list.toOwnedSlice(allocator),
+                .is_passive = is_passive,
+                .is_declarative = is_declarative,
+            };
+        } else {
+            // flags 0,1,2,3: elemkind + vec(funcidx)
+            if (flags & 3 != 0) {
+                // Flags 1,2,3 have an explicit elemkind byte
                 _ = try reader.readByte(); // elemkind (0x00 = funcref)
-                const num_elems = try reader.readU32();
-                const func_indices: []const u32 = if (num_elems > 0) blk: {
-                    const fi = try allocator.alloc(u32, num_elems);
-                    for (fi) |*f| f.* = try reader.readU32();
-                    break :blk fi;
-                } else &[_]u32{};
-                elem.* = .{
-                    .table_idx = 0,
-                    .offset = null,
-                    .kind = .func_ref,
-                    .func_indices = func_indices,
-                    .is_passive = true,
-                };
-            },
-            2 => {
-                // Active, tableidx, offset expr, elemkind, vec(funcidx)
-                const table_idx = try reader.readU32();
-                const offset = try parseInitExpr(reader);
-                _ = try reader.readByte(); // elemkind
-                const num_elems = try reader.readU32();
-                const func_indices: []const u32 = if (num_elems > 0) blk: {
-                    const fi = try allocator.alloc(u32, num_elems);
-                    for (fi) |*f| f.* = try reader.readU32();
-                    break :blk fi;
-                } else &[_]u32{};
-                elem.* = .{
-                    .table_idx = table_idx,
-                    .offset = offset,
-                    .kind = .func_ref,
-                    .func_indices = func_indices,
-                };
-            },
-            else => return error.InvalidElemSegment,
+            }
+            const num_elems = try reader.readU32();
+            const func_indices: []const u32 = if (num_elems > 0) blk: {
+                const fi = try allocator.alloc(u32, num_elems);
+                for (fi) |*f| f.* = try reader.readU32();
+                break :blk fi;
+            } else &[_]u32{};
+            elem.* = .{
+                .table_idx = table_idx,
+                .offset = offset,
+                .kind = .func_ref,
+                .func_indices = func_indices,
+                .is_passive = is_passive,
+                .is_declarative = is_declarative,
+            };
         }
     }
     return elements;
@@ -415,6 +433,9 @@ fn parseCodeSection(
         if (code_end > reader.data.len) return error.UnexpectedEnd;
         const code = reader.data[reader.pos..code_end];
         reader.pos = code_end;
+
+        // Function body must end with END (0x0B) opcode
+        if (code.len == 0 or code[code.len - 1] != 0x0B) return error.InvalidSectionSize;
 
         const type_idx = func_type_indices[i];
         if (type_idx >= module_types.len) return error.InvalidTypeIndex;
@@ -509,8 +530,8 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
 
         if (section_id > @intFromEnum(types.SectionId.data_count)) {
-            // Unknown section — skip it
-            try reader.skip(section_size);
+            // Section IDs beyond data_count (12) are invalid per the spec
+            return error.MalformedSectionId;
         } else {
             switch (@as(types.SectionId, @enumFromInt(section_id))) {
                 .custom => {
@@ -647,19 +668,72 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     }
 
     // Validate global init expressions - global_get must reference imported globals
+    // Also validate init expression type matches global type
     for (module.globals) |g| {
         switch (g.init_expr) {
             .global_get => |idx| {
                 if (idx >= module.import_global_count) return error.UnknownGlobal;
+                // Check type compatibility
+                if (getImportGlobalType(module, idx)) |gt| {
+                    if (gt.val_type != g.global_type.val_type) return error.TypeMismatch;
+                }
             },
-            else => {},
+            .i32_const => { if (g.global_type.val_type != .i32) return error.TypeMismatch; },
+            .i64_const => { if (g.global_type.val_type != .i64) return error.TypeMismatch; },
+            .f32_const => { if (g.global_type.val_type != .f32) return error.TypeMismatch; },
+            .f64_const => { if (g.global_type.val_type != .f64) return error.TypeMismatch; },
+            .ref_null => |rt| {
+                if (g.global_type.val_type != rt) return error.TypeMismatch;
+            },
+            .ref_func => {
+                if (g.global_type.val_type != .funcref) return error.TypeMismatch;
+            },
+        }
+    }
+
+    // Validate data segment offset expressions must evaluate to i32
+    for (module.data_segments) |seg| {
+        if (!seg.is_passive) {
+            switch (seg.offset) {
+                .i32_const => {},
+                .global_get => |idx| {
+                    if (idx >= module.import_global_count) return error.UnknownGlobal;
+                    if (getImportGlobalType(module, idx)) |gt| {
+                        if (gt.val_type != .i32) return error.TypeMismatch;
+                    }
+                },
+                else => return error.TypeMismatch,
+            }
+        }
+    }
+
+    // Validate element segment table and function indices
+    for (module.elements) |elem| {
+        if (!elem.is_passive and !elem.is_declarative) {
+            if (elem.table_idx >= total_tables) return error.UnknownTable;
+            // Validate offset expression type (must be i32)
+            if (elem.offset) |offset| {
+                switch (offset) {
+                    .i32_const => {},
+                    .global_get => |idx| {
+                        if (idx >= module.import_global_count) return error.UnknownGlobal;
+                        if (getImportGlobalType(module, idx)) |gt| {
+                            if (gt.val_type != .i32) return error.TypeMismatch;
+                        }
+                    },
+                    else => return error.TypeMismatch,
+                }
+            }
+        }
+        for (elem.func_indices) |fidx| {
+            if (fidx >= total_funcs) return error.UnknownFunction;
         }
     }
 
     // Validate function bodies (alignment, index bounds)
     for (module.functions) |func| {
         const total_locals = @as(u32, @intCast(func.func_type.params.len)) + func.local_count;
-        try validateFunctionBody(func.code, module.types.len, total_funcs, total_globals, total_locals);
+        try validateFunctionBody(func.code, module.types.len, total_funcs, total_tables, total_globals, total_locals, module.data_count != null);
     }
 
     // Type-stack validation for each function body (skip for imports w/ 0 local funcs)
@@ -668,6 +742,9 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             try validateFunctionTypes(module, &func);
         }
     }
+
+    // Validate ref.func references are "declared" (in element segments, exports, or globals)
+    try validateDeclaredFuncRefs(module, total_funcs);
 }
 
 fn validateMemoryLimits(limits: types.Limits) LoadError!void {
@@ -675,6 +752,113 @@ fn validateMemoryLimits(limits: types.Limits) LoadError!void {
     if (limits.max) |max| {
         if (max > 65536) return error.InvalidLimits;
         if (limits.min > max) return error.InvalidLimits;
+    }
+}
+
+/// Check that every ref.func index in function bodies references a "declared" function.
+/// A function is declared if it appears in an element segment, an export, or the start function.
+fn validateDeclaredFuncRefs(module: *const types.WasmModule, total_funcs: u32) LoadError!void {
+    // Build declared set as a bit set (max 64K functions for stack-based approach)
+    const max_track: u32 = if (total_funcs <= 8192) total_funcs else 8192;
+    var declared_buf: [8192]bool = undefined;
+    const declared = declared_buf[0..max_track];
+    @memset(declared, false);
+
+    // Functions in element segments are declared
+    for (module.elements) |elem| {
+        for (elem.func_indices) |fidx| {
+            if (fidx < max_track) declared[fidx] = true;
+        }
+    }
+    // Exported functions are declared
+    for (module.exports) |exp| {
+        if (exp.kind == .function and exp.index < max_track) declared[exp.index] = true;
+    }
+    // Functions referenced by ref.func in global init expressions are declared
+    for (module.globals) |g| {
+        switch (g.init_expr) {
+            .ref_func => |fidx| {
+                if (fidx < max_track) declared[fidx] = true;
+            },
+            else => {},
+        }
+    }
+    // Functions referenced in element segment init expressions are declared
+    for (module.elements) |elem| {
+        if (elem.offset) |offset| {
+            switch (offset) {
+                .ref_func => |fidx| {
+                    if (fidx < max_track) declared[fidx] = true;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Scan function bodies for ref.func instructions
+    for (module.functions) |func| {
+        try checkRefFuncDeclared(func.code, declared);
+    }
+}
+
+fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void {
+    var i: usize = 0;
+    while (i < code.len) {
+        const op = code[i];
+        i += 1;
+        switch (op) {
+            // Skip opcodes with known immediate sizes
+            0x02, 0x03, 0x04 => { // block/loop/if: blocktype
+                if (i >= code.len) return;
+                const bt = code[i];
+                if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
+                    i += 1;
+                } else {
+                    const r = leb128_mod.readSigned(i64, code[i..]) catch return;
+                    i += r.bytes_read;
+                }
+            },
+            0x0C, 0x0D => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x0E => { // br_table
+                const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read;
+                var j: u32 = 0;
+                while (j <= cr.value) : (j += 1) { const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += lr.bytes_read; }
+            },
+            0x10, 0x12 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x11, 0x13 => {
+                const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r1.bytes_read;
+                const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r2.bytes_read;
+            },
+            0x1C => { const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read; i += cr.value; },
+            0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x28...0x3E => { // memory load/store
+                const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r1.bytes_read;
+                const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r2.bytes_read;
+            },
+            0x3F, 0x40 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x41 => { const r = leb128_mod.readSigned(i32, code[i..]) catch return; i += r.bytes_read; },
+            0x42 => { const r = leb128_mod.readSigned(i64, code[i..]) catch return; i += r.bytes_read; },
+            0x43 => i += 4,
+            0x44 => i += 8,
+            0xD0 => { if (i < code.len) i += 1; },
+            0xD2 => { // ref.func - check declared
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+                if (r.value < declared.len) {
+                    if (!declared[r.value]) return error.UndeclaredFuncRef;
+                }
+            },
+            0xFC => {
+                const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += sr.bytes_read;
+                switch (sr.value) {
+                    0...7 => {},
+                    8, 10, 12, 14 => { const a = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += a.bytes_read; const b = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += b.bytes_read; },
+                    9, 11, 13, 15, 16, 17 => { const a = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += a.bytes_read; },
+                    else => {},
+                }
+            },
+            else => {},
+        }
     }
 }
 
@@ -705,8 +889,10 @@ fn validateFunctionBody(
     code: []const u8,
     num_types: usize,
     total_funcs: u32,
+    total_tables: u32,
     total_globals: u32,
     total_locals: u32,
+    has_data_count: bool,
 ) LoadError!void {
     var i: usize = 0;
     while (i < code.len) {
@@ -775,6 +961,7 @@ fn validateFunctionBody(
                 if (r1.value >= num_types) return error.InvalidTypeIndex;
                 const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += r2.bytes_read;
+                if (r2.value >= total_tables) return error.UnknownTable;
             },
 
             // select_t: vec(valtype)
@@ -796,6 +983,13 @@ fn validateFunctionBody(
                 const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += r.bytes_read;
                 if (r.value >= total_globals) return error.UnknownGlobal;
+            },
+
+            // table.get, table.set: tableidx
+            0x25, 0x26 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+                if (r.value >= total_tables) return error.UnknownTable;
             },
 
             // memory.size, memory.grow: memidx (u32 LEB)
@@ -833,10 +1027,12 @@ fn validateFunctionBody(
                         i += r.bytes_read;
                         const m = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += m.bytes_read;
+                        if (!has_data_count) return error.DataCountRequired;
                     },
                     9 => { // data.drop
                         const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += r.bytes_read;
+                        if (!has_data_count) return error.DataCountRequired;
                     },
                     10 => { // memory.copy: memidx + memidx
                         const m1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
@@ -848,25 +1044,29 @@ fn validateFunctionBody(
                         const m = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += m.bytes_read;
                     },
-                    12 => { // table.init
+                    12 => { // table.init: elemidx + tableidx
                         const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += r1.bytes_read;
                         const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += r2.bytes_read;
+                        if (r2.value >= total_tables) return error.UnknownTable;
                     },
                     13 => { // elem.drop
                         const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += r.bytes_read;
                     },
-                    14 => { // table.copy
+                    14 => { // table.copy: tableidx + tableidx
                         const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += r1.bytes_read;
+                        if (r1.value >= total_tables) return error.UnknownTable;
                         const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += r2.bytes_read;
+                        if (r2.value >= total_tables) return error.UnknownTable;
                     },
                     15, 16, 17 => { // table.grow, table.size, table.fill
                         const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                         i += r.bytes_read;
+                        if (r.value >= total_tables) return error.UnknownTable;
                     },
                     else => {},
                 }
@@ -881,12 +1081,60 @@ fn validateFunctionBody(
             0xD2 => {
                 const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += r.bytes_read;
+                if (r.value >= total_funcs) return error.UnknownFunction;
             },
 
-            // All other opcodes have no immediates (0xD1=ref.is_null, numerics, etc.)
-            else => {},
+            // ref.is_null has no immediate
+            0xD1 => {},
+
+            // FD prefix (SIMD) — skip sub-opcode and potential immediates
+            0xFD => {
+                const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += sr.bytes_read;
+                // SIMD ops may have additional immediates (e.g., lane indices);
+                // We skip validation of SIMD details here.
+            },
+            // FE prefix (threads/atomics) — skip sub-opcode + memarg
+            0xFE => {
+                const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += sr.bytes_read;
+            },
+
+            // All valid opcodes with no immediates (numerics, control, etc.)
+            // 0x00=unreachable, 0x01=nop, 0x05=else, 0x0B=end, 0x0F=return
+            // 0x1A=drop, 0x1B=select
+            // 0x45..0xC4=numeric/comparison/conversion/sign-ext ops
+            0x00, 0x01, 0x05, 0x0B, 0x0F, 0x1A, 0x1B => {},
+            0x45...0xC4 => {},
+
+            // Opcodes in ranges 0x06-0x0A, 0x14-0x19, 0x1D-0x1F, 0x27,
+            // 0xC5-0xCF, 0xD3-0xFB, 0xFF are reserved/illegal
+            else => return error.IllegalOpcode,
         }
     }
+}
+
+/// Get the type of an imported global by its index among imported globals.
+fn getImportGlobalType(module: *const types.WasmModule, idx: u32) ?types.GlobalType {
+    if (idx >= module.import_global_count) return null;
+    var gi: u32 = 0;
+    for (module.imports) |imp| {
+        if (imp.kind == .global) {
+            if (gi == idx) return imp.global_type;
+            gi += 1;
+        }
+    }
+    return null;
+}
+
+/// Get the full GlobalType (including mutability) for any global index.
+fn getFullGlobalType(module: *const types.WasmModule, idx: u32) ?types.GlobalType {
+    if (idx < module.import_global_count) {
+        return getImportGlobalType(module, idx);
+    }
+    const local_idx = idx - module.import_global_count;
+    if (local_idx < module.globals.len) return module.globals[local_idx].global_type;
+    return null;
 }
 
 // ─── Type-stack validation (WebAssembly spec §3.3) ─────────────────────────
@@ -1018,6 +1266,22 @@ fn getGlobalType(module: *const types.WasmModule, idx: u32) ?VT {
     }
     const local_idx = idx - module.import_global_count;
     if (local_idx < module.globals.len) return module.globals[local_idx].global_type.val_type;
+    return null;
+}
+
+fn getTableElemType(module: *const types.WasmModule, idx: u32) ?VT {
+    if (idx < module.import_table_count) {
+        var ti: u32 = 0;
+        for (module.imports) |imp| {
+            if (imp.kind == .table) {
+                if (ti == idx) return if (imp.table_type) |tt| tt.elem_type else null;
+                ti += 1;
+            }
+        }
+        return null;
+    }
+    const local_idx = idx - module.import_table_count;
+    if (local_idx < module.tables.len) return module.tables[local_idx].elem_type;
     return null;
 }
 
@@ -1316,10 +1580,34 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             // global.set
             0x24 => {
                 const gidx = readU32Leb(code, &i);
+                // Check mutability
+                if (getFullGlobalType(module, gidx)) |gt| {
+                    if (gt.mutability != .mutable) return error.TypeMismatch;
+                }
                 if (getGlobalType(module, gidx)) |gt| {
                     if (!popExpect(&stack_buf, &sp, gt, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                         return error.TypeMismatch;
                 }
+            },
+
+            // table.get: [i32] -> [t]
+            0x25 => {
+                const tidx = readU32Leb(code, &i);
+                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                    return error.TypeMismatch;
+                if (getTableElemType(module, tidx)) |et|
+                    pushType(&stack_buf, &sp, et)
+                else
+                    pushType(&stack_buf, &sp, .funcref);
+            },
+            // table.set: [i32 t] -> []
+            0x26 => {
+                const tidx = readU32Leb(code, &i);
+                const et = getTableElemType(module, tidx) orelse VT.funcref;
+                if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                    return error.TypeMismatch;
+                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                    return error.TypeMismatch;
             },
 
             // Memory loads
@@ -1417,7 +1705,29 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     12 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // table.init
                     13 => { _ = readU32Leb(code, &i); }, // elem.drop
                     14 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // table.copy
-                    15, 16, 17 => { _ = readU32Leb(code, &i); }, // table.grow, table.size, table.fill
+                    15 => { // table.grow: [t i32] -> [i32]
+                        const tidx = readU32Leb(code, &i);
+                        const et = getTableElemType(module, tidx) orelse VT.funcref;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i32);
+                    },
+                    16 => { // table.size: [] -> [i32]
+                        _ = readU32Leb(code, &i);
+                        pushType(&stack_buf, &sp, .i32);
+                    },
+                    17 => { // table.fill: [i32 t i32] -> []
+                        const tidx = readU32Leb(code, &i);
+                        const et = getTableElemType(module, tidx) orelse VT.funcref;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                    },
                     else => {},
                 }
             },
