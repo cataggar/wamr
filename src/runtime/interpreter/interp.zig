@@ -35,6 +35,14 @@ pub const TrapError = error{
     UnknownOpcode,
 };
 
+/// Result from dispatchLoop indicating how the function exited.
+const DispatchResult = enum(u32) {
+    /// Normal return (.end at function level or .return).
+    normal = 0,
+    /// Tail call — the target func_idx is stored separately.
+    tail_call = 1,
+};
+
 // ── LEB128 helpers for bytecode ──────────────────────────────────────────
 
 fn readU32(code: []const u8, ip: *usize) u32 {
@@ -96,10 +104,10 @@ fn readI64(code: []const u8, ip: *usize) i64 {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
-/// Execute a tail call: replace the current frame with a call to `func_idx`.
-/// Moves the new function's parameters to the current frame's stack base,
-/// pops the current frame, then calls the target function normally.
-fn executeTailCall(env: *ExecEnv, func_idx: u32) TrapError!void {
+/// Prepare a tail call: move new args to the current frame's stack base
+/// and pop the frame, leaving the stack ready for the next function.
+/// Returns the target func_idx for the caller to loop on.
+fn prepareTailCall(env: *ExecEnv, func_idx: u32) TrapError!void {
     const module = env.module_inst.module;
     if (func_idx < module.import_function_count) return error.UnknownFunction;
     const local_idx = func_idx - module.import_function_count;
@@ -122,40 +130,73 @@ fn executeTailCall(env: *ExecEnv, func_idx: u32) TrapError!void {
     env.sp = old_stack_base + new_param_count;
 
     _ = try env.popFrame();
-    try executeFunction(env, func_idx);
 }
 
 /// Execute a function by index within the module instance.
 pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
-    const module = env.module_inst.module;
-    if (func_idx < module.import_function_count) return error.UnknownFunction;
-    const local_idx = func_idx - module.import_function_count;
-    if (local_idx >= module.functions.len) return error.UnknownFunction;
+    var current_func_idx = func_idx;
 
-    const func = &module.functions[local_idx];
-    const func_type = module.types[func.type_idx];
-    const param_count: u32 = @intCast(func_type.params.len);
+    while (true) {
+        const module = env.module_inst.module;
+        if (current_func_idx < module.import_function_count) return error.UnknownFunction;
+        const local_idx = current_func_idx - module.import_function_count;
+        if (local_idx >= module.functions.len) return error.UnknownFunction;
 
-    var total_locals: u32 = param_count;
-    for (func.locals) |local| total_locals += local.count;
+        const func = &module.functions[local_idx];
+        const func_type = module.types[func.type_idx];
+        const param_count: u32 = @intCast(func_type.params.len);
 
-    const stack_base = env.sp - param_count;
-    try env.pushFrame(.{
-        .func_idx = func_idx,
-        .ip = 0,
-        .stack_base = stack_base,
-        .local_count = total_locals,
-        .return_arity = @intCast(func_type.results.len),
-        .prev_sp = env.sp,
-    });
+        var total_locals: u32 = param_count;
+        for (func.locals) |local| total_locals += local.count;
 
-    // Initialize non-param locals to zero.
-    var i: u32 = 0;
-    while (i < total_locals - param_count) : (i += 1) {
-        try env.push(.{ .i32 = 0 });
+        const stack_base = env.sp - param_count;
+        try env.pushFrame(.{
+            .func_idx = current_func_idx,
+            .ip = 0,
+            .stack_base = stack_base,
+            .local_count = total_locals,
+            .return_arity = @intCast(func_type.results.len),
+            .prev_sp = env.sp,
+        });
+
+        // Initialize non-param locals to zero.
+        var i: u32 = 0;
+        while (i < total_locals - param_count) : (i += 1) {
+            try env.push(.{ .i32 = 0 });
+        }
+
+        var tail_call_target: u32 = 0;
+        const result = try dispatchLoop(env, func.code, &tail_call_target);
+
+        switch (result) {
+            .normal => {
+                // Normal return: save results, pop frame, restore sp, push results.
+                const return_count: u32 = @intCast(func_type.results.len);
+                var return_vals: [16]types.Value = undefined;
+                {
+                    var ri: u32 = return_count;
+                    while (ri > 0) {
+                        ri -= 1;
+                        return_vals[ri] = try env.pop();
+                    }
+                }
+                const frame = try env.popFrame();
+                env.sp = frame.stack_base;
+                {
+                    var ri: u32 = 0;
+                    while (ri < return_count) : (ri += 1) {
+                        try env.push(return_vals[ri]);
+                    }
+                }
+                return;
+            },
+            .tail_call => {
+                // prepareTailCall already moved args and popped the frame.
+                current_func_idx = tail_call_target;
+                continue;
+            },
+        }
     }
-
-    try dispatchLoop(env, func.code);
 }
 
 // ── Block-target helpers ─────────────────────────────────────────────────
@@ -381,12 +422,15 @@ fn funcTypesEqual(a: types.FuncType, b: types.FuncType) bool {
 
 // ── Dispatch loop ────────────────────────────────────────────────────────
 
-fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
+fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapError!DispatchResult {
     var ip: usize = 0;
     var labels: [MAX_LABELS]Label = undefined;
     var label_sp: u32 = 0;
+    var fuel: u32 = 100_000_000;
 
     while (ip < code.len) {
+        fuel -|= 1;
+        if (fuel == 0) return error.Unreachable;
         const byte = code[ip];
         ip += 1;
         const op: Opcode = @enumFromInt(byte);
@@ -470,11 +514,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             },
 
             .end => {
-                if (label_sp == 0) return; // function-level end
+                if (label_sp == 0) return .normal; // function-level end
                 label_sp -= 1;
             },
 
-            .@"return" => return,
+            .@"return" => return .normal,
 
             .br => {
                 const depth = readU32(code, &ip);
@@ -610,8 +654,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
 
             .return_call => {
                 const func_idx = readU32(code, &ip);
-                try executeTailCall(env, func_idx);
-                return;
+                try prepareTailCall(env, func_idx);
+                tail_call_target.* = func_idx;
+                return .tail_call;
             },
 
             .return_call_indirect => {
@@ -629,8 +674,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
                 const actual_type = module.getFuncType(func_idx) orelse return error.UnknownFunction;
                 if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
 
-                try executeTailCall(env, func_idx);
-                return;
+                try prepareTailCall(env, func_idx);
+                tail_call_target.* = func_idx;
+                return .tail_call;
             },
 
             // ── Constants ──
@@ -1706,6 +1752,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8) TrapError!void {
             else => return error.UnknownOpcode,
         }
     }
+    return .normal;
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -1738,7 +1785,8 @@ fn runCode(code: []const u8) !i32 {
     // Push a dummy frame so locals/currentFrame works
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
 
-    try dispatchLoop(&env, code);
+    var dummy_target: u32 = 0;
+    _ = try dispatchLoop(&env, code, &dummy_target);
     return env.popI32();
 }
 
@@ -1871,12 +1919,13 @@ test "interp: local.get and local.set" {
     });
 
     // i32.const 42; local.set 1; local.get 1; end
-    try dispatchLoop(&env, &.{
+    var dummy_target: u32 = 0;
+    _ = try dispatchLoop(&env, &.{
         0x41, 42, // i32.const 42
         0x21, 1, // local.set 1
         0x20, 1, // local.get 1
         0x0B, // end
-    });
+    }, &dummy_target);
 
     _ = try env.popFrame();
     try testing.expectEqual(@as(i32, 42), try env.popI32());
@@ -2027,7 +2076,7 @@ test "interp: loop with br_if counts down" {
         0x0B, //   end (function)
     };
 
-    try dispatchLoop(&env, &code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, &code, &dummy_target); }
     _ = try env.popFrame();
     const result = try env.popI32();
     try testing.expectEqual(@as(i32, 0), result);
@@ -2158,7 +2207,7 @@ test "interp: call another function" {
         0x10, 0x00, // call 0
         0x0B, //       end
     };
-    try dispatchLoop(&env, &caller_code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, &caller_code, &dummy_target); }
     _ = try env.popFrame();
     const result = try env.popI32();
     try testing.expectEqual(@as(i32, 42), result);
@@ -2219,7 +2268,7 @@ test "interp: br_table dispatch" {
                 0x0B, //   end (function)
             };
 
-            try dispatchLoop(&env, &code);
+            { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, &code, &dummy_target); }
             _ = try env.popFrame();
             return env.popI32();
         }
@@ -2258,7 +2307,7 @@ fn runCodeI64(code: []const u8) !i64 {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    try dispatchLoop(&env, code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popI64();
 }
 
@@ -2283,7 +2332,7 @@ fn runCodeF32(code: []const u8) !f32 {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    try dispatchLoop(&env, code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF32();
 }
 
@@ -2308,7 +2357,7 @@ fn runCodeF64(code: []const u8) !f64 {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    try dispatchLoop(&env, code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF64();
 }
 
@@ -2333,7 +2382,8 @@ fn runCodeExpectTrapAny(code: []const u8, expected: TrapError) !void {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    const result = dispatchLoop(&env, code);
+    var dummy_target: u32 = 0;
+    const result = dispatchLoop(&env, code, &dummy_target);
     try testing.expectError(expected, result);
 }
 
@@ -2683,7 +2733,7 @@ fn runCodeWithMem(code: []const u8) !i32 {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    try dispatchLoop(&env, code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popI32();
 }
 
@@ -2716,7 +2766,7 @@ fn runCodeWithMemI64(code: []const u8) !i64 {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    try dispatchLoop(&env, code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popI64();
 }
 
@@ -2749,7 +2799,7 @@ fn runCodeWithMemF32(code: []const u8) !f32 {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    try dispatchLoop(&env, code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF32();
 }
 
@@ -2782,7 +2832,7 @@ fn runCodeWithMemF64(code: []const u8) !f64 {
     defer alloc.free(env.operand_stack);
     defer alloc.free(env.call_stack);
     try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
-    try dispatchLoop(&env, code);
+    { var dummy_target: u32 = 0; _ = try dispatchLoop(&env, code, &dummy_target); }
     return env.popF64();
 }
 
