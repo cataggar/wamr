@@ -153,12 +153,7 @@ fn readI64(code: []const u8, ip: *usize) i64 {
 /// Returns the target func_idx for the caller to loop on.
 fn prepareTailCall(env: *ExecEnv, func_idx: u32) TrapError!void {
     const module = env.module_inst.module;
-    if (func_idx < module.import_function_count) return error.UnknownFunction;
-    const local_idx = func_idx - module.import_function_count;
-    if (local_idx >= module.functions.len) return error.UnknownFunction;
-
-    const func = &module.functions[local_idx];
-    const func_type = module.types[func.type_idx];
+    const func_type = module.getFuncType(func_idx) orelse return error.UnknownFunction;
     const new_param_count: u32 = @intCast(func_type.params.len);
 
     const old_frame = env.currentFrame() orelse return error.CallStackUnderflow;
@@ -182,7 +177,24 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
 
     while (true) {
         const module = env.module_inst.module;
-        if (current_func_idx < module.import_function_count) return error.UnknownFunction;
+        if (current_func_idx < module.import_function_count) {
+            // Imported function — execute as no-op stub: pop args, push zero results.
+            const func_type = module.getFuncType(current_func_idx) orelse return error.UnknownFunction;
+            var i: usize = func_type.params.len;
+            while (i > 0) : (i -= 1) _ = try env.pop();
+            for (func_type.results) |result_type| {
+                try env.push(switch (result_type) {
+                    .i32 => .{ .i32 = 0 },
+                    .i64 => .{ .i64 = 0 },
+                    .f32 => .{ .f32 = 0.0 },
+                    .f64 => .{ .f64 = 0.0 },
+                    .funcref => .{ .funcref = null },
+                    .externref => .{ .externref = null },
+                    else => .{ .i32 = 0 },
+                });
+            }
+            return;
+        }
         const local_idx = current_func_idx - module.import_function_count;
         if (local_idx >= module.functions.len) return error.UnknownFunction;
 
