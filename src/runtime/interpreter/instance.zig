@@ -29,6 +29,7 @@ pub const ImportContext = struct {
     globals: []const types.GlobalInstance = &.{},
     memories: []const types.MemoryInstance = &.{},
     tables: []const types.TableInstance = &.{},
+    functions: []const types.ImportedFunction = &.{},
 };
 
 /// Instantiate a module, producing a runnable ModuleInstance.
@@ -72,6 +73,13 @@ pub fn instantiateWithImports(
     inst.globals = try initializeGlobals(module, allocator, import_ctx);
     errdefer freeGlobals(inst.globals, allocator);
 
+    // Store imported function references
+    if (import_ctx) |ctx| {
+        if (ctx.functions.len > 0) {
+            inst.import_functions = allocator.dupe(types.ImportedFunction, ctx.functions) catch return error.OutOfMemory;
+        }
+    }
+
     try applyDataSegments(module, inst.memories);
     try applyElemSegments(module, inst.tables);
 
@@ -93,6 +101,7 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     freeMemories(inst.memories, allocator);
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, allocator);
+    if (inst.import_functions.len > 0) allocator.free(inst.import_functions);
     allocator.destroy(inst);
 }
 

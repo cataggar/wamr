@@ -158,6 +158,8 @@ fn buildImportContext(
         for (tables.items) |t| allocator.free(t.elements);
         tables.deinit(allocator);
     }
+    var functions: std.ArrayList(types.ImportedFunction) = .empty;
+    defer functions.deinit(allocator);
 
     for (module.imports) |imp| {
         const is_spectest = std.mem.eql(u8, imp.module_name, "spectest");
@@ -249,6 +251,7 @@ fn buildImportContext(
                                 return error.ImportResolutionFailed;
                         }
                     }
+                    // spectest functions remain as stubs (no ImportedFunction entry)
                 } else {
                     const ri = reg_inst.?;
                     const exp = ri.module.findExport(imp.field_name, .function) orelse
@@ -261,6 +264,10 @@ fn buildImportContext(
                             }
                         }
                     }
+                    functions.append(allocator, .{
+                        .module_inst = ri,
+                        .func_idx = exp.index,
+                    }) catch return error.ImportResolutionFailed;
                 }
             },
         }
@@ -270,6 +277,7 @@ fn buildImportContext(
         .globals = globals.toOwnedSlice(allocator) catch return error.ImportResolutionFailed,
         .memories = memories.toOwnedSlice(allocator) catch return error.ImportResolutionFailed,
         .tables = tables.toOwnedSlice(allocator) catch return error.ImportResolutionFailed,
+        .functions = functions.toOwnedSlice(allocator) catch return error.ImportResolutionFailed,
     };
 }
 
@@ -279,6 +287,7 @@ fn freeImportContext(ctx: instance_mod.ImportContext, allocator: std.mem.Allocat
     for (ctx.tables) |*t| allocator.free(@constCast(t).elements);
     if (ctx.tables.len > 0) allocator.free(ctx.tables);
     if (ctx.globals.len > 0) allocator.free(ctx.globals);
+    if (ctx.functions.len > 0) allocator.free(ctx.functions);
 }
 
 fn getSpectestGlobal(field: []const u8, val_type: types.ValType) types.Value {

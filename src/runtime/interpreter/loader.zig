@@ -673,8 +673,9 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
         switch (g.init_expr) {
             .global_get => |idx| {
                 if (idx >= module.import_global_count) return error.UnknownGlobal;
-                // Check type compatibility
+                // Constant expressions require immutable imported globals (spec §3.3.10)
                 if (getImportGlobalType(module, idx)) |gt| {
+                    if (gt.mutability == .mutable) return error.TypeMismatch;
                     if (gt.val_type != g.global_type.val_type) return error.TypeMismatch;
                 }
             },
@@ -685,8 +686,9 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             .ref_null => |rt| {
                 if (g.global_type.val_type != rt) return error.TypeMismatch;
             },
-            .ref_func => {
+            .ref_func => |fidx| {
                 if (g.global_type.val_type != .funcref) return error.TypeMismatch;
+                if (fidx >= total_funcs) return error.UnknownFunction;
             },
         }
     }
@@ -699,6 +701,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 .global_get => |idx| {
                     if (idx >= module.import_global_count) return error.UnknownGlobal;
                     if (getImportGlobalType(module, idx)) |gt| {
+                        if (gt.mutability == .mutable) return error.TypeMismatch;
                         if (gt.val_type != .i32) return error.TypeMismatch;
                     }
                 },
@@ -718,6 +721,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                     .global_get => |idx| {
                         if (idx >= module.import_global_count) return error.UnknownGlobal;
                         if (getImportGlobalType(module, idx)) |gt| {
+                            if (gt.mutability == .mutable) return error.TypeMismatch;
                             if (gt.val_type != .i32) return error.TypeMismatch;
                         }
                     },
@@ -1510,7 +1514,11 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             // call_indirect, return_call_indirect
             0x11, 0x13 => {
                 const tidx = readU32Leb(code, &i);
-                _ = readU32Leb(code, &i); // table idx
+                const table_idx = readU32Leb(code, &i);
+                // call_indirect requires a funcref table (spec §3.3.8.8)
+                if (getTableElemType(module, table_idx)) |et| {
+                    if (et != .funcref) return error.TypeMismatch;
+                }
                 if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
                 if (tidx < module.types.len) {
@@ -1735,6 +1743,9 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             else => {},
         }
     }
+
+    // If we exit the loop without closing all blocks, the function body is truncated
+    if (ctrl_sp != 0) return error.UnexpectedEnd;
 }
 
 const testing = std.testing;
@@ -2038,4 +2049,45 @@ test "load: section size mismatch rejected" {
         0x01, 0x05, 0x01, 0x60, 0x00, 0x00,
     };
     try testing.expectError(error.InvalidSectionSize, load(&data, testing.allocator));
+}
+
+test "load: data segment with no memory rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // data.45.wasm: data section with active segment for memory 0, but no memory
+    const data = wasm_header ++ [_]u8{ 0x0B, 0x06, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x00 };
+    try testing.expectError(error.UnknownMemory, load(&data, arena.allocator()));
+}
+
+test "load: global.set on immutable global rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // global.1.wasm: immutable f32 global with a function that does global.set
+    const data = wasm_header ++ [_]u8{
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: func()->()
+        0x03, 0x02, 0x01, 0x00, // func section: 1 func, type 0
+        0x06, 0x09, 0x01, 0x7D, 0x00, 0x43, 0x00, 0x00, 0x00, 0x00, 0x0B, // global: f32, immut, f32.const(0)
+        0x0A, 0x0B, 0x01, 0x09, 0x00, 0x43, 0x00, 0x00, 0x80, 0x3F, 0x24, 0x00, 0x0B, // code: f32.const(1.0), global.set(0), end
+    };
+    try testing.expectError(error.TypeMismatch, load(&data, arena.allocator()));
+}
+
+test "load: illegal init expr in global rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // global.5.wasm: init expr with f32.const followed by f32.neg (not valid constant expr)
+    const data = wasm_header ++ [_]u8{ 0x06, 0x0A, 0x01, 0x7D, 0x00, 0x43, 0x00, 0x00, 0x00, 0x00, 0x8C, 0x0B };
+    try testing.expectError(error.InvalidInitExpr, load(&data, arena.allocator()));
+}
+
+test "load: illegal opcode 0xFF rejected" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // binary.126.wasm: function body with 0xFF opcode
+    const data = wasm_header ++ [_]u8{
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section
+        0x03, 0x02, 0x01, 0x00, // func section
+        0x0A, 0x08, 0x01, 0x06, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x0B, // code with 0xFF
+    };
+    try testing.expectError(error.IllegalOpcode, load(&data, arena.allocator()));
 }

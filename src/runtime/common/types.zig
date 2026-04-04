@@ -321,12 +321,19 @@ pub const GlobalInstance = struct {
     value: Value,
 };
 
+/// A resolved imported function target
+pub const ImportedFunction = struct {
+    module_inst: *ModuleInstance,
+    func_idx: u32,
+};
+
 /// Instantiated module
 pub const ModuleInstance = struct {
     module: *const WasmModule,
     memories: []MemoryInstance,
     tables: []TableInstance,
     globals: []GlobalInstance,
+    import_functions: []const ImportedFunction = &.{},
     allocator: std.mem.Allocator,
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {

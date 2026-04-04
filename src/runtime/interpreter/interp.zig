@@ -178,7 +178,16 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
     while (true) {
         const module = env.module_inst.module;
         if (current_func_idx < module.import_function_count) {
-            // Imported function — execute as no-op stub: pop args, push zero results.
+            // Dispatch to the imported module's actual function
+            if (current_func_idx < env.module_inst.import_functions.len) {
+                const imported = env.module_inst.import_functions[current_func_idx];
+                const saved_module_inst = env.module_inst;
+                env.module_inst = imported.module_inst;
+                defer env.module_inst = saved_module_inst;
+                try executeFunction(env, imported.func_idx);
+                return;
+            }
+            // Fallback: no-op stub for unresolved imports (pop args, push zero results)
             const func_type = module.getFuncType(current_func_idx) orelse return error.UnknownFunction;
             var i: usize = func_type.params.len;
             while (i > 0) : (i -= 1) _ = try env.pop();
@@ -1790,6 +1799,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         };
                         const old_size: u32 = @intCast(table.elements.len);
                         const new_size = @as(u64, old_size) + delta;
+                        // Table size cannot exceed u32 range
+                        if (new_size > std.math.maxInt(u32)) {
+                            try env.pushI32(-1);
+                            continue;
+                        }
                         if (table.table_type.limits.max) |max| {
                             if (new_size > max) {
                                 try env.pushI32(-1);
