@@ -203,10 +203,20 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
             .prev_sp = env.sp,
         });
 
-        // Initialize non-param locals to zero.
-        var i: u32 = 0;
-        while (i < total_locals - param_count) : (i += 1) {
-            try env.push(.{ .i32 = 0 });
+        // Initialize non-param locals to zero with correct types.
+        for (func.locals) |local| {
+            var j: u32 = 0;
+            while (j < local.count) : (j += 1) {
+                try env.push(switch (local.val_type) {
+                    .i32 => .{ .i32 = 0 },
+                    .i64 => .{ .i64 = 0 },
+                    .f32 => .{ .f32 = 0.0 },
+                    .f64 => .{ .f64 = 0.0 },
+                    .funcref => .{ .funcref = null },
+                    .externref => .{ .externref = null },
+                    else => .{ .i32 = 0 },
+                });
+            }
         }
 
         var tail_call_target: u32 = 0;
@@ -284,7 +294,7 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
         switch (@as(Opcode, @enumFromInt(b))) {
             .block, .loop, .@"if" => {
                 depth += 1;
-                pos += 1; // skip block-type byte
+                pos = skipLeb128(code, pos); // skip block-type (may be multi-byte)
             },
             .end => {
                 depth -= 1;
@@ -362,7 +372,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
         switch (@as(Opcode, @enumFromInt(b))) {
             .block, .loop, .@"if" => {
                 depth += 1;
-                pos += 1; // skip block-type byte
+                pos = skipLeb128(code, pos); // skip block-type (may be multi-byte)
             },
             .end => {
                 depth -= 1;
@@ -430,13 +440,30 @@ fn findElse(code: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Parse a block type byte and return the result arity.
-fn blockArity(bt: u8) u32 {
-    return switch (bt) {
-        0x40 => 0, // void
-        0x7F, 0x7E, 0x7D, 0x7C, 0x70, 0x6F => 1, // i32, i64, f32, f64, funcref, externref
-        else => 0,
-    };
+/// Parse a block type from bytecode, advancing ip past it.
+/// Returns result arity and param arity (for multi-value type indices).
+const BlockTypeInfo = struct { result_arity: u32, param_arity: u32 };
+
+fn readBlockTypeInfo(code: []const u8, ip: *usize, module_types: []const types.FuncType) BlockTypeInfo {
+    const first = code[ip.*];
+    // Inline types: bytes 0x40-0x7F are single-byte negative s33 values.
+    if (first >= 0x40 and first & 0x80 == 0) {
+        ip.* += 1;
+        return .{
+            .result_arity = if (first == 0x40) @as(u32, 0) else @as(u32, 1),
+            .param_arity = 0,
+        };
+    }
+    // Type index (unsigned LEB128)
+    const type_idx = readU32(code, ip);
+    if (type_idx < module_types.len) {
+        const ft = module_types[type_idx];
+        return .{
+            .result_arity = @intCast(ft.results.len),
+            .param_arity = @intCast(ft.params.len),
+        };
+    }
+    return .{ .result_arity = 0, .param_arity = 0 };
 }
 
 // ── Label for structured control flow ────────────────────────────────────
@@ -472,6 +499,16 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
     var label_sp: u32 = 0;
     var fuel: u32 = 100_000_000;
 
+    // Push implicit function-body label so br/br_if/br_table can target the function.
+    const return_arity: u32 = if (env.currentFrame()) |frame| frame.return_arity else 0;
+    labels[0] = .{
+        .kind = .block,
+        .target_ip = code.len,
+        .stack_height = env.sp,
+        .arity = return_arity,
+    };
+    label_sp = 1;
+
     while (ip < code.len) {
         fuel -|= 1;
         if (fuel == 0) return error.Unreachable;
@@ -485,39 +522,35 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .nop => {},
 
             .block => {
-                const bt = code[ip];
-                ip += 1;
-                const arity = blockArity(bt);
+                const module_types = env.module_inst.module.types;
+                const bt_info = readBlockTypeInfo(code, &ip, module_types);
                 const end_ip = findBlockEnd(code, ip);
                 if (label_sp >= MAX_LABELS) return error.StackOverflow;
                 labels[label_sp] = .{
                     .kind = .block,
                     .target_ip = end_ip,
-                    .stack_height = env.sp,
-                    .arity = arity,
+                    .stack_height = env.sp - bt_info.param_arity,
+                    .arity = bt_info.result_arity,
                 };
                 label_sp += 1;
             },
 
             .loop => {
-                const bt = code[ip];
-                ip += 1;
-                _ = bt;
-                // loop branches go back to the header; loop's br arity is 0
+                const module_types = env.module_inst.module.types;
+                const bt_info = readBlockTypeInfo(code, &ip, module_types);
                 if (label_sp >= MAX_LABELS) return error.StackOverflow;
                 labels[label_sp] = .{
                     .kind = .loop,
-                    .target_ip = ip, // right after the block-type byte
-                    .stack_height = env.sp,
-                    .arity = 0, // br to loop does not yield results
+                    .target_ip = ip, // right after the block-type byte(s)
+                    .stack_height = env.sp - bt_info.param_arity,
+                    .arity = bt_info.param_arity, // br to loop carries params
                 };
                 label_sp += 1;
             },
 
             .@"if" => {
-                const bt = code[ip];
-                ip += 1;
-                const arity = blockArity(bt);
+                const module_types = env.module_inst.module.types;
+                const bt_info = readBlockTypeInfo(code, &ip, module_types);
                 const cond = try env.popI32();
                 const end_ip = findBlockEnd(code, ip);
                 if (cond != 0) {
@@ -526,8 +559,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     labels[label_sp] = .{
                         .kind = .@"if",
                         .target_ip = end_ip,
-                        .stack_height = env.sp,
-                        .arity = arity,
+                        .stack_height = env.sp - bt_info.param_arity,
+                        .arity = bt_info.result_arity,
                     };
                     label_sp += 1;
                 } else {
@@ -537,8 +570,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         labels[label_sp] = .{
                             .kind = .@"if",
                             .target_ip = end_ip,
-                            .stack_height = env.sp,
-                            .arity = arity,
+                            .stack_height = env.sp - bt_info.param_arity,
+                            .arity = bt_info.result_arity,
                         };
                         label_sp += 1;
                         ip = else_ip;
@@ -551,14 +584,14 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
 
             .@"else" => {
                 // Reached else from the true branch — jump to end
-                if (label_sp == 0) return error.StackUnderflow;
+                if (label_sp <= 1) return error.StackUnderflow;
                 const label = labels[label_sp - 1];
                 ip = label.target_ip;
                 // Don't pop the label; `end` will pop it
             },
 
             .end => {
-                if (label_sp == 0) return .normal; // function-level end
+                if (label_sp <= 1) return .normal; // function-level end
                 label_sp -= 1;
             },
 
@@ -569,9 +602,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 if (depth >= label_sp) return error.StackUnderflow;
                 const label = labels[label_sp - 1 - depth];
                 // Preserve arity values on top of stack, unwind
-                if (label.kind == .loop) {
-                    env.sp = label.stack_height;
-                } else {
+                {
                     var results: [16]types.Value = undefined;
                     var i: u32 = 0;
                     while (i < label.arity) : (i += 1) {
@@ -599,9 +630,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 if (cond != 0) {
                     if (depth >= label_sp) return error.StackUnderflow;
                     const label = labels[label_sp - 1 - depth];
-                    if (label.kind == .loop) {
-                        env.sp = label.stack_height;
-                    } else {
+                    {
                         var results: [16]types.Value = undefined;
                         var i: u32 = 0;
                         while (i < label.arity) : (i += 1) {
@@ -647,9 +676,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 // Now branch to target_depth
                 if (target_depth >= label_sp) return error.StackUnderflow;
                 const label = labels[label_sp - 1 - target_depth];
-                if (label.kind == .loop) {
-                    env.sp = label.stack_height;
-                } else {
+                {
                     var results: [16]types.Value = undefined;
                     var i: u32 = 0;
                     while (i < label.arity) : (i += 1) {
@@ -1446,19 +1473,19 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i32_trunc_f32_u => {
                 const v = try env.popF32();
                 if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
-                if (v >= 4294967296.0 or v < 0.0) return error.IntegerOverflow;
+                if (v >= 4294967296.0 or v <= -1.0) return error.IntegerOverflow;
                 try env.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
             },
             .i32_trunc_f64_s => {
                 const v = try env.popF64();
                 if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
-                if (v >= 2147483648.0 or v < -2147483648.0) return error.IntegerOverflow;
+                if (v >= 2147483648.0 or v <= -2147483649.0) return error.IntegerOverflow;
                 try env.pushI32(@intFromFloat(v));
             },
             .i32_trunc_f64_u => {
                 const v = try env.popF64();
                 if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
-                if (v >= 4294967296.0 or v < 0.0) return error.IntegerOverflow;
+                if (v >= 4294967296.0 or v <= -1.0) return error.IntegerOverflow;
                 try env.pushI32(@bitCast(@as(u32, @intFromFloat(v))));
             },
             .i64_trunc_f32_s => {
@@ -1470,7 +1497,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i64_trunc_f32_u => {
                 const v = try env.popF32();
                 if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
-                if (v >= 18446744073709551616.0 or v < 0.0) return error.IntegerOverflow;
+                if (v >= 18446744073709551616.0 or v <= -1.0) return error.IntegerOverflow;
                 try env.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
             },
             .i64_trunc_f64_s => {
@@ -1482,7 +1509,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i64_trunc_f64_u => {
                 const v = try env.popF64();
                 if (std.math.isNan(v) or std.math.isInf(v)) return error.InvalidConversionToInteger;
-                if (v >= 18446744073709551616.0 or v < 0.0) return error.IntegerOverflow;
+                if (v >= 18446744073709551616.0 or v <= -1.0) return error.IntegerOverflow;
                 try env.pushI64(@bitCast(@as(u64, @intFromFloat(v))));
             },
 
