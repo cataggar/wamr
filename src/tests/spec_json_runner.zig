@@ -96,25 +96,25 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
         .i64 => |v| b == .i64 and b.i64 == v,
         .f32 => |v| blk: {
             if (b != .f32) break :blk false;
-            const e_bits: u32 = @bitCast(v);
-            const a_bits: u32 = @bitCast(b.f32);
+            const actual_bits: u32 = @bitCast(v);
+            const expected_bits: u32 = @bitCast(b.f32);
             // canonical NaN: accept either sign canonical
-            if (e_bits == 0x7FC00000 or e_bits == 0xFFC00000)
-                break :blk (a_bits == 0x7FC00000 or a_bits == 0xFFC00000);
+            if (expected_bits == 0x7FC00000 or expected_bits == 0xFFC00000)
+                break :blk (actual_bits == 0x7FC00000 or actual_bits == 0xFFC00000);
             // arithmetic NaN marker (0x7FC00001): any NaN passes
-            if (e_bits == 0x7FC00001)
-                break :blk std.math.isNan(b.f32);
-            break :blk a_bits == e_bits;
+            if (expected_bits == 0x7FC00001)
+                break :blk std.math.isNan(v);
+            break :blk actual_bits == expected_bits;
         },
         .f64 => |v| blk: {
             if (b != .f64) break :blk false;
-            const e_bits: u64 = @bitCast(v);
-            const a_bits: u64 = @bitCast(b.f64);
-            if (e_bits == 0x7FF8000000000000 or e_bits == 0xFFF8000000000000)
-                break :blk (a_bits == 0x7FF8000000000000 or a_bits == 0xFFF8000000000000);
-            if (e_bits == 0x7FF8000000000001)
-                break :blk std.math.isNan(b.f64);
-            break :blk a_bits == e_bits;
+            const actual_bits: u64 = @bitCast(v);
+            const expected_bits: u64 = @bitCast(b.f64);
+            if (expected_bits == 0x7FF8000000000000 or expected_bits == 0xFFF8000000000000)
+                break :blk (actual_bits == 0x7FF8000000000000 or actual_bits == 0xFFF8000000000000);
+            if (expected_bits == 0x7FF8000000000001)
+                break :blk std.math.isNan(v);
+            break :blk actual_bits == expected_bits;
         },
         .funcref => |v| b == .funcref and b.funcref == v,
         .externref => |v| b == .externref and b.externref == v,

@@ -16,6 +16,50 @@ inline fn canonF32(val: f32) f32 {
 inline fn canonF64(val: f64) f64 {
     return if (std.math.isNan(val)) @as(f64, @bitCast(@as(u64, 0x7FF8000000000000))) else val;
 }
+
+// Wasm-spec-compliant min/max that handle NaN propagation and signed zeros.
+// Wasm requires: min(-0, +0) = -0, max(-0, +0) = +0.
+inline fn wasmMinF32(a: f32, b: f32) f32 {
+    if (std.math.isNan(a) or std.math.isNan(b)) return canonF32(std.math.nan(f32));
+    if (a == b) return @bitCast(@as(u32, @bitCast(a)) | @as(u32, @bitCast(b)));
+    return @min(a, b);
+}
+inline fn wasmMaxF32(a: f32, b: f32) f32 {
+    if (std.math.isNan(a) or std.math.isNan(b)) return canonF32(std.math.nan(f32));
+    if (a == b) return @bitCast(@as(u32, @bitCast(a)) & @as(u32, @bitCast(b)));
+    return @max(a, b);
+}
+inline fn wasmMinF64(a: f64, b: f64) f64 {
+    if (std.math.isNan(a) or std.math.isNan(b)) return canonF64(std.math.nan(f64));
+    if (a == b) return @bitCast(@as(u64, @bitCast(a)) | @as(u64, @bitCast(b)));
+    return @min(a, b);
+}
+inline fn wasmMaxF64(a: f64, b: f64) f64 {
+    if (std.math.isNan(a) or std.math.isNan(b)) return canonF64(std.math.nan(f64));
+    if (a == b) return @bitCast(@as(u64, @bitCast(a)) & @as(u64, @bitCast(b)));
+    return @max(a, b);
+}
+
+// Wasm nearest: round to nearest integer, ties to even.
+// Zig's @round uses ties-away-from-zero, so we use the add-subtract trick
+// which relies on hardware FP default rounding mode (ties-to-even).
+inline fn wasmNearestF32(x: f32) f32 {
+    if (std.math.isNan(x)) return canonF32(x);
+    const mag = @abs(x);
+    if (mag == 0.0 or mag >= 0x1.0p23) return x;
+    const magic: f32 = 0x1.0p23;
+    const result = (mag + magic) - magic;
+    return std.math.copysign(result, x);
+}
+inline fn wasmNearestF64(x: f64) f64 {
+    if (std.math.isNan(x)) return canonF64(x);
+    const mag = @abs(x);
+    if (mag == 0.0 or mag >= 0x1.0p52) return x;
+    const magic: f64 = 0x1.0p52;
+    const result = (mag + magic) - magic;
+    return std.math.copysign(result, x);
+}
+
 const Opcode = @import("opcode.zig").Opcode;
 
 pub const TrapError = error{
@@ -1293,7 +1337,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .f32_ceil => try env.pushF32(canonF32(@ceil(try env.popF32()))),
             .f32_floor => try env.pushF32(canonF32(@floor(try env.popF32()))),
             .f32_trunc => try env.pushF32(canonF32(@trunc(try env.popF32()))),
-            .f32_nearest => try env.pushF32(canonF32(@round(try env.popF32()))),
+            .f32_nearest => try env.pushF32(wasmNearestF32(try env.popF32())),
             .f32_sqrt => try env.pushF32(canonF32(@sqrt(try env.popF32()))),
 
             // ── f32 arithmetic ──
@@ -1304,12 +1348,12 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .f32_min => {
                 const b = try env.popF32();
                 const a = try env.popF32();
-                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) canonF32(std.math.nan(f32)) else @min(a, b));
+                try env.pushF32(wasmMinF32(a, b));
             },
             .f32_max => {
                 const b = try env.popF32();
                 const a = try env.popF32();
-                try env.pushF32(if (std.math.isNan(a) or std.math.isNan(b)) canonF32(std.math.nan(f32)) else @max(a, b));
+                try env.pushF32(wasmMaxF32(a, b));
             },
             .f32_copysign => {
                 const b = try env.popF32();
@@ -1355,23 +1399,23 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .f64_ceil => try env.pushF64(canonF64(@ceil(try env.popF64()))),
             .f64_floor => try env.pushF64(canonF64(@floor(try env.popF64()))),
             .f64_trunc => try env.pushF64(canonF64(@trunc(try env.popF64()))),
-            .f64_nearest => try env.pushF64(canonF64(@round(try env.popF64()))),
+            .f64_nearest => try env.pushF64(wasmNearestF64(try env.popF64())),
             .f64_sqrt => try env.pushF64(canonF64(@sqrt(try env.popF64()))),
 
             // ── f64 arithmetic ──
             .f64_add => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() + b)); },
             .f64_sub => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() - b)); },
             .f64_mul => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() * b)); },
-            .f64_div => { const b = try env.popF64(); try env.pushF64(try env.popF64() / b); },
+            .f64_div => { const b = try env.popF64(); try env.pushF64(canonF64(try env.popF64() / b)); },
             .f64_min => {
                 const b = try env.popF64();
                 const a = try env.popF64();
-                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) canonF64(std.math.nan(f64)) else @min(a, b));
+                try env.pushF64(wasmMinF64(a, b));
             },
             .f64_max => {
                 const b = try env.popF64();
                 const a = try env.popF64();
-                try env.pushF64(if (std.math.isNan(a) or std.math.isNan(b)) canonF64(std.math.nan(f64)) else @max(a, b));
+                try env.pushF64(wasmMaxF64(a, b));
             },
             .f64_copysign => {
                 const b = try env.popF64();
