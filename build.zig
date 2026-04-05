@@ -129,6 +129,11 @@ pub fn build(b: *std.Build) void {
     // ── Spec test runner ─────────────────────────────────────────────
     // Built in ReleaseFast to avoid safety panics from unimplemented
     // interpreter opcodes — the runner reports failures instead of crashing.
+    const wabt_dep = b.dependency("wabt", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
     const spec_runner_module = b.createModule(.{
         .root_source_file = b.path("src/tests/run_spec_tests.zig"),
         .target = target,
@@ -136,6 +141,7 @@ pub fn build(b: *std.Build) void {
     });
     spec_runner_module.addImport("config", config_module);
     spec_runner_module.addImport("wamr", lib_module);
+    spec_runner_module.addImport("wabt", wabt_dep.artifact("wabt").root_module);
 
     const spec_runner_exe = b.addExecutable(.{
         .name = "spec-test-runner",

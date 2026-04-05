@@ -3,7 +3,12 @@
     .version = "0.1.0",
     .fingerprint = 0xf0e1e3d4e985a2fc,
     .minimum_zig_version = "0.16.0-dev.3061+9b1eaad13",
-    .dependencies = .{},
+    .dependencies = .{
+        .wabt = .{
+            .url = "https://github.com/cataggar/wabt/archive/ae752624bf40c37f8e3caf210ccc00add231d60c.tar.gz",
+            .hash = "wabt-1.0.40-eK3F5gOtJwDG4b9f-ls86vPcw7lVnNYLZEPY6x7JyBC-",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
