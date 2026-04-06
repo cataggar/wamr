@@ -440,14 +440,20 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
 
     var current_module: ?wamr.Module = null;
     var current_instance: ?wamr.Instance = null;
+    // Whether current_instance is owned (needs deinit) or borrowed from reg_instances
+    var current_instance_owned: bool = false;
 
     const json_dir = std.fs.path.dirname(json_path) orelse ".";
 
     var current_wasm_data: ?[]u8 = null;
 
-    // Module registry: maps name → instance for cross-module imports
+    // Module registry: maps import module name → instance for cross-module imports
     var module_registry = std.StringHashMap(*types.ModuleInstance).init(allocator);
     defer module_registry.deinit();
+
+    // Named instance registry: maps JSON module name ($Mg, $Mt, etc.) → instance for assertion lookup
+    var named_instances = std.StringHashMap(wamr.Instance).init(allocator);
+    defer named_instances.deinit();
 
     // Track allocated registry name strings for cleanup
     var registry_names: std.ArrayList([]const u8) = .empty;
@@ -462,7 +468,9 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
     var reg_wasm_data: std.ArrayList([]u8) = .empty;
 
     defer {
-        if (current_instance) |*i| i.deinit();
+        if (current_instance_owned) {
+            if (current_instance) |*i| i.deinit();
+        }
         if (current_module) |*m| m.deinit();
         if (current_wasm_data) |d| allocator.free(d);
     }
@@ -479,10 +487,12 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
         result.total += 1;
 
         if (std.mem.eql(u8, cmd.type, "module")) {
-            if (current_instance) |*inst| {
-                inst.deinit();
-                current_instance = null;
+            // Clean up previous current state
+            if (current_instance_owned) {
+                if (current_instance) |*inst| inst.deinit();
             }
+            current_instance = null;
+            current_instance_owned = false;
             if (current_module) |*mod| {
                 mod.deinit();
                 current_module = null;
@@ -530,6 +540,33 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                     continue;
                 };
             }
+
+            // If module has a JSON name, move to registries so it survives across module loads
+            if (cmd.name) |mod_name| {
+                if (current_instance) |inst| {
+                    // Move to registries for lifetime management
+                    reg_instances.append(allocator, inst) catch {};
+                    if (current_module) |mod| {
+                        const mod_heap = allocator.create(wamr.Module) catch {
+                            result.passed += 1;
+                            continue;
+                        };
+                        mod_heap.* = mod;
+                        inst.inner.module = &mod_heap.inner;
+                        reg_mod_ptrs.append(allocator, mod_heap) catch {};
+                        current_module = null;
+                    }
+                    if (current_wasm_data) |wd| {
+                        reg_wasm_data.append(allocator, wd) catch {};
+                        current_wasm_data = null;
+                    }
+                    named_instances.put(mod_name, inst) catch {};
+                    // current_instance is now a borrowed reference
+                    current_instance_owned = false;
+                }
+            } else {
+                current_instance_owned = true;
+            }
             result.passed += 1;
         } else if (std.mem.eql(u8, cmd.type, "register")) {
             const reg_name = cmd.@"as" orelse {
@@ -550,32 +587,40 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                     result.skipped += 1;
                     continue;
                 };
-                // Heap-allocate Module so WasmModule address stays stable
-                if (current_module) |mod| {
-                    const mod_heap = allocator.create(wamr.Module) catch {
+                // Only move to registries if not already moved by named module handler
+                if (current_instance_owned) {
+                    // Heap-allocate Module so WasmModule address stays stable
+                    if (current_module) |mod| {
+                        const mod_heap = allocator.create(wamr.Module) catch {
+                            result.skipped += 1;
+                            continue;
+                        };
+                        mod_heap.* = mod;
+                        inst.inner.module = &mod_heap.inner;
+                        reg_mod_ptrs.append(allocator, mod_heap) catch {
+                            result.skipped += 1;
+                            continue;
+                        };
+                        current_module = null;
+                    }
+                    reg_instances.append(allocator, inst) catch {
                         result.skipped += 1;
                         continue;
                     };
-                    mod_heap.* = mod;
-                    inst.inner.module = &mod_heap.inner;
-                    reg_mod_ptrs.append(allocator, mod_heap) catch {
-                        result.skipped += 1;
-                        continue;
-                    };
-                    current_module = null;
+                    if (current_wasm_data) |wd| {
+                        reg_wasm_data.append(allocator, wd) catch {
+                            result.skipped += 1;
+                            continue;
+                        };
+                        current_wasm_data = null;
+                    }
                 }
-                reg_instances.append(allocator, inst) catch {
-                    result.skipped += 1;
-                    continue;
-                };
+                // Also track by JSON name if present
+                if (cmd.name) |mod_name| {
+                    named_instances.put(mod_name, inst) catch {};
+                }
                 current_instance = null;
-                if (current_wasm_data) |wd| {
-                    reg_wasm_data.append(allocator, wd) catch {
-                        result.skipped += 1;
-                        continue;
-                    };
-                    current_wasm_data = null;
-                }
+                current_instance_owned = false;
                 result.passed += 1;
             } else {
                 result.skipped += 1;
@@ -591,7 +636,12 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 continue;
             }
 
-            var inst = current_instance orelse {
+            // Resolve instance: use action.module if specified, else current
+            const resolved_inst = if (action.module) |mod_name|
+                named_instances.get(mod_name) orelse current_instance
+            else
+                current_instance;
+            var inst = resolved_inst orelse {
                 result.skipped += 1;
                 continue;
             };
@@ -660,7 +710,12 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 continue;
             }
 
-            var inst = current_instance orelse {
+            // Resolve instance: use action.module if specified, else current
+            const resolved_trap_inst = if (action.module) |mod_name|
+                named_instances.get(mod_name) orelse current_instance
+            else
+                current_instance;
+            var inst = resolved_trap_inst orelse {
                 result.skipped += 1;
                 continue;
             };
