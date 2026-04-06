@@ -2,7 +2,7 @@
     .name = .wamr,
     .version = "0.1.0",
     .fingerprint = 0xf0e1e3d4e985a2fc,
-    .minimum_zig_version = "0.16.0-dev.3061+9b1eaad13",
+    .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .wabt = .{
             .url = "https://github.com/cataggar/wabt/archive/62681550465cb11b06d54be8cf7c3179028fc19d.tar.gz",

@@ -59,7 +59,7 @@ pub const x86_64_compile = @import("compiler/codegen/x86_64/compile.zig");
 pub const spec_runner = @import("tests/spec_runner.zig");
 
 /// WASI preview1 implementation.
-/// Note: Uses std.Io; tests require async IO-aware runner.
+/// Note: Uses std.fs.File; tests require IO-aware runner.
 /// Excluded from refAllDecls to avoid test runner hang.
 const _wasi = @import("wasi/wasi.zig");
 

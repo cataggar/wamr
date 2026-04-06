@@ -229,9 +229,9 @@ fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
 // ── 2. Threading ────────────────────────────────────────────────────────
 
 pub const Thread = std.Thread;
-pub const Mutex = std.Io.Mutex;
-pub const Condition = std.Io.Condition;
-pub const RwLock = std.Io.RwLock;
+pub const Mutex = std.Thread.Mutex;
+pub const Condition = std.Thread.Condition;
+pub const RwLock = std.Thread.RwLock;
 
 /// Get the current thread ID.
 pub fn selfThread() std.Thread.Id {
@@ -460,21 +460,21 @@ fn icacheFlushAarch64(start: [*]u8, len: usize) void {
             asm volatile ("dc cvau, %[addr]"
                 :
                 : [addr] "r" (addr),
-                : "memory"
+                : .{ .memory = true }
             );
         }
-        asm volatile ("dsb ish" ::: "memory");
+        asm volatile ("dsb ish" ::: .{ .memory = true });
 
         addr = base & ~(cache_line - 1);
         while (addr < end) : (addr += cache_line) {
             asm volatile ("ic ivau, %[addr]"
                 :
                 : [addr] "r" (addr),
-                : "memory"
+                : .{ .memory = true }
             );
         }
-        asm volatile ("dsb ish" ::: "memory");
-        asm volatile ("isb" ::: "memory");
+        asm volatile ("dsb ish" ::: .{ .memory = true });
+        asm volatile ("isb" ::: .{ .memory = true });
     }
 }
 

@@ -8,29 +8,30 @@
 const std = @import("std");
 const spec_json_runner = @import("spec_json_runner.zig");
 
-const Io = std.Io;
-const Dir = Io.Dir;
+const Dir = std.fs.Dir;
 const print = std.debug.print;
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-    defer args_iter.deinit();
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
-    _ = args_iter.next(); // skip program name
-    const json_dir = args_iter.next() orelse {
+    if (args.len < 2) {
         print("Usage: spec-test-runner <json-dir>\n", .{});
         std.process.exit(1);
-    };
+    }
+    const json_dir = args[1];
 
     print("\n=== WebAssembly Spec Test Runner ===\n\n", .{});
 
-    var dir = Dir.cwd().openDir(init.io, json_dir, .{ .iterate = true }) catch |err| {
+    var dir = std.fs.cwd().openDir(json_dir, .{ .iterate = true }) catch |err| {
         print("Error: cannot open directory '{s}': {}\n", .{ json_dir, err });
         std.process.exit(1);
     };
-    defer dir.close(init.io);
+    defer dir.close();
 
     var total_passed: u32 = 0;
     var total_failed: u32 = 0;
@@ -46,7 +47,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var iter = dir.iterate();
-    while (iter.next(init.io) catch null) |entry| {
+    while (iter.next() catch null) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
             const name_copy = try allocator.dupe(u8, entry.name);
             try json_files.append(allocator, name_copy);
@@ -64,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         const json_path = try std.fs.path.join(allocator, &.{ json_dir, name });
         defer allocator.free(json_path);
 
-        const result = spec_json_runner.runSpecTestFile(json_path, allocator, init.io) catch |err| {
+        const result = spec_json_runner.runSpecTestFile(json_path, allocator) catch |err| {
             print("  {s:<20} ERROR: {}\n", .{ name, err });
             continue;
         };

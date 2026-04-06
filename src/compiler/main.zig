@@ -7,20 +7,13 @@ const wamr = @import("wamr");
 const emit_aot = wamr.emit_aot;
 const compile = wamr.x86_64_compile;
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+pub fn main() !void {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    // Collect command-line arguments
-    var args_list: std.ArrayList([]const u8) = .empty;
-    defer args_list.deinit(allocator);
-    {
-        var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
-        defer it.deinit();
-        while (it.next()) |arg| {
-            try args_list.append(allocator, arg);
-        }
-    }
-    const args = args_list.items;
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
     if (args.len < 3) {
         std.debug.print("Usage: wamrc <input.wasm> -o <output.aot>\n", .{});
@@ -51,9 +44,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // 1. Read input wasm
-    const cwd = std.Io.Dir.cwd();
-    const io = init.io;
-    const wasm_data = cwd.readFileAlloc(io, in_path, allocator, std.Io.Limit.limited(64 * 1024 * 1024)) catch |err| {
+    const cwd = std.fs.cwd();
+    const wasm_data = cwd.readFileAlloc(allocator, in_path, 64 * 1024 * 1024) catch |err| {
         std.debug.print("Error reading {s}: {}\n", .{ in_path, err });
         std.process.exit(1);
     };
@@ -115,12 +107,12 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(aot_binary);
 
     // 7. Write output
-    const out_file = cwd.createFile(io, out_path, .{}) catch |err| {
+    const out_file = cwd.createFile(out_path, .{}) catch |err| {
         std.debug.print("Error creating {s}: {}\n", .{ out_path, err });
         std.process.exit(1);
     };
-    defer out_file.close(io);
-    out_file.writeStreamingAll(io, aot_binary) catch |err| {
+    defer out_file.close();
+    out_file.writeAll(aot_binary) catch |err| {
         std.debug.print("Error writing {s}: {}\n", .{ out_path, err });
         std.process.exit(1);
     };

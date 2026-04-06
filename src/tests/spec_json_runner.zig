@@ -11,7 +11,7 @@ const types = root.types;
 const instance_mod = root.instance;
 
 const Io = std.Io;
-const Dir = Io.Dir;
+const Dir = std.fs.Dir;
 
 pub const SpecTestResult = struct {
     file: []const u8,
@@ -422,9 +422,9 @@ fn makeDefaultTable(tt: ?types.TableType, allocator: std.mem.Allocator) ?types.T
     };
 }
 
-pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: Io) !SpecTestResult {
-    const cwd = Dir.cwd();
-    const json_data = try cwd.readFileAlloc(io, json_path, allocator, Io.Limit.limited(10 * 1024 * 1024));
+pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !SpecTestResult {
+    const cwd = std.fs.cwd();
+    const json_data = try cwd.readFileAlloc(allocator, json_path, 10 * 1024 * 1024);
     defer allocator.free(json_data);
 
     const parsed = try std.json.parseFromSlice(SpecJson, allocator, json_data, .{
@@ -500,7 +500,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(allocator, wasm_path, 10 * 1024 * 1024) catch {
                 result.skipped += 1;
                 continue;
             };
@@ -702,7 +702,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(allocator, wasm_path, 10 * 1024 * 1024) catch {
                 result.passed += 1; // can't read = invalid, as expected
                 continue;
             };
@@ -730,7 +730,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(allocator, wasm_path, 10 * 1024 * 1024) catch {
                 result.passed += 1;
                 continue;
             };
@@ -786,7 +786,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
             defer allocator.free(wasm_path);
 
-            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, Io.Limit.limited(10 * 1024 * 1024)) catch {
+            const wasm_data = cwd.readFileAlloc(allocator, wasm_path, 10 * 1024 * 1024) catch {
                 result.passed += 1;
                 continue;
             };
