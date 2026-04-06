@@ -26,7 +26,7 @@ pub const InstantiationError = error{
 /// When a module has imports, the caller must supply this context
 /// with enough entries to cover each import category count.
 pub const ImportContext = struct {
-    globals: []const types.GlobalInstance = &.{},
+    globals: []const *types.GlobalInstance = &.{},
     memories: []const types.MemoryInstance = &.{},
     tables: []const types.TableInstance = &.{},
     functions: []const types.ImportedFunction = &.{},
@@ -71,7 +71,7 @@ pub fn instantiateWithImports(
     errdefer freeTables(inst.tables, allocator);
 
     inst.globals = try initializeGlobals(module, allocator, import_ctx);
-    errdefer freeGlobals(inst.globals, allocator);
+    errdefer freeGlobals(inst.globals, module.import_global_count, allocator);
 
     // Store imported function references
     if (import_ctx) |ctx| {
@@ -100,7 +100,7 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     const allocator = inst.allocator;
     freeMemories(inst.memories, allocator);
     freeTables(inst.tables, allocator);
-    freeGlobals(inst.globals, allocator);
+    freeGlobals(inst.globals, inst.module.import_global_count, allocator);
     if (inst.import_functions.len > 0) allocator.free(inst.import_functions);
     allocator.destroy(inst);
 }
@@ -210,12 +210,12 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
     return tables;
 }
 
-fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]types.GlobalInstance {
+fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]*types.GlobalInstance {
     const import_count = module.import_global_count;
     const total_count = import_count + @as(u32, @intCast(module.globals.len));
     if (total_count == 0) return &.{};
 
-    const globals = allocator.alloc(types.GlobalInstance, total_count) catch
+    const globals = allocator.alloc(*types.GlobalInstance, total_count) catch
         return error.OutOfMemory;
 
     // Copy imported globals
@@ -230,17 +230,19 @@ fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocat
 
     // Initialize local globals (can reference imported globals via global.get)
     for (module.globals, 0..) |global, i| {
-        globals[import_count + i] = .{
+        const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
+        g.* = .{
             .global_type = global.global_type,
             .value = try evalInitExpr(global.init_expr, globals[0 .. import_count + i]),
         };
+        globals[import_count + i] = g;
     }
 
     return globals;
 }
 
 /// Evaluate a constant init expression.
-fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const types.GlobalInstance) InstantiationError!types.Value {
+fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalInstance) InstantiationError!types.Value {
     return switch (expr) {
         .i32_const => |v| .{ .i32 = v },
         .i64_const => |v| .{ .i64 = v },
@@ -301,7 +303,7 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []types.TableInsta
 }
 
 /// Helper: evaluate an init expr, returning the result as a u32 offset.
-fn evalInitExprAsU32(expr: types.InitExpr, globals: []const types.GlobalInstance) InstantiationError!u32 {
+fn evalInitExprAsU32(expr: types.InitExpr, globals: []const *types.GlobalInstance) InstantiationError!u32 {
     const val = try evalInitExpr(expr, globals);
     return switch (val) {
         .i32 => |v| if (v < 0) return error.DataSegmentOutOfBounds else @intCast(v),
@@ -322,7 +324,11 @@ fn freeTables(tables: []types.TableInstance, allocator: std.mem.Allocator) void 
     if (tables.len > 0) allocator.free(tables);
 }
 
-fn freeGlobals(globals: []types.GlobalInstance, allocator: std.mem.Allocator) void {
+fn freeGlobals(globals: []*types.GlobalInstance, import_count: u32, allocator: std.mem.Allocator) void {
+    // Only destroy locally-created globals; imported globals are shared pointers
+    for (globals[import_count..]) |g| {
+        allocator.destroy(g);
+    }
     if (globals.len > 0) allocator.free(globals);
 }
 

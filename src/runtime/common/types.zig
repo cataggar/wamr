@@ -319,6 +319,7 @@ pub const TableInstance = struct {
 pub const GlobalInstance = struct {
     global_type: GlobalType,
     value: Value,
+    owned: bool = true,
 };
 
 /// A resolved imported function target
@@ -332,7 +333,7 @@ pub const ModuleInstance = struct {
     module: *const WasmModule,
     memories: []MemoryInstance,
     tables: []TableInstance,
-    globals: []GlobalInstance,
+    globals: []*GlobalInstance,
     import_functions: []const ImportedFunction = &.{},
     allocator: std.mem.Allocator,
 

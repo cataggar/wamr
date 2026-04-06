@@ -146,7 +146,7 @@ fn buildImportContext(
         module.import_table_count == 0 and
         module.import_function_count == 0) return null;
 
-    var globals: std.ArrayList(types.GlobalInstance) = .empty;
+    var globals: std.ArrayList(*types.GlobalInstance) = .empty;
     defer globals.deinit(allocator);
     var memories: std.ArrayList(types.MemoryInstance) = .empty;
     defer {
@@ -176,10 +176,13 @@ fn buildImportContext(
                         return error.ImportResolutionFailed;
                     if (sgt.val_type != gt.val_type or sgt.mutability != gt.mutability)
                         return error.ImportResolutionFailed;
-                    globals.append(allocator, .{
+                    const g = allocator.create(types.GlobalInstance) catch
+                        return error.ImportResolutionFailed;
+                    g.* = .{
                         .global_type = gt,
                         .value = getSpectestGlobal(imp.field_name, gt.val_type),
-                    }) catch return error.ImportResolutionFailed;
+                    };
+                    globals.append(allocator, g) catch return error.ImportResolutionFailed;
                 } else {
                     const ri = reg_inst.?;
                     const exp = ri.module.findExport(imp.field_name, .global) orelse
@@ -189,7 +192,11 @@ fn buildImportContext(
                     if (eg.global_type.val_type != gt.val_type or
                         eg.global_type.mutability != gt.mutability)
                         return error.ImportResolutionFailed;
-                    globals.append(allocator, eg) catch return error.ImportResolutionFailed;
+                    const gw = allocator.create(types.GlobalInstance) catch
+                        return error.ImportResolutionFailed;
+                    gw.* = eg.*;
+                    gw.owned = false;
+                    globals.append(allocator, gw) catch return error.ImportResolutionFailed;
                 }
             },
             .memory => {
@@ -286,6 +293,19 @@ fn freeImportContext(ctx: instance_mod.ImportContext, allocator: std.mem.Allocat
     if (ctx.memories.len > 0) allocator.free(ctx.memories);
     for (ctx.tables) |*t| allocator.free(@constCast(t).elements);
     if (ctx.tables.len > 0) allocator.free(ctx.tables);
+    for (ctx.globals) |g| { if (g.owned) allocator.destroy(g); }
+    if (ctx.globals.len > 0) allocator.free(ctx.globals);
+    if (ctx.functions.len > 0) allocator.free(ctx.functions);
+}
+
+/// Free only the ImportContext slice containers and non-global data.
+/// For success paths where the module instance has taken ownership of
+/// the global pointers but memories/tables were value-copied.
+fn freeImportContextSlices(ctx: instance_mod.ImportContext, allocator: std.mem.Allocator) void {
+    for (ctx.memories) |*m| allocator.free(@constCast(m).data);
+    if (ctx.memories.len > 0) allocator.free(ctx.memories);
+    for (ctx.tables) |*t| allocator.free(@constCast(t).elements);
+    if (ctx.tables.len > 0) allocator.free(ctx.tables);
     if (ctx.globals.len > 0) allocator.free(ctx.globals);
     if (ctx.functions.len > 0) allocator.free(ctx.functions);
 }
@@ -310,7 +330,7 @@ fn defaultValue(val_type: types.ValType) types.Value {
     };
 }
 
-fn findExportedGlobal(inst: *types.ModuleInstance, name: []const u8) ?types.GlobalInstance {
+fn findExportedGlobal(inst: *types.ModuleInstance, name: []const u8) ?*types.GlobalInstance {
     const exp = inst.module.findExport(name, .global) orelse return null;
     if (exp.index < inst.globals.len) return inst.globals[exp.index];
     return null;
@@ -533,7 +553,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                     result.skipped += 1;
                     continue;
                 };
-                freeImportContext(ctx, allocator);
+                freeImportContextSlices(ctx, allocator);
             } else {
                 current_instance = current_module.?.instantiate() catch {
                     result.skipped += 1;

@@ -145,7 +145,7 @@ fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Alloca
     return tables;
 }
 
-fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]types.GlobalInstance {
+fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.GlobalInstance {
     // AOT modules don't carry global init exprs in this loader yet;
     // return empty for now. Full init_data parsing will populate these.
     _ = module;
@@ -167,7 +167,8 @@ fn freeTables(tables: []types.TableInstance, allocator: std.mem.Allocator) void 
     if (tables.len > 0) allocator.free(tables);
 }
 
-fn freeGlobals(globals: []types.GlobalInstance, allocator: std.mem.Allocator) void {
+fn freeGlobals(globals: []*types.GlobalInstance, allocator: std.mem.Allocator) void {
+    for (globals) |g| allocator.destroy(g);
     if (globals.len > 0) allocator.free(globals);
 }
 
