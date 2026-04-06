@@ -327,6 +327,9 @@ pub const MemoryInstance = struct {
 pub const TableInstance = struct {
     table_type: TableType,
     elements: []?u32,
+    /// Module instance that last wrote elem segments to this table.
+    /// Used by call_indirect to resolve function indices across modules.
+    source_module: ?*ModuleInstance = null,
     ref_count: u32 = 1,
 
     pub fn retain(self: *TableInstance) void {

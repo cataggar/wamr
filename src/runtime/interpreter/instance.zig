@@ -81,7 +81,7 @@ pub fn instantiateWithImports(
     }
 
     try applyDataSegments(module, inst.memories);
-    try applyElemSegments(module, inst.tables);
+    try applyElemSegments(module, inst.tables, inst);
 
     // Execute start function if present (§4.5.4 step 15)
     if (module.start_function) |start_idx| {
@@ -274,7 +274,7 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryI
     }
 }
 
-fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInstance) InstantiationError!void {
+fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInstance, inst: *types.ModuleInstance) InstantiationError!void {
     for (module.elements) |seg| {
         if (seg.is_passive or seg.is_declarative) continue;
 
@@ -292,6 +292,8 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
         for (seg.func_indices, 0..) |func_idx, i| {
             table.elements[offset + i] = func_idx;
         }
+        // Track the module that wrote to this table for cross-module call_indirect
+        table.source_module = inst;
     }
 }
 

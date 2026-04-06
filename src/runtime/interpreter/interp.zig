@@ -733,15 +733,30 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const func_idx = table.elements[elem_idx] orelse return error.UninitializedElement;
 
+                // Type check against calling module's type
                 const module = env.module_inst.module;
                 if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
                 const expected_type = module.types[type_idx];
-                const actual_type = module.getFuncType(func_idx) orelse return error.UnknownFunction;
+
+                // Resolve function: try source module first (for shared tables), then current
+                const source = table.source_module orelse env.module_inst;
+                const actual_type = source.module.getFuncType(func_idx) orelse
+                    env.module_inst.module.getFuncType(func_idx) orelse
+                    return error.UnknownFunction;
                 if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
 
                 const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
                 frame.ip = @intCast(ip);
-                try executeFunction(env, func_idx);
+
+                // Dispatch to source module if cross-module
+                if (source != env.module_inst) {
+                    const saved = env.module_inst;
+                    env.module_inst = source;
+                    defer env.module_inst = saved;
+                    try executeFunction(env, func_idx);
+                } else {
+                    try executeFunction(env, func_idx);
+                }
             },
 
             .return_call => {
@@ -763,9 +778,15 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const module = env.module_inst.module;
                 if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
                 const expected_type = module.types[type_idx];
-                const actual_type = module.getFuncType(func_idx) orelse return error.UnknownFunction;
+                const source = table.source_module orelse env.module_inst;
+                const actual_type = source.module.getFuncType(func_idx) orelse
+                    env.module_inst.module.getFuncType(func_idx) orelse
+                    return error.UnknownFunction;
                 if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
 
+                if (source != env.module_inst) {
+                    env.module_inst = source;
+                }
                 try prepareTailCall(env, func_idx);
                 tail_call_target.* = func_idx;
                 return .tail_call;
