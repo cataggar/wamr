@@ -392,7 +392,7 @@ fn makeSpectestMemory(allocator: std.mem.Allocator) ?*types.MemoryInstance {
 }
 
 fn makeSpectestTable(allocator: std.mem.Allocator) ?*types.TableInstance {
-    const elems = allocator.alloc(?u32, 10) catch return null;
+    const elems = allocator.alloc(?types.FuncRef, 10) catch return null;
     @memset(elems, null);
     const tbl = allocator.create(types.TableInstance) catch { allocator.free(elems); return null; };
     tbl.* = .{ .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 10, .max = 20 } }, .elements = elems };

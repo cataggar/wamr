@@ -323,13 +323,17 @@ pub const MemoryInstance = struct {
     }
 };
 
+/// A function reference stored in a table element.
+/// Tracks the source module for cross-module call_indirect dispatch.
+pub const FuncRef = struct {
+    func_idx: u32,
+    module_inst: *ModuleInstance,
+};
+
 /// Runtime table instance (refcounted for cross-module sharing)
 pub const TableInstance = struct {
     table_type: TableType,
-    elements: []?u32,
-    /// Module instance that last wrote elem segments to this table.
-    /// Used by call_indirect to resolve function indices across modules.
-    source_module: ?*ModuleInstance = null,
+    elements: []?FuncRef,
     ref_count: u32 = 1,
 
     pub fn retain(self: *TableInstance) void {

@@ -187,7 +187,7 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
     // Heap-allocate local tables
     for (module.tables, 0..) |table_type, i| {
         const min_elems = table_type.limits.min;
-        const elems = allocator.alloc(?u32, min_elems) catch
+        const elems = allocator.alloc(?types.FuncRef, min_elems) catch
             return error.TableAllocationFailed;
         @memset(elems, null);
 
@@ -290,10 +290,8 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
         if (end > table.elements.len) return error.ElemSegmentOutOfBounds;
 
         for (seg.func_indices, 0..) |func_idx, i| {
-            table.elements[offset + i] = func_idx;
+            table.elements[offset + i] = .{ .func_idx = func_idx, .module_inst = inst };
         }
-        // Track the module that wrote to this table for cross-module call_indirect
-        table.source_module = inst;
     }
 }
 

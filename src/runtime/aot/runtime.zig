@@ -132,7 +132,7 @@ fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Alloca
     }
 
     for (module.tables, 0..) |table_type, i| {
-        const elements = allocator.alloc(?u32, table_type.limits.min) catch return error.TableAllocationFailed;
+        const elements = allocator.alloc(?types.FuncRef, table_type.limits.min) catch return error.TableAllocationFailed;
         @memset(elements, null);
         const tbl = allocator.create(types.TableInstance) catch {
             allocator.free(elements);

@@ -731,31 +731,27 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
 
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
-                const func_idx = table.elements[elem_idx] orelse return error.UninitializedElement;
+                const funcref = table.elements[elem_idx] orelse return error.UninitializedElement;
 
-                // Type check against calling module's type
                 const module = env.module_inst.module;
                 if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
                 const expected_type = module.types[type_idx];
 
-                // Resolve function: try source module first (for shared tables), then current
-                const source = table.source_module orelse env.module_inst;
-                const actual_type = source.module.getFuncType(func_idx) orelse
-                    env.module_inst.module.getFuncType(func_idx) orelse
-                    return error.UnknownFunction;
+                // Resolve function type from the funcref's source module
+                const actual_type = funcref.module_inst.module.getFuncType(funcref.func_idx) orelse return error.UnknownFunction;
                 if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
 
                 const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
                 frame.ip = @intCast(ip);
 
-                // Dispatch to source module if cross-module
-                if (source != env.module_inst) {
+                // Dispatch to the funcref's source module
+                if (funcref.module_inst != env.module_inst) {
                     const saved = env.module_inst;
-                    env.module_inst = source;
+                    env.module_inst = funcref.module_inst;
                     defer env.module_inst = saved;
-                    try executeFunction(env, func_idx);
+                    try executeFunction(env, funcref.func_idx);
                 } else {
-                    try executeFunction(env, func_idx);
+                    try executeFunction(env, funcref.func_idx);
                 }
             },
 
@@ -773,22 +769,19 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
 
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
-                const func_idx = table.elements[elem_idx] orelse return error.UninitializedElement;
+                const funcref = table.elements[elem_idx] orelse return error.UninitializedElement;
 
                 const module = env.module_inst.module;
                 if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
                 const expected_type = module.types[type_idx];
-                const source = table.source_module orelse env.module_inst;
-                const actual_type = source.module.getFuncType(func_idx) orelse
-                    env.module_inst.module.getFuncType(func_idx) orelse
-                    return error.UnknownFunction;
+                const actual_type = funcref.module_inst.module.getFuncType(funcref.func_idx) orelse return error.UnknownFunction;
                 if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
 
-                if (source != env.module_inst) {
-                    env.module_inst = source;
+                if (funcref.module_inst != env.module_inst) {
+                    env.module_inst = funcref.module_inst;
                 }
-                try prepareTailCall(env, func_idx);
-                tail_call_target.* = func_idx;
+                try prepareTailCall(env, funcref.func_idx);
+                tail_call_target.* = funcref.func_idx;
                 return .tail_call;
             },
 
@@ -1626,9 +1619,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const ref = table.elements[elem_idx];
                 if (table.table_type.elem_type == .externref) {
-                    try env.push(.{ .externref = ref });
+                    try env.push(.{ .externref = if (ref) |r| r.func_idx else null });
                 } else {
-                    try env.push(.{ .funcref = ref });
+                    try env.push(.{ .funcref = if (ref) |r| r.func_idx else null });
                 }
             },
             .table_set => {
@@ -1637,11 +1630,12 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const elem_idx: u32 = @bitCast(try env.popI32());
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
-                table.elements[elem_idx] = switch (ref) {
+                const raw_ref: ?u32 = switch (ref) {
                     .funcref => |r| r,
                     .externref => |r| r,
                     else => null,
                 };
+                table.elements[elem_idx] = if (raw_ref) |r| .{ .func_idx = r, .module_inst = env.module_inst } else null;
             },
 
             // ── Misc prefix (0xFC) ──
@@ -1784,7 +1778,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
                         for (0..n) |i| {
-                            table.elements[d + @as(u32, @intCast(i))] = elem.func_indices[s + @as(u32, @intCast(i))];
+                            const fi = elem.func_indices[s + @as(u32, @intCast(i))];
+                            table.elements[d + @as(u32, @intCast(i))] = .{ .func_idx = fi, .module_inst = env.module_inst };
                         }
                     },
                     13 => { // elem.drop
@@ -1835,9 +1830,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             try env.pushI32(-1);
                             continue;
                         };
-                        const init_val: ?u32 = switch (init_ref) {
-                            .funcref => |r| r,
-                            .externref => |r| r,
+                        const init_val: ?types.FuncRef = switch (init_ref) {
+                            .funcref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
+                            .externref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
                             else => null,
                         };
                         for (new_elems[old_size..]) |*e| e.* = init_val;
@@ -1856,9 +1851,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const offset: u32 = @bitCast(try env.popI32());
                         const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, offset) + n > table.elements.len) return error.OutOfBoundsTableAccess;
-                        const ref_val: ?u32 = switch (val) {
-                            .funcref => |r| r,
-                            .externref => |r| r,
+                        const ref_val: ?types.FuncRef = switch (val) {
+                            .funcref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
+                            .externref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
                             else => null,
                         };
                         for (table.elements[offset..][0..n]) |*e| e.* = ref_val;
