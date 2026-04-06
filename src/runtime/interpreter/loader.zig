@@ -1227,7 +1227,20 @@ fn popAny(stack: []VT, sp: *u32, cf: ?*CtrlFrame) ?VT {
 }
 
 fn checkStackEnd(cf: *const CtrlFrame, stack: []const VT, sp: u32) bool {
-    if (cf.unreachable_flag) return true;
+    if (cf.unreachable_flag) {
+        const expected = cf.end_types;
+        // In unreachable mode: values above start_height are concrete and must match.
+        // Extra values above start_height + expected.len are invalid.
+        if (sp > cf.start_height + expected.len) return false;
+        // Check concrete values on stack (above start_height) against expected types.
+        // Values below start_height are polymorphic (match anything).
+        for (expected, 0..) |t, j| {
+            const stack_idx = cf.start_height + @as(u32, @intCast(j));
+            if (stack_idx >= sp) continue; // below concrete stack → polymorphic, OK
+            if (stack[stack_idx] != t) return false;
+        }
+        return true;
+    }
     const expected = cf.end_types;
     if (sp != cf.start_height + expected.len) return false;
     for (expected, 0..) |t, j| {
