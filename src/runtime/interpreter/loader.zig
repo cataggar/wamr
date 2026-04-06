@@ -1457,11 +1457,16 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
             0x0D => { // br_if
                 const label = readU32Leb(code, &i);
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
+                if (!popExpect(&stack_buf, &sp, .i32, cf))
                     return error.TypeMismatch;
                 if (ctrl_sp <= label) return error.TypeMismatch;
                 const target = &ctrl_buf[ctrl_sp - 1 - label];
-                try peekLabelTypes(&stack_buf, &sp, getLabelTypes(target), ctrl_top.get(&ctrl_buf, ctrl_sp));
+                const label_types = getLabelTypes(target);
+                // Per spec: br_if pops label types and re-pushes them.
+                // In unreachable code, this materializes concrete types on the stack.
+                try popLabelTypes(&stack_buf, &sp, label_types, cf);
+                for (label_types) |t| pushType(&stack_buf, &sp, t);
             },
             0x0E => { // br_table
                 const count = readU32Leb(code, &i);
@@ -1598,7 +1603,13 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
             0x1C => { // select_t
                 const count = readU32Leb(code, &i);
-                const sel_type: VT = if (count > 0 and i < code.len) @enumFromInt(code[i]) else .i32;
+                if (count == 0 or i >= code.len) return error.TypeMismatch;
+                const type_byte = code[i];
+                // Validate the type is a known valtype
+                const sel_type: VT = switch (type_byte) {
+                    0x7F, 0x7E, 0x7D, 0x7C, 0x70, 0x6F => @enumFromInt(type_byte),
+                    else => return error.TypeMismatch,
+                };
                 i += count;
                 if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
