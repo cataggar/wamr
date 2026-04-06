@@ -119,26 +119,25 @@ fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allo
     return memories;
 }
 
-fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]types.TableInstance {
+fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.TableInstance {
     if (module.tables.len == 0) return &.{};
 
-    const tables = allocator.alloc(types.TableInstance, module.tables.len) catch return error.OutOfMemory;
+    const tables = allocator.alloc(*types.TableInstance, module.tables.len) catch return error.OutOfMemory;
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| {
-            allocator.free(tables[i].elements);
-        }
+        for (0..initialized) |i| tables[i].release(allocator);
         allocator.free(tables);
     }
 
     for (module.tables, 0..) |table_type, i| {
         const elements = allocator.alloc(?u32, table_type.limits.min) catch return error.TableAllocationFailed;
         @memset(elements, null);
-
-        tables[i] = .{
-            .table_type = table_type,
-            .elements = elements,
+        const tbl = allocator.create(types.TableInstance) catch {
+            allocator.free(elements);
+            return error.TableAllocationFailed;
         };
+        tbl.* = .{ .table_type = table_type, .elements = elements };
+        tables[i] = tbl;
         initialized += 1;
     }
 
@@ -160,10 +159,8 @@ fn freeMemories(memories: []types.MemoryInstance, allocator: std.mem.Allocator) 
     if (memories.len > 0) allocator.free(memories);
 }
 
-fn freeTables(tables: []types.TableInstance, allocator: std.mem.Allocator) void {
-    for (tables) |*tbl| {
-        if (tbl.elements.len > 0) allocator.free(tbl.elements);
-    }
+fn freeTables(tables: []*types.TableInstance, allocator: std.mem.Allocator) void {
+    for (tables) |t| t.release(allocator);
     if (tables.len > 0) allocator.free(tables);
 }
 

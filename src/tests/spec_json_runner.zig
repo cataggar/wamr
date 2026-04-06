@@ -237,8 +237,15 @@ fn buildImportContext(
                     const exp = ri.module.findExport(imp.field_name, .table) orelse
                         return error.ImportResolutionFailed;
                     if (exp.index >= ri.tables.len) return error.ImportResolutionFailed;
-                    // Share the table — retain refcount
                     const t = ri.tables[exp.index];
+                    // Validate elem type and limits compatibility
+                    if (imp.table_type) |tt| {
+                        if (t.table_type.elem_type != tt.elem_type)
+                            return error.ImportResolutionFailed;
+                        if (!limitsMatch(t.table_type.limits, tt.limits))
+                            return error.ImportResolutionFailed;
+                    }
+                    // Share the table — retain refcount
                     t.retain();
                     tables.append(allocator, t) catch return error.ImportResolutionFailed;
                 }
@@ -384,13 +391,12 @@ fn makeSpectestMemory(allocator: std.mem.Allocator) ?types.MemoryInstance {
     };
 }
 
-fn makeSpectestTable(allocator: std.mem.Allocator) ?types.TableInstance {
+fn makeSpectestTable(allocator: std.mem.Allocator) ?*types.TableInstance {
     const elems = allocator.alloc(?u32, 10) catch return null;
     @memset(elems, null);
-    return .{
-        .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 10, .max = 20 } },
-        .elements = elems,
-    };
+    const tbl = allocator.create(types.TableInstance) catch { allocator.free(elems); return null; };
+    tbl.* = .{ .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 10, .max = 20 } }, .elements = elems };
+    return tbl;
 }
 
 fn copyMemory(src: types.MemoryInstance, allocator: std.mem.Allocator) ?types.MemoryInstance {
