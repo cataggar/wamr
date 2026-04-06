@@ -146,6 +146,16 @@ fn readValType(reader: *BinaryReader) LoadError!types.ValType {
         0x7B => .v128,
         0x70 => .funcref,
         0x6F => .externref,
+        // Typed reference types: ref null <heaptype> or ref <heaptype>
+        // Accept abstract heap types, reject concrete type indices for now
+        0x63, 0x64 => {
+            const heap_byte = try reader.readByte();
+            return switch (heap_byte) {
+                0x70, 0x73 => .funcref, // func, nofunc → funcref
+                0x6F, 0x72 => .externref, // extern, noextern → externref
+                else => error.InvalidValType, // concrete type indices not yet supported
+            };
+        },
         else => error.InvalidValType,
     };
 }
@@ -831,6 +841,29 @@ fn validateDeclaredFuncRefs(module: *const types.WasmModule, total_funcs: u32) L
     }
 }
 
+/// Skip a block type immediate: 0x40 (void), single-byte valtype, ref type (0x63/0x64 + heaptype), or type index (LEB128).
+fn skipBlockTypeImm(code: []const u8, i: *usize) void {
+    if (i.* >= code.len) return;
+    const bt = code[i.*];
+    if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
+        i.* += 1;
+    } else if (bt == 0x63 or bt == 0x64) {
+        i.* += 1; // skip ref prefix
+        if (i.* >= code.len) return;
+        const ht = code[i.*];
+        if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72) {
+            i.* += 1; // known heap type
+        } else {
+            // Type index LEB128
+            const r = leb128_mod.readUnsigned(u32, code[i.*..]) catch return;
+            i.* += r.bytes_read;
+        }
+    } else {
+        const r = leb128_mod.readSigned(i64, code[i.*..]) catch return;
+        i.* += r.bytes_read;
+    }
+}
+
 fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void {
     var i: usize = 0;
     while (i < code.len) {
@@ -839,22 +872,15 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
         switch (op) {
             // Skip opcodes with known immediate sizes
             0x02, 0x03, 0x04 => { // block/loop/if: blocktype
-                if (i >= code.len) return;
-                const bt = code[i];
-                if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
-                    i += 1;
-                } else {
-                    const r = leb128_mod.readSigned(i64, code[i..]) catch return;
-                    i += r.bytes_read;
-                }
+                skipBlockTypeImm(code, &i);
             },
-            0x0C, 0x0D => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x0C, 0x0D, 0xD4, 0xD6 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
             0x0E => { // br_table
                 const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read;
                 var j: u32 = 0;
                 while (j <= cr.value) : (j += 1) { const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += lr.bytes_read; }
             },
-            0x10, 0x12 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x10, 0x12, 0x14, 0x15 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
             0x11, 0x13 => {
                 const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r1.bytes_read;
                 const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r2.bytes_read;
@@ -870,7 +896,20 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
             0x42 => { const r = leb128_mod.readSigned(i64, code[i..]) catch return; i += r.bytes_read; },
             0x43 => i += 4,
             0x44 => i += 8,
-            0xD0 => { if (i < code.len) i += 1; },
+            0xD0 => { // ref.null: skip heap type
+                if (i < code.len) {
+                    const ht = code[i];
+                    i += 1;
+                    // If heap type is a type index (not a known abstract type), consume LEB128
+                    if (ht != 0x70 and ht != 0x6F and ht != 0x73 and ht != 0x72 and ht & 0x80 != 0) {
+                        while (i < code.len) {
+                            const b = code[i];
+                            i += 1;
+                            if (b & 0x80 == 0) break;
+                        }
+                    }
+                }
+            },
             0xD2 => { // ref.func - check declared
                 const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += r.bytes_read;
@@ -950,14 +989,7 @@ fn validateFunctionBody(
         switch (op) {
             // Block/loop/if: blocktype
             0x02, 0x03, 0x04 => {
-                if (i >= code.len) return;
-                const bt = code[i];
-                if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
-                    i += 1;
-                } else {
-                    const r = leb128_mod.readSigned(i64, code[i..]) catch return;
-                    i += r.bytes_read;
-                }
+                skipBlockTypeImm(code, &i);
             },
 
             // br, br_if: labelidx
@@ -1102,9 +1134,18 @@ fn validateFunctionBody(
                 }
             },
 
-            // ref.null: heaptype (1 byte)
+            // ref.null: heaptype (may be multi-byte for typed refs)
             0xD0 => {
-                if (i < code.len) i += 1;
+                if (i < code.len) {
+                    const ht = code[i];
+                    i += 1;
+                    if (ht != 0x70 and ht != 0x6F and ht != 0x73 and ht != 0x72 and ht & 0x80 != 0) {
+                        while (i < code.len) {
+                            if (code[i] & 0x80 == 0) { i += 1; break; }
+                            i += 1;
+                        }
+                    }
+                }
             },
 
             // ref.func: funcidx (u32 LEB)
@@ -1136,6 +1177,18 @@ fn validateFunctionBody(
             // 0x45..0xC4=numeric/comparison/conversion/sign-ext ops
             0x00, 0x01, 0x05, 0x0B, 0x0F, 0x1A, 0x1B => {},
             0x45...0xC4 => {},
+
+            // call_ref, return_call_ref: typeidx (not yet fully validated)
+            0x14, 0x15 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
+
+            // br_on_null, br_on_non_null: labelidx
+            0xD4, 0xD6 => {
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += r.bytes_read;
+            },
 
             // Opcodes in ranges 0x06-0x0A, 0x14-0x19, 0x1D-0x1F, 0x27,
             // 0xC5-0xCF, 0xD3-0xFB, 0xFF are reserved/illegal
@@ -1217,6 +1270,15 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
             0x6F => .{ .results = &[_]VT{.externref} },
             else => .{ .results = &.{} },
         };
+    }
+    // Typed reference block types: accept only abstract heap types
+    if (bt == 0x63 or bt == 0x64) {
+        pos.* += 1; // consume 0x63/0x64
+        if (pos.* >= code.len) return error.TypeMismatch;
+        const ht = code[pos.*];
+        if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = &[_]VT{.funcref} }; }
+        if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = &[_]VT{.externref} }; }
+        return error.InvalidValType; // concrete type indices not yet supported
     }
     const r = leb128_mod.readSigned(i64, code[pos.*..]) catch return error.TypeMismatch;
     pos.* += r.bytes_read;
@@ -1631,6 +1693,39 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
 
+            // call_ref, return_call_ref: typeidx
+            // Pop funcref (the ref to the function), pop params, push results
+            0x14, 0x15 => {
+                const tidx = readU32Leb(code, &i);
+                // Pop the function reference
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                if (tidx < module.types.len) {
+                    const ft = module.types[tidx];
+                    var pi = ft.params.len;
+                    while (pi > 0) {
+                        pi -= 1;
+                        if (!popExpect(&stack_buf, &sp, ft.params[pi], ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                    }
+                    if (op == 0x15) {
+                        // return_call_ref: callee results must match caller's return type
+                        const func_results = ctrl_buf[0].end_types;
+                        if (ft.results.len != func_results.len) return error.TypeMismatch;
+                        for (ft.results, func_results) |cr, fr| {
+                            if (cr != fr) return error.TypeMismatch;
+                        }
+                    } else {
+                        for (ft.results) |rt| pushType(&stack_buf, &sp, rt);
+                    }
+                }
+                if (op == 0x15) {
+                    if (ctrl_top.get(&ctrl_buf, ctrl_sp)) |cf| {
+                        cf.unreachable_flag = true;
+                        sp = cf.start_height;
+                    }
+                }
+            },
+
             0x1A => { _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); }, // drop
             0x1B => { // select (numeric types only; use select_t for ref types)
                 const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
@@ -1797,9 +1892,44 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             0xC2, 0xC3, 0xC4 => doUnop(&stack_buf, &sp, .i64, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
 
             // Reference ops
-            0xD0 => { if (i < code.len) i += 1; pushType(&stack_buf, &sp, .funcref); },
+            0xD0 => { // ref.null: skip heap type, push ref type
+                if (i < code.len) {
+                    const ht = code[i];
+                    i += 1;
+                    if (ht == 0x6F or ht == 0x72) {
+                        pushType(&stack_buf, &sp, .externref);
+                    } else if (ht == 0x70 or ht == 0x73) {
+                        pushType(&stack_buf, &sp, .funcref);
+                    } else {
+                        // Type index: consume remaining LEB128 bytes
+                        if (ht & 0x80 != 0) {
+                            while (i < code.len) {
+                                if (code[i] & 0x80 == 0) { i += 1; break; }
+                                i += 1;
+                            }
+                        }
+                        pushType(&stack_buf, &sp, .funcref);
+                    }
+                }
+            },
             0xD1 => { _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i32); },
             0xD2 => { _ = readU32Leb(code, &i); pushType(&stack_buf, &sp, .funcref); },
+
+            // br_on_null: pop ref, branch if null
+            0xD4 => {
+                _ = readU32Leb(code, &i); // label index
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+            },
+            // ref.as_non_null: pop nullable ref, push non-nullable ref (or trap)
+            0xD3 => {
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                pushType(&stack_buf, &sp, .funcref);
+            },
+            // br_on_non_null: pop ref, branch if non-null
+            0xD6 => {
+                _ = readU32Leb(code, &i); // label index
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+            },
 
             // 0xFC prefix
             0xFC => {
