@@ -116,8 +116,8 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
                 break :blk std.math.isNan(v);
             break :blk actual_bits == expected_bits;
         },
-        .funcref => |v| b == .funcref and b.funcref == v,
-        .externref => |v| b == .externref and b.externref == v,
+        .funcref => |v| b == .funcref and ((v == null and b.funcref == null) or (v != null and b.funcref != null)),
+        .externref => |v| b == .externref and ((v == null and b.externref == null) or (v != null and b.externref != null)),
         else => false,
     };
 }
