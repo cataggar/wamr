@@ -208,7 +208,7 @@ pub const ElemSegment = struct {
     table_idx: u32,
     offset: ?InitExpr, // null for passive/declarative
     kind: ElemKind,
-    func_indices: []const u32,
+    func_indices: []const ?u32,
     is_passive: bool = false,
     is_declarative: bool = false,
 

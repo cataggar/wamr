@@ -358,16 +358,20 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator) Load
                 };
             }
             const num_elems = try reader.readU32();
-            // Parse and collect func indices from expressions
-            var func_indices_list: std.ArrayList(u32) = .empty;
+            var func_indices_list: std.ArrayList(?u32) = .empty;
             var j: u32 = 0;
             while (j < num_elems) : (j += 1) {
-                // Each element is a constant expression (ref.func idx / ref.null)
                 const expr = try parseInitExpr(reader);
                 switch (expr) {
-                    .ref_func => |fidx| try func_indices_list.append(allocator, fidx),
-                    .ref_null => {}, // null ref — no function index to track
-                    else => {},
+                    .ref_func => |fidx| {
+                        try func_indices_list.append(allocator, fidx);
+                    },
+                    .ref_null => |vt| {
+                        if (kind == .func_ref and vt != .funcref) return error.TypeMismatch;
+                        if (kind == .extern_ref and vt != .externref) return error.TypeMismatch;
+                        try func_indices_list.append(allocator, null);
+                    },
+                    else => return error.TypeMismatch,
                 }
             }
             elem.* = .{
@@ -385,11 +389,11 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator) Load
                 _ = try reader.readByte(); // elemkind (0x00 = funcref)
             }
             const num_elems = try reader.readU32();
-            const func_indices: []const u32 = if (num_elems > 0) blk: {
-                const fi = try allocator.alloc(u32, num_elems);
+            const func_indices: []const ?u32 = if (num_elems > 0) blk: {
+                const fi = try allocator.alloc(?u32, num_elems);
                 for (fi) |*f| f.* = try reader.readU32();
                 break :blk fi;
-            } else &[_]u32{};
+            } else &[_]?u32{};
             elem.* = .{
                 .table_idx = table_idx,
                 .offset = offset,
@@ -743,8 +747,10 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 }
             }
         }
-        for (elem.func_indices) |fidx| {
-            if (fidx >= total_funcs) return error.UnknownFunction;
+        for (elem.func_indices) |mfidx| {
+            if (mfidx) |fidx| {
+                if (fidx >= total_funcs) return error.UnknownFunction;
+            }
         }
     }
 
@@ -784,8 +790,10 @@ fn validateDeclaredFuncRefs(module: *const types.WasmModule, total_funcs: u32) L
 
     // Functions in element segments are declared
     for (module.elements) |elem| {
-        for (elem.func_indices) |fidx| {
-            if (fidx < max_track) declared[fidx] = true;
+        for (elem.func_indices) |mfidx| {
+            if (mfidx) |fidx| {
+                if (fidx < max_track) declared[fidx] = true;
+            }
         }
     }
     // Exported functions are declared

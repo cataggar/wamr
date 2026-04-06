@@ -289,8 +289,11 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
         const end = @as(u64, offset) + seg.func_indices.len;
         if (end > table.elements.len) return error.ElemSegmentOutOfBounds;
 
-        for (seg.func_indices, 0..) |func_idx, i| {
-            table.elements[offset + i] = .{ .func_idx = func_idx, .module_inst = inst };
+        for (seg.func_indices, 0..) |mfunc_idx, i| {
+            table.elements[offset + i] = if (mfunc_idx) |func_idx|
+                .{ .func_idx = func_idx, .module_inst = inst }
+            else
+                null;
         }
     }
 }

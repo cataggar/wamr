@@ -1778,8 +1778,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
                         for (0..n) |i| {
-                            const fi = elem.func_indices[s + @as(u32, @intCast(i))];
-                            table.elements[d + @as(u32, @intCast(i))] = .{ .func_idx = fi, .module_inst = env.module_inst };
+                            const mfi = elem.func_indices[s + @as(u32, @intCast(i))];
+                            table.elements[d + @as(u32, @intCast(i))] = if (mfi) |fi|
+                                .{ .func_idx = fi, .module_inst = env.module_inst }
+                            else
+                                null;
                         }
                     },
                     13 => { // elem.drop
