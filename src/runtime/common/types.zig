@@ -309,10 +309,23 @@ pub const MemoryInstance = struct {
     }
 };
 
-/// Runtime table instance
+/// Runtime table instance (refcounted for cross-module sharing)
 pub const TableInstance = struct {
     table_type: TableType,
     elements: []?u32,
+    ref_count: u32 = 1,
+
+    pub fn retain(self: *TableInstance) void {
+        self.ref_count += 1;
+    }
+
+    pub fn release(self: *TableInstance, allocator: std.mem.Allocator) void {
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
+            if (self.elements.len > 0) allocator.free(self.elements);
+            allocator.destroy(self);
+        }
+    }
 };
 
 /// Runtime global instance
@@ -332,7 +345,7 @@ pub const ImportedFunction = struct {
 pub const ModuleInstance = struct {
     module: *const WasmModule,
     memories: []MemoryInstance,
-    tables: []TableInstance,
+    tables: []*TableInstance,
     globals: []*GlobalInstance,
     import_functions: []const ImportedFunction = &.{},
     allocator: std.mem.Allocator,

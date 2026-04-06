@@ -28,7 +28,7 @@ pub const InstantiationError = error{
 pub const ImportContext = struct {
     globals: []const *types.GlobalInstance = &.{},
     memories: []const types.MemoryInstance = &.{},
-    tables: []const types.TableInstance = &.{},
+    tables: []const *types.TableInstance = &.{},
     functions: []const types.ImportedFunction = &.{},
 };
 
@@ -162,49 +162,45 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
     return mems;
 }
 
-fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]types.TableInstance {
+fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]*types.TableInstance {
     const import_count = module.import_table_count;
     const total_count = import_count + @as(u32, @intCast(module.tables.len));
     if (total_count == 0) return &.{};
 
-    const tables = allocator.alloc(types.TableInstance, total_count) catch
+    const tables = allocator.alloc(*types.TableInstance, total_count) catch
         return error.TableAllocationFailed;
     errdefer allocator.free(tables);
 
-    var initialized: usize = 0;
-    errdefer for (tables[0..initialized]) |*t| allocator.free(t.elements);
+    var local_init: usize = 0;
+    errdefer for (0..local_init) |i| tables[import_count + i].release(allocator);
 
-    // Copy imported tables
+    // Imported tables: share pointer and bump refcount
     if (import_count > 0) {
         if (import_ctx) |ctx| {
             if (ctx.tables.len >= import_count) {
                 for (0..import_count) |i| {
-                    const src = ctx.tables[i];
-                    const elems = allocator.alloc(?u32, src.elements.len) catch
-                        return error.TableAllocationFailed;
-                    @memcpy(elems, src.elements);
-                    tables[i] = .{
-                        .table_type = src.table_type,
-                        .elements = elems,
-                    };
-                    initialized += 1;
+                    const t = ctx.tables[i];
+                    @constCast(t).retain();
+                    tables[i] = @constCast(t);
                 }
             }
         }
     }
 
-    // Allocate local tables
+    // Heap-allocate local tables
     for (module.tables, 0..) |table_type, i| {
         const min_elems = table_type.limits.min;
         const elems = allocator.alloc(?u32, min_elems) catch
             return error.TableAllocationFailed;
         @memset(elems, null);
 
-        tables[import_count + i] = .{
-            .table_type = table_type,
-            .elements = elems,
+        const tbl = allocator.create(types.TableInstance) catch {
+            allocator.free(elems);
+            return error.TableAllocationFailed;
         };
-        initialized += 1;
+        tbl.* = .{ .table_type = table_type, .elements = elems };
+        tables[import_count + i] = tbl;
+        local_init += 1;
     }
 
     return tables;
@@ -281,13 +277,13 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []types.MemoryIn
     }
 }
 
-fn applyElemSegments(module: *const types.WasmModule, tables: []types.TableInstance) InstantiationError!void {
+fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInstance) InstantiationError!void {
     for (module.elements) |seg| {
         if (seg.is_passive or seg.is_declarative) continue;
 
         const table_idx = seg.table_idx;
         if (table_idx >= tables.len) return error.ElemSegmentOutOfBounds;
-        var table = &tables[table_idx];
+        var table = tables[table_idx];
 
         const offset_expr = seg.offset orelse continue;
         const offset = evalInitExprAsU32(offset_expr, &.{}) catch
@@ -319,8 +315,8 @@ fn freeMemories(memories: []types.MemoryInstance, allocator: std.mem.Allocator) 
     if (memories.len > 0) allocator.free(memories);
 }
 
-fn freeTables(tables: []types.TableInstance, allocator: std.mem.Allocator) void {
-    for (tables) |*t| allocator.free(t.elements);
+fn freeTables(tables: []*types.TableInstance, allocator: std.mem.Allocator) void {
+    for (tables) |t| t.release(allocator);
     if (tables.len > 0) allocator.free(tables);
 }
 

@@ -729,7 +729,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const table_idx = readU32(code, &ip);
                 const elem_idx: u32 = @bitCast(try env.popI32());
 
-                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const func_idx = table.elements[elem_idx] orelse return error.UninitializedElement;
 
@@ -756,7 +756,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const table_idx = readU32(code, &ip);
                 const elem_idx: u32 = @bitCast(try env.popI32());
 
-                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const func_idx = table.elements[elem_idx] orelse return error.UninitializedElement;
 
@@ -1601,7 +1601,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .table_get => {
                 const table_idx = readU32(code, &ip);
                 const elem_idx: u32 = @bitCast(try env.popI32());
-                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const ref = table.elements[elem_idx];
                 if (table.table_type.elem_type == .externref) {
@@ -1614,7 +1614,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const table_idx = readU32(code, &ip);
                 const ref = try env.pop();
                 const elem_idx: u32 = @bitCast(try env.popI32());
-                const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 table.elements[elem_idx] = switch (ref) {
                     .funcref => |r| r,
@@ -1760,7 +1760,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const module = env.module_inst.module;
                         if (elem_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
                         const elem = &module.elements[elem_idx];
-                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
                         for (0..n) |i| {
                             table.elements[d + @as(u32, @intCast(i))] = elem.func_indices[s + @as(u32, @intCast(i))];
@@ -1776,8 +1776,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const n: u32 = @bitCast(try env.popI32());
                         const s: u32 = @bitCast(try env.popI32());
                         const d: u32 = @bitCast(try env.popI32());
-                        const dst_table = if (dst_table_idx < env.module_inst.tables.len) &env.module_inst.tables[dst_table_idx] else return error.OutOfBoundsTableAccess;
-                        const src_table = if (src_table_idx < env.module_inst.tables.len) &env.module_inst.tables[src_table_idx] else return error.OutOfBoundsTableAccess;
+                        const dst_table = if (dst_table_idx < env.module_inst.tables.len) env.module_inst.tables[dst_table_idx] else return error.OutOfBoundsTableAccess;
+                        const src_table = if (src_table_idx < env.module_inst.tables.len) env.module_inst.tables[src_table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, s) + n > src_table.elements.len or @as(u64, d) + n > dst_table.elements.len) return error.OutOfBoundsTableAccess;
                         if (d <= s) {
                             for (0..n) |i| dst_table.elements[d + @as(u32, @intCast(i))] = src_table.elements[s + @as(u32, @intCast(i))];
@@ -1793,7 +1793,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const table_idx = readU32(code, &ip);
                         const delta: u32 = @bitCast(try env.popI32());
                         const init_ref = try env.pop();
-                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else {
+                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else {
                             try env.pushI32(-1);
                             continue;
                         };
@@ -1825,7 +1825,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     },
                     16 => { // table.size
                         const table_idx = readU32(code, &ip);
-                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         try env.pushI32(@intCast(table.elements.len));
                     },
                     17 => { // table.fill
@@ -1833,7 +1833,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const n: u32 = @bitCast(try env.popI32());
                         const val = try env.pop();
                         const offset: u32 = @bitCast(try env.popI32());
-                        const table = if (table_idx < env.module_inst.tables.len) &env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
+                        const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, offset) + n > table.elements.len) return error.OutOfBoundsTableAccess;
                         const ref_val: ?u32 = switch (val) {
                             .funcref => |r| r,
