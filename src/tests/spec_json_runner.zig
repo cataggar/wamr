@@ -768,6 +768,7 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 continue;
             };
             mod.deinit();
+            std.debug.print("  NOTREJECTED line {d}: {s}\n", .{ cmd.line, filename });
             result.failed += 1; // should have failed to load
         } else if (std.mem.eql(u8, cmd.type, "assert_unlinkable")) {
             const filename = cmd.filename orelse {

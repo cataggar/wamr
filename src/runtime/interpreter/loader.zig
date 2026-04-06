@@ -913,10 +913,10 @@ fn validateFunctionBody(
         };
 
         if (max_align) |ma| {
-            const align_result = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+            const align_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidAlignment;
             i += align_result.bytes_read;
             if (align_result.value > ma) return error.InvalidAlignment;
-            const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+            const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidSectionSize;
             i += offset_result.bytes_read;
             continue;
         }
@@ -1161,7 +1161,7 @@ const BlockType = struct {
     results: []const VT,
 };
 
-fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.FuncType) BlockType {
+fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.FuncType) LoadError!BlockType {
     if (pos.* >= code.len) return .{ .results = &.{} };
     const bt = code[pos.*];
     if (bt == 0x40) { pos.* += 1; return .{ .results = &.{} }; }
@@ -1177,12 +1177,12 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
             else => .{ .results = &.{} },
         };
     }
-    const r = leb128_mod.readSigned(i64, code[pos.*..]) catch return .{ .results = &.{} };
+    const r = leb128_mod.readSigned(i64, code[pos.*..]) catch return error.TypeMismatch;
     pos.* += r.bytes_read;
-    if (r.value < 0) return .{ .results = &.{} };
+    if (r.value < 0) return error.TypeMismatch;
     const idx: usize = @intCast(r.value);
     if (idx < module_types.len) return .{ .params = module_types[idx].params, .results = module_types[idx].results };
-    return .{ .results = &.{} };
+    return error.InvalidTypeIndex;
 }
 
 fn readU32Leb(code: []const u8, pos: *usize) u32 {
@@ -1384,7 +1384,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
 
             // block, loop, if
             0x02, 0x03, 0x04 => {
-                const bt = readBlockType(code, &i, module.types);
+                const bt = try readBlockType(code, &i, module.types);
                 if (op == 0x04) {
                     if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                         return error.TypeMismatch;
@@ -1478,15 +1478,27 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
                 if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
-                // Validate all labels are in range, then check default label types
+                // Validate all labels are in range
                 var li: u32 = 0;
                 while (li < lcount) : (li += 1) {
                     if (ctrl_sp <= label_buf[li]) return error.TypeMismatch;
                 }
+                // Validate all labels have consistent types with the default
                 if (lcount > 0) {
                     const default_label = label_buf[lcount - 1];
-                    const target = &ctrl_buf[ctrl_sp - 1 - default_label];
-                    try popLabelTypes(&stack_buf, &sp, getLabelTypes(target), ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    const default_target = &ctrl_buf[ctrl_sp - 1 - default_label];
+                    const default_types = getLabelTypes(default_target);
+                    // Check each non-default label has the same arity and types
+                    li = 0;
+                    while (li < lcount - 1) : (li += 1) {
+                        const target = &ctrl_buf[ctrl_sp - 1 - label_buf[li]];
+                        const target_types = getLabelTypes(target);
+                        if (target_types.len != default_types.len) return error.TypeMismatch;
+                        for (target_types, default_types) |tt, dt| {
+                            if (tt != dt) return error.TypeMismatch;
+                        }
+                    }
+                    try popLabelTypes(&stack_buf, &sp, default_types, ctrl_top.get(&ctrl_buf, ctrl_sp));
                 }
                 if (ctrl_top.get(&ctrl_buf, ctrl_sp)) |cf| {
                     cf.unreachable_flag = true;
@@ -1513,7 +1525,14 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         if (!popExpect(&stack_buf, &sp, ft.params[pi], ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                     }
-                    if (op != 0x12) {
+                    if (op == 0x12) {
+                        // return_call: callee results must match caller's return type
+                        const func_results = ctrl_buf[0].end_types;
+                        if (ft.results.len != func_results.len) return error.TypeMismatch;
+                        for (ft.results, func_results) |cr, fr| {
+                            if (cr != fr) return error.TypeMismatch;
+                        }
+                    } else {
                         for (ft.results) |rt| pushType(&stack_buf, &sp, rt);
                     }
                 }
@@ -1542,7 +1561,14 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         if (!popExpect(&stack_buf, &sp, ft.params[pi], ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                     }
-                    if (op != 0x13) {
+                    if (op == 0x13) {
+                        // return_call_indirect: callee results must match caller's return type
+                        const func_results = ctrl_buf[0].end_types;
+                        if (ft.results.len != func_results.len) return error.TypeMismatch;
+                        for (ft.results, func_results) |cr, fr| {
+                            if (cr != fr) return error.TypeMismatch;
+                        }
+                    } else {
                         for (ft.results) |rt| pushType(&stack_buf, &sp, rt);
                     }
                 }
@@ -1555,11 +1581,18 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
 
             0x1A => { _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); }, // drop
-            0x1B => { // select
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+            0x1B => { // select (numeric types only; use select_t for ref types)
+                const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
+                if (!popExpect(&stack_buf, &sp, .i32, cf))
                     return error.TypeMismatch;
-                const t2 = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                const t1 = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                const t2 = popAny(&stack_buf, &sp, cf);
+                const t1 = popAny(&stack_buf, &sp, cf);
+                const is_unreachable = cf != null and cf.?.unreachable_flag;
+                // In non-unreachable code, both operands must be present
+                if (!is_unreachable and (t1 == null or t2 == null)) return error.TypeMismatch;
+                // select (untyped) requires numeric types — ref types need select_t
+                if (t1) |v| { if (v == .funcref or v == .externref) return error.TypeMismatch; }
+                if (t2) |v| { if (v == .funcref or v == .externref) return error.TypeMismatch; }
                 if (t1 != null and t2 != null and t1.? != t2.?) return error.TypeMismatch;
                 pushType(&stack_buf, &sp, t1 orelse t2 orelse .i32);
             },
