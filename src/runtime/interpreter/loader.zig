@@ -717,6 +717,17 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     for (module.elements) |elem| {
         if (!elem.is_passive and !elem.is_declarative) {
             if (elem.table_idx >= total_tables) return error.UnknownTable;
+            // Validate elem kind matches table elem type
+            const table_elem_type = if (elem.table_idx < module.import_table_count)
+                getImportTableElemType(module, elem.table_idx)
+            else blk: {
+                const local_idx = elem.table_idx - module.import_table_count;
+                break :blk if (local_idx < module.tables.len) module.tables[local_idx].elem_type else null;
+            };
+            if (table_elem_type) |tet| {
+                if (elem.kind == .func_ref and tet != .funcref) return error.TypeMismatch;
+                if (elem.kind == .extern_ref and tet != .externref) return error.TypeMismatch;
+            }
             // Validate offset expression type (must be i32)
             if (elem.offset) |offset| {
                 switch (offset) {
@@ -1129,6 +1140,21 @@ fn getImportGlobalType(module: *const types.WasmModule, idx: u32) ?types.GlobalT
         if (imp.kind == .global) {
             if (gi == idx) return imp.global_type;
             gi += 1;
+        }
+    }
+    return null;
+}
+
+fn getImportTableElemType(module: *const types.WasmModule, idx: u32) ?types.ValType {
+    if (idx >= module.import_table_count) return null;
+    var ti: u32 = 0;
+    for (module.imports) |imp| {
+        if (imp.kind == .table) {
+            if (ti == idx) {
+                if (imp.table_type) |tt| return tt.elem_type;
+                return null;
+            }
+            ti += 1;
         }
     }
     return null;
