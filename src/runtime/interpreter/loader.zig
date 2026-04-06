@@ -537,8 +537,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
 
         if (section_id > @intFromEnum(types.SectionId.data_count)) {
-            // Section IDs beyond data_count (12) are invalid per the spec
-            return error.MalformedSectionId;
+            // Skip known proposal sections (tag section = 13)
+            if (section_id == 13) {
+                reader.pos = section_start + section_size;
+            } else {
+                return error.MalformedSectionId;
+            }
         } else {
             switch (@as(types.SectionId, @enumFromInt(section_id))) {
                 .custom => {
