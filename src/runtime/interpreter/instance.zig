@@ -27,7 +27,7 @@ pub const InstantiationError = error{
 /// with enough entries to cover each import category count.
 pub const ImportContext = struct {
     globals: []const *types.GlobalInstance = &.{},
-    memories: []const types.MemoryInstance = &.{},
+    memories: []const *types.MemoryInstance = &.{},
     tables: []const *types.TableInstance = &.{},
     functions: []const types.ImportedFunction = &.{},
 };
@@ -107,40 +107,32 @@ pub fn destroy(inst: *types.ModuleInstance) void {
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
 
-fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]types.MemoryInstance {
+fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]*types.MemoryInstance {
     const import_count = module.import_memory_count;
     const total_count = import_count + @as(u32, @intCast(module.memories.len));
     if (total_count == 0) return &.{};
 
-    const mems = allocator.alloc(types.MemoryInstance, total_count) catch
+    const mems = allocator.alloc(*types.MemoryInstance, total_count) catch
         return error.MemoryAllocationFailed;
     errdefer allocator.free(mems);
 
-    var initialized: usize = 0;
-    errdefer for (mems[0..initialized]) |*m| allocator.free(m.data);
+    var local_init: usize = 0;
+    errdefer for (0..local_init) |i| mems[import_count + i].release(allocator);
 
-    // Copy imported memories
+    // Imported memories: share pointer and bump refcount
     if (import_count > 0) {
         if (import_ctx) |ctx| {
             if (ctx.memories.len >= import_count) {
                 for (0..import_count) |i| {
-                    const src = ctx.memories[i];
-                    const data = allocator.alloc(u8, src.data.len) catch
-                        return error.MemoryAllocationFailed;
-                    @memcpy(data, src.data);
-                    mems[i] = .{
-                        .memory_type = src.memory_type,
-                        .data = data,
-                        .current_pages = src.current_pages,
-                        .max_pages = src.max_pages,
-                    };
-                    initialized += 1;
+                    const m = ctx.memories[i];
+                    @constCast(m).retain();
+                    mems[i] = @constCast(m);
                 }
             }
         }
     }
 
-    // Allocate local memories
+    // Heap-allocate local memories
     for (module.memories, 0..) |mem_type, i| {
         const min_pages = mem_type.limits.min;
         const max_pages = mem_type.limits.max orelse 65536;
@@ -150,13 +142,18 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
             return error.MemoryAllocationFailed;
         @memset(data, 0);
 
-        mems[import_count + i] = .{
+        const mem = allocator.create(types.MemoryInstance) catch {
+            allocator.free(data);
+            return error.MemoryAllocationFailed;
+        };
+        mem.* = .{
             .memory_type = mem_type,
             .data = data,
             .current_pages = min_pages,
             .max_pages = max_pages,
         };
-        initialized += 1;
+        mems[import_count + i] = mem;
+        local_init += 1;
     }
 
     return mems;
@@ -259,13 +256,13 @@ fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalIn
 
 // ─── Segment application ────────────────────────────────────────────────────
 
-fn applyDataSegments(module: *const types.WasmModule, memories: []types.MemoryInstance) InstantiationError!void {
+fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryInstance) InstantiationError!void {
     for (module.data_segments) |seg| {
         if (seg.is_passive) continue;
 
         const mem_idx = seg.memory_idx;
         if (mem_idx >= memories.len) return error.DataSegmentOutOfBounds;
-        var mem = &memories[mem_idx];
+        const mem = memories[mem_idx];
 
         const offset = evalInitExprAsU32(seg.offset, &.{}) catch
             return error.DataSegmentOutOfBounds;
@@ -310,8 +307,8 @@ fn evalInitExprAsU32(expr: types.InitExpr, globals: []const *types.GlobalInstanc
 
 // ─── Cleanup helpers ────────────────────────────────────────────────────────
 
-fn freeMemories(memories: []types.MemoryInstance, allocator: std.mem.Allocator) void {
-    for (memories) |*m| allocator.free(m.data);
+fn freeMemories(memories: []*types.MemoryInstance, allocator: std.mem.Allocator) void {
+    for (memories) |m| m.release(allocator);
     if (memories.len > 0) allocator.free(memories);
 }
 

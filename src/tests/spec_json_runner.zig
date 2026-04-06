@@ -148,9 +148,9 @@ fn buildImportContext(
 
     var globals: std.ArrayList(*types.GlobalInstance) = .empty;
     defer globals.deinit(allocator);
-    var memories: std.ArrayList(types.MemoryInstance) = .empty;
+    var memories: std.ArrayList(*types.MemoryInstance) = .empty;
     defer {
-        for (memories.items) |m| allocator.free(m.data);
+        for (memories.items) |m| m.release(allocator);
         memories.deinit(allocator);
     }
     var tables: std.ArrayList(*types.TableInstance) = .empty;
@@ -213,13 +213,14 @@ fn buildImportContext(
                     const exp = ri.module.findExport(imp.field_name, .memory) orelse
                         return error.ImportResolutionFailed;
                     if (exp.index >= ri.memories.len) return error.ImportResolutionFailed;
-                    const em = ri.memories[exp.index];
+                    const m = ri.memories[exp.index];
                     if (imp.memory_type) |mt| {
-                        if (!limitsMatch(em.memory_type.limits, mt.limits))
+                        if (!limitsMatch(m.memory_type.limits, mt.limits))
                             return error.ImportResolutionFailed;
                     }
-                    memories.append(allocator, copyMemory(em, allocator) orelse
-                        return error.ImportResolutionFailed) catch return error.ImportResolutionFailed;
+                    // Share the memory — retain refcount
+                    m.retain();
+                    memories.append(allocator, m) catch return error.ImportResolutionFailed;
                 }
             },
             .table => {
@@ -291,7 +292,7 @@ fn buildImportContext(
 }
 
 fn freeImportContext(ctx: instance_mod.ImportContext, allocator: std.mem.Allocator) void {
-    for (ctx.memories) |*m| allocator.free(@constCast(m).data);
+    for (ctx.memories) |m| @constCast(m).release(allocator);
     if (ctx.memories.len > 0) allocator.free(ctx.memories);
     for (ctx.tables) |t| @constCast(t).release(allocator);
     if (ctx.tables.len > 0) allocator.free(ctx.tables);
@@ -301,11 +302,8 @@ fn freeImportContext(ctx: instance_mod.ImportContext, allocator: std.mem.Allocat
 }
 
 /// Success-path cleanup: the instance took ownership via retain().
-/// Free only slice containers, not the pointed-to data.
 fn freeImportContextSlices(ctx: instance_mod.ImportContext, allocator: std.mem.Allocator) void {
-    for (ctx.memories) |*m| allocator.free(@constCast(m).data);
     if (ctx.memories.len > 0) allocator.free(ctx.memories);
-    // Tables: refcount already bumped by allocateTables, don't release
     if (ctx.tables.len > 0) allocator.free(ctx.tables);
     if (ctx.globals.len > 0) allocator.free(ctx.globals);
     if (ctx.functions.len > 0) allocator.free(ctx.functions);
@@ -380,15 +378,17 @@ fn funcTypesMatch(a: types.FuncType, b: types.FuncType) bool {
     return true;
 }
 
-fn makeSpectestMemory(allocator: std.mem.Allocator) ?types.MemoryInstance {
+fn makeSpectestMemory(allocator: std.mem.Allocator) ?*types.MemoryInstance {
     const data = allocator.alloc(u8, types.MemoryInstance.page_size) catch return null;
     @memset(data, 0);
-    return .{
+    const mem = allocator.create(types.MemoryInstance) catch { allocator.free(data); return null; };
+    mem.* = .{
         .memory_type = .{ .limits = .{ .min = 1, .max = 2 } },
         .data = data,
         .current_pages = 1,
         .max_pages = 2,
     };
+    return mem;
 }
 
 fn makeSpectestTable(allocator: std.mem.Allocator) ?*types.TableInstance {

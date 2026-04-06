@@ -87,15 +87,13 @@ pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
 
-fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]types.MemoryInstance {
+fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.MemoryInstance {
     if (module.memories.len == 0) return &.{};
 
-    const memories = allocator.alloc(types.MemoryInstance, module.memories.len) catch return error.OutOfMemory;
+    const memories = allocator.alloc(*types.MemoryInstance, module.memories.len) catch return error.OutOfMemory;
     var initialized: usize = 0;
     errdefer {
-        for (0..initialized) |i| {
-            allocator.free(memories[i].data);
-        }
+        for (0..initialized) |i| memories[i].release(allocator);
         allocator.free(memories);
     }
 
@@ -106,13 +104,17 @@ fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allo
 
         const data = allocator.alloc(u8, size) catch return error.OutOfMemory;
         @memset(data, 0);
-
-        memories[i] = .{
+        const mem = allocator.create(types.MemoryInstance) catch {
+            allocator.free(data);
+            return error.OutOfMemory;
+        };
+        mem.* = .{
             .memory_type = mem_type,
             .data = data,
             .current_pages = initial_pages,
             .max_pages = max_pages,
         };
+        memories[i] = mem;
         initialized += 1;
     }
 
@@ -152,10 +154,8 @@ fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
     return &.{};
 }
 
-fn freeMemories(memories: []types.MemoryInstance, allocator: std.mem.Allocator) void {
-    for (memories) |*mem| {
-        if (mem.data.len > 0) allocator.free(mem.data);
-    }
+fn freeMemories(memories: []*types.MemoryInstance, allocator: std.mem.Allocator) void {
+    for (memories) |m| m.release(allocator);
     if (memories.len > 0) allocator.free(memories);
 }
 

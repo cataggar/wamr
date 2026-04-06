@@ -285,11 +285,13 @@ pub const NameSection = struct {
 // ─── Instance-level structures ──────────────────────────────────────────────
 
 /// Runtime memory instance
+/// Runtime memory instance (refcounted for cross-module sharing)
 pub const MemoryInstance = struct {
     memory_type: MemoryType,
     data: []u8,
     current_pages: u32,
     max_pages: u32,
+    ref_count: u32 = 1,
 
     pub const page_size: u32 = 65536;
 
@@ -306,6 +308,18 @@ pub const MemoryInstance = struct {
         }
         self.current_pages = new_pages;
         return old_pages;
+    }
+
+    pub fn retain(self: *MemoryInstance) void {
+        self.ref_count += 1;
+    }
+
+    pub fn release(self: *MemoryInstance, allocator: std.mem.Allocator) void {
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
+            if (self.data.len > 0) allocator.free(self.data);
+            allocator.destroy(self);
+        }
     }
 };
 
@@ -344,7 +358,7 @@ pub const ImportedFunction = struct {
 /// Instantiated module
 pub const ModuleInstance = struct {
     module: *const WasmModule,
-    memories: []MemoryInstance,
+    memories: []*MemoryInstance,
     tables: []*TableInstance,
     globals: []*GlobalInstance,
     import_functions: []const ImportedFunction = &.{},
@@ -356,7 +370,7 @@ pub const ModuleInstance = struct {
     }
 
     pub fn getMemory(self: *const ModuleInstance, idx: u32) ?*MemoryInstance {
-        if (idx < self.memories.len) return &self.memories[idx];
+        if (idx < self.memories.len) return self.memories[idx];
         return null;
     }
 };
