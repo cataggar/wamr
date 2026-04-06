@@ -1472,8 +1472,13 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             0x0B => { // end
                 if (ctrl_sp == 0) return error.TypeMismatch;
                 const cf = &ctrl_buf[ctrl_sp - 1];
-                if (cf.kind == .@"if" and !cf.has_else and cf.end_types.len > 0)
-                    return error.TypeMismatch;
+                // An if-without-else is only valid when start_types == end_types
+                if (cf.kind == .@"if" and !cf.has_else) {
+                    if (cf.start_types.len != cf.end_types.len) return error.TypeMismatch;
+                    for (cf.start_types, cf.end_types) |s, e| {
+                        if (s != e) return error.TypeMismatch;
+                    }
+                }
                 if (!checkStackEnd(cf, &stack_buf, sp))
                     return error.TypeMismatch;
                 sp = cf.start_height;
@@ -1788,8 +1793,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             0xBF => doUnop(&stack_buf, &sp, .i64, .f64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
 
             // Sign extension
-            0xC0, 0xC1, 0xC2 => doUnop(&stack_buf, &sp, .i32, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
-            0xC3, 0xC4 => doUnop(&stack_buf, &sp, .i64, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
+            0xC0, 0xC1 => doUnop(&stack_buf, &sp, .i32, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
+            0xC2, 0xC3, 0xC4 => doUnop(&stack_buf, &sp, .i64, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
 
             // Reference ops
             0xD0 => { if (i < code.len) i += 1; pushType(&stack_buf, &sp, .funcref); },
