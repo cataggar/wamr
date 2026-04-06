@@ -347,13 +347,16 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator) Load
         }
 
         if (has_exprs) {
-            // flags 4,5,6,7: reftype + vec(expr)
-            const ref_byte = try reader.readByte();
-            const kind: types.ElemSegment.ElemKind = switch (ref_byte) {
-                0x70 => .func_ref,
-                0x6F => .extern_ref,
-                else => return error.InvalidElemSegment,
-            };
+            // flags 4,5,6,7: vec(expr) — reftype byte only for flags 5,6,7
+            var kind: types.ElemSegment.ElemKind = .func_ref;
+            if (flags != 4) {
+                const ref_byte = try reader.readByte();
+                kind = switch (ref_byte) {
+                    0x70 => .func_ref,
+                    0x6F => .extern_ref,
+                    else => return error.InvalidElemSegment,
+                };
+            }
             const num_elems = try reader.readU32();
             // Parse and collect func indices from expressions
             var func_indices_list: std.ArrayList(u32) = .empty;

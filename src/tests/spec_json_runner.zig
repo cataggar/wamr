@@ -566,16 +566,19 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 if (current_instance) |inst| {
                     // Move to registries for lifetime management
                     reg_instances.append(allocator, inst) catch {};
-                    if (current_module) |mod| {
+                    if (current_module) |*mod| {
+                        // Transfer the Module to the heap. We must NOT copy it because
+                        // the ArenaAllocator inside has internal pointers. Instead, allocate
+                        // and move the bytes, then null out current_module to prevent deinit.
                         const mod_heap = allocator.create(wamr.Module) catch {
                             result.passed += 1;
                             continue;
                         };
-                        mod_heap.* = mod;
+                        mod_heap.* = mod.*;
                         inst.inner.module = &mod_heap.inner;
                         reg_mod_ptrs.append(allocator, mod_heap) catch {};
-                        current_module = null;
                     }
+                    current_module = null; // Prevent double-free (mod_heap owns the arena now)
                     if (current_wasm_data) |wd| {
                         reg_wasm_data.append(allocator, wd) catch {};
                         current_wasm_data = null;
