@@ -303,6 +303,28 @@ fn readU32Static(code: []const u8, pos: *usize) u32 {
     return result;
 }
 
+/// Skip a block type immediate in bytecode: handles 0x40 (void), single-byte val types,
+/// typed ref prefixes (0x63/0x64 + heaptype), and type index (LEB128).
+fn skipBlockTypeBytes(code: []const u8, pos: usize) usize {
+    if (pos >= code.len) return pos;
+    const bt = code[pos];
+    if (bt == 0x63 or bt == 0x64) {
+        // Typed ref: prefix + heap type
+        var p = pos + 1;
+        if (p >= code.len) return p;
+        const ht = code[p];
+        if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72) return p + 1;
+        // Concrete type index LEB128
+        while (p < code.len) {
+            const b = code[p];
+            p += 1;
+            if (b & 0x80 == 0) break;
+        }
+        return p;
+    }
+    return skipLeb128(code, pos);
+}
+
 /// Starting at `start` (which must be right after a block/loop/if opcode
 /// and its block-type byte), scan forward to find the position just AFTER
 /// the matching `end` opcode.
@@ -315,7 +337,7 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
         switch (@as(Opcode, @enumFromInt(b))) {
             .block, .loop, .@"if" => {
                 depth += 1;
-                pos = skipLeb128(code, pos); // skip block-type (may be multi-byte)
+                pos = skipBlockTypeBytes(code, pos);
             },
             .end => {
                 depth -= 1;
@@ -394,7 +416,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
         switch (@as(Opcode, @enumFromInt(b))) {
             .block, .loop, .@"if" => {
                 depth += 1;
-                pos = skipLeb128(code, pos); // skip block-type (may be multi-byte)
+                pos = skipBlockTypeBytes(code, pos);
             },
             .end => {
                 depth -= 1;
@@ -469,6 +491,24 @@ const BlockTypeInfo = struct { result_arity: u32, param_arity: u32 };
 
 fn readBlockTypeInfo(code: []const u8, ip: *usize, module_types: []const types.FuncType) BlockTypeInfo {
     const first = code[ip.*];
+    // Typed reference block types: 0x63 (ref null) / 0x64 (ref) + heap type
+    if (first == 0x63 or first == 0x64) {
+        ip.* += 1; // consume ref prefix
+        if (ip.* < code.len) {
+            const ht = code[ip.*];
+            if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72) {
+                ip.* += 1; // abstract heap type (1 byte)
+            } else {
+                // Concrete type index (LEB128)
+                while (ip.* < code.len) {
+                    const b = code[ip.*];
+                    ip.* += 1;
+                    if (b & 0x80 == 0) break;
+                }
+            }
+        }
+        return .{ .result_arity = 1, .param_arity = 0 };
+    }
     // Inline types: bytes 0x40-0x7F are single-byte negative s33 values.
     if (first >= 0x40 and first & 0x80 == 0) {
         ip.* += 1;
