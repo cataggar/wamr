@@ -791,14 +791,23 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
 
     // Validate global init expressions - global_get must reference imported globals
     // Also validate init expression type matches global type
-    for (module.globals) |g| {
+    // Validate global init expressions
+    for (module.globals, 0..) |g, gi| {
         switch (g.init_expr) {
             .global_get => |idx| {
-                if (idx >= module.import_global_count) return error.UnknownGlobal;
-                // Constant expressions require immutable imported globals (spec §3.3.10)
-                if (getImportGlobalType(module, idx)) |gt| {
-                    if (gt.mutability == .mutable) return error.TypeMismatch;
-                    if (gt.val_type != g.global_type.val_type) return error.TypeMismatch;
+                // Extended-const: global.get can reference any preceding immutable global
+                const max_idx = module.import_global_count + @as(u32, @intCast(gi));
+                if (idx >= max_idx) return error.UnknownGlobal;
+                if (idx < module.import_global_count) {
+                    if (getImportGlobalType(module, idx)) |gt| {
+                        if (gt.mutability == .mutable) return error.TypeMismatch;
+                        if (gt.val_type != g.global_type.val_type) return error.TypeMismatch;
+                    }
+                } else {
+                    const local_idx = idx - module.import_global_count;
+                    if (local_idx < module.globals.len) {
+                        if (module.globals[local_idx].global_type.mutability == .mutable) return error.TypeMismatch;
+                    }
                 }
             },
             .i32_const => { if (g.global_type.val_type != .i32) return error.TypeMismatch; },
@@ -822,10 +831,18 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             switch (seg.offset) {
                 .i32_const => {},
                 .global_get => |idx| {
-                    if (idx >= module.import_global_count) return error.UnknownGlobal;
-                    if (getImportGlobalType(module, idx)) |gt| {
-                        if (gt.mutability == .mutable) return error.TypeMismatch;
-                        if (gt.val_type != .i32) return error.TypeMismatch;
+                    // Extended-const: allow any immutable global
+                    if (idx >= total_globals) return error.UnknownGlobal;
+                    if (idx < module.import_global_count) {
+                        if (getImportGlobalType(module, idx)) |gt| {
+                            if (gt.mutability == .mutable) return error.TypeMismatch;
+                            if (gt.val_type != .i32) return error.TypeMismatch;
+                        }
+                    } else {
+                        const local_idx = idx - module.import_global_count;
+                        if (local_idx < module.globals.len) {
+                            if (module.globals[local_idx].global_type.mutability == .mutable) return error.TypeMismatch;
+                        }
                     }
                 },
                 .bytecode => {}, // compound offset expression validated at evaluation
@@ -854,10 +871,18 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 switch (offset) {
                     .i32_const => {},
                     .global_get => |idx| {
-                        if (idx >= module.import_global_count) return error.UnknownGlobal;
-                        if (getImportGlobalType(module, idx)) |gt| {
-                            if (gt.mutability == .mutable) return error.TypeMismatch;
-                            if (gt.val_type != .i32) return error.TypeMismatch;
+                        // Extended-const: allow any immutable global
+                        if (idx >= total_globals) return error.UnknownGlobal;
+                        if (idx < module.import_global_count) {
+                            if (getImportGlobalType(module, idx)) |gt| {
+                                if (gt.mutability == .mutable) return error.TypeMismatch;
+                                if (gt.val_type != .i32) return error.TypeMismatch;
+                            }
+                        } else {
+                            const local_idx = idx - module.import_global_count;
+                            if (local_idx < module.globals.len) {
+                                if (module.globals[local_idx].global_type.mutability == .mutable) return error.TypeMismatch;
+                            }
                         }
                     },
                     else => return error.TypeMismatch,

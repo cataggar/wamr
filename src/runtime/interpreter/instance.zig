@@ -81,8 +81,8 @@ pub fn instantiateWithImports(
         }
     }
 
-    try applyDataSegments(module, inst.memories);
-    try applyElemSegments(module, inst.tables, inst);
+    try applyDataSegments(module, inst.memories, inst.globals);
+    try applyElemSegments(module, inst.tables, inst, inst.globals);
 
     // Execute start function if present (§4.5.4 step 15)
     if (module.start_function) |start_idx| {
@@ -339,7 +339,7 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
 
 // ─── Segment application ────────────────────────────────────────────────────
 
-fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryInstance) InstantiationError!void {
+fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryInstance, globals: []const *types.GlobalInstance) InstantiationError!void {
     for (module.data_segments) |seg| {
         if (seg.is_passive) continue;
 
@@ -347,7 +347,7 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryI
         if (mem_idx >= memories.len) return error.DataSegmentOutOfBounds;
         const mem = memories[mem_idx];
 
-        const offset = evalInitExprAsU32(seg.offset, &.{}) catch
+        const offset = evalInitExprAsU32(seg.offset, globals) catch
             return error.DataSegmentOutOfBounds;
 
         const end = @as(u64, offset) + seg.data.len;
@@ -357,7 +357,7 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryI
     }
 }
 
-fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInstance, inst: *types.ModuleInstance) InstantiationError!void {
+fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInstance, inst: *types.ModuleInstance, globals: []const *types.GlobalInstance) InstantiationError!void {
     for (module.elements) |seg| {
         if (seg.is_passive or seg.is_declarative) continue;
 
@@ -366,7 +366,7 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
         var table = tables[table_idx];
 
         const offset_expr = seg.offset orelse continue;
-        const offset = evalInitExprAsU32(offset_expr, &.{}) catch
+        const offset = evalInitExprAsU32(offset_expr, globals) catch
             return error.ElemSegmentOutOfBounds;
 
         const end = @as(u64, offset) + seg.func_indices.len;
