@@ -1283,8 +1283,8 @@ fn validateFunctionBody(
                 if (r.value >= total_funcs) return error.UnknownFunction;
             },
 
-            // ref.is_null has no immediate
-            0xD1 => {},
+            // ref.is_null, ref.as_non_null, ref.eq have no immediate
+            0xD1, 0xD3, 0xD5 => {},
 
             // FD prefix (SIMD) — skip sub-opcode and potential immediates
             0xFD => {
