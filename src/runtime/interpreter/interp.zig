@@ -1593,7 +1593,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             // ── Reference types ──
             .ref_null => {
                 const ref_type = readU32(code, &ip);
-                if (ref_type == @intFromEnum(types.ValType.externref)) {
+                if (ref_type == @intFromEnum(types.ValType.externref) or ref_type == 0x72) {
                     try env.push(.{ .externref = null });
                 } else {
                     try env.push(.{ .funcref = null });
