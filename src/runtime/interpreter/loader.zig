@@ -1080,7 +1080,7 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
             0x02, 0x03, 0x04 => { // block/loop/if: blocktype
                 skipBlockTypeImm(code, &i);
             },
-            0x0C, 0x0D, 0xD4, 0xD6 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x0C, 0x0D, 0xD5, 0xD6 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
             0x0E => { // br_table
                 const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read;
                 var j: u32 = 0;
@@ -1361,8 +1361,8 @@ fn validateFunctionBody(
                 if (r.value >= total_funcs) return error.UnknownFunction;
             },
 
-            // ref.is_null, ref.as_non_null, ref.eq have no immediate
-            0xD1, 0xD3, 0xD5 => {},
+            // ref.is_null, ref.eq, ref.as_non_null have no immediate
+            0xD1, 0xD3, 0xD4 => {},
 
             // FD prefix (SIMD) — skip sub-opcode and potential immediates
             0xFD => {
@@ -1391,7 +1391,7 @@ fn validateFunctionBody(
             },
 
             // br_on_null, br_on_non_null: labelidx
-            0xD4, 0xD6 => {
+            0xD5, 0xD6 => {
                 const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += r.bytes_read;
             },
@@ -2128,15 +2128,21 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             0xD1 => { _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i32); },
             0xD2 => { _ = readU32Leb(code, &i); pushType(&stack_buf, &sp, .funcref); },
 
-            // br_on_null: pop ref, branch if null
+            // ref.as_non_null (0xD4): pop nullable ref, push non-nullable ref (or trap)
             0xD4 => {
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                pushType(&stack_buf, &sp, .funcref);
+            },
+            // br_on_null (0xD5): pop ref, branch if null
+            0xD5 => {
                 _ = readU32Leb(code, &i); // label index
                 _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
             },
-            // ref.as_non_null: pop nullable ref, push non-nullable ref (or trap)
+            // ref.eq (0xD3): pop 2 refs, push i32
             0xD3 => {
                 _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                pushType(&stack_buf, &sp, .funcref);
+                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                pushType(&stack_buf, &sp, .i32);
             },
             // br_on_non_null: pop ref, branch if non-null
             0xD6 => {

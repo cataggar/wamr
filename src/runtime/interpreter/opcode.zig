@@ -242,9 +242,9 @@ pub const Opcode = enum(u8) {
     ref_null = 0xD0,
     ref_is_null = 0xD1,
     ref_func = 0xD2,
-    ref_as_non_null = 0xD3,
-    br_on_null = 0xD4,
-    ref_eq = 0xD5,
+    ref_eq = 0xD3,
+    ref_as_non_null = 0xD4,
+    br_on_null = 0xD5,
     br_on_non_null = 0xD6,
 
     // ──── Prefix bytes for extended opcode spaces ────
