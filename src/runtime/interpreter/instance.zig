@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const types = @import("../common/types.zig");
+const leb128_mod = @import("../../shared/utils/leb128.zig");
 const ExecEnv = @import("../common/exec_env.zig").ExecEnv;
 const interp = @import("interp.zig");
 
@@ -251,7 +252,89 @@ fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalIn
             else => return error.InvalidInitExpr,
         },
         .ref_func => |idx| .{ .funcref = idx },
+        .bytecode => |code| evalInitBytecode(code, preceding_globals),
     };
+}
+
+/// Evaluate compound constant expression bytecode using a mini stack machine.
+fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) InstantiationError!types.Value {
+    var stack: [16]types.Value = undefined;
+    var sp: u32 = 0;
+    var ip: usize = 0;
+    while (ip < code.len) {
+        const op = code[ip];
+        ip += 1;
+        switch (op) {
+            0x41 => { // i32.const
+                const r = leb128_mod.readSigned(i32, code[ip..]) catch return error.InvalidInitExpr;
+                ip += r.bytes_read;
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                stack[sp] = .{ .i32 = r.value };
+                sp += 1;
+            },
+            0x42 => { // i64.const
+                const r = leb128_mod.readSigned(i64, code[ip..]) catch return error.InvalidInitExpr;
+                ip += r.bytes_read;
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                stack[sp] = .{ .i64 = r.value };
+                sp += 1;
+            },
+            0x43 => { // f32.const
+                if (ip + 4 > code.len) return error.InvalidInitExpr;
+                const bits = std.mem.readInt(u32, code[ip..][0..4], .little);
+                ip += 4;
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                stack[sp] = .{ .f32 = @bitCast(bits) };
+                sp += 1;
+            },
+            0x44 => { // f64.const
+                if (ip + 8 > code.len) return error.InvalidInitExpr;
+                const bits = std.mem.readInt(u64, code[ip..][0..8], .little);
+                ip += 8;
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                stack[sp] = .{ .f64 = @bitCast(bits) };
+                sp += 1;
+            },
+            0x23 => { // global.get
+                const r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                ip += r.bytes_read;
+                if (r.value >= globals.len) return error.InvalidGlobalIndex;
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                stack[sp] = globals[r.value].value;
+                sp += 1;
+            },
+            0xD0 => { // ref.null
+                if (ip >= code.len) return error.InvalidInitExpr;
+                const ht = code[ip];
+                ip += 1;
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                if (ht == 0x6F or ht == 0x72) {
+                    stack[sp] = .{ .externref = null };
+                } else {
+                    stack[sp] = .{ .funcref = null };
+                }
+                sp += 1;
+            },
+            0xD2 => { // ref.func
+                const r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                ip += r.bytes_read;
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                stack[sp] = .{ .funcref = r.value };
+                sp += 1;
+            },
+            // i32 arithmetic
+            0x6A => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 +% stack[sp].i32 }; },
+            0x6B => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 -% stack[sp].i32 }; },
+            0x6C => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i32 = stack[sp - 1].i32 *% stack[sp].i32 }; },
+            // i64 arithmetic
+            0x7C => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 +% stack[sp].i64 }; },
+            0x7D => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 -% stack[sp].i64 }; },
+            0x7E => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 *% stack[sp].i64 }; },
+            else => return error.InvalidInitExpr,
+        }
+    }
+    if (sp != 1) return error.InvalidInitExpr;
+    return stack[0];
 }
 
 // ─── Segment application ────────────────────────────────────────────────────

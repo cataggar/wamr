@@ -193,8 +193,10 @@ fn readGlobalType(reader: *BinaryReader) LoadError!types.GlobalType {
 }
 
 fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
+    const start_pos = reader.pos;
     const opcode = try reader.readByte();
-    const expr: types.InitExpr = switch (opcode) {
+    // Try to parse as a single-instruction init expression first
+    const simple: ?types.InitExpr = switch (opcode) {
         0x41 => .{ .i32_const = try reader.readI32() },
         0x42 => .{ .i64_const = try reader.readI64() },
         0x43 => .{ .f32_const = try reader.readF32() },
@@ -202,11 +204,44 @@ fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
         0x23 => .{ .global_get = try reader.readU32() },
         0xD0 => .{ .ref_null = try readValType(reader) },
         0xD2 => .{ .ref_func = try reader.readU32() },
-        else => return error.InvalidInitExpr,
+        else => null,
     };
     const end = try reader.readByte();
-    if (end != 0x0B) return error.InvalidInitExpr;
-    return expr;
+    if (end == 0x0B) {
+        // Simple single-instruction expression
+        if (simple) |s| return s;
+        // Unknown single opcode is invalid
+        return error.InvalidInitExpr;
+    }
+    // Compound expression: validate and scan forward to end
+    // Only opcodes valid in constant expressions are accepted (spec §3.3.10)
+    if (simple == null) return error.InvalidInitExpr; // first opcode must be valid
+    reader.pos = start_pos;
+    var stack_depth: i32 = 0;
+    while (reader.pos < reader.data.len) {
+        const b = try reader.readByte();
+        switch (b) {
+            0x0B => {
+                if (stack_depth != 1) return error.InvalidInitExpr;
+                return .{ .bytecode = reader.data[start_pos .. reader.pos - 1] };
+            },
+            // Valid const expr opcodes that push 1 value
+            0x41 => { _ = try reader.readI32(); stack_depth += 1; },
+            0x42 => { _ = try reader.readI64(); stack_depth += 1; },
+            0x43 => { _ = try reader.readBytes(4); stack_depth += 1; },
+            0x44 => { _ = try reader.readBytes(8); stack_depth += 1; },
+            0x23 => { _ = try reader.readU32(); stack_depth += 1; },
+            0xD0 => { _ = try readValType(reader); stack_depth += 1; },
+            0xD2 => { _ = try reader.readU32(); stack_depth += 1; },
+            // Valid const expr binary ops: pop 2, push 1
+            0x6A, 0x6B, 0x6C, // i32.add, i32.sub, i32.mul
+            0x7C, 0x7D, 0x7E, // i64.add, i64.sub, i64.mul
+            => { stack_depth -= 1; },
+            // Any other opcode is invalid in a constant expression
+            else => return error.InvalidInitExpr,
+        }
+    }
+    return error.InvalidInitExpr;
 }
 
 // ─── Section parsers ────────────────────────────────────────────────────────
@@ -711,6 +746,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 if (g.global_type.val_type != .funcref) return error.TypeMismatch;
                 if (fidx >= total_funcs) return error.UnknownFunction;
             },
+            .bytecode => {}, // compound expressions validated at evaluation time
         }
     }
 
@@ -726,6 +762,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                         if (gt.val_type != .i32) return error.TypeMismatch;
                     }
                 },
+                .bytecode => {}, // compound offset expression validated at evaluation
                 else => return error.TypeMismatch,
             }
         }

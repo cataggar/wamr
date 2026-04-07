@@ -184,7 +184,8 @@ pub const WasmGlobal = struct {
     init_expr: InitExpr,
 };
 
-/// Constant expression used for global/data/element initializers
+/// Constant expression used for global/data/element initializers.
+/// Stores raw bytecode for lazy evaluation, supporting compound expressions.
 pub const InitExpr = union(enum) {
     i32_const: i32,
     i64_const: i64,
@@ -193,6 +194,8 @@ pub const InitExpr = union(enum) {
     global_get: u32,
     ref_null: ValType,
     ref_func: u32,
+    /// Raw bytecode for compound constant expressions (without trailing 0x0B)
+    bytecode: []const u8,
 };
 
 /// Data segment (§2.5.7)
