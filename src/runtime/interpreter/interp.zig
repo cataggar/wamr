@@ -646,11 +646,12 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
 
             .@"else" => {
-                // Reached else from the true branch — jump to end
+                // Reached else from the true branch — skip to after end
                 if (label_sp <= 1) return error.StackUnderflow;
                 const label = labels[label_sp - 1];
+                // Pop the label (since we jump past the end opcode, it won't pop it)
+                label_sp -= 1;
                 ip = label.target_ip;
-                // Don't pop the label; `end` will pop it
             },
 
             .end => {
