@@ -529,6 +529,10 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                         if (kind == .extern_ref and vt != .externref) return error.TypeMismatch;
                         try func_indices_list.append(allocator, null);
                     },
+                    // global.get and compound expressions can produce funcref/externref
+                    .global_get, .bytecode => {
+                        try func_indices_list.append(allocator, null); // treat as runtime-resolved ref
+                    },
                     else => return error.TypeMismatch,
                 }
             }
