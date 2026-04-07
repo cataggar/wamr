@@ -215,7 +215,12 @@ fn buildImportContext(
                     if (exp.index >= ri.memories.len) return error.ImportResolutionFailed;
                     const m = ri.memories[exp.index];
                     if (imp.memory_type) |mt| {
-                        if (!limitsMatch(m.memory_type.limits, mt.limits))
+                        // Use current pages (may have been grown) for limits matching
+                        const actual_limits = types.Limits{
+                            .min = m.current_pages,
+                            .max = m.memory_type.limits.max,
+                        };
+                        if (!limitsMatch(actual_limits, mt.limits))
                             return error.ImportResolutionFailed;
                     }
                     // Share the memory — retain refcount
@@ -241,9 +246,15 @@ fn buildImportContext(
                     const t = ri.tables[exp.index];
                     // Validate elem type and limits compatibility
                     if (imp.table_type) |tt| {
-                        if (t.table_type.elem_type != tt.elem_type)
+                        if (t.table_type.elem_type != tt.elem_type and
+                            t.table_type.elem_type != .funcref and tt.elem_type != .funcref)
                             return error.ImportResolutionFailed;
-                        if (!limitsMatch(t.table_type.limits, tt.limits))
+                        // Use current element count for limits matching (table may have been grown)
+                        const actual_limits = types.Limits{
+                            .min = @intCast(t.elements.len),
+                            .max = t.table_type.limits.max,
+                        };
+                        if (!limitsMatch(actual_limits, tt.limits))
                             return error.ImportResolutionFailed;
                     }
                     // Share the table — retain refcount
