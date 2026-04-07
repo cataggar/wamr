@@ -11,6 +11,8 @@ pub const ValType = enum(u8) {
     v128 = 0x7B,
     funcref = 0x70,
     externref = 0x6F,
+    nonfuncref = 0x14,
+    nonexternref = 0x15,
 
     pub fn isNumeric(self: ValType) bool {
         return switch (self) {
@@ -24,7 +26,33 @@ pub const ValType = enum(u8) {
     }
 
     pub fn isRef(self: ValType) bool {
-        return self == .funcref or self == .externref;
+        return switch (self) {
+            .funcref, .externref, .nonfuncref, .nonexternref => true,
+            else => false,
+        };
+    }
+
+    pub fn isFuncRef(self: ValType) bool {
+        return self == .funcref or self == .nonfuncref;
+    }
+
+    pub fn isExternRef(self: ValType) bool {
+        return self == .externref or self == .nonexternref;
+    }
+
+    /// Non-nullable types are subtypes of their nullable counterparts.
+    pub fn isSubtypeOf(self: ValType, other: ValType) bool {
+        return (self == .nonfuncref and other == .funcref) or
+            (self == .nonexternref and other == .externref);
+    }
+
+    /// Map non-nullable ref types to their nullable equivalents.
+    pub fn toNullable(self: ValType) ValType {
+        return switch (self) {
+            .nonfuncref => .funcref,
+            .nonexternref => .externref,
+            else => self,
+        };
     }
 
     pub fn byteSize(self: ValType) usize {
@@ -32,7 +60,7 @@ pub const ValType = enum(u8) {
             .i32, .f32 => 4,
             .i64, .f64 => 8,
             .v128 => 16,
-            .funcref, .externref => @sizeOf(usize),
+            .funcref, .externref, .nonfuncref, .nonexternref => @sizeOf(usize),
         };
     }
 };
@@ -46,6 +74,8 @@ pub const Value = union(ValType) {
     v128: u128,
     funcref: ?u32,
     externref: ?u32,
+    nonfuncref: ?u32,
+    nonexternref: ?u32,
 };
 
 /// Function type (§2.3.5)

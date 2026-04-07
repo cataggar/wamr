@@ -116,8 +116,10 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
                 break :blk std.math.isNan(v);
             break :blk actual_bits == expected_bits;
         },
-        .funcref => |v| b == .funcref and ((v == null and b.funcref == null) or (v != null and b.funcref != null)),
-        .externref => |v| b == .externref and ((v == null and b.externref == null) or (v != null and b.externref != null)),
+        .funcref => |v| (b == .funcref or b == .nonfuncref) and ((v == null and (if (b == .funcref) b.funcref else b.nonfuncref) == null) or (v != null and (if (b == .funcref) b.funcref else b.nonfuncref) != null)),
+        .externref => |v| (b == .externref or b == .nonexternref) and ((v == null and (if (b == .externref) b.externref else b.nonexternref) == null) or (v != null and (if (b == .externref) b.externref else b.nonexternref) != null)),
+        .nonfuncref => |v| (b == .funcref or b == .nonfuncref) and ((v == null and (if (b == .funcref) b.funcref else b.nonfuncref) == null) or (v != null and (if (b == .funcref) b.funcref else b.nonfuncref) != null)),
+        .nonexternref => |v| (b == .externref or b == .nonexternref) and ((v == null and (if (b == .externref) b.externref else b.nonexternref) == null) or (v != null and (if (b == .externref) b.externref else b.nonexternref) != null)),
         else => false,
     };
 }
@@ -233,7 +235,7 @@ fn buildImportContext(
                     if (!std.mem.eql(u8, imp.field_name, "table"))
                         return error.ImportResolutionFailed;
                     const tt = imp.table_type orelse types.TableType{ .elem_type = .funcref, .limits = .{ .min = 10 } };
-                    if (tt.elem_type != .funcref) return error.ImportResolutionFailed;
+                    if (!tt.elem_type.isFuncRef()) return error.ImportResolutionFailed;
                     if (!limitsMatch(.{ .min = 10, .max = @as(?u32, 20) }, tt.limits))
                         return error.ImportResolutionFailed;
                     tables.append(allocator, makeSpectestTable(allocator) orelse
@@ -247,7 +249,7 @@ fn buildImportContext(
                     // Validate elem type and limits compatibility
                     if (imp.table_type) |tt| {
                         if (t.table_type.elem_type != tt.elem_type and
-                            t.table_type.elem_type != .funcref and tt.elem_type != .funcref)
+                            !t.table_type.elem_type.isFuncRef() and !tt.elem_type.isFuncRef())
                             return error.ImportResolutionFailed;
                         // Use current element count for limits matching (table may have been grown)
                         const actual_limits = types.Limits{
@@ -334,8 +336,8 @@ fn defaultValue(val_type: types.ValType) types.Value {
         .i64 => .{ .i64 = 0 },
         .f32 => .{ .f32 = 0.0 },
         .f64 => .{ .f64 = 0.0 },
-        .funcref => .{ .funcref = null },
-        .externref => .{ .externref = null },
+        .funcref, .nonfuncref => .{ .funcref = null },
+        .externref, .nonexternref => .{ .externref = null },
         .v128 => .{ .v128 = 0 },
     };
 }
@@ -384,8 +386,8 @@ fn spectestFuncTypeMatches(name: []const u8, ft: types.FuncType) bool {
 
 fn funcTypesMatch(a: types.FuncType, b: types.FuncType) bool {
     if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
-    for (a.params, b.params) |pa, pb| { if (pa != pb) return false; }
-    for (a.results, b.results) |ra, rb| { if (ra != rb) return false; }
+    for (a.params, b.params) |pa, pb| { if (pa.toNullable() != pb.toNullable()) return false; }
+    for (a.results, b.results) |ra, rb| { if (ra.toNullable() != rb.toNullable()) return false; }
     return true;
 }
 

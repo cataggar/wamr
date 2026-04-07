@@ -247,11 +247,11 @@ fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalIn
             return preceding_globals[idx].value;
         },
         .ref_null => |vt| switch (vt) {
-            .funcref => return .{ .funcref = null },
-            .externref => return .{ .externref = null },
+            .funcref, .nonfuncref => return .{ .funcref = null },
+            .externref, .nonexternref => return .{ .externref = null },
             else => return error.InvalidInitExpr,
         },
-        .ref_func => |idx| .{ .funcref = idx },
+        .ref_func => |idx| .{ .nonfuncref = idx },
         .bytecode => |code| evalInitBytecode(code, preceding_globals),
     };
 }
@@ -319,7 +319,7 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
                 const r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
                 ip += r.bytes_read;
                 if (sp >= stack.len) return error.InvalidInitExpr;
-                stack[sp] = .{ .funcref = r.value };
+                stack[sp] = .{ .nonfuncref = r.value };
                 sp += 1;
             },
             // i32 arithmetic
@@ -547,7 +547,7 @@ test "evalInitExpr: all constant types" {
     try testing.expectEqual(@as(?u32, null), ref_null_val.funcref);
 
     const ref_func_val = try evalInitExpr(.{ .ref_func = 5 }, &.{});
-    try testing.expectEqual(@as(?u32, 5), ref_func_val.funcref);
+    try testing.expectEqual(@as(?u32, 5), ref_func_val.nonfuncref);
 }
 
 test "evalInitExpr: global_get references preceding global" {

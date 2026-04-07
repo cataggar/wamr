@@ -153,10 +153,11 @@ fn readValTypeChecked(reader: *BinaryReader, max_types: ?u32) LoadError!types.Va
         0x6F => .externref,
         // Typed reference types: ref null <heaptype> or ref <heaptype>
         0x63, 0x64 => {
+            const is_nullable = (byte == 0x63);
             const heap_byte = try reader.readByte();
             return switch (heap_byte) {
-                0x70, 0x73 => .funcref, // func, nofunc
-                0x6F, 0x72 => .externref, // extern, noextern
+                0x70, 0x73 => if (is_nullable) .funcref else .nonfuncref,
+                0x6F, 0x72 => if (is_nullable) .externref else .nonexternref,
                 else => {
                     // Concrete type index (LEB128)
                     var type_idx: u32 = heap_byte & 0x7F;
@@ -172,7 +173,7 @@ fn readValTypeChecked(reader: *BinaryReader, max_types: ?u32) LoadError!types.Va
                     if (max_types) |mt| {
                         if (type_idx >= mt) return error.InvalidValType;
                     }
-                    return .funcref; // concrete typed func ref -> funcref
+                    return if (is_nullable) .funcref else .nonfuncref;
                 },
             };
         },
@@ -195,7 +196,7 @@ fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
                     if (b & 0x80 == 0) break;
                 }
             }
-            return .funcref;
+            return .nonfuncref;
         },
     };
 }
@@ -228,10 +229,11 @@ fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableTy
         0x70 => .funcref,
         0x6F => .externref,
         0x63, 0x64 => blk: {
+            const is_nullable = (first_byte == 0x63);
             const heap_byte = try reader.readByte();
             break :blk switch (heap_byte) {
-                0x70, 0x73 => .funcref,
-                0x6F, 0x72 => .externref,
+                0x70, 0x73 => if (is_nullable) types.ValType.funcref else types.ValType.nonfuncref,
+                0x6F, 0x72 => if (is_nullable) types.ValType.externref else types.ValType.nonexternref,
                 else => {
                     var type_idx: u32 = heap_byte & 0x7F;
                     if (heap_byte & 0x80 != 0) {
@@ -244,7 +246,7 @@ fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableTy
                         }
                     }
                     if (type_idx >= type_count) return error.InvalidValType;
-                    break :blk .funcref;
+                    break :blk if (is_nullable) types.ValType.funcref else types.ValType.nonfuncref;
                 },
             };
         },
@@ -549,8 +551,8 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                         try func_indices_list.append(allocator, fidx);
                     },
                     .ref_null => |vt| {
-                        if (kind == .func_ref and vt != .funcref) return error.TypeMismatch;
-                        if (kind == .extern_ref and vt != .externref) return error.TypeMismatch;
+                        if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
+                        if (kind == .extern_ref and !vt.isExternRef()) return error.TypeMismatch;
                         try func_indices_list.append(allocator, null);
                     },
                     // global.get and compound expressions can produce funcref/externref
@@ -878,7 +880,9 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 if (idx < module.import_global_count) {
                     if (getImportGlobalType(module, idx)) |gt| {
                         if (gt.mutability == .mutable) return error.TypeMismatch;
-                        if (gt.val_type != g.global_type.val_type) return error.TypeMismatch;
+                        if (gt.val_type != g.global_type.val_type and
+                            !gt.val_type.isSubtypeOf(g.global_type.val_type))
+                            return error.TypeMismatch;
                     }
                 } else {
                     const local_idx = idx - module.import_global_count;
@@ -892,10 +896,12 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             .f32_const => { if (g.global_type.val_type != .f32) return error.TypeMismatch; },
             .f64_const => { if (g.global_type.val_type != .f64) return error.TypeMismatch; },
             .ref_null => |rt| {
-                if (g.global_type.val_type != rt) return error.TypeMismatch;
+                if (g.global_type.val_type != rt and
+                    !rt.isSubtypeOf(g.global_type.val_type))
+                    return error.TypeMismatch;
             },
             .ref_func => |fidx| {
-                if (g.global_type.val_type != .funcref) return error.TypeMismatch;
+                if (!g.global_type.val_type.isFuncRef()) return error.TypeMismatch;
                 if (fidx >= total_funcs) return error.UnknownFunction;
             },
             .bytecode => {}, // compound expressions validated at evaluation time
@@ -940,8 +946,8 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 break :blk if (local_idx < module.tables.len) module.tables[local_idx].elem_type else null;
             };
             if (table_elem_type) |tet| {
-                if (elem.kind == .func_ref and tet != .funcref) return error.TypeMismatch;
-                if (elem.kind == .extern_ref and tet != .externref) return error.TypeMismatch;
+                if (elem.kind == .func_ref and !tet.isFuncRef()) return error.TypeMismatch;
+                if (elem.kind == .extern_ref and !tet.isExternRef()) return error.TypeMismatch;
             }
             // Validate offset expression type (must be i32)
             if (elem.offset) |offset| {
@@ -1479,16 +1485,17 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
     }
     // Typed reference block types: ref null/ref + heaptype
     if (bt == 0x63 or bt == 0x64) {
+        const is_nullable = (bt == 0x63);
         pos.* += 1; // consume 0x63/0x64
         if (pos.* >= code.len) return error.TypeMismatch;
         const ht = code[pos.*];
-        if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = &[_]VT{.funcref} }; }
-        if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = &[_]VT{.externref} }; }
-        // Concrete type index (LEB128) — validate and treat as funcref result
+        if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} }; }
+        if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} }; }
+        // Concrete type index (LEB128) — validate and treat as funcref/nonfuncref result
         const tir = leb128_mod.readUnsigned(u32, code[pos.*..]) catch return error.TypeMismatch;
         pos.* += tir.bytes_read;
         if (tir.value >= module_types.len) return error.InvalidValType;
-        return .{ .results = &[_]VT{.funcref} };
+        return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} };
     }
     const r = leb128_mod.readSigned(i64, code[pos.*..]) catch return error.TypeMismatch;
     pos.* += r.bytes_read;
@@ -1530,7 +1537,7 @@ fn popExpect(stack: []VT, sp: *u32, expected: VT, cf: ?*CtrlFrame) bool {
         return cf != null and cf.?.unreachable_flag;
     }
     sp.* -= 1;
-    return stack[sp.*] == expected;
+    return stack[sp.*] == expected or stack[sp.*].isSubtypeOf(expected);
 }
 
 fn popAny(stack: []VT, sp: *u32, cf: ?*CtrlFrame) ?VT {
@@ -1550,14 +1557,15 @@ fn checkStackEnd(cf: *const CtrlFrame, stack: []const VT, sp: u32) bool {
         for (expected, 0..) |t, j| {
             const stack_idx = cf.start_height + @as(u32, @intCast(j));
             if (stack_idx >= sp) continue; // below concrete stack → polymorphic, OK
-            if (stack[stack_idx] != t) return false;
+            if (stack[stack_idx] != t and !stack[stack_idx].isSubtypeOf(t)) return false;
         }
         return true;
     }
     const expected = cf.end_types;
     if (sp != cf.start_height + expected.len) return false;
     for (expected, 0..) |t, j| {
-        if (stack[cf.start_height + @as(u32, @intCast(j))] != t) return false;
+        const idx = cf.start_height + @as(u32, @intCast(j));
+        if (stack[idx] != t and !stack[idx].isSubtypeOf(t)) return false;
     }
     return true;
 }
@@ -1820,7 +1828,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         if (target_types.len != default_types.len) return error.TypeMismatch;
                         if (!is_unreachable) {
                             for (target_types, default_types) |tt, dt| {
-                                if (tt != dt) return error.TypeMismatch;
+                                if (tt != dt and !tt.isSubtypeOf(dt) and !dt.isSubtypeOf(tt)) return error.TypeMismatch;
                             }
                         }
                     }
@@ -1856,7 +1864,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         const func_results = ctrl_buf[0].end_types;
                         if (ft.results.len != func_results.len) return error.TypeMismatch;
                         for (ft.results, func_results) |cr, fr| {
-                            if (cr != fr) return error.TypeMismatch;
+                            if (cr != fr and !cr.isSubtypeOf(fr)) return error.TypeMismatch;
                         }
                     } else {
                         for (ft.results) |rt| pushType(&stack_buf, &sp, rt);
@@ -1875,7 +1883,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 const table_idx = readU32Leb(code, &i);
                 // call_indirect requires a funcref table (spec §3.3.8.8)
                 if (getTableElemType(module, table_idx)) |et| {
-                    if (et != .funcref) return error.TypeMismatch;
+                    if (!et.isFuncRef()) return error.TypeMismatch;
                 }
                 if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
@@ -1892,7 +1900,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         const func_results = ctrl_buf[0].end_types;
                         if (ft.results.len != func_results.len) return error.TypeMismatch;
                         for (ft.results, func_results) |cr, fr| {
-                            if (cr != fr) return error.TypeMismatch;
+                            if (cr != fr and !cr.isSubtypeOf(fr)) return error.TypeMismatch;
                         }
                     } else {
                         for (ft.results) |rt| pushType(&stack_buf, &sp, rt);
@@ -1925,7 +1933,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         const func_results = ctrl_buf[0].end_types;
                         if (ft.results.len != func_results.len) return error.TypeMismatch;
                         for (ft.results, func_results) |cr, fr| {
-                            if (cr != fr) return error.TypeMismatch;
+                            if (cr != fr and !cr.isSubtypeOf(fr)) return error.TypeMismatch;
                         }
                     } else {
                         for (ft.results) |rt| pushType(&stack_buf, &sp, rt);
@@ -1950,8 +1958,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 // In non-unreachable code, both operands must be present
                 if (!is_unreachable and (t1 == null or t2 == null)) return error.TypeMismatch;
                 // select (untyped) requires numeric types — ref types need select_t
-                if (t1) |v| { if (v == .funcref or v == .externref) return error.TypeMismatch; }
-                if (t2) |v| { if (v == .funcref or v == .externref) return error.TypeMismatch; }
+                if (t1) |v| { if (v.isRef()) return error.TypeMismatch; }
+                if (t2) |v| { if (v.isRef()) return error.TypeMismatch; }
                 if (t1 != null and t2 != null and t1.? != t2.?) return error.TypeMismatch;
                 pushType(&stack_buf, &sp, t1 orelse t2 orelse .i32);
             },
@@ -2126,12 +2134,19 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
             0xD1 => { _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i32); },
-            0xD2 => { _ = readU32Leb(code, &i); pushType(&stack_buf, &sp, .funcref); },
+            0xD2 => { _ = readU32Leb(code, &i); pushType(&stack_buf, &sp, .nonfuncref); },
 
             // ref.as_non_null (0xD4): pop nullable ref, push non-nullable ref (or trap)
             0xD4 => {
-                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                pushType(&stack_buf, &sp, .funcref);
+                const popped = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                if (popped) |pt| {
+                    if (pt == .externref or pt == .nonexternref)
+                        pushType(&stack_buf, &sp, .nonexternref)
+                    else
+                        pushType(&stack_buf, &sp, .nonfuncref);
+                } else {
+                    pushType(&stack_buf, &sp, .nonfuncref);
+                }
             },
             // br_on_null (0xD5): pop ref, branch if null
             0xD5 => {

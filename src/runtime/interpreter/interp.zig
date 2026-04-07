@@ -199,13 +199,14 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .f64 => .{ .f64 = 0.0 },
                     .funcref => .{ .funcref = null },
                     .externref => .{ .externref = null },
+                    .nonfuncref => .{ .nonfuncref = null },
+                    .nonexternref => .{ .nonexternref = null },
                     else => .{ .i32 = 0 },
                 });
             }
             return;
         }
         const local_idx = current_func_idx - module.import_function_count;
-        if (local_idx >= module.functions.len) return error.UnknownFunction;
 
         const func = &module.functions[local_idx];
         const func_type = module.types[func.type_idx];
@@ -235,6 +236,8 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .f64 => .{ .f64 = 0.0 },
                     .funcref => .{ .funcref = null },
                     .externref => .{ .externref = null },
+                    .nonfuncref => .{ .nonfuncref = null },
+                    .nonexternref => .{ .nonexternref = null },
                     else => .{ .i32 = 0 },
                 });
             }
@@ -549,8 +552,8 @@ const MAX_LABELS = 256;
 
 fn funcTypesEqual(a: types.FuncType, b: types.FuncType) bool {
     if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
-    for (a.params, b.params) |ap, bp| if (ap != bp) return false;
-    for (a.results, b.results) |ar, br| if (ar != br) return false;
+    for (a.params, b.params) |ap, bp| if (ap.toNullable() != bp.toNullable()) return false;
+    for (a.results, b.results) |ar, br| if (ar.toNullable() != br.toNullable()) return false;
     return true;
 }
 
@@ -1643,23 +1646,23 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .ref_is_null => {
                 const val = try env.pop();
                 const is_null: bool = switch (val) {
-                    .funcref => |r| r == null,
-                    .externref => |r| r == null,
+                    .funcref, .nonfuncref => |r| r == null,
+                    .externref, .nonexternref => |r| r == null,
                     else => false,
                 };
                 try env.pushI32(@intFromBool(is_null));
             },
             .ref_func => {
                 const func_idx = readU32(code, &ip);
-                try env.push(.{ .funcref = func_idx });
+                try env.push(.{ .nonfuncref = func_idx });
             },
 
             // ── Typed function reference ops ──
             .ref_as_non_null => {
                 const val = try env.peek();
                 switch (val) {
-                    .funcref => |r| if (r == null) return error.Unreachable,
-                    .externref => |r| if (r == null) return error.Unreachable,
+                    .funcref, .nonfuncref => |r| if (r == null) return error.Unreachable,
+                    .externref, .nonexternref => |r| if (r == null) return error.Unreachable,
                     else => return error.Unreachable,
                 }
             },
@@ -1667,8 +1670,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const depth = readU32(code, &ip);
                 const val = try env.peek();
                 const is_null = switch (val) {
-                    .funcref => |r| r == null,
-                    .externref => |r| r == null,
+                    .funcref, .nonfuncref => |r| r == null,
+                    .externref, .nonexternref => |r| r == null,
                     else => false,
                 };
                 if (is_null) {
@@ -1701,12 +1704,12 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const b = try env.pop();
                 const a = try env.pop();
                 const eq: bool = switch (a) {
-                    .funcref => |ra| switch (b) {
-                        .funcref => |rb| ra == rb,
+                    .funcref, .nonfuncref => |ra| switch (b) {
+                        .funcref, .nonfuncref => |rb| ra == rb,
                         else => false,
                     },
-                    .externref => |ra| switch (b) {
-                        .externref => |rb| ra == rb,
+                    .externref, .nonexternref => |ra| switch (b) {
+                        .externref, .nonexternref => |rb| ra == rb,
                         else => false,
                     },
                     else => false,
@@ -1717,8 +1720,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const depth = readU32(code, &ip);
                 const val = try env.peek();
                 const is_null = switch (val) {
-                    .funcref => |r| r == null,
-                    .externref => |r| r == null,
+                    .funcref, .nonfuncref => |r| r == null,
+                    .externref, .nonexternref => |r| r == null,
                     else => true,
                 };
                 if (!is_null) {
@@ -1751,7 +1754,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const type_idx = readU32(code, &ip);
                 const ref_val = try env.pop();
                 const func_idx = switch (ref_val) {
-                    .funcref => |r| r orelse return error.Unreachable,
+                    .funcref, .nonfuncref => |r| r orelse return error.Unreachable,
                     else => return error.Unreachable,
                 };
                 _ = type_idx;
@@ -1762,7 +1765,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const type_idx = readU32(code, &ip);
                 const ref_val = try env.pop();
                 const func_idx = switch (ref_val) {
-                    .funcref => |r| r orelse return error.Unreachable,
+                    .funcref, .nonfuncref => |r| r orelse return error.Unreachable,
                     else => return error.Unreachable,
                 };
                 _ = type_idx;
@@ -1778,7 +1781,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const ref = table.elements[elem_idx];
-                if (table.table_type.elem_type == .externref) {
+                if (table.table_type.elem_type.isExternRef()) {
                     try env.push(.{ .externref = if (ref) |r| r.func_idx else null });
                 } else {
                     try env.push(.{ .funcref = if (ref) |r| r.func_idx else null });
@@ -1791,8 +1794,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const raw_ref: ?u32 = switch (ref) {
-                    .funcref => |r| r,
-                    .externref => |r| r,
+                    .funcref, .nonfuncref => |r| r,
+                    .externref, .nonexternref => |r| r,
                     else => null,
                 };
                 table.elements[elem_idx] = if (raw_ref) |r| .{ .func_idx = r, .module_inst = env.module_inst } else null;
@@ -1994,8 +1997,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             continue;
                         };
                         const init_val: ?types.FuncRef = switch (init_ref) {
-                            .funcref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
-                            .externref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
+                            .funcref, .nonfuncref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
+                            .externref, .nonexternref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
                             else => null,
                         };
                         for (new_elems[old_size..]) |*e| e.* = init_val;
@@ -2015,8 +2018,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, offset) + n > table.elements.len) return error.OutOfBoundsTableAccess;
                         const ref_val: ?types.FuncRef = switch (val) {
-                            .funcref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
-                            .externref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
+                            .funcref, .nonfuncref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
+                            .externref, .nonexternref => |r| if (r) |idx| .{ .func_idx = idx, .module_inst = env.module_inst } else null,
                             else => null,
                         };
                         for (table.elements[offset..][0..n]) |*e| e.* = ref_val;
