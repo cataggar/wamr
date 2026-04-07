@@ -170,8 +170,36 @@ fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
     };
 }
 
-fn readTableType(reader: *BinaryReader) LoadError!types.TableType {
-    const elem_type = try readValType(reader);
+fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableType {
+    // Table element types support concrete typed refs (ref null $type)
+    const first_byte = try reader.readByte();
+    const elem_type: types.ValType = switch (first_byte) {
+        0x70 => .funcref,
+        0x6F => .externref,
+        0x63, 0x64 => blk: {
+            const heap_byte = try reader.readByte();
+            break :blk switch (heap_byte) {
+                0x70, 0x73 => .funcref,
+                0x6F, 0x72 => .externref,
+                else => {
+                    // Concrete type index LEB128 — validate against type count
+                    var type_idx: u32 = heap_byte & 0x7F;
+                    if (heap_byte & 0x80 != 0) {
+                        var shift: u5 = 7;
+                        while (true) {
+                            const b = try reader.readByte();
+                            type_idx |= @as(u32, b & 0x7F) << shift;
+                            if (b & 0x80 == 0) break;
+                            shift +|= 7;
+                        }
+                    }
+                    if (type_idx >= type_count) return error.InvalidValType;
+                    break :blk .funcref; // concrete typed func ref → funcref
+                },
+            };
+        },
+        else => return error.InvalidValType,
+    };
     const limits = try readLimits(reader);
     return .{ .elem_type = elem_type, .limits = limits };
 }
@@ -273,7 +301,7 @@ fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadErr
     return func_types;
 }
 
-fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.ImportDesc {
+fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.ImportDesc {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     var imports_list: std.ArrayList(types.ImportDesc) = .empty;
@@ -306,7 +334,7 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
 
         switch (kind) {
             .function => imp.func_type_idx = try reader.readU32(),
-            .table => imp.table_type = try readTableType(reader),
+            .table => imp.table_type = try readTableType(reader, type_count),
             .memory => imp.memory_type = try readMemoryType(reader),
             .global => imp.global_type = try readGlobalType(reader),
         }
@@ -325,12 +353,12 @@ fn parseFunctionSection(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
     return indices;
 }
 
-fn parseTableSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.TableType {
+fn parseTableSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.TableType {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     const tables = try allocator.alloc(types.TableType, count);
     for (tables) |*t| {
-        t.* = try readTableType(reader);
+        t.* = try readTableType(reader, type_count);
     }
     return tables;
 }
@@ -383,7 +411,7 @@ fn parseExportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
     return exports_list.toOwnedSlice(allocator) catch return error.InvalidExportKind;
 }
 
-fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.ElemSegment {
+fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.ElemSegment {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     const elements = try allocator.alloc(types.ElemSegment, count);
@@ -415,6 +443,26 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator) Load
                 kind = switch (ref_byte) {
                     0x70 => .func_ref,
                     0x6F => .extern_ref,
+                    // Typed reference: ref null/ref + heaptype
+                    0x63, 0x64 => blk: {
+                        const ht = try reader.readByte();
+                        if (ht == 0x6F or ht == 0x72) break :blk .extern_ref;
+                        // func, nofunc → funcref
+                        if (ht == 0x70 or ht == 0x73) break :blk .func_ref;
+                        // Concrete type index — validate and consume LEB128
+                        var type_idx: u32 = ht & 0x7F;
+                        if (ht & 0x80 != 0) {
+                            var shift: u5 = 7;
+                            while (true) {
+                                const b = try reader.readByte();
+                                type_idx |= @as(u32, b & 0x7F) << shift;
+                                if (b & 0x80 == 0) break;
+                                shift +|= 7;
+                            }
+                        }
+                        if (type_idx >= type_count) return error.InvalidValType;
+                        break :blk .func_ref;
+                    },
                     else => return error.InvalidElemSegment,
                 };
             }
@@ -616,7 +664,8 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
             },
                 .type => module.types = try parseTypeSection(&reader, allocator),
                 .import => {
-                    module.imports = try parseImportSection(&reader, allocator);
+                    const tc: u32 = @intCast(module.types.len);
+                    module.imports = try parseImportSection(&reader, allocator, tc);
                     for (module.imports) |imp| {
                         switch (imp.kind) {
                             .function => module.import_function_count += 1,
@@ -627,12 +676,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                     }
                 },
                 .function => func_type_indices = try parseFunctionSection(&reader, allocator),
-                .table => module.tables = try parseTableSection(&reader, allocator),
+                .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len)),
                 .memory => module.memories = try parseMemorySection(&reader, allocator),
                 .global => module.globals = try parseGlobalSection(&reader, allocator),
                 .@"export" => module.exports = try parseExportSection(&reader, allocator),
                 .start => module.start_function = try reader.readU32(),
-                .element => module.elements = try parseElementSection(&reader, allocator),
+                .element => module.elements = try parseElementSection(&reader, allocator, @intCast(module.types.len)),
                 .code => module.functions = try parseCodeSection(&reader, func_type_indices, module.types, allocator),
                 .data => module.data_segments = try parseDataSection(&reader, allocator),
                 .data_count => module.data_count = try reader.readU32(),
@@ -1325,14 +1374,18 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
             else => .{ .results = &.{} },
         };
     }
-    // Typed reference block types: accept only abstract heap types
+    // Typed reference block types: ref null/ref + heaptype
     if (bt == 0x63 or bt == 0x64) {
         pos.* += 1; // consume 0x63/0x64
         if (pos.* >= code.len) return error.TypeMismatch;
         const ht = code[pos.*];
         if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = &[_]VT{.funcref} }; }
         if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = &[_]VT{.externref} }; }
-        return error.InvalidValType; // concrete type indices not yet supported
+        // Concrete type index (LEB128) — validate and treat as funcref result
+        const tir = leb128_mod.readUnsigned(u32, code[pos.*..]) catch return error.TypeMismatch;
+        pos.* += tir.bytes_read;
+        if (tir.value >= module_types.len) return error.InvalidValType;
+        return .{ .results = &[_]VT{.funcref} };
     }
     const r = leb128_mod.readSigned(i64, code[pos.*..]) catch return error.TypeMismatch;
     pos.* += r.bytes_read;
