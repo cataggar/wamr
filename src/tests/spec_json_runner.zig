@@ -654,6 +654,42 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 continue;
             };
 
+            // Handle "get" actions (global.get by export name)
+            if (std.mem.eql(u8, action.type, "get")) {
+                const resolved_get_inst = if (action.module) |mod_name|
+                    named_instances.get(mod_name) orelse current_instance
+                else
+                    current_instance;
+                const get_inst = resolved_get_inst orelse {
+                    result.skipped += 1;
+                    continue;
+                };
+                const field = action.field orelse {
+                    result.skipped += 1;
+                    continue;
+                };
+                const expected_json = cmd.expected orelse &[_]Arg{};
+                const global = findExportedGlobal(get_inst.inner, field) orelse {
+                    result.skipped += 1;
+                    continue;
+                };
+                if (expected_json.len == 1) {
+                    const expected_val = parseValue(expected_json[0]) orelse {
+                        result.skipped += 1;
+                        continue;
+                    };
+                    if (valuesEqual(global.value, expected_val)) {
+                        result.passed += 1;
+                    } else {
+                        std.debug.print("  FAIL assert_return line {d}: get {s} value mismatch\n", .{ cmd.line, field });
+                        result.failed += 1;
+                    }
+                } else {
+                    result.passed += 1; // no expected value
+                }
+                continue;
+            }
+
             if (!std.mem.eql(u8, action.type, "invoke")) {
                 result.skipped += 1;
                 continue;

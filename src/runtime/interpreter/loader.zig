@@ -147,7 +147,7 @@ fn readValType(reader: *BinaryReader) LoadError!types.ValType {
         0x70 => .funcref,
         0x6F => .externref,
         // Typed reference types: ref null <heaptype> or ref <heaptype>
-        // Accept abstract heap types, reject concrete type indices for now
+        // Accept abstract heap types, reject concrete type indices
         0x63, 0x64 => {
             const heap_byte = try reader.readByte();
             return switch (heap_byte) {
