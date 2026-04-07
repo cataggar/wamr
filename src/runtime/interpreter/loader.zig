@@ -1708,14 +1708,17 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     const default_label = label_buf[lcount - 1];
                     const default_target = &ctrl_buf[ctrl_sp - 1 - default_label];
                     const default_types = getLabelTypes(default_target);
-                    // Check each non-default label has the same arity and types
+                    const is_unreachable = if (ctrl_top.get(&ctrl_buf, ctrl_sp)) |cf| cf.unreachable_flag else false;
+                    // Check each non-default label has the same arity (and types if reachable)
                     li = 0;
                     while (li < lcount - 1) : (li += 1) {
                         const target = &ctrl_buf[ctrl_sp - 1 - label_buf[li]];
                         const target_types = getLabelTypes(target);
                         if (target_types.len != default_types.len) return error.TypeMismatch;
-                        for (target_types, default_types) |tt, dt| {
-                            if (tt != dt) return error.TypeMismatch;
+                        if (!is_unreachable) {
+                            for (target_types, default_types) |tt, dt| {
+                                if (tt != dt) return error.TypeMismatch;
+                            }
                         }
                     }
                     try popLabelTypes(&stack_buf, &sp, default_types, ctrl_top.get(&ctrl_buf, ctrl_sp));
