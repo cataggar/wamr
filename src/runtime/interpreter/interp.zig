@@ -326,6 +326,7 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
             .global_get, .global_set, .i32_const, .call, .return_call,
             .ref_null, .ref_func,
             .table_get, .table_set,
+            .call_ref, .return_call_ref, .br_on_null, .br_on_non_null,
             => {
                 pos = skipLeb128(code, pos);
             },
@@ -406,6 +407,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
             .global_get, .global_set, .i32_const, .call, .return_call,
             .ref_null, .ref_func,
             .table_get, .table_set,
+            .call_ref, .return_call_ref, .br_on_null, .br_on_non_null,
             => {
                 pos = skipLeb128(code, pos);
             },
@@ -1609,6 +1611,122 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .ref_func => {
                 const func_idx = readU32(code, &ip);
                 try env.push(.{ .funcref = func_idx });
+            },
+
+            // ── Typed function reference ops ──
+            .ref_as_non_null => {
+                const val = try env.peek();
+                switch (val) {
+                    .funcref => |r| if (r == null) return error.Unreachable,
+                    .externref => |r| if (r == null) return error.Unreachable,
+                    else => return error.Unreachable,
+                }
+            },
+            .br_on_null => {
+                const depth = readU32(code, &ip);
+                const val = try env.peek();
+                const is_null = switch (val) {
+                    .funcref => |r| r == null,
+                    .externref => |r| r == null,
+                    else => false,
+                };
+                if (is_null) {
+                    _ = try env.pop(); // consume the null ref
+                    // Branch (same as br)
+                    if (depth >= label_sp) return error.StackUnderflow;
+                    const label = labels[label_sp - 1 - depth];
+                    {
+                        var results: [16]types.Value = undefined;
+                        var ri: u32 = 0;
+                        while (ri < label.arity) : (ri += 1) {
+                            results[label.arity - 1 - ri] = try env.pop();
+                        }
+                        env.sp = label.stack_height;
+                        ri = 0;
+                        while (ri < label.arity) : (ri += 1) {
+                            try env.push(results[ri]);
+                        }
+                    }
+                    label_sp -= depth + 1;
+                    if (label.kind == .loop) {
+                        labels[label_sp] = label;
+                        label_sp += 1;
+                    }
+                    ip = label.target_ip;
+                }
+                // If not null, continue with the non-null ref on the stack
+            },
+            .ref_eq => {
+                const b = try env.pop();
+                const a = try env.pop();
+                const eq: bool = switch (a) {
+                    .funcref => |ra| switch (b) {
+                        .funcref => |rb| ra == rb,
+                        else => false,
+                    },
+                    .externref => |ra| switch (b) {
+                        .externref => |rb| ra == rb,
+                        else => false,
+                    },
+                    else => false,
+                };
+                try env.pushI32(@intFromBool(eq));
+            },
+            .br_on_non_null => {
+                const depth = readU32(code, &ip);
+                const val = try env.peek();
+                const is_null = switch (val) {
+                    .funcref => |r| r == null,
+                    .externref => |r| r == null,
+                    else => true,
+                };
+                if (!is_null) {
+                    // Branch with the non-null ref on top
+                    if (depth >= label_sp) return error.StackUnderflow;
+                    const label = labels[label_sp - 1 - depth];
+                    {
+                        var results: [16]types.Value = undefined;
+                        var ri: u32 = 0;
+                        while (ri < label.arity) : (ri += 1) {
+                            results[label.arity - 1 - ri] = try env.pop();
+                        }
+                        env.sp = label.stack_height;
+                        ri = 0;
+                        while (ri < label.arity) : (ri += 1) {
+                            try env.push(results[ri]);
+                        }
+                    }
+                    label_sp -= depth + 1;
+                    if (label.kind == .loop) {
+                        labels[label_sp] = label;
+                        label_sp += 1;
+                    }
+                    ip = label.target_ip;
+                } else {
+                    _ = try env.pop(); // consume the null ref, don't branch
+                }
+            },
+            .call_ref => {
+                const type_idx = readU32(code, &ip);
+                const ref_val = try env.pop();
+                const func_idx = switch (ref_val) {
+                    .funcref => |r| r orelse return error.Unreachable,
+                    else => return error.Unreachable,
+                };
+                _ = type_idx;
+                // Call the function by index (same as call)
+                try executeFunction(env, func_idx);
+            },
+            .return_call_ref => {
+                const type_idx = readU32(code, &ip);
+                const ref_val = try env.pop();
+                const func_idx = switch (ref_val) {
+                    .funcref => |r| r orelse return error.Unreachable,
+                    else => return error.Unreachable,
+                };
+                _ = type_idx;
+                try executeFunction(env, func_idx);
+                return .normal;
             },
 
             // ── Table ops ──
