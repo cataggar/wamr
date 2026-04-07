@@ -180,6 +180,26 @@ fn readValTypeChecked(reader: *BinaryReader, max_types: ?u32) LoadError!types.Va
     };
 }
 
+/// Read a heap type and map to ValType. Heap types are: 0x70 (func), 0x6F (extern),
+/// 0x73 (nofunc), 0x72 (noextern), or a concrete type index (unsigned LEB128).
+fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
+    const byte = try reader.readByte();
+    return switch (byte) {
+        0x70, 0x73 => .funcref,
+        0x6F, 0x72 => .externref,
+        else => {
+            // Concrete type index: consume remaining LEB128 bytes
+            if (byte & 0x80 != 0) {
+                while (true) {
+                    const b = try reader.readByte();
+                    if (b & 0x80 == 0) break;
+                }
+            }
+            return .funcref;
+        },
+    };
+}
+
 fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
     const flags = try reader.readByte();
     const min = try reader.readU32();
@@ -245,7 +265,7 @@ fn skipInitExpr(reader: *BinaryReader) LoadError!void {
             0x43 => { _ = try reader.readBytes(4); },
             0x44 => { _ = try reader.readBytes(8); },
             0x23 => { _ = try reader.readU32(); },
-            0xD0 => { _ = try readValType(reader); },
+            0xD0 => { _ = try readValTypeChecked(reader, null); },
             0xD2 => { _ = try reader.readU32(); },
             else => {},
         }
@@ -270,6 +290,10 @@ fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.Globa
 }
 
 fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
+    return parseInitExprChecked(reader, null);
+}
+
+fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types.InitExpr {
     const start_pos = reader.pos;
     const opcode = try reader.readByte();
     // Try to parse as a single-instruction init expression first
@@ -279,7 +303,7 @@ fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
         0x43 => .{ .f32_const = try reader.readF32() },
         0x44 => .{ .f64_const = try reader.readF64() },
         0x23 => .{ .global_get = try reader.readU32() },
-        0xD0 => .{ .ref_null = try readValType(reader) },
+        0xD0 => .{ .ref_null = try readHeapTypeAsValType(reader) },
         0xD2 => .{ .ref_func = try reader.readU32() },
         else => null,
     };
@@ -308,7 +332,7 @@ fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
             0x43 => { _ = try reader.readBytes(4); stack_depth += 1; },
             0x44 => { _ = try reader.readBytes(8); stack_depth += 1; },
             0x23 => { _ = try reader.readU32(); stack_depth += 1; },
-            0xD0 => { _ = try readValType(reader); stack_depth += 1; },
+            0xD0 => { _ = try readValTypeChecked(reader, type_count); stack_depth += 1; },
             0xD2 => { _ = try reader.readU32(); stack_depth += 1; },
             // Valid const expr binary ops: pop 2, push 1
             0x6A, 0x6B, 0x6C, // i32.add, i32.sub, i32.mul
@@ -428,7 +452,7 @@ fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
     const globals = try allocator.alloc(types.WasmGlobal, count);
     for (globals) |*g| {
         const global_type = try readGlobalType(reader, type_count);
-        const init_expr = try parseInitExpr(reader);
+        const init_expr = try parseInitExprChecked(reader, type_count);
         g.* = .{ .global_type = global_type, .init_expr = init_expr };
     }
     return globals;
