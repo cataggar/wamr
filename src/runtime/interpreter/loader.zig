@@ -938,6 +938,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                             }
                         }
                     },
+                    .bytecode => {}, // compound offset expression validated at evaluation
                     else => return error.TypeMismatch,
                 }
             }
