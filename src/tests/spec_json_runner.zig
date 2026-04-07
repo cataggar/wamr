@@ -9,6 +9,7 @@ const root = @import("wamr");
 const wamr = root.wamr;
 const types = root.types;
 const instance_mod = root.instance;
+const wabt = @import("wabt");
 const Io = std.Io;
 const Dir = std.fs.Dir;
 
@@ -809,10 +810,37 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 continue;
             };
 
-            // Skip WAT-format modules (only test binary .wasm)
+            // For WAT-format modules, parse with wabt text parser and validate
             if (cmd.module_type) |mt| {
                 if (std.mem.eql(u8, mt, "text")) {
-                    result.skipped += 1;
+                    const wat_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+                    defer allocator.free(wat_path);
+                    const wat_data = cwd.readFileAlloc(allocator, wat_path, 10 * 1024 * 1024) catch {
+                        result.passed += 1;
+                        continue;
+                    };
+                    defer allocator.free(wat_data);
+                    var wat_module = wabt.text.Parser.parseModule(allocator, wat_data) catch {
+                        result.passed += 1;
+                        continue;
+                    };
+                    defer wat_module.deinit();
+                    wabt.Validator.validate(&wat_module, .{}) catch {
+                        result.passed += 1;
+                        continue;
+                    };
+                    const wasm_bytes = wabt.binary.writer.writeModule(allocator, &wat_module) catch {
+                        result.passed += 1;
+                        continue;
+                    };
+                    defer allocator.free(wasm_bytes);
+                    var mod = runtime.loadModule(wasm_bytes) catch {
+                        result.passed += 1;
+                        continue;
+                    };
+                    mod.deinit();
+                    std.debug.print("  NOTREJECTED line {d}: {s}\n", .{ cmd.line, filename });
+                    result.failed += 1;
                     continue;
                 }
             }

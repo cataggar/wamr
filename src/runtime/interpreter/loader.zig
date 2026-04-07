@@ -276,11 +276,20 @@ fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadErr
 fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.ImportDesc {
     const count = try reader.readU32();
     if (count == 0) return &.{};
-    const imports = try allocator.alloc(types.ImportDesc, count);
-    for (imports) |*imp| {
+    var imports_list: std.ArrayList(types.ImportDesc) = .empty;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
         const module_name = try reader.readName();
         const field_name = try reader.readName();
         const kind_byte = try reader.readByte();
+
+        // Tag imports (0x04) from exception handling — skip
+        if (kind_byte == 0x04) {
+            _ = try reader.readByte(); // tag attribute
+            _ = try reader.readU32(); // type index
+            continue;
+        }
+
         const kind: types.ExternalKind = switch (kind_byte) {
             0x00 => .function,
             0x01 => .table,
@@ -289,7 +298,7 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
             else => return error.InvalidImportKind,
         };
 
-        imp.* = .{
+        var imp = types.ImportDesc{
             .module_name = module_name,
             .field_name = field_name,
             .kind = kind,
@@ -301,8 +310,9 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
             .memory => imp.memory_type = try readMemoryType(reader),
             .global => imp.global_type = try readGlobalType(reader),
         }
+        imports_list.append(allocator, imp) catch return error.InvalidImportKind;
     }
-    return imports;
+    return imports_list.toOwnedSlice(allocator) catch return error.InvalidImportKind;
 }
 
 fn parseFunctionSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]u32 {
@@ -350,21 +360,27 @@ fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
 fn parseExportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.ExportDesc {
     const count = try reader.readU32();
     if (count == 0) return &.{};
-    const exports = try allocator.alloc(types.ExportDesc, count);
-    for (exports) |*e| {
+    // Allocate max size, then shrink if we skip tag exports
+    var exports_list: std.ArrayList(types.ExportDesc) = .empty;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
         const name = try reader.readName();
         const kind_byte = try reader.readByte();
-        const kind: types.ExternalKind = switch (kind_byte) {
+        const index = try reader.readU32();
+        const kind: ?types.ExternalKind = switch (kind_byte) {
             0x00 => .function,
             0x01 => .table,
             0x02 => .memory,
             0x03 => .global,
+            0x04 => null, // tag export (exception handling) — skip
             else => return error.InvalidExportKind,
         };
-        const index = try reader.readU32();
-        e.* = .{ .name = name, .kind = kind, .index = index };
+        if (kind) |k| {
+            exports_list.append(allocator, .{ .name = name, .kind = k, .index = index }) catch
+                return error.InvalidExportKind;
+        }
     }
-    return exports;
+    return exports_list.toOwnedSlice(allocator) catch return error.InvalidExportKind;
 }
 
 fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.ElemSegment {
@@ -570,8 +586,18 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         const section_id = try reader.readByte();
         const section_size = try reader.readU32();
 
-        // Enforce section ordering (custom sections can appear anywhere)
+        // Enforce section ordering (custom sections and proposal sections can appear anywhere)
         if (section_id != 0) {
+            // Skip known proposal sections (tag section = 13) without enforcing order
+            if (section_id > @intFromEnum(types.SectionId.data_count)) {
+                const section_start = reader.pos;
+                if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
+                if (section_id == 13) {
+                    reader.pos = section_start + section_size;
+                    continue;
+                }
+                return error.MalformedSectionId;
+            }
             if (last_section_id) |last| {
                 if (section_id <= last) return error.InvalidSectionOrder;
             }
@@ -581,21 +607,13 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         const section_start = reader.pos;
         if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
 
-        if (section_id > @intFromEnum(types.SectionId.data_count)) {
-            // Skip known proposal sections (tag section = 13)
-            if (section_id == 13) {
+        switch (@as(types.SectionId, @enumFromInt(section_id))) {
+            .custom => {
+                // Parse the custom section name to validate UTF-8
+                _ = try reader.readName();
+                if (reader.pos > section_start + section_size) return error.InvalidSectionSize;
                 reader.pos = section_start + section_size;
-            } else {
-                return error.MalformedSectionId;
-            }
-        } else {
-            switch (@as(types.SectionId, @enumFromInt(section_id))) {
-                .custom => {
-                    // Parse the custom section name to validate UTF-8
-                    _ = try reader.readName();
-                    if (reader.pos > section_start + section_size) return error.InvalidSectionSize;
-                    reader.pos = section_start + section_size;
-                },
+            },
                 .type => module.types = try parseTypeSection(&reader, allocator),
                 .import => {
                     module.imports = try parseImportSection(&reader, allocator);
@@ -619,10 +637,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 .data => module.data_segments = try parseDataSection(&reader, allocator),
                 .data_count => module.data_count = try reader.readU32(),
             }
-        }
 
-        // Verify we consumed exactly section_size bytes
-        if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
+            // Verify we consumed exactly section_size bytes
+            if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
     }
 
     // Function section count must match code section count
