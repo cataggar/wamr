@@ -2215,8 +2215,12 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
         }
     }
 
-    // If we exit the loop without closing all blocks, the function body is truncated
-    if (ctrl_sp != 0) return error.UnexpectedEnd;
+    // If we exit the loop without closing all blocks, the function body is truncated.
+    // Exception: if ctrl_sp == 1 (only function frame) and we consumed all bytes,
+    // the trailing 0x0B end opcode may have been consumed as an instruction immediate
+    // (e.g., br_on_null's label index in unreachable code). This is valid per spec.
+    if (ctrl_sp > 1) return error.UnexpectedEnd;
+    if (ctrl_sp == 1 and i < code.len) return error.UnexpectedEnd;
 }
 
 const testing = std.testing;
