@@ -191,8 +191,19 @@ fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
 }
 
 fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableType {
-    // Table element types support concrete typed refs (ref null $type)
     const first_byte = try reader.readByte();
+
+    // Table with init expression: 0x40 0x00 reftype limits expr
+    if (first_byte == 0x40) {
+        _ = try reader.readByte(); // reserved byte (must be 0)
+        const elem_type = try readValTypeChecked(reader, type_count);
+        const limits = try readLimits(reader);
+        // Skip the init expression
+        skipInitExpr(reader) catch return error.InvalidValType;
+        return .{ .elem_type = elem_type, .limits = limits };
+    }
+
+    // Standard table: reftype limits
     const elem_type: types.ValType = switch (first_byte) {
         0x70 => .funcref,
         0x6F => .externref,
@@ -202,7 +213,6 @@ fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableTy
                 0x70, 0x73 => .funcref,
                 0x6F, 0x72 => .externref,
                 else => {
-                    // Concrete type index LEB128 — validate against type count
                     var type_idx: u32 = heap_byte & 0x7F;
                     if (heap_byte & 0x80 != 0) {
                         var shift: u5 = 7;
@@ -214,7 +224,7 @@ fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableTy
                         }
                     }
                     if (type_idx >= type_count) return error.InvalidValType;
-                    break :blk .funcref; // concrete typed func ref → funcref
+                    break :blk .funcref;
                 },
             };
         },
@@ -222,6 +232,25 @@ fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableTy
     };
     const limits = try readLimits(reader);
     return .{ .elem_type = elem_type, .limits = limits };
+}
+
+/// Skip an init expression (scan to end opcode 0x0B).
+fn skipInitExpr(reader: *BinaryReader) LoadError!void {
+    while (reader.remaining() > 0) {
+        const b = try reader.readByte();
+        switch (b) {
+            0x0B => return, // end
+            0x41 => { _ = try reader.readI32(); },
+            0x42 => { _ = try reader.readI64(); },
+            0x43 => { _ = try reader.readBytes(4); },
+            0x44 => { _ = try reader.readBytes(8); },
+            0x23 => { _ = try reader.readU32(); },
+            0xD0 => { _ = try readValType(reader); },
+            0xD2 => { _ = try reader.readU32(); },
+            else => {},
+        }
+    }
+    return error.UnexpectedEnd;
 }
 
 fn readMemoryType(reader: *BinaryReader) LoadError!types.MemoryType {
