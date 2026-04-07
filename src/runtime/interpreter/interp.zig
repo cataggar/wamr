@@ -1725,8 +1725,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     else => return error.Unreachable,
                 };
                 _ = type_idx;
-                try executeFunction(env, func_idx);
-                return .normal;
+                try prepareTailCall(env, func_idx);
+                tail_call_target.* = func_idx;
+                return .tail_call;
             },
 
             // ── Table ops ──
