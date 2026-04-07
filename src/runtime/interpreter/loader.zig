@@ -2123,13 +2123,38 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     2, 3 => doUnop(&stack_buf, &sp, .f64, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
                     4, 5 => doUnop(&stack_buf, &sp, .f32, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
                     6, 7 => doUnop(&stack_buf, &sp, .f64, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch,
-                    8 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // memory.init
-                    9 => { _ = readU32Leb(code, &i); }, // data.drop
-                    10 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // memory.copy
-                    11 => { _ = readU32Leb(code, &i); }, // memory.fill
-                    12 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // table.init
-                    13 => { _ = readU32Leb(code, &i); }, // elem.drop
-                    14 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // table.copy
+                    8 => { // memory.init: [i32 i32 i32] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    },
+                    9 => { _ = readU32Leb(code, &i); }, // data.drop: [] -> []
+                    10 => { // memory.copy: [i32 i32 i32] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    },
+                    11 => { // memory.fill: [i32 i32 i32] -> []
+                        _ = readU32Leb(code, &i);
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    },
+                    12 => { // table.init: [i32 i32 i32] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    },
+                    13 => { _ = readU32Leb(code, &i); }, // elem.drop: [] -> []
+                    14 => { // table.copy: [i32 i32 i32] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    },
                     15 => { // table.grow: [t i32] -> [i32]
                         const tidx = readU32Leb(code, &i);
                         const et = getTableElemType(module, tidx) orelse VT.funcref;
