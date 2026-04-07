@@ -137,6 +137,11 @@ const BinaryReader = struct {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn readValType(reader: *BinaryReader) LoadError!types.ValType {
+    return readValTypeChecked(reader, null);
+}
+
+/// Read a value type, validating concrete type indices against max_types if provided.
+fn readValTypeChecked(reader: *BinaryReader, max_types: ?u32) LoadError!types.ValType {
     const byte = try reader.readByte();
     return switch (byte) {
         0x7F => .i32,
@@ -147,13 +152,28 @@ fn readValType(reader: *BinaryReader) LoadError!types.ValType {
         0x70 => .funcref,
         0x6F => .externref,
         // Typed reference types: ref null <heaptype> or ref <heaptype>
-        // Accept abstract heap types, reject concrete type indices
         0x63, 0x64 => {
             const heap_byte = try reader.readByte();
             return switch (heap_byte) {
-                0x70, 0x73 => .funcref, // func, nofunc → funcref
-                0x6F, 0x72 => .externref, // extern, noextern → externref
-                else => error.InvalidValType, // concrete type indices not yet supported
+                0x70, 0x73 => .funcref, // func, nofunc
+                0x6F, 0x72 => .externref, // extern, noextern
+                else => {
+                    // Concrete type index (LEB128)
+                    var type_idx: u32 = heap_byte & 0x7F;
+                    if (heap_byte & 0x80 != 0) {
+                        var shift: u5 = 7;
+                        while (true) {
+                            const b = try reader.readByte();
+                            type_idx |= @as(u32, b & 0x7F) << shift;
+                            if (b & 0x80 == 0) break;
+                            shift +|= 7;
+                        }
+                    }
+                    if (max_types) |mt| {
+                        if (type_idx >= mt) return error.InvalidValType;
+                    }
+                    return .funcref; // concrete typed func ref -> funcref
+                },
             };
         },
         else => error.InvalidValType,
@@ -209,8 +229,8 @@ fn readMemoryType(reader: *BinaryReader) LoadError!types.MemoryType {
     return .{ .limits = limits };
 }
 
-fn readGlobalType(reader: *BinaryReader) LoadError!types.GlobalType {
-    const val_type = try readValType(reader);
+fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.GlobalType {
+    const val_type = try readValTypeChecked(reader, type_count);
     const mut_byte = try reader.readByte();
     const mutability: types.GlobalType.Mutability = switch (mut_byte) {
         0 => .immutable,
@@ -285,14 +305,14 @@ fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadErr
         const param_count = try reader.readU32();
         const params: []const types.ValType = if (param_count > 0) blk: {
             const p = try allocator.alloc(types.ValType, param_count);
-            for (p) |*v| v.* = try readValType(reader);
+            for (p) |*v| v.* = try readValTypeChecked(reader, count);
             break :blk p;
         } else &[_]types.ValType{};
 
         const result_count = try reader.readU32();
         const results: []const types.ValType = if (result_count > 0) blk: {
             const r = try allocator.alloc(types.ValType, result_count);
-            for (r) |*v| v.* = try readValType(reader);
+            for (r) |*v| v.* = try readValTypeChecked(reader, count);
             break :blk r;
         } else &[_]types.ValType{};
 
@@ -336,7 +356,7 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
             .function => imp.func_type_idx = try reader.readU32(),
             .table => imp.table_type = try readTableType(reader, type_count),
             .memory => imp.memory_type = try readMemoryType(reader),
-            .global => imp.global_type = try readGlobalType(reader),
+            .global => imp.global_type = try readGlobalType(reader, type_count),
         }
         imports_list.append(allocator, imp) catch return error.InvalidImportKind;
     }
@@ -373,12 +393,12 @@ fn parseMemorySection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
     return memories;
 }
 
-fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.WasmGlobal {
+fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.WasmGlobal {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     const globals = try allocator.alloc(types.WasmGlobal, count);
     for (globals) |*g| {
-        const global_type = try readGlobalType(reader);
+        const global_type = try readGlobalType(reader, type_count);
         const init_expr = try parseInitExpr(reader);
         g.* = .{ .global_type = global_type, .init_expr = init_expr };
     }
@@ -537,7 +557,7 @@ fn parseCodeSection(
             const l = try allocator.alloc(types.LocalDecl, local_decl_count);
             for (l) |*ld| {
                 const lcount = try reader.readU32();
-                const val_type = try readValType(reader);
+                const val_type = try readValTypeChecked(reader, @intCast(module_types.len));
                 ld.* = .{ .count = lcount, .val_type = val_type };
                 total_locals += lcount;
                 if (total_locals > std.math.maxInt(u32)) return error.TooManyLocals;
@@ -678,7 +698,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 .function => func_type_indices = try parseFunctionSection(&reader, allocator),
                 .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len)),
                 .memory => module.memories = try parseMemorySection(&reader, allocator),
-                .global => module.globals = try parseGlobalSection(&reader, allocator),
+                .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len)),
                 .@"export" => module.exports = try parseExportSection(&reader, allocator),
                 .start => module.start_function = try reader.readU32(),
                 .element => module.elements = try parseElementSection(&reader, allocator, @intCast(module.types.len)),
