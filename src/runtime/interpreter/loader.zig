@@ -463,13 +463,20 @@ fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
 fn parseExportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.ExportDesc {
     const count = try reader.readU32();
     if (count == 0) return &.{};
-    // Allocate max size, then shrink if we skip tag exports
     var exports_list: std.ArrayList(types.ExportDesc) = .empty;
+    // Track ALL export names (including tags) for duplicate checking
+    var seen_names: std.ArrayList([]const u8) = .empty;
+    defer seen_names.deinit(allocator);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const name = try reader.readName();
         const kind_byte = try reader.readByte();
         const index = try reader.readU32();
+        // Check for duplicate export names before filtering
+        for (seen_names.items) |prev| {
+            if (std.mem.eql(u8, prev, name)) return error.DuplicateExportName;
+        }
+        seen_names.append(allocator, name) catch return error.InvalidExportKind;
         const kind: ?types.ExternalKind = switch (kind_byte) {
             0x00 => .function,
             0x01 => .table,
