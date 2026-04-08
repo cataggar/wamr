@@ -82,6 +82,10 @@ pub const Value = union(ValType) {
 pub const FuncType = struct {
     params: []const ValType,
     results: []const ValType,
+    /// Concrete type indices parallel to params (0xFFFFFFFF = abstract).
+    param_tidxs: []const u32 = &.{},
+    /// Concrete type indices parallel to results (0xFFFFFFFF = abstract).
+    result_tidxs: []const u32 = &.{},
 };
 
 /// Limits (§2.3.4)
@@ -94,6 +98,8 @@ pub const Limits = struct {
 pub const TableType = struct {
     elem_type: ValType,
     limits: Limits,
+    /// Concrete type index for elem_type (0xFFFFFFFF = abstract).
+    elem_tidx: u32 = 0xFFFFFFFF,
 };
 
 /// Memory type (§2.3.7)
@@ -107,6 +113,8 @@ pub const MemoryType = struct {
 pub const GlobalType = struct {
     val_type: ValType,
     mutability: Mutability,
+    /// Concrete type index for val_type (0xFFFFFFFF = abstract).
+    type_idx: u32 = 0xFFFFFFFF,
 
     pub const Mutability = enum(u1) {
         immutable = 0,
@@ -206,6 +214,8 @@ pub const WasmFunction = struct {
 pub const LocalDecl = struct {
     count: u32,
     val_type: ValType,
+    /// Concrete type index (0xFFFFFFFF = abstract).
+    type_idx: u32 = 0xFFFFFFFF,
 };
 
 /// Global variable definition
@@ -244,6 +254,8 @@ pub const ElemSegment = struct {
     func_indices: []const ?u32,
     is_passive: bool = false,
     is_declarative: bool = false,
+    /// Concrete type index for element type (0xFFFFFFFF = abstract).
+    type_idx: u32 = 0xFFFFFFFF,
 
     pub const ElemKind = enum { func_ref, extern_ref };
 };
@@ -300,6 +312,23 @@ pub const WasmModule = struct {
             const tidx = self.functions[local_idx].type_idx;
             return if (tidx < self.types.len) self.types[tidx] else null;
         }
+        return null;
+    }
+
+    /// Get the type index for a given function index (import or local).
+    pub fn getFuncTypeIdx(self: *const WasmModule, func_idx: u32) ?u32 {
+        if (func_idx < self.import_function_count) {
+            var import_func_idx: u32 = 0;
+            for (self.imports) |imp| {
+                if (imp.kind == .function) {
+                    if (import_func_idx == func_idx) return imp.func_type_idx;
+                    import_func_idx += 1;
+                }
+            }
+            return null;
+        }
+        const local_idx = func_idx - self.import_function_count;
+        if (local_idx < self.functions.len) return self.functions[local_idx].type_idx;
         return null;
     }
 };
