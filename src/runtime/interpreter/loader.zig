@@ -211,7 +211,7 @@ fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
     };
 }
 
-fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableType {
+fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u32) LoadError!types.TableType {
     const first_byte = try reader.readByte();
 
     // Table with init expression: 0x40 0x00 reftype limits expr
@@ -219,8 +219,9 @@ fn readTableType(reader: *BinaryReader, type_count: u32) LoadError!types.TableTy
         _ = try reader.readByte(); // reserved byte (must be 0)
         const elem_type = try readValTypeChecked(reader, type_count);
         const limits = try readLimits(reader);
-        // Skip the init expression
-        skipInitExpr(reader) catch return error.InvalidValType;
+        // Validate and skip the init expression
+        // Table init expressions can only reference imported globals
+        try validateAndSkipInitExpr(reader, import_global_count);
         return .{ .elem_type = elem_type, .limits = limits };
     }
 
@@ -267,6 +268,28 @@ fn skipInitExpr(reader: *BinaryReader) LoadError!void {
             0x43 => { _ = try reader.readBytes(4); },
             0x44 => { _ = try reader.readBytes(8); },
             0x23 => { _ = try reader.readU32(); },
+            0xD0 => { _ = try readValTypeChecked(reader, null); },
+            0xD2 => { _ = try reader.readU32(); },
+            else => {},
+        }
+    }
+    return error.UnexpectedEnd;
+}
+
+/// Validate and skip a table init expression. global.get can only reference imported globals.
+fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError!void {
+    while (reader.remaining() > 0) {
+        const b = try reader.readByte();
+        switch (b) {
+            0x0B => return,
+            0x41 => { _ = try reader.readI32(); },
+            0x42 => { _ = try reader.readI64(); },
+            0x43 => { _ = try reader.readBytes(4); },
+            0x44 => { _ = try reader.readBytes(8); },
+            0x23 => {
+                const idx = try reader.readU32();
+                if (idx >= max_global_idx) return error.UnknownGlobal;
+            },
             0xD0 => { _ = try readValTypeChecked(reader, null); },
             0xD2 => { _ = try reader.readU32(); },
             else => {},
@@ -409,7 +432,7 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
 
         switch (kind) {
             .function => imp.func_type_idx = try reader.readU32(),
-            .table => imp.table_type = try readTableType(reader, type_count),
+            .table => imp.table_type = try readTableType(reader, type_count, 0),
             .memory => imp.memory_type = try readMemoryType(reader),
             .global => imp.global_type = try readGlobalType(reader, type_count),
         }
@@ -428,12 +451,12 @@ fn parseFunctionSection(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
     return indices;
 }
 
-fn parseTableSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.TableType {
+fn parseTableSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32, import_global_count: u32) LoadError![]const types.TableType {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     const tables = try allocator.alloc(types.TableType, count);
     for (tables) |*t| {
-        t.* = try readTableType(reader, type_count);
+        t.* = try readTableType(reader, type_count, import_global_count);
     }
     return tables;
 }
@@ -762,7 +785,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                     }
                 },
                 .function => func_type_indices = try parseFunctionSection(&reader, allocator),
-                .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len)),
+                .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len), module.import_global_count),
                 .memory => module.memories = try parseMemorySection(&reader, allocator),
                 .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len)),
                 .@"export" => module.exports = try parseExportSection(&reader, allocator),
