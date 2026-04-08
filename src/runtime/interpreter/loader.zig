@@ -1956,11 +1956,14 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
 
             // call_ref, return_call_ref: typeidx
-            // Pop funcref (the ref to the function), pop params, push results
+            // Pop funcref (nullable or non-nullable), pop params, push results
             0x14, 0x15 => {
                 const tidx = readU32Leb(code, &i);
-                // Pop the function reference
-                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                // Pop the function reference — must be a funcref (nullable or not)
+                const ref_type = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                if (ref_type) |rt| {
+                    if (!rt.isFuncRef()) return error.TypeMismatch;
+                }
                 if (tidx < module.types.len) {
                     const ft = module.types[tidx];
                     var pi = ft.params.len;
@@ -2200,10 +2203,19 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     pushType(&stack_buf, &sp, .nonfuncref);
                 }
             },
-            // br_on_null (0xD5): pop ref, branch if null
+            // br_on_null (0xD5): pop ref, branch if null; push non-nullable if not branching
             0xD5 => {
                 _ = readU32Leb(code, &i); // label index
-                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                const popped = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                // If the ref is not null (doesn't branch), push non-nullable version
+                if (popped) |pt| {
+                    if (pt.isExternRef())
+                        pushType(&stack_buf, &sp, .nonexternref)
+                    else
+                        pushType(&stack_buf, &sp, .nonfuncref);
+                } else {
+                    pushType(&stack_buf, &sp, .nonfuncref);
+                }
             },
             // ref.eq (0xD3): pop 2 refs, push i32
             0xD3 => {
