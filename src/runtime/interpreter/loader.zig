@@ -1680,6 +1680,17 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
     var ctrl_buf: [256]CtrlFrame = undefined;
     var ctrl_sp: u32 = 0;
 
+    // Track initialization of non-nullable ref locals
+    // Parameters are always initialized; only local declarations may be uninitialized
+    var local_init_buf: [1024]bool = undefined;
+    const param_count = @as(u32, @intCast(func_type.params.len));
+    {
+        var li: u32 = 0;
+        while (li < total_locals and li < local_init_buf.len) : (li += 1) {
+            local_init_buf[li] = li < param_count; // params are initialized
+        }
+    }
+
     // Push the function frame
     ctrl_buf[0] = .{
         .kind = .function,
@@ -1990,19 +2001,30 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
 
             // local.get
-            0x20 => { const idx = readU32Leb(code, &i); if (idx < total_locals) pushType(&stack_buf, &sp, local_types[idx]); },
+            0x20 => {
+                const idx = readU32Leb(code, &i);
+                if (idx < total_locals) {
+                    // Non-nullable ref locals must be initialized before use
+                    if ((local_types[idx] == .nonfuncref or local_types[idx] == .nonexternref) and
+                        idx < local_init_buf.len and !local_init_buf[idx])
+                        return error.TypeMismatch;
+                    pushType(&stack_buf, &sp, local_types[idx]);
+                }
+            },
             // local.set
             0x21 => {
                 const idx = readU32Leb(code, &i);
                 if (idx < total_locals) {
                     if (!popExpect(&stack_buf, &sp, local_types[idx], ctrl_top.get(&ctrl_buf, ctrl_sp)))
                         return error.TypeMismatch;
+                    if (idx < local_init_buf.len) local_init_buf[idx] = true;
                 }
             },
             // local.tee
             0x22 => {
                 const idx = readU32Leb(code, &i);
                 if (idx < total_locals) {
+                    if (idx < local_init_buf.len) local_init_buf[idx] = true;
                     if (!popExpect(&stack_buf, &sp, local_types[idx], ctrl_top.get(&ctrl_buf, ctrl_sp)))
                         return error.TypeMismatch;
                     pushType(&stack_buf, &sp, local_types[idx]);
