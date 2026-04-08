@@ -2514,7 +2514,16 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
                     12 => { // table.init: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        const elemidx = readU32Leb(code, &i);
+                        const tableidx = readU32Leb(code, &i);
+                        // Validate elem/table type compatibility
+                        const ntables = module.import_table_count + @as(u32, @intCast(module.tables.len));
+                        if (elemidx < module.elements.len and tableidx < ntables) {
+                            const elem_kind = module.elements[elemidx].kind;
+                            const tet = getTableElemType(module, tableidx) orelse VT.funcref;
+                            if (elem_kind == .func_ref and tet.isExternRef()) return error.TypeMismatch;
+                            if (elem_kind == .extern_ref and tet.isFuncRef()) return error.TypeMismatch;
+                        }
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
