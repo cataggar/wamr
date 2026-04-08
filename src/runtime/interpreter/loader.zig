@@ -627,6 +627,7 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                 .is_passive = is_passive,
                 .is_declarative = is_declarative,
                 .type_idx = seg_tidx,
+                .nullable_elements = true, // expression vectors can contain ref.null
             };
         } else {
             // flags 0,1,2,3: elemkind + vec(funcidx)
@@ -647,6 +648,7 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                 .func_indices = func_indices,
                 .is_passive = is_passive,
                 .is_declarative = is_declarative,
+                .nullable_elements = false, // funcidx vectors are always non-null
             };
         }
     }
@@ -1006,6 +1008,9 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             if (table_elem_type) |tet| {
                 if (elem.kind == .func_ref and !tet.isFuncRef()) return error.TypeMismatch;
                 if (elem.kind == .extern_ref and !tet.isExternRef()) return error.TypeMismatch;
+                // Non-nullable table requires non-nullable elements
+                if ((tet == .nonfuncref or tet == .nonexternref) and elem.nullable_elements)
+                    return error.TypeMismatch;
                 // Check concrete type index compatibility
                 const table_tidx = if (elem.table_idx < module.import_table_count)
                     getImportTableTidx(module, elem.table_idx)

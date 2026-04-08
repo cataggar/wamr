@@ -256,6 +256,8 @@ pub const ElemSegment = struct {
     is_declarative: bool = false,
     /// Concrete type index for element type (0xFFFFFFFF = abstract).
     type_idx: u32 = 0xFFFFFFFF,
+    /// Whether element values can be null (expression vectors can, funcidx vectors can't)
+    nullable_elements: bool = true,
 
     pub const ElemKind = enum { func_ref, extern_ref };
 };
