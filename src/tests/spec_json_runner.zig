@@ -192,7 +192,8 @@ fn buildImportContext(
                     if (exp.index >= ri.globals.len) return error.ImportResolutionFailed;
                     const eg = ri.globals[exp.index];
                     if (eg.global_type.val_type != gt.val_type or
-                        eg.global_type.mutability != gt.mutability)
+                        eg.global_type.mutability != gt.mutability or
+                        eg.global_type.type_idx != gt.type_idx)
                         return error.ImportResolutionFailed;
                     const gw = allocator.create(types.GlobalInstance) catch
                         return error.ImportResolutionFailed;
