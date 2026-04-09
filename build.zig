@@ -4,8 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── Build flags ────────────────────────────────────────────────────
+    const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse false;
+    const stack_protector = b.option(bool, "stack-protector", "Enable stack protector (requires libc)") orelse false;
+    const link_libc = b.option(bool, "link-libc", "Link libc") orelse stack_protector;
+    const version_string = b.option([]const u8, "version", "Version string") orelse "dev";
+
     // ── Feature flags ──────────────────────────────────────────────────
     const options = b.addOptions();
+    options.addOption([]const u8, "version", version_string);
 
     const interp = b.option(bool, "interp", "Enable interpreter") orelse true;
     options.addOption(bool, "interp", interp);
@@ -101,6 +108,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = if (strip) true else null,
+        .stack_protector = if (stack_protector) true else null,
+        .link_libc = if (link_libc) true else null,
     });
     exe_module.addImport("config", config_module);
     exe_module.addImport("wamr", lib_module);
@@ -116,6 +126,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/compiler/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = if (strip) true else null,
+        .stack_protector = if (stack_protector) true else null,
+        .link_libc = if (link_libc) true else null,
     });
     wamrc_module.addImport("config", config_module);
     wamrc_module.addImport("wamr", lib_module);
