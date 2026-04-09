@@ -373,6 +373,39 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
         if (end > table.elements.len) return error.ElemSegmentOutOfBounds;
 
         for (seg.func_indices, 0..) |mfunc_idx, i| {
+            // Check if this element has a runtime init expression
+            if (seg.elem_exprs.len > i) {
+                if (seg.elem_exprs[i]) |expr| {
+                    switch (expr) {
+                        .ref_func => |fidx| {
+                            table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = inst };
+                        },
+                        .global_get => |gidx| {
+                            // Evaluate global to get funcref value
+                            if (gidx < globals.len) {
+                                const gval = globals[gidx].value;
+                                if (gval.funcref) |fidx| {
+                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = inst };
+                                } else if (gval.nonfuncref) |fidx| {
+                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = inst };
+                                } else {
+                                    table.elements[offset + i] = null;
+                                }
+                            } else {
+                                table.elements[offset + i] = null;
+                            }
+                        },
+                        else => {
+                            table.elements[offset + i] = if (mfunc_idx) |func_idx|
+                                .{ .func_idx = func_idx, .module_inst = inst }
+                            else
+                                null;
+                        },
+                    }
+                    continue;
+                }
+            }
+            // Fallback: use func_indices directly
             table.elements[offset + i] = if (mfunc_idx) |func_idx|
                 .{ .func_idx = func_idx, .module_inst = inst }
             else

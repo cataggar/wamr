@@ -600,21 +600,27 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
             }
             const num_elems = try reader.readU32();
             var func_indices_list: std.ArrayList(?u32) = .empty;
+            var elem_exprs_list: std.ArrayList(?types.InitExpr) = .empty;
+            var has_runtime_exprs = false;
             var j: u32 = 0;
             while (j < num_elems) : (j += 1) {
                 const expr = try parseInitExpr(reader);
                 switch (expr) {
                     .ref_func => |fidx| {
                         try func_indices_list.append(allocator, fidx);
+                        try elem_exprs_list.append(allocator, expr);
                     },
                     .ref_null => |vt| {
                         if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
                         if (kind == .extern_ref and !vt.isExternRef()) return error.TypeMismatch;
                         try func_indices_list.append(allocator, null);
+                        try elem_exprs_list.append(allocator, null);
                     },
                     // global.get and compound expressions can produce funcref/externref
                     .global_get, .bytecode => {
-                        try func_indices_list.append(allocator, null); // treat as runtime-resolved ref
+                        try func_indices_list.append(allocator, null);
+                        try elem_exprs_list.append(allocator, expr);
+                        has_runtime_exprs = true;
                     },
                     else => return error.TypeMismatch,
                 }
@@ -624,6 +630,7 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                 .offset = offset,
                 .kind = kind,
                 .func_indices = try func_indices_list.toOwnedSlice(allocator),
+                .elem_exprs = if (has_runtime_exprs) try elem_exprs_list.toOwnedSlice(allocator) else &.{},
                 .is_passive = is_passive,
                 .is_declarative = is_declarative,
                 .type_idx = seg_tidx,
