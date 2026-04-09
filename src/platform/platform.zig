@@ -87,13 +87,10 @@ pub fn mprotect(addr: [*]u8, size: usize, prot: MemProt) !void {
 fn mmapWindows(hint: ?[*]u8, size: usize, prot: MemProt, flags: MapFlags) ?[*]u8 {
     if (!is_windows) unreachable;
 
-    const alloc_flags: win.MEM.ALLOCATE = blk: {
-        var f: win.MEM.ALLOCATE = .{ .RESERVE = true };
-        if (prot.read or prot.write or prot.exec) {
-            f.COMMIT = true;
-        }
-        break :blk f;
-    };
+    var alloc_flags: u32 = win.MEM_RESERVE;
+    if (prot.read or prot.write or prot.exec) {
+        alloc_flags |= win.MEM_COMMIT;
+    }
 
     const page_prot = memProtToWindowsPage(prot);
 
@@ -121,12 +118,11 @@ fn munmapWindows(addr: [*]u8) void {
     var base: ?[*]u8 = addr;
     var region_size: usize = 0;
 
-    // MEM_RELEASE requires size=0 and frees the entire allocation.
     _ = ntdll.NtFreeVirtualMemory(
         win.GetCurrentProcess(),
         @ptrCast(&base),
         &region_size,
-        .{ .RELEASE = true },
+        win.MEM_RELEASE,
     );
 }
 
@@ -134,7 +130,7 @@ fn mprotectWindows(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (!is_windows) unreachable;
 
     const new_prot = memProtToWindowsPage(prot);
-    var old_prot: win.PAGE = undefined;
+    var old_prot: u32 = undefined;
     var base: ?*anyopaque = @ptrCast(addr);
     var region_size: usize = size;
 
@@ -149,17 +145,17 @@ fn mprotectWindows(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (status != .SUCCESS) return error.MprotectFailed;
 }
 
-fn memProtToWindowsPage(prot: MemProt) win.PAGE {
+fn memProtToWindowsPage(prot: MemProt) u32 {
     if (!is_windows) unreachable;
 
     if (prot.exec) {
-        if (prot.write) return .{ .EXECUTE_READWRITE = true };
-        if (prot.read) return .{ .EXECUTE_READ = true };
-        return .{ .EXECUTE = true };
+        if (prot.write) return win.PAGE_EXECUTE_READWRITE;
+        if (prot.read) return win.PAGE_EXECUTE_READ;
+        return win.PAGE_EXECUTE;
     }
-    if (prot.write) return .{ .READWRITE = true };
-    if (prot.read) return .{ .READONLY = true };
-    return .{ .NOACCESS = true };
+    if (prot.write) return win.PAGE_READWRITE;
+    if (prot.read) return win.PAGE_READONLY;
+    return win.PAGE_NOACCESS;
 }
 
 // ── POSIX memory mapping implementation ─────────────────────────────────
@@ -318,9 +314,9 @@ pub fn usleep(us: u64) void {
 fn usleepWindows(us: u64) void {
     if (!is_windows) unreachable;
 
-    // NtDelayExecution takes a negative value for relative time, in 100-ns units.
-    const hundred_ns = @as(i64, @intCast(us)) * -10;
-    _ = ntdll.NtDelayExecution(.FALSE, &hundred_ns);
+    // Sleep takes milliseconds; round up to avoid sleeping 0ms for small values.
+    const ms: u32 = @intCast(@min((us + 999) / 1000, std.math.maxInt(u32)));
+    std.os.windows.kernel32.Sleep(ms);
 }
 
 fn usleepPosix(us: u64) void {

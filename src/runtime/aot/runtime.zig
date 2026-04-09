@@ -12,9 +12,9 @@ const aot_loader = @import("loader.zig");
 
 pub const AotInstance = struct {
     module: *const aot_loader.AotModule,
-    memories: []types.MemoryInstance,
-    tables: []types.TableInstance,
-    globals: []types.GlobalInstance,
+    memories: []*types.MemoryInstance,
+    tables: []*types.TableInstance,
+    globals: []*types.GlobalInstance,
     allocator: std.mem.Allocator,
     /// Base address of the mapped executable code (null if not yet mapped).
     code_base: ?[*]const u8 = null,
@@ -235,7 +235,7 @@ test "instantiate: module with table" {
     try std.testing.expectEqual(@as(usize, 10), inst.tables[0].elements.len);
     // All elements should be null-initialized
     for (inst.tables[0].elements) |elem| {
-        try std.testing.expectEqual(@as(?u32, null), elem);
+        try std.testing.expectEqual(@as(?types.FuncRef, null), elem);
     }
 }
 

@@ -2043,8 +2043,8 @@ fn runCode(code: []const u8) !i32 {
     const alloc = testing.allocator;
     // Minimal module/instance for testing
     var dummy_module = types.WasmModule{};
-    var memories = [_]types.MemoryInstance{};
-    var globals = [_]types.GlobalInstance{};
+    var memories = [_]*types.MemoryInstance{};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
         .memories = &memories,
@@ -2568,8 +2568,8 @@ test "interp: br_table dispatch" {
 fn runCodeI64(code: []const u8) !i64 {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
-    var memories = [_]types.MemoryInstance{};
-    var globals = [_]types.GlobalInstance{};
+    var memories = [_]*types.MemoryInstance{};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
         .memories = &memories,
@@ -2593,8 +2593,8 @@ fn runCodeI64(code: []const u8) !i64 {
 fn runCodeF32(code: []const u8) !f32 {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
-    var memories = [_]types.MemoryInstance{};
-    var globals = [_]types.GlobalInstance{};
+    var memories = [_]*types.MemoryInstance{};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
         .memories = &memories,
@@ -2618,8 +2618,8 @@ fn runCodeF32(code: []const u8) !f32 {
 fn runCodeF64(code: []const u8) !f64 {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
-    var memories = [_]types.MemoryInstance{};
-    var globals = [_]types.GlobalInstance{};
+    var memories = [_]*types.MemoryInstance{};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
         .memories = &memories,
@@ -2643,8 +2643,8 @@ fn runCodeF64(code: []const u8) !f64 {
 fn runCodeExpectTrapAny(code: []const u8, expected: TrapError) !void {
     const alloc = testing.allocator;
     var dummy_module = types.WasmModule{};
-    var memories = [_]types.MemoryInstance{};
-    var globals = [_]types.GlobalInstance{};
+    var memories = [_]*types.MemoryInstance{};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
         .memories = &memories,
@@ -2987,18 +2987,18 @@ fn runCodeWithMem(code: []const u8) !i32 {
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
     @memset(mem_data, 0);
-    var mem_inst = [_]types.MemoryInstance{.{
+    var mem_inst = types.MemoryInstance{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
         .data = mem_data,
         .current_pages = 1,
         .max_pages = 4,
-    }};
-    // Free via mem_inst[0].data since grow() may realloc
-    defer alloc.free(mem_inst[0].data);
-    var globals = [_]types.GlobalInstance{};
+    };
+    defer alloc.free(mem_inst.data);
+    var mem_ptrs = [_]*types.MemoryInstance{&mem_inst};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
-        .memories = &mem_inst,
+        .memories = &mem_ptrs,
         .tables = &.{},
         .globals = &globals,
         .allocator = alloc,
@@ -3021,17 +3021,18 @@ fn runCodeWithMemI64(code: []const u8) !i64 {
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
     @memset(mem_data, 0);
-    var mem_inst = [_]types.MemoryInstance{.{
+    var mem_inst = types.MemoryInstance{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
         .data = mem_data,
         .current_pages = 1,
         .max_pages = 4,
-    }};
-    defer alloc.free(mem_inst[0].data);
-    var globals = [_]types.GlobalInstance{};
+    };
+    defer alloc.free(mem_inst.data);
+    var mem_ptrs = [_]*types.MemoryInstance{&mem_inst};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
-        .memories = &mem_inst,
+        .memories = &mem_ptrs,
         .tables = &.{},
         .globals = &globals,
         .allocator = alloc,
@@ -3054,17 +3055,18 @@ fn runCodeWithMemF32(code: []const u8) !f32 {
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
     @memset(mem_data, 0);
-    var mem_inst = [_]types.MemoryInstance{.{
+    var mem_inst = types.MemoryInstance{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
         .data = mem_data,
         .current_pages = 1,
         .max_pages = 4,
-    }};
-    defer alloc.free(mem_inst[0].data);
-    var globals = [_]types.GlobalInstance{};
+    };
+    defer alloc.free(mem_inst.data);
+    var mem_ptrs = [_]*types.MemoryInstance{&mem_inst};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
-        .memories = &mem_inst,
+        .memories = &mem_ptrs,
         .tables = &.{},
         .globals = &globals,
         .allocator = alloc,
@@ -3087,17 +3089,18 @@ fn runCodeWithMemF64(code: []const u8) !f64 {
     var dummy_module = types.WasmModule{};
     const mem_data = try alloc.alloc(u8, types.MemoryInstance.page_size);
     @memset(mem_data, 0);
-    var mem_inst = [_]types.MemoryInstance{.{
+    var mem_inst = types.MemoryInstance{
         .memory_type = .{ .limits = .{ .min = 1, .max = 4 } },
         .data = mem_data,
         .current_pages = 1,
         .max_pages = 4,
-    }};
-    defer alloc.free(mem_inst[0].data);
-    var globals = [_]types.GlobalInstance{};
+    };
+    defer alloc.free(mem_inst.data);
+    var mem_ptrs = [_]*types.MemoryInstance{&mem_inst};
+    var globals = [_]*types.GlobalInstance{};
     var dummy_inst = types.ModuleInstance{
         .module = &dummy_module,
-        .memories = &mem_inst,
+        .memories = &mem_ptrs,
         .tables = &.{},
         .globals = &globals,
         .allocator = alloc,

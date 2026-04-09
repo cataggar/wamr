@@ -467,7 +467,7 @@ test "instantiate: module with table" {
     try testing.expectEqual(@as(usize, 1), inst.tables.len);
     try testing.expectEqual(@as(usize, 4), inst.tables[0].elements.len);
     // All elements should be null.
-    for (inst.tables[0].elements) |e| try testing.expectEqual(@as(?u32, null), e);
+    for (inst.tables[0].elements) |e| try testing.expectEqual(@as(?types.FuncRef, null), e);
 }
 
 test "instantiate: module with global i32.const 42" {
@@ -551,12 +551,11 @@ test "evalInitExpr: all constant types" {
 }
 
 test "evalInitExpr: global_get references preceding global" {
-    const globals = [_]types.GlobalInstance{
-        .{
-            .global_type = .{ .val_type = .i32, .mutability = .immutable },
-            .value = .{ .i32 = 99 },
-        },
+    var global = types.GlobalInstance{
+        .global_type = .{ .val_type = .i32, .mutability = .immutable },
+        .value = .{ .i32 = 99 },
     };
+    const globals = [_]*types.GlobalInstance{&global};
     const val = try evalInitExpr(.{ .global_get = 0 }, &globals);
     try testing.expectEqual(@as(i32, 99), val.i32);
 }
