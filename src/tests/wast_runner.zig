@@ -198,7 +198,21 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                 try writeRegister(w, sexpr.text, line_num);
             },
             .invoke, .get => {
-                try w.print("{{\"type\":\"action\",\"line\":{d}}}", .{line_num});
+                // Write as action command with proper invoke details
+                if (cmd == .invoke) {
+                    if (findQuotedString(sexpr.text)) |field_name| {
+                        try w.print("{{\"type\":\"action\",\"line\":{d},\"action\":{{\"type\":\"invoke\",\"field\":\"{s}\",\"args\":[", .{ line_num, field_name });
+                        // Parse args (find all (type.const N) patterns)
+                        const invoke_end = std.mem.indexOf(u8, sexpr.text, "\"") orelse sexpr.text.len;
+                        _ = invoke_end;
+                        writeConstValues(w, sexpr.text) catch {};
+                        try w.writeAll("]}}");
+                    } else {
+                        try w.print("{{\"type\":\"action\",\"line\":{d}}}", .{line_num});
+                    }
+                } else {
+                    try w.print("{{\"type\":\"action\",\"line\":{d}}}", .{line_num});
+                }
             },
             .unknown => { first = true; },
         }
@@ -609,6 +623,57 @@ test "wast runner: full pipeline for simple module" {
     };
     try testing.expectEqual(@as(usize, 1), module.functions.len);
     try testing.expect(module.functions[0].code.len > 2);
+}
+
+test "wabt: memory load module round-trips through WAMR" {
+    const allocator = testing.allocator;
+    const wat = "(module (memory 1) (func (export \"load\") (result i32) (i32.load (i32.const 0))))";
+
+    var mod = try wabt.text.Parser.parseModule(allocator, wat);
+    defer mod.deinit();
+
+    const wasm_bytes = try wabt.binary.writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm_bytes);
+
+    // Load in WAMR
+    const root = @import("wamr");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const module = root.loader.load(wasm_bytes, arena.allocator()) catch |err| {
+        std.debug.print("WAMR load failed: {}\n", .{err});
+        for (wasm_bytes) |b| std.debug.print("{x:0>2}", .{b});
+        std.debug.print("\n", .{});
+        return err;
+    };
+
+    try testing.expectEqual(@as(usize, 1), module.functions.len);
+    try testing.expectEqual(@as(usize, 1), module.memories.len);
+    // Code must NOT contain the extra 0x00 (unreachable) byte
+    // Expected: i32.const 0 (41 00) + i32.load (28 00 00) + end (0b) = 6 bytes
+    try testing.expectEqual(@as(usize, 6), module.functions[0].code.len);
+}
+
+test "wabt: memory store module round-trips through WAMR" {
+    const allocator = testing.allocator;
+    const wat = "(module (memory 1) (func (export \"store\") (i32.store (i32.const 0) (i32.const 42))))";
+
+    var mod = try wabt.text.Parser.parseModule(allocator, wat);
+    defer mod.deinit();
+
+    const wasm_bytes = try wabt.binary.writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm_bytes);
+
+    const root = @import("wamr");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const module = root.loader.load(wasm_bytes, arena.allocator()) catch |err| {
+        std.debug.print("WAMR load failed: {}\n", .{err});
+        return err;
+    };
+
+    try testing.expectEqual(@as(usize, 1), module.functions.len);
+    // Expected: i32.const 0 (41 00) + i32.const 42 (41 2a) + i32.store (36 00 00) + end (0b) = 8 bytes
+    try testing.expectEqual(@as(usize, 8), module.functions[0].code.len);
 }
 
 test "parseConst: i32" {
