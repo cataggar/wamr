@@ -570,8 +570,12 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
             // flags 4,5,6,7: vec(expr) — reftype byte only for flags 5,6,7
             var kind: types.ElemSegment.ElemKind = .func_ref;
             var seg_tidx: u32 = NO_TIDX;
+            var is_nullable_elem = true; // default for flags=4 (no explicit reftype)
             if (flags != 4) {
                 const ref_byte = try reader.readByte();
+                // 0x70 (funcref) and 0x6F (externref) are nullable
+                // 0x63 (ref null) is nullable, 0x64 (ref) is non-nullable
+                is_nullable_elem = (ref_byte != 0x64);
                 kind = switch (ref_byte) {
                     0x70 => .func_ref,
                     0x6F => .extern_ref,
@@ -635,7 +639,7 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                 .is_passive = is_passive,
                 .is_declarative = is_declarative,
                 .type_idx = seg_tidx,
-                .nullable_elements = true, // expression vectors can contain ref.null
+                .nullable_elements = is_nullable_elem,
             };
         } else {
             // flags 0,1,2,3: elemkind + vec(funcidx)
