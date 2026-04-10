@@ -1937,6 +1937,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const d: u32 = @bitCast(try env.popI32());
                         const module = env.module_inst.module;
                         if (elem_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
+                        // Check if segment has been dropped
+                        if (elem_idx < env.module_inst.dropped_elems.len and env.module_inst.dropped_elems[elem_idx]) {
+                            if (n > 0) return error.OutOfBoundsTableAccess;
+                            continue;
+                        }
                         const elem = &module.elements[elem_idx];
                         const table = if (table_idx < env.module_inst.tables.len) env.module_inst.tables[table_idx] else return error.OutOfBoundsTableAccess;
                         if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
@@ -1949,8 +1954,10 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         }
                     },
                     13 => { // elem.drop
-                        _ = readU32(code, &ip);
-                        // TODO: mark element segment as dropped
+                        const idx = readU32(code, &ip);
+                        if (idx < env.module_inst.dropped_elems.len) {
+                            env.module_inst.dropped_elems[idx] = true;
+                        }
                     },
                     14 => { // table.copy
                         const dst_table_idx = readU32(code, &ip);

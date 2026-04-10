@@ -473,6 +473,8 @@ pub const ModuleInstance = struct {
     globals: []*GlobalInstance,
     import_functions: []const ImportedFunction = &.{},
     allocator: std.mem.Allocator,
+    /// Track dropped elem segments (active segments dropped after instantiation)
+    dropped_elems: []bool = &.{},
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {
         const exp = self.module.findExport(name, .function) orelse return null;

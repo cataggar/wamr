@@ -84,6 +84,14 @@ pub fn instantiateWithImports(
     try applyDataSegments(module, inst.memories, inst.globals);
     try applyElemSegments(module, inst.tables, inst, inst.globals);
 
+    // Mark active and declarative elem segments as dropped (§4.5.4 step 13)
+    if (module.elements.len > 0) {
+        inst.dropped_elems = allocator.alloc(bool, module.elements.len) catch return error.OutOfMemory;
+        for (module.elements, 0..) |seg, i| {
+            inst.dropped_elems[i] = !seg.is_passive; // active and declarative are dropped
+        }
+    }
+
     // Execute start function if present (§4.5.4 step 15)
     if (module.start_function) |start_idx| {
         if (start_idx >= module.import_function_count) {
@@ -103,6 +111,7 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, inst.module.import_global_count, allocator);
     if (inst.import_functions.len > 0) allocator.free(inst.import_functions);
+    if (inst.dropped_elems.len > 0) allocator.free(inst.dropped_elems);
     allocator.destroy(inst);
 }
 
