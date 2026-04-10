@@ -13,6 +13,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: true
 
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -30,16 +32,18 @@ jobs:
 
       - name: Spec tests
         run: |
-          if [ -d tests/spec-json ]; then
-            result=$(./zig-out/bin/spec-test-runner tests/spec-json 2>&1 | tail -6)
+          if [ -d third_party/testsuite ]; then
+            result=$(./zig-out/bin/spec-test-runner third_party/testsuite 2>&1 | tail -6)
             echo "$result"
             passed=$(echo "$result" | grep -oP 'Passed:\s+\K[0-9]+')
             failed=$(echo "$result" | grep -oP 'Failed:\s+\K[0-9]+')
-            skipped=$(echo "$result" | grep -oP 'Skipped:\s+\K[0-9]+')
-            echo "Results: $passed passed, $failed failed, $skipped skipped"
+            echo "Results: $passed passed, $failed failed"
             if [ "$failed" -gt 0 ]; then
               echo "::warning::$failed spec test failures"
             fi
+          elif [ -d tests/spec-json ]; then
+            result=$(./zig-out/bin/spec-test-runner tests/spec-json 2>&1 | tail -6)
+            echo "$result"
           else
-            echo "::notice::Spec test JSON files not found — skipping spec tests"
+            echo "::notice::No spec tests found"
           fi

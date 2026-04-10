@@ -2,3 +2,6 @@
 	path = tests/unit/llm-enhanced-test
 	url = https://github.com/wasm-micro-runtime/llm-enhanced-test.git
 	branch = main
+[submodule "third_party/testsuite"]
+	path = third_party/testsuite
+	url = https://github.com/WebAssembly/testsuite.git
