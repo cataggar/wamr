@@ -191,3 +191,60 @@ test "ThreadManager: trap flag" {
     tm.signalTrap();
     try std.testing.expect(tm.hasTrap());
 }
+
+test "ModuleInstance: cloneForThread shares memory" {
+    const allocator = std.testing.allocator;
+
+    // Create a parent module with shared memory
+    var module = types.WasmModule{};
+    const mem_data = try allocator.alloc(u8, 65536);
+    defer allocator.free(mem_data);
+    @memset(mem_data, 0);
+    mem_data[0] = 42; // write a value
+
+    var mem_inst = try allocator.create(types.MemoryInstance);
+    defer {
+        mem_inst.ref_count -= 1; // balance the clone's retain
+        allocator.destroy(mem_inst);
+    }
+    mem_inst.* = .{
+        .memory_type = .{ .limits = .{ .min = 1 }, .is_shared = true },
+        .data = mem_data,
+        .current_pages = 1,
+        .max_pages = 4,
+    };
+
+    var mem_ptrs = [_]*types.MemoryInstance{mem_inst};
+    var globals = [_]*types.GlobalInstance{};
+    var parent = try allocator.create(types.ModuleInstance);
+    parent.* = .{
+        .module = &module,
+        .memories = &mem_ptrs,
+        .tables = &.{},
+        .globals = &globals,
+        .allocator = allocator,
+    };
+    // Don't destroy parent — we manage manually
+
+    // Clone for a child thread
+    const child = try parent.cloneForThread(allocator);
+    defer {
+        // Release shared memory (retain was called in clone)
+        for (child.memories) |m| m.release(allocator);
+        allocator.free(child.memories);
+        for (child.globals) |g| allocator.destroy(g);
+        allocator.destroy(child);
+    }
+
+    // Child should see the same memory
+    try std.testing.expectEqual(@as(u8, 42), child.memories[0].data[0]);
+
+    // Write through child — parent should see it (shared)
+    child.memories[0].data[1] = 99;
+    try std.testing.expectEqual(@as(u8, 99), parent.memories[0].data[1]);
+
+    // Verify ref count was incremented
+    try std.testing.expectEqual(@as(u32, 2), mem_inst.ref_count);
+
+    allocator.destroy(parent);
+}

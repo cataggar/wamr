@@ -2212,36 +2212,60 @@ fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
 }
 
 fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
-    const a = try getAtomicAddr(env, code, ip, size);
+    _ = readU32(code, ip); // align
+    const offset = readU32(code, ip);
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
-    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const base: u32 = @bitCast(try env.popI32());
+    const addr = @as(u64, base) + offset;
+    const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
+    const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const old = @atomicRmw(T, ptr, op, val, .seq_cst);
     try env.pushI32(@bitCast(@as(u32, old)));
 }
 
 fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
-    const a = try getAtomicAddr(env, code, ip, size);
+    _ = readU32(code, ip); // align
+    const offset = readU32(code, ip);
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
-    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const base: u32 = @bitCast(try env.popI32());
+    const addr = @as(u64, base) + offset;
+    const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
+    const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const old = @atomicRmw(T, ptr, op, val, .seq_cst);
     try env.pushI64(@bitCast(@as(u64, old)));
 }
 
 fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
-    const a = try getAtomicAddr(env, code, ip, size);
+    _ = readU32(code, ip); // align
+    const offset = readU32(code, ip);
     const replacement: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const expected: T = @truncate(@as(u32, @bitCast(try env.popI32())));
-    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const base: u32 = @bitCast(try env.popI32());
+    const addr = @as(u64, base) + offset;
+    const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
+    const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const result = @cmpxchgStrong(T, ptr, expected, replacement, .seq_cst, .seq_cst);
     const old: u32 = if (result) |v| v else expected;
     try env.pushI32(@bitCast(old));
 }
 
 fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
-    const a = try getAtomicAddr(env, code, ip, size);
+    _ = readU32(code, ip); // align
+    const offset = readU32(code, ip);
     const replacement: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const expected: T = @truncate(@as(u64, @bitCast(try env.popI64())));
-    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const base: u32 = @bitCast(try env.popI32());
+    const addr = @as(u64, base) + offset;
+    const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
+    const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
     const result = @cmpxchgStrong(T, ptr, expected, replacement, .seq_cst, .seq_cst);
     const old: u64 = if (result) |v| v else expected;
     try env.pushI64(@bitCast(old));
@@ -3371,6 +3395,61 @@ test "interp: memory.grow beyond max returns -1" {
         0x0B,
     });
     try testing.expectEqual(@as(i32, -1), result);
+}
+
+// ── Atomic opcode tests ──
+
+test "interp: i32.atomic.store + i32.atomic.load" {
+    // Store 42 at address 0, then load it back
+    const result = try runCodeWithMem(&.{
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 42, // i32.const 42 (value)
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0x41, 0x00, // i32.const 0 (addr)
+        0xFE, 0x10, 0x02, 0x00, // i32.atomic.load align=2 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 42), result);
+}
+
+test "interp: i32.atomic.rmw.add" {
+    // Store 10 at addr 0, then add 5, returns old value (10)
+    const result = try runCodeWithMem(&.{
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 10, // i32.const 10
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 5, // i32.const 5
+        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 10), result); // returns OLD value
+}
+
+test "interp: i32.atomic.rmw.cmpxchg success" {
+    // Store 10 at addr 0, cmpxchg(expected=10, replacement=20) → returns old (10)
+    const result = try runCodeWithMem(&.{
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 10, // i32.const 10
+        0xFE, 0x17, 0x02, 0x00, // i32.atomic.store align=2 offset=0
+        0x41, 0x00, // i32.const 0 (addr)
+        0x41, 10, // i32.const 10 (expected)
+        0x41, 20, // i32.const 20 (replacement)
+        0xFE, 0x48, 0x02, 0x00, // i32.atomic.rmw.cmpxchg align=2 offset=0
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 10), result);
+}
+
+test "interp: atomic.fence is a no-op" {
+    // fence then return constant — no memory needed
+    // 77 in signed LEB128 = 0xCD 0x00 (two bytes, since 77 > 63)
+    const result = try runCode(&.{
+        0xFE, 0x03, 0x00, // atomic.fence reserved=0
+        0x41, 0xCD, 0x00, // i32.const 77
+        0x0B,
+    });
+    try testing.expectEqual(@as(i32, 77), result);
 }
 
 test "interp: i32.load8_s with 0xFF" {
