@@ -77,6 +77,7 @@ pub const TrapError = error{
     IndirectCallTypeMismatch,
     UnknownFunction,
     UnknownOpcode,
+    UnalignedAtomicAccess,
 };
 
 /// Result from dispatchLoop indicating how the function exited.
@@ -2035,10 +2036,209 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 }
             },
 
+            .atomic_prefix => {
+                const sub_op = readU32(code, &ip);
+                switch (sub_op) {
+                    0x03 => { // atomic.fence
+                        _ = readU32(code, &ip); // reserved byte (must be 0)
+                        // Fence is a no-op for single-threaded execution.
+                        // When multi-threading is implemented, use a proper barrier.
+                    },
+                    // atomic loads
+                    0x10 => try atomicLoad(env, code, &ip, u32, u32, 4),   // i32.atomic.load
+                    0x11 => try atomicLoad64(env, code, &ip, u64, 8),      // i64.atomic.load
+                    0x12 => try atomicLoad(env, code, &ip, u8, u32, 1),    // i32.atomic.load8_u
+                    0x13 => try atomicLoad(env, code, &ip, u16, u32, 2),   // i32.atomic.load16_u
+                    0x14 => try atomicLoad64(env, code, &ip, u8, 1),       // i64.atomic.load8_u
+                    0x15 => try atomicLoad64(env, code, &ip, u16, 2),      // i64.atomic.load16_u
+                    0x16 => try atomicLoad64(env, code, &ip, u32, 4),      // i64.atomic.load32_u
+                    // atomic stores
+                    0x17 => try atomicStore(env, code, &ip, u32, 4),       // i32.atomic.store
+                    0x18 => try atomicStore64(env, code, &ip, u64, 8),     // i64.atomic.store
+                    0x19 => try atomicStore(env, code, &ip, u8, 1),        // i32.atomic.store8
+                    0x1A => try atomicStore(env, code, &ip, u16, 2),       // i32.atomic.store16
+                    0x1B => try atomicStore64(env, code, &ip, u8, 1),      // i64.atomic.store8
+                    0x1C => try atomicStore64(env, code, &ip, u16, 2),     // i64.atomic.store16
+                    0x1D => try atomicStore64(env, code, &ip, u32, 4),     // i64.atomic.store32
+                    // RMW add
+                    0x1E => try atomicRmw(env, code, &ip, u32, 4, .Add),
+                    0x1F => try atomicRmw64(env, code, &ip, u64, 8, .Add),
+                    0x20 => try atomicRmw(env, code, &ip, u8, 1, .Add),
+                    0x21 => try atomicRmw(env, code, &ip, u16, 2, .Add),
+                    0x22 => try atomicRmw64(env, code, &ip, u8, 1, .Add),
+                    0x23 => try atomicRmw64(env, code, &ip, u16, 2, .Add),
+                    0x24 => try atomicRmw64(env, code, &ip, u32, 4, .Add),
+                    // RMW sub
+                    0x25 => try atomicRmw(env, code, &ip, u32, 4, .Sub),
+                    0x26 => try atomicRmw64(env, code, &ip, u64, 8, .Sub),
+                    0x27 => try atomicRmw(env, code, &ip, u8, 1, .Sub),
+                    0x28 => try atomicRmw(env, code, &ip, u16, 2, .Sub),
+                    0x29 => try atomicRmw64(env, code, &ip, u8, 1, .Sub),
+                    0x2A => try atomicRmw64(env, code, &ip, u16, 2, .Sub),
+                    0x2B => try atomicRmw64(env, code, &ip, u32, 4, .Sub),
+                    // RMW and
+                    0x2C => try atomicRmw(env, code, &ip, u32, 4, .And),
+                    0x2D => try atomicRmw64(env, code, &ip, u64, 8, .And),
+                    0x2E => try atomicRmw(env, code, &ip, u8, 1, .And),
+                    0x2F => try atomicRmw(env, code, &ip, u16, 2, .And),
+                    0x30 => try atomicRmw64(env, code, &ip, u8, 1, .And),
+                    0x31 => try atomicRmw64(env, code, &ip, u16, 2, .And),
+                    0x32 => try atomicRmw64(env, code, &ip, u32, 4, .And),
+                    // RMW or
+                    0x33 => try atomicRmw(env, code, &ip, u32, 4, .Or),
+                    0x34 => try atomicRmw64(env, code, &ip, u64, 8, .Or),
+                    0x35 => try atomicRmw(env, code, &ip, u8, 1, .Or),
+                    0x36 => try atomicRmw(env, code, &ip, u16, 2, .Or),
+                    0x37 => try atomicRmw64(env, code, &ip, u8, 1, .Or),
+                    0x38 => try atomicRmw64(env, code, &ip, u16, 2, .Or),
+                    0x39 => try atomicRmw64(env, code, &ip, u32, 4, .Or),
+                    // RMW xor
+                    0x3A => try atomicRmw(env, code, &ip, u32, 4, .Xor),
+                    0x3B => try atomicRmw64(env, code, &ip, u64, 8, .Xor),
+                    0x3C => try atomicRmw(env, code, &ip, u8, 1, .Xor),
+                    0x3D => try atomicRmw(env, code, &ip, u16, 2, .Xor),
+                    0x3E => try atomicRmw64(env, code, &ip, u8, 1, .Xor),
+                    0x3F => try atomicRmw64(env, code, &ip, u16, 2, .Xor),
+                    0x40 => try atomicRmw64(env, code, &ip, u32, 4, .Xor),
+                    // RMW xchg
+                    0x41 => try atomicRmw(env, code, &ip, u32, 4, .Xchg),
+                    0x42 => try atomicRmw64(env, code, &ip, u64, 8, .Xchg),
+                    0x43 => try atomicRmw(env, code, &ip, u8, 1, .Xchg),
+                    0x44 => try atomicRmw(env, code, &ip, u16, 2, .Xchg),
+                    0x45 => try atomicRmw64(env, code, &ip, u8, 1, .Xchg),
+                    0x46 => try atomicRmw64(env, code, &ip, u16, 2, .Xchg),
+                    0x47 => try atomicRmw64(env, code, &ip, u32, 4, .Xchg),
+                    // RMW cmpxchg
+                    0x48 => try atomicCmpxchg(env, code, &ip, u32, 4),
+                    0x49 => try atomicCmpxchg64(env, code, &ip, u64, 8),
+                    0x4A => try atomicCmpxchg(env, code, &ip, u8, 1),
+                    0x4B => try atomicCmpxchg(env, code, &ip, u16, 2),
+                    0x4C => try atomicCmpxchg64(env, code, &ip, u8, 1),
+                    0x4D => try atomicCmpxchg64(env, code, &ip, u16, 2),
+                    0x4E => try atomicCmpxchg64(env, code, &ip, u32, 4),
+                    // wait/notify (stub: single-threaded for now)
+                    0x00 => { // memory.atomic.notify
+                        _ = readU32(code, &ip); // align
+                        _ = readU32(code, &ip); // offset
+                        _ = try env.popI32(); // count
+                        const _addr = try env.popI32(); // addr
+                        _ = _addr;
+                        try env.pushI32(0); // 0 waiters woken (single-threaded)
+                    },
+                    0x01 => { // memory.atomic.wait32
+                        _ = readU32(code, &ip); // align
+                        _ = readU32(code, &ip); // offset
+                        _ = try env.popI64(); // timeout
+                        _ = try env.popI32(); // expected
+                        _ = try env.popI32(); // addr
+                        try env.pushI32(1); // 1 = "not equal" (value already changed)
+                    },
+                    0x02 => { // memory.atomic.wait64
+                        _ = readU32(code, &ip); // align
+                        _ = readU32(code, &ip); // offset
+                        _ = try env.popI64(); // timeout
+                        _ = try env.popI64(); // expected
+                        _ = try env.popI32(); // addr
+                        try env.pushI32(1); // 1 = "not equal"
+                    },
+                    else => return error.UnknownOpcode,
+                }
+            },
+
             else => return error.UnknownOpcode,
         }
     }
     return .normal;
+}
+
+// ── Atomic operation helpers ─────────────────────────────────────────────
+
+fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32) !struct { ptr: [*]u8, addr: usize } {
+    _ = readU32(code, ip); // alignment (ignored for atomics — natural alignment required)
+    const offset = readU32(code, ip);
+    const base: u32 = @bitCast(try env.popI32());
+    const addr = @as(u64, base) + offset;
+    const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    // Alignment check (atomics require natural alignment)
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
+    return .{ .ptr = mem.data.ptr + @as(usize, @intCast(addr)), .addr = @intCast(addr) };
+}
+
+fn atomicLoad(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime R: type, comptime size: u32) !void {
+    const a = try getAtomicAddr(env, code, ip, size);
+    const ptr: *const T = @ptrCast(@alignCast(a.ptr));
+    const val = @atomicLoad(T, ptr, .seq_cst);
+    try env.pushI32(@bitCast(@as(R, val)));
+}
+
+fn atomicLoad64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+    const a = try getAtomicAddr(env, code, ip, size);
+    const ptr: *const T = @ptrCast(@alignCast(a.ptr));
+    const val = @atomicLoad(T, ptr, .seq_cst);
+    try env.pushI64(@bitCast(@as(u64, val)));
+}
+
+fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+    _ = readU32(code, ip); // align
+    const offset = readU32(code, ip);
+    const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
+    const base: u32 = @bitCast(try env.popI32());
+    const addr = @as(u64, base) + offset;
+    const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
+    const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
+    @atomicStore(T, ptr, val, .seq_cst);
+}
+
+fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+    _ = readU32(code, ip); // align
+    const offset = readU32(code, ip);
+    const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
+    const base: u32 = @bitCast(try env.popI32());
+    const addr = @as(u64, base) + offset;
+    const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+    if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
+    if (addr % size != 0) return error.UnalignedAtomicAccess;
+    const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
+    @atomicStore(T, ptr, val, .seq_cst);
+}
+
+fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
+    const a = try getAtomicAddr(env, code, ip, size);
+    const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
+    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const old = @atomicRmw(T, ptr, op, val, .seq_cst);
+    try env.pushI32(@bitCast(@as(u32, old)));
+}
+
+fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
+    const a = try getAtomicAddr(env, code, ip, size);
+    const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
+    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const old = @atomicRmw(T, ptr, op, val, .seq_cst);
+    try env.pushI64(@bitCast(@as(u64, old)));
+}
+
+fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+    const a = try getAtomicAddr(env, code, ip, size);
+    const replacement: T = @truncate(@as(u32, @bitCast(try env.popI32())));
+    const expected: T = @truncate(@as(u32, @bitCast(try env.popI32())));
+    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const result = @cmpxchgStrong(T, ptr, expected, replacement, .seq_cst, .seq_cst);
+    const old: u32 = if (result) |v| v else expected;
+    try env.pushI32(@bitCast(old));
+}
+
+fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
+    const a = try getAtomicAddr(env, code, ip, size);
+    const replacement: T = @truncate(@as(u64, @bitCast(try env.popI64())));
+    const expected: T = @truncate(@as(u64, @bitCast(try env.popI64())));
+    const ptr: *T = @ptrCast(@alignCast(a.ptr));
+    const result = @cmpxchgStrong(T, ptr, expected, replacement, .seq_cst, .seq_cst);
+    const old: u64 = if (result) |v| v else expected;
+    try env.pushI64(@bitCast(old));
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
