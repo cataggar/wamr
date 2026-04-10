@@ -7,7 +7,6 @@ from pathlib import Path
 
 _TOOLS = [
     "wamr",
-    "wamrc",
 ]
 
 _EXT = ".exe" if sys.platform == "win32" else ""
@@ -33,7 +32,3 @@ def _run(tool_name: str) -> None:
 
 def wamr() -> None:
     _run("wamr")
-
-
-def wamrc() -> None:
-    _run("wamrc")

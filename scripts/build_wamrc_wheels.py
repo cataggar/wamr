@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download wamr release assets and repackage them as Python wheels."""
+"""Download wamrc release assets and repackage them as Python wheels."""
 
 # /// script
 # requires-python = ">=3.12"
@@ -17,35 +17,19 @@ from pathlib import Path
 
 import requests  # type: ignore[import-untyped]
 
-IMPORT_NAME = "wamr_cli"
-DIST_NAME = "wamr_bin"
+IMPORT_NAME = "wamrc_cli"
+DIST_NAME = "wamrc_bin"
 WAMR_REPO = "cataggar/wamr"
 
 PLATFORMS = {
-    "linux-x64": {
-        "tag": "manylinux_2_17_x86_64.manylinux2014_x86_64",
-    },
-    "linux-arm64": {
-        "tag": "manylinux_2_17_aarch64.manylinux2014_aarch64",
-    },
-    "linux-musl-x64": {
-        "tag": "musllinux_1_1_x86_64",
-    },
-    "linux-musl-arm64": {
-        "tag": "musllinux_1_1_aarch64",
-    },
-    "macos-arm64": {
-        "tag": "macosx_11_0_arm64",
-    },
-    "macos-x64": {
-        "tag": "macosx_10_9_x86_64",
-    },
-    "windows-x64": {
-        "tag": "win_amd64",
-    },
-    "windows-arm64": {
-        "tag": "win_arm64",
-    },
+    "linux-x64": {"tag": "manylinux_2_17_x86_64.manylinux2014_x86_64"},
+    "linux-arm64": {"tag": "manylinux_2_17_aarch64.manylinux2014_aarch64"},
+    "linux-musl-x64": {"tag": "musllinux_1_1_x86_64"},
+    "linux-musl-arm64": {"tag": "musllinux_1_1_aarch64"},
+    "macos-arm64": {"tag": "macosx_11_0_arm64"},
+    "macos-x64": {"tag": "macosx_10_9_x86_64"},
+    "windows-x64": {"tag": "win_amd64"},
+    "windows-arm64": {"tag": "win_arm64"},
 }
 
 _EXEC_ATTR = (
@@ -55,12 +39,10 @@ _FILE_ATTR = (stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH) << 16
 
 
 def sha256_digest(data: bytes) -> str:
-    """Return url-safe base64 sha256 digest (no padding)."""
     return urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 
 
 def download_asset(release_version: str, platform_key: str) -> bytes:
-    """Download a wamr release asset."""
     asset_name = f"wamr-{release_version}-{platform_key}.tar.gz"
     url = f"https://github.com/{WAMR_REPO}/releases/download/v{release_version}/{asset_name}"
     print(f"  Downloading {asset_name} ...")
@@ -70,7 +52,6 @@ def download_asset(release_version: str, platform_key: str) -> bytes:
 
 
 def _is_executable(path: Path) -> bool:
-    """Check if a file should be marked executable in the wheel."""
     name = path.name
     if name.endswith((".exe", ".so", ".dylib")):
         return True
@@ -83,13 +64,10 @@ def build_wheel(
     version: str, platform_key: str, platform_tag: str, dist_dir: Path,
     release_version: str | None = None,
 ) -> Path:
-    """Build a single platform wheel."""
     data = download_asset(release_version or version, platform_key)
 
-    # Extract the tarball
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
         members = tf.getmembers()
-        # Find the bin/ directory inside the archive
         bin_prefix = None
         for m in members:
             if "/bin/" in m.name and m.isfile():
@@ -98,16 +76,15 @@ def build_wheel(
 
         entries: list[tuple[str, bytes, bool]] = []
 
-        # Add __init__.py
         init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
         entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
 
-        # Add binaries from archive (exclude wamrc — distributed separately)
+        # Only include wamrc binary
         if bin_prefix:
             for m in members:
                 if m.name.startswith(bin_prefix) and m.isfile():
-                    rel = m.name[len(bin_prefix) :]
-                    if not rel or rel.startswith("wamrc"):
+                    rel = m.name[len(bin_prefix):]
+                    if not rel or not rel.startswith("wamrc"):
                         continue
                     f = tf.extractfile(m)
                     if f is None:
@@ -116,7 +93,6 @@ def build_wheel(
                     arcname = f"{IMPORT_NAME}/{rel}"
                     entries.append((arcname, file_data, _is_executable(Path(rel))))
 
-    # dist-info directory
     dist_info_dir = f"{DIST_NAME}-{version}.dist-info"
 
     readme_path = Path(__file__).resolve().parent.parent / "README.md"
@@ -124,9 +100,9 @@ def build_wheel(
 
     metadata = (
         f"Metadata-Version: 2.4\n"
-        f"Name: wamr-bin\n"
+        f"Name: wamrc-bin\n"
         f"Version: {version}\n"
-        f"Summary: WebAssembly Micro Runtime — native CLI tools\n"
+        f"Summary: WebAssembly Micro Runtime — AOT compiler\n"
         f"Home-page: https://github.com/cataggar/wamr\n"
         f"License: Apache-2.0\n"
         f"Requires-Python: >=3.9\n"
@@ -138,21 +114,15 @@ def build_wheel(
 
     wheel_meta = (
         f"Wheel-Version: 1.0\n"
-        f"Generator: build_wheels.py\n"
+        f"Generator: build_wamrc_wheels.py\n"
         f"Root-Is-Purelib: false\n"
         f"Tag: py3-none-{platform_tag}\n"
     )
     entries.append((f"{dist_info_dir}/WHEEL", wheel_meta.encode(), False))
 
-    tool_entries = "\n".join(
-        [
-            "wamr = wamr_cli:wamr",
-        ]
-    )
-    entry_points = f"[console_scripts]\n{tool_entries}\n"
+    entry_points = "[console_scripts]\nwamrc = wamrc_cli:wamrc\n"
     entries.append((f"{dist_info_dir}/entry_points.txt", entry_points.encode(), False))
 
-    # Build RECORD
     records: list[str] = []
     for arcname, file_data, _ in entries:
         digest = sha256_digest(file_data)
@@ -161,7 +131,6 @@ def build_wheel(
     record_data = ("\n".join(records) + "\n").encode()
     entries.append((f"{dist_info_dir}/RECORD", record_data, False))
 
-    # Write wheel zip
     wheel_name = f"{DIST_NAME}-{version}-py3-none-{platform_tag}.whl"
     wheel_path = dist_dir / wheel_name
     with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as whl:
@@ -176,9 +145,7 @@ def build_wheel(
 
 
 def to_pep440(version: str) -> str:
-    """Convert a semver-style version to PEP 440. e.g. 0.1.0-dev.1 -> 0.1.0.dev1"""
     import re
-
     m = re.match(r"^(\d+\.\d+\.\d+)-dev\.(\d+)$", version)
     if m:
         return f"{m.group(1)}.dev{m.group(2)}"
@@ -188,15 +155,14 @@ def to_pep440(version: str) -> str:
 def main() -> None:
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <version>")
-        print(f"Example: {sys.argv[0]} 0.1.0")
         sys.exit(1)
 
     raw_version = sys.argv[1]
     version = to_pep440(raw_version)
-    dist_dir = Path("dist")
+    dist_dir = Path("dist-wamrc")
     dist_dir.mkdir(exist_ok=True)
 
-    print(f"Building wheels for wamr v{raw_version} (PyPI: {version})\n")
+    print(f"Building wamrc wheels for v{raw_version} (PyPI: {version})\n")
 
     wheels: list[Path] = []
     for platform_key, info in PLATFORMS.items():
