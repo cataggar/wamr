@@ -143,16 +143,15 @@ fn printResult(name: []const u8, result: TestResult) void {
     });
 }
 
-/// Run a .wast file using wabt's spec test runner (wabt's own interpreter).
-/// This validates parsing, validation, and basic conformance.
+/// Run a .wast file using wabt's parser + interpreter for conformance.
 fn runWastFile(path: []const u8, allocator: std.mem.Allocator) TestResult {
-    const wabt = @import("wabt");
+    const wast_runner = @import("wast_runner.zig");
     const source = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024) catch {
         return .{ .file = path, .passed = 0, .failed = 0, .skipped = 1, .total = 1 };
     };
     defer allocator.free(source);
 
-    const result = wabt.wast_runner.run(allocator, source);
+    const result = wast_runner.run(allocator, source);
     return .{
         .file = path,
         .passed = result.passed,
