@@ -1664,17 +1664,36 @@ fn popExpectTidx(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*
     sp.* -= 1;
     const actual = stack[sp.*];
     if (actual != expected and !actual.isSubtypeOf(expected)) {
-        // In unreachable code, ref types are polymorphic (any ref matches any ref)
         if (!(cf != null and cf.?.unreachable_flag and actual.isRef() and expected.isRef())) return false;
     }
-    // Check concrete type index: if expected has a concrete tidx, actual must match
+    const actual_tidx = if (sp.* < tidx.len) tidx[sp.*] else NO_TIDX;
     if (expected_tidx != NO_TIDX) {
-        const actual_tidx = if (sp.* < tidx.len) tidx[sp.*] else NO_TIDX;
         if (actual_tidx != expected_tidx) {
-            // In unreachable code, accept abstract (NO_TIDX) as polymorphic
             if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
             return false;
         }
+    }
+    return true;
+}
+
+/// Strict version for branch label matching: (ref null $t) != funcref.
+fn popExpectTidxStrict(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*CtrlFrame, tidx: []const u32) bool {
+    if (sp.* == 0 or (cf != null and sp.* <= cf.?.start_height)) {
+        return cf != null and cf.?.unreachable_flag;
+    }
+    sp.* -= 1;
+    const actual = stack[sp.*];
+    if (actual != expected and !actual.isSubtypeOf(expected)) {
+        if (!(cf != null and cf.?.unreachable_flag and actual.isRef() and expected.isRef())) return false;
+    }
+    const actual_tidx = if (sp.* < tidx.len) tidx[sp.*] else NO_TIDX;
+    if (expected_tidx != NO_TIDX) {
+        if (actual_tidx != expected_tidx) {
+            if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
+            return false;
+        }
+    } else if (actual_tidx != NO_TIDX and actual.isRef()) {
+        if (!(cf != null and cf.?.unreachable_flag)) return false;
     }
     return true;
 }
@@ -1864,13 +1883,15 @@ fn popLabelTypes(stack: []VT, sp: *u32, label_types: []const VT, cur_frame: ?*Ct
     }
 }
 
-/// Pop label types with type index checking.
+/// Pop label types with strict type index checking for branch targets.
+/// Unlike popExpectTidx used for calls (which allows subtyping),
+/// branch target matching requires type indices to match when present.
 fn popLabelTypesTidx(stack: []VT, sp: *u32, label_types: []const VT, label_tidxs: []const u32, cur_frame: ?*CtrlFrame, tidx: []const u32) LoadError!void {
     var ri = label_types.len;
     while (ri > 0) {
         ri -= 1;
         const et = if (ri < label_tidxs.len) label_tidxs[ri] else NO_TIDX;
-        if (!popExpectTidx(stack, sp, label_types[ri], et, cur_frame, tidx))
+        if (!popExpectTidxStrict(stack, sp, label_types[ri], et, cur_frame, tidx))
             return error.TypeMismatch;
     }
 }
