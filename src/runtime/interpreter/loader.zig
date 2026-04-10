@@ -1557,6 +1557,8 @@ const CtrlFrame = struct {
     block_type_idx: u32 = NO_TIDX,
     /// For single-result block types with a concrete ref type, stores the tidx directly.
     single_result_tidx: u32 = NO_TIDX,
+    /// Index into init_save_stack where this frame's saved init state starts
+    init_save_idx: u32 = 0,
 };
 
 /// Block type: both params and results.
@@ -1909,6 +1911,11 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             local_init_buf[li] = li < param_count; // params are initialized
         }
     }
+    // Save stack for local init state at block boundaries
+    // Each block entry saves total_locals bools; max nesting = 256
+    var init_save_stack: [256 * 64]bool = undefined;
+    var init_save_sp: u32 = 0;
+    const save_count = @min(total_locals, 1024);
 
     // Push the function frame
     ctrl_buf[0] = .{
@@ -1981,7 +1988,13 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     .end_types = bt.results,
                     .block_type_idx = bt.type_idx,
                     .single_result_tidx = bt.single_result_tidx,
+                    .init_save_idx = init_save_sp,
                 };
+                // Save local init state before entering block
+                if (save_count > 0 and init_save_sp + save_count <= init_save_stack.len) {
+                    @memcpy(init_save_stack[init_save_sp..][0..save_count], local_init_buf[0..save_count]);
+                    init_save_sp += save_count;
+                }
                 ctrl_sp += 1;
             },
 
@@ -2020,6 +2033,11 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     stack_buf[sp] = t;
                     stack_tidx[sp] = if (j < end_tidxs.len) end_tidxs[j] else NO_TIDX;
                     sp += 1;
+                }
+                // Restore local init state from before this block (not function frame)
+                if (cf.kind != .function and save_count > 0 and cf.init_save_idx + save_count <= init_save_stack.len) {
+                    @memcpy(local_init_buf[0..save_count], init_save_stack[cf.init_save_idx..][0..save_count]);
+                    init_save_sp = cf.init_save_idx;
                 }
                 ctrl_sp -= 1;
                 if (ctrl_sp == 0) return;
