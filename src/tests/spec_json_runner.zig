@@ -191,9 +191,7 @@ fn buildImportContext(
                         return error.ImportResolutionFailed;
                     if (exp.index >= ri.globals.len) return error.ImportResolutionFailed;
                     const eg = ri.globals[exp.index];
-                    if (eg.global_type.val_type != gt.val_type or
-                        eg.global_type.mutability != gt.mutability or
-                        eg.global_type.type_idx != gt.type_idx)
+                    if (!types.GlobalType.importMatches(eg.global_type, gt))
                         return error.ImportResolutionFailed;
                     // Share the global by pointer — mutable globals must be aliased
                     eg.retain();
