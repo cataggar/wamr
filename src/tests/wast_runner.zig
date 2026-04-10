@@ -43,28 +43,35 @@ fn runInner(allocator: std.mem.Allocator, source: []const u8, name: []const u8) 
 
     try convertWast(allocator, source, name, &json_buf, &modules);
 
-    // Write to temp dir
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
+    // Write to a unique temp subdirectory in CWD
+    const dir_name = try std.fmt.allocPrint(allocator, ".wamr-test-{s}", .{name});
+    defer allocator.free(dir_name);
+
+    // Create dir (ignore if exists)
+    std.fs.cwd().makeDir(dir_name) catch {};
+    var out_dir = try std.fs.cwd().openDir(dir_name, .{});
+    defer out_dir.close();
 
     // Write wasm modules
     var mod_it = modules.iterator();
     while (mod_it.next()) |entry| {
-        tmp_dir.dir.writeFile(.{ .sub_path = entry.key_ptr.*, .data = entry.value_ptr.* }) catch continue;
-        // Debug: also write to CWD for inspection
-        std.fs.cwd().writeFile(.{ .sub_path = entry.key_ptr.*, .data = entry.value_ptr.* }) catch {};
+        out_dir.writeFile(.{ .sub_path = entry.key_ptr.*, .data = entry.value_ptr.* }) catch continue;
     }
 
     // Write JSON
-    tmp_dir.dir.writeFile(.{ .sub_path = "test.json", .data = json_buf.items }) catch return .{ .skipped = 1 };
-    // Debug: also write JSON to CWD
-    std.fs.cwd().writeFile(.{ .sub_path = "debug_test.json", .data = json_buf.items }) catch {};
+    const json_name = try std.fmt.allocPrint(allocator, "{s}.json", .{name});
+    defer allocator.free(json_name);
+    out_dir.writeFile(.{ .sub_path = json_name, .data = json_buf.items }) catch return .{ .skipped = 1 };
 
-    // Resolve real path and run
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const json_path = try tmp_dir.dir.realpath("test.json", &path_buf);
+    // Build full path
+    const json_path = try std.fs.path.join(allocator, &.{ dir_name, json_name });
+    defer allocator.free(json_path);
 
     const result = try spec_json_runner.runSpecTestFile(json_path, allocator);
+
+    // Cleanup temp dir
+    std.fs.cwd().deleteTree(dir_name) catch {};
+
     return .{
         .passed = result.passed,
         .failed = result.failed,
@@ -407,4 +414,101 @@ fn findDollarName(text: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "wabt: parse and write simple module produces valid wasm" {
+    const allocator = testing.allocator;
+    const wat_source = "(module (func (export \"add\") (param i32 i32) (result i32) (i32.add (local.get 0) (local.get 1))))";
+
+    var mod = try wabt.text.Parser.parseModule(allocator, wat_source);
+    defer mod.deinit();
+
+    const wasm_bytes = try wabt.binary.writer.writeModule(allocator, &mod);
+    defer allocator.free(wasm_bytes);
+
+    // Must have valid wasm header
+    try testing.expect(wasm_bytes.len >= 8);
+    try testing.expectEqualSlices(u8, &.{ 0x00, 0x61, 0x73, 0x6d }, wasm_bytes[0..4]);
+
+    // Must load successfully in WAMR
+    const root = @import("wamr");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const module = try root.loader.load(wasm_bytes, arena.allocator());
+
+    // Must have the add function
+    try testing.expectEqual(@as(usize, 1), module.functions.len);
+    try testing.expectEqual(@as(usize, 1), module.exports.len);
+
+    // Function body must contain actual bytecode (not just 00 0b)
+    try testing.expect(module.functions[0].code.len > 2);
+}
+
+test "wast runner: full pipeline for simple module" {
+    const allocator = testing.allocator;
+    const wast_source =
+        \\(module (func (export "add") (param i32 i32) (result i32) (i32.add (local.get 0) (local.get 1))))
+        \\(assert_return (invoke "add" (i32.const 1) (i32.const 2)) (i32.const 3))
+    ;
+
+    // Test the convertWast function specifically
+    var json_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer json_buf.deinit(allocator);
+    var modules = std.StringHashMapUnmanaged([]u8){};
+    defer {
+        var it = modules.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        modules.deinit(allocator);
+    }
+
+    try convertWast(allocator, wast_source, "test_add", &json_buf, &modules);
+
+    // Should have 1 module
+    try testing.expectEqual(@as(u32, 1), modules.count());
+
+    // Get the wasm bytes
+    const wasm = modules.get("test_add.0.wasm") orelse return error.TestFailed;
+    try testing.expect(wasm.len >= 8);
+
+    // Load in WAMR
+    const root = @import("wamr");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const module = root.loader.load(wasm, arena.allocator()) catch |err| {
+        std.debug.print("WAMR load failed: {}\n", .{err});
+        std.debug.print("wasm ({d} bytes): ", .{wasm.len});
+        for (wasm) |b| std.debug.print("{x:0>2}", .{b});
+        std.debug.print("\n", .{});
+        return err;
+    };
+    try testing.expectEqual(@as(usize, 1), module.functions.len);
+    try testing.expect(module.functions[0].code.len > 2);
+}
+
+test "parseConst: i32" {
+    const result = parseConst("(i32.const 42)", "i32.const", "i32");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("42", result.?.value);
+}
+
+test "parseConst: negative" {
+    const result = parseConst("(i32.const -1)", "i32.const", "i32");
+    try testing.expect(result != null);
+    try testing.expectEqualStrings("-1", result.?.value);
+}
+
+test "findQuotedString" {
+    try testing.expectEqualStrings("add", findQuotedString("(invoke \"add\" (i32.const 1))").?);
+}
+
+test "findDollarName" {
+    try testing.expectEqualStrings("$Mod", findDollarName("(invoke $Mod \"func\")").?);
+    try testing.expect(findDollarName("(invoke \"func\")") == null);
 }
