@@ -127,21 +127,17 @@ pub const GlobalType = struct {
     pub fn importMatches(exp: GlobalType, imp: GlobalType) bool {
         if (exp.mutability != imp.mutability) return false;
         if (imp.mutability == .mutable) {
-            // Invariant: exact match required
             return exp.val_type == imp.val_type and exp.type_idx == imp.type_idx;
         }
         // Covariant: export subtype of import
         if (exp.val_type == imp.val_type) {
-            // Same base type — concrete matches abstract
-            if (imp.type_idx == 0xFFFFFFFF) return true; // abstract import accepts any tidx
+            if (imp.type_idx == 0xFFFFFFFF) return true;
             return exp.type_idx == imp.type_idx;
         }
-        // nonfuncref is subtype of funcref
         if (exp.val_type == .nonfuncref and imp.val_type == .funcref) {
             if (imp.type_idx == 0xFFFFFFFF) return true;
             return exp.type_idx == imp.type_idx;
         }
-        // nonexternref is subtype of externref
         if (exp.val_type == .nonexternref and imp.val_type == .externref) {
             if (imp.type_idx == 0xFFFFFFFF) return true;
             return exp.type_idx == imp.type_idx;

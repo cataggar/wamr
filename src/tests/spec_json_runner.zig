@@ -249,8 +249,13 @@ fn buildImportContext(
                     const t = ri.tables[exp.index];
                     // Validate elem type and limits compatibility
                     if (imp.table_type) |tt| {
-                        if (t.table_type.elem_type != tt.elem_type and
-                            !t.table_type.elem_type.isFuncRef() and !tt.elem_type.isFuncRef())
+                        // Table element types must match exactly
+                        const exp_et = t.table_type.elem_type;
+                        const imp_et = tt.elem_type;
+                        if (exp_et != imp_et and !exp_et.isSubtypeOf(imp_et))
+                            return error.ImportResolutionFailed;
+                        // Element type indices must also match
+                        if (t.table_type.elem_tidx != tt.elem_tidx)
                             return error.ImportResolutionFailed;
                         // Use current element count for limits matching (table may have been grown)
                         const actual_limits = types.Limits{
