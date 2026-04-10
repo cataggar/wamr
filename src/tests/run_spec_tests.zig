@@ -151,7 +151,8 @@ fn runWastFile(path: []const u8, allocator: std.mem.Allocator) TestResult {
     };
     defer allocator.free(source);
 
-    const result = wast_runner.run(allocator, source);
+    const base = std.fs.path.stem(path);
+    const result = wast_runner.run(allocator, source, base);
     return .{
         .file = path,
         .passed = result.passed,
