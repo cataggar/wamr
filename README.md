@@ -18,7 +18,7 @@ $ uv tool install wamr-bin
 
 ## Tools
 
- - **iwasm**: decode and run a WebAssembly binary file using a stack-based interpreter
+ - **wamr**: decode and run a WebAssembly binary file using a stack-based interpreter
  - **wamrc**: AOT compiler — compile a .wasm module to native code
 
 ## Building

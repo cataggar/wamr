@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
     exe_module.addImport("wamr", lib_module);
 
     const exe = b.addExecutable(.{
-        .name = "iwasm",
+        .name = "wamr",
         .root_module = exe_module,
     });
     b.installArtifact(exe);

@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 _TOOLS = [
-    "iwasm",
+    "wamr",
     "wamrc",
 ]
 
@@ -31,8 +31,8 @@ def _run(tool_name: str) -> None:
         raise SystemExit(subprocess.call(args))
 
 
-def iwasm() -> None:
-    _run("iwasm")
+def wamr() -> None:
+    _run("wamr")
 
 
 def wamrc() -> None:

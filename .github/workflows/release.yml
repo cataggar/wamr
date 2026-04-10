@@ -70,7 +70,7 @@ jobs:
         shell: bash
         run: |
           PKGNAME="wamr-${{ steps.version.outputs.version }}-${{ matrix.name }}"
-          TOOLS="iwasm wamrc"
+          TOOLS="wamr wamrc"
           mkdir -p "$PKGNAME/bin"
           case "${{ matrix.target }}" in
             wasm32-wasi) EXT=".wasm" ;;
@@ -168,7 +168,7 @@ jobs:
             - Built with `ReleaseSafe` (runtime safety checks) + stack protector
             - 11 platform targets (linux, macOS, Windows, musl, RISC-V, WASI)
 
-            **Tools included:** iwasm, wamrc
+            **Tools included:** wamr, wamrc
 
             **Install:**
             ```

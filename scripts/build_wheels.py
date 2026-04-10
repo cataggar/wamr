@@ -146,7 +146,7 @@ def build_wheel(
 
     tool_entries = "\n".join(
         [
-            "iwasm = wamr_cli:iwasm",
+            "wamr = wamr_cli:wamr",
             "wamrc = wamr_cli:wamrc",
         ]
     )
