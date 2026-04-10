@@ -1644,7 +1644,11 @@ fn popExpect(stack: []VT, sp: *u32, expected: VT, cf: ?*CtrlFrame) bool {
         return cf != null and cf.?.unreachable_flag;
     }
     sp.* -= 1;
-    return stack[sp.*] == expected or stack[sp.*].isSubtypeOf(expected);
+    const actual = stack[sp.*];
+    if (actual == expected or actual.isSubtypeOf(expected)) return true;
+    // In unreachable code, ref types are polymorphic
+    if (cf != null and cf.?.unreachable_flag and actual.isRef() and expected.isRef()) return true;
+    return false;
 }
 
 /// Pop and also check concrete type index compatibility.
@@ -1654,7 +1658,10 @@ fn popExpectTidx(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*
     }
     sp.* -= 1;
     const actual = stack[sp.*];
-    if (actual != expected and !actual.isSubtypeOf(expected)) return false;
+    if (actual != expected and !actual.isSubtypeOf(expected)) {
+        // In unreachable code, ref types are polymorphic (any ref matches any ref)
+        if (!(cf != null and cf.?.unreachable_flag and actual.isRef() and expected.isRef())) return false;
+    }
     // Check concrete type index: if expected has a concrete tidx, actual must match
     if (expected_tidx != NO_TIDX) {
         const actual_tidx = if (sp.* < tidx.len) tidx[sp.*] else NO_TIDX;
@@ -1703,8 +1710,9 @@ fn checkStackEndTidx(cf: *const CtrlFrame, stack: []const VT, sp: u32, tidx: []c
         for (expected, 0..) |t, j| {
             const stack_idx = cf.start_height + @as(u32, @intCast(j));
             if (stack_idx >= sp) continue;
-            if (stack[stack_idx] != t and !stack[stack_idx].isSubtypeOf(t)) return false;
-            // In unreachable code, accept abstract (NO_TIDX) as polymorphic
+            const actual = stack[stack_idx];
+            // In unreachable code, ref types are polymorphic (any ref matches any ref)
+            if (actual != t and !actual.isSubtypeOf(t) and !(actual.isRef() and t.isRef())) return false;
             const et = if (j < expected_tidxs.len) expected_tidxs[j] else NO_TIDX;
             if (et != NO_TIDX and stack_idx < tidx.len) {
                 if (tidx[stack_idx] != et and tidx[stack_idx] != NO_TIDX) return false;
