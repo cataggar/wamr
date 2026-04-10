@@ -312,6 +312,7 @@ pub const WasmModule = struct {
     import_table_count: u32 = 0,
     import_memory_count: u32 = 0,
     import_global_count: u32 = 0,
+    import_tag_count: u32 = 0,
 
     // Custom sections
     name_section: ?NameSection = null,

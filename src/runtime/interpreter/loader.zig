@@ -424,7 +424,7 @@ fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadErr
     return func_types;
 }
 
-fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.ImportDesc {
+fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32, tag_count: *u32) LoadError![]const types.ImportDesc {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     var imports_list: std.ArrayList(types.ImportDesc) = .empty;
@@ -434,10 +434,11 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
         const field_name = try reader.readName();
         const kind_byte = try reader.readByte();
 
-        // Tag imports (0x04) from exception handling — skip
+        // Tag imports (0x04) from exception handling — count and skip
         if (kind_byte == 0x04) {
             _ = try reader.readByte(); // tag attribute
             _ = try reader.readU32(); // type index
+            tag_count.* += 1;
             continue;
         }
 
@@ -811,7 +812,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 .type => module.types = try parseTypeSection(&reader, allocator),
                 .import => {
                     const tc: u32 = @intCast(module.types.len);
-                    module.imports = try parseImportSection(&reader, allocator, tc);
+                    module.imports = try parseImportSection(&reader, allocator, tc, &module.import_tag_count);
                     for (module.imports) |imp| {
                         switch (imp.kind) {
                             .function => module.import_function_count += 1,

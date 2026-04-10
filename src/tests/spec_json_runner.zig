@@ -146,7 +146,11 @@ fn buildImportContext(
     if (module.import_global_count == 0 and
         module.import_memory_count == 0 and
         module.import_table_count == 0 and
-        module.import_function_count == 0) return null;
+        module.import_function_count == 0 and
+        module.import_tag_count == 0) return null;
+
+    // Tag imports are not supported — fail immediately
+    if (module.import_tag_count > 0) return error.ImportResolutionFailed;
 
     var globals: std.ArrayList(*types.GlobalInstance) = .empty;
     defer globals.deinit(allocator);
