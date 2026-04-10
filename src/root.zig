@@ -63,6 +63,9 @@ pub const spec_runner = @import("tests/spec_runner.zig");
 /// Excluded from refAllDecls to avoid test runner hang.
 const _wasi = @import("wasi/wasi.zig");
 
+/// Thread manager for WASI-threads.
+pub const thread_manager = @import("wasi/thread_manager.zig");
+
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).
 pub const platform = @import("platform/platform.zig");
