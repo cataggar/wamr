@@ -51,10 +51,14 @@ fn runInner(allocator: std.mem.Allocator, source: []const u8, name: []const u8) 
     var mod_it = modules.iterator();
     while (mod_it.next()) |entry| {
         tmp_dir.dir.writeFile(.{ .sub_path = entry.key_ptr.*, .data = entry.value_ptr.* }) catch continue;
+        // Debug: also write to CWD for inspection
+        std.fs.cwd().writeFile(.{ .sub_path = entry.key_ptr.*, .data = entry.value_ptr.* }) catch {};
     }
 
     // Write JSON
     tmp_dir.dir.writeFile(.{ .sub_path = "test.json", .data = json_buf.items }) catch return .{ .skipped = 1 };
+    // Debug: also write JSON to CWD
+    std.fs.cwd().writeFile(.{ .sub_path = "debug_test.json", .data = json_buf.items }) catch {};
 
     // Resolve real path and run
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
