@@ -171,13 +171,17 @@ pub const ExecEnv = struct {
     // -- Local variable access --
 
     /// Get a local variable value.
-    pub fn getLocal(self: *const ExecEnv, frame: *const CallFrame, idx: u32) types.Value {
-        return self.operand_stack[frame.stack_base + idx];
+    pub fn getLocal(self: *const ExecEnv, frame: *const CallFrame, idx: u32) !types.Value {
+        const abs = frame.stack_base + idx;
+        if (abs >= self.operand_stack.len) return error.StackOverflow;
+        return self.operand_stack[abs];
     }
 
     /// Set a local variable value.
-    pub fn setLocal(self: *ExecEnv, frame: *const CallFrame, idx: u32, val: types.Value) void {
-        self.operand_stack[frame.stack_base + idx] = val;
+    pub fn setLocal(self: *ExecEnv, frame: *const CallFrame, idx: u32, val: types.Value) !void {
+        const abs = frame.stack_base + idx;
+        if (abs >= self.operand_stack.len) return error.StackOverflow;
+        self.operand_stack[abs] = val;
     }
 
     // -- Trap handling --
@@ -387,8 +391,8 @@ test "local variable get and set" {
     try env.pushFrame(frame);
 
     const cur = env.currentFrame().?;
-    env.setLocal(cur, 1, .{ .i32 = 777 });
-    const val = env.getLocal(cur, 1);
+    try env.setLocal(cur, 1, .{ .i32 = 777 });
+    const val = try env.getLocal(cur, 1);
     try std.testing.expectEqual(@as(i32, 777), val.i32);
 }
 

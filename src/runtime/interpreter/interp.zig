@@ -160,6 +160,10 @@ fn prepareTailCall(env: *ExecEnv, func_idx: u32) TrapError!void {
     const old_frame = env.currentFrame() orelse return error.CallStackUnderflow;
     const old_stack_base = old_frame.stack_base;
 
+    // Bounds check before stack manipulation
+    if (env.sp < new_param_count) return error.StackUnderflow;
+    if (old_stack_base + new_param_count > env.operand_stack.len) return error.StackOverflow;
+
     // Move the new function's params from the top of the stack down
     // to the current frame's stack_base, then reset sp.
     const src_start = env.sp - new_param_count;
@@ -858,17 +862,17 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .local_get => {
                 const idx = readU32(code, &ip);
                 const frame = env.currentFrame() orelse return error.CallStackUnderflow;
-                try env.push(env.getLocal(frame, idx));
+                try env.push(try env.getLocal(frame, idx));
             },
             .local_set => {
                 const idx = readU32(code, &ip);
                 const frame = env.currentFrame() orelse return error.CallStackUnderflow;
-                env.setLocal(frame, idx, try env.pop());
+                try env.setLocal(frame, idx, try env.pop());
             },
             .local_tee => {
                 const idx = readU32(code, &ip);
                 const frame = env.currentFrame() orelse return error.CallStackUnderflow;
-                env.setLocal(frame, idx, try env.peek());
+                try env.setLocal(frame, idx, try env.peek());
             },
 
             // ── Globals ──

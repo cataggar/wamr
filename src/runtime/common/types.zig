@@ -388,7 +388,7 @@ pub const MemoryInstance = struct {
 
     pub fn grow(self: *MemoryInstance, delta: u32, allocator: std.mem.Allocator) !u32 {
         const old_pages = self.current_pages;
-        const new_pages = old_pages + delta;
+        const new_pages = std.math.add(u32, old_pages, delta) catch return error.MemoryGrowFailed;
         if (self.memory_type.limits.max) |max| {
             if (new_pages > max) return error.MemoryGrowFailed;
         }
