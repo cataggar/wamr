@@ -2542,13 +2542,10 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 if (popped_bnn) |pt| {
                     if (!pt.isRef()) return error.TypeMismatch;
                 }
-                // Check branch target: label expects [..., (ref ht)]
-                // Push non-nullable version temporarily, check label types, then pop it
+                // Check branch target: on branch, stack has [t* (ref ht)]
+                // Push non-nullable ref temporarily, peek-check label types, then remove it
                 if (ctrl_sp > label) {
-                    const target = &ctrl_buf[ctrl_sp - 1 - label];
-                    const label_types = getLabelTypes(target);
-                    const label_tidxs_slice = getLabelTidxs(target, module);
-                    // Push non-nullable ref temporarily for branch type check
+                    const save_sp = sp;
                     if (popped_bnn) |pt| {
                         if (pt.isExternRef())
                             pushType(&stack_buf, &sp, .nonexternref, &stack_tidx)
@@ -2557,16 +2554,12 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     } else {
                         pushType(&stack_buf, &sp, .nonfuncref, &stack_tidx);
                     }
+                    const target = &ctrl_buf[ctrl_sp - 1 - label];
+                    const label_types = getLabelTypes(target);
+                    const label_tidxs_slice = getLabelTidxs(target, module);
                     try popLabelTypesTidx(&stack_buf, &sp, label_types, label_tidxs_slice, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx);
-                    for (label_types, 0..) |t, li| {
-                        const lt = if (li < label_tidxs_slice.len) label_tidxs_slice[li] else NO_TIDX;
-                        pushV(&stack_buf, &sp, t, &stack_tidx, lt);
-                    }
-                    // Pop the re-pushed label types and the ref to restore stack
-                    var pops: u32 = @intCast(label_types.len);
-                    while (pops > 0) : (pops -= 1) {
-                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                    }
+                    // Restore stack to non-branch state [t*] (without the ref)
+                    sp = save_sp;
                 }
                 // Non-branch path: ref was null, stack has [t*] without the ref
             },
