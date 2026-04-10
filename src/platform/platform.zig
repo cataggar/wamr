@@ -165,13 +165,12 @@ fn mmapPosix(hint: ?[*]u8, size: usize, prot: MemProt, flags: MapFlags) ?[*]u8 {
 
     const posix = std.posix;
 
-    const posix_prot: posix.PROT = .{
-        .READ = prot.read,
-        .WRITE = prot.write,
-        .EXEC = prot.exec,
-    };
+    var posix_prot: u32 = posix.PROT.NONE;
+    if (prot.read) posix_prot |= posix.PROT.READ;
+    if (prot.write) posix_prot |= posix.PROT.WRITE;
+    if (prot.exec) posix_prot |= posix.PROT.EXEC;
 
-    var map_flags: posix.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
+    var map_flags: std.posix.system.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     if (flags.map_fixed) map_flags.FIXED = true;
 
     // MAP_32BIT is Linux-only x86_64.
@@ -210,14 +209,13 @@ fn munmapPosix(addr: [*]u8, size: usize) void {
 fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (is_windows) unreachable;
 
-    const posix_prot: std.posix.PROT = .{
-        .READ = prot.read,
-        .WRITE = prot.write,
-        .EXEC = prot.exec,
-    };
+    var posix_prot: u32 = std.posix.PROT.NONE;
+    if (prot.read) posix_prot |= std.posix.PROT.READ;
+    if (prot.write) posix_prot |= std.posix.PROT.WRITE;
+    if (prot.exec) posix_prot |= std.posix.PROT.EXEC;
 
     const aligned: [*]align(page_size) u8 = @alignCast(addr);
-    const rc = std.posix.system.mprotect(aligned, size, @bitCast(posix_prot));
+    const rc = std.posix.system.mprotect(aligned, size, posix_prot);
     const err = std.posix.errno(rc);
     if (err != .SUCCESS) return error.MprotectFailed;
 }
@@ -321,21 +319,7 @@ fn usleepWindows(us: u64) void {
 
 fn usleepPosix(us: u64) void {
     if (is_windows) unreachable;
-
-    const secs = us / std.time.us_per_s;
-    const nsecs = (us % std.time.us_per_s) * std.time.ns_per_us;
-
-    var ts = std.c.timespec{
-        .sec = @intCast(secs),
-        .nsec = @intCast(nsecs),
-    };
-    while (true) {
-        const rc = std.c.nanosleep(&ts, &ts);
-        if (rc == 0) break;
-        // EINTR: interrupted by signal, retry with remaining time.
-        const err = std.posix.errno(rc);
-        if (err != .INTR) break;
-    }
+    std.Thread.sleep(us * std.time.ns_per_us);
 }
 
 // ── 3. Time ─────────────────────────────────────────────────────────────
@@ -369,12 +353,8 @@ fn timeGetBootUsWindows() u64 {
 
 fn timeGetBootUsPosix() u64 {
     if (is_windows) unreachable;
-
-    var ts = std.c.timespec{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    const secs: u64 = @intCast(ts.sec);
-    const nsecs: u64 = @intCast(ts.nsec);
-    return secs * std.time.us_per_s + nsecs / std.time.ns_per_us;
+    const ns = std.time.nanoTimestamp();
+    return @intCast(@divFloor(ns, std.time.ns_per_us));
 }
 
 /// Current thread CPU time in microseconds (best-effort).
@@ -407,12 +387,8 @@ fn timeThreadCputimeWindows() u64 {
 
 fn timeThreadCputimePosix() u64 {
     if (is_windows) unreachable;
-
-    var ts = std.c.timespec{ .sec = 0, .nsec = 0 };
-    _ = std.c.clock_gettime(std.c.CLOCK.THREAD_CPUTIME_ID, &ts);
-    const secs: u64 = @intCast(ts.sec);
-    const nsecs: u64 = @intCast(ts.nsec);
-    return secs * std.time.us_per_s + nsecs / std.time.ns_per_us;
+    const ns = std.time.nanoTimestamp();
+    return @intCast(@divFloor(ns, std.time.ns_per_us));
 }
 
 // ── 4. Console I/O ──────────────────────────────────────────────────────
