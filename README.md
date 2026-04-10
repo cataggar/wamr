@@ -2,7 +2,7 @@
 
 A fork of [bytecodealliance/wasm-micro-runtime](https://github.com/bytecodealliance/wasm-micro-runtime) ported from C to Zig and maintained with AI assistance.
 
-**100% spec conformance** — 20,898/20,901 tests passing, 0 failures.
+**100% spec conformance** — 20,901/20,901 tests passing.
 
 ## Install
 
