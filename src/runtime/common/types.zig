@@ -487,6 +487,63 @@ pub const ModuleInstance = struct {
         if (idx < self.memories.len) return self.memories[idx];
         return null;
     }
+
+    /// Clone this instance for a new thread (WASI-threads instance-per-thread model).
+    /// Shared: memories, tables, import_functions (retained via ref_count).
+    /// Cloned: globals (mutable globals are thread-local).
+    pub fn cloneForThread(self: *const ModuleInstance, allocator: std.mem.Allocator) !*ModuleInstance {
+        const inst = try allocator.create(ModuleInstance);
+        errdefer allocator.destroy(inst);
+
+        inst.* = .{
+            .module = self.module,
+            .memories = &.{},
+            .tables = &.{},
+            .globals = &.{},
+            .import_functions = self.import_functions,
+            .allocator = allocator,
+        };
+
+        // Share memories (retain ref counts)
+        if (self.memories.len > 0) {
+            inst.memories = try allocator.alloc(*MemoryInstance, self.memories.len);
+            for (self.memories, 0..) |m, i| {
+                m.retain();
+                inst.memories[i] = m;
+            }
+        }
+
+        // Share tables (retain ref counts)
+        if (self.tables.len > 0) {
+            inst.tables = try allocator.alloc(*TableInstance, self.tables.len);
+            for (self.tables, 0..) |t, i| {
+                t.retain();
+                inst.tables[i] = t;
+            }
+        }
+
+        // Clone globals (each thread gets its own mutable global state)
+        if (self.globals.len > 0) {
+            inst.globals = try allocator.alloc(*GlobalInstance, self.globals.len);
+            for (self.globals, 0..) |g, i| {
+                const clone = try allocator.create(GlobalInstance);
+                clone.* = .{
+                    .global_type = g.global_type,
+                    .value = g.value,
+                    .source_module = g.source_module,
+                };
+                inst.globals[i] = clone;
+            }
+        }
+
+        // Clone dropped_elems
+        if (self.dropped_elems.len > 0) {
+            inst.dropped_elems = try allocator.alloc(bool, self.dropped_elems.len);
+            @memcpy(inst.dropped_elems, self.dropped_elems);
+        }
+
+        return inst;
+    }
 };
 
 // ─── Tests for module-level structures ──────────────────────────────────────

@@ -99,6 +99,71 @@ pub const ThreadManager = struct {
         defer self.mutex.unlock();
         return self.threads.items.len;
     }
+
+    /// Spawn a new thread with a cloned module instance.
+    /// The new thread calls the exported `wasi_thread_start(tid, start_arg)` function.
+    /// Returns the TID on success, or a negative errno on failure.
+    pub fn spawnThread(self: *ThreadManager, parent_inst: *types.ModuleInstance) !i32 {
+        const tid = self.allocateTid();
+
+        // Clone the parent instance (shared memory, independent globals)
+        const child_inst = parent_inst.cloneForThread(self.allocator) catch return error.OutOfMemory;
+
+        // Spawn the native thread
+        const thread = std.Thread.spawn(.{}, threadEntry, .{ self, child_inst, tid }) catch {
+            // Clean up cloned instance on spawn failure
+            destroyClonedInstance(child_inst);
+            return error.ThreadSpawnFailed;
+        };
+
+        try self.registerThread(.{
+            .tid = tid,
+            .thread = thread,
+            .instance = child_inst,
+        });
+
+        return tid;
+    }
+
+    fn threadEntry(self: *ThreadManager, inst: *types.ModuleInstance, tid: i32) void {
+        defer {
+            self.unregisterThread(tid);
+            destroyClonedInstance(inst);
+        }
+
+        // Find the exported wasi_thread_start function
+        const func_idx = inst.getExportFunc("wasi_thread_start") orelse return;
+
+        // Create execution environment for this thread
+        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+        var env = ExecEnv.create(inst, 4096, self.allocator) catch return;
+        defer env.destroy();
+
+        // Push arguments: tid and start_arg (0 for now)
+        env.pushI32(tid) catch return;
+        env.pushI32(0) catch return;
+
+        // Execute
+        const interp = @import("../runtime/interpreter/interp.zig");
+        interp.executeFunction(env, func_idx) catch {
+            // Thread trapped — signal all other threads
+            self.signalTrap();
+        };
+    }
+
+    fn destroyClonedInstance(inst: *types.ModuleInstance) void {
+        const allocator = inst.allocator;
+        // Release shared memories/tables
+        for (inst.memories) |m| m.release(allocator);
+        if (inst.memories.len > 0) allocator.free(inst.memories);
+        for (inst.tables) |t| t.release(allocator);
+        if (inst.tables.len > 0) allocator.free(inst.tables);
+        // Destroy cloned globals
+        for (inst.globals) |g| allocator.destroy(g);
+        if (inst.globals.len > 0) allocator.free(inst.globals);
+        if (inst.dropped_elems.len > 0) allocator.free(inst.dropped_elems);
+        allocator.destroy(inst);
+    }
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────
