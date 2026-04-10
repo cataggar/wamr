@@ -30,13 +30,16 @@ jobs:
 
       - name: Spec tests
         run: |
-          total=0 pass=0 fail=0 skip=0
-          result=$(./zig-out/bin/spec-test-runner tests/spec-json 2>&1 | tail -6)
-          echo "$result"
-          passed=$(echo "$result" | grep -oP 'Passed:\s+\K[0-9]+')
-          failed=$(echo "$result" | grep -oP 'Failed:\s+\K[0-9]+')
-          skipped=$(echo "$result" | grep -oP 'Skipped:\s+\K[0-9]+')
-          echo "Results: $passed passed, $failed failed, $skipped skipped"
-          if [ "$failed" -gt 0 ]; then
-            echo "::warning::$failed spec test failures"
+          if [ -d tests/spec-json ]; then
+            result=$(./zig-out/bin/spec-test-runner tests/spec-json 2>&1 | tail -6)
+            echo "$result"
+            passed=$(echo "$result" | grep -oP 'Passed:\s+\K[0-9]+')
+            failed=$(echo "$result" | grep -oP 'Failed:\s+\K[0-9]+')
+            skipped=$(echo "$result" | grep -oP 'Skipped:\s+\K[0-9]+')
+            echo "Results: $passed passed, $failed failed, $skipped skipped"
+            if [ "$failed" -gt 0 ]; then
+              echo "::warning::$failed spec test failures"
+            fi
+          else
+            echo "::notice::Spec test JSON files not found — skipping spec tests"
           fi
