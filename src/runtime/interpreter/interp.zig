@@ -579,6 +579,12 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
     while (ip < code.len) {
         fuel -|= 1;
         if (fuel == 0) return error.Unreachable;
+        // Check for cross-thread trap (every 4096 iterations to minimize overhead)
+        if (fuel % 4096 == 0) {
+            if (env.thread_manager) |tm| {
+                if (tm.hasTrap()) return error.Unreachable;
+            }
+        }
         const byte = code[ip];
         ip += 1;
         const op: Opcode = @enumFromInt(byte);

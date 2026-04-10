@@ -138,6 +138,8 @@ pub const ThreadManager = struct {
         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
         var env = ExecEnv.create(inst, 4096, self.allocator) catch return;
         defer env.destroy();
+        env.thread_manager = self;
+        env.tid = tid;
 
         // Push arguments: tid and start_arg (0 for now)
         env.pushI32(tid) catch return;

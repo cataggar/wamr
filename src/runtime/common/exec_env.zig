@@ -48,6 +48,12 @@ pub const ExecEnv = struct {
     /// Allocator used for this env's memory.
     allocator: std.mem.Allocator,
 
+    /// Thread manager for cross-thread trap propagation (null for single-threaded).
+    thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager = null,
+
+    /// Thread ID (0 for main thread).
+    tid: i32 = 0,
+
     /// Create a new execution environment.
     pub fn create(
         module_inst: *types.ModuleInstance,
