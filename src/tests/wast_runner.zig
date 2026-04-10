@@ -318,22 +318,22 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
         if (parseConst(remaining, "i32.const", "i32")) |result| {
             if (!first_val) try w.writeByte(',');
             first_val = false;
-            try w.print("{{\"type\":\"i32\",\"value\":\"{s}\"}}", .{result.value});
+            try writeConstJson(w, "i32", result.value);
             i += result.len - 1;
         } else if (parseConst(remaining, "i64.const", "i64")) |result| {
             if (!first_val) try w.writeByte(',');
             first_val = false;
-            try w.print("{{\"type\":\"i64\",\"value\":\"{s}\"}}", .{result.value});
+            try writeConstJson(w, "i64", result.value);
             i += result.len - 1;
         } else if (parseConst(remaining, "f32.const", "f32")) |result| {
             if (!first_val) try w.writeByte(',');
             first_val = false;
-            try w.print("{{\"type\":\"f32\",\"value\":\"{s}\"}}", .{result.value});
+            try writeConstJson(w, "f32", result.value);
             i += result.len - 1;
         } else if (parseConst(remaining, "f64.const", "f64")) |result| {
             if (!first_val) try w.writeByte(',');
             first_val = false;
-            try w.print("{{\"type\":\"f64\",\"value\":\"{s}\"}}", .{result.value});
+            try writeConstJson(w, "f64", result.value);
             i += result.len - 1;
         } else if (std.mem.startsWith(u8, remaining, "(ref.null")) {
             if (!first_val) try w.writeByte(',');
@@ -352,6 +352,125 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
             while (i < text.len and text[i] != ')') : (i += 1) {}
         }
     }
+}
+
+/// Write a JSON const value, converting WAT numeric literals to decimal.
+/// WAT allows hex (0x...), underscores, and negative values.
+/// The JSON format uses unsigned decimal for integers and either decimal
+/// or special strings (nan:canonical, nan:arithmetic, inf, -inf) for floats.
+fn writeConstJson(w: anytype, type_str: []const u8, raw_value: []const u8) !void {
+    // Special float values pass through as-is
+    if (std.mem.startsWith(u8, raw_value, "nan:") or
+        std.mem.eql(u8, raw_value, "inf") or
+        std.mem.eql(u8, raw_value, "-inf"))
+    {
+        try w.print("{{\"type\":\"{s}\",\"value\":\"{s}\"}}", .{ type_str, raw_value });
+        return;
+    }
+
+    // For integer types, parse and emit as unsigned decimal
+    if (std.mem.eql(u8, type_str, "i32")) {
+        if (parseWatI32(raw_value)) |val| {
+            try w.print("{{\"type\":\"i32\",\"value\":\"{d}\"}}", .{val});
+            return;
+        }
+    } else if (std.mem.eql(u8, type_str, "i64")) {
+        if (parseWatI64(raw_value)) |val| {
+            try w.print("{{\"type\":\"i64\",\"value\":\"{d}\"}}", .{val});
+            return;
+        }
+    } else if (std.mem.eql(u8, type_str, "f32")) {
+        if (parseWatF32(raw_value)) |val| {
+            try w.print("{{\"type\":\"f32\",\"value\":\"{d}\"}}", .{val});
+            return;
+        }
+    } else if (std.mem.eql(u8, type_str, "f64")) {
+        if (parseWatF64(raw_value)) |val| {
+            try w.print("{{\"type\":\"f64\",\"value\":\"{d}\"}}", .{val});
+            return;
+        }
+    }
+
+    // Fallback: emit as-is
+    try w.print("{{\"type\":\"{s}\",\"value\":\"{s}\"}}", .{ type_str, raw_value });
+}
+
+/// Parse a WAT i32 literal (decimal, hex, with underscores, possibly negative)
+/// and return as unsigned u32 (matching JSON spec format).
+fn parseWatI32(raw: []const u8) ?u32 {
+    const stripped = stripUnderscores(raw);
+    const s = stripped.slice();
+    const negative = s.len > 0 and s[0] == '-';
+    const abs = if (negative) s[1..] else s;
+    if (std.mem.startsWith(u8, abs, "0x") or std.mem.startsWith(u8, abs, "0X")) {
+        const val = std.fmt.parseUnsigned(u32, abs[2..], 16) catch return null;
+        return if (negative) 0 -% val else val;
+    }
+    if (negative) {
+        const val = std.fmt.parseUnsigned(u32, abs, 10) catch return null;
+        return 0 -% val;
+    }
+    return std.fmt.parseUnsigned(u32, abs, 10) catch return null;
+}
+
+fn parseWatI64(raw: []const u8) ?u64 {
+    const stripped = stripUnderscores(raw);
+    const s = stripped.slice();
+    const negative = s.len > 0 and s[0] == '-';
+    const abs = if (negative) s[1..] else s;
+    if (std.mem.startsWith(u8, abs, "0x") or std.mem.startsWith(u8, abs, "0X")) {
+        const val = std.fmt.parseUnsigned(u64, abs[2..], 16) catch return null;
+        return if (negative) 0 -% val else val;
+    }
+    if (negative) {
+        const val = std.fmt.parseUnsigned(u64, abs, 10) catch return null;
+        return 0 -% val;
+    }
+    return std.fmt.parseUnsigned(u64, abs, 10) catch return null;
+}
+
+/// Parse WAT f32 literal to its u32 bit pattern for JSON.
+fn parseWatF32(raw: []const u8) ?u32 {
+    const stripped = stripUnderscores(raw);
+    const s = stripped.slice();
+    // Try parsing as float
+    const f = std.fmt.parseFloat(f32, s) catch return null;
+    return @bitCast(f);
+}
+
+/// Parse WAT f64 literal to its u64 bit pattern for JSON.
+fn parseWatF64(raw: []const u8) ?u64 {
+    const stripped = stripUnderscores(raw);
+    const s = stripped.slice();
+    const f = std.fmt.parseFloat(f64, s) catch return null;
+    return @bitCast(f);
+}
+
+/// Strip underscores from a numeric literal. Returns a view that may be
+/// backed by a stack buffer or the original slice.
+const StrippedNum = struct {
+    buf: [64]u8 = undefined,
+    len: usize,
+    original: []const u8,
+
+    fn slice(self: *const StrippedNum) []const u8 {
+        if (self.len == self.original.len) return self.original;
+        return self.buf[0..self.len];
+    }
+};
+
+fn stripUnderscores(s: []const u8) StrippedNum {
+    if (std.mem.indexOf(u8, s, "_") == null) {
+        return .{ .len = s.len, .original = s };
+    }
+    var result: StrippedNum = .{ .len = 0, .original = s };
+    for (s) |c| {
+        if (c != '_' and result.len < result.buf.len) {
+            result.buf[result.len] = c;
+            result.len += 1;
+        }
+    }
+    return result;
 }
 
 const ConstResult = struct { value: []const u8, len: usize };
@@ -511,4 +630,37 @@ test "findQuotedString" {
 test "findDollarName" {
     try testing.expectEqualStrings("$Mod", findDollarName("(invoke $Mod \"func\")").?);
     try testing.expect(findDollarName("(invoke \"func\")") == null);
+}
+
+test "parseWatI32: decimal" {
+    try testing.expectEqual(@as(u32, 42), parseWatI32("42").?);
+    try testing.expectEqual(@as(u32, 0), parseWatI32("0").?);
+}
+
+test "parseWatI32: hex" {
+    try testing.expectEqual(@as(u32, 0x7fffffff), parseWatI32("0x7fffffff").?);
+    try testing.expectEqual(@as(u32, 0x80000000), parseWatI32("0x80000000").?);
+    try testing.expectEqual(@as(u32, 0xDEADBEEF), parseWatI32("0xDEADBEEF").?);
+}
+
+test "parseWatI32: negative" {
+    try testing.expectEqual(@as(u32, 0xFFFFFFFF), parseWatI32("-1").?); // -1 wraps to max u32
+    try testing.expectEqual(@as(u32, 0x80000000), parseWatI32("-0x80000000").?);
+}
+
+test "parseWatI32: underscores" {
+    try testing.expectEqual(@as(u32, 0x01234500), parseWatI32("0x012345_00").?);
+    try testing.expectEqual(@as(u32, 0xFEDCBA80), parseWatI32("0xfedcba_80").?);
+}
+
+test "parseWatI64: hex" {
+    try testing.expectEqual(@as(u64, 0x7FFFFFFFFFFFFFFF), parseWatI64("0x7FFFFFFFFFFFFFFF").?);
+}
+
+test "stripUnderscores" {
+    const s1 = stripUnderscores("0x012345_00");
+    try testing.expectEqualStrings("0x01234500", s1.slice());
+
+    const s2 = stripUnderscores("42");
+    try testing.expectEqualStrings("42", s2.slice());
 }

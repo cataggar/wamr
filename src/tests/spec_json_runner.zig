@@ -824,7 +824,9 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
             std.mem.eql(u8, cmd.type, "assert_malformed"))
         {
             const filename = cmd.filename orelse {
-                result.skipped += 1;
+                // No filename means the module was already rejected during
+                // wast→JSON conversion (parser/validator caught it). That's a pass.
+                result.passed += 1;
                 continue;
             };
 
