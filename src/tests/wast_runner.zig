@@ -136,7 +136,13 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                 }
                 const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
                 defer allocator.free(fn2);
-                try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                // Check for named module: (module $name ...)
+                const mod_name = extractModuleName(sexpr.text);
+                if (mod_name) |mn| {
+                    try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\",\"name\":\"{s}\"}}", .{ line_num, fn2, mn });
+                } else {
+                    try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                }
                 module_idx += 1;
             },
             .assert_invalid, .assert_malformed, .assert_unlinkable => {
@@ -292,9 +298,10 @@ fn writeRegister(w: anytype, text: []const u8, line: u32) !void {
 
 fn writeInvokeFields(w: anytype, invoke_text: []const u8) !void {
     // (invoke "name" args...) or (invoke $Mod "name" args...)
-    // Extract module name if present
+    // Extract module name if present (strip $ prefix)
     if (findDollarName(invoke_text)) |mod_name| {
-        try w.print(",\"module\":\"{s}\"", .{mod_name});
+        const name = if (mod_name.len > 0 and mod_name[0] == '$') mod_name[1..] else mod_name;
+        try w.print(",\"module\":\"{s}\"", .{name});
     }
     // Extract function name
     if (findQuotedString(invoke_text)) |name| {
@@ -308,7 +315,8 @@ fn writeInvokeFields(w: anytype, invoke_text: []const u8) !void {
 
 fn writeGetFields(w: anytype, get_text: []const u8) !void {
     if (findDollarName(get_text)) |mod_name| {
-        try w.print(",\"module\":\"{s}\"", .{mod_name});
+        const name = if (mod_name.len > 0 and mod_name[0] == '$') mod_name[1..] else mod_name;
+        try w.print(",\"module\":\"{s}\"", .{name});
     }
     if (findQuotedString(get_text)) |name| {
         try w.print(",\"field\":\"{s}\"", .{name});
@@ -528,7 +536,26 @@ fn stripUnderscores(s: []const u8) StrippedNum {
     return result;
 }
 
-const ConstResult = struct { value: []const u8, len: usize };
+/// Extract the module name from a WAT module declaration.
+/// "(module $Mt ...)" → "Mt" (without $ prefix)
+/// "(module ...)" → null
+fn extractModuleName(text: []const u8) ?[]const u8 {
+    const prefix = "(module";
+    if (!std.mem.startsWith(u8, text, prefix)) return null;
+    var i = prefix.len;
+    // Skip whitespace
+    while (i < text.len and (text[i] == ' ' or text[i] == '\n' or text[i] == '\r' or text[i] == '\t')) : (i += 1) {}
+    if (i >= text.len or text[i] != '$') return null;
+    const name_start = i + 1; // skip $
+    var name_end = name_start;
+    while (name_end < text.len and text[name_end] != ' ' and text[name_end] != '\n' and
+        text[name_end] != '\r' and text[name_end] != '\t' and text[name_end] != ')') : (name_end += 1)
+    {}
+    if (name_end == name_start) return null;
+    return text[name_start..name_end];
+}
+
+const ConstResult= struct { value: []const u8, len: usize };
 
 fn parseConst(text: []const u8, prefix: []const u8, _: []const u8) ?ConstResult {
     // Match "(i32.const VALUE)"
@@ -731,6 +758,13 @@ test "parseConst: negative" {
 
 test "findQuotedString" {
     try testing.expectEqualStrings("add", findQuotedString("(invoke \"add\" (i32.const 1))").?);
+}
+
+test "extractModuleName" {
+    try testing.expectEqualStrings("Mt", extractModuleName("(module $Mt (func))").?);
+    try testing.expectEqualStrings("Nt", extractModuleName("(module $Nt\n  (func))").?);
+    try testing.expect(extractModuleName("(module (func))") == null);
+    try testing.expect(extractModuleName("(module)") == null);
 }
 
 test "findDollarName" {
