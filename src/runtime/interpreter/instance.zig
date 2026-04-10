@@ -84,6 +84,13 @@ pub fn instantiateWithImports(
     try applyDataSegments(module, inst.memories, inst.globals);
     try applyElemSegments(module, inst.tables, inst, inst.globals);
 
+    // Set source_module for locally-created funcref globals
+    for (module.globals, 0..) |global, i| {
+        if (global.init_expr == .ref_func) {
+            inst.globals[module.import_global_count + i].source_module = inst;
+        }
+    }
+
     // Mark active and declarative elem segments as dropped (§4.5.4 step 13)
     if (module.elements.len > 0) {
         inst.dropped_elems = allocator.alloc(bool, module.elements.len) catch return error.OutOfMemory;
@@ -238,6 +245,14 @@ fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocat
             .global_type = global.global_type,
             .value = try evalInitExpr(global.init_expr, globals[0 .. import_count + i]),
         };
+        // For ref_func globals, source_module will be set after inst is fully created
+        // For global.get, inherit source_module from the referenced global
+        if (global.init_expr == .global_get) {
+            const src_idx = global.init_expr.global_get;
+            if (src_idx < import_count + i) {
+                g.source_module = globals[src_idx].source_module;
+            }
+        }
         globals[import_count + i] = g;
     }
 
@@ -392,11 +407,14 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
                         .global_get => |gidx| {
                             // Evaluate global to get funcref value
                             if (gidx < globals.len) {
-                                const gval = globals[gidx].value;
+                                const global = globals[gidx];
+                                const gval = global.value;
+                                // Use the source module that owns the function
+                                const src_inst = global.source_module orelse inst;
                                 if (gval.funcref) |fidx| {
-                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = inst };
+                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = src_inst };
                                 } else if (gval.nonfuncref) |fidx| {
-                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = inst };
+                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = src_inst };
                                 } else {
                                     table.elements[offset + i] = null;
                                 }

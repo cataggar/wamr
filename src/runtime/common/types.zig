@@ -446,6 +446,8 @@ pub const GlobalInstance = struct {
     value: Value,
     owned: bool = true,
     ref_count: u32 = 1,
+    /// For funcref globals: the module instance that owns the referenced function
+    source_module: ?*ModuleInstance = null,
 
     pub fn retain(self: *GlobalInstance) void {
         self.ref_count += 1;
