@@ -373,10 +373,9 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
 /// The JSON format uses unsigned decimal for integers and either decimal
 /// or special strings (nan:canonical, nan:arithmetic, inf, -inf) for floats.
 fn writeConstJson(w: anytype, type_str: []const u8, raw_value: []const u8) !void {
-    // Special float values pass through as-is
-    if (std.mem.startsWith(u8, raw_value, "nan:") or
-        std.mem.eql(u8, raw_value, "inf") or
-        std.mem.eql(u8, raw_value, "-inf"))
+    // Special float values recognized by the JSON runner
+    if (std.mem.eql(u8, raw_value, "nan:canonical") or
+        std.mem.eql(u8, raw_value, "nan:arithmetic"))
     {
         try w.print("{{\"type\":\"{s}\",\"value\":\"{s}\"}}", .{ type_str, raw_value });
         return;
@@ -447,7 +446,12 @@ fn parseWatI64(raw: []const u8) ?u64 {
 fn parseWatF32(raw: []const u8) ?u32 {
     const stripped = stripUnderscores(raw);
     const s = stripped.slice();
-    // Try parsing as float
+    // Handle NaN variants
+    if (parseWatNanF32(s)) |bits| return bits;
+    // Handle inf
+    if (std.mem.eql(u8, s, "inf")) return 0x7F800000;
+    if (std.mem.eql(u8, s, "-inf")) return 0xFF800000;
+    // Try standard parse (handles hex float like 0x1.5p+5)
     const f = std.fmt.parseFloat(f32, s) catch return null;
     return @bitCast(f);
 }
@@ -456,8 +460,45 @@ fn parseWatF32(raw: []const u8) ?u32 {
 fn parseWatF64(raw: []const u8) ?u64 {
     const stripped = stripUnderscores(raw);
     const s = stripped.slice();
+    if (parseWatNanF64(s)) |bits| return bits;
+    if (std.mem.eql(u8, s, "inf")) return 0x7FF0000000000000;
+    if (std.mem.eql(u8, s, "-inf")) return 0xFFF0000000000000;
     const f = std.fmt.parseFloat(f64, s) catch return null;
     return @bitCast(f);
+}
+
+/// Parse WAT NaN notation for f32: nan, -nan, nan:0xN, -nan:0xN
+fn parseWatNanF32(s: []const u8) ?u32 {
+    const negative = s.len > 0 and s[0] == '-';
+    const rest = if (negative) s[1..] else s;
+    if (!std.mem.startsWith(u8, rest, "nan")) return null;
+    const sign: u32 = if (negative) 0x80000000 else 0;
+    if (rest.len == 3) {
+        // Plain nan → canonical NaN
+        return sign | 0x7FC00000;
+    }
+    if (std.mem.startsWith(u8, rest[3..], ":0x")) {
+        // nan:0xN → custom payload
+        const payload = std.fmt.parseUnsigned(u32, rest[6..], 16) catch return null;
+        return sign | 0x7F800000 | (payload & 0x7FFFFF);
+    }
+    return null;
+}
+
+/// Parse WAT NaN notation for f64: nan, -nan, nan:0xN, -nan:0xN
+fn parseWatNanF64(s: []const u8) ?u64 {
+    const negative = s.len > 0 and s[0] == '-';
+    const rest = if (negative) s[1..] else s;
+    if (!std.mem.startsWith(u8, rest, "nan")) return null;
+    const sign: u64 = if (negative) 0x8000000000000000 else 0;
+    if (rest.len == 3) {
+        return sign | 0x7FF8000000000000;
+    }
+    if (std.mem.startsWith(u8, rest[3..], ":0x")) {
+        const payload = std.fmt.parseUnsigned(u64, rest[6..], 16) catch return null;
+        return sign | 0x7FF0000000000000 | (payload & 0xFFFFFFFFFFFFF);
+    }
+    return null;
 }
 
 /// Strip underscores from a numeric literal. Returns a view that may be
@@ -728,4 +769,36 @@ test "stripUnderscores" {
 
     const s2 = stripUnderscores("42");
     try testing.expectEqualStrings("42", s2.slice());
+}
+
+test "parseWatF32: nan variants" {
+    try testing.expectEqual(@as(u32, 0x7FC00000), parseWatF32("nan").?);
+    try testing.expectEqual(@as(u32, 0xFFC00000), parseWatF32("-nan").?);
+    try testing.expectEqual(@as(u32, 0x7F800001), parseWatF32("nan:0x1").?);
+    try testing.expectEqual(@as(u32, 0xFF800001), parseWatF32("-nan:0x1").?);
+    try testing.expectEqual(@as(u32, 0x7FC00000), parseWatF32("nan:0x400000").?);
+}
+
+test "parseWatF32: inf" {
+    try testing.expectEqual(@as(u32, 0x7F800000), parseWatF32("inf").?);
+    try testing.expectEqual(@as(u32, 0xFF800000), parseWatF32("-inf").?);
+}
+
+test "parseWatF32: hex float" {
+    // 0x0p+0 = 0.0
+    try testing.expectEqual(@as(u32, 0), parseWatF32("0x0p+0").?);
+    // -0x0p+0 = -0.0
+    try testing.expectEqual(@as(u32, 0x80000000), parseWatF32("-0x0p+0").?);
+}
+
+test "parseWatF64: nan variants" {
+    try testing.expectEqual(@as(u64, 0x7FF8000000000000), parseWatF64("nan").?);
+    try testing.expectEqual(@as(u64, 0xFFF8000000000000), parseWatF64("-nan").?);
+}
+
+test "parseWatNanF32" {
+    try testing.expectEqual(@as(u32, 0x7FC00000), parseWatNanF32("nan").?);
+    try testing.expectEqual(@as(u32, 0xFFC00000), parseWatNanF32("-nan").?);
+    try testing.expect(parseWatNanF32("42") == null);
+    try testing.expect(parseWatNanF32("0x7fc00000") == null);
 }
