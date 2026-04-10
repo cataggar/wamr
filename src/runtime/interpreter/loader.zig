@@ -2471,8 +2471,9 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 _ = readU32Leb(code, &i); // label index
                 const popped_tidx_br = if (sp > 0 and sp - 1 < stack_tidx.len) stack_tidx[sp - 1] else NO_TIDX;
                 const popped = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                // If the ref is not null (doesn't branch), push non-nullable version
+                // Must be a reference type
                 if (popped) |pt| {
+                    if (!pt.isRef()) return error.TypeMismatch;
                     if (pt.isExternRef())
                         pushType(&stack_buf, &sp, .nonexternref, &stack_tidx)
                     else
@@ -2487,10 +2488,13 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                 pushType(&stack_buf, &sp, .i32, &stack_tidx);
             },
-            // br_on_non_null: pop ref, branch if non-null
+            // br_on_non_null (0xD6): pop ref, branch if non-null
             0xD6 => {
                 _ = readU32Leb(code, &i); // label index
-                _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                const popped_bnn = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                if (popped_bnn) |pt| {
+                    if (!pt.isRef()) return error.TypeMismatch;
+                }
             },
 
             // 0xFC prefix

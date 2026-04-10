@@ -437,10 +437,9 @@ fn freeTables(tables: []*types.TableInstance, allocator: std.mem.Allocator) void
 }
 
 fn freeGlobals(globals: []*types.GlobalInstance, import_count: u32, allocator: std.mem.Allocator) void {
-    // Only destroy locally-created globals; imported globals are shared pointers
-    for (globals[import_count..]) |g| {
-        allocator.destroy(g);
-    }
+    // Imported globals use refcounting; locally-created globals are destroyed directly
+    for (globals[0..import_count]) |g| g.release(allocator);
+    for (globals[import_count..]) |g| allocator.destroy(g);
     if (globals.len > 0) allocator.free(globals);
 }
 

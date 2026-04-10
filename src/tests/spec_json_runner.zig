@@ -195,11 +195,9 @@ fn buildImportContext(
                         eg.global_type.mutability != gt.mutability or
                         eg.global_type.type_idx != gt.type_idx)
                         return error.ImportResolutionFailed;
-                    const gw = allocator.create(types.GlobalInstance) catch
-                        return error.ImportResolutionFailed;
-                    gw.* = eg.*;
-                    gw.owned = false;
-                    globals.append(allocator, gw) catch return error.ImportResolutionFailed;
+                    // Share the global by pointer — mutable globals must be aliased
+                    eg.retain();
+                    globals.append(allocator, eg) catch return error.ImportResolutionFailed;
                 }
             },
             .memory => {

@@ -252,6 +252,8 @@ pub const ElemSegment = struct {
     offset: ?InitExpr, // null for passive/declarative
     kind: ElemKind,
     func_indices: []const ?u32,
+    /// Init expressions for elements that need runtime evaluation (global.get, bytecode)
+    elem_exprs: []const ?InitExpr = &.{},
     is_passive: bool = false,
     is_declarative: bool = false,
     /// Concrete type index for element type (0xFFFFFFFF = abstract).
@@ -418,6 +420,18 @@ pub const GlobalInstance = struct {
     global_type: GlobalType,
     value: Value,
     owned: bool = true,
+    ref_count: u32 = 1,
+
+    pub fn retain(self: *GlobalInstance) void {
+        self.ref_count += 1;
+    }
+
+    pub fn release(self: *GlobalInstance, allocator: std.mem.Allocator) void {
+        self.ref_count -= 1;
+        if (self.ref_count == 0) {
+            allocator.destroy(self);
+        }
+    }
 };
 
 /// A resolved imported function target
