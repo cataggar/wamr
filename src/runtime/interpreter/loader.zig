@@ -2494,13 +2494,30 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
             // br_on_null (0xD5): pop ref, branch if null; push non-nullable if not branching
+            // Spec: br_on_null $l : [t* (ref null ht)] -> [t* (ref ht)]
+            // Must validate that t* matches label $l's types
             0xD5 => {
-                _ = readU32Leb(code, &i); // label index
+                const label = readU32Leb(code, &i);
                 const popped_tidx_br = if (sp > 0 and sp - 1 < stack_tidx.len) stack_tidx[sp - 1] else NO_TIDX;
                 const popped = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                 // Must be a reference type
                 if (popped) |pt| {
                     if (!pt.isRef()) return error.TypeMismatch;
+                }
+                // Check branch target types (values under the ref must match label types)
+                if (ctrl_sp > label) {
+                    const target = &ctrl_buf[ctrl_sp - 1 - label];
+                    const label_types = getLabelTypes(target);
+                    const label_tidxs_slice = getLabelTidxs(target, module);
+                    // Peek: check and pop label types, then re-push them
+                    try popLabelTypesTidx(&stack_buf, &sp, label_types, label_tidxs_slice, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx);
+                    for (label_types, 0..) |t, li| {
+                        const lt = if (li < label_tidxs_slice.len) label_tidxs_slice[li] else NO_TIDX;
+                        pushV(&stack_buf, &sp, t, &stack_tidx, lt);
+                    }
+                }
+                // Push non-nullable version for the non-branch path
+                if (popped) |pt| {
                     if (pt.isExternRef())
                         pushType(&stack_buf, &sp, .nonexternref, &stack_tidx)
                     else
@@ -2516,12 +2533,42 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 pushType(&stack_buf, &sp, .i32, &stack_tidx);
             },
             // br_on_non_null (0xD6): pop ref, branch if non-null
+            // Spec: br_on_non_null $l : [t* (ref null ht)] -> [t*]
+            // On branch: delivers [t* (ref ht)] to label $l
             0xD6 => {
-                _ = readU32Leb(code, &i); // label index
+                const label = readU32Leb(code, &i);
+                const popped_tidx_bnn = if (sp > 0 and sp - 1 < stack_tidx.len) stack_tidx[sp - 1] else NO_TIDX;
                 const popped_bnn = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                 if (popped_bnn) |pt| {
                     if (!pt.isRef()) return error.TypeMismatch;
                 }
+                // Check branch target: label expects [..., (ref ht)]
+                // Push non-nullable version temporarily, check label types, then pop it
+                if (ctrl_sp > label) {
+                    const target = &ctrl_buf[ctrl_sp - 1 - label];
+                    const label_types = getLabelTypes(target);
+                    const label_tidxs_slice = getLabelTidxs(target, module);
+                    // Push non-nullable ref temporarily for branch type check
+                    if (popped_bnn) |pt| {
+                        if (pt.isExternRef())
+                            pushType(&stack_buf, &sp, .nonexternref, &stack_tidx)
+                        else
+                            pushV(&stack_buf, &sp, .nonfuncref, &stack_tidx, popped_tidx_bnn);
+                    } else {
+                        pushType(&stack_buf, &sp, .nonfuncref, &stack_tidx);
+                    }
+                    try popLabelTypesTidx(&stack_buf, &sp, label_types, label_tidxs_slice, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx);
+                    for (label_types, 0..) |t, li| {
+                        const lt = if (li < label_tidxs_slice.len) label_tidxs_slice[li] else NO_TIDX;
+                        pushV(&stack_buf, &sp, t, &stack_tidx, lt);
+                    }
+                    // Pop the re-pushed label types and the ref to restore stack
+                    var pops: u32 = @intCast(label_types.len);
+                    while (pops > 0) : (pops -= 1) {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    }
+                }
+                // Non-branch path: ref was null, stack has [t*] without the ref
             },
 
             // 0xFC prefix
