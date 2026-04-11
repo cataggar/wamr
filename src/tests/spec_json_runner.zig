@@ -975,15 +975,16 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 result.passed += 1;
                 continue;
             };
-            defer allocator.free(wasm_data);
 
             var mod = runtime.loadModule(wasm_data) catch {
+                allocator.free(wasm_data);
                 result.passed += 1;
                 continue;
             };
 
             const import_ctx = buildImportContext(&mod.inner, &module_registry, allocator) catch {
                 mod.deinit();
+                allocator.free(wasm_data);
                 result.passed += 1;
                 continue;
             };
@@ -993,10 +994,30 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                     inst.deinit();
                     freeImportContext(ctx, allocator);
                     mod.deinit();
+                    allocator.free(wasm_data);
                     result.failed += 1;
                 } else |_| {
                     freeImportContext(ctx, allocator);
-                    mod.deinit();
+                    // Keep the module alive — elem segments may have placed
+                    // funcrefs in shared tables that reference this module.
+                    const mod_heap = allocator.create(wamr.Module) catch {
+                        mod.deinit();
+                        allocator.free(wasm_data);
+                        result.passed += 1;
+                        continue;
+                    };
+                    mod_heap.* = mod;
+                    reg_mod_ptrs.append(allocator, mod_heap) catch {
+                        mod.deinit();
+                        allocator.destroy(mod_heap);
+                        allocator.free(wasm_data);
+                        result.passed += 1;
+                        continue;
+                    };
+                    reg_wasm_data.append(allocator, wasm_data) catch {
+                        result.passed += 1;
+                        continue;
+                    };
                     result.passed += 1;
                 }
             } else {
@@ -1004,9 +1025,11 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 if (inst_or_err) |*inst| {
                     inst.deinit();
                     mod.deinit();
+                    allocator.free(wasm_data);
                     result.failed += 1;
                 } else |_| {
                     mod.deinit();
+                    allocator.free(wasm_data);
                     result.passed += 1;
                 }
             }
