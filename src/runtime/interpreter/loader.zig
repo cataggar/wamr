@@ -1282,7 +1282,17 @@ fn validateFunctionBody(
         if (max_align) |ma| {
             const align_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidAlignment;
             i += align_result.bytes_read;
-            if (align_result.value > ma) return error.InvalidAlignment;
+            // Multi-memory: bit 6 signals a memory index follows
+            const has_mem_idx = align_result.value & 0x40 != 0;
+            if (has_mem_idx) {
+                const mem_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidSectionSize;
+                i += mem_result.bytes_read;
+            }
+            // Alignment is in bits 0-5 (mask off multi-memory bit 6)
+            const align_value = align_result.value & 0x3F;
+            // But reject if any bits above bit 6 are set (invalid)
+            if (align_result.value & ~@as(u32, 0x7F) != 0) return error.InvalidAlignment;
+            if (align_value > ma) return error.InvalidAlignment;
             const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidSectionSize;
             i += offset_result.bytes_read;
             continue;
