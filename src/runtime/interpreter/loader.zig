@@ -618,6 +618,8 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                         try elem_exprs_list.append(allocator, expr);
                     },
                     .ref_null => |vt| {
+                        // For flags=4, kind defaults to func_ref but element may be externref
+                        if (flags == 4 and vt.isExternRef()) kind = .extern_ref;
                         if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
                         if (kind == .extern_ref and !vt.isExternRef()) return error.TypeMismatch;
                         try func_indices_list.append(allocator, null);
