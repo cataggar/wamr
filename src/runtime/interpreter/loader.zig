@@ -334,6 +334,8 @@ fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
 fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types.InitExpr {
     const start_pos = reader.pos;
     const opcode = try reader.readByte();
+    // Empty init expression (just 0x0B end) is invalid
+    if (opcode == 0x0B) return error.TypeMismatch;
     // Try to parse as a single-instruction init expression first
     const simple: ?types.InitExpr = switch (opcode) {
         0x41 => .{ .i32_const = try reader.readI32() },
@@ -1069,7 +1071,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     // Validate function bodies (alignment, index bounds)
     for (module.functions) |func| {
         const total_locals = @as(u32, @intCast(func.func_type.params.len)) + func.local_count;
-        try validateFunctionBody(func.code, module.types.len, total_funcs, total_tables, total_globals, total_locals, module.data_count != null);
+        try validateFunctionBody(func.code, module.types.len, total_funcs, total_tables, total_memories, total_globals, total_locals, module.data_count != null);
     }
 
     // Type-stack validation for each function body (skip for imports w/ 0 local funcs)
@@ -1261,6 +1263,7 @@ fn validateFunctionBody(
     num_types: usize,
     total_funcs: u32,
     total_tables: u32,
+    total_memories: u32,
     total_globals: u32,
     total_locals: u32,
     has_data_count: bool,
@@ -1280,6 +1283,8 @@ fn validateFunctionBody(
         };
 
         if (max_align) |ma| {
+            // Memory operations require at least one memory
+            if (total_memories == 0) return error.UnknownMemory;
             const align_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidAlignment;
             i += align_result.bytes_read;
             // Multi-memory: bit 6 signals a memory index follows
@@ -1368,6 +1373,7 @@ fn validateFunctionBody(
 
             // memory.size, memory.grow: memidx (u32 LEB)
             0x3F, 0x40 => {
+                if (total_memories == 0) return error.UnknownMemory;
                 const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += r.bytes_read;
             },
