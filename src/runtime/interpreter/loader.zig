@@ -1668,7 +1668,9 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
     if (pos.* >= code.len) return .{ .results = &.{} };
     const bt = code[pos.*];
     if (bt == 0x40) { pos.* += 1; return .{ .results = &.{} }; }
-    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
+    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F or
+        bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or bt == 0x6A or bt == 0x65 or bt == 0x71 or
+        bt == 0x69 or bt == 0x68 or bt == 0x74) {
         pos.* += 1;
         return switch (bt) {
             0x7F => .{ .results = &[_]VT{.i32} },
@@ -1677,6 +1679,9 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
             0x7C => .{ .results = &[_]VT{.f64} },
             0x70 => .{ .results = &[_]VT{.funcref} },
             0x6F => .{ .results = &[_]VT{.externref} },
+            // GC abstract ref types
+            0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65, 0x71 => .{ .results = &[_]VT{.funcref} },
+            0x69, 0x68, 0x74 => .{ .results = &[_]VT{.externref} },
             else => .{ .results = &.{} },
         };
     }
@@ -1688,6 +1693,13 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
         const ht = code[pos.*];
         if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} }; }
         if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} }; }
+        // GC abstract heap types
+        if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or ht == 0x65 or ht == 0x71) {
+            pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} };
+        }
+        if (ht == 0x69 or ht == 0x68 or ht == 0x74) {
+            pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} };
+        }
         // Concrete type index (LEB128) — validate and treat as funcref/nonfuncref result
         const tir = leb128_mod.readUnsigned(u32, code[pos.*..]) catch return error.TypeMismatch;
         pos.* += tir.bytes_read;
