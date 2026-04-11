@@ -170,11 +170,11 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x6A => .{ .vt = .funcref, .tidx = NO_TIDX }, // arrayref
         0x69 => .{ .vt = .externref, .tidx = NO_TIDX }, // exnref
         0x68 => .{ .vt = .externref, .tidx = NO_TIDX }, // noexnref
-        0x65 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullref
-        0x71 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref
-        0x74 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref
-        0x73 => .{ .vt = .nonfuncref, .tidx = NO_TIDX }, // nofunc (non-nullable)
-        0x72 => .{ .vt = .nonexternref, .tidx = NO_TIDX }, // noextern (non-nullable)
+        0x65 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullref (ref null none)
+        0x71 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref (ref null nofunc)
+        0x74 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref (ref null noextern)
+        0x73 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref shorthand (ref null nofunc)
+        0x72 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref shorthand (ref null noextern)
         // Typed reference types: ref null <heaptype> or ref <heaptype>
         0x63, 0x64 => {
             const is_nullable = (byte == 0x63);
@@ -2607,9 +2607,17 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 if (i < code.len) {
                     const ht = code[i];
                     i += 1;
-                    if (ht == 0x6F or ht == 0x72) {
+                    if (ht == 0x6F or ht == 0x72 or ht == 0x74) {
+                        // extern, noextern, noextern(alt)
                         pushType(&stack_buf, &sp, .externref, &stack_tidx);
-                    } else if (ht == 0x70 or ht == 0x73) {
+                    } else if (ht == 0x69 or ht == 0x68) {
+                        // exn, noexn → externref abstraction
+                        pushType(&stack_buf, &sp, .externref, &stack_tidx);
+                    } else if (ht == 0x70 or ht == 0x73 or ht == 0x71) {
+                        // func, nofunc, nofunc(alt)
+                        pushType(&stack_buf, &sp, .funcref, &stack_tidx);
+                    } else if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or ht == 0x65) {
+                        // any, eq, i31, struct, array, none → funcref abstraction
                         pushType(&stack_buf, &sp, .funcref, &stack_tidx);
                     } else {
                         // Concrete type index: parse LEB128 and track it
