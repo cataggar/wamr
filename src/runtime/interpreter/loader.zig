@@ -946,6 +946,10 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
         if (table.limits.max) |max| {
             if (table.limits.min > max) return error.InvalidLimits;
         }
+        // Non-nullable element types require a table initializer
+        if (table.elem_type == .nonfuncref or table.elem_type == .nonexternref) {
+            return error.TypeMismatch;
+        }
     }
 
     // Validate import types and limits
