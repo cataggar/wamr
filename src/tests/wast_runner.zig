@@ -198,7 +198,47 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                     .assert_exception => "assert_trap",
                     else => unreachable,
                 };
-                try writeAssertTrap(w, sexpr.text, type_str, line_num);
+                // Check if this is assert_trap with an embedded module (instantiation trap)
+                if (std.mem.indexOf(u8, sexpr.text, "(module") != null and
+                    std.mem.indexOf(u8, sexpr.text, "(invoke") == null)
+                {
+                    // Treat like assert_unlinkable: compile the module and write it as a file
+                    const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    module_idx += 1;
+                    if (std.mem.indexOf(u8, sexpr.text, "(module")) |mod_start| {
+                        if (wr.extractSExpr(sexpr.text, mod_start)) |mod_sexpr| {
+                            if (wr.isBinaryModule(mod_sexpr.text)) {
+                                if (wr.decodeWastHexStrings(allocator, mod_sexpr.text)) |wasm_bytes| {
+                                    try modules.put(allocator, filename, wasm_bytes);
+                                } else |_| {
+                                    allocator.free(filename);
+                                }
+                            } else if (!wr.isQuoteModule(mod_sexpr.text)) {
+                                var mod2 = wabt.text.Parser.parseModule(allocator, mod_sexpr.text) catch {
+                                    allocator.free(filename);
+                                    try w.print("{{\"type\":\"assert_trap\",\"line\":{d}}}", .{line_num});
+                                    continue;
+                                };
+                                defer mod2.deinit();
+                                if (wabt.binary.writer.writeModule(allocator, &mod2)) |wasm_bytes| {
+                                    try modules.put(allocator, filename, wasm_bytes);
+                                } else |_| {
+                                    allocator.free(filename);
+                                }
+                            } else {
+                                allocator.free(filename);
+                            }
+                            const fn3 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx - 1 });
+                            defer allocator.free(fn3);
+                            try w.print("{{\"type\":\"assert_uninstantiable\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn3 });
+                            continue;
+                        }
+                    }
+                    allocator.free(filename);
+                    try w.print("{{\"type\":\"assert_trap\",\"line\":{d}}}", .{line_num});
+                } else {
+                    try writeAssertTrap(w, sexpr.text, type_str, line_num);
+                }
             },
             .register => {
                 try writeRegister(w, sexpr.text, line_num);
