@@ -211,9 +211,11 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
             }
             return;
         }
-        const local_idx = current_func_idx - module.import_function_count;
+        const local_idx = std.math.sub(u32, current_func_idx, module.import_function_count) catch return error.UnknownFunction;
 
+        if (local_idx >= module.functions.len) return error.UnknownFunction;
         const func = &module.functions[local_idx];
+        if (func.type_idx >= module.types.len) return error.UnknownFunction;
         const func_type = module.types[func.type_idx];
         const param_count: u32 = @intCast(func_type.params.len);
 

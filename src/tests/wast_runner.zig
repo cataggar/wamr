@@ -370,8 +370,24 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
         } else if (std.mem.startsWith(u8, remaining, "(ref.func")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
-            try w.writeAll("{\"type\":\"funcref\",\"value\":\"0\"}");
-            while (i < text.len and text[i] != ')') : (i += 1) {}
+            // Extract the function index if present
+            if (parseConst(remaining, "ref.func", "funcref")) |result| {
+                try writeConstJson(w, "funcref", result.value);
+                i += result.len - 1;
+            } else {
+                try w.writeAll("{\"type\":\"funcref\",\"value\":\"0\"}");
+                while (i < text.len and text[i] != ')') : (i += 1) {}
+            }
+        } else if (std.mem.startsWith(u8, remaining, "(ref.extern")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            if (parseConst(remaining, "ref.extern", "externref")) |result| {
+                try writeConstJson(w, "externref", result.value);
+                i += result.len - 1;
+            } else {
+                try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
+                while (i < text.len and text[i] != ')') : (i += 1) {}
+            }
         }
     }
 }

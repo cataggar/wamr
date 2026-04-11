@@ -336,7 +336,7 @@ pub const WasmModule = struct {
             }
             return null;
         }
-        const local_idx = func_idx - self.import_function_count;
+        const local_idx = std.math.sub(u32, func_idx, self.import_function_count) catch return null;
         if (local_idx < self.functions.len) {
             const tidx = self.functions[local_idx].type_idx;
             return if (tidx < self.types.len) self.types[tidx] else null;
@@ -356,7 +356,7 @@ pub const WasmModule = struct {
             }
             return null;
         }
-        const local_idx = func_idx - self.import_function_count;
+        const local_idx = std.math.sub(u32, func_idx, self.import_function_count) catch return null;
         if (local_idx < self.functions.len) return self.functions[local_idx].type_idx;
         return null;
     }
