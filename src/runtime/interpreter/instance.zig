@@ -411,9 +411,12 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
                                 const gval = global.value;
                                 // Use the source module that owns the function
                                 const src_inst = global.source_module orelse inst;
-                                if (gval.funcref) |fidx| {
-                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = src_inst };
-                                } else if (gval.nonfuncref) |fidx| {
+                                const opt_fidx: ?u32 = switch (gval) {
+                                    .funcref => |v| v,
+                                    .nonfuncref => |v| v,
+                                    else => null,
+                                };
+                                if (opt_fidx) |fidx| {
                                     table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = src_inst };
                                 } else {
                                     table.elements[offset + i] = null;

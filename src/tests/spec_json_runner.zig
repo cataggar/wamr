@@ -116,12 +116,24 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
                 break :blk std.math.isNan(v);
             break :blk actual_bits == expected_bits;
         },
-        .funcref => |v| (b == .funcref or b == .nonfuncref) and ((v == null and (if (b == .funcref) b.funcref else b.nonfuncref) == null) or (v != null and (if (b == .funcref) b.funcref else b.nonfuncref) != null)),
-        .externref => |v| (b == .externref or b == .nonexternref) and ((v == null and (if (b == .externref) b.externref else b.nonexternref) == null) or (v != null and (if (b == .externref) b.externref else b.nonexternref) != null)),
-        .nonfuncref => |v| (b == .funcref or b == .nonfuncref) and ((v == null and (if (b == .funcref) b.funcref else b.nonfuncref) == null) or (v != null and (if (b == .funcref) b.funcref else b.nonfuncref) != null)),
-        .nonexternref => |v| (b == .externref or b == .nonexternref) and ((v == null and (if (b == .externref) b.externref else b.nonexternref) == null) or (v != null and (if (b == .externref) b.externref else b.nonexternref) != null)),
+        .funcref => |v| refNullEqual(v == null, b),
+        .externref => |v| refNullEqual(v == null, b),
+        .nonfuncref => |v| refNullEqual(v == null, b),
+        .nonexternref => |v| refNullEqual(v == null, b),
         else => false,
     };
+}
+
+/// Compare ref types by nullness (funcref/nonfuncref/externref/nonexternref are compatible).
+fn refNullEqual(a_is_null: bool, b: types.Value) bool {
+    const b_is_null = switch (b) {
+        .funcref => |v| v == null,
+        .nonfuncref => |v| v == null,
+        .externref => |v| v == null,
+        .nonexternref => |v| v == null,
+        else => return false,
+    };
+    return a_is_null == b_is_null;
 }
 
 /// Parse a slice of JSON args into a caller-owned slice of Values.
