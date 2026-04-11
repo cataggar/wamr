@@ -169,6 +169,7 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x6B => .{ .vt = .funcref, .tidx = NO_TIDX }, // structref
         0x6A => .{ .vt = .funcref, .tidx = NO_TIDX }, // arrayref
         0x69 => .{ .vt = .externref, .tidx = NO_TIDX }, // exnref
+        0x68 => .{ .vt = .externref, .tidx = NO_TIDX }, // noexnref
         0x65 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullref
         0x71 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref
         0x74 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref
@@ -199,13 +200,19 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
                         }
                     }
                     if (max_types) |mt| {
-                        if (type_idx >= mt) return error.InvalidValType;
+                        if (type_idx >= mt) {
+                            std.debug.print("InvalidValType: byte=0x{x:0>2} heap=0x{x:0>2} tidx={d} max={d}\n", .{ byte, heap_byte, type_idx, mt });
+                            return error.InvalidValType;
+                        }
                     }
                     return .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = type_idx };
                 },
             };
         },
-        else => error.InvalidValType,
+        else => {
+            std.debug.print("InvalidValType(readValType-catch-all): byte=0x{x:0>2}\n", .{byte});
+            return error.InvalidValType;
+        },
     };
 }
 
@@ -277,13 +284,19 @@ fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u3
                             shift +|= 7;
                         }
                     }
-                    if (type_idx >= type_count) return error.InvalidValType;
+                    if (type_idx >= type_count) {
+                        std.debug.print("InvalidValType(readTableType-concrete): tidx={d} tc={d}\n", .{ type_idx, type_count });
+                        return error.InvalidValType;
+                    }
                     elem_tidx = type_idx;
                     break :blk if (is_nullable) types.ValType.funcref else types.ValType.nonfuncref;
                 },
             };
         },
-        else => return error.InvalidValType,
+        else => {
+            std.debug.print("InvalidValType(readTableType): byte=0x{x:0>2}\n", .{first_byte});
+            return error.InvalidValType;
+        },
     };
     const limits = try readLimits(reader);
     return .{ .elem_type = elem_type, .limits = limits, .elem_tidx = elem_tidx };
@@ -341,7 +354,10 @@ fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.Globa
     const mutability: types.GlobalType.Mutability = switch (mut_byte) {
         0 => .immutable,
         1 => .mutable,
-        else => return error.InvalidValType,
+        else => {
+            std.debug.print("InvalidValType(readGlobalType): byte=0x{x:0>2}\n", .{mut_byte});
+            return error.InvalidValType;
+        },
     };
     return .{ .val_type = info.vt, .mutability = mutability, .type_idx = info.tidx };
 }
@@ -668,7 +684,10 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                                 shift +|= 7;
                             }
                         }
-                        if (ht_idx >= type_count) return error.InvalidValType;
+                        if (ht_idx >= type_count) {
+                            std.debug.print("InvalidValType(elemSection): ht={d} tc={d}\n", .{ ht_idx, type_count });
+                            return error.InvalidValType;
+                        }
                         seg_tidx = ht_idx;
                         break :blk .func_ref;
                     },
@@ -1707,7 +1726,10 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
         // Concrete type index (LEB128) — validate and treat as funcref/nonfuncref result
         const tir = leb128_mod.readUnsigned(u32, code[pos.*..]) catch return error.TypeMismatch;
         pos.* += tir.bytes_read;
-        if (tir.value >= module_types.len) return error.InvalidValType;
+        if (tir.value >= module_types.len) {
+            std.debug.print("InvalidValType(readBlockType): tidx={d} types={d}\n", .{ tir.value, module_types.len });
+            return error.InvalidValType;
+        }
         return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref}, .single_result_tidx = tir.value };
     }
     const r = leb128_mod.readSigned(i64, code[pos.*..]) catch return error.TypeMismatch;
