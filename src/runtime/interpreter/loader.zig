@@ -1376,8 +1376,8 @@ fn validateFunctionBody(
             // memory.size, memory.grow: reserved byte must be exactly 0x00
             0x3F, 0x40 => {
                 if (total_memories == 0) return error.UnknownMemory;
-                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
-                i += r.bytes_read;
+                if (i >= code.len or code[i] != 0x00) return error.InvalidAlignment;
+                i += 1;
             },
 
             // i32.const
