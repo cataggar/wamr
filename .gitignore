@@ -48,3 +48,14 @@ tests/unit/aot-stack-frame/wasm-apps/test_aot.h
 # Spec test data (generated/cloned — not committed)
 tests/spec/
 tests/spec-json/
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# Wast test runner temp directories
+.wamr-test-*/
+
+# Windows NUL device artifacts
+NUL.*
