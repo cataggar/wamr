@@ -171,6 +171,14 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                                 continue;
                             };
                             defer mod2.deinit();
+                            // For assert_invalid, validate before writing binary
+                            if (cmd == .assert_invalid) {
+                                wabt.Validator.validate(&mod2, .{}) catch {
+                                    allocator.free(filename);
+                                    try w.print("{{\"type\":\"{s}\",\"line\":{d},\"module_type\":\"text\"}}", .{ type_str, line_num });
+                                    continue;
+                                };
+                            }
                             if (wabt.binary.writer.writeModule(allocator, &mod2)) |wasm_bytes| {
                                 try modules.put(allocator, filename, wasm_bytes);
                             } else |_| {
