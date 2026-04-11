@@ -162,6 +162,18 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x7B => .{ .vt = .v128, .tidx = NO_TIDX },
         0x70 => .{ .vt = .funcref, .tidx = NO_TIDX },
         0x6F => .{ .vt = .externref, .tidx = NO_TIDX },
+        // GC proposal shorthand types (single-byte nullable ref types)
+        0x6E => .{ .vt = .funcref, .tidx = NO_TIDX }, // anyref
+        0x6D => .{ .vt = .funcref, .tidx = NO_TIDX }, // eqref
+        0x6C => .{ .vt = .funcref, .tidx = NO_TIDX }, // i31ref
+        0x6B => .{ .vt = .funcref, .tidx = NO_TIDX }, // structref
+        0x6A => .{ .vt = .funcref, .tidx = NO_TIDX }, // arrayref
+        0x69 => .{ .vt = .externref, .tidx = NO_TIDX }, // exnref
+        0x65 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullref
+        0x71 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref
+        0x74 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref
+        0x73 => .{ .vt = .nonfuncref, .tidx = NO_TIDX }, // nofunc (non-nullable)
+        0x72 => .{ .vt = .nonexternref, .tidx = NO_TIDX }, // noextern (non-nullable)
         // Typed reference types: ref null <heaptype> or ref <heaptype>
         0x63, 0x64 => {
             const is_nullable = (byte == 0x63);
@@ -169,6 +181,11 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
             return switch (heap_byte) {
                 0x70, 0x73 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX },
                 0x6F, 0x72 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX },
+                // GC abstract heap types — map to funcref/externref abstractions
+                0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX }, // any, eq, i31, struct, array, none
+                0x69, 0x68 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX }, // exn, noexn
+                0x74 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX }, // noextern
+                0x71 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX }, // nofunc
                 else => {
                     // Concrete type index (LEB128)
                     var type_idx: u32 = heap_byte & 0x7F;
@@ -199,6 +216,8 @@ fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
     return switch (byte) {
         0x70, 0x73 => .funcref,
         0x6F, 0x72 => .externref,
+        0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65, 0x71 => .funcref, // GC: any, eq, i31, struct, array, none, nofunc
+        0x69, 0x68, 0x74 => .externref, // exn, noexn, noextern
         else => {
             // Concrete type index: consume remaining LEB128 bytes
             if (byte & 0x80 != 0) {
@@ -390,40 +409,91 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
 fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.FuncType {
     const count = try reader.readU32();
     if (count == 0) return &.{};
-    const func_types = try allocator.alloc(types.FuncType, count);
-    for (func_types) |*ft| {
+
+    // GC proposal: type entries may be rec groups (0x4E) containing sub types (0x50/0x4F)
+    // We flatten them all into a single FuncType array.
+    var func_types_list: std.ArrayList(types.FuncType) = .empty;
+    var entries_parsed: u32 = 0;
+    while (entries_parsed < count) : (entries_parsed += 1) {
         const tag = try reader.readByte();
-        if (tag != 0x60) return error.InvalidFuncType;
-
-        const param_count = try reader.readU32();
-        var params: []types.ValType = &.{};
-        var param_tidxs: []u32 = &.{};
-        if (param_count > 0) {
-            params = try allocator.alloc(types.ValType, param_count);
-            param_tidxs = try allocator.alloc(u32, param_count);
-            for (params, param_tidxs) |*v, *t| {
-                const info = try readValTypeWithTidx(reader, count);
-                v.* = info.vt;
-                t.* = info.tidx;
+        if (tag == 0x4E) {
+            // rec group: count of sub-entries, then sub-entries
+            const rec_count = try reader.readU32();
+            var ri: u32 = 0;
+            while (ri < rec_count) : (ri += 1) {
+                const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
+                func_types_list.append(allocator, ft) catch return error.OutOfMemory;
             }
+        } else {
+            // Single type entry (0x60 func, 0x50 sub, 0x4F sub final)
+            reader.pos -= 1; // unread the tag
+            const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
+            func_types_list.append(allocator, ft) catch return error.OutOfMemory;
         }
-
-        const result_count = try reader.readU32();
-        var results: []types.ValType = &.{};
-        var result_tidxs: []u32 = &.{};
-        if (result_count > 0) {
-            results = try allocator.alloc(types.ValType, result_count);
-            result_tidxs = try allocator.alloc(u32, result_count);
-            for (results, result_tidxs) |*v, *t| {
-                const info = try readValTypeWithTidx(reader, count);
-                v.* = info.vt;
-                t.* = info.tidx;
-            }
-        }
-
-        ft.* = .{ .params = params, .results = results, .param_tidxs = param_tidxs, .result_tidxs = result_tidxs };
     }
-    return func_types;
+    return func_types_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
+    const tag = try reader.readByte();
+    if (tag == 0x50 or tag == 0x4F) {
+        // sub type: 0x50 <num_supers> <super_idx*> <comptype>
+        // sub final type: 0x4F <num_supers> <super_idx*> <comptype>
+        const num_supers = try reader.readU32();
+        var si: u32 = 0;
+        while (si < num_supers) : (si += 1) {
+            _ = try reader.readU32(); // skip supertype index
+        }
+        const comp_tag = try reader.readByte();
+        if (comp_tag == 0x60) {
+            return parseFuncType(reader, allocator, max_types);
+        }
+        // struct (0x5F) or array (0x5E) — skip fields
+        if (comp_tag == 0x5F) {
+            const field_count = try reader.readU32();
+            var fi: u32 = 0;
+            while (fi < field_count) : (fi += 1) {
+                _ = try readValTypeWithTidx(reader, max_types);
+                _ = try reader.readByte(); // mutability
+            }
+        } else if (comp_tag == 0x5E) {
+            _ = try readValTypeWithTidx(reader, max_types);
+            _ = try reader.readByte(); // mutability
+        }
+        return .{ .params = &.{}, .results = &.{} };
+    }
+    if (tag != 0x60) return error.InvalidFuncType;
+    return parseFuncType(reader, allocator, max_types);
+}
+
+fn parseFuncType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
+    const param_count = try reader.readU32();
+    var params: []types.ValType = &.{};
+    var param_tidxs: []u32 = &.{};
+    if (param_count > 0) {
+        params = try allocator.alloc(types.ValType, param_count);
+        param_tidxs = try allocator.alloc(u32, param_count);
+        for (params, param_tidxs) |*v, *t| {
+            const info = try readValTypeWithTidx(reader, max_types);
+            v.* = info.vt;
+            t.* = info.tidx;
+        }
+    }
+
+    const result_count = try reader.readU32();
+    var results: []types.ValType = &.{};
+    var result_tidxs: []u32 = &.{};
+    if (result_count > 0) {
+        results = try allocator.alloc(types.ValType, result_count);
+        result_tidxs = try allocator.alloc(u32, result_count);
+        for (results, result_tidxs) |*v, *t| {
+            const info = try readValTypeWithTidx(reader, max_types);
+            v.* = info.vt;
+            t.* = info.tidx;
+        }
+    }
+
+    return .{ .params = params, .results = results, .param_tidxs = param_tidxs, .result_tidxs = result_tidxs };
 }
 
 fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32, tag_count: *u32) LoadError![]const types.ImportDesc {
@@ -876,6 +946,10 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
         if (table.limits.max) |max| {
             if (table.limits.min > max) return error.InvalidLimits;
         }
+        // Non-nullable element types require a table initializer
+        if (table.elem_type == .nonfuncref or table.elem_type == .nonexternref) {
+            return error.TypeMismatch;
+        }
     }
 
     // Validate import types and limits
@@ -1034,10 +1108,8 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                     const local_idx = elem.table_idx - module.import_table_count;
                     break :blk if (local_idx < module.tables.len) module.tables[local_idx].elem_tidx else NO_TIDX;
                 };
-                // If table has concrete type, elem segment must have same concrete type
-                if (table_tidx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
-                // If elem has concrete type, table must also have concrete type (or be abstract supertype)
-                if (elem.type_idx != NO_TIDX and table_tidx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
+                // Both concrete: must match
+                if (table_tidx != NO_TIDX and elem.type_idx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
             }
             // Validate offset expression type (must be i32)
             if (elem.offset) |offset| {
@@ -1600,7 +1672,9 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
     if (pos.* >= code.len) return .{ .results = &.{} };
     const bt = code[pos.*];
     if (bt == 0x40) { pos.* += 1; return .{ .results = &.{} }; }
-    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
+    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F or
+        bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or bt == 0x6A or bt == 0x65 or bt == 0x71 or
+        bt == 0x69 or bt == 0x68 or bt == 0x74) {
         pos.* += 1;
         return switch (bt) {
             0x7F => .{ .results = &[_]VT{.i32} },
@@ -1609,6 +1683,9 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
             0x7C => .{ .results = &[_]VT{.f64} },
             0x70 => .{ .results = &[_]VT{.funcref} },
             0x6F => .{ .results = &[_]VT{.externref} },
+            // GC abstract ref types
+            0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65, 0x71 => .{ .results = &[_]VT{.funcref} },
+            0x69, 0x68, 0x74 => .{ .results = &[_]VT{.externref} },
             else => .{ .results = &.{} },
         };
     }
@@ -1620,6 +1697,13 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
         const ht = code[pos.*];
         if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} }; }
         if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} }; }
+        // GC abstract heap types
+        if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or ht == 0x65 or ht == 0x71) {
+            pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} };
+        }
+        if (ht == 0x69 or ht == 0x68 or ht == 0x74) {
+            pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} };
+        }
         // Concrete type index (LEB128) — validate and treat as funcref/nonfuncref result
         const tir = leb128_mod.readUnsigned(u32, code[pos.*..]) catch return error.TypeMismatch;
         pos.* += tir.bytes_read;
