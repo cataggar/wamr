@@ -85,6 +85,11 @@ fn parseValue(arg: Arg) ?types.Value {
         if (std.mem.eql(u8, val_str, "null")) return .{ .externref = null };
         const idx = std.fmt.parseUnsigned(u32, val_str, 10) catch return null;
         return .{ .externref = idx };
+    } else if (std.mem.eql(u8, arg.type, "v128")) {
+        // v128 is encoded as "lane_type:v1 v2 v3 ..." by wast2json
+        // or as a single decimal/hex u128 value
+        const bits = std.fmt.parseUnsigned(u128, val_str, 10) catch return null;
+        return .{ .v128 = bits };
     }
     return null;
 }
@@ -120,7 +125,7 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
         .externref => |v| refNullEqual(v == null, b),
         .nonfuncref => |v| refNullEqual(v == null, b),
         .nonexternref => |v| refNullEqual(v == null, b),
-        else => false,
+        .v128 => |v| b == .v128 and b.v128 == v,
     };
 }
 

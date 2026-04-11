@@ -61,6 +61,7 @@ inline fn wasmNearestF64(x: f64) f64 {
 }
 
 const Opcode = @import("opcode.zig").Opcode;
+const simd = @import("simd.zig");
 
 pub const TrapError = error{
     Unreachable,
@@ -217,7 +218,7 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .externref => .{ .externref = null },
                     .nonfuncref => .{ .nonfuncref = null },
                     .nonexternref => .{ .nonexternref = null },
-                    else => .{ .i32 = 0 },
+                    .v128 => .{ .v128 = 0 },
                 });
             }
             return;
@@ -256,7 +257,7 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .externref => .{ .externref = null },
                     .nonfuncref => .{ .nonfuncref = null },
                     .nonexternref => .{ .nonexternref = null },
-                    else => .{ .i32 = 0 },
+                    .v128 => .{ .v128 = 0 },
                 });
             }
         }
@@ -419,6 +420,28 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                     else => {},
                 }
             },
+            .simd_prefix => {
+                const sub_op = readU32Static(code, &pos);
+                switch (sub_op) {
+                    0x00...0x0B => { // v128.load/store: memarg
+                        pos = skipLeb128(code, pos); // align
+                        pos = skipLeb128(code, pos); // offset
+                    },
+                    0x0C => pos += 16, // v128.const: 16 bytes
+                    0x0D => pos += 16, // i8x16.shuffle: 16 lane bytes
+                    0x15...0x22 => pos += 1, // lane extract/replace: 1 byte
+                    0x54...0x5B => { // load/store lane: memarg + lane byte
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                        pos += 1;
+                    },
+                    0x5C, 0x5D => { // load_zero: memarg
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
+                    else => {}, // no immediates
+                }
+            },
             else => {},
         }
     }
@@ -494,6 +517,28 @@ fn findElse(code: []const u8, start: usize) ?usize {
                     0...7 => {},
                     9, 11, 13, 15, 16, 17 => pos = skipLeb128(code, pos),
                     8, 10, 12, 14 => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
+                    else => {},
+                }
+            },
+            .simd_prefix => {
+                const sub_op = readU32Static(code, &pos);
+                switch (sub_op) {
+                    0x00...0x0B => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                    },
+                    0x0C => pos += 16,
+                    0x0D => pos += 16,
+                    0x15...0x22 => pos += 1,
+                    0x54...0x5B => {
+                        pos = skipLeb128(code, pos);
+                        pos = skipLeb128(code, pos);
+                        pos += 1;
+                    },
+                    0x5C, 0x5D => {
                         pos = skipLeb128(code, pos);
                         pos = skipLeb128(code, pos);
                     },
@@ -2039,6 +2084,20 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     },
                     else => return error.UnknownOpcode,
                 }
+            },
+
+            .simd_prefix => {
+                const save_ip = ip;
+                simd.executeSIMD(env, code, &ip) catch |err| switch (err) {
+                    error.UnknownOpcode => {
+                        ip = save_ip;
+                        return error.UnknownOpcode;
+                    },
+                    error.OutOfBoundsMemoryAccess => return error.OutOfBoundsMemoryAccess,
+                    error.Unreachable => return error.Unreachable,
+                    error.StackOverflow => return error.StackOverflow,
+                    error.StackUnderflow => return error.StackUnderflow,
+                };
             },
 
             .atomic_prefix => {
