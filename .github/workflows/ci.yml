@@ -30,20 +30,36 @@ jobs:
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
 
-      - name: Spec tests
+      - name: Spec tests (JSON — 20,901 conformance tests)
         run: |
-          if [ -d third_party/testsuite ]; then
-            result=$(./zig-out/bin/spec-test-runner third_party/testsuite 2>&1 | tail -6)
+          if [ -d tests/spec-json ]; then
+            result=$(./zig-out/bin/spec-test-runner tests/spec-json 2>&1 | tail -6)
             echo "$result"
             passed=$(echo "$result" | grep -oP 'Passed:\s+\K[0-9]+')
             failed=$(echo "$result" | grep -oP 'Failed:\s+\K[0-9]+')
             echo "Results: $passed passed, $failed failed"
             if [ "$failed" -gt 0 ]; then
-              echo "::warning::$failed spec test failures"
+              echo "::error::$failed spec test failures"
+              exit 1
             fi
-          elif [ -d tests/spec-json ]; then
-            result=$(./zig-out/bin/spec-test-runner tests/spec-json 2>&1 | tail -6)
-            echo "$result"
           else
-            echo "::notice::No spec tests found"
+            echo "::notice::No JSON spec tests found"
+          fi
+
+      - name: Spec tests (.wast — extended testsuite)
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -d third_party/testsuite ]; then
+            pass=0; fail=0; crash=0; total=0
+            for f in third_party/testsuite/*.wast; do
+              name=$(basename "$f")
+              out=$(timeout 60 ./zig-out/bin/spec-test-runner "$f" 2>&1) || { crash=$((crash+1)); continue; }
+              p=$(echo "$out" | grep -oP 'pass=\K[0-9]+' | tail -1)
+              fl=$(echo "$out" | grep -oP 'fail=\K[0-9]+' | tail -1)
+              pass=$((pass + ${p:-0}))
+              fail=$((fail + ${fl:-0}))
+              total=$((total + 1))
+            done
+            echo "Wast results: $pass passed, $fail failed, $crash crashed out of $total files"
           fi
