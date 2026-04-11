@@ -388,8 +388,85 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
                 while (i < text.len and text[i] != ')') : (i += 1) {}
             }
+        } else if (std.mem.startsWith(u8, remaining, "(v128.const")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            // Parse v128.const: (v128.const <shape> <lane0> <lane1> ...)
+            // Need to find the closing paren and parse all lanes
+            const close = std.mem.indexOfPos(u8, text, i, ")") orelse text.len;
+            const inner = text[i + 1 .. close]; // "v128.const <shape> <lanes>"
+            writeV128Json(w, inner) catch {
+                try w.writeAll("{\"type\":\"v128\",\"value\":\"0\"}");
+            };
+            i = close;
         }
     }
+}
+
+/// Write a v128 const value as JSON.
+/// Input format: "v128.const <shape> <lane0> <lane1> ..."
+/// Output: {"type":"v128","value":"<decimal_u128>"}
+fn writeV128Json(w: anytype, inner: []const u8) !void {
+    // Skip "v128.const"
+    var pos: usize = 0;
+    while (pos < inner.len and inner[pos] != ' ' and inner[pos] != '\t') : (pos += 1) {}
+    while (pos < inner.len and (inner[pos] == ' ' or inner[pos] == '\t')) : (pos += 1) {}
+
+    // Read shape
+    const shape_start = pos;
+    while (pos < inner.len and inner[pos] != ' ' and inner[pos] != '\t') : (pos += 1) {}
+    const shape = inner[shape_start..pos];
+    while (pos < inner.len and (inner[pos] == ' ' or inner[pos] == '\t')) : (pos += 1) {}
+
+    // Collect lane value strings
+    var lane_strs: [16][]const u8 = undefined;
+    var lane_count: usize = 0;
+    while (pos < inner.len and lane_count < 16) {
+        while (pos < inner.len and (inner[pos] == ' ' or inner[pos] == '\t')) : (pos += 1) {}
+        if (pos >= inner.len) break;
+        const start = pos;
+        while (pos < inner.len and inner[pos] != ' ' and inner[pos] != '\t' and inner[pos] != ')') : (pos += 1) {}
+        if (pos > start) {
+            lane_strs[lane_count] = inner[start..pos];
+            lane_count += 1;
+        }
+    }
+
+    var bytes: [16]u8 = .{0} ** 16;
+    if (std.mem.eql(u8, shape, "i8x16")) {
+        for (0..@min(lane_count, 16)) |i| {
+            const val = parseWatI32(lane_strs[i]) orelse 0;
+            bytes[i] = @truncate(val);
+        }
+    } else if (std.mem.eql(u8, shape, "i16x8")) {
+        for (0..@min(lane_count, 8)) |i| {
+            const val = parseWatI32(lane_strs[i]) orelse 0;
+            std.mem.writeInt(u16, bytes[i * 2 ..][0..2], @truncate(val), .little);
+        }
+    } else if (std.mem.eql(u8, shape, "i32x4")) {
+        for (0..@min(lane_count, 4)) |i| {
+            const val = parseWatI32(lane_strs[i]) orelse 0;
+            std.mem.writeInt(u32, bytes[i * 4 ..][0..4], val, .little);
+        }
+    } else if (std.mem.eql(u8, shape, "i64x2")) {
+        for (0..@min(lane_count, 2)) |i| {
+            const val = parseWatI64(lane_strs[i]) orelse 0;
+            std.mem.writeInt(u64, bytes[i * 8 ..][0..8], val, .little);
+        }
+    } else if (std.mem.eql(u8, shape, "f32x4")) {
+        for (0..@min(lane_count, 4)) |i| {
+            const val = parseWatF32(lane_strs[i]) orelse 0;
+            std.mem.writeInt(u32, bytes[i * 4 ..][0..4], val, .little);
+        }
+    } else if (std.mem.eql(u8, shape, "f64x2")) {
+        for (0..@min(lane_count, 2)) |i| {
+            const val = parseWatF64(lane_strs[i]) orelse 0;
+            std.mem.writeInt(u64, bytes[i * 8 ..][0..8], val, .little);
+        }
+    }
+
+    const result = std.mem.readInt(u128, &bytes, .little);
+    try w.print("{{\"type\":\"v128\",\"value\":\"{d}\"}}", .{result});
 }
 
 /// Write a JSON const value, converting WAT numeric literals to decimal.
