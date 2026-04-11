@@ -124,19 +124,45 @@ pub const ExecEnv = struct {
     /// Pop typed values
     pub fn popI32(self: *ExecEnv) !i32 {
         const v = try self.pop();
-        return v.i32;
+        return switch (v) {
+            .i32 => |i| i,
+            .f32 => |f| @bitCast(f),
+            .funcref, .nonfuncref => 0, // null ref as 0
+            .externref, .nonexternref => 0,
+            .i64 => |i| @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(i)))))),
+            .f64 => |f| @as(i32, @bitCast(@as(u32, @truncate(@as(u64, @bitCast(f)))))),
+            else => 0,
+        };
     }
     pub fn popI64(self: *ExecEnv) !i64 {
         const v = try self.pop();
-        return v.i64;
+        return switch (v) {
+            .i64 => |i| i,
+            .f64 => |f| @bitCast(f),
+            .i32 => |i| @as(i64, i),
+            .f32 => |f| @as(i64, @as(i32, @bitCast(f))),
+            else => 0,
+        };
     }
     pub fn popF32(self: *ExecEnv) !f32 {
         const v = try self.pop();
-        return v.f32;
+        return switch (v) {
+            .f32 => |f| f,
+            .i32 => |i| @bitCast(i),
+            .i64 => |i| @bitCast(@as(u32, @truncate(@as(u64, @bitCast(i))))),
+            .f64 => |f| @floatCast(f),
+            else => 0.0,
+        };
     }
     pub fn popF64(self: *ExecEnv) !f64 {
         const v = try self.pop();
-        return v.f64;
+        return switch (v) {
+            .f64 => |f| f,
+            .i64 => |i| @bitCast(i),
+            .i32 => |i| @bitCast(@as(i64, i)),
+            .f32 => |f| @floatCast(f),
+            else => 0.0,
+        };
     }
 
     // -- Call frame operations --
