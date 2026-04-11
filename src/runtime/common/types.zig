@@ -394,8 +394,11 @@ pub const MemoryInstance = struct {
         }
         if (new_pages > 65536) return error.MemoryGrowFailed;
         const new_size = @as(usize, new_pages) * page_size;
-        if (self.data.len < new_size) {
+        const old_size = self.data.len;
+        if (old_size < new_size) {
             self.data = try allocator.realloc(self.data, new_size);
+            // Zero-initialize the new pages (wasm spec requirement)
+            @memset(self.data[old_size..new_size], 0);
         }
         self.current_pages = new_pages;
         return old_pages;
