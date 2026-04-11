@@ -1187,6 +1187,10 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
             0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
             0x28...0x3E => { // memory load/store
                 const r1 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r1.bytes_read;
+                // Multi-memory: bit 6 of alignment signals a memory index follows
+                if (r1.value & 0x40 != 0) {
+                    const r_mi = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r_mi.bytes_read;
+                }
                 const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r2.bytes_read;
             },
             0x3F, 0x40 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
@@ -1631,8 +1635,10 @@ fn readI64Leb(code: []const u8, pos: *usize) i64 {
 }
 
 fn skipMemImm(code: []const u8, pos: *usize) void {
-    _ = readU32Leb(code, pos);
-    _ = readU32Leb(code, pos);
+    const align_flags = readU32Leb(code, pos);
+    // Multi-memory: bit 6 of alignment signals a memory index follows
+    if (align_flags & 0x40 != 0) _ = readU32Leb(code, pos);
+    _ = readU32Leb(code, pos); // offset
 }
 
 fn pushType(stack: []VT, sp: *u32, t: VT, tidx: []u32) void {
