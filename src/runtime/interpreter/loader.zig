@@ -1104,10 +1104,8 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                     const local_idx = elem.table_idx - module.import_table_count;
                     break :blk if (local_idx < module.tables.len) module.tables[local_idx].elem_tidx else NO_TIDX;
                 };
-                // If table has concrete type, elem segment must have same concrete type
-                if (table_tidx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
-                // If elem has concrete type, table must also have concrete type (or be abstract supertype)
-                if (elem.type_idx != NO_TIDX and table_tidx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
+                // Both concrete: must match
+                if (table_tidx != NO_TIDX and elem.type_idx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
             }
             // Validate offset expression type (must be i32)
             if (elem.offset) |offset| {

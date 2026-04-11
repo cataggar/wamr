@@ -70,7 +70,7 @@ fn runInner(allocator: std.mem.Allocator, source: []const u8, name: []const u8) 
     const result = try spec_json_runner.runSpecTestFile(json_path, allocator);
 
     // Cleanup temp dir
-    // std.fs.cwd().deleteTree(dir_name) catch {};
+    std.fs.cwd().deleteTree(dir_name) catch {};
 
     return .{
         .passed = result.passed,
