@@ -380,14 +380,41 @@ fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
     };
 }
 
-fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
+const LimitsResult = struct {
+    limits: types.Limits,
+    is_64: bool,
+};
+
+fn readLimitsEx(reader: *BinaryReader) LoadError!LimitsResult {
     const flags = try reader.readByte();
-    const min = try reader.readU32();
-    return switch (flags) {
-        0x00 => .{ .min = min },
-        0x01 => .{ .min = min, .max = try reader.readU32() },
-        else => error.InvalidLimits,
-    };
+    const has_max = (flags & 0x01) != 0;
+    // bit 1 = shared (0x02) — accepted but not stored in Limits
+    const is_64 = (flags & 0x04) != 0;
+    // Reject unknown flag bits
+    if (flags & ~@as(u8, 0x07) != 0) return error.InvalidLimits;
+
+    if (is_64) {
+        const min64 = try reader.readU64();
+        if (min64 > std.math.maxInt(u32)) return error.InvalidLimits;
+        const min: u32 = @intCast(min64);
+        if (has_max) {
+            const max64 = try reader.readU64();
+            if (max64 > std.math.maxInt(u32)) return error.InvalidLimits;
+            return .{ .limits = .{ .min = min, .max = @intCast(max64) }, .is_64 = true };
+        }
+        return .{ .limits = .{ .min = min }, .is_64 = true };
+    } else {
+        const min = try reader.readU32();
+        if (has_max) {
+            return .{ .limits = .{ .min = min, .max = try reader.readU32() }, .is_64 = false };
+        }
+        return .{ .limits = .{ .min = min }, .is_64 = false };
+    }
+}
+
+fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
+    const result = try readLimitsEx(reader);
+    return result.limits;
 }
 
 fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types.TableType {
@@ -397,9 +424,9 @@ fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types
     if (first_byte == 0x40) {
         _ = try reader.readByte(); // reserved byte (must be 0)
         const info = try readValTypeWithTidx(reader, type_count);
-        const limits = try readLimits(reader);
+        const lr = try readLimitsEx(reader);
         const init_expr = try parseInitExprChecked(reader, type_count);
-        return .{ .elem_type = info.vt, .limits = limits, .elem_tidx = info.tidx, .init_expr = init_expr };
+        return .{ .elem_type = info.vt, .limits = lr.limits, .elem_tidx = info.tidx, .init_expr = init_expr, .is_table64 = lr.is_64 };
     }
 
     // Standard table: reftype limits
@@ -438,8 +465,8 @@ fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types
             return error.InvalidValType;
         },
     };
-    const limits = try readLimits(reader);
-    return .{ .elem_type = elem_type, .limits = limits, .elem_tidx = elem_tidx };
+    const lr = try readLimitsEx(reader);
+    return .{ .elem_type = elem_type, .limits = lr.limits, .elem_tidx = elem_tidx, .is_table64 = lr.is_64 };
 }
 
 /// Skip an init expression (scan to end opcode 0x0B).
@@ -484,8 +511,8 @@ fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError
 }
 
 fn readMemoryType(reader: *BinaryReader) LoadError!types.MemoryType {
-    const limits = try readLimits(reader);
-    return .{ .limits = limits };
+    const result = try readLimitsEx(reader);
+    return .{ .limits = result.limits, .is_memory64 = result.is_64 };
 }
 
 fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.GlobalType {

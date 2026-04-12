@@ -11,6 +11,7 @@ pub const ValType = enum(u8) {
     v128 = 0x7B,
     funcref = 0x70,
     externref = 0x6F,
+    exnref = 0x69,
     nonfuncref = 0x14,
     nonexternref = 0x15,
 
@@ -27,7 +28,7 @@ pub const ValType = enum(u8) {
 
     pub fn isRef(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .nonfuncref, .nonexternref => true,
+            .funcref, .externref, .exnref, .nonfuncref, .nonexternref => true,
             else => false,
         };
     }
@@ -60,7 +61,7 @@ pub const ValType = enum(u8) {
             .i32, .f32 => 4,
             .i64, .f64 => 8,
             .v128 => 16,
-            .funcref, .externref, .nonfuncref, .nonexternref => @sizeOf(usize),
+            .funcref, .externref, .exnref, .nonfuncref, .nonexternref => @sizeOf(usize),
         };
     }
 };
@@ -74,6 +75,8 @@ pub const Value = union(ValType) {
     v128: u128,
     funcref: ?u32,
     externref: ?u32,
+    /// Exception reference — index into ExecEnv.exception_refs pool.
+    exnref: ?u32,
     nonfuncref: ?u32,
     nonexternref: ?u32,
 };
@@ -109,6 +112,8 @@ pub const TableType = struct {
     elem_tidx: u32 = 0xFFFFFFFF,
     /// Init expression for table elements (from 0x40 prefix encoding).
     init_expr: ?InitExpr = null,
+    /// Whether this table uses 64-bit addressing (table64 proposal).
+    is_table64: bool = false,
 };
 
 /// Memory type (§2.3.7)

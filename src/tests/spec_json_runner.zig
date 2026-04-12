@@ -123,6 +123,7 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
         },
         .funcref => |v| refNullEqual(v == null, b),
         .externref => |v| refNullEqual(v == null, b),
+        .exnref => |v| refNullEqual(v == null, b),
         .nonfuncref => |v| refNullEqual(v == null, b),
         .nonexternref => |v| refNullEqual(v == null, b),
         .v128 => |v| b == .v128 and b.v128 == v,
@@ -223,6 +224,10 @@ fn buildImportContext(
                     if (!std.mem.eql(u8, imp.field_name, "memory"))
                         return error.ImportResolutionFailed;
                     const imp_limits = if (imp.memory_type) |mt| mt.limits else types.Limits{ .min = 1 };
+                    // Spectest memory is i32; reject i64 imports
+                    if (imp.memory_type) |mt| {
+                        if (mt.is_memory64) return error.ImportResolutionFailed;
+                    }
                     if (!limitsMatch(.{ .min = 1, .max = @as(?u32, 2) }, imp_limits))
                         return error.ImportResolutionFailed;
                     memories.append(allocator, makeSpectestMemory(allocator) orelse
@@ -234,6 +239,9 @@ fn buildImportContext(
                     if (exp.index >= ri.memories.len) return error.ImportResolutionFailed;
                     const m = ri.memories[exp.index];
                     if (imp.memory_type) |mt| {
+                        // Address types must match (i32 vs i64)
+                        if (m.memory_type.is_memory64 != mt.is_memory64)
+                            return error.ImportResolutionFailed;
                         // Use current pages (may have been grown) for limits matching
                         const actual_limits = types.Limits{
                             .min = m.current_pages,
@@ -252,6 +260,8 @@ fn buildImportContext(
                     if (!std.mem.eql(u8, imp.field_name, "table"))
                         return error.ImportResolutionFailed;
                     const tt = imp.table_type orelse types.TableType{ .elem_type = .funcref, .limits = .{ .min = 10 } };
+                    // Spectest table is i32; reject i64 imports
+                    if (tt.is_table64) return error.ImportResolutionFailed;
                     if (!tt.elem_type.isFuncRef()) return error.ImportResolutionFailed;
                     if (!limitsMatch(.{ .min = 10, .max = @as(?u32, 20) }, tt.limits))
                         return error.ImportResolutionFailed;
@@ -265,6 +275,9 @@ fn buildImportContext(
                     const t = ri.tables[exp.index];
                     // Validate elem type and limits compatibility
                     if (imp.table_type) |tt| {
+                        // Address types must match (i32 vs i64)
+                        if (t.table_type.is_table64 != tt.is_table64)
+                            return error.ImportResolutionFailed;
                         // Table element types must match exactly
                         const exp_et = t.table_type.elem_type;
                         const imp_et = tt.elem_type;
@@ -378,6 +391,7 @@ fn defaultValue(val_type: types.ValType) types.Value {
         .f64 => .{ .f64 = 0.0 },
         .funcref, .nonfuncref => .{ .funcref = null },
         .externref, .nonexternref => .{ .externref = null },
+        .exnref => .{ .exnref = null },
         .v128 => .{ .v128 = 0 },
     };
 }
@@ -1143,7 +1157,12 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 result.skipped += 1;
                 continue;
             }
-            var inst = current_instance orelse {
+            // Resolve instance: use action.module if specified, else current
+            const resolved_action_inst = if (action.module) |mod_name|
+                named_instances.get(mod_name) orelse current_instance
+            else
+                current_instance;
+            var inst = resolved_action_inst orelse {
                 result.skipped += 1;
                 continue;
             };

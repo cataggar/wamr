@@ -102,9 +102,9 @@ pub fn instantiateWithImports(
         }
     }
 
-    try applyDataSegments(module, inst.memories, inst.globals);
     try applyTableInitExprs(module, inst.tables, inst, inst.globals);
     try applyElemSegments(module, inst.tables, inst, inst.globals);
+    try applyDataSegments(module, inst.memories, inst.globals);
 
     // Set source_module for locally-created funcref globals
     for (module.globals, 0..) |global, i| {

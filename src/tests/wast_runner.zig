@@ -388,10 +388,13 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                 // Write as action command with proper invoke details
                 if (cmd == .invoke) {
                     if (findQuotedString(sexpr.text)) |field_name| {
-                        try w.print("{{\"type\":\"action\",\"line\":{d},\"action\":{{\"type\":\"invoke\",\"field\":\"{s}\",\"args\":[", .{ line_num, field_name });
-                        // Parse args (find all (type.const N) patterns)
-                        const invoke_end = std.mem.indexOf(u8, sexpr.text, "\"") orelse sexpr.text.len;
-                        _ = invoke_end;
+                        try w.print("{{\"type\":\"action\",\"line\":{d},\"action\":{{\"type\":\"invoke\"", .{line_num});
+                        // Include module name if present (e.g., invoke $M1 "store")
+                        if (findDollarName(sexpr.text)) |mod_name| {
+                            const name = if (mod_name.len > 0 and mod_name[0] == '$') mod_name[1..] else mod_name;
+                            try w.print(",\"module\":\"{s}\"", .{name});
+                        }
+                        try w.print(",\"field\":\"{s}\",\"args\":[", .{field_name});
                         writeConstValues(w, sexpr.text) catch {};
                         try w.writeAll("]}}");
                     } else {
