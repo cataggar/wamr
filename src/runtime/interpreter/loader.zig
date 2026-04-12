@@ -1940,12 +1940,44 @@ fn validateFunctionBody(
             // ref.is_null, ref.eq, ref.as_non_null have no immediate
             0xD1, 0xD3, 0xD4 => {},
 
-            // FD prefix (SIMD) — skip sub-opcode and potential immediates
+            // FD prefix (SIMD) — skip sub-opcode and immediates
             0xFD => {
                 const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += sr.bytes_read;
-                // SIMD ops may have additional immediates (e.g., lane indices);
-                // We skip validation of SIMD details here.
+                switch (sr.value) {
+                    // v128.load/store variants: memarg (align + offset)
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B => {
+                        const a1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a1.bytes_read;
+                        // multi-memory: bit 6 of align signals memory index follows
+                        if (a1.value & 0x40 != 0) { const m = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m.bytes_read; }
+                        const o1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += o1.bytes_read;
+                    },
+                    0x0C => i += 16, // v128.const: 16 bytes
+                    0x0D => i += 16, // i8x16.shuffle: 16 lane bytes
+                    // extract_lane / replace_lane: 1 byte lane index
+                    0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22 => i += 1,
+                    // load/store lane: memarg + 1 byte lane
+                    0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B => {
+                        const a2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a2.bytes_read;
+                        if (a2.value & 0x40 != 0) { const m2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m2.bytes_read; }
+                        const o2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += o2.bytes_read;
+                        i += 1; // lane byte
+                    },
+                    // load_zero: memarg
+                    0x5C, 0x5D => {
+                        const a3 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a3.bytes_read;
+                        if (a3.value & 0x40 != 0) { const m3 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m3.bytes_read; }
+                        const o3 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += o3.bytes_read;
+                    },
+                    // All other SIMD ops have no immediates
+                    else => {},
+                }
             },
             // FE prefix (threads/atomics) — skip sub-opcode + memarg
             0xFE => {
@@ -3537,10 +3569,53 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
-                    // All other SIMD: treat as v128 unary (conservative but allows validation)
-                    else => {
+                    // swizzle: [v128 v128] -> [v128]
+                    0x0E => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // Comparison ops [v128 v128] -> [v128]: eq, ne, lt, gt, le, ge (all shapes)
+                    0x23...0x40 => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128 unary: [v128] -> [v128] (not, neg, abs, etc.)
+                    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52 => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128.any_true: [v128] -> [i32]
+                    0x53 => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    // All remaining SIMD: categorize by opcode range
+                    else => {
+                        // Bitmask/all_true ops return i32: 0x62, 0x63, 0x82, 0x83, 0xA3, 0xA4, 0xC3, 0xC4
+                        if (sub == 0x62 or sub == 0x63 or sub == 0x82 or sub == 0x83 or
+                            sub == 0xA3 or sub == 0xA4 or sub == 0xC3 or sub == 0xC4)
+                        {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        }
+                        // Binary v128 ops (add, sub, mul, etc.): [v128 v128] -> [v128]
+                        else if ((sub >= 0x5E and sub <= 0x61) or // i8x16 arith
+                            (sub >= 0x64 and sub <= 0x81) or // i8x16 more + i16x8
+                            (sub >= 0x84 and sub <= 0xA2) or // i16x8 more + i32x4
+                            (sub >= 0xA5 and sub <= 0xC2) or // i32x4 more + i64x2
+                            (sub >= 0xC5 and sub <= 0xFF) or // i64x2 more + f32x4/f64x2
+                            sub >= 0x100) // extended ops
+                        {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                        } else {
+                            // Unary fallback
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                        }
                     },
                 }
             },
