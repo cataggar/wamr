@@ -116,7 +116,41 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                         };
                         try modules.put(allocator, filename, wasm_bytes);
                     } else {
-                        allocator.free(filename);
+                        // Quote module: decode quoted WAT text, parse, and compile
+                        const wat_text = wr.decodeQuoteStrings(allocator, sexpr.text) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        defer allocator.free(wat_text);
+                        // Wrap in (module ...) if not already
+                        const trimmed = std.mem.trimLeft(u8, wat_text, " \t\n\r");
+                        const parse_text = if (std.mem.startsWith(u8, trimmed, "(module"))
+                            wat_text
+                        else blk: {
+                            break :blk std.fmt.allocPrint(allocator, "(module {s})", .{wat_text}) catch {
+                                try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                                allocator.free(filename);
+                                module_idx += 1;
+                                continue;
+                            };
+                        };
+                        defer if (parse_text.ptr != wat_text.ptr) allocator.free(parse_text);
+                        var mod = wabt.text.Parser.parseModule(allocator, parse_text) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        defer mod.deinit();
+                        const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        try modules.put(allocator, filename, wasm_bytes);
                     }
                 } else {
                     var mod = wabt.text.Parser.parseModule(allocator, sexpr.text) catch {
