@@ -145,6 +145,33 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                     }
                     module_idx += 1;
                     continue;
+                } else if (hasDefinitionKw(sexpr.text)) {
+                    // Unnamed module definition — strip keyword and compile
+                    const stripped = wr.stripDefinitionKeyword(allocator, sexpr.text) orelse {
+                        try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
+                        continue;
+                    };
+                    defer allocator.free(stripped);
+                    const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    var mod = wabt.text.Parser.parseModule(allocator, stripped) catch {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                        allocator.free(filename);
+                        module_idx += 1;
+                        continue;
+                    };
+                    defer mod.deinit();
+                    const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                        allocator.free(filename);
+                        module_idx += 1;
+                        continue;
+                    };
+                    try modules.put(allocator, filename, wasm_bytes);
+                    const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    defer allocator.free(fn2);
+                    try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                    module_idx += 1;
+                    continue;
                 } else if (wr.isModuleInstance(sexpr.text)) {
                     // (module instance $inst $def) — compile a fresh copy from the definition
                     var inst_name: ?[]const u8 = null;
@@ -402,6 +429,17 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
     }
 
     try w.writeAll("]}");
+}
+
+fn hasDefinitionKw(text: []const u8) bool {
+    var i: usize = 1;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) : (i += 1) {}
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) : (i += 1) {}
+    if (i + 10 >= text.len) return false;
+    return std.mem.eql(u8, text[i .. i + 10], "definition");
 }
 
 // ── S-expression parsers for assert commands ─────────────────────────────
