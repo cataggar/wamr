@@ -318,7 +318,8 @@ fn buildImportContext(
                         if (tidx < module.types.len) {
                             const export_tidx = ri.module.getRawFuncTypeIdx(exp.index);
                             if (export_tidx) |et| {
-                                if (!crossModuleTypesMatch(module, tidx, ri.module, et))
+                                // Export type must be subtype of import declaration
+                                if (!crossModuleTypeIsSubtype(ri.module, et, module, tidx))
                                     return error.ImportResolutionFailed;
                             } else {
                                 if (ri.module.getFuncType(exp.index)) |export_ft| {
@@ -456,32 +457,102 @@ fn crossModuleTypesMatch(
 ) bool {
     if (tidx_a >= mod_a.types.len or tidx_b >= mod_b.types.len) return false;
 
-    // Get rec group info (fall back to implicit single-type groups)
+    const ft_a = mod_a.types[tidx_a];
+    const ft_b = mod_b.types[tidx_b];
+
+    // Kind must match
+    if (ft_a.kind != ft_b.kind) return false;
+
+    // Structural signature must match (params/results ValTypes)
+    if (!funcTypesMatch(ft_a, ft_b)) return false;
+
+    // Finality must match
+    if (ft_a.is_final != ft_b.is_final) return false;
+
+    // Get rec group info
     const rg_a = if (tidx_a < mod_a.rec_groups.len) mod_a.rec_groups[tidx_a] else types.RecGroupInfo{ .group_start = tidx_a, .group_size = 1 };
     const rg_b = if (tidx_b < mod_b.rec_groups.len) mod_b.rec_groups[tidx_b] else types.RecGroupInfo{ .group_start = tidx_b, .group_size = 1 };
 
-    // For single-type rec groups, use simpler structural matching
-    // (avoids rejecting valid subtypes across modules)
-    if (rg_a.group_size == 1 and rg_b.group_size == 1) {
-        return funcTypesMatch(mod_a.types[tidx_a], mod_b.types[tidx_b]);
-    }
-
-    // Multi-type rec groups: must have same size
+    // Must be at same relative position in same-size rec groups
     if (rg_a.group_size != rg_b.group_size) return false;
+    if (tidx_a - rg_a.group_start != tidx_b - rg_b.group_start) return false;
 
-    // Verify that the rec group type kinds match pairwise (func/struct/array).
-    // This catches types in differently-structured groups (e.g.,
-    // [(func),(struct)] vs [(struct),(func)]) without rejecting valid
-    // subtype imports that share the same kind sequence but differ in
-    // params/results/field details or occupy different positions.
-    var i: u32 = 0;
-    while (i < rg_a.group_size) : (i += 1) {
-        const ai = rg_a.group_start + i;
-        const bi = rg_b.group_start + i;
-        if (ai >= mod_a.types.len or bi >= mod_b.types.len) return false;
-        if (mod_a.types[ai].kind != mod_b.types[bi].kind) return false;
+    // Check supertype equivalence (cross-module recursive check)
+    if (ft_a.supertype_idx != 0xFFFFFFFF or ft_b.supertype_idx != 0xFFFFFFFF) {
+        if (ft_a.supertype_idx == 0xFFFFFFFF or ft_b.supertype_idx == 0xFFFFFFFF) return false;
+        // Supertypes that are internal to the rec group: compare by relative position
+        const a_internal = ft_a.supertype_idx >= rg_a.group_start and ft_a.supertype_idx < rg_a.group_start + rg_a.group_size;
+        const b_internal = ft_b.supertype_idx >= rg_b.group_start and ft_b.supertype_idx < rg_b.group_start + rg_b.group_size;
+        if (a_internal and b_internal) {
+            if (ft_a.supertype_idx - rg_a.group_start != ft_b.supertype_idx - rg_b.group_start) return false;
+        } else if (!a_internal and !b_internal) {
+            if (!crossModuleTypesMatch(mod_a, ft_a.supertype_idx, mod_b, ft_b.supertype_idx)) return false;
+        } else {
+            return false; // one internal, one external
+        }
     }
-    return funcTypesMatch(mod_a.types[tidx_a], mod_b.types[tidx_b]);
+
+    // For multi-type rec groups, verify all entries structurally match
+    if (rg_a.group_size > 1) {
+        var i: u32 = 0;
+        while (i < rg_a.group_size) : (i += 1) {
+            const ai = rg_a.group_start + i;
+            const bi = rg_b.group_start + i;
+            if (ai >= mod_a.types.len or bi >= mod_b.types.len) return false;
+            const ta = mod_a.types[ai];
+            const tb = mod_b.types[bi];
+            if (ta.kind != tb.kind) return false;
+            if (ta.is_final != tb.is_final) return false;
+            if (!funcTypesMatch(ta, tb)) return false;
+            // Check supertype match for each entry
+            if (ta.supertype_idx != 0xFFFFFFFF or tb.supertype_idx != 0xFFFFFFFF) {
+                if (ta.supertype_idx == 0xFFFFFFFF or tb.supertype_idx == 0xFFFFFFFF) return false;
+                const ai_int = ta.supertype_idx >= rg_a.group_start and ta.supertype_idx < rg_a.group_start + rg_a.group_size;
+                const bi_int = tb.supertype_idx >= rg_b.group_start and tb.supertype_idx < rg_b.group_start + rg_b.group_size;
+                if (ai_int and bi_int) {
+                    if (ta.supertype_idx - rg_a.group_start != tb.supertype_idx - rg_b.group_start) return false;
+                } else if (!ai_int and !bi_int) {
+                    if (!crossModuleTypesMatch(mod_a, ta.supertype_idx, mod_b, tb.supertype_idx)) return false;
+                } else return false;
+            }
+            // Check field type references
+            if (ta.field_tidxs.len != tb.field_tidxs.len) return false;
+            for (ta.field_tidxs, tb.field_tidxs) |fa, fb| {
+                const fa_int = fa >= rg_a.group_start and fa < rg_a.group_start + rg_a.group_size;
+                const fb_int = fb >= rg_b.group_start and fb < rg_b.group_start + rg_b.group_size;
+                if (fa_int and fb_int) {
+                    if (fa - rg_a.group_start != fb - rg_b.group_start) return false;
+                } else if (fa == 0xFFFFFFFF and fb == 0xFFFFFFFF) {
+                    continue;
+                } else if (!fa_int and !fb_int and fa != 0xFFFFFFFF and fb != 0xFFFFFFFF) {
+                    if (!crossModuleTypesMatch(mod_a, fa, mod_b, fb)) return false;
+                } else return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+/// Check if the exported type (mod_exp:tidx_exp) is a subtype of the imported
+/// type (mod_imp:tidx_imp). Used for import validation where the export's type
+/// must match or be a subtype of the import declaration.
+fn crossModuleTypeIsSubtype(
+    mod_exp: *const types.WasmModule,
+    tidx_exp: u32,
+    mod_imp: *const types.WasmModule,
+    tidx_imp: u32,
+) bool {
+    // Exact equivalence is always valid
+    if (crossModuleTypesMatch(mod_exp, tidx_exp, mod_imp, tidx_imp)) return true;
+
+    // Walk the export's supertype chain
+    if (tidx_exp >= mod_exp.types.len) return false;
+    const ft_exp = mod_exp.types[tidx_exp];
+    if (ft_exp.supertype_idx != 0xFFFFFFFF) {
+        return crossModuleTypeIsSubtype(mod_exp, ft_exp.supertype_idx, mod_imp, tidx_imp);
+    }
+    return false;
 }
 
 fn makeSpectestMemory(allocator: std.mem.Allocator) ?*types.MemoryInstance {
