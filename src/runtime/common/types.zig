@@ -171,6 +171,7 @@ pub const SectionId = enum(u8) {
     code = 10,
     data = 11,
     data_count = 12,
+    tag = 13,
 };
 
 /// Wasm binary magic number
