@@ -385,6 +385,37 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
             0x7C => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 +% stack[sp].i64 }; },
             0x7D => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 -% stack[sp].i64 }; },
             0x7E => { if (sp < 2) return error.InvalidInitExpr; sp -= 1; stack[sp - 1] = .{ .i64 = stack[sp - 1].i64 *% stack[sp].i64 }; },
+            // GC prefix opcodes
+            0xFB => {
+                const r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                ip += r.bytes_read;
+                switch (r.value) {
+                    0x1C => { // ref.i31: pop i32, push i31ref
+                        if (sp < 1) return error.InvalidInitExpr;
+                        const i32_val = stack[sp - 1].i32;
+                        stack[sp - 1] = .{ .funcref = @as(u32, @bitCast(i32_val)) & 0x7FFF_FFFF };
+                    },
+                    0x1A => { // any.convert_extern: pop externref, push anyref
+                        if (sp < 1) return error.InvalidInitExpr;
+                        const val: ?u32 = switch (stack[sp - 1]) {
+                            .externref, .nonexternref => |v| v,
+                            .funcref, .nonfuncref => |v| v,
+                            else => null,
+                        };
+                        stack[sp - 1] = .{ .funcref = val };
+                    },
+                    0x1B => { // extern.convert_any: pop anyref, push externref
+                        if (sp < 1) return error.InvalidInitExpr;
+                        const val: ?u32 = switch (stack[sp - 1]) {
+                            .funcref, .nonfuncref => |v| v,
+                            .externref, .nonexternref => |v| v,
+                            else => null,
+                        };
+                        stack[sp - 1] = .{ .externref = val };
+                    },
+                    else => return error.InvalidInitExpr,
+                }
+            },
             else => return error.InvalidInitExpr,
         }
     }

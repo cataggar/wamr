@@ -570,6 +570,15 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
         0x23 => .{ .global_get = try reader.readU32() },
         0xD0 => .{ .ref_null = try readHeapTypeAsValType(reader) },
         0xD2 => .{ .ref_func = try reader.readU32() },
+        0xFB => blk: {
+            // GC prefix: read sub-opcode
+            const sub = try reader.readU32();
+            switch (sub) {
+                0x1C => break :blk null, // ref.i31 — compound (needs i32 operand)
+                0x1A, 0x1B => break :blk null, // any.convert_extern, extern.convert_any — compound
+                else => break :blk null,
+            }
+        },
         else => null,
     };
     const end = try reader.readByte();
@@ -581,7 +590,6 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
     }
     // Compound expression: validate and scan forward to end
     // Only opcodes valid in constant expressions are accepted (spec §3.3.10)
-    if (simple == null) return error.InvalidInitExpr; // first opcode must be valid
     reader.pos = start_pos;
     var stack_depth: i32 = 0;
     while (reader.pos < reader.data.len) {
@@ -603,6 +611,16 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
             0x6A, 0x6B, 0x6C, // i32.add, i32.sub, i32.mul
             0x7C, 0x7D, 0x7E, // i64.add, i64.sub, i64.mul
             => { stack_depth -= 1; },
+            // GC prefix opcodes valid in constant expressions
+            0xFB => {
+                const sub = try reader.readU32();
+                switch (sub) {
+                    0x1C => {}, // ref.i31: pop i32, push i31ref (net 0)
+                    0x1A => {}, // any.convert_extern: pop externref, push anyref (net 0)
+                    0x1B => {}, // extern.convert_any: pop anyref, push externref (net 0)
+                    else => return error.InvalidInitExpr,
+                }
+            },
             // Any other opcode is invalid in a constant expression
             else => return error.InvalidInitExpr,
         }
