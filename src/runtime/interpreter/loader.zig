@@ -232,21 +232,39 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
     // canonical[i] = the lowest type index equivalent to i
     const canonical = allocator.alloc(u32, n) catch return;
     for (canonical, 0..) |*c, i| c.* = @intCast(i);
-    // Find equivalences: for each pair, if equivalent, map to the lower index
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        if (canonical[i] != i) continue; // already mapped
-        var j: u32 = i + 1;
-        while (j < n) : (j += 1) {
-            if (canonical[j] != j) continue;
-            if (typeIdxEquivalent(module.types, module.rec_groups, i, j)) {
-                canonical[j] = i;
+
+    // Iterate until convergence: rewrite tidxs using current canonical map,
+    // then find new equivalences. Repeat until no new equivalences found.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        // Rewrite type refs using current canonical mapping
+        for (module.types) |ft| {
+            for (@constCast(ft.param_tidxs)) |*t| {
+                if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
+            }
+            for (@constCast(ft.result_tidxs)) |*t| {
+                if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
+            }
+            for (@constCast(ft.field_tidxs)) |*t| {
+                if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
+            }
+        }
+        // Find new equivalences
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            if (canonical[i] != i) continue;
+            var j: u32 = i + 1;
+            while (j < n) : (j += 1) {
+                if (canonical[j] != j) continue;
+                if (typeIdxEquivalent(module.types, module.rec_groups, i, j)) {
+                    canonical[j] = i;
+                    changed = true;
+                }
             }
         }
     }
-    // Store canonical map for use by getFuncTypeIdx
-    module.canonical_type_map = canonical;
-    // Rewrite type indices embedded in func type signatures
+    // Final rewrite pass
     for (module.types) |ft| {
         for (@constCast(ft.param_tidxs)) |*t| {
             if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
@@ -258,6 +276,7 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
             if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
         }
     }
+    module.canonical_type_map = canonical;
 }
 
 /// A value type paired with its concrete type index.
