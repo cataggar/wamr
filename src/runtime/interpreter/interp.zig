@@ -617,6 +617,17 @@ fn funcTypesEqual(a: types.FuncType, b: types.FuncType) bool {
     if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
     for (a.params, b.params) |ap, bp| if (ap.toNullable() != bp.toNullable()) return false;
     for (a.results, b.results) |ar, br| if (ar.toNullable() != br.toNullable()) return false;
+    // Compare concrete type indices (canonical) for typed refs
+    for (0..a.params.len) |pi| {
+        const ta: u32 = if (pi < a.param_tidxs.len) a.param_tidxs[pi] else 0xFFFFFFFF;
+        const tb: u32 = if (pi < b.param_tidxs.len) b.param_tidxs[pi] else 0xFFFFFFFF;
+        if (ta != tb) return false;
+    }
+    for (0..a.results.len) |ri| {
+        const ta: u32 = if (ri < a.result_tidxs.len) a.result_tidxs[ri] else 0xFFFFFFFF;
+        const tb: u32 = if (ri < b.result_tidxs.len) b.result_tidxs[ri] else 0xFFFFFFFF;
+        if (ta != tb) return false;
+    }
     return true;
 }
 
@@ -849,12 +860,21 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const funcref = table.elements[elem_idx] orelse return error.UninitializedElement;
 
                 const module = env.module_inst.module;
-                if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
-                const expected_type = module.types[type_idx];
 
-                // Resolve function type from the funcref's source module
-                const actual_type = funcref.module_inst.module.getFuncType(funcref.func_idx) orelse return error.UnknownFunction;
-                if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
+                // Compare canonical type indices for iso-recursive equivalence
+                const expected_canonical = if (type_idx < module.canonical_type_map.len) module.canonical_type_map[type_idx] else type_idx;
+                const actual_tidx = funcref.module_inst.module.getFuncTypeIdx(funcref.func_idx) orelse return error.UnknownFunction;
+
+                if (funcref.module_inst == env.module_inst) {
+                    // Same module: compare canonical indices directly
+                    if (actual_tidx != expected_canonical) return error.IndirectCallTypeMismatch;
+                } else {
+                    // Cross-module: fall back to structural comparison
+                    if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
+                    const expected_type = module.types[type_idx];
+                    const actual_type = funcref.module_inst.module.getFuncType(funcref.func_idx) orelse return error.UnknownFunction;
+                    if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
+                }
 
                 const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
                 frame.ip = @intCast(ip);
@@ -887,10 +907,17 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const funcref = table.elements[elem_idx] orelse return error.UninitializedElement;
 
                 const module = env.module_inst.module;
-                if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
-                const expected_type = module.types[type_idx];
-                const actual_type = funcref.module_inst.module.getFuncType(funcref.func_idx) orelse return error.UnknownFunction;
-                if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
+                const expected_canonical = if (type_idx < module.canonical_type_map.len) module.canonical_type_map[type_idx] else type_idx;
+                const actual_tidx = funcref.module_inst.module.getFuncTypeIdx(funcref.func_idx) orelse return error.UnknownFunction;
+
+                if (funcref.module_inst == env.module_inst) {
+                    if (actual_tidx != expected_canonical) return error.IndirectCallTypeMismatch;
+                } else {
+                    if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
+                    const expected_type = module.types[type_idx];
+                    const actual_type = funcref.module_inst.module.getFuncType(funcref.func_idx) orelse return error.UnknownFunction;
+                    if (!funcTypesEqual(expected_type, actual_type)) return error.IndirectCallTypeMismatch;
+                }
 
                 if (funcref.module_inst != env.module_inst) {
                     env.module_inst = funcref.module_inst;
