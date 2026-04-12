@@ -540,9 +540,10 @@ fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadErr
             // rec group: count of sub-entries, then sub-entries
             const rec_count = try reader.readU32();
             const group_start: u32 = @intCast(func_types_list.items.len);
+            const max_type_in_group: u32 = @intCast(func_types_list.items.len + rec_count);
             var ri: u32 = 0;
             while (ri < rec_count) : (ri += 1) {
-                const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
+                const ft = try parseOneType(reader, allocator, @max(max_type_in_group, @as(u32, @intCast(func_types_list.items.len)) + count));
                 func_types_list.append(allocator, ft) catch return error.OutOfMemory;
                 rec_groups_list.append(allocator, .{ .group_start = group_start, .group_size = rec_count }) catch return error.OutOfMemory;
             }
