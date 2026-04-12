@@ -175,10 +175,11 @@ fn typeIdxEquivalent(module_types: []const types.FuncType, rec_groups: []const t
 }
 
 fn funcTypesStructurallyMatch(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, a: types.FuncType, b: types.FuncType, ga_start: u32, gb_start: u32) bool {
+    if (a.kind != b.kind) return false;
     if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
     for (a.params, b.params) |pa, pb| if (pa != pb) return false;
     for (a.results, b.results) |ra, rb| if (ra != rb) return false;
-    // Compare type index references
+    // Compare type index references in params/results
     for (0..a.params.len) |pi| {
         const ta = if (pi < a.param_tidxs.len) a.param_tidxs[pi] else NO_TIDX;
         const tb = if (pi < b.param_tidxs.len) b.param_tidxs[pi] else NO_TIDX;
@@ -189,19 +190,38 @@ fn funcTypesStructurallyMatch(module_types: []const types.FuncType, rec_groups: 
         const tb = if (ri < b.result_tidxs.len) b.result_tidxs[ri] else NO_TIDX;
         if (!tidxEquivalent(module_types, rec_groups, ta, tb, ga_start, gb_start)) return false;
     }
+    // Compare struct/array field type indices
+    if (a.field_tidxs.len != b.field_tidxs.len) return false;
+    for (a.field_tidxs, b.field_tidxs) |fa, fb| {
+        if (!tidxEquivalent(module_types, rec_groups, fa, fb, ga_start, gb_start)) return false;
+    }
     return true;
 }
 
-fn tidxEquivalent(_: []const types.FuncType, _: []const types.RecGroupInfo, ta: u32, tb: u32, ga_start: u32, gb_start: u32) bool {
-    if (ta == tb) return true;
+fn tidxEquivalent(_: []const types.FuncType, rec_groups: []const types.RecGroupInfo, ta: u32, tb: u32, ga_start: u32, gb_start: u32) bool {
+    if (ta == tb) {
+        // Same absolute index — but must check both are internal or both external
+        const ga_size = if (ga_start < rec_groups.len) rec_groups[ga_start].group_size else 1;
+        const gb_size = if (gb_start < rec_groups.len) rec_groups[gb_start].group_size else 1;
+        const a_internal = ta >= ga_start and ta < ga_start + ga_size;
+        const b_internal = tb >= gb_start and tb < gb_start + gb_size;
+        if (a_internal != b_internal) return false;
+        return true;
+    }
     if (ta == NO_TIDX or tb == NO_TIDX) return ta == tb;
     // Check if both reference within their respective rec groups (self-references)
     // and at the same relative position
-    if (ta >= ga_start and tb >= gb_start) {
+    const ga_size = if (ga_start < rec_groups.len) rec_groups[ga_start].group_size else 1;
+    const gb_size = if (gb_start < rec_groups.len) rec_groups[gb_start].group_size else 1;
+    const a_internal = ta >= ga_start and ta < ga_start + ga_size;
+    const b_internal = tb >= gb_start and tb < gb_start + gb_size;
+    if (a_internal and b_internal) {
         return (ta - ga_start) == (tb - gb_start);
     }
-    // External references must be the same index
-    return ta == tb;
+    // Both external: must be the same index
+    if (!a_internal and !b_internal) return ta == tb;
+    // One internal, one external: not equivalent
+    return false;
 }
 
 /// Build a canonical type index mapping so structurally equivalent types share
@@ -232,6 +252,9 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
             if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
         }
         for (@constCast(ft.result_tidxs)) |*t| {
+            if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
+        }
+        for (@constCast(ft.field_tidxs)) |*t| {
             if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
         }
     }
@@ -576,38 +599,44 @@ fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: 
         if (comp_tag == 0x60) {
             return parseFuncType(reader, allocator, max_types);
         }
-        // struct (0x5F) or array (0x5E) — skip fields
+        // struct (0x5F) or array (0x5E) — parse fields and store type info
         if (comp_tag == 0x5F) {
-            const field_count = try reader.readU32();
-            var fi: u32 = 0;
-            while (fi < field_count) : (fi += 1) {
-                _ = try readValTypeWithTidx(reader, max_types);
-                _ = try reader.readByte(); // mutability
-            }
+            return parseStructType(reader, allocator, max_types);
         } else if (comp_tag == 0x5E) {
-            _ = try readValTypeWithTidx(reader, max_types);
-            _ = try reader.readByte(); // mutability
+            return parseArrayType(reader, allocator, max_types);
         }
         return .{ .params = &.{}, .results = &.{} };
     }
     if (tag != 0x60) {
-        // struct (0x5F) or array (0x5E) without sub wrapper — skip and return placeholder
+        // struct (0x5F) or array (0x5E) without sub wrapper
         if (tag == 0x5F) {
-            const field_count = try reader.readU32();
-            var fi: u32 = 0;
-            while (fi < field_count) : (fi += 1) {
-                _ = try readValTypeWithTidx(reader, max_types);
-                _ = try reader.readByte(); // mutability
-            }
-            return .{ .params = &.{}, .results = &.{} };
+            return parseStructType(reader, allocator, max_types);
         } else if (tag == 0x5E) {
-            _ = try readValTypeWithTidx(reader, max_types);
-            _ = try reader.readByte(); // mutability
-            return .{ .params = &.{}, .results = &.{} };
+            return parseArrayType(reader, allocator, max_types);
         }
         return error.InvalidFuncType;
     }
     return parseFuncType(reader, allocator, max_types);
+}
+
+fn parseStructType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
+    const field_count = try reader.readU32();
+    var ftidxs = if (field_count > 0) try allocator.alloc(u32, field_count) else @as([]u32, &.{});
+    var fi: u32 = 0;
+    while (fi < field_count) : (fi += 1) {
+        const info = try readValTypeWithTidx(reader, max_types);
+        ftidxs[fi] = info.tidx;
+        _ = try reader.readByte(); // mutability
+    }
+    return .{ .params = &.{}, .results = &.{}, .kind = .struct_, .field_tidxs = ftidxs };
+}
+
+fn parseArrayType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
+    const info = try readValTypeWithTidx(reader, max_types);
+    _ = try reader.readByte(); // mutability
+    var ftidxs = try allocator.alloc(u32, 1);
+    ftidxs[0] = info.tidx;
+    return .{ .params = &.{}, .results = &.{}, .kind = .array, .field_tidxs = ftidxs };
 }
 
 fn parseFuncType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {

@@ -78,7 +78,7 @@ pub const Value = union(ValType) {
     nonexternref: ?u32,
 };
 
-/// Function type (§2.3.5)
+/// Function type (§2.3.5), also used as placeholder for struct/array types.
 pub const FuncType = struct {
     params: []const ValType,
     results: []const ValType,
@@ -86,6 +86,13 @@ pub const FuncType = struct {
     param_tidxs: []const u32 = &.{},
     /// Concrete type indices parallel to results (0xFFFFFFFF = abstract).
     result_tidxs: []const u32 = &.{},
+    /// Type kind (func/struct/array) for iso-recursive equivalence.
+    kind: Kind = .func,
+    /// For struct types: field type indices (for equivalence comparison).
+    /// For array types: single element type index (len=1).
+    field_tidxs: []const u32 = &.{},
+
+    pub const Kind = enum(u2) { func, struct_, array };
 };
 
 /// Limits (§2.3.4)
