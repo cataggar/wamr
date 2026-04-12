@@ -151,6 +151,92 @@ fn isBottomTidx(tidx: u32) bool {
     return tidx == BOTTOM_FUNC_TIDX or tidx == BOTTOM_EXTERN_TIDX;
 }
 
+/// Check if two type indices are iso-recursively equivalent.
+/// Two types are equivalent if they occupy the same position within rec groups
+/// that have identical structure.
+fn typeIdxEquivalent(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, a: u32, b: u32) bool {
+    if (a == b) return true;
+    if (a >= module_types.len or b >= module_types.len) return false;
+    if (a >= rec_groups.len or b >= rec_groups.len) return false;
+    const ga = rec_groups[a];
+    const gb = rec_groups[b];
+    // Must be at the same position within their rec groups and groups must be the same size
+    if (ga.group_size != gb.group_size) return false;
+    if (a - ga.group_start != b - gb.group_start) return false;
+    // Compare all types in both rec groups pairwise
+    var i: u32 = 0;
+    while (i < ga.group_size) : (i += 1) {
+        const ai = ga.group_start + i;
+        const bi = gb.group_start + i;
+        if (ai >= module_types.len or bi >= module_types.len) return false;
+        if (!funcTypesStructurallyMatch(module_types, rec_groups, module_types[ai], module_types[bi], ga.group_start, gb.group_start)) return false;
+    }
+    return true;
+}
+
+fn funcTypesStructurallyMatch(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, a: types.FuncType, b: types.FuncType, ga_start: u32, gb_start: u32) bool {
+    if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
+    for (a.params, b.params) |pa, pb| if (pa != pb) return false;
+    for (a.results, b.results) |ra, rb| if (ra != rb) return false;
+    // Compare type index references
+    for (0..a.params.len) |pi| {
+        const ta = if (pi < a.param_tidxs.len) a.param_tidxs[pi] else NO_TIDX;
+        const tb = if (pi < b.param_tidxs.len) b.param_tidxs[pi] else NO_TIDX;
+        if (!tidxEquivalent(module_types, rec_groups, ta, tb, ga_start, gb_start)) return false;
+    }
+    for (0..a.results.len) |ri| {
+        const ta = if (ri < a.result_tidxs.len) a.result_tidxs[ri] else NO_TIDX;
+        const tb = if (ri < b.result_tidxs.len) b.result_tidxs[ri] else NO_TIDX;
+        if (!tidxEquivalent(module_types, rec_groups, ta, tb, ga_start, gb_start)) return false;
+    }
+    return true;
+}
+
+fn tidxEquivalent(_: []const types.FuncType, _: []const types.RecGroupInfo, ta: u32, tb: u32, ga_start: u32, gb_start: u32) bool {
+    if (ta == tb) return true;
+    if (ta == NO_TIDX or tb == NO_TIDX) return ta == tb;
+    // Check if both reference within their respective rec groups (self-references)
+    // and at the same relative position
+    if (ta >= ga_start and tb >= gb_start) {
+        return (ta - ga_start) == (tb - gb_start);
+    }
+    // External references must be the same index
+    return ta == tb;
+}
+
+/// Build a canonical type index mapping so structurally equivalent types share
+/// the same canonical index. This allows exact-match comparison in validators.
+fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocator) void {
+    const n: u32 = @intCast(module.types.len);
+    if (n == 0) return;
+    // canonical[i] = the lowest type index equivalent to i
+    const canonical = allocator.alloc(u32, n) catch return;
+    for (canonical, 0..) |*c, i| c.* = @intCast(i);
+    // Find equivalences: for each pair, if equivalent, map to the lower index
+    var i: u32 = 0;
+    while (i < n) : (i += 1) {
+        if (canonical[i] != i) continue; // already mapped
+        var j: u32 = i + 1;
+        while (j < n) : (j += 1) {
+            if (canonical[j] != j) continue;
+            if (typeIdxEquivalent(module.types, module.rec_groups, i, j)) {
+                canonical[j] = i;
+            }
+        }
+    }
+    // Store canonical map for use by getFuncTypeIdx
+    module.canonical_type_map = canonical;
+    // Rewrite type indices embedded in func type signatures
+    for (module.types) |ft| {
+        for (@constCast(ft.param_tidxs)) |*t| {
+            if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
+        }
+        for (@constCast(ft.result_tidxs)) |*t| {
+            if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
+        }
+    }
+}
+
 /// A value type paired with its concrete type index.
 const ValTypeTidx = struct { vt: types.ValType, tidx: u32 };
 
@@ -434,32 +520,45 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
 
 // ─── Section parsers ────────────────────────────────────────────────────────
 
-fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.FuncType {
+const TypeSectionResult = struct {
+    types: []const types.FuncType,
+    rec_groups: []const types.RecGroupInfo,
+};
+
+fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!TypeSectionResult {
     const count = try reader.readU32();
-    if (count == 0) return &.{};
+    if (count == 0) return .{ .types = &.{}, .rec_groups = &.{} };
 
     // GC proposal: type entries may be rec groups (0x4E) containing sub types (0x50/0x4F)
     // We flatten them all into a single FuncType array.
     var func_types_list: std.ArrayList(types.FuncType) = .empty;
+    var rec_groups_list: std.ArrayList(types.RecGroupInfo) = .empty;
     var entries_parsed: u32 = 0;
     while (entries_parsed < count) : (entries_parsed += 1) {
         const tag = try reader.readByte();
         if (tag == 0x4E) {
             // rec group: count of sub-entries, then sub-entries
             const rec_count = try reader.readU32();
+            const group_start: u32 = @intCast(func_types_list.items.len);
             var ri: u32 = 0;
             while (ri < rec_count) : (ri += 1) {
                 const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
                 func_types_list.append(allocator, ft) catch return error.OutOfMemory;
+                rec_groups_list.append(allocator, .{ .group_start = group_start, .group_size = rec_count }) catch return error.OutOfMemory;
             }
         } else {
             // Single type entry (0x60 func, 0x50 sub, 0x4F sub final)
             reader.pos -= 1; // unread the tag
+            const group_start: u32 = @intCast(func_types_list.items.len);
             const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
             func_types_list.append(allocator, ft) catch return error.OutOfMemory;
+            rec_groups_list.append(allocator, .{ .group_start = group_start, .group_size = 1 }) catch return error.OutOfMemory;
         }
     }
-    return func_types_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return .{
+        .types = func_types_list.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .rec_groups = rec_groups_list.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
 }
 
 fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
@@ -934,7 +1033,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 if (reader.pos > section_start + section_size) return error.InvalidSectionSize;
                 reader.pos = section_start + section_size;
             },
-                .type => module.types = try parseTypeSection(&reader, allocator),
+                .type => {
+                    const type_result = try parseTypeSection(&reader, allocator);
+                    module.types = type_result.types;
+                    module.rec_groups = type_result.rec_groups;
+                    canonicalizeTypeIndices(&module, allocator);
+                },
                 .import => {
                     const tc: u32 = @intCast(module.types.len);
                     module.imports = try parseImportSection(&reader, allocator, tc, &module.import_tag_count);
@@ -1100,6 +1204,14 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             .ref_func => |fidx| {
                 if (!g.global_type.val_type.isFuncRef()) return error.TypeMismatch;
                 if (fidx >= total_funcs) return error.UnknownFunction;
+                // Check concrete type index compatibility
+                if (g.global_type.type_idx != NO_TIDX) {
+                    const func_tidx = module.getFuncTypeIdx(fidx) orelse NO_TIDX;
+                    if (func_tidx != NO_TIDX and func_tidx != g.global_type.type_idx) {
+                        if (!typeIdxEquivalent(module.types, module.rec_groups, func_tidx, g.global_type.type_idx))
+                            return error.TypeMismatch;
+                    }
+                }
             },
             .bytecode => {}, // compound expressions validated at evaluation time
         }
