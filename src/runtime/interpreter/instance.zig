@@ -393,7 +393,7 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
                     0x1C => { // ref.i31: pop i32, push i31ref
                         if (sp < 1) return error.InvalidInitExpr;
                         const i32_val = stack[sp - 1].i32;
-                        stack[sp - 1] = .{ .funcref = @as(u32, @bitCast(i32_val)) & 0x7FFF_FFFF };
+                        stack[sp - 1] = .{ .i31ref = @as(u32, @bitCast(i32_val)) & 0x7FFF_FFFF };
                     },
                     0x1A => { // any.convert_extern: pop externref, push anyref
                         if (sp < 1) return error.InvalidInitExpr;
