@@ -698,11 +698,17 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
         const field_name = try reader.readName();
         const kind_byte = try reader.readByte();
 
-        // Tag imports (0x04) from exception handling — count and skip
+        // Tag imports (0x04) from exception handling — store with kind = .tag
         if (kind_byte == 0x04) {
             _ = try reader.readByte(); // tag attribute
-            _ = try reader.readU32(); // type index
+            const tag_tidx = try reader.readU32(); // type index
             tag_count.* += 1;
+            imports_list.append(allocator, .{
+                .module_name = module_name,
+                .field_name = field_name,
+                .kind = .tag,
+                .tag_type_idx = tag_tidx,
+            }) catch return error.OutOfMemory;
             continue;
         }
 
@@ -712,10 +718,16 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
             0x02 => .memory,
             0x03 => .global,
             0x04 => {
-                // Tag import (exception handling) — skip attribute + type index
+                // Tag import (exception handling) — store
                 _ = try reader.readByte(); // attribute
-                _ = try reader.readU32(); // type index
+                const tag_tidx = try reader.readU32(); // type index
                 tag_count.* += 1;
+                imports_list.append(allocator, .{
+                    .module_name = module_name,
+                    .field_name = field_name,
+                    .kind = .tag,
+                    .tag_type_idx = tag_tidx,
+                }) catch return error.OutOfMemory;
                 continue;
             },
             else => return error.InvalidImportKind,
@@ -732,6 +744,7 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
             .table => imp.table_type = try readTableType(reader, type_count, 0),
             .memory => imp.memory_type = try readMemoryType(reader),
             .global => imp.global_type = try readGlobalType(reader, type_count),
+            .tag => {}, // tag imports handled above
         }
         imports_list.append(allocator, imp) catch return error.InvalidImportKind;
     }
@@ -802,7 +815,7 @@ fn parseExportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
             0x01 => .table,
             0x02 => .memory,
             0x03 => .global,
-            0x04 => null, // tag export (exception handling) — skip
+            0x04 => .tag,
             else => return error.InvalidExportKind,
         };
         if (kind) |k| {
@@ -1100,6 +1113,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                             .table => module.import_table_count += 1,
                             .memory => module.import_memory_count += 1,
                             .global => module.import_global_count += 1,
+                            .tag => {}, // tag count already tracked by parseImportSection
                         }
                     }
                 },
@@ -1114,8 +1128,16 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 .data => module.data_segments = try parseDataSection(&reader, allocator),
                 .data_count => module.data_count = try reader.readU32(),
                 .tag => {
-                    // Tag section (exception handling) — skip
-                    reader.pos = section_start + section_size;
+                    // Tag section (exception handling): count + (attribute, type_idx)*
+                    const tag_count = try reader.readU32();
+                    if (tag_count > 0) {
+                        const tag_types = allocator.alloc(u32, tag_count) catch return error.OutOfMemory;
+                        for (tag_types) |*tt| {
+                            _ = try reader.readByte(); // attribute (0 = exception)
+                            tt.* = try reader.readU32(); // type index
+                        }
+                        module.tag_types = tag_types;
+                    }
                 },
             }
 
@@ -1129,6 +1151,27 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
     // Validate function type indices from function section
     for (func_type_indices) |type_idx| {
         if (type_idx >= module.types.len) return error.InvalidTypeIndex;
+    }
+
+    // Infer local tag count from tag exports when tag section is missing.
+    // Some binary writers (e.g., wabt) emit tag exports but no tag section.
+    if (module.tag_types.len == 0) {
+        var max_tag_idx: ?u32 = null;
+        for (module.exports) |exp| {
+            if (exp.kind == .tag) {
+                if (max_tag_idx == null or exp.index > max_tag_idx.?)
+                    max_tag_idx = exp.index;
+            }
+        }
+        if (max_tag_idx) |max_idx| {
+            const local_count = if (max_idx >= module.import_tag_count) max_idx - module.import_tag_count + 1 else 0;
+            if (local_count > 0) {
+                if (allocator.alloc(u32, local_count)) |tag_types| {
+                    for (tag_types) |*tt| tt.* = 0xFFFFFFFF;
+                    module.tag_types = tag_types;
+                } else |_| {}
+            }
+        }
     }
 
     try validateModule(&module);
@@ -1180,6 +1223,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 }
             },
             .global => {},
+            .tag => {},
         }
     }
 
@@ -1198,6 +1242,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             .global => {
                 if (exp.index >= total_globals) return error.UnknownGlobal;
             },
+            .tag => {},
         }
     }
 

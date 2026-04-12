@@ -347,6 +347,19 @@ fn skipBlockTypeBytes(code: []const u8, pos: usize) usize {
     return skipLeb128(code, pos);
 }
 
+/// Skip catch clause list in try_table (count + clauses).
+fn skipCatchClauses(code: []const u8, pos: usize) usize {
+    var p = pos;
+    const count = readU32Static(code, &p);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const kind = readU32Static(code, &p);
+        if (kind == 0 or kind == 1) p = skipLeb128(code, p); // tag index
+        p = skipLeb128(code, p); // label index
+    }
+    return p;
+}
+
 /// Starting at `start` (which must be right after a block/loop/if opcode
 /// and its block-type byte), scan forward to find the position just AFTER
 /// the matching `end` opcode.
@@ -357,9 +370,14 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
         const b = code[pos];
         pos += 1;
         switch (@as(Opcode, @enumFromInt(b))) {
-            .block, .loop, .@"if" => {
+            .block, .loop, .@"if", .@"try" => {
                 depth += 1;
                 pos = skipBlockTypeBytes(code, pos);
+            },
+            .try_table => {
+                depth += 1;
+                pos = skipBlockTypeBytes(code, pos);
+                pos = skipCatchClauses(code, pos);
             },
             .end => {
                 depth -= 1;
@@ -371,6 +389,7 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
             .ref_null, .ref_func,
             .table_get, .table_set,
             .call_ref, .return_call_ref, .br_on_null, .br_on_non_null,
+            .throw, .@"catch", .rethrow, .delegate, .catch_all,
             => {
                 pos = skipLeb128(code, pos);
             },
@@ -458,9 +477,14 @@ fn findElse(code: []const u8, start: usize) ?usize {
         const b = code[pos];
         pos += 1;
         switch (@as(Opcode, @enumFromInt(b))) {
-            .block, .loop, .@"if" => {
+            .block, .loop, .@"if", .@"try" => {
                 depth += 1;
                 pos = skipBlockTypeBytes(code, pos);
+            },
+            .try_table => {
+                depth += 1;
+                pos = skipBlockTypeBytes(code, pos);
+                pos = skipCatchClauses(code, pos);
             },
             .end => {
                 depth -= 1;
@@ -474,6 +498,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
             .ref_null, .ref_func,
             .table_get, .table_set,
             .call_ref, .return_call_ref, .br_on_null, .br_on_non_null,
+            .throw, .@"catch", .rethrow, .delegate, .catch_all,
             => {
                 pos = skipLeb128(code, pos);
             },
@@ -605,8 +630,12 @@ const Label = struct {
     stack_height: u32,
     /// Expected result arity of this block.
     arity: u32,
+    /// For try_table: bytecode position of catch clause list.
+    catch_ip: u32 = 0,
+    /// For try_table: number of catch clauses.
+    catch_count: u16 = 0,
 
-    const Kind = enum { block, loop, @"if" };
+    const Kind = enum { block, loop, @"if", try_table };
 };
 
 const MAX_LABELS = 256;
@@ -726,6 +755,87 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         ip = end_ip;
                     }
                 }
+            },
+
+            .try_table => {
+                const module_types = env.module_inst.module.types;
+                const bt_info = readBlockTypeInfo(code, &ip, module_types);
+                // Record position of catch clause list for later matching
+                const catch_ip_start: u32 = @intCast(ip);
+                const clause_count = readU32(code, &ip);
+                // Skip past the catch clauses
+                var ci: u32 = 0;
+                while (ci < clause_count) : (ci += 1) {
+                    const ck = readU32(code, &ip);
+                    if (ck == 0 or ck == 1) _ = readU32(code, &ip); // tag index
+                    _ = readU32(code, &ip); // label index
+                }
+                const end_ip = findBlockEnd(code, ip);
+                if (label_sp >= MAX_LABELS) return error.StackOverflow;
+                labels[label_sp] = .{
+                    .kind = .try_table,
+                    .target_ip = end_ip,
+                    .stack_height = env.sp - bt_info.param_arity,
+                    .arity = bt_info.result_arity,
+                    .catch_ip = catch_ip_start,
+                    .catch_count = @intCast(clause_count),
+                };
+                label_sp += 1;
+            },
+
+            .throw => {
+                const tag_idx = readU32(code, &ip);
+                const tags = env.module_inst.tags;
+                if (tag_idx >= tags.len) return error.Unreachable;
+                const thrown_tag = tags[tag_idx];
+                var found = false;
+                var search_idx: u32 = label_sp;
+                while (search_idx > 0 and !found) {
+                    search_idx -= 1;
+                    const lbl = labels[search_idx];
+                    if (lbl.kind != .try_table) continue;
+                    var scan_ip: usize = lbl.catch_ip;
+                    const n_clauses = readU32(code, &scan_ip);
+                    var cj: u32 = 0;
+                    while (cj < n_clauses) : (cj += 1) {
+                        const ck = readU32(code, &scan_ip);
+                        var clause_tag_idx: ?u32 = null;
+                        if (ck == 0 or ck == 1) clause_tag_idx = readU32(code, &scan_ip);
+                        const label_depth = readU32(code, &scan_ip);
+                        const matched = switch (ck) {
+                            0, 1 => blk: { // catch / catch_ref
+                                if (clause_tag_idx) |cti| {
+                                    if (cti < tags.len)
+                                        break :blk tags[cti] == thrown_tag;
+                                }
+                                break :blk false;
+                            },
+                            2, 3 => true, // catch_all / catch_all_ref
+                            else => false,
+                        };
+                        if (matched) {
+                            // Catch label_depth is like br depth from inside
+                            // the try_table body (depth 0 = try_table itself).
+                            const target_label_idx = search_idx -| label_depth;
+                            const target_label = labels[target_label_idx];
+                            env.sp = target_label.stack_height;
+                            label_sp = target_label_idx;
+                            if (target_label.kind == .loop) {
+                                labels[label_sp] = target_label;
+                                label_sp += 1;
+                            }
+                            ip = target_label.target_ip;
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) return error.Unreachable;
+            },
+
+            .throw_ref, .@"try", .@"catch", .rethrow, .delegate, .catch_all => {
+                // Legacy exception opcodes — skip immediates but don't execute
+                return error.Unreachable;
             },
 
             .@"else" => {
