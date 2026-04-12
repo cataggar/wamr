@@ -528,6 +528,8 @@ pub const ModuleInstance = struct {
     allocator: std.mem.Allocator,
     /// Track dropped elem segments (active segments dropped after instantiation)
     dropped_elems: []bool = &.{},
+    /// Track dropped data segments (for data.drop instruction)
+    dropped_data: []bool = &.{},
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {
         const exp = self.module.findExport(name, .function) orelse return null;

@@ -1134,8 +1134,10 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
             if (section_id > @intFromEnum(types.SectionId.tag)) {
                 return error.MalformedSectionId;
             }
-            // Tag section (13) doesn't participate in strict ordering with other sections
-            if (section_id != @intFromEnum(types.SectionId.tag)) {
+            // Tag section (13) and data count section (12) don't participate in strict ordering
+            if (section_id != @intFromEnum(types.SectionId.tag) and
+                section_id != @intFromEnum(types.SectionId.data_count))
+            {
                 if (last_section_id) |last| {
                     if (section_id <= last) return error.InvalidSectionOrder;
                 }
@@ -1774,11 +1776,12 @@ fn validateFunctionBody(
                 if (r.value >= total_tables) return error.UnknownTable;
             },
 
-            // memory.size, memory.grow: reserved byte must be exactly 0x00
+            // memory.size, memory.grow: memory index (LEB128)
             0x3F, 0x40 => {
                 if (total_memories == 0) return error.UnknownMemory;
-                if (i >= code.len or code[i] != 0x00) return error.InvalidAlignment;
-                i += 1;
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidAlignment;
+                i += r.bytes_read;
+                if (r.value >= total_memories) return error.UnknownMemory;
             },
 
             // i32.const

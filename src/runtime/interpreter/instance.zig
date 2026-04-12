@@ -121,6 +121,12 @@ pub fn instantiateWithImports(
         }
     }
 
+    // Initialize dropped data segments tracking
+    if (module.data_segments.len > 0) {
+        inst.dropped_data = allocator.alloc(bool, module.data_segments.len) catch return error.OutOfMemory;
+        @memset(inst.dropped_data, false);
+    }
+
     // Execute start function if present (§4.5.4 step 15)
     if (module.start_function) |start_idx| {
         if (start_idx >= module.import_function_count) {

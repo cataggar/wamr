@@ -2255,12 +2255,35 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         }
                     },
                     8 => { // memory.init
-                        _ = readU32(code, &ip); // data_idx
-                        _ = readU32(code, &ip); // memory index
-                        return error.UnknownOpcode;
+                        const data_idx = readU32(code, &ip);
+                        const mem_idx = readU32(code, &ip);
+                        const n: u32 = @bitCast(try env.popI32());
+                        const src: u32 = @bitCast(try env.popI32());
+                        const dst: u32 = @bitCast(try env.popI32());
+                        const mem = env.module_inst.getMemory(mem_idx) orelse return error.OutOfBoundsMemoryAccess;
+                        // Check if segment is dropped
+                        if (data_idx < env.module_inst.dropped_data.len and env.module_inst.dropped_data[data_idx]) {
+                            if (n > 0) return error.OutOfBoundsMemoryAccess;
+                            continue;
+                        }
+                        const module = env.module_inst.module;
+                        if (data_idx >= module.data_segments.len) {
+                            if (n > 0) return error.OutOfBoundsMemoryAccess;
+                            continue;
+                        }
+                        const seg = module.data_segments[data_idx];
+                        if (@as(u64, src) + n > seg.data.len or @as(u64, dst) + n > mem.data.len)
+                            return error.OutOfBoundsMemoryAccess;
+                        const d: usize = dst;
+                        const s: usize = src;
+                        const len: usize = n;
+                        @memcpy(mem.data[d .. d + len], seg.data[s .. s + len]);
                     },
                     9 => { // data.drop
-                        _ = readU32(code, &ip);
+                        const data_idx = readU32(code, &ip);
+                        if (data_idx < env.module_inst.dropped_data.len) {
+                            env.module_inst.dropped_data[data_idx] = true;
+                        }
                     },
                     10 => { // memory.copy
                         const dst_mem_idx = readU32(code, &ip);
