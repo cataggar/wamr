@@ -82,6 +82,7 @@ pub fn instantiateWithImports(
     }
 
     try applyDataSegments(module, inst.memories, inst.globals);
+    try applyTableInitExprs(module, inst.tables, inst, inst.globals);
     try applyElemSegments(module, inst.tables, inst, inst.globals);
 
     // Set source_module for locally-created funcref globals
@@ -378,6 +379,27 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryI
         if (end > mem.data.len) return error.DataSegmentOutOfBounds;
 
         @memcpy(mem.data[offset..][0..seg.data.len], seg.data);
+    }
+}
+
+fn applyTableInitExprs(module: *const types.WasmModule, tables: []*types.TableInstance, inst: *types.ModuleInstance, globals: []const *types.GlobalInstance) InstantiationError!void {
+    const import_count = module.import_table_count;
+    for (module.tables, 0..) |table_type, i| {
+        const init_expr = table_type.init_expr orelse continue;
+        const table = tables[import_count + i];
+        const val = evalInitExpr(init_expr, globals) catch continue;
+        const func_idx: ?u32 = switch (val) {
+            .funcref => |v| v,
+            .nonfuncref => |v| v,
+            .externref, .nonexternref => continue,
+            else => continue,
+        };
+        for (table.elements) |*elem| {
+            elem.* = if (func_idx) |fidx|
+                .{ .func_idx = fidx, .module_inst = inst }
+            else
+                null;
+        }
     }
 }
 

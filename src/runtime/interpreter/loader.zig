@@ -262,7 +262,7 @@ fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
     };
 }
 
-fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u32) LoadError!types.TableType {
+fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types.TableType {
     const first_byte = try reader.readByte();
 
     // Table with init expression: 0x40 0x00 reftype limits expr
@@ -270,10 +270,8 @@ fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u3
         _ = try reader.readByte(); // reserved byte (must be 0)
         const info = try readValTypeWithTidx(reader, type_count);
         const limits = try readLimits(reader);
-        // Validate and skip the init expression
-        // Table init expressions can only reference imported globals
-        try validateAndSkipInitExpr(reader, import_global_count);
-        return .{ .elem_type = info.vt, .limits = limits, .elem_tidx = info.tidx, .has_init_expr = true };
+        const init_expr = try parseInitExprChecked(reader, type_count);
+        return .{ .elem_type = info.vt, .limits = limits, .elem_tidx = info.tidx, .init_expr = init_expr };
     }
 
     // Standard table: reftype limits
@@ -980,7 +978,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             if (table.limits.min > max) return error.InvalidLimits;
         }
         // Non-nullable element types require a table initializer
-        if ((table.elem_type == .nonfuncref or table.elem_type == .nonexternref) and !table.has_init_expr) {
+        if ((table.elem_type == .nonfuncref or table.elem_type == .nonexternref) and table.init_expr == null) {
             return error.TypeMismatch;
         }
     }
