@@ -100,8 +100,8 @@ pub const TableType = struct {
     limits: Limits,
     /// Concrete type index for elem_type (0xFFFFFFFF = abstract).
     elem_tidx: u32 = 0xFFFFFFFF,
-    /// Whether the table has an init expression (required for non-nullable elem types).
-    has_init_expr: bool = false,
+    /// Init expression for table elements (from 0x40 prefix encoding).
+    init_expr: ?InitExpr = null,
 };
 
 /// Memory type (§2.3.7)
