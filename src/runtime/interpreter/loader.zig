@@ -3475,11 +3475,79 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
 
+            // 0xFD prefix (SIMD opcodes)
+            0xFD => {
+                const sub = readU32Leb(code, &i);
+                switch (sub) {
+                    // v128.load variants: [addr] -> [v128]
+                    0x00...0x0A => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    0x0B => { // v128.store: [addr v128] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x0C => { i += 16; pushType(&stack_buf, &sp, .v128, &stack_tidx); }, // v128.const
+                    0x0D => { // i8x16.shuffle
+                        i += 16;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // splat ops: [scalar] -> [v128]
+                    0x0F, 0x10, 0x11, 0x12, 0x13 => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // extract_lane: [v128] -> [scalar]
+                    0x15, 0x16, 0x17, 0x18, 0x19, 0x1B, 0x1D => {
+                        i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x1A => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i64, &stack_tidx); }, // i64x2.extract_lane
+                    0x1C => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f32, &stack_tidx); }, // f32x4.extract_lane
+                    0x1E => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f64, &stack_tidx); }, // f64x2.extract_lane
+                    // replace_lane: [v128 scalar] -> [v128]
+                    0x1F, 0x20, 0x21, 0x22 => {
+                        i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128.load lane: [addr v128] -> [v128]
+                    0x54...0x57 => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128.store lane: [addr v128] -> []
+                    0x58...0x5B => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    // v128.load zero: [addr] -> [v128]
+                    0x5C, 0x5D => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // All other SIMD: treat as v128 unary (conservative but allows validation)
+                    else => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                }
+            },
+
             else => {},
         }
     }
-
-    // If we exit the loop without closing all blocks, the function body is truncated.
     // Exception: if ctrl_sp == 1 (only function frame) and we consumed all bytes,
     // the trailing 0x0B end opcode may have been consumed as an instruction immediate
     // (e.g., br_on_null's label index in unreachable code). This is valid per spec.
