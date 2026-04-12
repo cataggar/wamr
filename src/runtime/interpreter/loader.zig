@@ -663,6 +663,13 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
             0x01 => .table,
             0x02 => .memory,
             0x03 => .global,
+            0x04 => {
+                // Tag import (exception handling) — skip attribute + type index
+                _ = try reader.readByte(); // attribute
+                _ = try reader.readU32(); // type index
+                tag_count.* += 1;
+                continue;
+            },
             else => return error.InvalidImportKind,
         };
 
@@ -1006,22 +1013,18 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         const section_id = try reader.readByte();
         const section_size = try reader.readU32();
 
-        // Enforce section ordering (custom sections and proposal sections can appear anywhere)
+        // Enforce section ordering (custom sections can appear anywhere)
         if (section_id != 0) {
-            // Skip known proposal sections (tag section = 13) without enforcing order
-            if (section_id > @intFromEnum(types.SectionId.data_count)) {
-                const section_start = reader.pos;
-                if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
-                if (section_id == 13) {
-                    reader.pos = section_start + section_size;
-                    continue;
-                }
+            if (section_id > @intFromEnum(types.SectionId.tag)) {
                 return error.MalformedSectionId;
             }
-            if (last_section_id) |last| {
-                if (section_id <= last) return error.InvalidSectionOrder;
+            // Tag section (13) doesn't participate in strict ordering with other sections
+            if (section_id != @intFromEnum(types.SectionId.tag)) {
+                if (last_section_id) |last| {
+                    if (section_id <= last) return error.InvalidSectionOrder;
+                }
+                last_section_id = section_id;
             }
-            last_section_id = section_id;
         }
 
         const section_start = reader.pos;
@@ -1062,6 +1065,10 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 .code => module.functions = try parseCodeSection(&reader, func_type_indices, module.types, allocator),
                 .data => module.data_segments = try parseDataSection(&reader, allocator),
                 .data_count => module.data_count = try reader.readU32(),
+                .tag => {
+                    // Tag section (exception handling) — skip
+                    reader.pos = section_start + section_size;
+                },
             }
 
             // Verify we consumed exactly section_size bytes
@@ -1409,6 +1416,20 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
                 skipBlockTypeImm(code, &i);
             },
             0x0C, 0x0D, 0xD5, 0xD6 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            // Exception handling opcodes
+            0x06 => { skipBlockTypeImm(code, &i); }, // try
+            0x07, 0x08, 0x09, 0x19 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x0A => {}, // throw_ref
+            0x1F => { // try_table
+                skipBlockTypeImm(code, &i);
+                const clause_count_r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += clause_count_r.bytes_read;
+                var ci: u32 = 0;
+                while (ci < clause_count_r.value) : (ci += 1) {
+                    const ck = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += ck.bytes_read;
+                    if (ck.value == 0 or ck.value == 1) { const tr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += tr.bytes_read; }
+                    const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += lr.bytes_read;
+                }
+            },
             0x0E => { // br_table
                 const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read;
                 var j: u32 = 0;
@@ -1740,6 +1761,26 @@ fn validateFunctionBody(
             0xD5, 0xD6 => {
                 const r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += r.bytes_read;
+            },
+
+            // Exception handling opcodes
+            0x06 => { skipBlockTypeImm(code, &i); }, // try (legacy): blocktype
+            0x07 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // catch: tagidx
+            0x08 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // throw: tagidx
+            0x09 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // rethrow: labelidx
+            0x0A => {}, // throw_ref: no immediates
+            0x19 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // delegate: labelidx
+            0x1F => { // try_table: blocktype + catch clause list
+                skipBlockTypeImm(code, &i);
+                const clause_count = readU32Leb(code, &i);
+                var ci: u32 = 0;
+                while (ci < clause_count) : (ci += 1) {
+                    const clause_kind = readU32Leb(code, &i); // 0=catch, 1=catch_ref, 2=catch_all, 3=catch_all_ref
+                    if (clause_kind == 0 or clause_kind == 1) {
+                        _ = readU32Leb(code, &i); // tag index
+                    }
+                    _ = readU32Leb(code, &i); // label index
+                }
             },
 
             // Opcodes in ranges 0x06-0x0A, 0x14-0x19, 0x1D-0x1F, 0x27,
@@ -2258,6 +2299,58 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
             0x01 => {}, // nop
+
+            // Exception handling: throw/throw_ref — mark unreachable
+            0x08 => { // throw: tagidx
+                _ = readU32Leb(code, &i);
+                if (ctrl_top.get(&ctrl_buf, ctrl_sp)) |cf| {
+                    cf.unreachable_flag = true;
+                    sp = cf.start_height;
+                }
+            },
+            0x0A => { // throw_ref — mark unreachable
+                if (ctrl_top.get(&ctrl_buf, ctrl_sp)) |cf| {
+                    cf.unreachable_flag = true;
+                    sp = cf.start_height;
+                }
+            },
+            // Exception handling: try_table — like block
+            0x06, 0x1F => {
+                const bt = try readBlockType(code, &i, module.types);
+                if (op == 0x1F) {
+                    // Skip catch clause list
+                    const clause_count = readU32Leb(code, &i);
+                    var ci: u32 = 0;
+                    while (ci < clause_count) : (ci += 1) {
+                        const ck = readU32Leb(code, &i);
+                        if (ck == 0 or ck == 1) _ = readU32Leb(code, &i); // tag index
+                        _ = readU32Leb(code, &i); // label index
+                    }
+                }
+                const start: u32 = sp;
+                if (bt.params.len > 0) {
+                    var pi = bt.params.len;
+                    while (pi > 0) {
+                        pi -= 1;
+                        if (!popExpect(&stack_buf, &sp, bt.params[pi], ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                    }
+                }
+                if (ctrl_sp >= ctrl_buf.len) return error.TypeMismatch;
+                ctrl_buf[ctrl_sp] = .{
+                    .kind = .block,
+                    .start_height = start,
+                    .start_types = bt.params,
+                    .end_types = bt.results,
+                    .block_type_idx = bt.type_idx,
+                    .single_result_tidx = bt.single_result_tidx,
+                };
+                for (bt.params) |p| pushType(&stack_buf, &sp, p, &stack_tidx);
+                ctrl_sp += 1;
+            },
+            // Exception handling: catch/catch_all/rethrow/delegate — skip immediates
+            0x07 => { _ = readU32Leb(code, &i); }, // catch: tagidx
+            0x09, 0x19 => { _ = readU32Leb(code, &i); }, // rethrow/delegate: labelidx
 
             // block, loop, if
             0x02, 0x03, 0x04 => {
