@@ -2091,11 +2091,11 @@ fn readI64Leb(code: []const u8, pos: *usize) i64 {
     return r.value;
 }
 
-fn skipMemImm(code: []const u8, pos: *usize) void {
+fn skipMemImm(code: []const u8, pos: *usize) u32 {
     const align_flags = readU32Leb(code, pos);
-    // Multi-memory: bit 6 of alignment signals a memory index follows
-    if (align_flags & 0x40 != 0) _ = readU32Leb(code, pos);
+    const mem_idx: u32 = if (align_flags & 0x40 != 0) readU32Leb(code, pos) else 0;
     _ = readU32Leb(code, pos); // offset
+    return mem_idx;
 }
 
 fn pushType(stack: []VT, sp: *u32, t: VT, tidx: []u32) void {
@@ -2254,9 +2254,19 @@ fn doLoad(stack: []VT, sp: *u32, result: VT, cf: ?*CtrlFrame, tidx: []u32) LoadE
     pushType(stack, sp, result, tidx);
 }
 
+fn doLoad64(stack: []VT, sp: *u32, result: VT, addr_type: VT, cf: ?*CtrlFrame, tidx: []u32) LoadError!void {
+    if (!popExpect(stack, sp, addr_type, cf)) return error.TypeMismatch;
+    pushType(stack, sp, result, tidx);
+}
+
 fn doStore(stack: []VT, sp: *u32, val_type: VT, cf: ?*CtrlFrame) LoadError!void {
     if (!popExpect(stack, sp, val_type, cf)) return error.TypeMismatch;
     if (!popExpect(stack, sp, .i32, cf)) return error.TypeMismatch;
+}
+
+fn doStore64(stack: []VT, sp: *u32, val_type: VT, addr_type: VT, cf: ?*CtrlFrame) LoadError!void {
+    if (!popExpect(stack, sp, val_type, cf)) return error.TypeMismatch;
+    if (!popExpect(stack, sp, addr_type, cf)) return error.TypeMismatch;
 }
 
 fn doUnop(stack: []VT, sp: *u32, input: VT, output: VT, cf: ?*CtrlFrame, tidx: []u32) LoadError!void {
@@ -2301,6 +2311,23 @@ fn getGlobalTidx(module: *const types.WasmModule, idx: u32) u32 {
     const local_idx = idx - module.import_global_count;
     if (local_idx < module.globals.len) return module.globals[local_idx].global_type.type_idx;
     return NO_TIDX;
+}
+
+/// Get the address type for a memory (i64 for memory64, i32 otherwise).
+fn getMemAddrType(module: *const types.WasmModule, idx: u32) VT {
+    if (idx < module.import_memory_count) {
+        var mi: u32 = 0;
+        for (module.imports) |imp| {
+            if (imp.kind == .memory) {
+                if (mi == idx) return if (imp.memory_type) |mt| (if (mt.is_memory64) VT.i64 else VT.i32) else VT.i32;
+                mi += 1;
+            }
+        }
+        return .i32;
+    }
+    const local_idx = idx - module.import_memory_count;
+    if (local_idx < module.memories.len) return if (module.memories[local_idx].is_memory64) VT.i64 else VT.i32;
+    return .i32;
 }
 
 fn getTableElemType(module: *const types.WasmModule, idx: u32) ?VT {
@@ -2919,27 +2946,27 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
 
             // Memory loads
-            0x28 => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x29 => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2A => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .f32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2B => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .f64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2C, 0x2D, 0x2E, 0x2F => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x30, 0x31, 0x32, 0x33, 0x34, 0x35 => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x28 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x29 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x2A => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x2B => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x2C, 0x2D, 0x2E, 0x2F => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
 
             // Memory stores
-            0x36 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x37 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x38 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .f32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x39 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .f64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x3A, 0x3B => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x3C, 0x3D, 0x3E => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x36 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x37 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x38 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x39 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x3A, 0x3B => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x3C, 0x3D, 0x3E => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
 
             // memory.size
-            0x3F => { _ = readU32Leb(code, &i); pushType(&stack_buf, &sp, .i32, &stack_tidx); },
+            0x3F => { const mi = readU32Leb(code, &i); const at = getMemAddrType(module, mi); pushType(&stack_buf, &sp, at, &stack_tidx); },
             // memory.grow
-            0x40 => { _ = readU32Leb(code, &i);
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                pushType(&stack_buf, &sp, .i32, &stack_tidx);
+            0x40 => { const mi = readU32Leb(code, &i); const at = getMemAddrType(module, mi);
+                if (!popExpect(&stack_buf, &sp, at, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                pushType(&stack_buf, &sp, at, &stack_tidx);
             },
 
             // Constants

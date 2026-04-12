@@ -92,7 +92,7 @@ const DispatchResult = enum(u32) {
 
 // ── LEB128 helpers for bytecode ──────────────────────────────────────────
 
-const Memarg = struct { mem_idx: u32, offset: u32 };
+const Memarg = struct { mem_idx: u32, offset: u64 };
 
 /// Read a memarg from bytecode: alignment (with multi-memory bit 6) + offset.
 /// Returns the memory index and offset.
@@ -101,6 +101,16 @@ fn readMemarg(code: []const u8, ip: *usize) Memarg {
     const mem_idx: u32 = if (align_flags & 0x40 != 0) readU32(code, ip) else 0;
     const offset = readU32(code, ip);
     return .{ .mem_idx = mem_idx, .offset = offset };
+}
+
+/// Pop address from the stack, handling memory64 (i64 address) vs i32.
+fn popMemAddr(env: *ExecEnv, mem_idx: u32) TrapError!u64 {
+    const mem = env.module_inst.getMemory(mem_idx) orelse return error.OutOfBoundsMemoryAccess;
+    if (mem.memory_type.is_memory64) {
+        return @bitCast(try env.popI64());
+    } else {
+        return @as(u64, @as(u32, @bitCast(try env.popI32())));
+    }
 }
 
 fn readU32(code: []const u8, ip: *usize) u32 {
@@ -1402,8 +1412,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             // i32 loads
             .i32_load => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1411,8 +1420,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i32_load8_s => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const signed_byte: i8 = @bitCast(mem.data[@intCast(addr)]);
@@ -1420,16 +1428,14 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i32_load8_u => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 try env.pushI32(@as(i32, @intCast(mem.data[@intCast(addr)])));
             },
             .i32_load16_s => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1438,8 +1444,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i32_load16_u => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1451,8 +1456,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i32_store => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popI32();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1461,8 +1465,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i32_store8 => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popI32();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 mem.data[@intCast(addr)] = @truncate(@as(u32, @bitCast(val)));
@@ -1470,8 +1473,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i32_store16 => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popI32();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1481,8 +1483,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             // i64 loads
             .i64_load => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1490,8 +1491,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i64_load8_s => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const signed_byte: i8 = @bitCast(mem.data[@intCast(addr)]);
@@ -1499,16 +1499,14 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i64_load8_u => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 try env.pushI64(@as(i64, @intCast(mem.data[@intCast(addr)])));
             },
             .i64_load16_s => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1517,8 +1515,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i64_load16_u => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1527,8 +1524,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i64_load32_s => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1537,8 +1533,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             },
             .i64_load32_u => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1550,8 +1545,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i64_store => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popI64();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1560,8 +1554,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i64_store8 => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popI64();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 1 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 mem.data[@intCast(addr)] = @truncate(@as(u64, @bitCast(val)));
@@ -1569,8 +1562,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i64_store16 => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popI64();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 2 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1579,8 +1571,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .i64_store32 => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popI64();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1590,8 +1581,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             // f32 load/store
             .f32_load => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1600,8 +1590,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .f32_store => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popF32();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1611,8 +1600,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             // f64 load/store
             .f64_load => {
                 const ma = readMemarg(code, &ip);
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1621,8 +1609,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .f64_store => {
                 const ma = readMemarg(code, &ip);
                 const val = try env.popF64();
-                const base: u32 = @bitCast(try env.popI32());
-                const addr = @as(u64, base) + ma.offset;
+                const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
                 const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                 if (addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
                 const a: usize = @intCast(addr);
@@ -1633,20 +1620,33 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .memory_size => {
                 const mem_idx = readU32(code, &ip);
                 const mem = env.module_inst.getMemory(mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                try env.pushI32(@intCast(mem.current_pages));
+                if (mem.memory_type.is_memory64) {
+                    try env.pushI64(@intCast(mem.current_pages));
+                } else {
+                    try env.pushI32(@intCast(mem.current_pages));
+                }
             },
             .memory_grow => {
                 const mem_idx = readU32(code, &ip);
-                const delta: u32 = @bitCast(try env.popI32());
                 const mem = env.module_inst.getMemory(mem_idx) orelse {
                     try env.pushI32(-1);
                     continue;
                 };
-                const old_pages = mem.grow(delta, env.module_inst.allocator) catch {
-                    try env.pushI32(-1);
-                    continue;
-                };
-                try env.pushI32(@bitCast(old_pages));
+                if (mem.memory_type.is_memory64) {
+                    const delta: u32 = @intCast(@as(u64, @bitCast(try env.popI64())));
+                    const old_pages = mem.grow(delta, env.module_inst.allocator) catch {
+                        try env.pushI64(-1);
+                        continue;
+                    };
+                    try env.pushI64(@as(i64, @intCast(old_pages)));
+                } else {
+                    const delta: u32 = @bitCast(try env.popI32());
+                    const old_pages = mem.grow(delta, env.module_inst.allocator) catch {
+                        try env.pushI32(-1);
+                        continue;
+                    };
+                    try env.pushI32(@bitCast(old_pages));
+                }
             },
 
             // ── i64 comparison ──
@@ -2557,8 +2557,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
 
 fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32) !struct { ptr: [*]u8, addr: usize } {
     const ma = readMemarg(code, ip);
-    const base: u32 = @bitCast(try env.popI32());
-    const addr = @as(u64, base) + ma.offset;
+    const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     // Alignment check (atomics require natural alignment)
@@ -2583,8 +2582,7 @@ fn atomicLoad64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, c
 fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
-    const base: u32 = @bitCast(try env.popI32());
-    const addr = @as(u64, base) + ma.offset;
+    const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
@@ -2595,8 +2593,7 @@ fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
 fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
-    const base: u32 = @bitCast(try env.popI32());
-    const addr = @as(u64, base) + ma.offset;
+    const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
@@ -2607,8 +2604,7 @@ fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
 fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u32, @bitCast(try env.popI32())));
-    const base: u32 = @bitCast(try env.popI32());
-    const addr = @as(u64, base) + ma.offset;
+    const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
@@ -2620,8 +2616,7 @@ fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comp
 fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
     const ma = readMemarg(code, ip);
     const val: T = @truncate(@as(u64, @bitCast(try env.popI64())));
-    const base: u32 = @bitCast(try env.popI32());
-    const addr = @as(u64, base) + ma.offset;
+    const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
@@ -2634,8 +2629,7 @@ fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     const ma = readMemarg(code, ip);
     const replacement: T = @truncate(@as(u32, @bitCast(try env.popI32())));
     const expected: T = @truncate(@as(u32, @bitCast(try env.popI32())));
-    const base: u32 = @bitCast(try env.popI32());
-    const addr = @as(u64, base) + ma.offset;
+    const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
@@ -2649,8 +2643,7 @@ fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type
     const ma = readMemarg(code, ip);
     const replacement: T = @truncate(@as(u64, @bitCast(try env.popI64())));
     const expected: T = @truncate(@as(u64, @bitCast(try env.popI64())));
-    const base: u32 = @bitCast(try env.popI32());
-    const addr = @as(u64, base) + ma.offset;
+    const addr = try popMemAddr(env, ma.mem_idx) + ma.offset;
     const mem = env.module_inst.getMemory(ma.mem_idx) orelse return error.OutOfBoundsMemoryAccess;
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
