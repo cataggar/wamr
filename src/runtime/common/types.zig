@@ -11,7 +11,13 @@ pub const ValType = enum(u8) {
     v128 = 0x7B,
     funcref = 0x70,
     externref = 0x6F,
+    anyref = 0x6E,
+    eqref = 0x6D,
+    i31ref = 0x6C,
+    structref = 0x6B,
+    arrayref = 0x6A,
     exnref = 0x69,
+    nullref = 0x65,
     nonfuncref = 0x14,
     nonexternref = 0x15,
 
@@ -28,7 +34,7 @@ pub const ValType = enum(u8) {
 
     pub fn isRef(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .exnref, .nonfuncref, .nonexternref => true,
+            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .nullref, .nonfuncref, .nonexternref => true,
             else => false,
         };
     }
@@ -42,9 +48,16 @@ pub const ValType = enum(u8) {
     }
 
     /// Non-nullable types are subtypes of their nullable counterparts.
+    /// Also implements GC type hierarchy subtyping.
     pub fn isSubtypeOf(self: ValType, other: ValType) bool {
-        return (self == .nonfuncref and other == .funcref) or
-            (self == .nonexternref and other == .externref);
+        if (self == other) return true;
+        // non-nullable → nullable
+        if (self == .nonfuncref and other == .funcref) return true;
+        if (self == .nonexternref and other == .externref) return true;
+        // GC type hierarchy: nullref <: i31ref/structref/arrayref <: eqref <: anyref
+        if (other == .anyref) return self == .eqref or self == .i31ref or self == .structref or self == .arrayref or self == .nullref;
+        if (other == .eqref) return self == .i31ref or self == .structref or self == .arrayref or self == .nullref;
+        return false;
     }
 
     /// Map non-nullable ref types to their nullable equivalents.
@@ -61,7 +74,7 @@ pub const ValType = enum(u8) {
             .i32, .f32 => 4,
             .i64, .f64 => 8,
             .v128 => 16,
-            .funcref, .externref, .exnref, .nonfuncref, .nonexternref => @sizeOf(usize),
+            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .nullref, .nonfuncref, .nonexternref => @sizeOf(usize),
         };
     }
 };
@@ -75,8 +88,14 @@ pub const Value = union(ValType) {
     v128: u128,
     funcref: ?u32,
     externref: ?u32,
+    anyref: ?u32,
+    eqref: ?u32,
+    i31ref: ?u32,
+    structref: ?u32,
+    arrayref: ?u32,
     /// Exception reference — index into ExecEnv.exception_refs pool.
     exnref: ?u32,
+    nullref: ?u32,
     nonfuncref: ?u32,
     nonexternref: ?u32,
 };

@@ -241,6 +241,12 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .exnref => .{ .exnref = null },
                     .nonfuncref => .{ .nonfuncref = null },
                     .nonexternref => .{ .nonexternref = null },
+                    .anyref => .{ .anyref = null },
+                    .eqref => .{ .eqref = null },
+                    .i31ref => .{ .i31ref = null },
+                    .structref => .{ .structref = null },
+                    .arrayref => .{ .arrayref = null },
+                    .nullref => .{ .nullref = null },
                     .v128 => .{ .v128 = 0 },
                 });
             }
@@ -281,6 +287,12 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .exnref => .{ .exnref = null },
                     .nonfuncref => .{ .nonfuncref = null },
                     .nonexternref => .{ .nonexternref = null },
+                    .anyref => .{ .anyref = null },
+                    .eqref => .{ .eqref = null },
+                    .i31ref => .{ .i31ref = null },
+                    .structref => .{ .structref = null },
+                    .arrayref => .{ .arrayref = null },
+                    .nullref => .{ .nullref = null },
                     .v128 => .{ .v128 = 0 },
                 });
             }
@@ -2483,12 +2495,12 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     0x1C => { // ref.i31: [i32] -> [i31ref]
                         const val = try env.popI32();
                         const i31_val: u32 = @as(u32, @bitCast(val)) & 0x7FFF_FFFF;
-                        try env.push(.{ .funcref = i31_val });
+                        try env.push(.{ .i31ref = i31_val });
                     },
                     0x1D => { // i31.get_s: [i31ref] -> [i32]
                         const ref = try env.pop();
                         const raw = switch (ref) {
-                            .funcref, .nonfuncref => |r| r orelse return error.Unreachable,
+                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref => |r| r orelse return error.Unreachable,
                             else => return error.Unreachable,
                         };
                         // Sign-extend from 31 bits
@@ -2501,7 +2513,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     0x1E => { // i31.get_u: [i31ref] -> [i32]
                         const ref = try env.pop();
                         const raw = switch (ref) {
-                            .funcref, .nonfuncref => |r| r orelse return error.Unreachable,
+                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref => |r| r orelse return error.Unreachable,
                             else => return error.Unreachable,
                         };
                         try env.pushI32(@bitCast(raw & 0x7FFF_FFFF));

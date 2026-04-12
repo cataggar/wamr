@@ -126,6 +126,12 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
         .exnref => |v| refNullEqual(v == null, b),
         .nonfuncref => |v| refNullEqual(v == null, b),
         .nonexternref => |v| refNullEqual(v == null, b),
+        .anyref => |v| refNullEqual(v == null, b),
+        .eqref => |v| refNullEqual(v == null, b),
+        .i31ref => |v| refNullEqual(v == null, b),
+        .structref => |v| refNullEqual(v == null, b),
+        .arrayref => |v| refNullEqual(v == null, b),
+        .nullref => |v| refNullEqual(v == null, b),
         .v128 => |v| b == .v128 and b.v128 == v,
     };
 }
@@ -137,6 +143,12 @@ fn refNullEqual(a_is_null: bool, b: types.Value) bool {
         .nonfuncref => |v| v == null,
         .externref => |v| v == null,
         .nonexternref => |v| v == null,
+        .anyref => |v| v == null,
+        .eqref => |v| v == null,
+        .i31ref => |v| v == null,
+        .structref => |v| v == null,
+        .arrayref => |v| v == null,
+        .nullref => |v| v == null,
         else => return false,
     };
     return a_is_null == b_is_null;
@@ -393,6 +405,12 @@ fn defaultValue(val_type: types.ValType) types.Value {
         .funcref, .nonfuncref => .{ .funcref = null },
         .externref, .nonexternref => .{ .externref = null },
         .exnref => .{ .exnref = null },
+        .anyref => .{ .anyref = null },
+        .eqref => .{ .eqref = null },
+        .i31ref => .{ .i31ref = null },
+        .structref => .{ .structref = null },
+        .arrayref => .{ .arrayref = null },
+        .nullref => .{ .nullref = null },
         .v128 => .{ .v128 = 0 },
     };
 }
