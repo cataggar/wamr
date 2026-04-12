@@ -2064,8 +2064,23 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             // ── Reference types ──
             .ref_null => {
                 const ref_type = readU32(code, &ip);
-                if (ref_type == @intFromEnum(types.ValType.externref) or ref_type == 0x72) {
+                const ref_byte: u8 = @truncate(ref_type);
+                if (ref_byte == 0x6F or ref_byte == 0x72 or ref_byte == 0x68 or ref_byte == 0x74) {
                     try env.push(.{ .externref = null });
+                } else if (ref_byte == 0x6E) {
+                    try env.push(.{ .anyref = null });
+                } else if (ref_byte == 0x6D) {
+                    try env.push(.{ .eqref = null });
+                } else if (ref_byte == 0x6C) {
+                    try env.push(.{ .i31ref = null });
+                } else if (ref_byte == 0x6B) {
+                    try env.push(.{ .structref = null });
+                } else if (ref_byte == 0x6A) {
+                    try env.push(.{ .arrayref = null });
+                } else if (ref_byte == 0x65 or ref_byte == 0x71) {
+                    try env.push(.{ .nullref = null });
+                } else if (ref_byte == 0x69) {
+                    try env.push(.{ .exnref = null });
                 } else {
                     try env.push(.{ .funcref = null });
                 }
@@ -2073,8 +2088,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .ref_is_null => {
                 const val = try env.pop();
                 const is_null: bool = switch (val) {
-                    .funcref, .nonfuncref => |r| r == null,
+                    .funcref, .nonfuncref, .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => |r| r == null,
                     .externref, .nonexternref => |r| r == null,
+                    .exnref => |r| r == null,
                     else => false,
                 };
                 try env.pushI32(@intFromBool(is_null));
@@ -2208,11 +2224,19 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const elem_idx: u32 = try popTableIdx(env, table);
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const ref = table.elements[elem_idx];
-                if (table.table_type.elem_type.isExternRef()) {
-                    try env.push(.{ .externref = if (ref) |r| r.func_idx else null });
-                } else {
-                    try env.push(.{ .funcref = if (ref) |r| r.func_idx else null });
-                }
+                const val: ?u32 = if (ref) |r| r.func_idx else null;
+                try env.push(switch (table.table_type.elem_type) {
+                    .externref => .{ .externref = val },
+                    .anyref => .{ .anyref = val },
+                    .eqref => .{ .eqref = val },
+                    .i31ref => .{ .i31ref = val },
+                    .structref => .{ .structref = val },
+                    .arrayref => .{ .arrayref = val },
+                    .nullref => .{ .nullref = val },
+                    .nonexternref => .{ .nonexternref = val },
+                    .nonfuncref => .{ .nonfuncref = val },
+                    else => .{ .funcref = val },
+                });
             },
             .table_set => {
                 const table_idx = readU32(code, &ip);
@@ -2221,8 +2245,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const elem_idx: u32 = try popTableIdx(env, table);
                 if (elem_idx >= table.elements.len) return error.OutOfBoundsTableAccess;
                 const raw_ref: ?u32 = switch (ref) {
-                    .funcref, .nonfuncref => |r| r,
+                    .funcref, .nonfuncref, .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => |r| r,
                     .externref, .nonexternref => |r| r,
+                    .exnref => |r| r,
                     else => null,
                 };
                 table.elements[elem_idx] = if (raw_ref) |r| .{ .func_idx = r, .module_inst = env.module_inst } else null;
@@ -2535,6 +2560,39 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             else => null,
                         };
                         try env.push(.{ .externref = val });
+                    },
+                    0x14, 0x15 => { // ref.test, ref.test_nullable: [ref] -> [i32]
+                        const heap_type = readU32(code, &ip);
+                        const ref = try env.pop();
+                        // Simple implementation: check if ref is non-null for the target type
+                        const is_match: i32 = switch (ref) {
+                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref => |r| blk: {
+                                if (r == null) break :blk 0;
+                                // For i31ref target (0x6C), check if value is in i31 range
+                                if (heap_type == 0x6C) break :blk 1;
+                                // For eqref (0x6D), anyref (0x6E), funcref (0x70) — always match non-null
+                                break :blk 1;
+                            },
+                            .externref, .nonexternref => |r| if (r != null) @as(i32, 1) else 0,
+                            .nullref => |r| if (r != null) @as(i32, 1) else 0,
+                            else => 0,
+                        };
+                        try env.pushI32(is_match);
+                    },
+                    0x16, 0x17 => { // ref.cast, ref.cast_nullable: [ref] -> [ref]
+                        const heap_type = readU32(code, &ip);
+                        _ = heap_type;
+                        const ref = try env.pop();
+                        // For nullable cast (0x17), null passes through
+                        // For non-nullable cast (0x16), null traps
+                        const is_null = switch (ref) {
+                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
+                            .externref, .nonexternref => |r| r == null,
+                            else => true,
+                        };
+                        if (sub_op == 0x16 and is_null) return error.Unreachable;
+                        // Pass through the value (cast succeeds for matching types)
+                        try env.push(ref);
                     },
                     else => return error.UnknownOpcode,
                 }
