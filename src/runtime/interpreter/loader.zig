@@ -174,8 +174,26 @@ fn typeIdxEquivalent(module_types: []const types.FuncType, rec_groups: []const t
     return true;
 }
 
+/// Check if type `sub_idx` is a subtype of `super_idx` within the same module.
+/// A type is a subtype of another if it declares that other as its supertype
+/// (directly or transitively), and the types are iso-recursively compatible.
+pub fn typeIdxIsSubtype(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, sub_idx: u32, super_idx: u32) bool {
+    // Exact equivalence counts as subtype
+    if (typeIdxEquivalent(module_types, rec_groups, sub_idx, super_idx)) return true;
+    // Walk the supertype chain
+    if (sub_idx >= module_types.len) return false;
+    const sub_type = module_types[sub_idx];
+    if (sub_type.supertype_idx != NO_TIDX) {
+        return typeIdxIsSubtype(module_types, rec_groups, sub_type.supertype_idx, super_idx);
+    }
+    return false;
+}
+
 fn funcTypesStructurallyMatch(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, a: types.FuncType, b: types.FuncType, ga_start: u32, gb_start: u32) bool {
     if (a.kind != b.kind) return false;
+    // Supertype and finality must match for iso-recursive equivalence
+    if (a.is_final != b.is_final) return false;
+    if (!tidxEquivalent(module_types, rec_groups, a.supertype_idx, b.supertype_idx, ga_start, gb_start)) return false;
     if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
     for (a.params, b.params) |pa, pb| if (pa != pb) return false;
     for (a.results, b.results) |ra, rb| if (ra != rb) return false;
@@ -249,6 +267,9 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
             for (@constCast(ft.field_tidxs)) |*t| {
                 if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
             }
+            // Also canonicalize supertype index
+            const st = @constCast(&ft.supertype_idx);
+            if (st.* != NO_TIDX and st.* < n and canonical[st.*] != st.*) st.* = canonical[st.*];
         }
         // Find new equivalences
         var i: u32 = 0;
@@ -275,6 +296,8 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
         for (@constCast(ft.field_tidxs)) |*t| {
             if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
         }
+        const st = @constCast(&ft.supertype_idx);
+        if (st.* != NO_TIDX and st.* < n) st.* = canonical[st.*];
     }
     module.canonical_type_map = canonical;
 }
@@ -636,22 +659,27 @@ fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: 
     if (tag == 0x50 or tag == 0x4F) {
         // sub type: 0x50 <num_supers> <super_idx*> <comptype>
         // sub final type: 0x4F <num_supers> <super_idx*> <comptype>
+        const is_final = (tag == 0x4F);
         const num_supers = try reader.readU32();
+        var supertype_idx: u32 = NO_TIDX;
         var si: u32 = 0;
         while (si < num_supers) : (si += 1) {
-            _ = try reader.readU32(); // skip supertype index
+            supertype_idx = try reader.readU32();
         }
         const comp_tag = try reader.readByte();
+        var ft: types.FuncType = undefined;
         if (comp_tag == 0x60) {
-            return parseFuncType(reader, allocator, max_types);
-        }
-        // struct (0x5F) or array (0x5E) — parse fields and store type info
-        if (comp_tag == 0x5F) {
-            return parseStructType(reader, allocator, max_types);
+            ft = try parseFuncType(reader, allocator, max_types);
+        } else if (comp_tag == 0x5F) {
+            ft = try parseStructType(reader, allocator, max_types);
         } else if (comp_tag == 0x5E) {
-            return parseArrayType(reader, allocator, max_types);
+            ft = try parseArrayType(reader, allocator, max_types);
+        } else {
+            ft = .{ .params = &.{}, .results = &.{} };
         }
-        return .{ .params = &.{}, .results = &.{} };
+        ft.supertype_idx = supertype_idx;
+        ft.is_final = is_final;
+        return ft;
     }
     if (tag != 0x60) {
         // struct (0x5F) or array (0x5E) without sub wrapper
@@ -1332,11 +1360,11 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             .ref_func => |fidx| {
                 if (!g.global_type.val_type.isFuncRef()) return error.TypeMismatch;
                 if (fidx >= total_funcs) return error.UnknownFunction;
-                // Check concrete type index compatibility
+                // Check concrete type index compatibility (subtyping allowed)
                 if (g.global_type.type_idx != NO_TIDX) {
                     const func_tidx = module.getFuncTypeIdx(fidx) orelse NO_TIDX;
                     if (func_tidx != NO_TIDX and func_tidx != g.global_type.type_idx) {
-                        if (!typeIdxEquivalent(module.types, module.rec_groups, func_tidx, g.global_type.type_idx))
+                        if (!typeIdxIsSubtype(module.types, module.rec_groups, func_tidx, g.global_type.type_idx))
                             return error.TypeMismatch;
                     }
                 }

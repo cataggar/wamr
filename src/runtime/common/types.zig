@@ -94,6 +94,10 @@ pub const FuncType = struct {
     /// For struct types: field type indices (for equivalence comparison).
     /// For array types: single element type index (len=1).
     field_tidxs: []const u32 = &.{},
+    /// Declared supertype index (0xFFFFFFFF = none).
+    supertype_idx: u32 = 0xFFFFFFFF,
+    /// Whether this type is declared `final` (cannot be subtyped).
+    is_final: bool = false,
 
     pub const Kind = enum(u2) { func, struct_, array };
 };

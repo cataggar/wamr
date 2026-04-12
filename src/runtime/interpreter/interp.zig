@@ -1131,13 +1131,20 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
 
                 const module = env.module_inst.module;
 
-                // Compare canonical type indices for iso-recursive equivalence
-                const expected_canonical = if (type_idx < module.canonical_type_map.len) module.canonical_type_map[type_idx] else type_idx;
-                const actual_tidx = funcref.module_inst.module.getFuncTypeIdx(funcref.func_idx) orelse return error.UnknownFunction;
-
                 if (funcref.module_inst == env.module_inst) {
-                    // Same module: compare canonical indices directly
-                    if (actual_tidx != expected_canonical) return error.IndirectCallTypeMismatch;
+                    // Same module: check canonical equivalence first, then subtype
+                    const raw_actual = funcref.module_inst.module.getRawFuncTypeIdx(funcref.func_idx) orelse return error.UnknownFunction;
+                    if (raw_actual != type_idx) {
+                        // Check canonical equivalence (iso-recursive)
+                        const canon_actual = if (raw_actual < module.canonical_type_map.len) module.canonical_type_map[raw_actual] else raw_actual;
+                        const canon_expected = if (type_idx < module.canonical_type_map.len) module.canonical_type_map[type_idx] else type_idx;
+                        if (canon_actual != canon_expected) {
+                            // Not equivalent — check subtype chain
+                            const loader = @import("loader.zig");
+                            if (!loader.typeIdxIsSubtype(module.types, module.rec_groups, raw_actual, type_idx))
+                                return error.IndirectCallTypeMismatch;
+                        }
+                    }
                 } else {
                     // Cross-module: fall back to structural comparison
                     if (type_idx >= module.types.len) return error.IndirectCallTypeMismatch;
