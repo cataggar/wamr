@@ -490,7 +490,23 @@ fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: 
         }
         return .{ .params = &.{}, .results = &.{} };
     }
-    if (tag != 0x60) return error.InvalidFuncType;
+    if (tag != 0x60) {
+        // struct (0x5F) or array (0x5E) without sub wrapper — skip and return placeholder
+        if (tag == 0x5F) {
+            const field_count = try reader.readU32();
+            var fi: u32 = 0;
+            while (fi < field_count) : (fi += 1) {
+                _ = try readValTypeWithTidx(reader, max_types);
+                _ = try reader.readByte(); // mutability
+            }
+            return .{ .params = &.{}, .results = &.{} };
+        } else if (tag == 0x5E) {
+            _ = try readValTypeWithTidx(reader, max_types);
+            _ = try reader.readByte(); // mutability
+            return .{ .params = &.{}, .results = &.{} };
+        }
+        return error.InvalidFuncType;
+    }
     return parseFuncType(reader, allocator, max_types);
 }
 
