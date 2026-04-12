@@ -132,8 +132,49 @@ fn valuesEqual(a: types.Value, b: types.Value) bool {
         .structref => |v| refNullEqual(v == null, b),
         .arrayref => |v| refNullEqual(v == null, b),
         .nullref => |v| refNullEqual(v == null, b),
-        .v128 => |v| b == .v128 and b.v128 == v,
+        .v128 => |v| blk: {
+            if (b != .v128) break :blk false;
+            if (b.v128 == v) break :blk true;
+            // Lane-wise NaN comparison for float SIMD results
+            const a_bytes: [16]u8 = @bitCast(v);
+            const b_bytes: [16]u8 = @bitCast(b.v128);
+            // Try f32x4 comparison first (more common)
+            var f32_ok = true;
+            inline for (0..4) |li| {
+                const a_f32: u32 = std.mem.readInt(u32, a_bytes[li * 4 ..][0..4], .little);
+                const b_f32: u32 = std.mem.readInt(u32, b_bytes[li * 4 ..][0..4], .little);
+                if (!f32BitsMatch(a_f32, b_f32)) f32_ok = false;
+            }
+            if (f32_ok) break :blk true;
+            // Try f64x2 comparison
+            var f64_ok = true;
+            inline for (0..2) |li| {
+                const a_f64: u64 = std.mem.readInt(u64, a_bytes[li * 8 ..][0..8], .little);
+                const b_f64: u64 = std.mem.readInt(u64, b_bytes[li * 8 ..][0..8], .little);
+                if (!f64BitsMatch(a_f64, b_f64)) f64_ok = false;
+            }
+            break :blk f64_ok;
+        },
     };
+}
+
+/// Compare f64 bit patterns with NaN tolerance.
+fn f64BitsMatch(actual: u64, expected: u64) bool {
+    if (actual == expected) return true;
+    const exp_f: f64 = @bitCast(expected);
+    const act_f: f64 = @bitCast(actual);
+    // If expected is NaN, accept any NaN (canonical or arithmetic)
+    if (std.math.isNan(exp_f)) return std.math.isNan(act_f);
+    return false;
+}
+
+/// Compare f32 bit patterns with NaN tolerance.
+fn f32BitsMatch(actual: u32, expected: u32) bool {
+    if (actual == expected) return true;
+    const exp_f: f32 = @bitCast(expected);
+    const act_f: f32 = @bitCast(actual);
+    if (std.math.isNan(exp_f)) return std.math.isNan(act_f);
+    return false;
 }
 
 /// Compare ref types by nullness (funcref/nonfuncref/externref/nonexternref are compatible).
