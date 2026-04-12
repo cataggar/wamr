@@ -139,6 +139,18 @@ const BinaryReader = struct {
 /// Sentinel for "no concrete type index" (abstract type).
 const NO_TIDX: u32 = 0xFFFF_FFFF;
 
+/// Sentinel tidx for bottom of func ref hierarchy (nullfuncref / nullref).
+/// A value with this tidx is a subtype of any funcref regardless of concrete tidx.
+const BOTTOM_FUNC_TIDX: u32 = 0xFFFF_FFFE;
+
+/// Sentinel tidx for bottom of extern ref hierarchy (nullexternref / nullexnref).
+/// A value with this tidx is a subtype of any externref regardless of concrete tidx.
+const BOTTOM_EXTERN_TIDX: u32 = 0xFFFF_FFFD;
+
+fn isBottomTidx(tidx: u32) bool {
+    return tidx == BOTTOM_FUNC_TIDX or tidx == BOTTOM_EXTERN_TIDX;
+}
+
 /// A value type paired with its concrete type index.
 const ValTypeTidx = struct { vt: types.ValType, tidx: u32 };
 
@@ -169,24 +181,26 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x6B => .{ .vt = .funcref, .tidx = NO_TIDX }, // structref
         0x6A => .{ .vt = .funcref, .tidx = NO_TIDX }, // arrayref
         0x69 => .{ .vt = .externref, .tidx = NO_TIDX }, // exnref
-        0x68 => .{ .vt = .externref, .tidx = NO_TIDX }, // noexnref
-        0x65 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullref (ref null none)
-        0x71 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref (ref null nofunc)
-        0x74 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref (ref null noextern)
-        0x73 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref shorthand (ref null nofunc)
-        0x72 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref shorthand (ref null noextern)
+        // Bottom types — use sentinel tidx so they're subtypes of any ref in their family
+        0x68 => .{ .vt = .externref, .tidx = BOTTOM_EXTERN_TIDX }, // nullexnref (ref null noexn)
+        0x65 => .{ .vt = .funcref, .tidx = BOTTOM_FUNC_TIDX }, // nullref (ref null none)
+        0x71 => .{ .vt = .funcref, .tidx = BOTTOM_FUNC_TIDX }, // nullfuncref (ref null nofunc)
+        0x74 => .{ .vt = .externref, .tidx = BOTTOM_EXTERN_TIDX }, // nullexnref (ref null noexn, alt)
+        0x73 => .{ .vt = .funcref, .tidx = BOTTOM_FUNC_TIDX }, // nullfuncref (ref null nofunc, alt)
+        0x72 => .{ .vt = .externref, .tidx = BOTTOM_EXTERN_TIDX }, // nullexternref (ref null noextern)
         // Typed reference types: ref null <heaptype> or ref <heaptype>
         0x63, 0x64 => {
             const is_nullable = (byte == 0x63);
             const heap_byte = try reader.readByte();
             return switch (heap_byte) {
-                0x70, 0x73 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX },
-                0x6F, 0x72 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX },
+                0x70 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX },
+                0x6F => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX },
                 // GC abstract heap types — map to funcref/externref abstractions
-                0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX }, // any, eq, i31, struct, array, none
-                0x69, 0x68 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX }, // exn, noexn
-                0x74 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX }, // noextern
-                0x71 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX }, // nofunc
+                0x6E, 0x6D, 0x6C, 0x6B, 0x6A => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX }, // any, eq, i31, struct, array
+                0x69 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX }, // exn
+                // Bottom heap types — use sentinel tidx
+                0x65, 0x71, 0x73 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = BOTTOM_FUNC_TIDX }, // none, nofunc
+                0x68, 0x72, 0x74 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = BOTTOM_EXTERN_TIDX }, // noexn, noextern
                 else => {
                     // Concrete type index (LEB128)
                     var type_idx: u32 = heap_byte & 0x7F;
@@ -259,7 +273,7 @@ fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u3
         // Validate and skip the init expression
         // Table init expressions can only reference imported globals
         try validateAndSkipInitExpr(reader, import_global_count);
-        return .{ .elem_type = info.vt, .limits = limits, .elem_tidx = info.tidx };
+        return .{ .elem_type = info.vt, .limits = limits, .elem_tidx = info.tidx, .has_init_expr = true };
     }
 
     // Standard table: reftype limits
@@ -966,7 +980,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             if (table.limits.min > max) return error.InvalidLimits;
         }
         // Non-nullable element types require a table initializer
-        if (table.elem_type == .nonfuncref or table.elem_type == .nonexternref) {
+        if ((table.elem_type == .nonfuncref or table.elem_type == .nonexternref) and !table.has_init_expr) {
             return error.TypeMismatch;
         }
     }
@@ -1800,6 +1814,8 @@ fn popExpectTidx(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*
     if (expected_tidx != NO_TIDX) {
         if (actual_tidx != expected_tidx) {
             if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
+            // Bottom types are subtypes of any concrete type in their family
+            if (isBottomTidx(actual_tidx)) return true;
             return false;
         }
     }
@@ -1820,9 +1836,13 @@ fn popExpectTidxStrict(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, 
     if (expected_tidx != NO_TIDX) {
         if (actual_tidx != expected_tidx) {
             if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
+            // Bottom types are subtypes of any concrete type in their family
+            if (isBottomTidx(actual_tidx)) return true;
             return false;
         }
     } else if (actual_tidx != NO_TIDX and actual.isRef()) {
+        // Bottom types are also subtypes of abstract ref types
+        if (isBottomTidx(actual_tidx)) return true;
         if (!(cf != null and cf.?.unreachable_flag)) return false;
     }
     return true;
@@ -1869,7 +1889,7 @@ fn checkStackEndTidx(cf: *const CtrlFrame, stack: []const VT, sp: u32, tidx: []c
             if (actual != t and !actual.isSubtypeOf(t) and !(actual.isRef() and t.isRef())) return false;
             const et = if (j < expected_tidxs.len) expected_tidxs[j] else NO_TIDX;
             if (et != NO_TIDX and stack_idx < tidx.len) {
-                if (tidx[stack_idx] != et and tidx[stack_idx] != NO_TIDX) return false;
+                if (tidx[stack_idx] != et and tidx[stack_idx] != NO_TIDX and !isBottomTidx(tidx[stack_idx])) return false;
             }
         }
         return true;
@@ -1880,7 +1900,7 @@ fn checkStackEndTidx(cf: *const CtrlFrame, stack: []const VT, sp: u32, tidx: []c
         if (stack[idx] != t and !stack[idx].isSubtypeOf(t)) return false;
         const et = if (j < expected_tidxs.len) expected_tidxs[j] else NO_TIDX;
         if (et != NO_TIDX and idx < tidx.len) {
-            if (tidx[idx] != et) return false;
+            if (tidx[idx] != et and !isBottomTidx(tidx[idx])) return false;
         }
     }
     return true;
@@ -2607,18 +2627,30 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 if (i < code.len) {
                     const ht = code[i];
                     i += 1;
-                    if (ht == 0x6F or ht == 0x72 or ht == 0x74) {
-                        // extern, noextern, noextern(alt)
+                    if (ht == 0x6F) {
+                        // extern → abstract externref
                         pushType(&stack_buf, &sp, .externref, &stack_tidx);
-                    } else if (ht == 0x69 or ht == 0x68) {
-                        // exn, noexn → externref abstraction
+                    } else if (ht == 0x72 or ht == 0x74) {
+                        // noextern, noexn(alt) → bottom of extern hierarchy
+                        pushV(&stack_buf, &sp, .externref, &stack_tidx, BOTTOM_EXTERN_TIDX);
+                    } else if (ht == 0x69) {
+                        // exn → abstract externref
                         pushType(&stack_buf, &sp, .externref, &stack_tidx);
-                    } else if (ht == 0x70 or ht == 0x73 or ht == 0x71) {
-                        // func, nofunc, nofunc(alt)
+                    } else if (ht == 0x68) {
+                        // noexn → bottom of extern hierarchy
+                        pushV(&stack_buf, &sp, .externref, &stack_tidx, BOTTOM_EXTERN_TIDX);
+                    } else if (ht == 0x70) {
+                        // func → abstract funcref
                         pushType(&stack_buf, &sp, .funcref, &stack_tidx);
-                    } else if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or ht == 0x65) {
-                        // any, eq, i31, struct, array, none → funcref abstraction
+                    } else if (ht == 0x73 or ht == 0x71) {
+                        // nofunc → bottom of func hierarchy
+                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, BOTTOM_FUNC_TIDX);
+                    } else if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A) {
+                        // any, eq, i31, struct, array → abstract funcref
                         pushType(&stack_buf, &sp, .funcref, &stack_tidx);
+                    } else if (ht == 0x65) {
+                        // none → bottom of func hierarchy (internal bottom)
+                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, BOTTOM_FUNC_TIDX);
                     } else {
                         // Concrete type index: parse LEB128 and track it
                         var concrete_tidx: u32 = ht & 0x7F;
