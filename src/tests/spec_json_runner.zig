@@ -636,7 +636,11 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
                 result.skipped += 1;
                 continue;
             };
-            if (current_instance) |inst| {
+            // If a named module is specified in the register command, look it up
+            const target_inst = if (cmd.name) |mod_name| blk: {
+                break :blk named_instances.get(mod_name) orelse current_instance;
+            } else current_instance;
+            if (target_inst) |inst| {
                 const name_copy = allocator.dupe(u8, reg_name) catch {
                     result.skipped += 1;
                     continue;
