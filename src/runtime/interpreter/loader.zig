@@ -1375,18 +1375,33 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
         }
     }
 
-    // Validate data segment offset expressions must evaluate to i32
+    // Validate data segment offset expressions
     for (module.data_segments) |seg| {
         if (!seg.is_passive) {
+            // memory64 segments use i64 offsets, regular memory uses i32
+            const is_mem64 = if (seg.memory_idx < module.import_memory_count) blk: {
+                var mi: u32 = 0;
+                for (module.imports) |imp| {
+                    if (imp.kind == .memory) {
+                        if (mi == seg.memory_idx) break :blk if (imp.memory_type) |mt| mt.is_memory64 else false;
+                        mi += 1;
+                    }
+                }
+                break :blk false;
+            } else blk: {
+                const li = seg.memory_idx - module.import_memory_count;
+                break :blk if (li < module.memories.len) module.memories[li].is_memory64 else false;
+            };
             switch (seg.offset) {
-                .i32_const => {},
+                .i32_const => { if (is_mem64) return error.TypeMismatch; },
+                .i64_const => { if (!is_mem64) return error.TypeMismatch; },
                 .global_get => |idx| {
-                    // Extended-const: allow any immutable global
                     if (idx >= total_globals) return error.UnknownGlobal;
                     if (idx < module.import_global_count) {
                         if (getImportGlobalType(module, idx)) |gt| {
                             if (gt.mutability == .mutable) return error.TypeMismatch;
-                            if (gt.val_type != .i32) return error.TypeMismatch;
+                            const expected_type: VT = if (is_mem64) .i64 else .i32;
+                            if (gt.val_type != expected_type) return error.TypeMismatch;
                         }
                     } else {
                         const local_idx = idx - module.import_global_count;
@@ -1395,7 +1410,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                         }
                     }
                 },
-                .bytecode => {}, // compound offset expression validated at evaluation
+                .bytecode => {},
                 else => return error.TypeMismatch,
             }
         }
@@ -1428,17 +1443,32 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 // Both concrete: must match
                 if (table_tidx != NO_TIDX and elem.type_idx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
             }
-            // Validate offset expression type (must be i32)
+            // Validate offset expression type
             if (elem.offset) |offset| {
+                // table64 uses i64 offsets
+                const is_tbl64 = if (elem.table_idx < module.import_table_count) blk: {
+                    var ti: u32 = 0;
+                    for (module.imports) |imp| {
+                        if (imp.kind == .table) {
+                            if (ti == elem.table_idx) break :blk if (imp.table_type) |tt| tt.is_table64 else false;
+                            ti += 1;
+                        }
+                    }
+                    break :blk false;
+                } else blk: {
+                    const li = elem.table_idx - module.import_table_count;
+                    break :blk if (li < module.tables.len) module.tables[li].is_table64 else false;
+                };
                 switch (offset) {
-                    .i32_const => {},
+                    .i32_const => { if (is_tbl64) return error.TypeMismatch; },
+                    .i64_const => { if (!is_tbl64) return error.TypeMismatch; },
                     .global_get => |idx| {
-                        // Extended-const: allow any immutable global
                         if (idx >= total_globals) return error.UnknownGlobal;
                         if (idx < module.import_global_count) {
                             if (getImportGlobalType(module, idx)) |gt| {
                                 if (gt.mutability == .mutable) return error.TypeMismatch;
-                                if (gt.val_type != .i32) return error.TypeMismatch;
+                                const expected_type: VT = if (is_tbl64) .i64 else .i32;
+                                if (gt.val_type != expected_type) return error.TypeMismatch;
                             }
                         } else {
                             const local_idx = idx - module.import_global_count;
@@ -1447,7 +1477,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                             }
                         }
                     },
-                    .bytecode => {}, // compound offset expression validated at evaluation
+                    .bytecode => {},
                     else => return error.TypeMismatch,
                 }
             }
@@ -2313,6 +2343,23 @@ fn getGlobalTidx(module: *const types.WasmModule, idx: u32) u32 {
     return NO_TIDX;
 }
 
+/// Get the address type for a table (i64 for table64, i32 otherwise).
+fn getTableAddrType(module: *const types.WasmModule, idx: u32) VT {
+    if (idx < module.import_table_count) {
+        var ti: u32 = 0;
+        for (module.imports) |imp| {
+            if (imp.kind == .table) {
+                if (ti == idx) return if (imp.table_type) |tt| (if (tt.is_table64) VT.i64 else VT.i32) else VT.i32;
+                ti += 1;
+            }
+        }
+        return .i32;
+    }
+    const local_idx = idx - module.import_table_count;
+    if (local_idx < module.tables.len) return if (module.tables[local_idx].is_table64) VT.i64 else VT.i32;
+    return .i32;
+}
+
 /// Get the address type for a memory (i64 for memory64, i32 otherwise).
 fn getMemAddrType(module: *const types.WasmModule, idx: u32) VT {
     if (idx < module.import_memory_count) {
@@ -2751,7 +2798,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 if (getTableElemType(module, table_idx)) |et| {
                     if (!et.isFuncRef()) return error.TypeMismatch;
                 }
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                const tat_ci = getTableAddrType(module, table_idx);
+                if (!popExpect(&stack_buf, &sp, tat_ci, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
                 if (tidx_ci < module.types.len) {
                     const ft = module.types[tidx_ci];
@@ -2925,23 +2973,25 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
 
-            // table.get: [i32] -> [t]
+            // table.get: [addr] -> [t]
             0x25 => {
                 const tidx_tg = readU32Leb(code, &i);
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                const tat = getTableAddrType(module, tidx_tg);
+                if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
                 if (getTableElemType(module, tidx_tg)) |et|
                     pushV(&stack_buf, &sp, et, &stack_tidx, getTableElemTidx(module, tidx_tg))
                 else
                     pushType(&stack_buf, &sp, .funcref, &stack_tidx);
             },
-            // table.set: [i32 t] -> []
+            // table.set: [addr t] -> []
             0x26 => {
                 const tidx_ts = readU32Leb(code, &i);
+                const tat = getTableAddrType(module, tidx_ts);
                 const et = getTableElemType(module, tidx_ts) orelse VT.funcref;
                 if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
             },
 
@@ -3170,29 +3220,36 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     2, 3 => doUnop(&stack_buf, &sp, .f64, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch,
                     4, 5 => doUnop(&stack_buf, &sp, .f32, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch,
                     6, 7 => doUnop(&stack_buf, &sp, .f64, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch,
-                    8 => { // memory.init: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                    8 => { // memory.init: [at i32 at] -> []
+                        _ = readU32Leb(code, &i);
+                        const memidx = readU32Leb(code, &i);
+                        const mat = getMemAddrType(module, memidx);
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, mat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
                     9 => { _ = readU32Leb(code, &i); }, // data.drop: [] -> []
-                    10 => { // memory.copy: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    10 => { // memory.copy: [at_d at_s n] -> []
+                        const dst_mi = readU32Leb(code, &i);
+                        const src_mi = readU32Leb(code, &i);
+                        const dat = getMemAddrType(module, dst_mi);
+                        const sat = getMemAddrType(module, src_mi);
+                        const nat: VT = if (dat == .i64 or sat == .i64) .i64 else .i32;
+                        if (!popExpect(&stack_buf, &sp, nat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, sat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, dat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    11 => { // memory.fill: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i);
+                    11 => { // memory.fill: [at i32 at] -> []
+                        const memidx = readU32Leb(code, &i);
+                        const mat = getMemAddrType(module, memidx);
+                        if (!popExpect(&stack_buf, &sp, mat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, mat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    12 => { // table.init: [i32 i32 i32] -> []
+                    12 => { // table.init: [at i32 at] -> []
                         const elemidx = readU32Leb(code, &i);
                         const tableidx = readU32Leb(code, &i);
-                        // Validate elem/table type compatibility
+                        const tat = getTableAddrType(module, tableidx);
                         const ntables = module.import_table_count + @as(u32, @intCast(module.tables.len));
                         if (elemidx < module.elements.len and tableidx < ntables) {
                             const elem_kind = module.elements[elemidx].kind;
@@ -3202,36 +3259,44 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         }
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
                     13 => { _ = readU32Leb(code, &i); }, // elem.drop: [] -> []
-                    14 => { // table.copy: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    14 => { // table.copy: [at_d at_s at] -> []
+                        const dst_tidx = readU32Leb(code, &i);
+                        const src_tidx = readU32Leb(code, &i);
+                        const dat = getTableAddrType(module, dst_tidx);
+                        const sat = getTableAddrType(module, src_tidx);
+                        // n is max of both address types
+                        const nat: VT = if (dat == .i64 or sat == .i64) .i64 else .i32;
+                        if (!popExpect(&stack_buf, &sp, nat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, sat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, dat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    15 => { // table.grow: [t i32] -> [i32]
+                    15 => { // table.grow: [t at] -> [at]
                         const tidx = readU32Leb(code, &i);
+                        const tat = getTableAddrType(module, tidx);
                         const et = getTableElemType(module, tidx) orelse VT.funcref;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
-                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        pushType(&stack_buf, &sp, tat, &stack_tidx);
                     },
-                    16 => { // table.size: [] -> [i32]
-                        _ = readU32Leb(code, &i);
-                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
-                    },
-                    17 => { // table.fill: [i32 t i32] -> []
+                    16 => { // table.size: [] -> [at]
                         const tidx = readU32Leb(code, &i);
+                        const tat = getTableAddrType(module, tidx);
+                        pushType(&stack_buf, &sp, tat, &stack_tidx);
+                    },
+                    17 => { // table.fill: [at t at] -> []
+                        const tidx = readU32Leb(code, &i);
+                        const tat = getTableAddrType(module, tidx);
                         const et = getTableElemType(module, tidx) orelse VT.funcref;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                     },
                     else => {},
