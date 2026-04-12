@@ -595,6 +595,30 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                     else => {}, // no immediates
                 }
             },
+            .gc_prefix => {
+                const sub_op = readU32Static(code, &pos);
+                switch (sub_op) {
+                    // struct ops with type index
+                    0x00, 0x01 => pos = skipLeb128(code, pos), // struct.new, struct.new_default
+                    0x02, 0x03, 0x04, 0x05 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // struct.get/set
+                    // array ops with type index
+                    0x06, 0x07 => pos = skipLeb128(code, pos), // array.new, array.new_default
+                    0x08 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.new_fixed
+                    0x09, 0x0A => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.new_data, array.new_elem
+                    0x0B, 0x0C, 0x0D, 0x0E => pos = skipLeb128(code, pos), // array.get/set
+                    0x0F => {}, // array.len: no immediates
+                    0x10 => pos = skipLeb128(code, pos), // array.fill
+                    0x11 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.copy
+                    0x12, 0x13 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.init_data/elem
+                    // ref.test/ref.cast: flags + type immediates
+                    0x14, 0x15, 0x16, 0x17 => { pos = skipLeb128(code, pos); }, // simplified
+                    // br_on_cast/br_on_cast_fail: flags + label + 2 type immediates
+                    0x18, 0x19 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    // No immediates
+                    0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
+                    else => {},
+                }
+            },
             else => {},
         }
     }
@@ -701,6 +725,23 @@ fn findElse(code: []const u8, start: usize) ?usize {
                         pos = skipLeb128(code, pos);
                         pos = skipLeb128(code, pos);
                     },
+                    else => {},
+                }
+            },
+            .gc_prefix => {
+                const sub_op = readU32Static(code, &pos);
+                switch (sub_op) {
+                    0x00, 0x01 => pos = skipLeb128(code, pos),
+                    0x02, 0x03, 0x04, 0x05 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x06, 0x07 => pos = skipLeb128(code, pos),
+                    0x08, 0x09, 0x0A => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x0B, 0x0C, 0x0D, 0x0E => pos = skipLeb128(code, pos),
+                    0x10 => pos = skipLeb128(code, pos),
+                    0x11 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x12, 0x13 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x14, 0x15, 0x16, 0x17 => pos = skipLeb128(code, pos),
+                    0x18, 0x19 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
                     else => {},
                 }
             },
@@ -2431,6 +2472,57 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             else => null,
                         };
                         for (table.elements[offset..][0..n]) |*e| e.* = ref_val;
+                    },
+                    else => return error.UnknownOpcode,
+                }
+            },
+
+            .gc_prefix => {
+                const sub_op = readU32(code, &ip);
+                switch (sub_op) {
+                    0x1C => { // ref.i31: [i32] -> [i31ref]
+                        const val = try env.popI32();
+                        const i31_val: u32 = @as(u32, @bitCast(val)) & 0x7FFF_FFFF;
+                        try env.push(.{ .funcref = i31_val });
+                    },
+                    0x1D => { // i31.get_s: [i31ref] -> [i32]
+                        const ref = try env.pop();
+                        const raw = switch (ref) {
+                            .funcref, .nonfuncref => |r| r orelse return error.Unreachable,
+                            else => return error.Unreachable,
+                        };
+                        // Sign-extend from 31 bits
+                        const signed: i32 = if (raw & 0x4000_0000 != 0)
+                            @bitCast(raw | 0x8000_0000)
+                        else
+                            @bitCast(raw & 0x7FFF_FFFF);
+                        try env.pushI32(signed);
+                    },
+                    0x1E => { // i31.get_u: [i31ref] -> [i32]
+                        const ref = try env.pop();
+                        const raw = switch (ref) {
+                            .funcref, .nonfuncref => |r| r orelse return error.Unreachable,
+                            else => return error.Unreachable,
+                        };
+                        try env.pushI32(@bitCast(raw & 0x7FFF_FFFF));
+                    },
+                    0x1A => { // any.convert_extern: [externref] -> [anyref]
+                        const ref = try env.pop();
+                        const val: ?u32 = switch (ref) {
+                            .externref, .nonexternref => |r| r,
+                            .funcref, .nonfuncref => |r| r,
+                            else => null,
+                        };
+                        try env.push(.{ .funcref = val });
+                    },
+                    0x1B => { // extern.convert_any: [anyref] -> [externref]
+                        const ref = try env.pop();
+                        const val: ?u32 = switch (ref) {
+                            .funcref, .nonfuncref => |r| r,
+                            .externref, .nonexternref => |r| r,
+                            else => null,
+                        };
+                        try env.push(.{ .externref = val });
                     },
                     else => return error.UnknownOpcode,
                 }
