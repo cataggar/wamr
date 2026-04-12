@@ -79,6 +79,7 @@ pub const TrapError = error{
     UnknownFunction,
     UnknownOpcode,
     UnalignedAtomicAccess,
+    UncaughtException,
 };
 
 /// Result from dispatchLoop indicating how the function exited.
@@ -216,6 +217,7 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .f64 => .{ .f64 = 0.0 },
                     .funcref => .{ .funcref = null },
                     .externref => .{ .externref = null },
+                    .exnref => .{ .exnref = null },
                     .nonfuncref => .{ .nonfuncref = null },
                     .nonexternref => .{ .nonexternref = null },
                     .v128 => .{ .v128 = 0 },
@@ -255,6 +257,7 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                     .f64 => .{ .f64 = 0.0 },
                     .funcref => .{ .funcref = null },
                     .externref => .{ .externref = null },
+                    .exnref => .{ .exnref = null },
                     .nonfuncref => .{ .nonfuncref = null },
                     .nonexternref => .{ .nonexternref = null },
                     .v128 => .{ .v128 = 0 },
@@ -263,7 +266,14 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
         }
 
         var tail_call_target: u32 = 0;
-        const result = try dispatchLoop(env, func.code, &tail_call_target);
+        const result = dispatchLoop(env, func.code, &tail_call_target) catch |err| {
+            if (err == error.UncaughtException) {
+                // Pop the callee's frame and restore the caller's stack
+                const frame = env.popFrame() catch return err;
+                env.sp = frame.stack_base;
+            }
+            return err;
+        };
 
         switch (result) {
             .normal => {
@@ -297,6 +307,109 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
 }
 
 // ── Block-target helpers ─────────────────────────────────────────────────
+
+/// Result of a successful catch handler search.
+const CatchResult = struct {
+    stack_height: u32,
+    label_sp: u32,
+    ip: usize,
+    is_ref: bool, // true for catch_ref / catch_all_ref
+};
+
+/// Search the label stack for a try_table with a matching catch handler.
+fn searchCatchHandler(
+    env: *ExecEnv,
+    labels_slice: []const Label,
+    code: []const u8,
+    thrown_tag: *types.TagInstance,
+    tags: []const *types.TagInstance,
+) ?CatchResult {
+    _ = env;
+    var search_idx: u32 = @intCast(labels_slice.len);
+    while (search_idx > 0) {
+        search_idx -= 1;
+        const lbl = labels_slice[search_idx];
+        if (lbl.kind != .try_table) continue;
+        var scan_ip: usize = lbl.catch_ip;
+        const n_clauses = readU32Static(code, &scan_ip);
+        var cj: u32 = 0;
+        while (cj < n_clauses) : (cj += 1) {
+            const ck = readU32Static(code, &scan_ip);
+            var clause_tag_idx: ?u32 = null;
+            if (ck == 0 or ck == 1) clause_tag_idx = readU32Static(code, &scan_ip);
+            const label_depth = readU32Static(code, &scan_ip);
+            const matched = switch (ck) {
+                0, 1 => blk: { // catch / catch_ref
+                    if (clause_tag_idx) |cti| {
+                        if (cti < tags.len)
+                            break :blk tags[cti] == thrown_tag;
+                    }
+                    break :blk false;
+                },
+                2, 3 => true, // catch_all / catch_all_ref
+                else => false,
+            };
+            if (matched) {
+                const target_label_idx = search_idx -| label_depth;
+                const target_label = labels_slice[target_label_idx];
+                const result_label_sp = target_label_idx;
+                return CatchResult{
+                    .stack_height = target_label.stack_height,
+                    .label_sp = result_label_sp,
+                    .ip = target_label.target_ip,
+                    .is_ref = (ck == 1 or ck == 3),
+                };
+            }
+        }
+    }
+    return null;
+}
+
+/// Handle an uncaught exception from a callee. Searches the current function's
+/// label stack for a matching try_table handler using the pending exception in env.
+/// Returns true if a handler was found and control flow was redirected.
+fn handleUncaughtException(
+    env: *ExecEnv,
+    labels_slice: []const Label,
+    code: []const u8,
+    label_sp: *u32,
+    ip_out: *usize,
+) TrapError!bool {
+    const thrown_tag = env.pending_exception_tag orelse return false;
+    const param_count = env.pending_exception_param_count;
+    const tags = env.module_inst.tags;
+
+    const catch_result = searchCatchHandler(env, labels_slice, code, thrown_tag, tags);
+    if (catch_result) |cr| {
+        env.sp = cr.stack_height;
+        // Push exception params onto the stack
+        var pi: u32 = 0;
+        while (pi < param_count) : (pi += 1) {
+            try env.push(env.pending_exception_params[pi]);
+        }
+        // For catch_ref / catch_all_ref, also push exnref
+        if (cr.is_ref) {
+            const ref_idx = env.exception_ref_count;
+            if (ref_idx < env.exception_refs.len) {
+                env.exception_refs[ref_idx] = .{
+                    .tag = thrown_tag,
+                    .param_count = param_count,
+                };
+                var qi: u32 = 0;
+                while (qi < param_count) : (qi += 1) {
+                    env.exception_refs[ref_idx].params[qi] = env.pending_exception_params[qi];
+                }
+                env.exception_ref_count = ref_idx + 1;
+            }
+            try env.push(.{ .exnref = ref_idx });
+        }
+        label_sp.* = cr.label_sp;
+        ip_out.* = cr.ip;
+        env.pending_exception_tag = null;
+        return true;
+    }
+    return false;
+}
 
 /// Skip past a single LEB128-encoded integer in `code` starting at `pos`.
 fn skipLeb128(code: []const u8, pos: usize) usize {
@@ -788,52 +901,94 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const tags = env.module_inst.tags;
                 if (tag_idx >= tags.len) return error.Unreachable;
                 const thrown_tag = tags[tag_idx];
-                var found = false;
-                var search_idx: u32 = label_sp;
-                while (search_idx > 0 and !found) {
-                    search_idx -= 1;
-                    const lbl = labels[search_idx];
-                    if (lbl.kind != .try_table) continue;
-                    var scan_ip: usize = lbl.catch_ip;
-                    const n_clauses = readU32(code, &scan_ip);
-                    var cj: u32 = 0;
-                    while (cj < n_clauses) : (cj += 1) {
-                        const ck = readU32(code, &scan_ip);
-                        var clause_tag_idx: ?u32 = null;
-                        if (ck == 0 or ck == 1) clause_tag_idx = readU32(code, &scan_ip);
-                        const label_depth = readU32(code, &scan_ip);
-                        const matched = switch (ck) {
-                            0, 1 => blk: { // catch / catch_ref
-                                if (clause_tag_idx) |cti| {
-                                    if (cti < tags.len)
-                                        break :blk tags[cti] == thrown_tag;
-                                }
-                                break :blk false;
-                            },
-                            2, 3 => true, // catch_all / catch_all_ref
-                            else => false,
-                        };
-                        if (matched) {
-                            // Catch label_depth is like br depth from inside
-                            // the try_table body (depth 0 = try_table itself).
-                            const target_label_idx = search_idx -| label_depth;
-                            const target_label = labels[target_label_idx];
-                            env.sp = target_label.stack_height;
-                            label_sp = target_label_idx;
-                            if (target_label.kind == .loop) {
-                                labels[label_sp] = target_label;
-                                label_sp += 1;
-                            }
-                            ip = target_label.target_ip;
-                            found = true;
-                            break;
-                        }
+                const param_count = thrown_tag.param_arity;
+
+                // Save exception params from stack before any unwinding
+                var exc_params: [16]types.Value = undefined;
+                {
+                    var pi: u32 = param_count;
+                    while (pi > 0) {
+                        pi -= 1;
+                        exc_params[pi] = try env.pop();
                     }
                 }
-                if (!found) return error.Unreachable;
+
+                const catch_result_throw = searchCatchHandler(env, labels[0..label_sp], code, thrown_tag, tags);
+                if (catch_result_throw) |cr| {
+                    env.sp = cr.stack_height;
+                    {
+                        var pi: u32 = 0;
+                        while (pi < param_count) : (pi += 1) {
+                            try env.push(exc_params[pi]);
+                        }
+                    }
+                    // For catch_ref / catch_all_ref, also push exnref
+                    if (cr.is_ref) {
+                        const ref_idx = env.exception_ref_count;
+                        if (ref_idx < env.exception_refs.len) {
+                            env.exception_refs[ref_idx] = .{
+                                .tag = thrown_tag,
+                                .params = exc_params,
+                                .param_count = param_count,
+                            };
+                            env.exception_ref_count = ref_idx + 1;
+                        }
+                        try env.push(.{ .exnref = ref_idx });
+                    }
+                    label_sp = cr.label_sp;
+                    ip = cr.ip;
+                } else {
+                    // No handler in this function — propagate as uncaught exception
+                    env.pending_exception_tag = thrown_tag;
+                    env.pending_exception_param_count = param_count;
+                    var pi: u32 = 0;
+                    while (pi < param_count) : (pi += 1) {
+                        env.pending_exception_params[pi] = exc_params[pi];
+                    }
+                    return error.UncaughtException;
+                }
             },
 
-            .throw_ref, .@"try", .@"catch", .rethrow, .delegate, .catch_all => {
+            .throw_ref => {
+                // throw_ref: pop exnref from stack, re-throw it
+                const exnref_val = try env.pop();
+                const ref_idx = exnref_val.exnref orelse return error.Unreachable;
+                if (ref_idx >= env.exception_ref_count) return error.Unreachable;
+                const exc_ref = env.exception_refs[ref_idx];
+                const thrown_tag = exc_ref.tag orelse return error.Unreachable;
+                const param_count = thrown_tag.param_arity;
+                const tags = env.module_inst.tags;
+
+                var exc_params: [16]types.Value = undefined;
+                var pi: u32 = 0;
+                while (pi < param_count) : (pi += 1) {
+                    exc_params[pi] = exc_ref.params[pi];
+                }
+
+                const catch_result = searchCatchHandler(env, labels[0..label_sp], code, thrown_tag, tags);
+                if (catch_result) |cr| {
+                    env.sp = cr.stack_height;
+                    pi = 0;
+                    while (pi < param_count) : (pi += 1) {
+                        try env.push(exc_params[pi]);
+                    }
+                    if (cr.is_ref) {
+                        try env.push(.{ .exnref = ref_idx });
+                    }
+                    label_sp = cr.label_sp;
+                    ip = cr.ip;
+                } else {
+                    env.pending_exception_tag = thrown_tag;
+                    env.pending_exception_param_count = param_count;
+                    pi = 0;
+                    while (pi < param_count) : (pi += 1) {
+                        env.pending_exception_params[pi] = exc_params[pi];
+                    }
+                    return error.UncaughtException;
+                }
+            },
+
+            .@"try", .@"catch", .rethrow, .delegate, .catch_all => {
                 // Legacy exception opcodes — skip immediates but don't execute
                 return error.Unreachable;
             },
@@ -957,7 +1112,12 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const func_idx = readU32(code, &ip);
                 const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
                 frame.ip = @intCast(ip);
-                try executeFunction(env, func_idx);
+                executeFunction(env, func_idx) catch |err| {
+                    if (err == error.UncaughtException) {
+                        if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
+                    }
+                    return err;
+                };
             },
 
             .call_indirect => {
@@ -993,10 +1153,21 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 if (funcref.module_inst != env.module_inst) {
                     const saved = env.module_inst;
                     env.module_inst = funcref.module_inst;
-                    defer env.module_inst = saved;
-                    try executeFunction(env, funcref.func_idx);
+                    executeFunction(env, funcref.func_idx) catch |err| {
+                        env.module_inst = saved;
+                        if (err == error.UncaughtException) {
+                            if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
+                        }
+                        return err;
+                    };
+                    env.module_inst = saved;
                 } else {
-                    try executeFunction(env, funcref.func_idx);
+                    executeFunction(env, funcref.func_idx) catch |err| {
+                        if (err == error.UncaughtException) {
+                            if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
+                        }
+                        return err;
+                    };
                 }
             },
 
