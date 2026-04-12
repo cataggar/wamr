@@ -31,6 +31,7 @@ pub const ImportContext = struct {
     memories: []const *types.MemoryInstance = &.{},
     tables: []const *types.TableInstance = &.{},
     functions: []const types.ImportedFunction = &.{},
+    tags: []const *types.TagInstance = &.{},
 };
 
 /// Instantiate a module, producing a runnable ModuleInstance.
@@ -48,7 +49,8 @@ pub fn instantiateWithImports(
     const has_imports = module.import_function_count > 0 or
         module.import_global_count > 0 or
         module.import_memory_count > 0 or
-        module.import_table_count > 0;
+        module.import_table_count > 0 or
+        module.import_tag_count > 0;
 
     if (has_imports and import_ctx == null) {
         return error.ImportResolutionFailed;
@@ -78,6 +80,25 @@ pub fn instantiateWithImports(
     if (import_ctx) |ctx| {
         if (ctx.functions.len > 0) {
             inst.import_functions = allocator.dupe(types.ImportedFunction, ctx.functions) catch return error.OutOfMemory;
+        }
+    }
+
+    // Allocate tags: imported tags + locally defined tags
+    const total_tags = module.import_tag_count + @as(u32, @intCast(module.tag_types.len));
+    if (total_tags > 0) {
+        inst.tags = allocator.alloc(*types.TagInstance, total_tags) catch return error.OutOfMemory;
+        // Imported tags: shared pointers from exporting instances
+        if (import_ctx) |ctx| {
+            for (ctx.tags, 0..) |t, i| {
+                inst.tags[i] = t;
+            }
+        }
+        // Locally defined tags: create new instances
+        for (module.tag_types, 0..) |type_idx, i| {
+            const tag = allocator.create(types.TagInstance) catch return error.OutOfMemory;
+            const arity: u32 = if (type_idx < module.types.len) @intCast(module.types[type_idx].params.len) else 0;
+            tag.* = .{ .param_arity = arity };
+            inst.tags[module.import_tag_count + i] = tag;
         }
     }
 
@@ -119,6 +140,9 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, inst.module.import_global_count, allocator);
     if (inst.import_functions.len > 0) allocator.free(inst.import_functions);
+    // Free locally defined tags (imported tags are owned by their source instance)
+    for (inst.tags[inst.module.import_tag_count..]) |t| allocator.destroy(t);
+    if (inst.tags.len > 0) allocator.free(inst.tags);
     if (inst.dropped_elems.len > 0) allocator.free(inst.dropped_elems);
     allocator.destroy(inst);
 }

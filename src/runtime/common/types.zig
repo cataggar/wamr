@@ -161,6 +161,7 @@ pub const ExternalKind = enum(u8) {
     table = 0x01,
     memory = 0x02,
     global = 0x03,
+    tag = 0x04,
 };
 
 /// Wasm section IDs
@@ -224,6 +225,7 @@ pub const ImportDesc = struct {
     table_type: ?TableType = null,
     memory_type: ?MemoryType = null,
     global_type: ?GlobalType = null,
+    tag_type_idx: ?u32 = null,
 };
 
 /// Export descriptor (§2.5.2)
@@ -323,6 +325,8 @@ pub const WasmModule = struct {
     elements: []const ElemSegment = &.{},
     data_segments: []const DataSegment = &.{},
     data_count: ?u32 = null,
+    /// Tag type indices (local tags, excluding imports).
+    tag_types: []const u32 = &.{},
 
     // Derived counts (imports + local definitions)
     import_function_count: u32 = 0,
@@ -373,7 +377,7 @@ pub const WasmModule = struct {
         return raw_tidx;
     }
 
-    fn getRawFuncTypeIdx(self: *const WasmModule, func_idx: u32) ?u32 {
+    pub fn getRawFuncTypeIdx(self: *const WasmModule, func_idx: u32) ?u32 {
         if (func_idx < self.import_function_count) {
             var import_func_idx: u32 = 0;
             for (self.imports) |imp| {
@@ -492,6 +496,12 @@ pub const GlobalInstance = struct {
     }
 };
 
+/// Tag instance (identity via pointer equality).
+pub const TagInstance = struct {
+    /// Number of parameters this tag carries.
+    param_arity: u32,
+};
+
 /// A resolved imported function target
 pub const ImportedFunction = struct {
     module_inst: *ModuleInstance,
@@ -505,6 +515,7 @@ pub const ModuleInstance = struct {
     tables: []*TableInstance,
     globals: []*GlobalInstance,
     import_functions: []const ImportedFunction = &.{},
+    tags: []*TagInstance = &.{},
     allocator: std.mem.Allocator,
     /// Track dropped elem segments (active segments dropped after instantiation)
     dropped_elems: []bool = &.{},
