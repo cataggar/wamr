@@ -147,6 +147,7 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                     continue;
                 } else if (wr.isModuleInstance(sexpr.text)) {
                     // (module instance $inst $def) — compile a fresh copy from the definition
+                    var inst_name: ?[]const u8 = null;
                     const def_name = blk: {
                         var i: usize = 1;
                         while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
@@ -154,8 +155,10 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                         while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
                         i += 8; // "instance"
                         while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
-                        // Skip instance name
+                        // Extract instance name
+                        const ins = i;
                         while (i < sexpr.text.len and sexpr.text[i] != ' ' and sexpr.text[i] != '\t' and sexpr.text[i] != ')') : (i += 1) {}
+                        inst_name = sexpr.text[ins..i];
                         while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t')) : (i += 1) {}
                         // Extract def name
                         const ds = i;
@@ -185,7 +188,11 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                         try modules.put(allocator, filename, wasm_bytes);
                         const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
                         defer allocator.free(fn2);
-                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                        if (inst_name) |iname| {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\",\"name\":\"{s}\"}}", .{ line_num, fn2, iname });
+                        } else {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                        }
                         module_idx += 1;
                     } else {
                         try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
