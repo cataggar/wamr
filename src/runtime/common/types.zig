@@ -290,10 +290,21 @@ pub const ElemSegment = struct {
     pub const ElemKind = enum { func_ref, extern_ref };
 };
 
+/// Rec group boundary for a type (used for iso-recursive equivalence).
+pub const RecGroupInfo = struct {
+    group_start: u32,
+    group_size: u32,
+};
+
 /// Full parsed WebAssembly module
 pub const WasmModule = struct {
     // Sections
     types: []const FuncType = &.{},
+    /// Rec group info parallel to types (same length).
+    rec_groups: []const RecGroupInfo = &.{},
+    /// Canonical type index mapping (same length as types).
+    /// canonical_type_map[i] = the canonical index for type i.
+    canonical_type_map: []const u32 = &.{},
     imports: []const ImportDesc = &.{},
     functions: []const WasmFunction = &.{},
     tables: []const TableType = &.{},
@@ -347,7 +358,14 @@ pub const WasmModule = struct {
     }
 
     /// Get the type index for a given function index (import or local).
+    /// Returns the canonical type index if a canonical mapping exists.
     pub fn getFuncTypeIdx(self: *const WasmModule, func_idx: u32) ?u32 {
+        const raw_tidx = self.getRawFuncTypeIdx(func_idx) orelse return null;
+        if (raw_tidx < self.canonical_type_map.len) return self.canonical_type_map[raw_tidx];
+        return raw_tidx;
+    }
+
+    fn getRawFuncTypeIdx(self: *const WasmModule, func_idx: u32) ?u32 {
         if (func_idx < self.import_function_count) {
             var import_func_idx: u32 = 0;
             for (self.imports) |imp| {
