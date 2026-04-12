@@ -88,6 +88,9 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
     var module_idx: u32 = 0;
     var first = true;
 
+    // Storage for module definitions (module definition $name ...)
+    var module_defs: std.StringHashMapUnmanaged([]const u8) = .{};
+
     while (pos < source.len) {
         pos = wr.skipWhitespaceAndComments(source, pos);
         if (pos >= source.len) break;
@@ -105,6 +108,91 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
         const cmd = wr.classifyCommand(sexpr.text);
         switch (cmd) {
             .module => {
+                // Handle module definition/instance syntax
+                if (wr.isModuleDefinition(sexpr.text)) {
+                    // Store the definition text for later instantiation
+                    if (wr.extractModuleDefName(sexpr.text)) |name| {
+                        module_defs.put(allocator, name, sexpr.text) catch {};
+                    }
+                    // Compile it as a normal module (strip the definition keyword)
+                    const stripped = wr.stripDefinitionKeyword(allocator, sexpr.text) orelse {
+                        try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
+                        continue;
+                    };
+                    defer allocator.free(stripped);
+                    const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    var mod = wabt.text.Parser.parseModule(allocator, stripped) catch {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                        allocator.free(filename);
+                        module_idx += 1;
+                        continue;
+                    };
+                    defer mod.deinit();
+                    const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                        allocator.free(filename);
+                        module_idx += 1;
+                        continue;
+                    };
+                    try modules.put(allocator, filename, wasm_bytes);
+                    const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    defer allocator.free(fn2);
+                    const mod_name = extractModuleName(sexpr.text);
+                    if (mod_name) |mn| {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\",\"name\":\"{s}\"}}", .{ line_num, fn2, mn });
+                    } else {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                    }
+                    module_idx += 1;
+                    continue;
+                } else if (wr.isModuleInstance(sexpr.text)) {
+                    // (module instance $inst $def) — compile a fresh copy from the definition
+                    const def_name = blk: {
+                        var i: usize = 1;
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
+                        i += 6; // "module"
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
+                        i += 8; // "instance"
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
+                        // Skip instance name
+                        while (i < sexpr.text.len and sexpr.text[i] != ' ' and sexpr.text[i] != '\t' and sexpr.text[i] != ')') : (i += 1) {}
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t')) : (i += 1) {}
+                        // Extract def name
+                        const ds = i;
+                        while (i < sexpr.text.len and sexpr.text[i] != ' ' and sexpr.text[i] != '\t' and sexpr.text[i] != ')') : (i += 1) {}
+                        break :blk sexpr.text[ds..i];
+                    };
+                    if (module_defs.get(def_name)) |def_text| {
+                        const stripped = wr.stripDefinitionKeyword(allocator, def_text) orelse {
+                            try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
+                            continue;
+                        };
+                        defer allocator.free(stripped);
+                        const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                        var mod = wabt.text.Parser.parseModule(allocator, stripped) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        defer mod.deinit();
+                        const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        try modules.put(allocator, filename, wasm_bytes);
+                        const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                        defer allocator.free(fn2);
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                        module_idx += 1;
+                    } else {
+                        try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
+                    }
+                    continue;
+                }
+
                 const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
                 if (wr.isBinaryOrQuoteModule(sexpr.text)) {
                     if (wr.isBinaryModule(sexpr.text)) {
