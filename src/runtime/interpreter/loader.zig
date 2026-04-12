@@ -2932,7 +2932,12 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                                 shift +|= 7;
                             }
                         }
-                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, concrete_tidx);
+                        // Canonicalize the type index for iso-recursive equivalence
+                        const canon_tidx = if (concrete_tidx < module.canonical_type_map.len)
+                            module.canonical_type_map[concrete_tidx]
+                        else
+                            concrete_tidx;
+                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, canon_tidx);
                     }
                 }
             },
