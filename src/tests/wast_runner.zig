@@ -146,31 +146,8 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                     module_idx += 1;
                     continue;
                 } else if (hasDefinitionKw(sexpr.text)) {
-                    // Unnamed module definition — strip keyword and compile
-                    const stripped = wr.stripDefinitionKeyword(allocator, sexpr.text) orelse {
-                        try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
-                        continue;
-                    };
-                    defer allocator.free(stripped);
-                    const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
-                    var mod = wabt.text.Parser.parseModule(allocator, stripped) catch {
-                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
-                        allocator.free(filename);
-                        module_idx += 1;
-                        continue;
-                    };
-                    defer mod.deinit();
-                    const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
-                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
-                        allocator.free(filename);
-                        module_idx += 1;
-                        continue;
-                    };
-                    try modules.put(allocator, filename, wasm_bytes);
-                    const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
-                    defer allocator.free(fn2);
-                    try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
-                    module_idx += 1;
+                    // Unnamed module definition — just validate, don't instantiate
+                    first = true; // undo the comma
                     continue;
                 } else if (wr.isModuleInstance(sexpr.text)) {
                     // (module instance $inst $def) — compile a fresh copy from the definition
