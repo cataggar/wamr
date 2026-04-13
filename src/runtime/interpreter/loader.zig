@@ -3278,8 +3278,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     } else if (ht == 0x6A) {
                         pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
                     } else if (ht == 0x65) {
-                        // none → bottom of func hierarchy (internal bottom)
-                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, BOTTOM_FUNC_TIDX);
+                        // none → nullref (bottom of any hierarchy)
+                        pushV(&stack_buf, &sp, .nullref, &stack_tidx, BOTTOM_FUNC_TIDX);
                     } else {
                         // Concrete type index: parse LEB128 and track it
                         var concrete_tidx: u32 = ht & 0x7F;
