@@ -522,6 +522,28 @@ fn funcTypesMatch(a: types.FuncType, b: types.FuncType) bool {
     return true;
 }
 
+/// Determine the relative position of a type reference within a rec group,
+/// accounting for canonicalization. After canonicalization, a reference that
+/// was originally internal (pointing within the rec group) may now point to
+/// the canonical representative in a different equivalent group. This helper
+/// detects that case via the canonical_type_map. Returns null if external.
+fn internalRelativePos(tidx: u32, rg: types.RecGroupInfo, module: *const types.WasmModule) ?u32 {
+    // Direct range check
+    if (tidx >= rg.group_start and tidx < rg.group_start + rg.group_size)
+        return tidx - rg.group_start;
+    // Check if tidx is canonically equivalent to some type in the group
+    if (tidx < module.canonical_type_map.len) {
+        const canon = module.canonical_type_map[tidx];
+        var i: u32 = 0;
+        while (i < rg.group_size) : (i += 1) {
+            const gi = rg.group_start + i;
+            if (gi < module.canonical_type_map.len and module.canonical_type_map[gi] == canon)
+                return i;
+        }
+    }
+    return null;
+}
+
 /// Cross-module type equivalence check using iso-recursive rec group semantics.
 /// Two types from different modules are equivalent iff they occupy the same
 /// relative position within rec groups that have identical structure.
@@ -556,15 +578,14 @@ fn crossModuleTypesMatch(
     // Check supertype equivalence (cross-module recursive check)
     if (ft_a.supertype_idx != 0xFFFFFFFF or ft_b.supertype_idx != 0xFFFFFFFF) {
         if (ft_a.supertype_idx == 0xFFFFFFFF or ft_b.supertype_idx == 0xFFFFFFFF) return false;
-        // Supertypes that are internal to the rec group: compare by relative position
-        const a_internal = ft_a.supertype_idx >= rg_a.group_start and ft_a.supertype_idx < rg_a.group_start + rg_a.group_size;
-        const b_internal = ft_b.supertype_idx >= rg_b.group_start and ft_b.supertype_idx < rg_b.group_start + rg_b.group_size;
-        if (a_internal and b_internal) {
-            if (ft_a.supertype_idx - rg_a.group_start != ft_b.supertype_idx - rg_b.group_start) return false;
-        } else if (!a_internal and !b_internal) {
+        const rel_a = internalRelativePos(ft_a.supertype_idx, rg_a, mod_a);
+        const rel_b = internalRelativePos(ft_b.supertype_idx, rg_b, mod_b);
+        if (rel_a != null and rel_b != null) {
+            if (rel_a.? != rel_b.?) return false;
+        } else if (rel_a == null and rel_b == null) {
             if (!crossModuleTypesMatch(mod_a, ft_a.supertype_idx, mod_b, ft_b.supertype_idx)) return false;
         } else {
-            return false; // one internal, one external
+            return false;
         }
     }
 
@@ -583,24 +604,24 @@ fn crossModuleTypesMatch(
             // Check supertype match for each entry
             if (ta.supertype_idx != 0xFFFFFFFF or tb.supertype_idx != 0xFFFFFFFF) {
                 if (ta.supertype_idx == 0xFFFFFFFF or tb.supertype_idx == 0xFFFFFFFF) return false;
-                const ai_int = ta.supertype_idx >= rg_a.group_start and ta.supertype_idx < rg_a.group_start + rg_a.group_size;
-                const bi_int = tb.supertype_idx >= rg_b.group_start and tb.supertype_idx < rg_b.group_start + rg_b.group_size;
-                if (ai_int and bi_int) {
-                    if (ta.supertype_idx - rg_a.group_start != tb.supertype_idx - rg_b.group_start) return false;
-                } else if (!ai_int and !bi_int) {
+                const ai_rel = internalRelativePos(ta.supertype_idx, rg_a, mod_a);
+                const bi_rel = internalRelativePos(tb.supertype_idx, rg_b, mod_b);
+                if (ai_rel != null and bi_rel != null) {
+                    if (ai_rel.? != bi_rel.?) return false;
+                } else if (ai_rel == null and bi_rel == null) {
                     if (!crossModuleTypesMatch(mod_a, ta.supertype_idx, mod_b, tb.supertype_idx)) return false;
                 } else return false;
             }
             // Check field type references
             if (ta.field_tidxs.len != tb.field_tidxs.len) return false;
             for (ta.field_tidxs, tb.field_tidxs) |fa, fb| {
-                const fa_int = fa >= rg_a.group_start and fa < rg_a.group_start + rg_a.group_size;
-                const fb_int = fb >= rg_b.group_start and fb < rg_b.group_start + rg_b.group_size;
-                if (fa_int and fb_int) {
-                    if (fa - rg_a.group_start != fb - rg_b.group_start) return false;
-                } else if (fa == 0xFFFFFFFF and fb == 0xFFFFFFFF) {
-                    continue;
-                } else if (!fa_int and !fb_int and fa != 0xFFFFFFFF and fb != 0xFFFFFFFF) {
+                if (fa == 0xFFFFFFFF and fb == 0xFFFFFFFF) continue;
+                if (fa == 0xFFFFFFFF or fb == 0xFFFFFFFF) return false;
+                const fa_rel = internalRelativePos(fa, rg_a, mod_a);
+                const fb_rel = internalRelativePos(fb, rg_b, mod_b);
+                if (fa_rel != null and fb_rel != null) {
+                    if (fa_rel.? != fb_rel.?) return false;
+                } else if (fa_rel == null and fb_rel == null) {
                     if (!crossModuleTypesMatch(mod_a, fa, mod_b, fb)) return false;
                 } else return false;
             }
@@ -609,11 +630,11 @@ fn crossModuleTypesMatch(
             for (ta.param_tidxs, tb.param_tidxs) |pa, pb| {
                 if (pa == 0xFFFFFFFF and pb == 0xFFFFFFFF) continue;
                 if (pa == 0xFFFFFFFF or pb == 0xFFFFFFFF) return false;
-                const pa_int = pa >= rg_a.group_start and pa < rg_a.group_start + rg_a.group_size;
-                const pb_int = pb >= rg_b.group_start and pb < rg_b.group_start + rg_b.group_size;
-                if (pa_int and pb_int) {
-                    if (pa - rg_a.group_start != pb - rg_b.group_start) return false;
-                } else if (!pa_int and !pb_int) {
+                const pa_rel = internalRelativePos(pa, rg_a, mod_a);
+                const pb_rel = internalRelativePos(pb, rg_b, mod_b);
+                if (pa_rel != null and pb_rel != null) {
+                    if (pa_rel.? != pb_rel.?) return false;
+                } else if (pa_rel == null and pb_rel == null) {
                     if (!crossModuleTypesMatch(mod_a, pa, mod_b, pb)) return false;
                 } else return false;
             }
@@ -621,11 +642,11 @@ fn crossModuleTypesMatch(
             for (ta.result_tidxs, tb.result_tidxs) |ra, rb| {
                 if (ra == 0xFFFFFFFF and rb == 0xFFFFFFFF) continue;
                 if (ra == 0xFFFFFFFF or rb == 0xFFFFFFFF) return false;
-                const ra_int = ra >= rg_a.group_start and ra < rg_a.group_start + rg_a.group_size;
-                const rb_int = rb >= rg_b.group_start and rb < rg_b.group_start + rg_b.group_size;
-                if (ra_int and rb_int) {
-                    if (ra - rg_a.group_start != rb - rg_b.group_start) return false;
-                } else if (!ra_int and !rb_int) {
+                const ra_rel = internalRelativePos(ra, rg_a, mod_a);
+                const rb_rel = internalRelativePos(rb, rg_b, mod_b);
+                if (ra_rel != null and rb_rel != null) {
+                    if (ra_rel.? != rb_rel.?) return false;
+                } else if (ra_rel == null and rb_rel == null) {
                     if (!crossModuleTypesMatch(mod_a, ra, mod_b, rb)) return false;
                 } else return false;
             }
