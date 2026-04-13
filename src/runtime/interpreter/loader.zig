@@ -3159,21 +3159,29 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
             0x1C => { // select_t
                 const count_sel = readU32Leb(code, &i);
-                if (count_sel == 0 or i >= code.len) return error.TypeMismatch;
-                const type_byte = code[i];
-                // Validate the type is a known valtype
-                const sel_type: VT = switch (type_byte) {
-                    0x7F, 0x7E, 0x7D, 0x7C, 0x70, 0x6F => @enumFromInt(type_byte),
-                    else => return error.TypeMismatch,
-                };
-                i += count_sel;
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                if (count_sel == 0) {
+                    // Empty select_t in unreachable code is valid
+                    const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
+                    const is_unreachable = cf != null and cf.?.unreachable_flag;
+                    if (!is_unreachable) return error.TypeMismatch;
+                    pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                } else if (i >= code.len) {
                     return error.TypeMismatch;
-                if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
-                    return error.TypeMismatch;
-                if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
-                    return error.TypeMismatch;
-                pushType(&stack_buf, &sp, sel_type, &stack_tidx);
+                } else {
+                    const type_byte = code[i];
+                    const sel_type: VT = switch (type_byte) {
+                        0x7F, 0x7E, 0x7D, 0x7C, 0x7B, 0x70, 0x6F, 0x6E => @enumFromInt(type_byte),
+                        else => return error.TypeMismatch,
+                    };
+                    i += count_sel;
+                    if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        return error.TypeMismatch;
+                    if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        return error.TypeMismatch;
+                    if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        return error.TypeMismatch;
+                    pushType(&stack_buf, &sp, sel_type, &stack_tidx);
+                }
             },
 
             // local.get

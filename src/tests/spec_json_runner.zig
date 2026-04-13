@@ -604,6 +604,31 @@ fn crossModuleTypesMatch(
                     if (!crossModuleTypesMatch(mod_a, fa, mod_b, fb)) return false;
                 } else return false;
             }
+            // Check param/result type references for function types
+            if (ta.param_tidxs.len != tb.param_tidxs.len) return false;
+            for (ta.param_tidxs, tb.param_tidxs) |pa, pb| {
+                if (pa == 0xFFFFFFFF and pb == 0xFFFFFFFF) continue;
+                if (pa == 0xFFFFFFFF or pb == 0xFFFFFFFF) return false;
+                const pa_int = pa >= rg_a.group_start and pa < rg_a.group_start + rg_a.group_size;
+                const pb_int = pb >= rg_b.group_start and pb < rg_b.group_start + rg_b.group_size;
+                if (pa_int and pb_int) {
+                    if (pa - rg_a.group_start != pb - rg_b.group_start) return false;
+                } else if (!pa_int and !pb_int) {
+                    if (!crossModuleTypesMatch(mod_a, pa, mod_b, pb)) return false;
+                } else return false;
+            }
+            if (ta.result_tidxs.len != tb.result_tidxs.len) return false;
+            for (ta.result_tidxs, tb.result_tidxs) |ra, rb| {
+                if (ra == 0xFFFFFFFF and rb == 0xFFFFFFFF) continue;
+                if (ra == 0xFFFFFFFF or rb == 0xFFFFFFFF) return false;
+                const ra_int = ra >= rg_a.group_start and ra < rg_a.group_start + rg_a.group_size;
+                const rb_int = rb >= rg_b.group_start and rb < rg_b.group_start + rg_b.group_size;
+                if (ra_int and rb_int) {
+                    if (ra - rg_a.group_start != rb - rg_b.group_start) return false;
+                } else if (!ra_int and !rb_int) {
+                    if (!crossModuleTypesMatch(mod_a, ra, mod_b, rb)) return false;
+                } else return false;
+            }
         }
     }
 
