@@ -322,6 +322,10 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x7D => .{ .vt = .f32, .tidx = NO_TIDX },
         0x7C => .{ .vt = .f64, .tidx = NO_TIDX },
         0x7B => .{ .vt = .v128, .tidx = NO_TIDX },
+        // GC packed storage types (used in struct/array fields, treated as i32 at runtime)
+        0x7A => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type
+        0x79 => .{ .vt = .i32, .tidx = NO_TIDX }, // i16 storage type
+        0x78 => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type (alias)
         0x70 => .{ .vt = .funcref, .tidx = NO_TIDX },
         0x6F => .{ .vt = .externref, .tidx = NO_TIDX },
         // GC proposal shorthand types (single-byte nullable ref types)
@@ -643,6 +647,27 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
                     0x1C => {}, // ref.i31: pop i32, push i31ref (net 0)
                     0x1A => {}, // any.convert_extern: pop externref, push anyref (net 0)
                     0x1B => {}, // extern.convert_any: pop anyref, push externref (net 0)
+                    0x00 => { // struct.new: pop N fields, push structref
+                        const tidx = try reader.readU32();
+                        _ = tidx; // type index consumed
+                    },
+                    0x01 => { _ = try reader.readU32(); stack_depth += 1; }, // struct.new_default: push structref
+                    0x08 => { // array.new_fixed: type_idx + count → pop count, push 1
+                        _ = try reader.readU32();
+                        const count: i32 = @intCast(try reader.readU32());
+                        if (stack_depth >= count) stack_depth -= count;
+                        stack_depth += 1;
+                    },
+                    0x02, 0x03, 0x04 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.get: net 0
+                    0x05 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.set
+                    0x06, 0x07 => { _ = try reader.readU32(); }, // array.new/new_default
+                    0x09, 0x0A => { _ = try reader.readU32(); _ = try reader.readU32(); }, // array.new_data/elem
+                    0x0B, 0x0C, 0x0D => { _ = try reader.readU32(); }, // array.get
+                    0x0E => { _ = try reader.readU32(); }, // array.set
+                    0x0F => {}, // array.len
+                    0x10, 0x11, 0x12, 0x13 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // array.fill/copy/init
+                    0x14, 0x15 => { _ = try reader.readU32(); }, // ref.test
+                    0x16, 0x17 => { _ = try reader.readU32(); }, // ref.cast
                     else => return error.InvalidInitExpr,
                 }
             },
