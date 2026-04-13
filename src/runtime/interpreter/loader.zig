@@ -3575,14 +3575,25 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
-                    // Comparison ops [v128 v128] -> [v128]: eq, ne, lt, gt, le, ge (all shapes)
-                    0x23...0x40 => {
+                    // Comparison ops [v128 v128] -> [v128]: i8x16..i64x2 + f32x4 + f64x2
+                    0x23...0x4C => {
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
-                    // v128 unary: [v128] -> [v128] (not, neg, abs, etc.)
-                    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52 => {
+                    // v128 bitwise: not [v128]->[v128], and/or/xor/andnot [v128 v128]->[v128], bitselect [v128 v128 v128]->[v128]
+                    0x4D => { // v128.not: unary
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    0x4E, 0x4F, 0x50, 0x51 => { // v128.and/andnot/or/xor: binary
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    0x52 => { // v128.bitselect: [v128 v128 v128] -> [v128]
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
@@ -3591,28 +3602,38 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
-                    // All remaining SIMD: categorize by opcode range
+                    // All remaining SIMD: categorize by opcode
                     else => {
-                        // Bitmask/all_true ops return i32: 0x62, 0x63, 0x82, 0x83, 0xA3, 0xA4, 0xC3, 0xC4
+                        // Bitmask/all_true ops return i32
                         if (sub == 0x62 or sub == 0x63 or sub == 0x82 or sub == 0x83 or
                             sub == 0xA3 or sub == 0xA4 or sub == 0xC3 or sub == 0xC4)
                         {
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .i32, &stack_tidx);
                         }
-                        // Binary v128 ops (add, sub, mul, etc.): [v128 v128] -> [v128]
-                        else if ((sub >= 0x5E and sub <= 0x61) or // i8x16 arith
-                            (sub >= 0x64 and sub <= 0x81) or // i8x16 more + i16x8
-                            (sub >= 0x84 and sub <= 0xA2) or // i16x8 more + i32x4
-                            (sub >= 0xA5 and sub <= 0xC2) or // i32x4 more + i64x2
-                            (sub >= 0xC5 and sub <= 0xFF) or // i64x2 more + f32x4/f64x2
-                            sub >= 0x100) // extended ops
+                        // Unary ops [v128]->[v128]: abs, neg, popcnt, ceil, floor, trunc, nearest, sqrt, extend, convert, trunc_sat, demote, promote
+                        else if (sub == 0x60 or sub == 0x61 or // i8x16 abs/neg/popcnt
+                            sub == 0x80 or sub == 0x81 or // i16x8 abs/neg
+                            (sub >= 0x94 and sub <= 0x9F) or // i16x8 extend + i32x4 extend_low/high
+                            sub == 0xA0 or sub == 0xA1 or sub == 0xA2 or // i32x4 abs/neg
+                            sub == 0xBF or // i32x4.trunc_sat
+                            sub == 0xC0 or sub == 0xC1 or sub == 0xC2 or // i64x2 abs/neg
+                            (sub >= 0xD4 and sub <= 0xD7) or // i64x2 extend
+                            sub == 0xE0 or sub == 0xE1 or sub == 0xE3 or // f32x4 abs/neg/sqrt
+                            (sub >= 0xF0 and sub <= 0xF3) or // f32x4 trunc_sat
+                            sub == 0xEC or sub == 0xED or sub == 0xEF or // f64x2 abs/neg/sqrt
+                            sub == 0xFE or sub == 0xFF or // f64x2 convert
+                            sub == 0xFC or sub == 0xFD or // f64x2 promote/demote
+                            sub == 0x5E or sub == 0x5F or // i8x16 narrow_i16x8
+                            sub == 0x14 or // i8x16.swizzle — but already handled above
+                            (sub >= 0x100 and sub <= 0x107)) // extended unary
                         {
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .v128, &stack_tidx);
-                        } else {
-                            // Unary fallback
+                        }
+                        // Default: binary [v128 v128]->[v128]
+                        else {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .v128, &stack_tidx);
                         }
