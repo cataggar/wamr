@@ -3621,17 +3621,14 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                             sub == 0x94 or // f64x2.nearest
                             sub == 0xA0 or sub == 0xA1 or sub == 0xA2 or // i32x4 abs/neg
                             (sub >= 0xA7 and sub <= 0xAA) or // i32x4 extend_low/high
-                            sub == 0xB7 or // i32x4.trunc_sat_f64x2_s_zero
-                            sub == 0xBF or // i32x4.trunc_sat_f32x4_s
                             sub == 0xC0 or sub == 0xC1 or sub == 0xC2 or // i64x2 abs/neg
                             (sub >= 0xC7 and sub <= 0xCA) or // i64x2 extend_low/high
-                            sub == 0xCF or // f32x4.convert_i32x4_s
-                            sub == 0xD0 or sub == 0xD1 or // f32x4.convert
-                            (sub >= 0xD4 and sub <= 0xD7) or // i64x2 sconvert/uconvert
                             sub == 0xE0 or sub == 0xE1 or sub == 0xE3 or // f32x4 abs/neg/sqrt
                             sub == 0xEC or sub == 0xED or sub == 0xEF or // f64x2 abs/neg/sqrt
-                            sub == 0xF7 or sub == 0xF8 or sub == 0xF9 or sub == 0xFA or // trunc_sat
-                            sub == 0xFB or sub == 0xFC or sub == 0xFD or sub == 0xFE or sub == 0xFF) // convert/promote/demote
+                            sub == 0xF8 or sub == 0xF9 or // i32x4.trunc_sat_f32x4
+                            sub == 0xFA or sub == 0xFB or // f32x4.convert_i32x4
+                            sub == 0xFC or sub == 0xFD or // i32x4.trunc_sat_f64x2_zero
+                            sub == 0xFE or sub == 0xFF) // f64x2.convert_low_i32x4
                         {
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .v128, &stack_tidx);
