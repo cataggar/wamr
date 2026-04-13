@@ -225,12 +225,23 @@ fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInst
         0x6B => { // struct
             return switch (ref) {
                 .structref => |r| if (r != null) @as(i32, 1) else 0,
+                .anyref, .eqref => |r| blk: {
+                    if (r == null) break :blk @as(i32, 0);
+                    // Check if the GC object is a struct
+                    const obj = getGcObject(module_inst, r.?) orelse break :blk 0;
+                    break :blk if (obj.type_idx < module_inst.module.types.len and module_inst.module.types[obj.type_idx].kind == .struct_) @as(i32, 1) else 0;
+                },
                 else => 0,
             };
         },
         0x6A => { // array
             return switch (ref) {
                 .arrayref => |r| if (r != null) @as(i32, 1) else 0,
+                .anyref, .eqref => |r| blk: {
+                    if (r == null) break :blk @as(i32, 0);
+                    const obj = getGcObject(module_inst, r.?) orelse break :blk 0;
+                    break :blk if (obj.type_idx < module_inst.module.types.len and module_inst.module.types[obj.type_idx].kind == .array) @as(i32, 1) else 0;
+                },
                 else => 0,
             };
         },
@@ -2924,8 +2935,18 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     0x14, 0x15 => { // ref.test, ref.test_nullable: [ref] -> [i32]
                         const heap_type = readU32(code, &ip);
                         const ref = try env.pop();
-                        const is_match: i32 = refTestMatch(ref, heap_type, env.module_inst);
-                        try env.pushI32(is_match);
+                        const is_null = switch (ref) {
+                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
+                            .externref, .nonexternref => |r| r == null,
+                            .exnref => |r| r == null,
+                            else => true,
+                        };
+                        if (is_null) {
+                            // For nullable test (0x15), null always matches; for non-nullable (0x14), null never matches
+                            try env.pushI32(if (sub_op == 0x15) @as(i32, 1) else @as(i32, 0));
+                        } else {
+                            try env.pushI32(refTestMatch(ref, heap_type, env.module_inst));
+                        }
                     },
                     0x16, 0x17 => { // ref.cast, ref.cast_nullable
                         const heap_type = readU32(code, &ip);
