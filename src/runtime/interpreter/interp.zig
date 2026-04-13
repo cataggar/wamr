@@ -2713,6 +2713,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const is_null = switch (val) {
                     .funcref, .nonfuncref => |r| r == null,
                     .externref, .nonexternref => |r| r == null,
+                    .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => |r| r == null,
+                    .exnref => |r| r == null,
                     else => false,
                 };
                 if (is_null) {
@@ -2765,6 +2767,8 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const is_null = switch (val) {
                     .funcref, .nonfuncref => |r| r == null,
                     .externref, .nonexternref => |r| r == null,
+                    .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => |r| r == null,
+                    .exnref => |r| r == null,
                     else => true,
                 };
                 if (!is_null) {
