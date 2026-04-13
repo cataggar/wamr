@@ -302,7 +302,7 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
 }
 
 /// A value type paired with its concrete type index.
-const ValTypeTidx = struct { vt: types.ValType, tidx: u32 };
+const ValTypeTidx = struct { vt: types.ValType, tidx: u32, pack: u8 = 0 };
 
 fn readValType(reader: *BinaryReader) LoadError!types.ValType {
     return (try readValTypeWithTidx(reader, null)).vt;
@@ -323,10 +323,10 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x7C => .{ .vt = .f64, .tidx = NO_TIDX },
         0x7B => .{ .vt = .v128, .tidx = NO_TIDX },
         // GC packed storage types (used in struct/array fields, treated as i32 at runtime)
-        0x7A => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type (legacy encoding)
-        0x79 => .{ .vt = .i32, .tidx = NO_TIDX }, // i16 storage type (legacy encoding)
-        0x78 => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type
-        0x77 => .{ .vt = .i32, .tidx = NO_TIDX }, // i16 storage type
+        0x7A => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 1 }, // i8 storage type (legacy encoding)
+        0x79 => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 2 }, // i16 storage type (legacy encoding)
+        0x78 => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 1 }, // i8 storage type
+        0x77 => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 2 }, // i16 storage type
         0x70 => .{ .vt = .funcref, .tidx = NO_TIDX },
         0x6F => .{ .vt = .externref, .tidx = NO_TIDX },
         // GC proposal shorthand types (single-byte nullable ref types)
@@ -788,7 +788,9 @@ fn parseStructType(reader: *BinaryReader, allocator: std.mem.Allocator, max_type
         const info = try readValTypeWithTidx(reader, max_types);
         ftidxs[fi] = info.tidx;
         ftypes[fi] = info.vt;
-        fmuts[fi] = try reader.readByte(); // mutability
+        const mut_byte = try reader.readByte(); // mutability (bit 0)
+        // Encode packed type in high bits: bit 4 = i8, bit 5 = i16
+        fmuts[fi] = mut_byte | (@as(u8, info.pack) << 4);
     }
     return .{ .params = &.{}, .results = &.{}, .kind = .struct_, .field_tidxs = ftidxs, .field_types = ftypes, .field_muts = fmuts };
 }

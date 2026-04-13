@@ -370,7 +370,7 @@ fn gcStructNew(env: *ExecEnv, type_idx: u32, is_default: bool) TrapError!void {
     try env.push(.{ .structref = obj_idx });
 }
 
-fn gcStructGet(env: *ExecEnv, _: u32, field_idx: u32, _: u32) TrapError!void {
+fn gcStructGet(env: *ExecEnv, type_idx: u32, field_idx: u32, sub_op: u32) TrapError!void {
     const ref = try env.pop();
     const obj_idx = switch (ref) {
         .structref, .anyref, .eqref, .nullref => |r| r orelse return error.Unreachable,
@@ -379,12 +379,40 @@ fn gcStructGet(env: *ExecEnv, _: u32, field_idx: u32, _: u32) TrapError!void {
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     if (field_idx >= obj.fields.len) return error.Unreachable;
     const val = obj.fields[field_idx];
-    // For packed types, struct.get_s/get_u would apply sign/zero extension
-    // Currently field storage matches runtime type, so pass through
+
+    // For packed types (i8/i16), struct.get_s/get_u apply sign/zero extension
+    if (sub_op == 0x03 or sub_op == 0x04) {
+        const module = env.module_inst.module;
+        if (type_idx < module.types.len) {
+            const ft = module.types[type_idx];
+            if (field_idx < ft.field_muts.len) {
+                const packed_type = ft.field_muts[field_idx] >> 4; // 1=i8, 2=i16
+                const raw: u32 = @bitCast(val.i32);
+                if (packed_type == 1) { // i8
+                    if (sub_op == 0x03) { // struct.get_s
+                        const byte: i8 = @bitCast(@as(u8, @truncate(raw)));
+                        try env.pushI32(@as(i32, byte));
+                    } else { // struct.get_u
+                        try env.pushI32(@as(i32, @as(u8, @truncate(raw))));
+                    }
+                    return;
+                } else if (packed_type == 2) { // i16
+                    if (sub_op == 0x03) { // struct.get_s
+                        const short: i16 = @bitCast(@as(u16, @truncate(raw)));
+                        try env.pushI32(@as(i32, short));
+                    } else { // struct.get_u
+                        try env.pushI32(@as(i32, @as(u16, @truncate(raw))));
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
     try env.push(val);
 }
 
-fn gcStructSet(env: *ExecEnv, _: u32, field_idx: u32) TrapError!void {
+fn gcStructSet(env: *ExecEnv, type_idx: u32, field_idx: u32) TrapError!void {
     const val = try env.pop();
     const ref = try env.pop();
     const obj_idx = switch (ref) {
@@ -393,6 +421,21 @@ fn gcStructSet(env: *ExecEnv, _: u32, field_idx: u32) TrapError!void {
     };
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     if (field_idx >= obj.fields.len) return error.Unreachable;
+    // Truncate for packed fields
+    const module = env.module_inst.module;
+    if (type_idx < module.types.len) {
+        const ft = module.types[type_idx];
+        if (field_idx < ft.field_muts.len) {
+            const packed_type = ft.field_muts[field_idx] >> 4;
+            if (packed_type == 1) { // i8
+                obj.fields[field_idx] = .{ .i32 = @as(i32, @as(u8, @truncate(@as(u32, @bitCast(val.i32))))) };
+                return;
+            } else if (packed_type == 2) { // i16
+                obj.fields[field_idx] = .{ .i32 = @as(i32, @as(u16, @truncate(@as(u32, @bitCast(val.i32))))) };
+                return;
+            }
+        }
+    }
     obj.fields[field_idx] = val;
 }
 
