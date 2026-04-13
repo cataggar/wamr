@@ -328,16 +328,15 @@ fn buildImportContext(
             },
             .table => {
                 if (is_spectest) {
-                    if (!std.mem.eql(u8, imp.field_name, "table"))
+                    if (!std.mem.eql(u8, imp.field_name, "table") and !std.mem.eql(u8, imp.field_name, "table64"))
                         return error.ImportResolutionFailed;
                     const tt = imp.table_type orelse types.TableType{ .elem_type = .funcref, .limits = .{ .min = 10 } };
-                    // Spectest table is i32; reject i64 imports
-                    if (tt.is_table64) return error.ImportResolutionFailed;
                     if (!tt.elem_type.isFuncRef()) return error.ImportResolutionFailed;
                     if (!limitsMatch(.{ .min = 10, .max = @as(?u32, 20) }, tt.limits))
                         return error.ImportResolutionFailed;
-                    tables.append(allocator, makeSpectestTable(allocator) orelse
-                        return error.ImportResolutionFailed) catch return error.ImportResolutionFailed;
+                    const tbl = makeSpectestTable(allocator, tt.is_table64) orelse
+                        return error.ImportResolutionFailed;
+                    tables.append(allocator, tbl) catch return error.ImportResolutionFailed;
                 } else {
                     const ri = reg_inst.?;
                     const exp = ri.module.findExport(imp.field_name, .table) orelse
@@ -645,11 +644,11 @@ fn makeSpectestMemory(allocator: std.mem.Allocator) ?*types.MemoryInstance {
     return mem;
 }
 
-fn makeSpectestTable(allocator: std.mem.Allocator) ?*types.TableInstance {
+fn makeSpectestTable(allocator: std.mem.Allocator, is_table64: bool) ?*types.TableInstance {
     const elems = allocator.alloc(types.TableElement, 10) catch return null;
     for (elems) |*e| e.* = types.TableElement.nullForType(.funcref);
     const tbl = allocator.create(types.TableInstance) catch { allocator.free(elems); return null; };
-    tbl.* = .{ .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 10, .max = 20 } }, .elements = elems };
+    tbl.* = .{ .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 10, .max = 20 }, .is_table64 = is_table64 }, .elements = elems };
     return tbl;
 }
 
