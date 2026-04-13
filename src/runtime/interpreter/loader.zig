@@ -3626,7 +3626,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         else if (sub == 0x5E or sub == 0x5F or // f32x4_demote, f64x2_promote
                             sub == 0x60 or sub == 0x61 or sub == 0x62 or // i8x16 abs/neg/popcnt
                             sub == 0x67 or sub == 0x68 or sub == 0x69 or sub == 0x6A or // f32x4 ceil/floor/trunc/nearest
-                            sub == 0x74 or sub == 0x75 or sub == 0x7A or sub == 0x7B or // f64x2 ceil/floor/trunc
+                            sub == 0x74 or sub == 0x75 or sub == 0x7A or // f64x2 ceil/floor/trunc
                             sub == 0x80 or sub == 0x81 or // i16x8 abs/neg
                             (sub >= 0x87 and sub <= 0x8A) or // i16x8 extend_low/high
                             sub == 0x94 or // f64x2.nearest
