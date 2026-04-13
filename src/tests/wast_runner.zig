@@ -805,16 +805,15 @@ fn parseHexFloat64(s: []const u8) ?u64 {
     const int_val: u128 = if (int_part.len > 0 and int_part.len <= 32) (std.fmt.parseUnsigned(u128, int_part, 16) catch 0) else 0;
     // Convert integer part to f64
     var fval: f64 = @floatFromInt(int_val);
-    // Apply exponent from p
-    if (exp != 0) fval = fval * std.math.pow(f64, 2.0, @floatFromInt(exp));
+    // Apply exponent from p using ldexp for subnormal precision
+    if (exp != 0) fval = std.math.ldexp(fval, exp);
     // Add fractional part (parse up to 16 hex digits for f64 precision)
     if (frac_part.len > 0) {
         const max_frac = @min(frac_part.len, 16);
         const frac_val: u64 = std.fmt.parseUnsigned(u64, frac_part[0..max_frac], 16) catch 0;
         var frac_f: f64 = @floatFromInt(frac_val);
-        // Each hex digit is 4 bits, so divide by 2^(max_frac*4)
         const frac_exp: i32 = -@as(i32, @intCast(max_frac)) * 4 + exp;
-        frac_f = frac_f * std.math.pow(f64, 2.0, @floatFromInt(frac_exp));
+        frac_f = std.math.ldexp(frac_f, frac_exp);
         fval += frac_f;
     }
     if (fval == 0 and neg) return 0x8000000000000000;
