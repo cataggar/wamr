@@ -3629,8 +3629,13 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         pushType(&stack_buf, &sp, .anyref, &stack_tidx); // approximate
                     },
                     0x18, 0x19 => { // br_on_cast, br_on_cast_fail
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i); // flags
+                        _ = readU32Leb(code, &i); // label
+                        _ = readU32Leb(code, &i); // source type
+                        _ = readU32Leb(code, &i); // target type
+                        // Pop ref, push ref (net effect: type narrowing, approximate as pop+push)
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .anyref, &stack_tidx);
                     },
                     else => {},
                 }
