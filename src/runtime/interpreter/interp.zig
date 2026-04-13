@@ -82,6 +82,10 @@ pub const TrapError = error{
     UncaughtException,
 };
 
+/// Sentinel type_idx for GC objects that wrap externref values via any.convert_extern.
+/// Used by refTestMatch to distinguish externref-wrapped anyref from real i31/struct/array.
+const EXTERNREF_SENTINEL_TYPE: u32 = 0xFFFF_FFFE;
+
 /// Result from dispatchLoop indicating how the function exited.
 const DispatchResult = enum(u32) {
     /// Normal return (.end at function level or .return).
@@ -205,7 +209,9 @@ fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInst
                 .i31ref, .eqref, .structref, .arrayref => |r| if (r != null) @as(i32, 1) else 0,
                 .anyref => |r| blk: {
                     if (r == null) break :blk @as(i32, 0);
-                    // anyref is always eq-compatible for non-null values
+                    // Check if this is a GC object; externref-wrapped anyref is NOT eq-compatible
+                    const obj = getGcObject(module_inst, r.?) orelse break :blk 0;
+                    if (obj.type_idx == EXTERNREF_SENTINEL_TYPE) break :blk 0;
                     break :blk 1;
                 },
                 .nullref => 0,
@@ -225,19 +231,22 @@ fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInst
                 else => 0,
             };
         },
-        0x70, 0x73 => { // func / nofunc
+        0x70 => { // func
             return switch (ref) {
                 .funcref, .nonfuncref => |r| if (r != null) @as(i32, 1) else 0,
                 else => 0,
             };
+        },
+        0x73 => { // nofunc (bottom type — only null matches)
+            return 0;
         },
         0x6B => { // struct
             return switch (ref) {
                 .structref => |r| if (r != null) @as(i32, 1) else 0,
                 .anyref, .eqref => |r| blk: {
                     if (r == null) break :blk @as(i32, 0);
-                    // Check if the GC object is a struct
                     const obj = getGcObject(module_inst, r.?) orelse break :blk 0;
+                    if (obj.type_idx == EXTERNREF_SENTINEL_TYPE) break :blk 0;
                     break :blk if (obj.type_idx < module_inst.module.types.len and module_inst.module.types[obj.type_idx].kind == .struct_) @as(i32, 1) else 0;
                 },
                 else => 0,
@@ -249,6 +258,7 @@ fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInst
                 .anyref, .eqref => |r| blk: {
                     if (r == null) break :blk @as(i32, 0);
                     const obj = getGcObject(module_inst, r.?) orelse break :blk 0;
+                    if (obj.type_idx == EXTERNREF_SENTINEL_TYPE) break :blk 0;
                     break :blk if (obj.type_idx < module_inst.module.types.len and module_inst.module.types[obj.type_idx].kind == .array) @as(i32, 1) else 0;
                 },
                 else => 0,
@@ -2491,11 +2501,14 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             // ── Typed function reference ops ──
             .ref_as_non_null => {
                 const val = try env.peek();
-                switch (val) {
-                    .funcref, .nonfuncref => |r| if (r == null) return error.Unreachable,
-                    .externref, .nonexternref => |r| if (r == null) return error.Unreachable,
-                    else => return error.Unreachable,
-                }
+                const is_null = switch (val) {
+                    .funcref, .nonfuncref => |r| r == null,
+                    .externref, .nonexternref => |r| r == null,
+                    .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => |r| r == null,
+                    .exnref => |r| r == null,
+                    else => true,
+                };
+                if (is_null) return error.Unreachable;
             },
             .br_on_null => {
                 const depth = readU32(code, &ip);
@@ -2939,14 +2952,34 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             .funcref, .nonfuncref => |r| r,
                             else => null,
                         };
-                        try env.push(.{ .anyref = val });
+                        if (val) |v| {
+                            // Wrap externref in a sentinel GC object so refTestMatch can
+                            // distinguish externref-wrapped anyref from i31/struct/array.
+                            var extern_val = [1]types.Value{.{ .i32 = @bitCast(v) }};
+                            const obj_idx = try allocGcObject(env.module_inst, EXTERNREF_SENTINEL_TYPE, &extern_val);
+                            try env.push(.{ .anyref = obj_idx });
+                        } else {
+                            try env.push(.{ .anyref = null });
+                        }
                     },
                     0x1B => { // extern.convert_any: [anyref] -> [externref]
                         const ref = try env.pop();
                         const val: ?u32 = switch (ref) {
+                            .anyref, .eqref => |r| blk: {
+                                // Unwrap externref sentinel GC objects
+                                if (r) |idx| {
+                                    if (getGcObject(env.module_inst, idx)) |obj| {
+                                        if (obj.type_idx == EXTERNREF_SENTINEL_TYPE and obj.fields.len > 0) {
+                                            break :blk @as(?u32, @bitCast(obj.fields[0].i32));
+                                        }
+                                    }
+                                }
+                                break :blk r;
+                            },
+                            .i31ref, .structref, .arrayref => |r| r,
                             .funcref, .nonfuncref => |r| r,
                             .externref, .nonexternref => |r| r,
-                            .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref => |r| r,
+                            .nullref => |r| r,
                             .exnref => |r| r,
                             else => null,
                         };
