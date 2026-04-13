@@ -555,8 +555,20 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
         } else if (std.mem.startsWith(u8, remaining, "(ref.null")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
-            if (std.mem.indexOf(u8, remaining, "extern")) |_| {
+            if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "extern")) |_| {
                 try w.writeAll("{\"type\":\"externref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "i31")) |_| {
+                try w.writeAll("{\"type\":\"i31ref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "any")) |_| {
+                try w.writeAll("{\"type\":\"anyref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "eq")) |_| {
+                try w.writeAll("{\"type\":\"eqref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "struct")) |_| {
+                try w.writeAll("{\"type\":\"structref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "array")) |_| {
+                try w.writeAll("{\"type\":\"arrayref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "none")) |_| {
+                try w.writeAll("{\"type\":\"nullref\",\"value\":\"null\"}");
             } else {
                 try w.writeAll("{\"type\":\"funcref\",\"value\":\"null\"}");
             }
@@ -583,6 +595,22 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
                 while (i < text.len and text[i] != ')') : (i += 1) {}
             }
+        } else if (std.mem.startsWith(u8, remaining, "(ref.i31)")) {
+            // (ref.i31) = any non-null i31ref
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"i31ref\",\"value\":\"1\"}");
+            while (i < text.len and text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.eq)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"eqref\",\"value\":\"1\"}");
+            while (i < text.len and text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.any)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"anyref\",\"value\":\"1\"}");
+            while (i < text.len and text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(v128.const")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
