@@ -2142,7 +2142,7 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
     if (pos.* >= code.len) return .{ .results = &.{} };
     const bt = code[pos.*];
     if (bt == 0x40) { pos.* += 1; return .{ .results = &.{} }; }
-    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F or
+    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x7B or bt == 0x70 or bt == 0x6F or
         bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or bt == 0x6A or bt == 0x65 or bt == 0x71 or
         bt == 0x69 or bt == 0x68 or bt == 0x74) {
         pos.* += 1;
@@ -2151,6 +2151,7 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
             0x7E => .{ .results = &[_]VT{.i64} },
             0x7D => .{ .results = &[_]VT{.f32} },
             0x7C => .{ .results = &[_]VT{.f64} },
+            0x7B => .{ .results = &[_]VT{.v128} },
             0x70 => .{ .results = &[_]VT{.funcref} },
             0x6F => .{ .results = &[_]VT{.externref} },
             // GC abstract ref types
