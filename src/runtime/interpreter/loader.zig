@@ -477,6 +477,13 @@ fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types
             break :blk switch (heap_byte) {
                 0x70, 0x73 => if (is_nullable) types.ValType.funcref else types.ValType.nonfuncref,
                 0x6F, 0x72 => if (is_nullable) types.ValType.externref else types.ValType.nonexternref,
+                0x6E => types.ValType.anyref,
+                0x6D => types.ValType.eqref,
+                0x6C => types.ValType.i31ref,
+                0x6B => types.ValType.structref,
+                0x6A => types.ValType.arrayref,
+                0x65 => types.ValType.nullref,
+                0x69 => types.ValType.exnref,
                 else => {
                     var type_idx: u32 = heap_byte & 0x7F;
                     if (heap_byte & 0x80 != 0) {
@@ -1614,13 +1621,17 @@ fn validateDeclaredFuncRefs(module: *const types.WasmModule, total_funcs: u32) L
 fn skipBlockTypeImm(code: []const u8, i: *usize) void {
     if (i.* >= code.len) return;
     const bt = code[i.*];
-    if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
+    if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x7B or
+        bt == 0x70 or bt == 0x6F or bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or
+        bt == 0x6A or bt == 0x65 or bt == 0x71 or bt == 0x69 or bt == 0x68 or bt == 0x74) {
         i.* += 1;
     } else if (bt == 0x63 or bt == 0x64) {
         i.* += 1; // skip ref prefix
         if (i.* >= code.len) return;
         const ht = code[i.*];
-        if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72) {
+        if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72 or
+            ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or
+            ht == 0x65 or ht == 0x71 or ht == 0x69 or ht == 0x68 or ht == 0x74) {
             i.* += 1; // known heap type
         } else {
             // Type index LEB128
@@ -2661,7 +2672,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = readU32Leb(code, &i); // label index
                     }
                 }
-                const start: u32 = sp;
+                // Pop block input types (for multi-value blocks) — same as block/loop/if
                 if (bt.params.len > 0) {
                     var pi = bt.params.len;
                     while (pi > 0) {
@@ -2671,6 +2682,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     }
                 }
                 if (ctrl_sp >= ctrl_buf.len) return error.TypeMismatch;
+                const start: u32 = sp;
                 ctrl_buf[ctrl_sp] = .{
                     .kind = .block,
                     .start_height = start,
