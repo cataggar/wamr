@@ -27,6 +27,7 @@ const Command = struct {
     filename: ?[]const u8 = null,
     action: ?Action = null,
     expected: ?[]const Arg = null,
+    alternatives: ?[]const []const Arg = null,
     text: ?[]const u8 = null,
     module_type: ?[]const u8 = null,
     @"as": ?[]const u8 = null,
@@ -1015,10 +1016,28 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator) !Spe
             if (all_match) {
                 result.passed += 1;
             } else {
-                if (actual.len > 0 and expected.len > 0) {
-                    std.debug.print("  FAIL assert_return line {d}: {s} value mismatch\n", .{ cmd.line, field });
+                // Check either/alternatives if available
+                var alt_match = false;
+                if (cmd.alternatives) |alts| {
+                    for (alts) |alt_args| {
+                        const alt_vals = parseArgs(alt_args, allocator) orelse continue;
+                        defer allocator.free(alt_vals);
+                        if (alt_vals.len != actual.len) continue;
+                        var this_match = true;
+                        for (actual, alt_vals) |a, e| {
+                            if (!valuesEqual(a, e)) { this_match = false; break; }
+                        }
+                        if (this_match) { alt_match = true; break; }
+                    }
                 }
-                result.failed += 1;
+                if (alt_match) {
+                    result.passed += 1;
+                } else {
+                    if (actual.len > 0 and expected.len > 0) {
+                        std.debug.print("  FAIL assert_return line {d}: {s} value mismatch\n", .{ cmd.line, field });
+                    }
+                    result.failed += 1;
+                }
             }
         } else if (std.mem.eql(u8, cmd.type, "assert_trap")) {
             const action = cmd.action orelse {
