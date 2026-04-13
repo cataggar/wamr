@@ -474,10 +474,21 @@ fn gcArrayNewData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     const len = @as(u32, @bitCast(try env.popI32()));
     const offset = @as(u32, @bitCast(try env.popI32()));
     const module = env.module_inst.module;
-    const elem_type = if (type_idx < module.types.len and module.types[type_idx].field_types.len > 0) module.types[type_idx].field_types[0] else types.ValType.i32;
-    const elem_size: u32 = switch (elem_type) {
-        .i32, .f32 => 4, .i64, .f64 => 8, .v128 => 16, else => 1,
-    };
+    // Determine element size from type definition, accounting for packed types
+    var elem_size: u32 = 1;
+    if (type_idx < module.types.len) {
+        const ft = module.types[type_idx];
+        const packed_type: u8 = if (ft.field_muts.len > 0) ft.field_muts[0] >> 4 else 0;
+        if (packed_type == 1) {
+            elem_size = 1; // i8
+        } else if (packed_type == 2) {
+            elem_size = 2; // i16
+        } else if (ft.field_types.len > 0) {
+            elem_size = switch (ft.field_types[0]) {
+                .i32, .f32 => 4, .i64, .f64 => 8, .v128 => 16, else => 1,
+            };
+        }
+    }
     if (data_idx >= module.data_segments.len) return error.Unreachable;
     const data = module.data_segments[data_idx].data;
     const byte_len = @as(u64, len) * elem_size;
@@ -486,11 +497,11 @@ fn gcArrayNewData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     if (len > fields_buf.len) return error.StackOverflow;
     for (0..len) |i| {
         const byte_offset = offset + @as(u32, @intCast(i)) * elem_size;
-        fields_buf[i] = switch (elem_type) {
-            .i32 => .{ .i32 = @bitCast(std.mem.readInt(u32, data[byte_offset..][0..4], .little)) },
-            .i64 => .{ .i64 = @bitCast(std.mem.readInt(u64, data[byte_offset..][0..8], .little)) },
-            .f32 => .{ .f32 = @bitCast(std.mem.readInt(u32, data[byte_offset..][0..4], .little)) },
-            .f64 => .{ .f64 = @bitCast(std.mem.readInt(u64, data[byte_offset..][0..8], .little)) },
+        fields_buf[i] = switch (elem_size) {
+            1 => .{ .i32 = @as(i32, data[byte_offset]) },
+            2 => .{ .i32 = @as(i32, std.mem.readInt(u16, data[byte_offset..][0..2], .little)) },
+            4 => .{ .i32 = @bitCast(std.mem.readInt(u32, data[byte_offset..][0..4], .little)) },
+            8 => .{ .i64 = @bitCast(std.mem.readInt(u64, data[byte_offset..][0..8], .little)) },
             else => .{ .i32 = @as(i32, data[byte_offset]) },
         };
     }
@@ -507,7 +518,7 @@ fn gcArrayNewElem(env: *ExecEnv, type_idx: u32, elem_idx: u32) TrapError!void {
     try env.push(.{ .arrayref = null });
 }
 
-fn gcArrayGet(env: *ExecEnv, _: u32, sub_op: u32) TrapError!void {
+fn gcArrayGet(env: *ExecEnv, type_idx: u32, sub_op: u32) TrapError!void {
     const idx = @as(u32, @bitCast(try env.popI32()));
     const ref = try env.pop();
     const obj_idx = switch (ref) {
@@ -516,14 +527,34 @@ fn gcArrayGet(env: *ExecEnv, _: u32, sub_op: u32) TrapError!void {
     };
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     if (idx >= obj.fields.len) return error.OutOfBoundsMemoryAccess;
-    var val = obj.fields[idx];
-    if (sub_op == 0x0C and val == .i32) { // array.get_s
+    const val = obj.fields[idx];
+    if ((sub_op == 0x0C or sub_op == 0x0D) and val == .i32) {
+        // array.get_s or array.get_u — check packed type from array type definition
+        const module = env.module_inst.module;
+        var packed_type: u8 = 1; // default i8
+        if (type_idx < module.types.len) {
+            const ft = module.types[type_idx];
+            if (ft.field_muts.len > 0) {
+                packed_type = ft.field_muts[0] >> 4;
+            }
+        }
         const raw: u32 = @bitCast(val.i32);
-        const byte: i8 = @bitCast(@as(u8, @truncate(raw)));
-        val = .{ .i32 = @as(i32, byte) };
-    } else if (sub_op == 0x0D and val == .i32) { // array.get_u
-        const raw: u32 = @bitCast(val.i32);
-        val = .{ .i32 = @bitCast(@as(u32, @as(u8, @truncate(raw)))) };
+        if (packed_type == 2) { // i16
+            if (sub_op == 0x0C) { // array.get_s
+                const short: i16 = @bitCast(@as(u16, @truncate(raw)));
+                try env.pushI32(@as(i32, short));
+            } else { // array.get_u
+                try env.pushI32(@as(i32, @as(u16, @truncate(raw))));
+            }
+        } else { // i8 (default)
+            if (sub_op == 0x0C) { // array.get_s
+                const byte: i8 = @bitCast(@as(u8, @truncate(raw)));
+                try env.pushI32(@as(i32, byte));
+            } else { // array.get_u
+                try env.pushI32(@as(i32, @as(u8, @truncate(raw))));
+            }
+        }
+        return;
     }
     try env.push(val);
 }
@@ -586,17 +617,33 @@ fn gcArrayInitData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     const module = env.module_inst.module;
     if (data_idx >= module.data_segments.len) return error.Unreachable;
     const data = module.data_segments[data_idx].data;
-    const elem_type = if (type_idx < module.types.len and module.types[type_idx].field_types.len > 0) module.types[type_idx].field_types[0] else types.ValType.i32;
-    const elem_size: u32 = switch (elem_type) { .i32, .f32 => 4, .i64, .f64 => 8, .v128 => 16, else => 1 };
+    // Determine element size from type definition, accounting for packed types
+    var elem_size: u32 = 1;
+    if (type_idx < module.types.len) {
+        const ft = module.types[type_idx];
+        const packed_type: u8 = if (ft.field_muts.len > 0) ft.field_muts[0] >> 4 else 0;
+        if (packed_type == 1) {
+            elem_size = 1; // i8
+        } else if (packed_type == 2) {
+            elem_size = 2; // i16
+        } else if (ft.field_types.len > 0) {
+            elem_size = switch (ft.field_types[0]) {
+                .i32, .f32 => 4,
+                .i64, .f64 => 8,
+                .v128 => 16,
+                else => 1,
+            };
+        }
+    }
     if (@as(u64, dst_off) + len > obj.fields.len) return error.OutOfBoundsMemoryAccess;
     if (@as(u64, src_off) + @as(u64, len) * elem_size > data.len) return error.OutOfBoundsMemoryAccess;
     for (0..len) |i| {
         const bo = src_off + @as(u32, @intCast(i)) * elem_size;
-        obj.fields[dst_off + i] = switch (elem_type) {
-            .i32 => .{ .i32 = @bitCast(std.mem.readInt(u32, data[bo..][0..4], .little)) },
-            .i64 => .{ .i64 = @bitCast(std.mem.readInt(u64, data[bo..][0..8], .little)) },
-            .f32 => .{ .f32 = @bitCast(std.mem.readInt(u32, data[bo..][0..4], .little)) },
-            .f64 => .{ .f64 = @bitCast(std.mem.readInt(u64, data[bo..][0..8], .little)) },
+        obj.fields[dst_off + i] = switch (elem_size) {
+            1 => .{ .i32 = @as(i32, data[bo]) },
+            2 => .{ .i32 = @as(i32, std.mem.readInt(u16, data[bo..][0..2], .little)) },
+            4 => .{ .i32 = @bitCast(std.mem.readInt(u32, data[bo..][0..4], .little)) },
+            8 => .{ .i64 = @bitCast(std.mem.readInt(u64, data[bo..][0..8], .little)) },
             else => .{ .i32 = @as(i32, data[bo]) },
         };
     }
