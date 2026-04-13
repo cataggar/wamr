@@ -3673,8 +3673,8 @@ test "interp: i32.shl" {
 }
 
 test "interp: unknown opcode traps" {
-    // 0x06 = try opcode (not implemented)
-    try runCodeExpectTrap(&.{0x06}, error.UnknownOpcode);
+    // 0xE7 is a truly unknown opcode (not assigned in the spec)
+    try runCodeExpectTrap(&.{0xE7}, error.UnknownOpcode);
 }
 
 test "LEB128: readI32 decodes -129 correctly" {
