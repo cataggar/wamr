@@ -1045,8 +1045,11 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                         try elem_exprs_list.append(allocator, expr);
                     },
                     .ref_null => |vt| {
-                        // For flags=4, kind defaults to func_ref but element may be externref
-                        if (flags == 4 and vt.isExternRef()) kind = .extern_ref;
+                        // For flags=4, kind defaults to func_ref but may need adjustment
+                        if (flags == 4) {
+                            if (vt.isExternRef()) kind = .extern_ref
+                            else if (!vt.isFuncRef()) kind = .gc_ref;
+                        }
                         // Only enforce type compatibility for func_ref and extern_ref kinds (not gc_ref)
                         if (kind != .gc_ref) {
                             if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
@@ -1055,8 +1058,10 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                         try func_indices_list.append(allocator, null);
                         try elem_exprs_list.append(allocator, null);
                     },
-                    // global.get and compound expressions can produce funcref/externref
+                    // global.get and compound expressions
                     .global_get, .bytecode => {
+                        // For flags=4, bytecode GC expressions imply gc_ref kind
+                        if (flags == 4 and kind == .func_ref) kind = .gc_ref;
                         try func_indices_list.append(allocator, null);
                         try elem_exprs_list.append(allocator, expr);
                         has_runtime_exprs = true;
@@ -3505,45 +3510,70 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .externref, &stack_tidx);
                     },
-                    // struct/array/ref.test/ref.cast/br_on_cast: skip immediates, approximate types
+                    // struct/array/ref.test/ref.cast/br_on_cast: use type info for proper validation
                     0x00 => { // struct.new: [fields...] -> [structref]
+                        const tidx = readU32Leb(code, &i);
+                        if (tidx < module.types.len) {
+                            const ft = module.types[tidx];
+                            // Pop field values in reverse order
+                            var fi = ft.field_types.len;
+                            while (fi > 0) { fi -= 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); }
+                        }
+                        pushType(&stack_buf, &sp, .structref, &stack_tidx);
+                    },
+                    0x01 => { // struct.new_default: [] -> [structref]
                         _ = readU32Leb(code, &i);
                         pushType(&stack_buf, &sp, .structref, &stack_tidx);
                     },
-                    0x01 => { // struct.new_default
+                    0x02, 0x03, 0x04 => { // struct.get/get_s/get_u: [structref] -> [field_type]
+                        const tidx = readU32Leb(code, &i);
+                        const fidx = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        // Push the actual field type
+                        if (tidx < module.types.len and fidx < module.types[tidx].field_types.len) {
+                            pushType(&stack_buf, &sp, module.types[tidx].field_types[fidx], &stack_tidx);
+                        } else {
+                            pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        }
+                    },
+                    0x05 => { // struct.set: [structref val] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x06 => { // array.new: [val len] -> [arrayref]
                         _ = readU32Leb(code, &i);
-                        pushType(&stack_buf, &sp, .structref, &stack_tidx);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // len
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // val
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
                     },
-                    0x02, 0x03, 0x04 => { // struct.get/get_s/get_u
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                        pushType(&stack_buf, &sp, .i32, &stack_tidx); // approximate
-                    },
-                    0x05 => { // struct.set
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                    },
-                    0x06, 0x07 => { // array.new, array.new_default
+                    0x07 => { // array.new_default: [len] -> [arrayref]
                         _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
                     },
-                    0x08 => { // array.new_fixed
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
-                    },
-                    0x09, 0x0A => { // array.new_data, array.new_elem
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
-                    },
-                    0x0B, 0x0C, 0x0D => { // array.get/get_s/get_u
+                    0x08 => { // array.new_fixed: [elems...] -> [arrayref]
                         _ = readU32Leb(code, &i);
+                        const count = readU32Leb(code, &i);
+                        var ci: u32 = 0;
+                        while (ci < count) : (ci += 1) _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
+                    },
+                    0x09, 0x0A => { // array.new_data/elem: [offset len] -> [arrayref]
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
-                        pushType(&stack_buf, &sp, .i32, &stack_tidx); // approximate
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
+                    },
+                    0x0B, 0x0C, 0x0D => { // array.get/get_s/get_u: [arrayref idx] -> [elem_type]
+                        const tidx = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // idx
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // arrayref
+                        if (tidx < module.types.len and module.types[tidx].field_types.len > 0) {
+                            pushType(&stack_buf, &sp, module.types[tidx].field_types[0], &stack_tidx);
+                        } else {
+                            pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        }
                     },
                     0x0E => { // array.set
                         _ = readU32Leb(code, &i);
