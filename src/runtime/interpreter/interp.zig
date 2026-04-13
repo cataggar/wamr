@@ -649,14 +649,53 @@ fn gcArrayInitData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     }
 }
 
-fn gcArrayInitElem(env: *ExecEnv, type_idx: u32, elem_idx: u32) TrapError!void {
+fn gcArrayInitElem(env: *ExecEnv, type_idx: u32, elem_seg_idx: u32) TrapError!void {
     _ = type_idx;
-    _ = elem_idx;
-    _ = try env.popI32();
-    _ = try env.popI32();
-    _ = try env.popI32();
-    _ = try env.pop();
-    // TODO: implement element-based array init
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const src_off = @as(u32, @bitCast(try env.popI32()));
+    const dst_off = @as(u32, @bitCast(try env.popI32()));
+    const ref = try env.pop();
+    const obj_idx = switch (ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+    const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
+    const module = env.module_inst.module;
+    if (elem_seg_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
+    if (elem_seg_idx < env.module_inst.dropped_elems.len and env.module_inst.dropped_elems[elem_seg_idx]) {
+        if (len > 0) return error.OutOfBoundsTableAccess;
+        return;
+    }
+    const elem = &module.elements[elem_seg_idx];
+    if (@as(u64, src_off) + len > elem.func_indices.len) return error.OutOfBoundsTableAccess;
+    if (@as(u64, dst_off) + len > obj.fields.len) return error.OutOfBoundsTableAccess;
+    const instance_mod = @import("instance.zig");
+    for (0..len) |i| {
+        const si = src_off + @as(u32, @intCast(i));
+        const di = dst_off + @as(u32, @intCast(i));
+        // Check for element expressions first
+        if (elem.elem_exprs.len > si) {
+            if (elem.elem_exprs[si]) |expr| {
+                switch (expr) {
+                    .ref_func => |fidx| {
+                        obj.fields[di] = .{ .nonfuncref = fidx };
+                        continue;
+                    },
+                    .bytecode => |bc| {
+                        const bc_val = instance_mod.evalInitBytecode(bc, &.{}, env.module_inst) catch {
+                            obj.fields[di] = .{ .funcref = null };
+                            continue;
+                        };
+                        obj.fields[di] = bc_val;
+                        continue;
+                    },
+                    else => {},
+                }
+            }
+        }
+        // Fallback: use func_indices
+        obj.fields[di] = if (elem.func_indices[si]) |fi|
+            .{ .nonfuncref = fi }
+        else
+            .{ .funcref = null };
+    }
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
