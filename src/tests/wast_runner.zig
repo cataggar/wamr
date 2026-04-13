@@ -770,28 +770,64 @@ fn parseWatF64(raw: []const u8) ?u64 {
     if (parseWatNanF64(s)) |bits| return bits;
     if (std.mem.eql(u8, s, "inf")) return 0x7FF0000000000000;
     if (std.mem.eql(u8, s, "-inf")) return 0xFFF0000000000000;
-    // Hex integers without 'p' exponent: treat as integer → float conversion
-    // Also handles trailing dot: 0xABC. (same as 0xABC)
     const is_hex = std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "-0x");
-    const has_p = std.mem.indexOfAny(u8, s, "pP") != null;
-    if (is_hex and !has_p) {
-        const neg = s[0] == '-';
-        var hex = if (neg) s[3..] else s[2..];
-        // Strip trailing dot
-        if (hex.len > 0 and hex[hex.len - 1] == '.') hex = hex[0 .. hex.len - 1];
-        // Check if it has a fractional part (dot not at end)
-        if (std.mem.indexOfScalar(u8, hex, '.') != null) {
-            // Has real fractional part — need proper hex float parse, fall through
-        } else {
-            const int_val = std.fmt.parseUnsigned(u128, hex, 16) catch return null;
-            const fval: f64 = @floatFromInt(int_val);
-            var bits: u64 = @bitCast(fval);
-            if (neg) bits |= 0x8000000000000000;
-            return bits;
-        }
+    if (is_hex) {
+        if (parseHexFloat64(s)) |bits| return bits;
     }
     const f = std.fmt.parseFloat(f64, s) catch return null;
     return @bitCast(f);
+}
+
+/// Parse hex float using Python-style algorithm for maximum precision.
+fn parseHexFloat64(s: []const u8) ?u64 {
+    const neg = s[0] == '-';
+    var hex = if (neg) s[3..] else s[2..];
+    // Find p/P exponent
+    const p_idx = std.mem.indexOfAny(u8, hex, "pP");
+    var exp: i32 = 0;
+    var mantissa_hex = hex;
+    if (p_idx) |pi| {
+        const exp_str = hex[pi + 1 ..];
+        exp = std.fmt.parseInt(i32, exp_str, 10) catch 0;
+        mantissa_hex = hex[0..pi];
+    }
+    // Strip trailing dot
+    if (mantissa_hex.len > 0 and mantissa_hex[mantissa_hex.len - 1] == '.') mantissa_hex = mantissa_hex[0 .. mantissa_hex.len - 1];
+    // Split at dot if present
+    const dot_idx = std.mem.indexOfScalar(u8, mantissa_hex, '.');
+    var int_part = mantissa_hex;
+    var frac_part: []const u8 = &.{};
+    if (dot_idx) |di| {
+        int_part = mantissa_hex[0..di];
+        frac_part = mantissa_hex[di + 1 ..];
+    }
+    // Build mantissa as integer, tracking total hex digits after the integer part
+    // The value is (integer_value + fractional_value) * 2^exp
+    // = integer_from_all_digits * 2^(exp - frac_bits)
+    var all_digits_buf: [128]u8 = undefined;
+    var all_len: usize = 0;
+    for (int_part) |c| {
+        if (all_len < all_digits_buf.len) { all_digits_buf[all_len] = c; all_len += 1; }
+    }
+    for (frac_part) |c| {
+        if (all_len < all_digits_buf.len) { all_digits_buf[all_len] = c; all_len += 1; }
+    }
+    if (all_len == 0) return null;
+    const all_digits = all_digits_buf[0..all_len];
+    const int_val = std.fmt.parseUnsigned(u128, all_digits, 16) catch return null;
+    if (int_val == 0) return if (neg) @as(u64, 0x8000000000000000) else 0;
+    // Adjust exponent for fractional digits (each hex digit = 4 bits)
+    const total_exp: i32 = exp - @as(i32, @intCast(frac_part.len)) * 4;
+    // Convert to f64: int_val * 2^total_exp
+    var fval: f64 = @floatFromInt(int_val);
+    if (total_exp > 0) {
+        fval = fval * std.math.pow(f64, 2.0, @floatFromInt(total_exp));
+    } else if (total_exp < 0) {
+        fval = fval * std.math.pow(f64, 2.0, @floatFromInt(total_exp));
+    }
+    var bits: u64 = @bitCast(fval);
+    if (neg) bits |= 0x8000000000000000;
+    return bits;
 }
 
 /// Parse WAT NaN notation for f32: nan, -nan, nan:0xN, -nan:0xN
