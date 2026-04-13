@@ -3611,22 +3611,27 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .i32, &stack_tidx);
                         }
-                        // Unary ops [v128]->[v128]: abs, neg, popcnt, ceil, floor, trunc, nearest, sqrt, extend, convert, trunc_sat, demote, promote
-                        else if (sub == 0x60 or sub == 0x61 or // i8x16 abs/neg/popcnt
+                        // Unary ops [v128]->[v128]
+                        else if (sub == 0x5E or sub == 0x5F or // f32x4_demote, f64x2_promote
+                            sub == 0x60 or sub == 0x61 or // i8x16 abs/neg
+                            sub == 0x67 or sub == 0x68 or sub == 0x69 or sub == 0x6A or // f32x4 ceil/floor/trunc/nearest
+                            sub == 0x74 or sub == 0x75 or sub == 0x7A or sub == 0x7B or // f64x2 ceil/floor/trunc
                             sub == 0x80 or sub == 0x81 or // i16x8 abs/neg
-                            (sub >= 0x94 and sub <= 0x9F) or // i16x8 extend + i32x4 extend_low/high
+                            (sub >= 0x87 and sub <= 0x8A) or // i16x8 extend_low/high
+                            sub == 0x94 or // f64x2.nearest
                             sub == 0xA0 or sub == 0xA1 or sub == 0xA2 or // i32x4 abs/neg
-                            sub == 0xBF or // i32x4.trunc_sat
+                            (sub >= 0xA7 and sub <= 0xAA) or // i32x4 extend_low/high
+                            sub == 0xB7 or // i32x4.trunc_sat_f64x2_s_zero
+                            sub == 0xBF or // i32x4.trunc_sat_f32x4_s
                             sub == 0xC0 or sub == 0xC1 or sub == 0xC2 or // i64x2 abs/neg
-                            (sub >= 0xD4 and sub <= 0xD7) or // i64x2 extend
+                            (sub >= 0xC7 and sub <= 0xCA) or // i64x2 extend_low/high
+                            sub == 0xCF or // f32x4.convert_i32x4_s
+                            sub == 0xD0 or sub == 0xD1 or // f32x4.convert
+                            (sub >= 0xD4 and sub <= 0xD7) or // i64x2 sconvert/uconvert
                             sub == 0xE0 or sub == 0xE1 or sub == 0xE3 or // f32x4 abs/neg/sqrt
-                            (sub >= 0xF0 and sub <= 0xF3) or // f32x4 trunc_sat
                             sub == 0xEC or sub == 0xED or sub == 0xEF or // f64x2 abs/neg/sqrt
-                            sub == 0xFE or sub == 0xFF or // f64x2 convert
-                            sub == 0xFC or sub == 0xFD or // f64x2 promote/demote
-                            sub == 0x5E or sub == 0x5F or // i8x16 narrow_i16x8
-                            sub == 0x14 or // i8x16.swizzle — but already handled above
-                            (sub >= 0x100 and sub <= 0x107)) // extended unary
+                            sub == 0xF7 or sub == 0xF8 or sub == 0xF9 or sub == 0xFA or // trunc_sat
+                            sub == 0xFB or sub == 0xFC or sub == 0xFD or sub == 0xFE or sub == 0xFF) // convert/promote/demote
                         {
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .v128, &stack_tidx);
