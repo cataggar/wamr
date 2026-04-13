@@ -416,6 +416,22 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
                     else => return error.InvalidInitExpr,
                 }
             },
+            // SIMD prefix: v128.const
+            0xFD => {
+                const r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                ip += r.bytes_read;
+                switch (r.value) {
+                    0x0C => { // v128.const: 16 bytes
+                        if (ip + 16 > code.len) return error.InvalidInitExpr;
+                        const bits = std.mem.readInt(u128, code[ip..][0..16], .little);
+                        ip += 16;
+                        if (sp >= stack.len) return error.InvalidInitExpr;
+                        stack[sp] = .{ .v128 = bits };
+                        sp += 1;
+                    },
+                    else => return error.InvalidInitExpr,
+                }
+            },
             else => return error.InvalidInitExpr,
         }
     }

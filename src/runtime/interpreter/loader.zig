@@ -631,6 +631,14 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
                     else => return error.InvalidInitExpr,
                 }
             },
+            // SIMD prefix: v128.const
+            0xFD => {
+                const sub = try reader.readU32();
+                switch (sub) {
+                    0x0C => { _ = try reader.readBytes(16); stack_depth += 1; }, // v128.const: 16 bytes
+                    else => return error.InvalidInitExpr,
+                }
+            },
             // Any other opcode is invalid in a constant expression
             else => return error.InvalidInitExpr,
         }
