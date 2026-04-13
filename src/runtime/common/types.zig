@@ -54,9 +54,12 @@ pub const ValType = enum(u8) {
         // non-nullable → nullable
         if (self == .nonfuncref and other == .funcref) return true;
         if (self == .nonexternref and other == .externref) return true;
-        // GC type hierarchy: nullref <: i31ref/structref/arrayref <: eqref <: anyref
-        if (other == .anyref) return self == .eqref or self == .i31ref or self == .structref or self == .arrayref or self == .nullref;
-        if (other == .eqref) return self == .i31ref or self == .structref or self == .arrayref or self == .nullref;
+        // nullref (none) is the bottom type — subtype of all internal ref types
+        if (self == .nullref) return other == .anyref or other == .eqref or other == .i31ref or
+            other == .structref or other == .arrayref or other == .funcref or other == .nonfuncref;
+        // GC type hierarchy: i31ref/structref/arrayref <: eqref <: anyref
+        if (other == .anyref) return self == .eqref or self == .i31ref or self == .structref or self == .arrayref;
+        if (other == .eqref) return self == .i31ref or self == .structref or self == .arrayref;
         return false;
     }
 
