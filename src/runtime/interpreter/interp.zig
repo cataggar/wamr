@@ -490,6 +490,16 @@ fn gcArrayNewData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
         }
     }
     if (data_idx >= module.data_segments.len) return error.Unreachable;
+    // Check if data segment has been dropped
+    const is_data_dropped = data_idx < env.module_inst.dropped_data.len and
+        env.module_inst.dropped_data[data_idx];
+    if (is_data_dropped) {
+        const byte_len = @as(u64, len) * elem_size;
+        if (byte_len > 0) return error.OutOfBoundsMemoryAccess;
+        const obj_idx = try allocGcObject(env.module_inst, type_idx, &.{});
+        try env.push(.{ .arrayref = obj_idx });
+        return;
+    }
     const data = module.data_segments[data_idx].data;
     const byte_len = @as(u64, len) * elem_size;
     if (@as(u64, offset) + byte_len > data.len) return error.OutOfBoundsMemoryAccess;
@@ -514,38 +524,43 @@ fn gcArrayNewElem(env: *ExecEnv, type_idx: u32, elem_seg_idx: u32) TrapError!voi
     const offset = @as(u32, @bitCast(try env.popI32()));
     const module = env.module_inst.module;
     if (elem_seg_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
-    const is_truly_dropped = elem_seg_idx < env.module_inst.dropped_elems.len and
-        env.module_inst.dropped_elems[elem_seg_idx] and
-        !module.elements[elem_seg_idx].is_declarative;
-    if (is_truly_dropped) {
+
+    // Use cached evaluated values if available (spec requires one-time evaluation).
+    // Check cache before dropped status — see gcArrayInitElem comment for rationale.
+    if (elem_seg_idx < env.module_inst.cached_elem_values.len) {
+        if (env.module_inst.cached_elem_values[elem_seg_idx]) |cached| {
+            if (@as(u64, offset) + len > cached.len) return error.OutOfBoundsTableAccess;
+            var fields_buf: [65536]types.Value = undefined;
+            if (len > fields_buf.len) return error.StackOverflow;
+            for (0..len) |i| {
+                fields_buf[i] = cached[offset + @as(u32, @intCast(i))];
+            }
+            const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..len]);
+            try env.push(.{ .arrayref = obj_idx });
+            return;
+        }
+    }
+
+    const is_dropped = elem_seg_idx < env.module_inst.dropped_elems.len and
+        env.module_inst.dropped_elems[elem_seg_idx];
+    if (is_dropped) {
         if (len > 0) return error.OutOfBoundsTableAccess;
         const obj_idx = try allocGcObject(env.module_inst, type_idx, &.{});
         try env.push(.{ .arrayref = obj_idx });
         return;
     }
     const elem = &module.elements[elem_seg_idx];
-    if (@as(u64, offset) + len > elem.func_indices.len) return error.OutOfBoundsTableAccess;
+    const elem_count = @max(elem.func_indices.len, elem.elem_exprs.len);
+    if (@as(u64, offset) + len > elem_count) return error.OutOfBoundsTableAccess;
     var fields_buf: [65536]types.Value = undefined;
     if (len > fields_buf.len) return error.StackOverflow;
-    const instance_mod = @import("instance.zig");
+    // Fallback: use func_indices directly
     for (0..len) |i| {
         const si = offset + @as(u32, @intCast(i));
-        if (elem.elem_exprs.len > si) {
-            if (elem.elem_exprs[si]) |expr| {
-                switch (expr) {
-                    .ref_func => |fidx| {
-                        fields_buf[i] = .{ .nonfuncref = fidx };
-                        continue;
-                    },
-                    .bytecode => |bc| {
-                        fields_buf[i] = instance_mod.evalInitBytecode(bc, &.{}, env.module_inst) catch .{ .funcref = null };
-                        continue;
-                    },
-                    else => {},
-                }
-            }
-        }
-        fields_buf[i] = if (elem.func_indices[si]) |fi| .{ .nonfuncref = fi } else .{ .funcref = null };
+        fields_buf[i] = if (si < elem.func_indices.len)
+            (if (elem.func_indices[si]) |fi| .{ .nonfuncref = fi } else .{ .funcref = null })
+        else
+            .{ .funcref = null };
     }
     const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..len]);
     try env.push(.{ .arrayref = obj_idx });
@@ -641,10 +656,10 @@ fn gcArrayCopy(env: *ExecEnv) TrapError!void {
 }
 
 fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labels: *[256]Label, label_sp: *u32) TrapError!void {
-    // Wabt encoding: labelidx(LEB128) ht1(LEB128) ht2(LEB128) — no castflags
+    // Wabt encoding: labelidx(U32 LEB128) castflags(1 byte) target_heaptype(S32 LEB128)
     const depth = readU32(code, ip);
-    _ = readU32(code, ip); // source heap type
-    const target_ht = readU32(code, ip); // target heap type
+    const castflags = readU32(code, ip); // bit 0 = source nullable, bit 1 = target nullable
+    const target_ht = readU32(code, ip);
     const ref = try env.pop();
     const is_null = switch (ref) {
         .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
@@ -652,7 +667,8 @@ fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labe
         .exnref => |r| r == null,
         else => true,
     };
-    const matches = if (is_null) false else refTestMatch(ref, target_ht, env.module_inst) != 0;
+    const target_nullable = (castflags & 0x02) != 0;
+    const matches = if (is_null) target_nullable else refTestMatch(ref, target_ht, env.module_inst) != 0;
     const should_branch = if (sub_op == 0x18) matches else !matches;
     if (should_branch) {
         if (depth >= label_sp.*) return error.StackUnderflow;
@@ -679,6 +695,13 @@ fn gcArrayInitData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     const module = env.module_inst.module;
     if (data_idx >= module.data_segments.len) return error.Unreachable;
+    // Check if data segment has been dropped
+    const is_data_dropped = data_idx < env.module_inst.dropped_data.len and
+        env.module_inst.dropped_data[data_idx];
+    if (is_data_dropped) {
+        if (len > 0) return error.OutOfBoundsMemoryAccess;
+        return;
+    }
     const data = module.data_segments[data_idx].data;
     // Determine element size from type definition, accounting for packed types
     var elem_size: u32 = 1;
@@ -722,45 +745,40 @@ fn gcArrayInitElem(env: *ExecEnv, type_idx: u32, elem_seg_idx: u32) TrapError!vo
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     const module = env.module_inst.module;
     if (elem_seg_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
-    // Workaround: wabt encodes `(elem func ...)` as declarative (flags=3) instead of passive (flags=1).
-    // Allow declarative segments for GC array operations since they have valid function indices.
-    const is_truly_dropped = elem_seg_idx < env.module_inst.dropped_elems.len and
-        env.module_inst.dropped_elems[elem_seg_idx] and
-        !module.elements[elem_seg_idx].is_declarative;
-    if (is_truly_dropped) {
+
+    // Use cached evaluated values if available (spec requires one-time evaluation).
+    // Check cache before dropped status because wabt encodes passive elem segments
+    // as declarative (flags=3), which are initially marked as dropped but must
+    // remain accessible for GC array operations via cached values.
+    if (elem_seg_idx < env.module_inst.cached_elem_values.len) {
+        if (env.module_inst.cached_elem_values[elem_seg_idx]) |cached| {
+            if (@as(u64, src_off) + len > cached.len) return error.OutOfBoundsTableAccess;
+            if (@as(u64, dst_off) + len > obj.fields.len) return error.OutOfBoundsTableAccess;
+            for (0..len) |i| {
+                const si = src_off + @as(u32, @intCast(i));
+                const di = dst_off + @as(u32, @intCast(i));
+                obj.fields[di] = cached[si];
+            }
+            return;
+        }
+    }
+
+    const is_dropped = elem_seg_idx < env.module_inst.dropped_elems.len and
+        env.module_inst.dropped_elems[elem_seg_idx];
+    if (is_dropped) {
         if (len > 0) return error.OutOfBoundsTableAccess;
         return;
     }
     const elem = &module.elements[elem_seg_idx];
-    if (@as(u64, src_off) + len > elem.func_indices.len) return error.OutOfBoundsTableAccess;
+    const elem_count = @max(elem.func_indices.len, elem.elem_exprs.len);
+    if (@as(u64, src_off) + len > elem_count) return error.OutOfBoundsTableAccess;
     if (@as(u64, dst_off) + len > obj.fields.len) return error.OutOfBoundsTableAccess;
-    const instance_mod = @import("instance.zig");
+    // Fallback: use func_indices directly
     for (0..len) |i| {
         const si = src_off + @as(u32, @intCast(i));
         const di = dst_off + @as(u32, @intCast(i));
-        // Check for element expressions first
-        if (elem.elem_exprs.len > si) {
-            if (elem.elem_exprs[si]) |expr| {
-                switch (expr) {
-                    .ref_func => |fidx| {
-                        obj.fields[di] = .{ .nonfuncref = fidx };
-                        continue;
-                    },
-                    .bytecode => |bc| {
-                        const bc_val = instance_mod.evalInitBytecode(bc, &.{}, env.module_inst) catch {
-                            obj.fields[di] = .{ .funcref = null };
-                            continue;
-                        };
-                        obj.fields[di] = bc_val;
-                        continue;
-                    },
-                    else => {},
-                }
-            }
-        }
-        // Fallback: use func_indices
-        obj.fields[di] = if (elem.func_indices[si]) |fi|
-            .{ .nonfuncref = fi }
+        obj.fields[di] = if (si < elem.func_indices.len)
+            (if (elem.func_indices[si]) |fi| .{ .nonfuncref = fi } else .{ .funcref = null })
         else
             .{ .funcref = null };
     }
@@ -3047,6 +3065,10 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const idx = readU32(code, &ip);
                         if (idx < env.module_inst.dropped_elems.len) {
                             env.module_inst.dropped_elems[idx] = true;
+                        }
+                        // Also clear cached elem values so GC operations trap
+                        if (idx < env.module_inst.cached_elem_values.len) {
+                            env.module_inst.cached_elem_values[idx] = null;
                         }
                     },
                     14 => { // table.copy

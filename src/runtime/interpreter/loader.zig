@@ -42,6 +42,8 @@ pub const LoadError = error{
     DataCountRequired,
     IllegalOpcode,
     UndeclaredFuncRef,
+    ImmutableArray,
+    InvalidArrayElemType,
 };
 
 /// A streaming reader over the Wasm binary.
@@ -2168,8 +2170,8 @@ fn validateFunctionBody(
                     0x12, 0x13 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.init_data/elem: typeidx + idx
                     // ref.test/ref.cast: heaptype
                     0x14, 0x15, 0x16, 0x17 => { _ = readU32Leb(code, &i); },
-                    // br_on_cast: flags + label + 2 heaptypes
-                    0x18, 0x19 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); },
+                    // br_on_cast: label + castflags(1 byte read as LEB) + target heaptype
+                    0x18, 0x19 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); },
                     // No immediates
                     0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
                     else => {},
@@ -3627,7 +3629,13 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         }
                     },
                     0x0E => { // array.set
-                        _ = readU32Leb(code, &i);
+                        const tidx = readU32Leb(code, &i);
+                        if (tidx < module.types.len) {
+                            const ft = module.types[tidx];
+                            if (ft.kind == .array and ft.field_muts.len > 0) {
+                                if (ft.field_muts[0] & 0x01 == 0) return error.ImmutableArray;
+                            }
+                        }
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
@@ -3652,7 +3660,20 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                     },
                     0x12, 0x13 => { // array.init_data, array.init_elem
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        const tidx = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        // Validate array type: must be mutable, and element type must match
+                        if (tidx < module.types.len) {
+                            const ft = module.types[tidx];
+                            if (ft.kind == .array and ft.field_muts.len > 0) {
+                                if (ft.field_muts[0] & 0x01 == 0) return error.ImmutableArray;
+                                if (sub == 0x12 and ft.field_types.len > 0) {
+                                    // array.init_data: element type must be numeric or vector
+                                    const et = ft.field_types[0];
+                                    if (!et.isNumeric() and !et.isVector()) return error.InvalidArrayElemType;
+                                }
+                            }
+                        }
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
