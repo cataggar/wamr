@@ -1565,8 +1565,11 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                     const local_idx = elem.table_idx - module.import_table_count;
                     break :blk if (local_idx < module.tables.len) module.tables[local_idx].elem_tidx else NO_TIDX;
                 };
-                // Both concrete: must match
-                if (table_tidx != NO_TIDX and elem.type_idx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
+                // Both concrete: must match or be subtypes
+                if (table_tidx != NO_TIDX and elem.type_idx != NO_TIDX and elem.type_idx != table_tidx) {
+                    if (!typeIdxIsSubtype(module.types, module.rec_groups, elem.type_idx, table_tidx))
+                        return error.TypeMismatch;
+                }
             }
             // Validate offset expression type
             if (elem.offset) |offset| {
@@ -1632,9 +1635,15 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     const has_advanced_types = blk: {
         for (module.types) |t| {
             if (t.kind == .struct_ or t.kind == .array) break :blk true;
+            // Subtype declarations with concrete supertype require subtype-aware validation
+            if (t.supertype_idx != 0xFFFFFFFF) break :blk true;
         }
         for (module.tables) |t| {
             if (t.is_table64) break :blk true;
+        }
+        // Rec groups with multiple types need iso-recursive type checking
+        for (module.rec_groups) |rg| {
+            if (rg.group_size > 1) break :blk true;
         }
         break :blk false;
     };
