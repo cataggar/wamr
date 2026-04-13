@@ -394,7 +394,9 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                             const name = if (mod_name.len > 0 and mod_name[0] == '$') mod_name[1..] else mod_name;
                             try w.print(",\"module\":\"{s}\"", .{name});
                         }
-                        try w.print(",\"field\":\"{s}\",\"args\":[", .{field_name});
+                        try w.writeAll(",\"field\":");
+                        try writeJsonFieldName(w, field_name);
+                        try w.writeAll(",\"args\":[");
                         writeConstValues(w, sexpr.text) catch {};
                         try w.writeAll("]}}");
                     } else {
@@ -500,7 +502,8 @@ fn writeInvokeFields(w: anytype, invoke_text: []const u8) !void {
     }
     // Extract function name
     if (findQuotedString(invoke_text)) |name| {
-        try w.print(",\"field\":\"{s}\"", .{name});
+        try w.writeAll(",\"field\":");
+        try writeJsonFieldName(w, name);
     }
     // Extract args
     try w.writeAll(",\"args\":[");
@@ -514,7 +517,8 @@ fn writeGetFields(w: anytype, get_text: []const u8) !void {
         try w.print(",\"module\":\"{s}\"", .{name});
     }
     if (findQuotedString(get_text)) |name| {
-        try w.print(",\"field\":\"{s}\"", .{name});
+        try w.writeAll(",\"field\":");
+        try writeJsonFieldName(w, name);
     }
 }
 
@@ -1080,6 +1084,75 @@ fn findQuotedString(text: []const u8) ?[]const u8 {
         if (text[end] == '\\' and end + 1 < text.len) end += 1;
     }
     return text[start..end];
+}
+
+/// Write a WAT string (content between quotes, with WAT escapes) as a JSON string value.
+/// Decodes WAT escapes (\xx, \\, \", \n, \t) and re-encodes as valid JSON escapes.
+fn writeJsonFieldName(w: anytype, wat_str: []const u8) !void {
+    try w.writeByte('"');
+    var i: usize = 0;
+    while (i < wat_str.len) {
+        if (wat_str[i] == '\\' and i + 1 < wat_str.len) {
+            const esc = wat_str[i + 1];
+            if (esc == '\\' or esc == '"') {
+                // These WAT escapes are the same in JSON
+                try w.writeByte('\\');
+                try w.writeByte(esc);
+                i += 2;
+            } else if (esc == 'n') {
+                try w.writeAll("\\n");
+                i += 2;
+            } else if (esc == 't') {
+                try w.writeAll("\\t");
+                i += 2;
+            } else if (esc == 'r') {
+                try w.writeAll("\\r");
+                i += 2;
+            } else if (isHexDigit(esc) and i + 2 < wat_str.len and isHexDigit(wat_str[i + 2])) {
+                // WAT \xx hex escape → decode byte, re-encode as JSON
+                const byte = (hexVal(esc) << 4) | hexVal(wat_str[i + 2]);
+                if (byte < 0x20) {
+                    try w.print("\\u{x:0>4}", .{@as(u16, byte)});
+                } else if (byte == '"') {
+                    try w.writeAll("\\\"");
+                } else if (byte == '\\') {
+                    try w.writeAll("\\\\");
+                } else {
+                    try w.writeByte(byte);
+                }
+                i += 3;
+            } else {
+                // Unknown escape: pass through
+                try w.writeByte('\\');
+                try w.writeByte(esc);
+                i += 2;
+            }
+        } else {
+            const ch = wat_str[i];
+            if (ch == '"') {
+                try w.writeAll("\\\"");
+            } else if (ch == '\\') {
+                try w.writeAll("\\\\");
+            } else if (ch < 0x20) {
+                try w.print("\\u{x:0>4}", .{@as(u16, ch)});
+            } else {
+                try w.writeByte(ch);
+            }
+            i += 1;
+        }
+    }
+    try w.writeByte('"');
+}
+
+fn isHexDigit(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+fn hexVal(c: u8) u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return 0;
 }
 
 fn findLastQuotedString(text: []const u8) ?[]const u8 {
