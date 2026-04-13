@@ -640,6 +640,38 @@ fn gcArrayCopy(env: *ExecEnv) TrapError!void {
     }
 }
 
+fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labels: *[256]Label, label_sp: *u32) TrapError!void {
+    // Encoding: castflags(1 byte) labelidx(u32) ht1(s33) ht2(s33)
+    if (ip.* >= code.len) return error.Unreachable;
+    ip.* += 1; // castflags (1 raw byte)
+    const depth = readU32(code, ip);
+    _ = readU32(code, ip); // source heap type
+    const target_ht = readU32(code, ip); // target heap type
+    const ref = try env.pop();
+    const is_null = switch (ref) {
+        .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
+        .externref, .nonexternref => |r| r == null,
+        .exnref => |r| r == null,
+        else => true,
+    };
+    const matches = if (is_null) false else refTestMatch(ref, target_ht, env.module_inst) != 0;
+    const should_branch = if (sub_op == 0x18) matches else !matches;
+    if (should_branch) {
+        if (depth >= label_sp.*) return error.StackUnderflow;
+        const label = labels.*[label_sp.* - 1 - depth];
+        env.sp = label.stack_height;
+        try env.push(ref);
+        label_sp.* -= depth + 1;
+        if (label.kind == .loop) {
+            labels.*[label_sp.*] = label;
+            label_sp.* += 1;
+        }
+        ip.* = label.target_ip;
+    } else {
+        try env.push(ref);
+    }
+}
+
 fn gcArrayInitData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     const len = @as(u32, @bitCast(try env.popI32()));
     const src_off = @as(u32, @bitCast(try env.popI32()));
@@ -1181,8 +1213,8 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                     0x12, 0x13 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.init_data/elem
                     // ref.test/ref.cast: flags + type immediates
                     0x14, 0x15, 0x16, 0x17 => { pos = skipLeb128(code, pos); }, // simplified
-                    // br_on_cast/br_on_cast_fail: flags + label + 2 type immediates
-                    0x18, 0x19 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    // br_on_cast/br_on_cast_fail: castflags(1 byte) + label + 2 type immediates
+                    0x18, 0x19 => { pos += 1; pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
                     // No immediates
                     0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
                     else => {},
@@ -1309,7 +1341,7 @@ fn findElse(code: []const u8, start: usize) ?usize {
                     0x11 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
                     0x12, 0x13 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
                     0x14, 0x15, 0x16, 0x17 => pos = skipLeb128(code, pos),
-                    0x18, 0x19 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
+                    0x18, 0x19 => { pos += 1; pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
                     0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
                     else => {},
                 }
@@ -3210,6 +3242,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     0x11 => { _ = readU32(code, &ip); _ = readU32(code, &ip); try gcArrayCopy(env); },
                     0x12 => { const ti = readU32(code, &ip); const di = readU32(code, &ip); try gcArrayInitData(env, ti, di); },
                     0x13 => { const ti = readU32(code, &ip); const ei = readU32(code, &ip); try gcArrayInitElem(env, ti, ei); },
+                    0x18, 0x19 => { // br_on_cast (0x18), br_on_cast_fail (0x19)
+                        try handleBrOnCast(env, sub_op, code, &ip, &labels, &label_sp);
+                    },
                     else => return error.UnknownOpcode,
                 }
             },
