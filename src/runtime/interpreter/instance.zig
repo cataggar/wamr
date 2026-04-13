@@ -304,6 +304,13 @@ fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalIn
         .ref_null => |vt| switch (vt) {
             .funcref, .nonfuncref => return .{ .funcref = null },
             .externref, .nonexternref => return .{ .externref = null },
+            .anyref => return .{ .anyref = null },
+            .eqref => return .{ .eqref = null },
+            .i31ref => return .{ .i31ref = null },
+            .structref => return .{ .structref = null },
+            .arrayref => return .{ .arrayref = null },
+            .nullref => return .{ .nullref = null },
+            .exnref => return .{ .exnref = null },
             else => return error.InvalidInitExpr,
         },
         .ref_func => |idx| .{ .nonfuncref = idx },
@@ -362,12 +369,25 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
                 if (ip >= code.len) return error.InvalidInitExpr;
                 const ht = code[ip];
                 ip += 1;
-                if (sp >= stack.len) return error.InvalidInitExpr;
-                if (ht == 0x6F or ht == 0x72) {
-                    stack[sp] = .{ .externref = null };
-                } else {
-                    stack[sp] = .{ .funcref = null };
+                // For concrete type indices, consume remaining LEB128 bytes
+                if (ht & 0x80 != 0) {
+                    while (ip < code.len) {
+                        if (code[ip] & 0x80 == 0) { ip += 1; break; }
+                        ip += 1;
+                    }
                 }
+                if (sp >= stack.len) return error.InvalidInitExpr;
+                stack[sp] = switch (ht) {
+                    0x6F, 0x72, 0x74 => .{ .externref = null },
+                    0x6E => .{ .anyref = null },
+                    0x6D => .{ .eqref = null },
+                    0x6C => .{ .i31ref = null },
+                    0x6B => .{ .structref = null },
+                    0x6A => .{ .arrayref = null },
+                    0x65 => .{ .nullref = null },
+                    0x69, 0x68 => .{ .exnref = null },
+                    else => .{ .funcref = null },
+                };
                 sp += 1;
             },
             0xD2 => { // ref.func
