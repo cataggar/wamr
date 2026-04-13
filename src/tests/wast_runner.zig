@@ -745,19 +745,21 @@ fn parseWatF32(raw: []const u8) ?u32 {
     if (parseWatNanF32(s)) |bits| return bits;
     if (std.mem.eql(u8, s, "inf")) return 0x7F800000;
     if (std.mem.eql(u8, s, "-inf")) return 0xFF800000;
-    const f = std.fmt.parseFloat(f32, s) catch {
-        // Fallback: try parsing as hex integer and converting to f32
-        if (std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "-0x")) {
-            const neg = s[0] == '-';
-            const hex = if (neg) s[3..] else s[2..];
+    const is_hex = std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "-0x");
+    const has_p = std.mem.indexOfAny(u8, s, "pP") != null;
+    if (is_hex and !has_p) {
+        const neg = s[0] == '-';
+        var hex = if (neg) s[3..] else s[2..];
+        if (hex.len > 0 and hex[hex.len - 1] == '.') hex = hex[0 .. hex.len - 1];
+        if (std.mem.indexOfScalar(u8, hex, '.') == null) {
             const int_val = std.fmt.parseUnsigned(u64, hex, 16) catch return null;
             const fval: f32 = @floatFromInt(int_val);
             var bits: u32 = @bitCast(fval);
             if (neg) bits |= 0x80000000;
             return bits;
         }
-        return null;
-    };
+    }
+    const f = std.fmt.parseFloat(f32, s) catch return null;
     return @bitCast(f);
 }
 
@@ -768,19 +770,27 @@ fn parseWatF64(raw: []const u8) ?u64 {
     if (parseWatNanF64(s)) |bits| return bits;
     if (std.mem.eql(u8, s, "inf")) return 0x7FF0000000000000;
     if (std.mem.eql(u8, s, "-inf")) return 0xFFF0000000000000;
-    const f = std.fmt.parseFloat(f64, s) catch {
-        // Fallback: try parsing as hex integer and converting to f64
-        if (std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "-0x")) {
-            const neg = s[0] == '-';
-            const hex = if (neg) s[3..] else s[2..];
+    // Hex integers without 'p' exponent: treat as integer → float conversion
+    // Also handles trailing dot: 0xABC. (same as 0xABC)
+    const is_hex = std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "-0x");
+    const has_p = std.mem.indexOfAny(u8, s, "pP") != null;
+    if (is_hex and !has_p) {
+        const neg = s[0] == '-';
+        var hex = if (neg) s[3..] else s[2..];
+        // Strip trailing dot
+        if (hex.len > 0 and hex[hex.len - 1] == '.') hex = hex[0 .. hex.len - 1];
+        // Check if it has a fractional part (dot not at end)
+        if (std.mem.indexOfScalar(u8, hex, '.') != null) {
+            // Has real fractional part — need proper hex float parse, fall through
+        } else {
             const int_val = std.fmt.parseUnsigned(u128, hex, 16) catch return null;
             const fval: f64 = @floatFromInt(int_val);
             var bits: u64 = @bitCast(fval);
             if (neg) bits |= 0x8000000000000000;
             return bits;
         }
-        return null;
-    };
+    }
+    const f = std.fmt.parseFloat(f64, s) catch return null;
     return @bitCast(f);
 }
 
