@@ -235,9 +235,9 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
     // Heap-allocate local tables
     for (module.tables, 0..) |table_type, i| {
         const min_elems = table_type.limits.min;
-        const elems = allocator.alloc(?types.FuncRef, min_elems) catch
+        const elems = allocator.alloc(types.TableElement, min_elems) catch
             return error.TableAllocationFailed;
-        @memset(elems, null);
+        for (elems) |*e| e.* = types.TableElement.nullForType(table_type.elem_type);
 
         const tbl = allocator.create(types.TableInstance) catch {
             allocator.free(elems);
@@ -319,7 +319,7 @@ fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalIn
 }
 
 /// Evaluate compound constant expression bytecode using a mini stack machine.
-fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) InstantiationError!types.Value {
+pub fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) InstantiationError!types.Value {
     var stack: [16]types.Value = undefined;
     var sp: u32 = 0;
     var ip: usize = 0;
@@ -422,7 +422,7 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
                             .funcref, .nonfuncref => |v| v,
                             else => null,
                         };
-                        stack[sp - 1] = .{ .funcref = val };
+                        stack[sp - 1] = .{ .anyref = val };
                     },
                     0x1B => { // extern.convert_any: pop anyref, push externref
                         if (sp < 1) return error.InvalidInitExpr;
@@ -510,28 +510,14 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryI
 
 fn applyTableInitExprs(module: *const types.WasmModule, tables: []*types.TableInstance, inst: *types.ModuleInstance, globals: []const *types.GlobalInstance) InstantiationError!void {
     const import_count = module.import_table_count;
-    for (module.tables, 0..) |table_type, i| {
+    for (module.tables, 0..) |_, i| {
+        const table_type = module.tables[i];
         const init_expr = table_type.init_expr orelse continue;
         const table = tables[import_count + i];
         const val = evalInitExpr(init_expr, globals) catch continue;
-        // Extract u32 value from the init expression result, regardless of ref type
-        const ref_val: ?u32 = switch (val) {
-            .funcref => |v| v,
-            .nonfuncref => |v| v,
-            .i31ref => |v| v,
-            .anyref => |v| v,
-            .eqref => |v| v,
-            .structref => |v| v,
-            .arrayref => |v| v,
-            .nullref => |v| v,
-            .externref, .nonexternref => continue,
-            else => continue,
-        };
-        for (table.elements) |*elem| {
-            elem.* = if (ref_val) |rv|
-                .{ .func_idx = rv, .module_inst = inst }
-            else
-                null;
+        const elem = types.TableElement.fromValue(val, inst);
+        for (table.elements) |*e| {
+            e.* = elem;
         }
     }
 }
@@ -557,54 +543,33 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
                 if (seg.elem_exprs[i]) |expr| {
                     switch (expr) {
                         .ref_func => |fidx| {
-                            table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = inst };
+                            table.elements[offset + i] = .{
+                                .value = .{ .nonfuncref = fidx },
+                                .module_inst = inst,
+                            };
                         },
                         .global_get => |gidx| {
-                            // Evaluate global to get funcref value
                             if (gidx < globals.len) {
                                 const global = globals[gidx];
                                 const gval = global.value;
-                                // Use the source module that owns the function
                                 const src_inst = global.source_module orelse inst;
-                                const opt_fidx: ?u32 = switch (gval) {
-                                    .funcref => |v| v,
-                                    .nonfuncref => |v| v,
-                                    .i31ref => |v| v,
-                                    .anyref => |v| v,
-                                    .eqref => |v| v,
-                                    else => null,
-                                };
-                                if (opt_fidx) |fidx| {
-                                    table.elements[offset + i] = .{ .func_idx = fidx, .module_inst = src_inst };
-                                } else {
-                                    table.elements[offset + i] = null;
-                                }
+                                table.elements[offset + i] = types.TableElement.fromValue(gval, src_inst);
                             } else {
-                                table.elements[offset + i] = null;
+                                table.elements[offset + i] = types.TableElement.nullForType(table.table_type.elem_type);
                             }
                         },
                         .bytecode => {
-                            // Evaluate compound init expression (e.g., ref.i31, global.get + ref.i31)
                             const bc_val = evalInitExpr(expr, globals) catch {
-                                table.elements[offset + i] = null;
+                                table.elements[offset + i] = types.TableElement.nullForType(table.table_type.elem_type);
                                 continue;
                             };
-                            const ref_u32: ?u32 = switch (bc_val) {
-                                .funcref, .nonfuncref => |v| v,
-                                .i31ref, .anyref, .eqref, .structref, .arrayref => |v| v,
-                                else => null,
-                            };
-                            if (ref_u32) |rv| {
-                                table.elements[offset + i] = .{ .func_idx = rv, .module_inst = inst };
-                            } else {
-                                table.elements[offset + i] = null;
-                            }
+                            table.elements[offset + i] = types.TableElement.fromValue(bc_val, inst);
                         },
                         else => {
                             table.elements[offset + i] = if (mfunc_idx) |func_idx|
-                                .{ .func_idx = func_idx, .module_inst = inst }
+                                .{ .value = .{ .nonfuncref = func_idx }, .module_inst = inst }
                             else
-                                null;
+                                types.TableElement.nullForType(table.table_type.elem_type);
                         },
                     }
                     continue;
@@ -612,9 +577,9 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
             }
             // Fallback: use func_indices directly
             table.elements[offset + i] = if (mfunc_idx) |func_idx|
-                .{ .func_idx = func_idx, .module_inst = inst }
+                .{ .value = .{ .nonfuncref = func_idx }, .module_inst = inst }
             else
-                null;
+                types.TableElement.nullForType(table.table_type.elem_type);
         }
     }
 }
@@ -704,7 +669,7 @@ test "instantiate: module with table" {
     try testing.expectEqual(@as(usize, 1), inst.tables.len);
     try testing.expectEqual(@as(usize, 4), inst.tables[0].elements.len);
     // All elements should be null.
-    for (inst.tables[0].elements) |e| try testing.expectEqual(@as(?types.FuncRef, null), e);
+    for (inst.tables[0].elements) |e| try testing.expect(e.isNull());
 }
 
 test "instantiate: module with global i32.const 42" {

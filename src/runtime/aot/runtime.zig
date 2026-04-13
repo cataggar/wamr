@@ -132,8 +132,8 @@ fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Alloca
     }
 
     for (module.tables, 0..) |table_type, i| {
-        const elements = allocator.alloc(?types.FuncRef, table_type.limits.min) catch return error.TableAllocationFailed;
-        @memset(elements, null);
+        const elements = allocator.alloc(types.TableElement, table_type.limits.min) catch return error.TableAllocationFailed;
+        for (elements) |*e| e.* = types.TableElement.nullForType(table_type.elem_type);
         const tbl = allocator.create(types.TableInstance) catch {
             allocator.free(elements);
             return error.TableAllocationFailed;
@@ -235,7 +235,7 @@ test "instantiate: module with table" {
     try std.testing.expectEqual(@as(usize, 10), inst.tables[0].elements.len);
     // All elements should be null-initialized
     for (inst.tables[0].elements) |elem| {
-        try std.testing.expectEqual(@as(?types.FuncRef, null), elem);
+        try std.testing.expect(elem.isNull());
     }
 }
 
