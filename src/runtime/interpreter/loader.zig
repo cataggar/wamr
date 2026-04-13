@@ -323,9 +323,10 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x7C => .{ .vt = .f64, .tidx = NO_TIDX },
         0x7B => .{ .vt = .v128, .tidx = NO_TIDX },
         // GC packed storage types (used in struct/array fields, treated as i32 at runtime)
-        0x7A => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type
-        0x79 => .{ .vt = .i32, .tidx = NO_TIDX }, // i16 storage type
-        0x78 => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type (alias)
+        0x7A => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type (legacy encoding)
+        0x79 => .{ .vt = .i32, .tidx = NO_TIDX }, // i16 storage type (legacy encoding)
+        0x78 => .{ .vt = .i32, .tidx = NO_TIDX }, // i8 storage type
+        0x77 => .{ .vt = .i32, .tidx = NO_TIDX }, // i16 storage type
         0x70 => .{ .vt = .funcref, .tidx = NO_TIDX },
         0x6F => .{ .vt = .externref, .tidx = NO_TIDX },
         // GC proposal shorthand types (single-byte nullable ref types)
@@ -718,10 +719,11 @@ fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadErr
         } else {
             // Single type entry (0x60 func, 0x50 sub, 0x4F sub final)
             reader.pos -= 1; // unread the tag
-            const group_start: u32 = @intCast(func_types_list.items.len);
-            const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
+            const ft = parseOneType(reader, allocator, @intCast(func_types_list.items.len + count)) catch |err| {
+                return err;
+            };
             func_types_list.append(allocator, ft) catch return error.OutOfMemory;
-            rec_groups_list.append(allocator, .{ .group_start = group_start, .group_size = 1 }) catch return error.OutOfMemory;
+            rec_groups_list.append(allocator, .{ .group_start = @intCast(func_types_list.items.len - 1), .group_size = 1 }) catch return error.OutOfMemory;
         }
     }
     return .{
