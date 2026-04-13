@@ -73,7 +73,7 @@ pub fn instantiateWithImports(
     inst.tables = try allocateTables(module, allocator, import_ctx);
     errdefer freeTables(inst.tables, allocator);
 
-    inst.globals = try initializeGlobals(module, allocator, import_ctx);
+    inst.globals = try initializeGlobals(module, allocator, import_ctx, inst);
     errdefer freeGlobals(inst.globals, module.import_global_count, allocator);
 
     // Store imported function references
@@ -251,7 +251,7 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
     return tables;
 }
 
-fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext) InstantiationError![]*types.GlobalInstance {
+fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocator, import_ctx: ?ImportContext, inst: *types.ModuleInstance) InstantiationError![]*types.GlobalInstance {
     const import_count = module.import_global_count;
     const total_count = import_count + @as(u32, @intCast(module.globals.len));
     if (total_count == 0) return &.{};
@@ -274,7 +274,7 @@ fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocat
         const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
         g.* = .{
             .global_type = global.global_type,
-            .value = try evalInitExpr(global.init_expr, globals[0 .. import_count + i]),
+            .value = try evalInitExpr(global.init_expr, globals[0 .. import_count + i], inst),
         };
         // For ref_func globals, source_module will be set after inst is fully created
         // For global.get, inherit source_module from the referenced global
@@ -291,7 +291,7 @@ fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocat
 }
 
 /// Evaluate a constant init expression.
-fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalInstance) InstantiationError!types.Value {
+fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalInstance, inst: ?*types.ModuleInstance) InstantiationError!types.Value {
     return switch (expr) {
         .i32_const => |v| .{ .i32 = v },
         .i64_const => |v| .{ .i64 = v },
@@ -314,12 +314,12 @@ fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalIn
             else => return error.InvalidInitExpr,
         },
         .ref_func => |idx| .{ .nonfuncref = idx },
-        .bytecode => |code| evalInitBytecode(code, preceding_globals),
+        .bytecode => |code| evalInitBytecode(code, preceding_globals, inst),
     };
 }
 
 /// Evaluate compound constant expression bytecode using a mini stack machine.
-pub fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) InstantiationError!types.Value {
+pub fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance, inst: ?*types.ModuleInstance) InstantiationError!types.Value {
     var stack: [16]types.Value = undefined;
     var sp: u32 = 0;
     var ip: usize = 0;
@@ -436,15 +436,55 @@ pub fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance
                     0x00, 0x01 => { // struct.new, struct.new_default
                         const type_idx_r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
                         ip += type_idx_r.bytes_read;
-                        // Skip struct creation in init expr (no module inst available)
-                        // Just push a null structref as placeholder
-                        if (r.value == 0x01) { // struct.new_default: no args
+                        const type_idx = type_idx_r.value;
+                        if (inst) |mi| {
+                            const module = mi.module;
+                            if (type_idx >= module.types.len) return error.InvalidInitExpr;
+                            const ft = module.types[type_idx];
+                            const field_count = ft.field_types.len;
+                            var fields_buf: [256]types.Value = undefined;
+                            if (field_count > fields_buf.len) return error.InvalidInitExpr;
+                            if (r.value == 0x01) { // struct.new_default
+                                for (ft.field_types, 0..) |fvt, fi| {
+                                    fields_buf[fi] = switch (fvt) {
+                                        .i32 => .{ .i32 = 0 },
+                                        .i64 => .{ .i64 = 0 },
+                                        .f32 => .{ .f32 = 0.0 },
+                                        .f64 => .{ .f64 = 0.0 },
+                                        .funcref => .{ .funcref = null },
+                                        .externref => .{ .externref = null },
+                                        .anyref => .{ .anyref = null },
+                                        .eqref => .{ .eqref = null },
+                                        .i31ref => .{ .i31ref = null },
+                                        .structref => .{ .structref = null },
+                                        .arrayref => .{ .arrayref = null },
+                                        .nullref => .{ .nullref = null },
+                                        .v128 => .{ .v128 = 0 },
+                                        else => .{ .i32 = 0 },
+                                    };
+                                }
+                            } else { // struct.new: pop fields in reverse
+                                if (sp < field_count) return error.InvalidInitExpr;
+                                var fi = field_count;
+                                while (fi > 0) {
+                                    fi -= 1;
+                                    sp -= 1;
+                                    fields_buf[fi] = stack[sp];
+                                }
+                            }
+                            const fields_copy = mi.allocator.alloc(types.Value, field_count) catch return error.InvalidInitExpr;
+                            @memcpy(fields_copy, fields_buf[0..field_count]);
+                            const obj_idx: u32 = @intCast(mi.gc_objects.items.len);
+                            mi.gc_objects.append(mi.allocator, .{ .type_idx = type_idx, .fields = fields_copy }) catch return error.InvalidInitExpr;
                             if (sp >= stack.len) return error.InvalidInitExpr;
-                            stack[sp] = .{ .structref = null };
+                            stack[sp] = .{ .structref = obj_idx };
                             sp += 1;
-                        } else { // struct.new: pop fields, push structref
-                            // Can't properly create objects without module instance
-                            // Consume field count from type and push null
+                        } else {
+                            // No module instance — push null placeholder
+                            if (r.value == 0x00) {
+                                // struct.new: need to pop fields but don't know count without types
+                                return error.InvalidInitExpr;
+                            }
                             if (sp >= stack.len) return error.InvalidInitExpr;
                             stack[sp] = .{ .structref = null };
                             sp += 1;
@@ -455,12 +495,88 @@ pub fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance
                         ip += type_idx_r.bytes_read;
                         const count_r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
                         ip += count_r.bytes_read;
-                        // Pop count elements, push arrayref
-                        if (sp < count_r.value) return error.InvalidInitExpr;
-                        sp -= count_r.value;
-                        if (sp >= stack.len) return error.InvalidInitExpr;
-                        stack[sp] = .{ .arrayref = null };
-                        sp += 1;
+                        const elem_count = count_r.value;
+                        if (sp < elem_count) return error.InvalidInitExpr;
+                        if (inst) |mi| {
+                            var elems_buf: [65536]types.Value = undefined;
+                            if (elem_count > elems_buf.len) return error.InvalidInitExpr;
+                            // Pop elements in reverse
+                            var ei = elem_count;
+                            while (ei > 0) {
+                                ei -= 1;
+                                sp -= 1;
+                                elems_buf[ei] = stack[sp];
+                            }
+                            const fields_copy = mi.allocator.alloc(types.Value, elem_count) catch return error.InvalidInitExpr;
+                            @memcpy(fields_copy, elems_buf[0..elem_count]);
+                            const obj_idx: u32 = @intCast(mi.gc_objects.items.len);
+                            mi.gc_objects.append(mi.allocator, .{ .type_idx = type_idx_r.value, .fields = fields_copy }) catch return error.InvalidInitExpr;
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .arrayref = obj_idx };
+                            sp += 1;
+                        } else {
+                            sp -= elem_count;
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .arrayref = null };
+                            sp += 1;
+                        }
+                    },
+                    0x06 => { // array.new: pop init_val + length, allocate array
+                        const type_idx_r2 = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                        ip += type_idx_r2.bytes_read;
+                        if (sp < 2) return error.InvalidInitExpr;
+                        sp -= 1;
+                        const len: u32 = @bitCast(stack[sp].i32);
+                        sp -= 1;
+                        const init_val = stack[sp];
+                        if (inst) |mi| {
+                            const fields_copy = mi.allocator.alloc(types.Value, len) catch return error.InvalidInitExpr;
+                            for (fields_copy) |*f| f.* = init_val;
+                            const obj_idx: u32 = @intCast(mi.gc_objects.items.len);
+                            mi.gc_objects.append(mi.allocator, .{ .type_idx = type_idx_r2.value, .fields = fields_copy }) catch return error.InvalidInitExpr;
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .arrayref = obj_idx };
+                            sp += 1;
+                        } else {
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .arrayref = null };
+                            sp += 1;
+                        }
+                    },
+                    0x07 => { // array.new_default: pop length, allocate zero-initialized array
+                        const type_idx_r2 = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                        ip += type_idx_r2.bytes_read;
+                        if (sp < 1) return error.InvalidInitExpr;
+                        sp -= 1;
+                        const len: u32 = @bitCast(stack[sp].i32);
+                        if (inst) |mi| {
+                            const module = mi.module;
+                            const elem_vt: types.ValType = if (type_idx_r2.value < module.types.len) blk: {
+                                const ft = module.types[type_idx_r2.value];
+                                break :blk if (ft.field_types.len > 0) ft.field_types[0] else .i32;
+                            } else .i32;
+                            const default_val: types.Value = switch (elem_vt) {
+                                .i32 => .{ .i32 = 0 },
+                                .i64 => .{ .i64 = 0 },
+                                .f32 => .{ .f32 = 0.0 },
+                                .f64 => .{ .f64 = 0.0 },
+                                .funcref => .{ .funcref = null },
+                                .externref => .{ .externref = null },
+                                .anyref => .{ .anyref = null },
+                                else => .{ .i32 = 0 },
+                            };
+                            const fields_copy = mi.allocator.alloc(types.Value, len) catch return error.InvalidInitExpr;
+                            for (fields_copy) |*f| f.* = default_val;
+                            const obj_idx: u32 = @intCast(mi.gc_objects.items.len);
+                            mi.gc_objects.append(mi.allocator, .{ .type_idx = type_idx_r2.value, .fields = fields_copy }) catch return error.InvalidInitExpr;
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .arrayref = obj_idx };
+                            sp += 1;
+                        } else {
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .arrayref = null };
+                            sp += 1;
+                        }
                     },
                     else => return error.InvalidInitExpr,
                 }
@@ -514,7 +630,7 @@ fn applyTableInitExprs(module: *const types.WasmModule, tables: []*types.TableIn
         const table_type = module.tables[i];
         const init_expr = table_type.init_expr orelse continue;
         const table = tables[import_count + i];
-        const val = evalInitExpr(init_expr, globals) catch continue;
+        const val = evalInitExpr(init_expr, globals, inst) catch continue;
         const elem = types.TableElement.fromValue(val, inst);
         for (table.elements) |*e| {
             e.* = elem;
@@ -559,7 +675,7 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
                             }
                         },
                         .bytecode => {
-                            const bc_val = evalInitExpr(expr, globals) catch {
+                            const bc_val = evalInitExpr(expr, globals, inst) catch {
                                 table.elements[offset + i] = types.TableElement.nullForType(table.table_type.elem_type);
                                 continue;
                             };
@@ -586,7 +702,7 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
 
 /// Helper: evaluate an init expr, returning the result as a u32 offset.
 fn evalInitExprAsU32(expr: types.InitExpr, globals: []const *types.GlobalInstance) InstantiationError!u32 {
-    const val = try evalInitExpr(expr, globals);
+    const val = try evalInitExpr(expr, globals, null);
     return switch (val) {
         .i32 => |v| if (v < 0) return error.DataSegmentOutOfBounds else @intCast(v),
         .i64 => |v| if (v < 0 or v > std.math.maxInt(u32)) return error.DataSegmentOutOfBounds else @intCast(v),
@@ -733,22 +849,22 @@ test "instantiate: data segment with nonzero offset" {
 // test "instantiate: destroy cleans up without leaks"
 
 test "evalInitExpr: all constant types" {
-    const i32_val = try evalInitExpr(.{ .i32_const = -5 }, &.{});
+    const i32_val = try evalInitExpr(.{ .i32_const = -5 }, &.{}, null);
     try testing.expectEqual(@as(i32, -5), i32_val.i32);
 
-    const i64_val = try evalInitExpr(.{ .i64_const = 100 }, &.{});
+    const i64_val = try evalInitExpr(.{ .i64_const = 100 }, &.{}, null);
     try testing.expectEqual(@as(i64, 100), i64_val.i64);
 
-    const f32_val = try evalInitExpr(.{ .f32_const = 3.14 }, &.{});
+    const f32_val = try evalInitExpr(.{ .f32_const = 3.14 }, &.{}, null);
     try testing.expectApproxEqAbs(@as(f32, 3.14), f32_val.f32, 0.001);
 
-    const f64_val = try evalInitExpr(.{ .f64_const = 2.718 }, &.{});
+    const f64_val = try evalInitExpr(.{ .f64_const = 2.718 }, &.{}, null);
     try testing.expectApproxEqAbs(@as(f64, 2.718), f64_val.f64, 0.001);
 
-    const ref_null_val = try evalInitExpr(.{ .ref_null = .funcref }, &.{});
+    const ref_null_val = try evalInitExpr(.{ .ref_null = .funcref }, &.{}, null);
     try testing.expectEqual(@as(?u32, null), ref_null_val.funcref);
 
-    const ref_func_val = try evalInitExpr(.{ .ref_func = 5 }, &.{});
+    const ref_func_val = try evalInitExpr(.{ .ref_func = 5 }, &.{}, null);
     try testing.expectEqual(@as(?u32, 5), ref_func_val.nonfuncref);
 }
 
@@ -758,11 +874,11 @@ test "evalInitExpr: global_get references preceding global" {
         .value = .{ .i32 = 99 },
     };
     const globals = [_]*types.GlobalInstance{&global};
-    const val = try evalInitExpr(.{ .global_get = 0 }, &globals);
+    const val = try evalInitExpr(.{ .global_get = 0 }, &globals, null);
     try testing.expectEqual(@as(i32, 99), val.i32);
 }
 
 test "evalInitExpr: global_get out of range" {
-    const result = evalInitExpr(.{ .global_get = 5 }, &.{});
+    const result = evalInitExpr(.{ .global_get = 5 }, &.{}, null);
     try testing.expectError(error.InvalidGlobalIndex, result);
 }

@@ -2825,7 +2825,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                                             continue;
                                         },
                                         .bytecode => |bc| {
-                                            const bc_val = instance_mod.evalInitBytecode(bc, &.{}) catch {
+                                            const bc_val = instance_mod.evalInitBytecode(bc, &.{}, env.module_inst) catch {
                                                 table.elements[d + ii] = types.TableElement.nullForType(table.table_type.elem_type);
                                                 continue;
                                             };

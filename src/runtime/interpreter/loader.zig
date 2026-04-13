@@ -466,7 +466,7 @@ fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types
         _ = try reader.readByte(); // reserved byte (must be 0)
         const info = try readValTypeWithTidx(reader, type_count);
         const lr = try readLimitsEx(reader);
-        const init_expr = try parseInitExprChecked(reader, type_count);
+        const init_expr = try parseInitExprChecked(reader, type_count, null);
         return .{ .elem_type = info.vt, .limits = lr.limits, .elem_tidx = info.tidx, .init_expr = init_expr, .is_table64 = lr.is_64 };
     }
 
@@ -583,10 +583,10 @@ fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.Globa
 }
 
 fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
-    return parseInitExprChecked(reader, null);
+    return parseInitExprChecked(reader, null, null);
 }
 
-fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types.InitExpr {
+fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32, module_types: ?[]const types.FuncType) LoadError!types.InitExpr {
     const start_pos = reader.pos;
     const opcode = try reader.readByte();
     // Empty init expression (just 0x0B end) is invalid
@@ -650,7 +650,13 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
                     0x1B => {}, // extern.convert_any: pop anyref, push externref (net 0)
                     0x00 => { // struct.new: pop N fields, push structref
                         const tidx = try reader.readU32();
-                        _ = tidx; // type index consumed
+                        if (module_types) |mt| {
+                            if (tidx < mt.len) {
+                                const field_count: i32 = @intCast(mt[tidx].field_types.len);
+                                stack_depth -= field_count;
+                            }
+                        }
+                        stack_depth += 1;
                     },
                     0x01 => { _ = try reader.readU32(); stack_depth += 1; }, // struct.new_default: push structref
                     0x08 => { // array.new_fixed: type_idx + count → pop count, push 1
@@ -661,8 +667,9 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
                     },
                     0x02, 0x03, 0x04 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.get: net 0
                     0x05 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.set
-                    0x06, 0x07 => { _ = try reader.readU32(); }, // array.new/new_default
-                    0x09, 0x0A => { _ = try reader.readU32(); _ = try reader.readU32(); }, // array.new_data/elem
+                    0x06 => { _ = try reader.readU32(); stack_depth -= 1; }, // array.new: pop init+len, push arrayref (net -1)
+                    0x07 => { _ = try reader.readU32(); }, // array.new_default: pop len, push arrayref (net 0)
+                    0x09, 0x0A => { _ = try reader.readU32(); _ = try reader.readU32(); stack_depth -= 1; }, // array.new_data/elem: pop offset+len, push arrayref (net -1)
                     0x0B, 0x0C, 0x0D => { _ = try reader.readU32(); }, // array.get
                     0x0E => { _ = try reader.readU32(); }, // array.set
                     0x0F => {}, // array.len
@@ -921,13 +928,13 @@ fn parseMemorySection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
     return memories;
 }
 
-fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.WasmGlobal {
+fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32, module_types: ?[]const types.FuncType) LoadError![]const types.WasmGlobal {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     const globals = try allocator.alloc(types.WasmGlobal, count);
     for (globals) |*g| {
         const global_type = try readGlobalType(reader, type_count);
-        const init_expr = try parseInitExprChecked(reader, type_count);
+        const init_expr = try parseInitExprChecked(reader, type_count, module_types);
         g.* = .{ .global_type = global_type, .init_expr = init_expr };
     }
     return globals;
@@ -1274,7 +1281,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 .function => func_type_indices = try parseFunctionSection(&reader, allocator),
                 .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len), module.import_global_count),
                 .memory => module.memories = try parseMemorySection(&reader, allocator),
-                .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len)),
+                .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len), module.types),
                 .@"export" => module.exports = try parseExportSection(&reader, allocator),
                 .start => module.start_function = try reader.readU32(),
                 .element => module.elements = try parseElementSection(&reader, allocator, @intCast(module.types.len)),
