@@ -622,6 +622,8 @@ pub const ModuleInstance = struct {
     dropped_data: []bool = &.{},
     /// GC heap for struct/array objects
     gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
+    /// Cached evaluated element segment values (spec requires one-time evaluation)
+    cached_elem_values: []?[]Value = &.{},
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {
         const exp = self.module.findExport(name, .function) orelse return null;

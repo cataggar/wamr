@@ -121,6 +121,46 @@ pub fn instantiateWithImports(
         }
     }
 
+    // Cache evaluated element segment values (spec requires one-time evaluation)
+    if (module.elements.len > 0) {
+        inst.cached_elem_values = allocator.alloc(?[]types.Value, module.elements.len) catch return error.OutOfMemory;
+        for (module.elements, 0..) |elem, seg_i| {
+            if (elem.elem_exprs.len == 0 and elem.func_indices.len == 0) {
+                inst.cached_elem_values[seg_i] = null;
+                continue;
+            }
+            const count = @max(elem.elem_exprs.len, elem.func_indices.len);
+            const vals = allocator.alloc(types.Value, count) catch {
+                inst.cached_elem_values[seg_i] = null;
+                continue;
+            };
+            for (0..count) |i| {
+                const si = @as(u32, @intCast(i));
+                if (elem.elem_exprs.len > si) {
+                    if (elem.elem_exprs[si]) |expr| {
+                        switch (expr) {
+                            .ref_func => |fidx| {
+                                vals[i] = .{ .nonfuncref = fidx };
+                                continue;
+                            },
+                            .bytecode => |bc| {
+                                vals[i] = evalInitBytecode(bc, &.{}, inst) catch .{ .funcref = null };
+                                continue;
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                if (si < elem.func_indices.len) {
+                    vals[i] = if (elem.func_indices[si]) |fi| .{ .nonfuncref = fi } else .{ .funcref = null };
+                } else {
+                    vals[i] = .{ .funcref = null };
+                }
+            }
+            inst.cached_elem_values[seg_i] = vals;
+        }
+    }
+
     // Initialize dropped data segments tracking
     if (module.data_segments.len > 0) {
         inst.dropped_data = allocator.alloc(bool, module.data_segments.len) catch return error.OutOfMemory;
