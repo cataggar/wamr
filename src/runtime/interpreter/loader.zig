@@ -192,6 +192,22 @@ pub fn typeIdxIsSubtype(module_types: []const types.FuncType, rec_groups: []cons
     return false;
 }
 
+/// Check subtype using canonical type map for iso-recursive equivalence.
+fn isSubtypeWithCanonical(module: *const types.WasmModule, sub_idx: u32, super_idx: u32) bool {
+    if (sub_idx == super_idx) return true;
+    // Check canonical equivalence
+    if (sub_idx < module.canonical_type_map.len and super_idx < module.canonical_type_map.len) {
+        if (module.canonical_type_map[sub_idx] == module.canonical_type_map[super_idx]) return true;
+    }
+    // Walk the supertype chain with canonical checks
+    if (sub_idx >= module.types.len) return false;
+    const sub_type = module.types[sub_idx];
+    if (sub_type.supertype_idx != NO_TIDX) {
+        return isSubtypeWithCanonical(module, sub_type.supertype_idx, super_idx);
+    }
+    return false;
+}
+
 fn funcTypesStructurallyMatch(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, a: types.FuncType, b: types.FuncType, ga_start: u32, gb_start: u32) bool {
     if (a.kind != b.kind) return false;
     // Supertype and finality must match for iso-recursive equivalence
@@ -1490,8 +1506,14 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 if (g.global_type.type_idx != NO_TIDX) {
                     const func_tidx = module.getFuncTypeIdx(fidx) orelse NO_TIDX;
                     if (func_tidx != NO_TIDX and func_tidx != g.global_type.type_idx) {
-                        if (!typeIdxIsSubtype(module.types, module.rec_groups, func_tidx, g.global_type.type_idx))
-                            return error.TypeMismatch;
+                        // Check canonical equivalence (handles iso-recursive type equivalence)
+                        const canon_a = if (func_tidx < module.canonical_type_map.len) module.canonical_type_map[func_tidx] else func_tidx;
+                        const canon_b = if (g.global_type.type_idx < module.canonical_type_map.len) module.canonical_type_map[g.global_type.type_idx] else g.global_type.type_idx;
+                        if (canon_a != canon_b) {
+                            // Walk supertype chain with canonical comparison
+                            if (!isSubtypeWithCanonical(module, func_tidx, g.global_type.type_idx))
+                                return error.TypeMismatch;
+                        }
                     }
                 }
             },
