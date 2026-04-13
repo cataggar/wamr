@@ -436,12 +436,12 @@ fn readLimitsEx(reader: *BinaryReader) LoadError!LimitsResult {
 
     if (is_64) {
         const min64 = try reader.readU64();
-        if (min64 > std.math.maxInt(u32)) return error.InvalidLimits;
-        const min: u32 = @intCast(min64);
+        // For memory64/table64, allow limits > u32 max — cap to u32 for storage
+        const min: u32 = if (min64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(min64);
         if (has_max) {
             const max64 = try reader.readU64();
-            if (max64 > std.math.maxInt(u32)) return error.InvalidLimits;
-            return .{ .limits = .{ .min = min, .max = @intCast(max64) }, .is_64 = true };
+            const max: u32 = if (max64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max64);
+            return .{ .limits = .{ .min = min, .max = max }, .is_64 = true };
         }
         return .{ .limits = .{ .min = min }, .is_64 = true };
     } else {
