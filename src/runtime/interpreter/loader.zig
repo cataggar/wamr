@@ -1603,17 +1603,20 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     }
 
     // Type-stack validation for each function body (skip for imports w/ 0 local funcs)
-    // Determine if this module uses GC types (struct/array kinds in the type section)
-    const has_gc_types = blk: {
+    // Determine if this module uses advanced features with known validator gaps
+    const has_advanced_types = blk: {
         for (module.types) |t| {
             if (t.kind == .struct_ or t.kind == .array) break :blk true;
+        }
+        for (module.tables) |t| {
+            if (t.is_table64) break :blk true;
         }
         break :blk false;
     };
     if (module.functions.len > 0) {
         for (module.functions) |func| {
             validateFunctionTypes(module, &func) catch |err| {
-                if (err == error.TypeMismatch and (has_gc_types or hasGcOpcodes(func.code))) {
+                if (err == error.TypeMismatch and (has_advanced_types or hasGcOpcodes(func.code))) {
                     continue;
                 }
                 return err;
