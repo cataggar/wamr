@@ -1369,7 +1369,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
 
     // Validate memory limits
     for (module.memories) |mem| {
-        try validateMemoryLimits(mem.limits);
+        try validateMemoryLimits(mem);
     }
 
     // Validate table limits
@@ -1393,7 +1393,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             },
             .memory => {
                 if (imp.memory_type) |mem| {
-                    try validateMemoryLimits(mem.limits);
+                    try validateMemoryLimits(mem);
                 }
             },
             .table => {
@@ -1615,9 +1615,16 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     }
 
     // Validate function bodies (alignment, index bounds)
+    const has_memory64 = blk: {
+        for (module.memories) |m| { if (m.is_memory64) break :blk true; }
+        for (module.imports) |imp| {
+            if (imp.kind == .memory) if (imp.memory_type) |mt| { if (mt.is_memory64) break :blk true; };
+        }
+        break :blk false;
+    };
     for (module.functions) |func| {
         const total_locals = @as(u32, @intCast(func.func_type.params.len)) + func.local_count;
-        try validateFunctionBody(func.code, module.types.len, total_funcs, total_tables, total_memories, total_globals, total_locals, module.data_count != null);
+        try validateFunctionBody(func.code, module.types.len, total_funcs, total_tables, total_memories, total_globals, total_locals, module.data_count != null, has_memory64);
     }
 
     // Type-stack validation for each function body (skip for imports w/ 0 local funcs)
@@ -1655,11 +1662,12 @@ fn hasGcOpcodes(code: []const u8) bool {
     return false;
 }
 
-fn validateMemoryLimits(limits: types.Limits) LoadError!void {
-    if (limits.min > 65536) return error.InvalidLimits;
-    if (limits.max) |max| {
-        if (max > 65536) return error.InvalidLimits;
-        if (limits.min > max) return error.InvalidLimits;
+fn validateMemoryLimits(mem: types.MemoryType) LoadError!void {
+    const max_pages: u64 = if (mem.is_memory64) (1 << 48) else 65536;
+    if (mem.limits.min > max_pages) return error.InvalidLimits;
+    if (mem.limits.max) |max| {
+        if (max > max_pages) return error.InvalidLimits;
+        if (mem.limits.min > max) return error.InvalidLimits;
     }
 }
 
@@ -1781,7 +1789,8 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
                 if (r1.value & 0x40 != 0) {
                     const r_mi = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r_mi.bytes_read;
                 }
-                const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r2.bytes_read;
+                // Offset: u64 for memory64, u32 for memory32 (u64 read is backward-compatible)
+                const r2 = leb128_mod.readUnsigned(u64, code[i..]) catch return; i += r2.bytes_read;
             },
             0x3F, 0x40 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
             0x41 => { const r = leb128_mod.readSigned(i32, code[i..]) catch return; i += r.bytes_read; },
@@ -1855,6 +1864,7 @@ fn validateFunctionBody(
     total_globals: u32,
     total_locals: u32,
     has_data_count: bool,
+    has_memory64: bool,
 ) LoadError!void {
     var i: usize = 0;
     while (i < code.len) {
@@ -1886,8 +1896,14 @@ fn validateFunctionBody(
             // But reject if any bits above bit 6 are set (invalid)
             if (align_result.value & ~@as(u32, 0x7F) != 0) return error.InvalidAlignment;
             if (align_value > ma) return error.InvalidAlignment;
-            const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidSectionSize;
-            i += offset_result.bytes_read;
+            // Offset: u64 for memory64, u32 for memory32
+            if (has_memory64) {
+                const offset_result = leb128_mod.readUnsigned(u64, code[i..]) catch return error.InvalidSectionSize;
+                i += offset_result.bytes_read;
+            } else {
+                const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidSectionSize;
+                i += offset_result.bytes_read;
+            }
             continue;
         }
 
