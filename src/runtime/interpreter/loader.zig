@@ -386,7 +386,21 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
             };
         },
         else => {
-            std.debug.print("InvalidValType(readValType-catch-all): byte=0x{x:0>2}\n", .{byte});
+            // Concrete type indices (small values 0x00-0x3F) may appear
+            // as heap types in certain contexts; treat as nonfuncref
+            if (byte < 0x40) {
+                if (max_types) |mt| {
+                    if (byte >= mt) return error.InvalidValType;
+                }
+                // Consume any LEB128 continuation bytes
+                if (byte & 0x80 != 0) {
+                    while (true) {
+                        const b = try reader.readByte();
+                        if (b & 0x80 == 0) break;
+                    }
+                }
+                return .{ .vt = .nonfuncref, .tidx = byte };
+            }
             return error.InvalidValType;
         },
     };
@@ -534,7 +548,7 @@ fn skipInitExpr(reader: *BinaryReader) LoadError!void {
             0x43 => { _ = try reader.readBytes(4); },
             0x44 => { _ = try reader.readBytes(8); },
             0x23 => { _ = try reader.readU32(); },
-            0xD0 => { _ = try readValTypeChecked(reader, null); },
+            0xD0 => { _ = try readHeapTypeAsValType(reader); },
             0xD2 => { _ = try reader.readU32(); },
             else => {},
         }
@@ -542,7 +556,6 @@ fn skipInitExpr(reader: *BinaryReader) LoadError!void {
     return error.UnexpectedEnd;
 }
 
-/// Validate and skip a table init expression. global.get can only reference imported globals.
 fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError!void {
     while (reader.remaining() > 0) {
         const b = try reader.readByte();
@@ -556,7 +569,7 @@ fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError
                 const idx = try reader.readU32();
                 if (idx >= max_global_idx) return error.UnknownGlobal;
             },
-            0xD0 => { _ = try readValTypeChecked(reader, null); },
+            0xD0 => { _ = try readHeapTypeAsValType(reader); },
             0xD2 => { _ = try reader.readU32(); },
             else => {},
         }
@@ -587,7 +600,7 @@ fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
     return parseInitExprChecked(reader, null, null);
 }
 
-fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32, module_types: ?[]const types.FuncType) LoadError!types.InitExpr {
+fn parseInitExprChecked(reader: *BinaryReader, _: ?u32, module_types: ?[]const types.FuncType) LoadError!types.InitExpr {
     const start_pos = reader.pos;
     const opcode = try reader.readByte();
     // Empty init expression (just 0x0B end) is invalid
@@ -636,7 +649,7 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32, module_types: ?
             0x43 => { _ = try reader.readBytes(4); stack_depth += 1; },
             0x44 => { _ = try reader.readBytes(8); stack_depth += 1; },
             0x23 => { _ = try reader.readU32(); stack_depth += 1; },
-            0xD0 => { _ = try readValTypeChecked(reader, type_count); stack_depth += 1; },
+            0xD0 => { _ = try readHeapTypeAsValType(reader); stack_depth += 1; },
             0xD2 => { _ = try reader.readU32(); stack_depth += 1; },
             // Valid const expr binary ops: pop 2, push 1
             0x6A, 0x6B, 0x6C, // i32.add, i32.sub, i32.mul
