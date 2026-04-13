@@ -190,7 +190,12 @@ fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInst
         0x6C => { // i31
             return switch (ref) {
                 .i31ref => |r| if (r != null) @as(i32, 1) else 0,
-                .eqref, .anyref => |r| if (r != null) @as(i32, 1) else 0, // i31 values stored in any/eq
+                .anyref, .eqref => |r| blk: {
+                    if (r == null) break :blk @as(i32, 0);
+                    // Check if this is a GC object (struct/array) — if so, not i31
+                    if (getGcObject(module_inst, r.?) != null) break :blk 0;
+                    break :blk 1; // Not a GC object → must be i31
+                },
                 .nullref => 0,
                 else => 0,
             };
@@ -198,7 +203,11 @@ fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInst
         0x6D => { // eq
             return switch (ref) {
                 .i31ref, .eqref, .structref, .arrayref => |r| if (r != null) @as(i32, 1) else 0,
-                .anyref => |r| if (r != null) @as(i32, 1) else 0,
+                .anyref => |r| blk: {
+                    if (r == null) break :blk @as(i32, 0);
+                    // anyref is always eq-compatible for non-null values
+                    break :blk 1;
+                },
                 .nullref => 0,
                 else => 0,
             };
