@@ -2504,17 +2504,19 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
             .ref_eq => {
                 const b = try env.pop();
                 const a = try env.pop();
-                const eq: bool = switch (a) {
-                    .funcref, .nonfuncref => |ra| switch (b) {
-                        .funcref, .nonfuncref => |rb| ra == rb,
-                        else => false,
-                    },
-                    .externref, .nonexternref => |ra| switch (b) {
-                        .externref, .nonexternref => |rb| ra == rb,
-                        else => false,
-                    },
-                    else => false,
+                // Extract the ?u32 from any ref type
+                const ra: ?u32 = switch (a) {
+                    .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r,
+                    .externref, .nonexternref, .exnref => |r| r,
+                    else => null,
                 };
+                const rb: ?u32 = switch (b) {
+                    .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r,
+                    .externref, .nonexternref, .exnref => |r| r,
+                    else => null,
+                };
+                // Both null = equal; both non-null and same index = equal
+                const eq = if (ra == null and rb == null) true else if (ra != null and rb != null) ra.? == rb.? else false;
                 try env.pushI32(@intFromBool(eq));
             },
             .br_on_non_null => {

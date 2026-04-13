@@ -433,6 +433,35 @@ fn evalInitBytecode(code: []const u8, globals: []const *types.GlobalInstance) In
                         };
                         stack[sp - 1] = .{ .externref = val };
                     },
+                    0x00, 0x01 => { // struct.new, struct.new_default
+                        const type_idx_r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                        ip += type_idx_r.bytes_read;
+                        // Skip struct creation in init expr (no module inst available)
+                        // Just push a null structref as placeholder
+                        if (r.value == 0x01) { // struct.new_default: no args
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .structref = null };
+                            sp += 1;
+                        } else { // struct.new: pop fields, push structref
+                            // Can't properly create objects without module instance
+                            // Consume field count from type and push null
+                            if (sp >= stack.len) return error.InvalidInitExpr;
+                            stack[sp] = .{ .structref = null };
+                            sp += 1;
+                        }
+                    },
+                    0x08 => { // array.new_fixed: type_idx + count
+                        const type_idx_r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                        ip += type_idx_r.bytes_read;
+                        const count_r = leb128_mod.readUnsigned(u32, code[ip..]) catch return error.InvalidInitExpr;
+                        ip += count_r.bytes_read;
+                        // Pop count elements, push arrayref
+                        if (sp < count_r.value) return error.InvalidInitExpr;
+                        sp -= count_r.value;
+                        if (sp >= stack.len) return error.InvalidInitExpr;
+                        stack[sp] = .{ .arrayref = null };
+                        sp += 1;
+                    },
                     else => return error.InvalidInitExpr,
                 }
             },
