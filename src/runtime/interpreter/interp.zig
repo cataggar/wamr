@@ -509,13 +509,46 @@ fn gcArrayNewData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
     try env.push(.{ .arrayref = obj_idx });
 }
 
-fn gcArrayNewElem(env: *ExecEnv, type_idx: u32, elem_idx: u32) TrapError!void {
-    _ = type_idx;
-    _ = elem_idx;
-    _ = try env.popI32(); // len
-    _ = try env.popI32(); // offset
-    // TODO: implement element-based array creation
-    try env.push(.{ .arrayref = null });
+fn gcArrayNewElem(env: *ExecEnv, type_idx: u32, elem_seg_idx: u32) TrapError!void {
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const offset = @as(u32, @bitCast(try env.popI32()));
+    const module = env.module_inst.module;
+    if (elem_seg_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
+    const is_truly_dropped = elem_seg_idx < env.module_inst.dropped_elems.len and
+        env.module_inst.dropped_elems[elem_seg_idx] and
+        !module.elements[elem_seg_idx].is_declarative;
+    if (is_truly_dropped) {
+        if (len > 0) return error.OutOfBoundsTableAccess;
+        const obj_idx = try allocGcObject(env.module_inst, type_idx, &.{});
+        try env.push(.{ .arrayref = obj_idx });
+        return;
+    }
+    const elem = &module.elements[elem_seg_idx];
+    if (@as(u64, offset) + len > elem.func_indices.len) return error.OutOfBoundsTableAccess;
+    var fields_buf: [65536]types.Value = undefined;
+    if (len > fields_buf.len) return error.StackOverflow;
+    const instance_mod = @import("instance.zig");
+    for (0..len) |i| {
+        const si = offset + @as(u32, @intCast(i));
+        if (elem.elem_exprs.len > si) {
+            if (elem.elem_exprs[si]) |expr| {
+                switch (expr) {
+                    .ref_func => |fidx| {
+                        fields_buf[i] = .{ .nonfuncref = fidx };
+                        continue;
+                    },
+                    .bytecode => |bc| {
+                        fields_buf[i] = instance_mod.evalInitBytecode(bc, &.{}, env.module_inst) catch .{ .funcref = null };
+                        continue;
+                    },
+                    else => {},
+                }
+            }
+        }
+        fields_buf[i] = if (elem.func_indices[si]) |fi| .{ .nonfuncref = fi } else .{ .funcref = null };
+    }
+    const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..len]);
+    try env.push(.{ .arrayref = obj_idx });
 }
 
 fn gcArrayGet(env: *ExecEnv, type_idx: u32, sub_op: u32) TrapError!void {
@@ -659,7 +692,12 @@ fn gcArrayInitElem(env: *ExecEnv, type_idx: u32, elem_seg_idx: u32) TrapError!vo
     const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
     const module = env.module_inst.module;
     if (elem_seg_idx >= module.elements.len) return error.OutOfBoundsTableAccess;
-    if (elem_seg_idx < env.module_inst.dropped_elems.len and env.module_inst.dropped_elems[elem_seg_idx]) {
+    // Workaround: wabt encodes `(elem func ...)` as declarative (flags=3) instead of passive (flags=1).
+    // Allow declarative segments for GC array operations since they have valid function indices.
+    const is_truly_dropped = elem_seg_idx < env.module_inst.dropped_elems.len and
+        env.module_inst.dropped_elems[elem_seg_idx] and
+        !module.elements[elem_seg_idx].is_declarative;
+    if (is_truly_dropped) {
         if (len > 0) return error.OutOfBoundsTableAccess;
         return;
     }
