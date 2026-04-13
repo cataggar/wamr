@@ -3613,16 +3613,18 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     },
                     // All remaining SIMD: categorize by opcode
                     else => {
-                        // Bitmask/all_true ops return i32
-                        if (sub == 0x62 or sub == 0x63 or sub == 0x82 or sub == 0x83 or
-                            sub == 0xA3 or sub == 0xA4 or sub == 0xC3 or sub == 0xC4)
+                        // all_true/bitmask ops return i32 (NOT popcnt 0x62!)
+                        if (sub == 0x63 or sub == 0x64 or // i8x16 all_true, bitmask
+                            sub == 0x83 or sub == 0x84 or // i16x8 all_true, bitmask
+                            sub == 0xA3 or sub == 0xA4 or // i32x4 all_true, bitmask
+                            sub == 0xC3 or sub == 0xC4) // i64x2 all_true, bitmask
                         {
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .i32, &stack_tidx);
                         }
                         // Unary ops [v128]->[v128]
                         else if (sub == 0x5E or sub == 0x5F or // f32x4_demote, f64x2_promote
-                            sub == 0x60 or sub == 0x61 or // i8x16 abs/neg
+                            sub == 0x60 or sub == 0x61 or sub == 0x62 or // i8x16 abs/neg/popcnt
                             sub == 0x67 or sub == 0x68 or sub == 0x69 or sub == 0x6A or // f32x4 ceil/floor/trunc/nearest
                             sub == 0x74 or sub == 0x75 or sub == 0x7A or sub == 0x7B or // f64x2 ceil/floor/trunc
                             sub == 0x80 or sub == 0x81 or // i16x8 abs/neg
