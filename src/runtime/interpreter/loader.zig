@@ -3711,7 +3711,14 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             pushType(&stack_buf, &sp, .v128, &stack_tidx);
                         }
-                        // Default: binary [v128 v128]->[v128]
+                        // Relaxed SIMD ternary: [v128 v128 v128] -> [v128]
+                        else if ((sub >= 0x105 and sub <= 0x10C) or sub == 0x113) {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                        }
+                        // Default: binary [v128 v128]->[v128] (includes relaxed 0x100-0x106)
                         else {
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                             _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));

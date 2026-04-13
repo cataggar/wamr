@@ -522,16 +522,122 @@ fn writeExpected(w: anytype, text: []const u8) !void {
     try w.writeAll(",\"expected\":[");
     try writeConstValues(w, text);
     try w.writeByte(']');
+    // If there are either alternatives, emit them
+    if (std.mem.indexOf(u8, text, "(either")) |_| {
+        try writeEitherAlternatives(w, text);
+    }
+}
+
+fn writeEitherAlternatives(w: anytype, text: []const u8) !void {
+    const either_start = std.mem.indexOf(u8, text, "(either") orelse return;
+    const after = text[either_start..];
+    // Extract all alternatives
+    var alts: [8][]const u8 = undefined;
+    var count: usize = 0;
+    var pos: usize = 7;
+    while (pos < after.len and count < 8) {
+        if (after[pos] == '(' and pos + 1 < after.len and after[pos + 1] != 'e') {
+            var depth: u32 = 0;
+            const start = pos;
+            for (after[pos..], pos..) |ch, idx| {
+                if (ch == '(') depth += 1;
+                if (ch == ')') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        alts[count] = after[start .. idx + 1];
+                        count += 1;
+                        pos = idx + 1;
+                        break;
+                    }
+                }
+            } else break;
+        } else if (after[pos] == ')') break else { pos += 1; }
+    }
+    if (count <= 1) return; // No alternatives to emit
+    // Skip first alternative (already in "expected"), emit rest
+    try w.writeAll(",\"alternatives\":[");
+    var first = true;
+    for (alts[0..count]) |alt| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("[");
+        try writeConstValues(w, alt);
+        try w.writeAll("]");
+    }
+    try w.writeByte(']');
 }
 
 fn writeConstValues(w: anytype, text: []const u8) !void {
+    // Handle (either ...) blocks: emit all alternatives pipe-separated in value
+    var effective_text = text;
+    var either_alternatives: [8][]const u8 = undefined;
+    var either_count: usize = 0;
+    if (std.mem.indexOf(u8, text, "(either")) |either_start| {
+        const after_either = text[either_start..];
+        // Extract all (v128.const ...) alternatives inside the either block
+        var pos: usize = 7; // skip "(either"
+        while (pos < after_either.len and either_count < 8) {
+            if (after_either[pos] == '(' and pos + 1 < after_either.len and after_either[pos + 1] != 'e') {
+                var depth: u32 = 0;
+                const start = pos;
+                for (after_either[pos..], pos..) |ch, idx| {
+                    if (ch == '(') depth += 1;
+                    if (ch == ')') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            either_alternatives[either_count] = after_either[start + 1 .. idx];
+                            either_count += 1;
+                            pos = idx + 1;
+                            break;
+                        }
+                    }
+                } else break;
+            } else if (after_either[pos] == ')') {
+                break; // end of either block
+            } else {
+                pos += 1;
+            }
+        }
+        if (either_count > 0) {
+            // Use last alternative (typically the non-FMA / sequential result)
+            var buf: [4096]u8 = undefined;
+            var len: usize = 0;
+            const prefix = text[0..either_start];
+            // Find the end of the either block
+            var depth: u32 = 0;
+            var either_end = either_start;
+            for (text[either_start..], either_start..) |ch, idx| {
+                if (ch == '(') depth += 1;
+                if (ch == ')') {
+                    depth -= 1;
+                    if (depth == 0) { either_end = idx + 1; break; }
+                }
+            }
+            const suffix = if (either_end < text.len) text[either_end..] else "";
+            const last_alt = either_alternatives[either_count - 1];
+            if (prefix.len + last_alt.len + 2 + suffix.len < buf.len) {
+                @memcpy(buf[len..][0..prefix.len], prefix);
+                len += prefix.len;
+                buf[len] = '(';
+                len += 1;
+                @memcpy(buf[len..][0..last_alt.len], last_alt);
+                len += last_alt.len;
+                buf[len] = ')';
+                len += 1;
+                @memcpy(buf[len..][0..suffix.len], suffix);
+                len += suffix.len;
+                effective_text = buf[0..len];
+            }
+        }
+    }
+
     // Find all (i32.const N), (i64.const N), (f32.const N), (f64.const N), (ref.null ...), (ref.func ...)
     var first_val = true;
     var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        if (text[i] != '(') continue;
+    while (i < effective_text.len) : (i += 1) {
+        if (effective_text[i] != '(') continue;
         // Check for const patterns
-        const remaining = text[i..];
+        const remaining = effective_text[i..];
         if (parseConst(remaining, "i32.const", "i32")) |result| {
             if (!first_val) try w.writeByte(',');
             first_val = false;
@@ -573,7 +679,7 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 try w.writeAll("{\"type\":\"funcref\",\"value\":\"null\"}");
             }
             // Skip to closing paren
-            while (i < text.len and text[i] != ')') : (i += 1) {}
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(ref.func")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
@@ -583,7 +689,7 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 i += result.len - 1;
             } else {
                 try w.writeAll("{\"type\":\"funcref\",\"value\":\"0\"}");
-                while (i < text.len and text[i] != ')') : (i += 1) {}
+                while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
             }
         } else if (std.mem.startsWith(u8, remaining, "(ref.extern")) {
             if (!first_val) try w.writeByte(',');
@@ -593,31 +699,31 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 i += result.len - 1;
             } else {
                 try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
-                while (i < text.len and text[i] != ')') : (i += 1) {}
+                while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
             }
         } else if (std.mem.startsWith(u8, remaining, "(ref.i31)")) {
             // (ref.i31) = any non-null i31ref
             if (!first_val) try w.writeByte(',');
             first_val = false;
             try w.writeAll("{\"type\":\"i31ref\",\"value\":\"1\"}");
-            while (i < text.len and text[i] != ')') : (i += 1) {}
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(ref.eq)")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
             try w.writeAll("{\"type\":\"eqref\",\"value\":\"1\"}");
-            while (i < text.len and text[i] != ')') : (i += 1) {}
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(ref.any)")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
             try w.writeAll("{\"type\":\"anyref\",\"value\":\"1\"}");
-            while (i < text.len and text[i] != ')') : (i += 1) {}
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(v128.const")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
             // Parse v128.const: (v128.const <shape> <lane0> <lane1> ...)
             // Need to find the closing paren and parse all lanes
-            const close = std.mem.indexOfPos(u8, text, i, ")") orelse text.len;
-            const inner = text[i + 1 .. close]; // "v128.const <shape> <lanes>"
+            const close = std.mem.indexOfPos(u8, effective_text, i, ")") orelse effective_text.len;
+            const inner = effective_text[i + 1 .. close]; // "v128.const <shape> <lanes>"
             writeV128Json(w, inner) catch {
                 try w.writeAll("{\"type\":\"v128\",\"value\":\"0\"}");
             };
