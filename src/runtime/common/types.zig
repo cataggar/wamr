@@ -491,10 +491,68 @@ pub const FuncRef = struct {
     module_inst: *ModuleInstance,
 };
 
+/// A table element that preserves the exact Value type (i31ref, structref, etc.)
+/// plus module provenance for function references.
+pub const TableElement = struct {
+    value: Value,
+    /// For funcref/nonfuncref: the originating module instance (for cross-module dispatch).
+    module_inst: ?*ModuleInstance = null,
+
+    /// Create a null element for a given ref type.
+    pub fn nullForType(vt: ValType) TableElement {
+        return .{ .value = switch (vt) {
+            .funcref => .{ .funcref = null },
+            .externref => .{ .externref = null },
+            .anyref => .{ .anyref = null },
+            .eqref => .{ .eqref = null },
+            .i31ref => .{ .i31ref = null },
+            .structref => .{ .structref = null },
+            .arrayref => .{ .arrayref = null },
+            .nullref => .{ .nullref = null },
+            .exnref => .{ .exnref = null },
+            .nonfuncref => .{ .nonfuncref = null },
+            .nonexternref => .{ .nonexternref = null },
+            else => .{ .funcref = null },
+        } };
+    }
+
+    /// Create a table element from a Value, preserving module provenance for funcrefs.
+    pub fn fromValue(val: Value, source_module: ?*ModuleInstance) TableElement {
+        return .{
+            .value = val,
+            .module_inst = switch (val) {
+                .funcref, .nonfuncref => source_module,
+                else => null,
+            },
+        };
+    }
+
+    /// Extract as FuncRef for call_indirect. Returns null if not a callable funcref.
+    pub fn asFuncRef(self: TableElement) ?FuncRef {
+        const func_idx: ?u32 = switch (self.value) {
+            .funcref, .nonfuncref => |r| r,
+            else => null,
+        };
+        const idx = func_idx orelse return null;
+        const mi = self.module_inst orelse return null;
+        return .{ .func_idx = idx, .module_inst = mi };
+    }
+
+    /// Check if this element is a null reference.
+    pub fn isNull(self: TableElement) bool {
+        return switch (self.value) {
+            .funcref, .nonfuncref => |r| r == null,
+            .externref, .nonexternref => |r| r == null,
+            .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref, .exnref => |r| r == null,
+            else => true,
+        };
+    }
+};
+
 /// Runtime table instance (refcounted for cross-module sharing)
 pub const TableInstance = struct {
     table_type: TableType,
-    elements: []?FuncRef,
+    elements: []TableElement,
     ref_count: u32 = 1,
 
     pub fn retain(self: *TableInstance) void {

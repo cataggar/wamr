@@ -701,6 +701,17 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
                 while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
             }
+        } else if (std.mem.startsWith(u8, remaining, "(ref.host")) {
+            // ref.host N — spec test opaque externref, map to externref
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            if (parseConst(remaining, "ref.host", "externref")) |result| {
+                try writeConstJson(w, "externref", result.value);
+                i += result.len - 1;
+            } else {
+                try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
+                while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+            }
         } else if (std.mem.startsWith(u8, remaining, "(ref.i31)")) {
             // (ref.i31) = any non-null i31ref
             if (!first_val) try w.writeByte(',');
@@ -716,6 +727,16 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
             if (!first_val) try w.writeByte(',');
             first_val = false;
             try w.writeAll("{\"type\":\"anyref\",\"value\":\"1\"}");
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.struct)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"structref\",\"value\":\"1\"}");
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.array)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"arrayref\",\"value\":\"1\"}");
             while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(v128.const")) {
             if (!first_val) try w.writeByte(',');

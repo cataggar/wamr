@@ -646,8 +646,8 @@ fn makeSpectestMemory(allocator: std.mem.Allocator) ?*types.MemoryInstance {
 }
 
 fn makeSpectestTable(allocator: std.mem.Allocator) ?*types.TableInstance {
-    const elems = allocator.alloc(?types.FuncRef, 10) catch return null;
-    @memset(elems, null);
+    const elems = allocator.alloc(types.TableElement, 10) catch return null;
+    for (elems) |*e| e.* = types.TableElement.nullForType(.funcref);
     const tbl = allocator.create(types.TableInstance) catch { allocator.free(elems); return null; };
     tbl.* = .{ .table_type = .{ .elem_type = .funcref, .limits = .{ .min = 10, .max = 20 } }, .elements = elems };
     return tbl;
@@ -665,7 +665,7 @@ fn copyMemory(src: types.MemoryInstance, allocator: std.mem.Allocator) ?types.Me
 }
 
 fn copyTable(src: types.TableInstance, allocator: std.mem.Allocator) ?types.TableInstance {
-    const elems = allocator.alloc(?u32, src.elements.len) catch return null;
+    const elems = allocator.alloc(types.TableElement, src.elements.len) catch return null;
     @memcpy(elems, src.elements);
     return .{
         .table_type = src.table_type,
@@ -688,8 +688,8 @@ fn makeDefaultMemory(mt: ?types.MemoryType, allocator: std.mem.Allocator) ?types
 
 fn makeDefaultTable(tt: ?types.TableType, allocator: std.mem.Allocator) ?types.TableInstance {
     const table_type = tt orelse types.TableType{ .elem_type = .funcref, .limits = .{ .min = 10 } };
-    const elems = allocator.alloc(?u32, table_type.limits.min) catch return null;
-    @memset(elems, null);
+    const elems = allocator.alloc(types.TableElement, table_type.limits.min) catch return null;
+    for (elems) |*e| e.* = types.TableElement.nullForType(table_type.elem_type);
     return .{
         .table_type = table_type,
         .elements = elems,
