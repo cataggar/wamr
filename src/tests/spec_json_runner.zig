@@ -90,6 +90,23 @@ fn parseValue(arg: Arg) ?types.Value {
         // or as a single decimal/hex u128 value
         const bits = std.fmt.parseUnsigned(u128, val_str, 10) catch return null;
         return .{ .v128 = bits };
+    } else if (std.mem.eql(u8, arg.type, "i31ref")) {
+        if (std.mem.eql(u8, val_str, "null")) return .{ .i31ref = null };
+        return .{ .i31ref = 1 };
+    } else if (std.mem.eql(u8, arg.type, "anyref")) {
+        if (std.mem.eql(u8, val_str, "null")) return .{ .anyref = null };
+        return .{ .anyref = 1 };
+    } else if (std.mem.eql(u8, arg.type, "eqref")) {
+        if (std.mem.eql(u8, val_str, "null")) return .{ .eqref = null };
+        return .{ .eqref = 1 };
+    } else if (std.mem.eql(u8, arg.type, "structref")) {
+        if (std.mem.eql(u8, val_str, "null")) return .{ .structref = null };
+        return .{ .structref = 1 };
+    } else if (std.mem.eql(u8, arg.type, "arrayref")) {
+        if (std.mem.eql(u8, val_str, "null")) return .{ .arrayref = null };
+        return .{ .arrayref = 1 };
+    } else if (std.mem.eql(u8, arg.type, "nullref")) {
+        return .{ .nullref = null };
     }
     return null;
 }

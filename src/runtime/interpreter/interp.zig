@@ -181,6 +181,97 @@ fn readI64(code: []const u8, ip: *usize) i64 {
     return @bitCast(result);
 }
 
+/// Check if a ref value matches a target heap type for ref.test/ref.cast.
+/// heap_type is either an abstract type (0x6C=i31, 0x6D=eq, 0x6E=any, 0x6F=extern, 0x70=func)
+/// or a concrete type index.
+fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInstance) i32 {
+    // Abstract heap types
+    switch (heap_type) {
+        0x6C => { // i31
+            return switch (ref) {
+                .i31ref => |r| if (r != null) @as(i32, 1) else 0,
+                .eqref, .anyref => |r| if (r != null) @as(i32, 1) else 0, // i31 values stored in any/eq
+                .nullref => 0,
+                else => 0,
+            };
+        },
+        0x6D => { // eq
+            return switch (ref) {
+                .i31ref, .eqref, .structref, .arrayref => |r| if (r != null) @as(i32, 1) else 0,
+                .anyref => |r| if (r != null) @as(i32, 1) else 0,
+                .nullref => 0,
+                else => 0,
+            };
+        },
+        0x6E => { // any
+            return switch (ref) {
+                .i31ref, .eqref, .anyref, .structref, .arrayref => |r| if (r != null) @as(i32, 1) else 0,
+                .nullref => 0,
+                else => 0,
+            };
+        },
+        0x6F => { // extern
+            return switch (ref) {
+                .externref, .nonexternref => |r| if (r != null) @as(i32, 1) else 0,
+                else => 0,
+            };
+        },
+        0x70, 0x73 => { // func / nofunc
+            return switch (ref) {
+                .funcref, .nonfuncref => |r| if (r != null) @as(i32, 1) else 0,
+                else => 0,
+            };
+        },
+        0x6B => { // struct
+            return switch (ref) {
+                .structref => |r| if (r != null) @as(i32, 1) else 0,
+                else => 0,
+            };
+        },
+        0x6A => { // array
+            return switch (ref) {
+                .arrayref => |r| if (r != null) @as(i32, 1) else 0,
+                else => 0,
+            };
+        },
+        else => {},
+    }
+    // Concrete type index: check if funcref's type is a subtype of heap_type
+    const func_idx = switch (ref) {
+        .funcref, .nonfuncref => |r| r orelse return 0,
+        else => return 0,
+    };
+    const module = module_inst.module;
+    const actual_type_idx = module.getRawFuncTypeIdx(func_idx) orelse return 0;
+    // Walk the supertype chain from actual_type_idx looking for heap_type
+    return if (typeIsSubtype(actual_type_idx, heap_type, module)) @as(i32, 1) else 0;
+}
+
+/// Check if type_idx is a subtype of target_idx within the same module,
+/// using canonical type IDs and the supertype chain.
+fn typeIsSubtype(type_idx: u32, target_idx: u32, module: *const types.WasmModule) bool {
+    // Same index is always a match
+    if (type_idx == target_idx) return true;
+    // Check canonical equivalence
+    if (type_idx < module.canonical_type_map.len and target_idx < module.canonical_type_map.len) {
+        if (module.canonical_type_map[type_idx] == module.canonical_type_map[target_idx]) return true;
+    }
+    // Walk supertype chain
+    var current = type_idx;
+    var depth: u32 = 0;
+    while (depth < 100) : (depth += 1) {
+        if (current >= module.types.len) break;
+        const parent = module.types[current].supertype_idx;
+        if (parent == 0xFFFFFFFF) break;
+        if (parent == target_idx) return true;
+        if (parent < module.canonical_type_map.len and target_idx < module.canonical_type_map.len) {
+            if (module.canonical_type_map[parent] == module.canonical_type_map[target_idx]) return true;
+        }
+        current = parent;
+    }
+    return false;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 /// Prepare a tail call: move new args to the current frame's stack base
@@ -2564,34 +2655,24 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     0x14, 0x15 => { // ref.test, ref.test_nullable: [ref] -> [i32]
                         const heap_type = readU32(code, &ip);
                         const ref = try env.pop();
-                        // Simple implementation: check if ref is non-null for the target type
-                        const is_match: i32 = switch (ref) {
-                            .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref => |r| blk: {
-                                if (r == null) break :blk 0;
-                                // For i31ref target (0x6C), check if value is in i31 range
-                                if (heap_type == 0x6C) break :blk 1;
-                                // For eqref (0x6D), anyref (0x6E), funcref (0x70) — always match non-null
-                                break :blk 1;
-                            },
-                            .externref, .nonexternref => |r| if (r != null) @as(i32, 1) else 0,
-                            .nullref => |r| if (r != null) @as(i32, 1) else 0,
-                            else => 0,
-                        };
+                        const is_match: i32 = refTestMatch(ref, heap_type, env.module_inst);
                         try env.pushI32(is_match);
                     },
                     0x16, 0x17 => { // ref.cast, ref.cast_nullable: [ref] -> [ref]
                         const heap_type = readU32(code, &ip);
-                        _ = heap_type;
                         const ref = try env.pop();
-                        // For nullable cast (0x17), null passes through
-                        // For non-nullable cast (0x16), null traps
                         const is_null = switch (ref) {
                             .funcref, .nonfuncref, .i31ref, .anyref, .eqref, .structref, .arrayref, .nullref => |r| r == null,
                             .externref, .nonexternref => |r| r == null,
                             else => true,
                         };
-                        if (sub_op == 0x16 and is_null) return error.Unreachable;
-                        // Pass through the value (cast succeeds for matching types)
+                        if (is_null) {
+                            // Nullable cast (0x17): null passes; non-nullable (0x16): null traps
+                            if (sub_op == 0x16) return error.Unreachable;
+                        } else {
+                            // Non-null: check type match, trap if no match
+                            if (refTestMatch(ref, heap_type, env.module_inst) == 0) return error.Unreachable;
+                        }
                         try env.push(ref);
                     },
                     else => return error.UnknownOpcode,

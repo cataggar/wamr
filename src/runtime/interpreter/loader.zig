@@ -257,7 +257,8 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
     while (changed) {
         changed = false;
         // Rewrite type refs using current canonical mapping
-        for (module.types) |ft| {
+        // Must use pointer iteration so supertype_idx mutations persist
+        for (@constCast(module.types)) |*ft| {
             for (@constCast(ft.param_tidxs)) |*t| {
                 if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
             }
@@ -268,8 +269,7 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
                 if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
             }
             // Also canonicalize supertype index
-            const st = @constCast(&ft.supertype_idx);
-            if (st.* != NO_TIDX and st.* < n and canonical[st.*] != st.*) st.* = canonical[st.*];
+            if (ft.supertype_idx != NO_TIDX and ft.supertype_idx < n and canonical[ft.supertype_idx] != ft.supertype_idx) ft.supertype_idx = canonical[ft.supertype_idx];
         }
         // Find new equivalences
         var i: u32 = 0;
@@ -286,7 +286,7 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
         }
     }
     // Final rewrite pass
-    for (module.types) |ft| {
+    for (@constCast(module.types)) |*ft| {
         for (@constCast(ft.param_tidxs)) |*t| {
             if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
         }
@@ -296,8 +296,7 @@ fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocat
         for (@constCast(ft.field_tidxs)) |*t| {
             if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
         }
-        const st = @constCast(&ft.supertype_idx);
-        if (st.* != NO_TIDX and st.* < n) st.* = canonical[st.*];
+        if (ft.supertype_idx != NO_TIDX and ft.supertype_idx < n) ft.supertype_idx = canonical[ft.supertype_idx];
     }
     module.canonical_type_map = canonical;
 }
@@ -467,6 +466,11 @@ fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types
     const elem_type: types.ValType = switch (first_byte) {
         0x70 => .funcref,
         0x6F => .externref,
+        0x6E => .anyref,
+        0x6D => .eqref,
+        0x6C => .i31ref,
+        0x6B => .structref,
+        0x6A => .arrayref,
         0x63, 0x64 => blk: {
             const is_nullable = (first_byte == 0x63);
             const heap_byte = try reader.readByte();
@@ -954,12 +958,16 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                 kind = switch (ref_byte) {
                     0x70 => .func_ref,
                     0x6F => .extern_ref,
+                    // GC shorthand types
+                    0x6E, 0x6D, 0x6C, 0x6B, 0x6A => .gc_ref,
                     // Typed reference: ref null/ref + heaptype
                     0x63, 0x64 => blk: {
                         const ht = try reader.readByte();
                         if (ht == 0x6F or ht == 0x72) break :blk .extern_ref;
                         // func, nofunc → funcref
                         if (ht == 0x70 or ht == 0x73) break :blk .func_ref;
+                        // GC abstract heap types
+                        if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or ht == 0x65) break :blk .gc_ref;
                         // Concrete type index — validate and consume LEB128
                         var ht_idx: u32 = ht & 0x7F;
                         if (ht & 0x80 != 0) {
@@ -996,8 +1004,11 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                     .ref_null => |vt| {
                         // For flags=4, kind defaults to func_ref but element may be externref
                         if (flags == 4 and vt.isExternRef()) kind = .extern_ref;
-                        if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
-                        if (kind == .extern_ref and !vt.isExternRef()) return error.TypeMismatch;
+                        // Only enforce type compatibility for func_ref and extern_ref kinds (not gc_ref)
+                        if (kind != .gc_ref) {
+                            if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
+                            if (kind == .extern_ref and !vt.isExternRef()) return error.TypeMismatch;
+                        }
                         try func_indices_list.append(allocator, null);
                         try elem_exprs_list.append(allocator, null);
                     },
@@ -1466,6 +1477,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             if (table_elem_type) |tet| {
                 if (elem.kind == .func_ref and !tet.isFuncRef()) return error.TypeMismatch;
                 if (elem.kind == .extern_ref and !tet.isExternRef()) return error.TypeMismatch;
+                // gc_ref kind is compatible with GC table element types (i31ref, anyref, eqref, etc.)
                 // Non-nullable table requires non-nullable elements
                 if ((tet == .nonfuncref or tet == .nonexternref) and elem.nullable_elements)
                     return error.TypeMismatch;

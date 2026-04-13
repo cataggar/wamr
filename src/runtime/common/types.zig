@@ -325,7 +325,7 @@ pub const ElemSegment = struct {
     /// Whether element values can be null (expression vectors can, funcidx vectors can't)
     nullable_elements: bool = true,
 
-    pub const ElemKind = enum { func_ref, extern_ref };
+    pub const ElemKind = enum { func_ref, extern_ref, gc_ref };
 };
 
 /// Rec group boundary for a type (used for iso-recursive equivalence).

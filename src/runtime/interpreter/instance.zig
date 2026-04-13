@@ -465,15 +465,22 @@ fn applyTableInitExprs(module: *const types.WasmModule, tables: []*types.TableIn
         const init_expr = table_type.init_expr orelse continue;
         const table = tables[import_count + i];
         const val = evalInitExpr(init_expr, globals) catch continue;
-        const func_idx: ?u32 = switch (val) {
+        // Extract u32 value from the init expression result, regardless of ref type
+        const ref_val: ?u32 = switch (val) {
             .funcref => |v| v,
             .nonfuncref => |v| v,
+            .i31ref => |v| v,
+            .anyref => |v| v,
+            .eqref => |v| v,
+            .structref => |v| v,
+            .arrayref => |v| v,
+            .nullref => |v| v,
             .externref, .nonexternref => continue,
             else => continue,
         };
         for (table.elements) |*elem| {
-            elem.* = if (func_idx) |fidx|
-                .{ .func_idx = fidx, .module_inst = inst }
+            elem.* = if (ref_val) |rv|
+                .{ .func_idx = rv, .module_inst = inst }
             else
                 null;
         }
@@ -513,6 +520,9 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
                                 const opt_fidx: ?u32 = switch (gval) {
                                     .funcref => |v| v,
                                     .nonfuncref => |v| v,
+                                    .i31ref => |v| v,
+                                    .anyref => |v| v,
+                                    .eqref => |v| v,
                                     else => null,
                                 };
                                 if (opt_fidx) |fidx| {
@@ -520,6 +530,23 @@ fn applyElemSegments(module: *const types.WasmModule, tables: []*types.TableInst
                                 } else {
                                     table.elements[offset + i] = null;
                                 }
+                            } else {
+                                table.elements[offset + i] = null;
+                            }
+                        },
+                        .bytecode => {
+                            // Evaluate compound init expression (e.g., ref.i31, global.get + ref.i31)
+                            const bc_val = evalInitExpr(expr, globals) catch {
+                                table.elements[offset + i] = null;
+                                continue;
+                            };
+                            const ref_u32: ?u32 = switch (bc_val) {
+                                .funcref, .nonfuncref => |v| v,
+                                .i31ref, .anyref, .eqref, .structref, .arrayref => |v| v,
+                                else => null,
+                            };
+                            if (ref_u32) |rv| {
+                                table.elements[offset + i] = .{ .func_idx = rv, .module_inst = inst };
                             } else {
                                 table.elements[offset + i] = null;
                             }
