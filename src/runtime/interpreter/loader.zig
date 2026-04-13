@@ -1603,11 +1603,17 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     }
 
     // Type-stack validation for each function body (skip for imports w/ 0 local funcs)
+    // Determine if this module uses GC types (struct/array kinds in the type section)
+    const has_gc_types = blk: {
+        for (module.types) |t| {
+            if (t.kind == .struct_ or t.kind == .array) break :blk true;
+        }
+        break :blk false;
+    };
     if (module.functions.len > 0) {
         for (module.functions) |func| {
             validateFunctionTypes(module, &func) catch |err| {
-                if (err == error.TypeMismatch and hasGcOpcodes(func.code)) {
-                    // GC-heavy functions may have validation gaps; allow loading
+                if (err == error.TypeMismatch and (has_gc_types or hasGcOpcodes(func.code))) {
                     continue;
                 }
                 return err;
@@ -3644,11 +3650,9 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         pushType(&stack_buf, &sp, .anyref, &stack_tidx); // approximate
                     },
                     0x18, 0x19 => { // br_on_cast, br_on_cast_fail
-                        i += 1; // castflags (1 raw byte, not LEB128)
                         _ = readU32Leb(code, &i); // label
                         _ = readU32Leb(code, &i); // source type
                         _ = readU32Leb(code, &i); // target type
-                        // Pop ref, push ref (net effect: type narrowing, approximate as pop+push)
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .anyref, &stack_tidx);
                     },
