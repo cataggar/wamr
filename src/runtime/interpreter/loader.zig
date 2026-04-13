@@ -22,6 +22,7 @@ pub const LoadError = error{
     InvalidInitExpr,
     InvalidDataSegment,
     InvalidElemSegment,
+    MalformedMutability,
     TooManyLocals,
     Overflow,
     OutOfMemory,
@@ -789,6 +790,7 @@ fn parseStructType(reader: *BinaryReader, allocator: std.mem.Allocator, max_type
         ftidxs[fi] = info.tidx;
         ftypes[fi] = info.vt;
         const mut_byte = try reader.readByte(); // mutability (bit 0)
+        if (mut_byte & 0x01 != mut_byte) return error.MalformedMutability;
         // Encode packed type in high bits: bit 4 = i8, bit 5 = i16
         fmuts[fi] = mut_byte | (@as(u8, info.pack) << 4);
     }
@@ -798,6 +800,7 @@ fn parseStructType(reader: *BinaryReader, allocator: std.mem.Allocator, max_type
 fn parseArrayType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
     const info = try readValTypeWithTidx(reader, max_types);
     const mut_byte = try reader.readByte(); // mutability
+    if (mut_byte & 0x01 != mut_byte) return error.MalformedMutability; // must be 0 or 1
     var ftidxs = try allocator.alloc(u32, 1);
     ftidxs[0] = info.tidx;
     var ftypes = try allocator.alloc(types.ValType, 1);
