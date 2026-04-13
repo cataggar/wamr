@@ -3611,6 +3611,17 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
+                    // Shift ops: [v128 i32] -> [v128]
+                    0x6B, 0x6C, 0x6D, // i8x16 shl/shr_s/shr_u
+                    0x8B, 0x8C, 0x8D, // i16x8 shl/shr_s/shr_u
+                    0xAB, 0xAC, 0xAD, // i32x4 shl/shr_s/shr_u
+                    0xCB, 0xCC, 0xCD, // i64x2 shl/shr_s/shr_u
+                    => {
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
                     // All remaining SIMD: categorize by opcode
                     else => {
                         // all_true/bitmask ops return i32 (NOT popcnt 0x62!)
