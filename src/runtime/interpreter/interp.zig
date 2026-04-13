@@ -641,7 +641,7 @@ fn gcArrayCopy(env: *ExecEnv) TrapError!void {
 }
 
 fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labels: *[256]Label, label_sp: *u32) TrapError!void {
-    // Read immediates — try without castflags (wabt may omit it)
+    // Wabt encoding: labelidx(LEB128) ht1(LEB128) ht2(LEB128) — no castflags
     const depth = readU32(code, ip);
     _ = readU32(code, ip); // source heap type
     const target_ht = readU32(code, ip); // target heap type
@@ -1211,7 +1211,7 @@ fn findBlockEnd(code: []const u8, start: usize) usize {
                     0x12, 0x13 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); }, // array.init_data/elem
                     // ref.test/ref.cast: flags + type immediates
                     0x14, 0x15, 0x16, 0x17 => { pos = skipLeb128(code, pos); }, // simplified
-                    // br_on_cast/br_on_cast_fail: label + 2 type immediates (+ flags as LEB128)
+                    // br_on_cast/br_on_cast_fail: label + 2 type immediates
                     0x18, 0x19 => { pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); pos = skipLeb128(code, pos); },
                     // No immediates
                     0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
