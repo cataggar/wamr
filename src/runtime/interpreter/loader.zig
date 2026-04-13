@@ -3535,16 +3535,25 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         pushType(&stack_buf, &sp, .v128, &stack_tidx);
                     },
                     // extract_lane: [v128] -> [scalar]
-                    0x15, 0x16, 0x17, 0x18, 0x19, 0x1B, 0x1D => {
+                    0x15, 0x16, // i8x16 extract_lane_s/u
+                    0x18, 0x19, // i16x8 extract_lane_s/u
+                    0x1B, // i32x4 extract_lane
+                    => {
                         i += 1;
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         pushType(&stack_buf, &sp, .i32, &stack_tidx);
                     },
-                    0x1A => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i64, &stack_tidx); }, // i64x2.extract_lane
-                    0x1C => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f32, &stack_tidx); }, // f32x4.extract_lane
-                    0x1E => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f64, &stack_tidx); }, // f64x2.extract_lane
+                    0x1D => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i64, &stack_tidx); }, // i64x2.extract_lane
+                    0x1F => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f32, &stack_tidx); }, // f32x4.extract_lane
+                    0x21 => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f64, &stack_tidx); }, // f64x2.extract_lane
                     // replace_lane: [v128 scalar] -> [v128]
-                    0x1F, 0x20, 0x21, 0x22 => {
+                    0x17, // i8x16 replace_lane
+                    0x1A, // i16x8 replace_lane
+                    0x1C, // i32x4 replace_lane
+                    0x1E, // i64x2 replace_lane
+                    0x20, // f32x4 replace_lane
+                    0x22, // f64x2 replace_lane
+                    => {
                         i += 1;
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
                         _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
