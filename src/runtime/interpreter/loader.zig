@@ -803,7 +803,7 @@ fn parseArrayType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types
     var ftypes = try allocator.alloc(types.ValType, 1);
     ftypes[0] = info.vt;
     var fmuts = try allocator.alloc(u8, 1);
-    fmuts[0] = mut_byte;
+    fmuts[0] = mut_byte | (@as(u8, info.pack) << 4);
     return .{ .params = &.{}, .results = &.{}, .kind = .array, .field_tidxs = ftidxs, .field_types = ftypes, .field_muts = fmuts };
 }
 
