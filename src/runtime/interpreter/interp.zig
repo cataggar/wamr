@@ -236,15 +236,29 @@ fn refTestMatch(ref: types.Value, heap_type: u32, module_inst: *types.ModuleInst
         },
         else => {},
     }
-    // Concrete type index: check if funcref's type is a subtype of heap_type
-    const func_idx = switch (ref) {
-        .funcref, .nonfuncref => |r| r orelse return 0,
+    // Concrete type index: check if ref's type is a subtype of heap_type
+    switch (ref) {
+        .funcref, .nonfuncref => |r| {
+            const func_idx = r orelse return 0;
+            const module = module_inst.module;
+            const actual_type_idx = module.getRawFuncTypeIdx(func_idx) orelse return 0;
+            return if (typeIsSubtype(actual_type_idx, heap_type, module)) @as(i32, 1) else 0;
+        },
+        .structref, .arrayref => |r| {
+            const obj_idx = r orelse return 0;
+            const obj = getGcObject(module_inst, obj_idx) orelse return 0;
+            return if (typeIsSubtype(obj.type_idx, heap_type, module_inst.module)) @as(i32, 1) else 0;
+        },
+        .anyref, .eqref => |r| {
+            const obj_idx = r orelse return 0;
+            // Could be an i31 value or a GC object
+            if (getGcObject(module_inst, obj_idx)) |obj| {
+                return if (typeIsSubtype(obj.type_idx, heap_type, module_inst.module)) @as(i32, 1) else 0;
+            }
+            return 0;
+        },
         else => return 0,
-    };
-    const module = module_inst.module;
-    const actual_type_idx = module.getRawFuncTypeIdx(func_idx) orelse return 0;
-    // Walk the supertype chain from actual_type_idx looking for heap_type
-    return if (typeIsSubtype(actual_type_idx, heap_type, module)) @as(i32, 1) else 0;
+    }
 }
 
 /// Check if type_idx is a subtype of target_idx within the same module,
@@ -270,6 +284,259 @@ fn typeIsSubtype(type_idx: u32, target_idx: u32, module: *const types.WasmModule
         current = parent;
     }
     return false;
+}
+
+// ── GC Heap helpers ─────────────────────────────────────────────────────
+
+fn getGcObject(inst: *types.ModuleInstance, idx: u32) ?*types.GcObject {
+    if (idx < inst.gc_objects.items.len) return &inst.gc_objects.items[idx];
+    return null;
+}
+
+fn allocGcObject(inst: *types.ModuleInstance, type_idx: u32, fields: []types.Value) TrapError!u32 {
+    const idx: u32 = @intCast(inst.gc_objects.items.len);
+    const fields_copy = inst.allocator.alloc(types.Value, fields.len) catch return error.StackOverflow;
+    @memcpy(fields_copy, fields);
+    inst.gc_objects.append(inst.allocator, .{ .type_idx = type_idx, .fields = fields_copy }) catch return error.StackOverflow;
+    return idx;
+}
+
+fn defaultValue(vt: types.ValType) types.Value {
+    return switch (vt) {
+        .i32 => .{ .i32 = 0 },
+        .i64 => .{ .i64 = 0 },
+        .f32 => .{ .f32 = 0.0 },
+        .f64 => .{ .f64 = 0.0 },
+        .v128 => .{ .v128 = 0 },
+        .funcref => .{ .funcref = null },
+        .externref => .{ .externref = null },
+        .anyref => .{ .anyref = null },
+        .eqref => .{ .eqref = null },
+        .i31ref => .{ .i31ref = null },
+        .structref => .{ .structref = null },
+        .arrayref => .{ .arrayref = null },
+        .nullref => .{ .nullref = null },
+        .exnref => .{ .exnref = null },
+        .nonfuncref => .{ .nonfuncref = null },
+        .nonexternref => .{ .nonexternref = null },
+    };
+}
+
+fn gcStructNew(env: *ExecEnv, type_idx: u32, is_default: bool) TrapError!void {
+    const module = env.module_inst.module;
+    if (type_idx >= module.types.len) return error.Unreachable;
+    const ft = module.types[type_idx];
+    const field_count = ft.field_types.len;
+    var fields_buf: [256]types.Value = undefined;
+    if (field_count > fields_buf.len) return error.StackOverflow;
+    if (is_default) {
+        for (ft.field_types, 0..) |fvt, i| fields_buf[i] = defaultValue(fvt);
+    } else {
+        // Pop fields in reverse (last field is TOS)
+        var i = field_count;
+        while (i > 0) { i -= 1; fields_buf[i] = try env.pop(); }
+    }
+    const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..field_count]);
+    try env.push(.{ .structref = obj_idx });
+}
+
+fn gcStructGet(env: *ExecEnv, _: u32, field_idx: u32, _: u32) TrapError!void {
+    const ref = try env.pop();
+    const obj_idx = switch (ref) {
+        .structref, .anyref, .eqref, .nullref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
+    const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
+    if (field_idx >= obj.fields.len) return error.Unreachable;
+    const val = obj.fields[field_idx];
+    // For packed types, struct.get_s/get_u would apply sign/zero extension
+    // Currently field storage matches runtime type, so pass through
+    try env.push(val);
+}
+
+fn gcStructSet(env: *ExecEnv, _: u32, field_idx: u32) TrapError!void {
+    const val = try env.pop();
+    const ref = try env.pop();
+    const obj_idx = switch (ref) {
+        .structref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
+    const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
+    if (field_idx >= obj.fields.len) return error.Unreachable;
+    obj.fields[field_idx] = val;
+}
+
+fn gcArrayNew(env: *ExecEnv, type_idx: u32) TrapError!void {
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const init = try env.pop();
+    var fields_buf: [65536]types.Value = undefined;
+    if (len > fields_buf.len) return error.StackOverflow;
+    for (0..len) |i| fields_buf[i] = init;
+    const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..len]);
+    try env.push(.{ .arrayref = obj_idx });
+}
+
+fn gcArrayNewDefault(env: *ExecEnv, type_idx: u32) TrapError!void {
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const module = env.module_inst.module;
+    const elem_type = if (type_idx < module.types.len and module.types[type_idx].field_types.len > 0) module.types[type_idx].field_types[0] else types.ValType.i32;
+    const def = defaultValue(elem_type);
+    var fields_buf: [65536]types.Value = undefined;
+    if (len > fields_buf.len) return error.StackOverflow;
+    for (0..len) |i| fields_buf[i] = def;
+    const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..len]);
+    try env.push(.{ .arrayref = obj_idx });
+}
+
+fn gcArrayNewFixed(env: *ExecEnv, type_idx: u32, count: u32) TrapError!void {
+    var fields_buf: [65536]types.Value = undefined;
+    if (count > fields_buf.len) return error.StackOverflow;
+    var i = count;
+    while (i > 0) { i -= 1; fields_buf[i] = try env.pop(); }
+    const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..count]);
+    try env.push(.{ .arrayref = obj_idx });
+}
+
+fn gcArrayNewData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const offset = @as(u32, @bitCast(try env.popI32()));
+    const module = env.module_inst.module;
+    const elem_type = if (type_idx < module.types.len and module.types[type_idx].field_types.len > 0) module.types[type_idx].field_types[0] else types.ValType.i32;
+    const elem_size: u32 = switch (elem_type) {
+        .i32, .f32 => 4, .i64, .f64 => 8, .v128 => 16, else => 1,
+    };
+    if (data_idx >= module.data_segments.len) return error.Unreachable;
+    const data = module.data_segments[data_idx].data;
+    const byte_len = @as(u64, len) * elem_size;
+    if (@as(u64, offset) + byte_len > data.len) return error.OutOfBoundsMemoryAccess;
+    var fields_buf: [65536]types.Value = undefined;
+    if (len > fields_buf.len) return error.StackOverflow;
+    for (0..len) |i| {
+        const byte_offset = offset + @as(u32, @intCast(i)) * elem_size;
+        fields_buf[i] = switch (elem_type) {
+            .i32 => .{ .i32 = @bitCast(std.mem.readInt(u32, data[byte_offset..][0..4], .little)) },
+            .i64 => .{ .i64 = @bitCast(std.mem.readInt(u64, data[byte_offset..][0..8], .little)) },
+            .f32 => .{ .f32 = @bitCast(std.mem.readInt(u32, data[byte_offset..][0..4], .little)) },
+            .f64 => .{ .f64 = @bitCast(std.mem.readInt(u64, data[byte_offset..][0..8], .little)) },
+            else => .{ .i32 = @as(i32, data[byte_offset]) },
+        };
+    }
+    const obj_idx = try allocGcObject(env.module_inst, type_idx, fields_buf[0..len]);
+    try env.push(.{ .arrayref = obj_idx });
+}
+
+fn gcArrayNewElem(env: *ExecEnv, type_idx: u32, elem_idx: u32) TrapError!void {
+    _ = type_idx;
+    _ = elem_idx;
+    _ = try env.popI32(); // len
+    _ = try env.popI32(); // offset
+    // TODO: implement element-based array creation
+    try env.push(.{ .arrayref = null });
+}
+
+fn gcArrayGet(env: *ExecEnv, _: u32, sub_op: u32) TrapError!void {
+    const idx = @as(u32, @bitCast(try env.popI32()));
+    const ref = try env.pop();
+    const obj_idx = switch (ref) {
+        .arrayref, .anyref, .eqref, .structref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
+    const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
+    if (idx >= obj.fields.len) return error.OutOfBoundsMemoryAccess;
+    var val = obj.fields[idx];
+    if (sub_op == 0x0C and val == .i32) { // array.get_s
+        const raw: u32 = @bitCast(val.i32);
+        const byte: i8 = @bitCast(@as(u8, @truncate(raw)));
+        val = .{ .i32 = @as(i32, byte) };
+    } else if (sub_op == 0x0D and val == .i32) { // array.get_u
+        const raw: u32 = @bitCast(val.i32);
+        val = .{ .i32 = @bitCast(@as(u32, @as(u8, @truncate(raw)))) };
+    }
+    try env.push(val);
+}
+
+fn gcArraySet(env: *ExecEnv, type_idx: u32) TrapError!void {
+    _ = type_idx;
+    const val = try env.pop();
+    const idx = @as(u32, @bitCast(try env.popI32()));
+    const ref = try env.pop();
+    const obj_idx = switch (ref) {
+        .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
+    const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
+    if (idx >= obj.fields.len) return error.OutOfBoundsMemoryAccess;
+    obj.fields[idx] = val;
+}
+
+fn gcArrayFill(env: *ExecEnv) TrapError!void {
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const val = try env.pop();
+    const offset = @as(u32, @bitCast(try env.popI32()));
+    const ref = try env.pop();
+    const obj_idx = switch (ref) {
+        .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable,
+        else => return error.Unreachable,
+    };
+    const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
+    if (@as(u64, offset) + len > obj.fields.len) return error.OutOfBoundsMemoryAccess;
+    for (0..len) |i| obj.fields[offset + i] = val;
+}
+
+fn gcArrayCopy(env: *ExecEnv) TrapError!void {
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const src_off = @as(u32, @bitCast(try env.popI32()));
+    const src_ref = try env.pop();
+    const dst_off = @as(u32, @bitCast(try env.popI32()));
+    const dst_ref = try env.pop();
+    const src_idx = switch (src_ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+    const dst_idx = switch (dst_ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+    const src_obj = getGcObject(env.module_inst, src_idx) orelse return error.Unreachable;
+    const dst_obj = getGcObject(env.module_inst, dst_idx) orelse return error.Unreachable;
+    if (@as(u64, src_off) + len > src_obj.fields.len or @as(u64, dst_off) + len > dst_obj.fields.len) return error.OutOfBoundsMemoryAccess;
+    // Use memmove semantics for overlapping copies
+    if (dst_off <= src_off) {
+        for (0..len) |i| dst_obj.fields[dst_off + i] = src_obj.fields[src_off + i];
+    } else {
+        var i = len;
+        while (i > 0) { i -= 1; dst_obj.fields[dst_off + i] = src_obj.fields[src_off + i]; }
+    }
+}
+
+fn gcArrayInitData(env: *ExecEnv, type_idx: u32, data_idx: u32) TrapError!void {
+    const len = @as(u32, @bitCast(try env.popI32()));
+    const src_off = @as(u32, @bitCast(try env.popI32()));
+    const dst_off = @as(u32, @bitCast(try env.popI32()));
+    const ref = try env.pop();
+    const obj_idx = switch (ref) { .arrayref, .anyref, .eqref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+    const obj = getGcObject(env.module_inst, obj_idx) orelse return error.Unreachable;
+    const module = env.module_inst.module;
+    if (data_idx >= module.data_segments.len) return error.Unreachable;
+    const data = module.data_segments[data_idx].data;
+    const elem_type = if (type_idx < module.types.len and module.types[type_idx].field_types.len > 0) module.types[type_idx].field_types[0] else types.ValType.i32;
+    const elem_size: u32 = switch (elem_type) { .i32, .f32 => 4, .i64, .f64 => 8, .v128 => 16, else => 1 };
+    if (@as(u64, dst_off) + len > obj.fields.len) return error.OutOfBoundsMemoryAccess;
+    if (@as(u64, src_off) + @as(u64, len) * elem_size > data.len) return error.OutOfBoundsMemoryAccess;
+    for (0..len) |i| {
+        const bo = src_off + @as(u32, @intCast(i)) * elem_size;
+        obj.fields[dst_off + i] = switch (elem_type) {
+            .i32 => .{ .i32 = @bitCast(std.mem.readInt(u32, data[bo..][0..4], .little)) },
+            .i64 => .{ .i64 = @bitCast(std.mem.readInt(u64, data[bo..][0..8], .little)) },
+            .f32 => .{ .f32 = @bitCast(std.mem.readInt(u32, data[bo..][0..4], .little)) },
+            .f64 => .{ .f64 = @bitCast(std.mem.readInt(u64, data[bo..][0..8], .little)) },
+            else => .{ .i32 = @as(i32, data[bo]) },
+        };
+    }
+}
+
+fn gcArrayInitElem(env: *ExecEnv, type_idx: u32, elem_idx: u32) TrapError!void {
+    _ = type_idx;
+    _ = elem_idx;
+    _ = try env.popI32();
+    _ = try env.popI32();
+    _ = try env.popI32();
+    _ = try env.pop();
+    // TODO: implement element-based array init
 }
 
 // ── Public API ───────────────────────────────────────────────────────────
@@ -2658,7 +2925,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const is_match: i32 = refTestMatch(ref, heap_type, env.module_inst);
                         try env.pushI32(is_match);
                     },
-                    0x16, 0x17 => { // ref.cast, ref.cast_nullable: [ref] -> [ref]
+                    0x16, 0x17 => { // ref.cast, ref.cast_nullable
                         const heap_type = readU32(code, &ip);
                         const ref = try env.pop();
                         const is_null = switch (ref) {
@@ -2667,14 +2934,39 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             else => true,
                         };
                         if (is_null) {
-                            // Nullable cast (0x17): null passes; non-nullable (0x16): null traps
                             if (sub_op == 0x16) return error.Unreachable;
                         } else {
-                            // Non-null: check type match, trap if no match
                             if (refTestMatch(ref, heap_type, env.module_inst) == 0) return error.Unreachable;
                         }
                         try env.push(ref);
                     },
+                    // ── GC struct operations ───────────────────────────
+                    0x00 => try gcStructNew(env, readU32(code, &ip), false),
+                    0x01 => try gcStructNew(env, readU32(code, &ip), true),
+                    0x02, 0x03, 0x04 => { // struct.get/get_s/get_u
+                        const ti = readU32(code, &ip);
+                        const fi = readU32(code, &ip);
+                        try gcStructGet(env, ti, fi, sub_op);
+                    },
+                    0x05 => { const ti = readU32(code, &ip); const fi = readU32(code, &ip); try gcStructSet(env, ti, fi); },
+                    // ── GC array operations ────────────────────────────
+                    0x06 => try gcArrayNew(env, readU32(code, &ip)),
+                    0x07 => try gcArrayNewDefault(env, readU32(code, &ip)),
+                    0x08 => { const ti = readU32(code, &ip); const n = readU32(code, &ip); try gcArrayNewFixed(env, ti, n); },
+                    0x09 => { const ti = readU32(code, &ip); const di = readU32(code, &ip); try gcArrayNewData(env, ti, di); },
+                    0x0A => { const ti = readU32(code, &ip); const ei = readU32(code, &ip); try gcArrayNewElem(env, ti, ei); },
+                    0x0B, 0x0C, 0x0D => try gcArrayGet(env, readU32(code, &ip), sub_op),
+                    0x0E => try gcArraySet(env, readU32(code, &ip)),
+                    0x0F => { // array.len
+                        const ref = try env.pop();
+                        const oi = switch (ref) { .arrayref, .anyref, .eqref, .structref => |r| r orelse return error.Unreachable, else => return error.Unreachable };
+                        const obj = getGcObject(env.module_inst, oi) orelse return error.Unreachable;
+                        try env.pushI32(@intCast(obj.fields.len));
+                    },
+                    0x10 => { _ = readU32(code, &ip); try gcArrayFill(env); },
+                    0x11 => { _ = readU32(code, &ip); _ = readU32(code, &ip); try gcArrayCopy(env); },
+                    0x12 => { const ti = readU32(code, &ip); const di = readU32(code, &ip); try gcArrayInitData(env, ti, di); },
+                    0x13 => { const ti = readU32(code, &ip); const ei = readU32(code, &ip); try gcArrayInitElem(env, ti, ei); },
                     else => return error.UnknownOpcode,
                 }
             },

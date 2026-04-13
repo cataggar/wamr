@@ -113,6 +113,10 @@ pub const FuncType = struct {
     /// For struct types: field type indices (for equivalence comparison).
     /// For array types: single element type index (len=1).
     field_tidxs: []const u32 = &.{},
+    /// For struct/array: field value types (parallel to field_tidxs).
+    field_types: []const ValType = &.{},
+    /// For struct/array: field mutability (0=immutable, 1=mutable).
+    field_muts: []const u8 = &.{},
     /// Declared supertype index (0xFFFFFFFF = none).
     supertype_idx: u32 = 0xFFFFFFFF,
     /// Whether this type is declared `final` (cannot be subtyped).
@@ -537,6 +541,12 @@ pub const ImportedFunction = struct {
 };
 
 /// Instantiated module
+/// GC heap object (struct or array instance).
+pub const GcObject = struct {
+    type_idx: u32,
+    fields: []Value,
+};
+
 pub const ModuleInstance = struct {
     module: *const WasmModule,
     memories: []*MemoryInstance,
@@ -549,6 +559,8 @@ pub const ModuleInstance = struct {
     dropped_elems: []bool = &.{},
     /// Track dropped data segments (for data.drop instruction)
     dropped_data: []bool = &.{},
+    /// GC heap for struct/array objects
+    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {
         const exp = self.module.findExport(name, .function) orelse return null;

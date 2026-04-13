@@ -747,21 +747,28 @@ fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: 
 fn parseStructType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
     const field_count = try reader.readU32();
     var ftidxs = if (field_count > 0) try allocator.alloc(u32, field_count) else @as([]u32, &.{});
+    var ftypes = if (field_count > 0) try allocator.alloc(types.ValType, field_count) else @as([]types.ValType, &.{});
+    var fmuts = if (field_count > 0) try allocator.alloc(u8, field_count) else @as([]u8, &.{});
     var fi: u32 = 0;
     while (fi < field_count) : (fi += 1) {
         const info = try readValTypeWithTidx(reader, max_types);
         ftidxs[fi] = info.tidx;
-        _ = try reader.readByte(); // mutability
+        ftypes[fi] = info.vt;
+        fmuts[fi] = try reader.readByte(); // mutability
     }
-    return .{ .params = &.{}, .results = &.{}, .kind = .struct_, .field_tidxs = ftidxs };
+    return .{ .params = &.{}, .results = &.{}, .kind = .struct_, .field_tidxs = ftidxs, .field_types = ftypes, .field_muts = fmuts };
 }
 
 fn parseArrayType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
     const info = try readValTypeWithTidx(reader, max_types);
-    _ = try reader.readByte(); // mutability
+    const mut_byte = try reader.readByte(); // mutability
     var ftidxs = try allocator.alloc(u32, 1);
     ftidxs[0] = info.tidx;
-    return .{ .params = &.{}, .results = &.{}, .kind = .array, .field_tidxs = ftidxs };
+    var ftypes = try allocator.alloc(types.ValType, 1);
+    ftypes[0] = info.vt;
+    var fmuts = try allocator.alloc(u8, 1);
+    fmuts[0] = mut_byte;
+    return .{ .params = &.{}, .results = &.{}, .kind = .array, .field_tidxs = ftidxs, .field_types = ftypes, .field_muts = fmuts };
 }
 
 fn parseFuncType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
