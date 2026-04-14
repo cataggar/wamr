@@ -247,8 +247,8 @@ fn allocateMemories(module: *const types.WasmModule, allocator: std.mem.Allocato
 
     // Heap-allocate local memories
     for (module.memories, 0..) |mem_type, i| {
-        const min_pages = mem_type.limits.min;
-        const max_pages = mem_type.limits.max orelse 65536;
+        const min_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
+        const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
         const initial_size = @as(usize, min_pages) * types.MemoryInstance.page_size;
 
         const data = allocator.alloc(u8, initial_size) catch
@@ -299,7 +299,7 @@ fn allocateTables(module: *const types.WasmModule, allocator: std.mem.Allocator,
 
     // Heap-allocate local tables
     for (module.tables, 0..) |table_type, i| {
-        const min_elems = table_type.limits.min;
+        const min_elems: usize = @intCast(@min(table_type.limits.min, std.math.maxInt(usize)));
         const elems = allocator.alloc(types.TableElement, min_elems) catch
             return error.TableAllocationFailed;
         for (elems) |*e| e.* = types.TableElement.nullForType(table_type.elem_type);
@@ -679,13 +679,17 @@ fn applyDataSegments(module: *const types.WasmModule, memories: []*types.MemoryI
         if (mem_idx >= memories.len) return error.DataSegmentOutOfBounds;
         const mem = memories[mem_idx];
 
-        const offset = evalInitExprAsU32(seg.offset, globals) catch
-            return error.DataSegmentOutOfBounds;
+        // Use u64 offset for memory64, u32 for memory32
+        const offset: u64 = if (mem.memory_type.is_memory64)
+            evalInitExprAsU64(seg.offset, globals) catch return error.DataSegmentOutOfBounds
+        else
+            @as(u64, evalInitExprAsU32(seg.offset, globals) catch return error.DataSegmentOutOfBounds);
 
-        const end = @as(u64, offset) + seg.data.len;
+        const end = offset + seg.data.len;
         if (end > mem.data.len) return error.DataSegmentOutOfBounds;
 
-        @memcpy(mem.data[offset..][0..seg.data.len], seg.data);
+        const off: usize = @intCast(offset);
+        @memcpy(mem.data[off..][0..seg.data.len], seg.data);
     }
 }
 
@@ -771,6 +775,16 @@ fn evalInitExprAsU32(expr: types.InitExpr, globals: []const *types.GlobalInstanc
     return switch (val) {
         .i32 => |v| if (v < 0) return error.DataSegmentOutOfBounds else @intCast(v),
         .i64 => |v| if (v < 0 or v > std.math.maxInt(u32)) return error.DataSegmentOutOfBounds else @intCast(v),
+        else => return error.InvalidInitExpr,
+    };
+}
+
+/// Helper: evaluate an init expr, returning the result as a u64 offset (memory64).
+fn evalInitExprAsU64(expr: types.InitExpr, globals: []const *types.GlobalInstance) InstantiationError!u64 {
+    const val = try evalInitExpr(expr, globals, null);
+    return switch (val) {
+        .i64 => |v| if (v < 0) return error.DataSegmentOutOfBounds else @intCast(v),
+        .i32 => |v| if (v < 0) return error.DataSegmentOutOfBounds else @intCast(v),
         else => return error.InvalidInitExpr,
     };
 }

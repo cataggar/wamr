@@ -458,35 +458,31 @@ fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
 const LimitsResult = struct {
     limits: types.Limits,
     is_64: bool,
-    raw_min64: u64 = 0,
-    raw_max64: u64 = 0,
+    is_shared: bool = false,
 };
 
 fn readLimitsEx(reader: *BinaryReader) LoadError!LimitsResult {
     const flags = try reader.readByte();
     const has_max = (flags & 0x01) != 0;
-    // bit 1 = shared (0x02) — accepted but not stored in Limits
+    const is_shared = (flags & 0x02) != 0;
     const is_64 = (flags & 0x04) != 0;
     // Reject unknown flag bits
     if (flags & ~@as(u8, 0x07) != 0) return error.InvalidLimits;
 
     if (is_64) {
-        const min64 = try reader.readU64();
-        // For memory64/table64, allow limits > u32 max — cap to u32 for storage
-        const min: u32 = if (min64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(min64);
+        const min = try reader.readU64();
         if (has_max) {
-            const max64 = try reader.readU64();
-            if (min64 > max64) return error.InvalidLimits;
-            const max: u32 = if (max64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max64);
-            return .{ .limits = .{ .min = min, .max = max }, .is_64 = true, .raw_min64 = min64, .raw_max64 = max64 };
+            const max = try reader.readU64();
+            if (min > max) return error.InvalidLimits;
+            return .{ .limits = .{ .min = min, .max = max }, .is_64 = true, .is_shared = is_shared };
         }
-        return .{ .limits = .{ .min = min }, .is_64 = true, .raw_min64 = min64 };
+        return .{ .limits = .{ .min = min }, .is_64 = true, .is_shared = is_shared };
     } else {
         const min = try reader.readU32();
         if (has_max) {
-            return .{ .limits = .{ .min = min, .max = try reader.readU32() }, .is_64 = false };
+            return .{ .limits = .{ .min = min, .max = try reader.readU32() }, .is_64 = false, .is_shared = is_shared };
         }
-        return .{ .limits = .{ .min = min }, .is_64 = false };
+        return .{ .limits = .{ .min = min }, .is_64 = false, .is_shared = is_shared };
     }
 }
 
@@ -601,13 +597,14 @@ fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError
 
 fn readMemoryType(reader: *BinaryReader) LoadError!types.MemoryType {
     const result = try readLimitsEx(reader);
-    // Validate memory64 limits using raw u64 values before they were truncated to u32
     if (result.is_64) {
         const max_pages: u64 = 1 << 48;
-        if (result.raw_min64 > max_pages) return error.InvalidLimits;
-        if (result.raw_max64 > max_pages) return error.InvalidLimits;
+        if (result.limits.min > max_pages) return error.InvalidLimits;
+        if (result.limits.max) |max| {
+            if (max > max_pages) return error.InvalidLimits;
+        }
     }
-    return .{ .limits = result.limits, .is_memory64 = result.is_64 };
+    return .{ .limits = result.limits, .is_shared = result.is_shared, .is_memory64 = result.is_64 };
 }
 
 fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.GlobalType {
@@ -4041,8 +4038,8 @@ test "load: module with memory" {
     };
     const module = try load(&data, arena.allocator());
     try testing.expectEqual(@as(usize, 1), module.memories.len);
-    try testing.expectEqual(@as(u32, 1), module.memories[0].limits.min);
-    try testing.expectEqual(@as(?u32, null), module.memories[0].limits.max);
+    try testing.expectEqual(@as(u64, 1), module.memories[0].limits.min);
+    try testing.expectEqual(@as(?u64, null), module.memories[0].limits.max);
 }
 
 test "load: memory with max" {
@@ -4054,8 +4051,8 @@ test "load: memory with max" {
     };
     const module = try load(&data, arena.allocator());
     try testing.expectEqual(@as(usize, 1), module.memories.len);
-    try testing.expectEqual(@as(u32, 1), module.memories[0].limits.min);
-    try testing.expectEqual(@as(?u32, 4), module.memories[0].limits.max);
+    try testing.expectEqual(@as(u64, 1), module.memories[0].limits.min);
+    try testing.expectEqual(@as(?u64, 4), module.memories[0].limits.max);
 }
 
 test "load: module with export" {
