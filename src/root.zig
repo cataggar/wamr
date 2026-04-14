@@ -54,6 +54,12 @@ pub const x86_64_emit = @import("compiler/codegen/x86_64/emit.zig");
 /// x86-64 IR-to-native compiler.
 pub const x86_64_compile = @import("compiler/codegen/x86_64/compile.zig");
 
+/// AArch64 machine code emitter.
+pub const aarch64_emit = @import("compiler/codegen/aarch64/emit.zig");
+
+/// AArch64 IR-to-native compiler.
+pub const aarch64_compile = @import("compiler/codegen/aarch64/compile.zig");
+
 // Testing
 /// Spec test runner infrastructure.
 pub const spec_runner = @import("tests/spec_runner.zig");
