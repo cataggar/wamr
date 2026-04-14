@@ -10,6 +10,7 @@ const leb128_mod = @import("../../shared/utils/leb128.zig");
 pub const LoadError = error{
     InvalidMagic,
     InvalidVersion,
+    IsComponent,
     InvalidSectionOrder,
     InvalidSectionSize,
     UnexpectedEnd,
@@ -1268,6 +1269,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
     const magic = try reader.readFixedU32();
     if (magic != types.wasm_magic) return error.InvalidMagic;
     const version = try reader.readFixedU32();
+    if (version == types.component_version) return error.IsComponent;
     if (version != types.wasm_version) return error.InvalidVersion;
 
     var module = types.WasmModule{};

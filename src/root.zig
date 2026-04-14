@@ -69,6 +69,13 @@ pub const thread_manager = @import("wasi/thread_manager.zig");
 /// WASI host function implementations (thread-spawn, etc.).
 pub const wasi_host = @import("wasi/host_functions.zig");
 
+// Component Model
+/// Component Model types (AST).
+pub const component_types = @import("component/types.zig");
+
+/// Component Model binary format loader.
+pub const component_loader = @import("component/loader.zig");
+
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).
 pub const platform = @import("platform/platform.zig");

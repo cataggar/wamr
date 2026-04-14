@@ -220,8 +220,12 @@ pub const SectionId = enum(u8) {
 /// Wasm binary magic number
 pub const wasm_magic: u32 = 0x6d736100; // "\0asm"
 
-/// Wasm binary version
+/// Core module binary version (version=1, layer=0)
 pub const wasm_version: u32 = 0x01;
+
+/// Component binary version and layer (version=0x0d, layer=0x01).
+/// Encoded as: version(u16 LE) ++ layer(u16 LE) = 0x0d 0x00 0x01 0x00.
+pub const component_version: u32 = 0x0001_000d;
 
 /// AOT binary magic number
 pub const aot_magic: u32 = 0x746f6100; // "\0aot"
