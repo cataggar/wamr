@@ -1364,7 +1364,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         var max_tag_idx: ?u32 = null;
         for (module.exports) |exp| {
             if (exp.kind == .tag) {
-                if (max_tag_idx == null or exp.index > max_tag_idx.?)
+                if (max_tag_idx == null or exp.index > (max_tag_idx orelse 0))
                     max_tag_idx = exp.index;
             }
         }
@@ -2437,32 +2437,41 @@ fn pushV(stack: []VT, sp: *u32, t: VT, tidx: []u32, concrete: u32) void {
 }
 
 fn popExpect(stack: []VT, sp: *u32, expected: VT, cf: ?*CtrlFrame) bool {
-    if (sp.* == 0 or (cf != null and sp.* <= cf.?.start_height)) {
-        return cf != null and cf.?.unreachable_flag;
+    const frame = cf orelse {
+        if (sp.* == 0) return false;
+        sp.* -= 1;
+        const actual = stack[sp.*];
+        return actual == expected or actual.isSubtypeOf(expected);
+    };
+    if (sp.* == 0 or sp.* <= frame.start_height) {
+        return frame.unreachable_flag;
     }
     sp.* -= 1;
     const actual = stack[sp.*];
     if (actual == expected or actual.isSubtypeOf(expected)) return true;
-    // In unreachable code, ref types are polymorphic
-    if (cf != null and cf.?.unreachable_flag and actual.isRef() and expected.isRef()) return true;
+    if (frame.unreachable_flag and actual.isRef() and expected.isRef()) return true;
     return false;
 }
 
 /// Pop and also check concrete type index compatibility.
 fn popExpectTidx(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*CtrlFrame, tidx: []const u32) bool {
-    if (sp.* == 0 or (cf != null and sp.* <= cf.?.start_height)) {
-        return cf != null and cf.?.unreachable_flag;
+    const frame = cf orelse {
+        if (sp.* == 0) return false;
+        sp.* -= 1;
+        return stack[sp.*] == expected;
+    };
+    if (sp.* == 0 or sp.* <= frame.start_height) {
+        return frame.unreachable_flag;
     }
     sp.* -= 1;
     const actual = stack[sp.*];
     if (actual != expected and !actual.isSubtypeOf(expected)) {
-        if (!(cf != null and cf.?.unreachable_flag and actual.isRef() and expected.isRef())) return false;
+        if (!(frame.unreachable_flag and actual.isRef() and expected.isRef())) return false;
     }
     const actual_tidx = if (sp.* < tidx.len) tidx[sp.*] else NO_TIDX;
     if (expected_tidx != NO_TIDX) {
         if (actual_tidx != expected_tidx) {
-            if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
-            // Bottom types are subtypes of any concrete type in their family
+            if (actual_tidx == NO_TIDX and frame.unreachable_flag) return true;
             if (isBottomTidx(actual_tidx)) return true;
             return false;
         }
@@ -2472,32 +2481,39 @@ fn popExpectTidx(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*
 
 /// Strict version for branch label matching: (ref null $t) != funcref.
 fn popExpectTidxStrict(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*CtrlFrame, tidx: []const u32) bool {
-    if (sp.* == 0 or (cf != null and sp.* <= cf.?.start_height)) {
-        return cf != null and cf.?.unreachable_flag;
+    const frame = cf orelse {
+        if (sp.* == 0) return false;
+        sp.* -= 1;
+        return stack[sp.*] == expected;
+    };
+    if (sp.* == 0 or sp.* <= frame.start_height) {
+        return frame.unreachable_flag;
     }
     sp.* -= 1;
     const actual = stack[sp.*];
     if (actual != expected and !actual.isSubtypeOf(expected)) {
-        if (!(cf != null and cf.?.unreachable_flag and actual.isRef() and expected.isRef())) return false;
+        if (!(frame.unreachable_flag and actual.isRef() and expected.isRef())) return false;
     }
     const actual_tidx = if (sp.* < tidx.len) tidx[sp.*] else NO_TIDX;
     if (expected_tidx != NO_TIDX) {
         if (actual_tidx != expected_tidx) {
-            if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
-            // Bottom types are subtypes of any concrete type in their family
+            if (actual_tidx == NO_TIDX and frame.unreachable_flag) return true;
             if (isBottomTidx(actual_tidx)) return true;
             return false;
         }
     } else if (actual_tidx != NO_TIDX and actual.isRef()) {
-        // Bottom types are also subtypes of abstract ref types
         if (isBottomTidx(actual_tidx)) return true;
-        if (!(cf != null and cf.?.unreachable_flag)) return false;
+        if (!frame.unreachable_flag) return false;
     }
     return true;
 }
 
 fn popAny(stack: []VT, sp: *u32, cf: ?*CtrlFrame) ?VT {
-    if (sp.* == 0 or (cf != null and sp.* <= cf.?.start_height)) return null;
+    if (cf) |frame| {
+        if (sp.* == 0 or sp.* <= frame.start_height) return null;
+    } else {
+        if (sp.* == 0) return null;
+    }
     sp.* -= 1;
     return stack[sp.*];
 }
@@ -3196,13 +3212,15 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     return error.TypeMismatch;
                 const t2 = popAny(&stack_buf, &sp, cf);
                 const t1 = popAny(&stack_buf, &sp, cf);
-                const is_unreachable = cf != null and cf.?.unreachable_flag;
+                const is_unreachable = if (cf) |f| f.unreachable_flag else false;
                 // In non-unreachable code, both operands must be present
                 if (!is_unreachable and (t1 == null or t2 == null)) return error.TypeMismatch;
                 // select (untyped) requires numeric types — ref types need select_t
                 if (t1) |v| { if (v.isRef()) return error.TypeMismatch; }
                 if (t2) |v| { if (v.isRef()) return error.TypeMismatch; }
-                if (t1 != null and t2 != null and t1.? != t2.?) return error.TypeMismatch;
+                if (t1 != null and t2 != null) {
+                    if (t1.? != t2.?) return error.TypeMismatch;
+                }
                 pushType(&stack_buf, &sp, t1 orelse t2 orelse .i32, &stack_tidx);
             },
             0x1C => { // select_t
@@ -3210,7 +3228,7 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 if (count_sel == 0) {
                     // Empty select_t in unreachable code is valid
                     const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
-                    const is_unreachable = cf != null and cf.?.unreachable_flag;
+                    const is_unreachable = if (cf) |f| f.unreachable_flag else false;
                     if (!is_unreachable) return error.TypeMismatch;
                     pushType(&stack_buf, &sp, .i32, &stack_tidx);
                 } else if (i >= code.len) {

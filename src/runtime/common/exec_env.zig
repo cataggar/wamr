@@ -217,6 +217,7 @@ pub const ExecEnv = struct {
 
     /// Get a local variable value.
     pub fn getLocal(self: *const ExecEnv, frame: *const CallFrame, idx: u32) !types.Value {
+        if (idx >= frame.local_count) return error.StackOverflow;
         const abs = frame.stack_base + idx;
         if (abs >= self.operand_stack.len) return error.StackOverflow;
         return self.operand_stack[abs];
@@ -224,6 +225,7 @@ pub const ExecEnv = struct {
 
     /// Set a local variable value.
     pub fn setLocal(self: *ExecEnv, frame: *const CallFrame, idx: u32, val: types.Value) !void {
+        if (idx >= frame.local_count) return error.StackOverflow;
         const abs = frame.stack_base + idx;
         if (abs >= self.operand_stack.len) return error.StackOverflow;
         self.operand_stack[abs] = val;

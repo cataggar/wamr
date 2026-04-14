@@ -74,8 +74,9 @@ pub fn instantiateWithImports(
     // Initialize waiter queues for shared memories
     for (inst.memories) |mem| {
         if (mem.memory_type.is_shared and mem.waiter_queue == null) {
-            mem.waiter_queue = allocator.create(types.WaiterQueue) catch return error.OutOfMemory;
-            mem.waiter_queue.?.* = .{};
+            const wq = allocator.create(types.WaiterQueue) catch return error.OutOfMemory;
+            wq.* = .{};
+            mem.waiter_queue = wq;
         }
     }
 
