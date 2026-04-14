@@ -392,3 +392,253 @@ test "WaiterQueue: wait with immediate timeout" {
     // 0 timeout = immediate timeout or woken (could be either depending on timing)
     try std.testing.expect(result == 0 or result == 2);
 }
+
+// ── Integration tests ───────────────────────────────────────────────────────
+// These tests exercise the full thread lifecycle: spawn → execute → join.
+// Each builds a WasmModule with an exported wasi_thread_start function,
+// creates a ModuleInstance with shared memory, and spawns real threads.
+// Gated on multi-threaded targets (can't spawn threads on wasm32-wasi).
+
+const builtin = @import("builtin");
+
+const ThreadTestCtx = struct {
+    module: *types.WasmModule,
+    mem_inst: *types.MemoryInstance,
+    inst: *types.ModuleInstance,
+};
+
+/// Build a test module with a wasi_thread_start export.
+/// `code` is the function body bytecode (excluding the end opcode).
+fn buildThreadTestModule(
+    func_code: []const u8,
+    allocator: std.mem.Allocator,
+) !ThreadTestCtx {
+    const module = try allocator.create(types.WasmModule);
+
+    // Build code with end opcode
+    const full_code = try allocator.alloc(u8, func_code.len + 1);
+    @memcpy(full_code[0..func_code.len], func_code);
+    full_code[func_code.len] = 0x0B; // end
+
+    const func_types = try allocator.alloc(types.FuncType, 1);
+    func_types[0] = .{
+        .params = &.{ .i32, .i32 },
+        .results = &.{},
+    };
+    const functions = try allocator.alloc(types.WasmFunction, 1);
+    functions[0] = .{
+        .type_idx = 0,
+        .func_type = func_types[0],
+        .local_count = 2,
+        .locals = &.{},
+        .code = full_code,
+    };
+    const exports = try allocator.alloc(types.ExportDesc, 1);
+    exports[0] = .{
+        .name = "wasi_thread_start",
+        .kind = .function,
+        .index = 0,
+    };
+    const memories = try allocator.alloc(types.MemoryType, 1);
+    memories[0] = .{ .limits = .{ .min = 1 }, .is_shared = true };
+
+    module.* = .{
+        .types = func_types,
+        .functions = functions,
+        .exports = exports,
+        .memories = memories,
+    };
+
+    // Create shared memory instance
+    const mem_data = try allocator.alloc(u8, 65536);
+    @memset(mem_data, 0);
+    const mem_inst = try allocator.create(types.MemoryInstance);
+    mem_inst.* = .{
+        .memory_type = .{ .limits = .{ .min = 1 }, .is_shared = true },
+        .data = mem_data,
+        .current_pages = 1,
+        .max_pages = 4,
+    };
+    var mem_ptrs = try allocator.alloc(*types.MemoryInstance, 1);
+    mem_ptrs[0] = mem_inst;
+
+    const inst = try allocator.create(types.ModuleInstance);
+    inst.* = .{
+        .module = module,
+        .memories = mem_ptrs,
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = allocator,
+    };
+
+    return .{ .module = module, .mem_inst = mem_inst, .inst = inst };
+}
+
+fn cleanupThreadTest(
+    ctx: ThreadTestCtx,
+    allocator: std.mem.Allocator,
+) void {
+    // Memory may have been retained by clones — just release our ref
+    ctx.mem_inst.release(allocator);
+    allocator.free(ctx.inst.memories);
+    allocator.destroy(ctx.inst);
+    allocator.free(@constCast(ctx.module.functions[0].code));
+    allocator.free(ctx.module.types);
+    allocator.free(ctx.module.functions);
+    allocator.free(ctx.module.exports);
+    allocator.free(ctx.module.memories);
+    allocator.destroy(ctx.module);
+}
+
+test "integration: spawn threads incrementing atomic counter" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // wasi_thread_start body: i32.const 0; i32.const 1; i32.atomic.rmw.add 2 0; drop
+    const code = [_]u8{
+        0x41, 0x00, // i32.const 0 (address)
+        0x41, 0x01, // i32.const 1 (value to add)
+        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
+        0x1A, // drop
+    };
+    const ctx = try buildThreadTestModule(&code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var tm = ThreadManager.init(allocator);
+    defer tm.deinit();
+    ctx.inst.thread_manager = &tm;
+
+    // Spawn 2 threads
+    const tid1 = try tm.spawnThread(ctx.inst, 0);
+    const tid2 = try tm.spawnThread(ctx.inst, 0);
+    try std.testing.expect(tid1 > 0);
+    try std.testing.expect(tid2 > 0);
+    try std.testing.expect(tid1 != tid2);
+
+    // Wait for completion
+    tm.joinAll();
+
+    // Read shared memory — should have been incremented twice
+    const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 2), counter);
+}
+
+test "integration: trap in child signals trap flag" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // wasi_thread_start body: unreachable
+    const code = [_]u8{0x00}; // unreachable
+    const ctx = try buildThreadTestModule(&code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var tm = ThreadManager.init(allocator);
+    defer tm.deinit();
+    ctx.inst.thread_manager = &tm;
+
+    try std.testing.expect(!tm.hasTrap());
+
+    const tid = try tm.spawnThread(ctx.inst, 0);
+    try std.testing.expect(tid > 0);
+
+    // Wait for the thread to finish (it will trap)
+    tm.joinAll();
+
+    // Trap flag should be set
+    try std.testing.expect(tm.hasTrap());
+}
+
+test "integration: stress spawn 4 threads" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // wasi_thread_start body: i32.const 0; i32.const 1; i32.atomic.rmw.add 2 0; drop
+    const code = [_]u8{
+        0x41, 0x00, // i32.const 0
+        0x41, 0x01, // i32.const 1
+        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
+        0x1A, // drop
+    };
+    const ctx = try buildThreadTestModule(&code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var tm = ThreadManager.init(allocator);
+    defer tm.deinit();
+    ctx.inst.thread_manager = &tm;
+
+    // Spawn 4 threads
+    var tids: [4]i32 = undefined;
+    for (&tids) |*tid| {
+        tid.* = try tm.spawnThread(ctx.inst, 0);
+        try std.testing.expect(tid.* > 0);
+    }
+
+    // All TIDs should be unique
+    for (tids, 0..) |a, i| {
+        for (tids[i + 1 ..]) |b| {
+            try std.testing.expect(a != b);
+        }
+    }
+
+    tm.joinAll();
+
+    // Counter should equal 4
+    const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 4), counter);
+    try std.testing.expect(!tm.hasTrap());
+}
+
+test "integration: threads receive start_arg" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // wasi_thread_start(tid, start_arg) body:
+    //   i32.const 0 (address); local.get 1 (start_arg); i32.atomic.rmw.add 2 0; drop
+    const code = [_]u8{
+        0x41, 0x00, // i32.const 0 (address)
+        0x20, 0x01, // local.get 1 (start_arg)
+        0xFE, 0x1E, 0x02, 0x00, // i32.atomic.rmw.add align=2 offset=0
+        0x1A, // drop
+    };
+    const ctx = try buildThreadTestModule(&code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var tm = ThreadManager.init(allocator);
+    defer tm.deinit();
+    ctx.inst.thread_manager = &tm;
+
+    // Spawn with start_arg=10 and start_arg=20
+    _ = try tm.spawnThread(ctx.inst, 10);
+    _ = try tm.spawnThread(ctx.inst, 20);
+    tm.joinAll();
+
+    // Counter should be 10 + 20 = 30
+    const counter = std.mem.readInt(u32, ctx.mem_inst.data[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 30), counter);
+}
+
+test "integration: aux stack pool allocates distinct stacks" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Simple nop body — we just verify stacks are allocated/freed
+    const code = [_]u8{0x01}; // nop
+    const ctx = try buildThreadTestModule(&code, allocator);
+    defer cleanupThreadTest(ctx, allocator);
+
+    var tm = ThreadManager.init(allocator);
+    defer tm.deinit();
+    ctx.inst.thread_manager = &tm;
+
+    // Pre-allocate aux stacks
+    try tm.aux_stack_pool.init(2, 32768, allocator);
+
+    // Spawn 2 threads — each should get a distinct stack
+    _ = try tm.spawnThread(ctx.inst, 0);
+    _ = try tm.spawnThread(ctx.inst, 0);
+    tm.joinAll();
+
+    // Both stacks should be returned to the pool
+    try std.testing.expectEqual(@as(usize, 2), tm.aux_stack_pool.free_stacks.items.len);
+    try std.testing.expect(!tm.hasTrap());
+}
