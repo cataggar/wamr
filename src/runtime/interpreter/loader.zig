@@ -457,6 +457,8 @@ fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
 const LimitsResult = struct {
     limits: types.Limits,
     is_64: bool,
+    raw_min64: u64 = 0,
+    raw_max64: u64 = 0,
 };
 
 fn readLimitsEx(reader: *BinaryReader) LoadError!LimitsResult {
@@ -473,10 +475,11 @@ fn readLimitsEx(reader: *BinaryReader) LoadError!LimitsResult {
         const min: u32 = if (min64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(min64);
         if (has_max) {
             const max64 = try reader.readU64();
+            if (min64 > max64) return error.InvalidLimits;
             const max: u32 = if (max64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max64);
-            return .{ .limits = .{ .min = min, .max = max }, .is_64 = true };
+            return .{ .limits = .{ .min = min, .max = max }, .is_64 = true, .raw_min64 = min64, .raw_max64 = max64 };
         }
-        return .{ .limits = .{ .min = min }, .is_64 = true };
+        return .{ .limits = .{ .min = min }, .is_64 = true, .raw_min64 = min64 };
     } else {
         const min = try reader.readU32();
         if (has_max) {
@@ -597,6 +600,12 @@ fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError
 
 fn readMemoryType(reader: *BinaryReader) LoadError!types.MemoryType {
     const result = try readLimitsEx(reader);
+    // Validate memory64 limits using raw u64 values before they were truncated to u32
+    if (result.is_64) {
+        const max_pages: u64 = 1 << 48;
+        if (result.raw_min64 > max_pages) return error.InvalidLimits;
+        if (result.raw_max64 > max_pages) return error.InvalidLimits;
+    }
     return .{ .limits = result.limits, .is_memory64 = result.is_64 };
 }
 
@@ -1397,6 +1406,15 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
         if ((table.elem_type == .nonfuncref or table.elem_type == .nonexternref) and table.init_expr == null) {
             return error.TypeMismatch;
         }
+        // Validate table init expression: global.get must reference an imported global
+        if (table.init_expr) |ie| {
+            switch (ie) {
+                .global_get => |idx| {
+                    if (idx >= module.import_global_count) return error.UnknownGlobal;
+                },
+                else => {},
+            }
+        }
     }
 
     // Validate import types and limits
@@ -1685,10 +1703,19 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
 }
 
 /// Check if a function body contains GC-related opcodes or typed reference block types.
+/// Checks for:
+/// - 0xFB prefix (GC instruction namespace)
+/// - 0x63/0x64 (ref null/ref) as block type immediates after block/loop/if/try_table
+/// Note: 0x63/0x64 as standalone opcodes are f64.lt/f64.gt, so we only check them
+/// when they appear immediately after a block-introducing opcode.
 fn hasGcOpcodes(code: []const u8) bool {
-    for (code) |b| {
-        // 0xFB = GC prefix, 0x63/0x64 = ref null/ref typed reference (in block types)
-        if (b == 0xFB or b == 0x63 or b == 0x64) return true;
+    var i: usize = 0;
+    while (i < code.len) : (i += 1) {
+        if (code[i] == 0xFB) return true;
+        // Check for block types with reference type encoding
+        if ((code[i] == 0x02 or code[i] == 0x03 or code[i] == 0x04 or code[i] == 0x06) and
+            i + 1 < code.len and (code[i + 1] == 0x63 or code[i + 1] == 0x64))
+            return true;
     }
     return false;
 }
