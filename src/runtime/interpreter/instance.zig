@@ -46,13 +46,14 @@ pub fn instantiateWithImports(
     allocator: std.mem.Allocator,
     import_ctx: ?ImportContext,
 ) InstantiationError!*types.ModuleInstance {
-    const has_imports = module.import_function_count > 0 or
+    const has_non_func_imports =
         module.import_global_count > 0 or
         module.import_memory_count > 0 or
         module.import_table_count > 0 or
         module.import_tag_count > 0;
 
-    if (has_imports and import_ctx == null) {
+    // Non-function imports still require an explicit ImportContext
+    if (has_non_func_imports and import_ctx == null) {
         return error.ImportResolutionFailed;
     }
 
@@ -70,6 +71,14 @@ pub fn instantiateWithImports(
     inst.memories = try allocateMemories(module, allocator, import_ctx);
     errdefer freeMemories(inst.memories, allocator);
 
+    // Initialize waiter queues for shared memories
+    for (inst.memories) |mem| {
+        if (mem.memory_type.is_shared and mem.waiter_queue == null) {
+            mem.waiter_queue = allocator.create(types.WaiterQueue) catch return error.OutOfMemory;
+            mem.waiter_queue.?.* = .{};
+        }
+    }
+
     inst.tables = try allocateTables(module, allocator, import_ctx);
     errdefer freeTables(inst.tables, allocator);
 
@@ -81,6 +90,14 @@ pub fn instantiateWithImports(
         if (ctx.functions.len > 0) {
             inst.import_functions = allocator.dupe(types.ImportedFunction, ctx.functions) catch return error.OutOfMemory;
         }
+    }
+
+    // Resolve WASI host functions for function imports
+    if (module.import_function_count > 0) {
+        const wasi_host = @import("../../wasi/host_functions.zig");
+        const host_fns = wasi_host.resolveWasiHostFunctions(module, allocator) catch return error.OutOfMemory;
+        inst.host_functions = host_fns;
+        inst.owns_host_functions = true;
     }
 
     // Allocate tags: imported tags + locally defined tags
@@ -186,10 +203,18 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, inst.module.import_global_count, allocator);
     if (inst.import_functions.len > 0) allocator.free(inst.import_functions);
+    if (inst.owns_host_functions and inst.host_functions.len > 0)
+        allocator.free(inst.host_functions);
     // Free locally defined tags (imported tags are owned by their source instance)
     for (inst.tags[inst.module.import_tag_count..]) |t| allocator.destroy(t);
     if (inst.tags.len > 0) allocator.free(inst.tags);
     if (inst.dropped_elems.len > 0) allocator.free(inst.dropped_elems);
+    if (inst.dropped_data.len > 0) allocator.free(inst.dropped_data);
+    // Free cached element segment values
+    for (inst.cached_elem_values) |maybe_vals| {
+        if (maybe_vals) |vals| allocator.free(vals);
+    }
+    if (inst.cached_elem_values.len > 0) allocator.free(inst.cached_elem_values);
     allocator.destroy(inst);
 }
 
@@ -921,4 +946,54 @@ test "evalInitExpr: global_get references preceding global" {
 test "evalInitExpr: global_get out of range" {
     const result = evalInitExpr(.{ .global_get = 5 }, &.{}, null);
     try testing.expectError(error.InvalidGlobalIndex, result);
+}
+
+test "instantiate: host functions resolved for wasi thread-spawn import" {
+    const imports = [_]types.ImportDesc{
+        .{
+            .module_name = "wasi",
+            .field_name = "thread-spawn",
+            .kind = .function,
+            .func_type_idx = 0,
+        },
+    };
+    const func_types = [_]types.FuncType{
+        .{ .params = &.{.i32}, .results = &.{.i32} },
+    };
+    var module = types.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const inst = try instantiate(&module, testing.allocator);
+    defer destroy(inst);
+
+    // Host functions should be resolved
+    try testing.expectEqual(@as(usize, 1), inst.host_functions.len);
+    try testing.expect(inst.host_functions[0] != null);
+    try testing.expect(inst.owns_host_functions);
+}
+
+test "instantiate: non-wasi imports have null host functions" {
+    const imports = [_]types.ImportDesc{
+        .{
+            .module_name = "env",
+            .field_name = "some_func",
+            .kind = .function,
+            .func_type_idx = 0,
+        },
+    };
+    const func_types = [_]types.FuncType{
+        .{ .params = &.{}, .results = &.{} },
+    };
+    var module = types.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const inst = try instantiate(&module, testing.allocator);
+    defer destroy(inst);
+
+    try testing.expectEqual(@as(usize, 1), inst.host_functions.len);
+    try testing.expect(inst.host_functions[0] == null);
 }
