@@ -1,21 +1,49 @@
-"""wamrc-bin — WebAssembly Micro Runtime AOT compiler."""
+"""wamrc-bin — WebAssembly Micro Runtime AOT compiler.
+
+Provides a helper to locate the wamrc binary installed via
+the data/scripts/ wheel layout. The binary is placed directly
+in the scripts directory by pip and does not require Python at runtime.
+"""
+
+from __future__ import annotations
 
 import os
-import subprocess
 import sys
-from pathlib import Path
-
-_EXT = ".exe" if sys.platform == "win32" else ""
+import sysconfig
 
 
-def wamrc() -> None:
-    """Run the wamrc AOT compiler binary."""
-    binary = Path(__file__).parent / f"wamrc{_EXT}"
-    if not binary.exists():
-        print(f"wamrc binary not found at {binary}", file=sys.stderr)
-        sys.exit(1)
-    args = [str(binary), *sys.argv[1:]]
-    if sys.platform != "win32":
-        os.execv(args[0], args)
+def find_wamrc_bin() -> str:
+    """Return the path to the wamrc binary.
+
+    Searches the scripts directories where pip installs data/scripts/ files.
+    """
+    ext = ".exe" if sys.platform == "win32" else ""
+    exe = f"wamrc{ext}"
+
+    targets = [
+        sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
+    ]
+
+    # User scheme
+    if sys.version_info >= (3, 10):
+        user_scheme = sysconfig.get_preferred_scheme("user")
+    elif os.name == "nt":
+        user_scheme = "nt_user"
     else:
-        raise SystemExit(subprocess.call(args))
+        user_scheme = "posix_user"
+    targets.append(sysconfig.get_path("scripts", scheme=user_scheme))
+
+    seen: list[str] = []
+    for target in targets:
+        if not target or target in seen:
+            continue
+        seen.append(target)
+        path = os.path.join(target, exe)
+        if os.path.isfile(path):
+            return path
+
+    locations = "\n".join(f" - {t}" for t in seen)
+    raise FileNotFoundError(
+        f"Could not find {exe} in:\n{locations}\n"
+    )
