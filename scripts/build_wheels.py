@@ -21,30 +21,42 @@ IMPORT_NAME = "wamr_cli"
 DIST_NAME = "wamr_bin"
 WAMR_REPO = "cataggar/wamr"
 
+TOOLS = [
+    "wamr",
+]
+
 PLATFORMS = {
     "linux-x64": {
         "tag": "manylinux_2_17_x86_64.manylinux2014_x86_64",
+        "ext": "",
     },
     "linux-arm64": {
         "tag": "manylinux_2_17_aarch64.manylinux2014_aarch64",
+        "ext": "",
     },
     "linux-musl-x64": {
         "tag": "musllinux_1_1_x86_64",
+        "ext": "",
     },
     "linux-musl-arm64": {
         "tag": "musllinux_1_1_aarch64",
+        "ext": "",
     },
     "macos-arm64": {
         "tag": "macosx_11_0_arm64",
+        "ext": "",
     },
     "macos-x64": {
         "tag": "macosx_10_9_x86_64",
+        "ext": "",
     },
     "windows-x64": {
         "tag": "win_amd64",
+        "ext": ".exe",
     },
     "windows-arm64": {
         "tag": "win_arm64",
+        "ext": ".exe",
     },
 }
 
@@ -69,55 +81,44 @@ def download_asset(release_version: str, platform_key: str) -> bytes:
     return resp.content
 
 
-def _is_executable(path: Path) -> bool:
-    """Check if a file should be marked executable in the wheel."""
-    name = path.name
-    if name.endswith((".exe", ".so", ".dylib")):
-        return True
-    if "." not in name:
-        return True
-    return False
-
-
 def build_wheel(
-    version: str, platform_key: str, platform_tag: str, dist_dir: Path,
-    release_version: str | None = None,
+    version: str, platform_key: str, platform_tag: str, ext: str,
+    dist_dir: Path, release_version: str | None = None,
 ) -> Path:
-    """Build a single platform wheel."""
+    """Build a single platform wheel with native binaries in data/scripts/."""
     data = download_asset(release_version or version, platform_key)
 
-    # Extract the tarball
+    # Extract tool binaries from the tarball (exclude wamrc — distributed separately)
+    tool_binaries: dict[str, bytes] = {}
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        members = tf.getmembers()
-        # Find the bin/ directory inside the archive
-        bin_prefix = None
-        for m in members:
-            if "/bin/" in m.name and m.isfile():
-                bin_prefix = m.name.split("/bin/")[0] + "/bin/"
-                break
-
-        entries: list[tuple[str, bytes, bool]] = []
-
-        # Add __init__.py
-        init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
-        entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
-
-        # Add binaries from archive (exclude wamrc — distributed separately)
-        if bin_prefix:
-            for m in members:
-                if m.name.startswith(bin_prefix) and m.isfile():
-                    rel = m.name[len(bin_prefix) :]
-                    if not rel or rel.startswith("wamrc"):
-                        continue
+        for m in tf.getmembers():
+            if not m.isfile() or "/bin/" not in m.name:
+                continue
+            basename = m.name.rsplit("/", 1)[-1]
+            if basename.startswith("wamrc"):
+                continue
+            for tool in TOOLS:
+                if basename == f"{tool}{ext}":
                     f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    file_data = f.read()
-                    arcname = f"{IMPORT_NAME}/{rel}"
-                    entries.append((arcname, file_data, _is_executable(Path(rel))))
+                    if f is not None:
+                        tool_binaries[basename] = f.read()
+                    break
 
-    # dist-info directory
+    if not tool_binaries:
+        raise RuntimeError(f"No tool binaries found in archive for {platform_key}")
+
+    data_scripts_dir = f"{DIST_NAME}-{version}.data/scripts"
     dist_info_dir = f"{DIST_NAME}-{version}.dist-info"
+
+    entries: list[tuple[str, bytes, bool]] = []
+
+    # Python package with find helpers (for programmatic use)
+    init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
+    entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
+
+    # Native binaries go in data/scripts/ — pip copies them directly to bin/Scripts
+    for name, binary_data in sorted(tool_binaries.items()):
+        entries.append((f"{data_scripts_dir}/{name}", binary_data, True))
 
     readme_path = Path(__file__).resolve().parent.parent / "README.md"
     readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
@@ -144,13 +145,7 @@ def build_wheel(
     )
     entries.append((f"{dist_info_dir}/WHEEL", wheel_meta.encode(), False))
 
-    tool_entries = "\n".join(
-        [
-            "wamr = wamr_cli:wamr",
-        ]
-    )
-    entry_points = f"[console_scripts]\n{tool_entries}\n"
-    entries.append((f"{dist_info_dir}/entry_points.txt", entry_points.encode(), False))
+    # No entry_points.txt — binaries are installed directly via data/scripts
 
     # Build RECORD
     records: list[str] = []
@@ -201,7 +196,10 @@ def main() -> None:
     wheels: list[Path] = []
     for platform_key, info in PLATFORMS.items():
         print(f"[{platform_key}]")
-        wheel = build_wheel(version, platform_key, info["tag"], dist_dir, raw_version)
+        wheel = build_wheel(
+            version, platform_key, info["tag"], info["ext"],
+            dist_dir, raw_version,
+        )
         wheels.append(wheel)
         print()
 
