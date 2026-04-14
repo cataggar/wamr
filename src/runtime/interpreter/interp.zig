@@ -3026,35 +3026,24 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             if (n > 0) return error.OutOfBoundsTableAccess;
                             continue;
                         }
+
+                        // Use cached evaluated values (spec requires one-time evaluation)
+                        if (elem_idx < env.module_inst.cached_elem_values.len) {
+                            if (env.module_inst.cached_elem_values[elem_idx]) |cached| {
+                                if (@as(u64, s) + n > cached.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
+                                for (0..n) |i_| {
+                                    const ii = @as(u32, @intCast(i_));
+                                    table.elements[d + ii] = types.TableElement.fromValue(cached[s + ii], env.module_inst);
+                                }
+                                continue;
+                            }
+                        }
+
                         const elem = &module.elements[elem_idx];
                         if (@as(u64, s) + n > elem.func_indices.len or @as(u64, d) + n > table.elements.len) return error.OutOfBoundsTableAccess;
-                        const instance_mod = @import("instance.zig");
                         for (0..n) |i_| {
                             const ii = @as(u32, @intCast(i_));
                             const mfi = elem.func_indices[s + ii];
-                            // Check for element expressions first
-                            if (elem.elem_exprs.len > s + ii) {
-                                if (elem.elem_exprs[s + ii]) |expr| {
-                                    switch (expr) {
-                                        .ref_func => |fidx| {
-                                            table.elements[d + ii] = .{
-                                                .value = .{ .nonfuncref = fidx },
-                                                .module_inst = env.module_inst,
-                                            };
-                                            continue;
-                                        },
-                                        .bytecode => |bc| {
-                                            const bc_val = instance_mod.evalInitBytecode(bc, &.{}, env.module_inst) catch {
-                                                table.elements[d + ii] = types.TableElement.nullForType(table.table_type.elem_type);
-                                                continue;
-                                            };
-                                            table.elements[d + ii] = types.TableElement.fromValue(bc_val, env.module_inst);
-                                            continue;
-                                        },
-                                        else => {},
-                                    }
-                                }
-                            }
                             table.elements[d + ii] = if (mfi) |fi|
                                 .{ .value = .{ .nonfuncref = fi }, .module_inst = env.module_inst }
                             else
