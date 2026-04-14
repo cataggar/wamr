@@ -94,6 +94,18 @@ pub const wasi_p2_core = @import("wasi/preview2/core.zig");
 /// WASI Preview 2 I/O streams and poll.
 pub const wasi_p2_streams = @import("wasi/preview2/streams.zig");
 
+/// WASI Preview 2 sockets (TCP, UDP, name lookup).
+pub const wasi_p2_sockets = @import("wasi/preview2/sockets.zig");
+
+/// WASI Preview 2 HTTP types and handler.
+pub const wasi_p2_http = @import("wasi/preview2/http.zig");
+
+/// WASIp1 polyfill layer (maps p1 calls to p2 interfaces).
+pub const wasi_p1_polyfill = @import("wasi/preview2/polyfill.zig");
+
+/// Component Model async canonical ABI extensions.
+pub const component_async_canon = @import("component/async_canon.zig");
+
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).
 pub const platform = @import("platform/platform.zig");
