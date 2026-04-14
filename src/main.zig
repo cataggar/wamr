@@ -66,7 +66,51 @@ pub fn main() !void {
     };
     defer allocator.free(wasm_data);
 
-    // Load module
+    // Detect file type by magic bytes: AOT (\0aot) vs Wasm (\0asm)
+    if (wasm_data.len >= 4 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.aot_magic) {
+        runAot(wasm_data, allocator);
+        return;
+    }
+
+    // Wasm module (core or component)
+    runWasm(wasm_data, stack_size, &wasm_args, allocator);
+}
+
+fn runAot(data: []const u8, allocator: std.mem.Allocator) void {
+    const aot_loader = wamr.aot_loader;
+    const aot_runtime = wamr.aot_runtime;
+
+    const aot_module = aot_loader.load(data, allocator) catch |err| {
+        std.debug.print("Error: failed to load AOT module: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    const aot_inst = aot_runtime.instantiate(&aot_module, allocator) catch |err| {
+        std.debug.print("Error: failed to instantiate AOT module: {}\n", .{err});
+        std.process.exit(1);
+    };
+    _ = aot_inst;
+
+    // AOT execution: find _start export and call native code
+    const start_exp = aot_module.findExport("_start", .function) orelse
+        aot_module.findExport("main", .function) orelse {
+        std.debug.print("Error: no _start or main function exported in AOT module\n", .{});
+        std.process.exit(1);
+    };
+    _ = start_exp;
+
+    // TODO: map native code as executable and call via function pointer
+    std.debug.print("AOT module loaded ({} functions, {} exports). Native execution not yet implemented.\n", .{
+        aot_module.func_count, aot_module.exports.len,
+    });
+}
+
+fn runWasm(
+    wasm_data: []const u8,
+    stack_size: u32,
+    wasm_args: *std.ArrayListUnmanaged([]const u8),
+    allocator: std.mem.Allocator,
+) void {
     var runtime = wamr.wamr.Runtime.init(allocator);
     defer runtime.deinit();
 
@@ -76,21 +120,18 @@ pub fn main() !void {
     };
     defer module.deinit();
 
-    // Instantiate
     var instance = module.instantiate() catch |err| {
         std.debug.print("Error: failed to instantiate: {}\n", .{err});
         std.process.exit(1);
     };
     defer instance.deinit();
 
-    // Look for _start or main
     const start_func = module.findExport("_start", .function) orelse
         module.findExport("main", .function) orelse {
         std.debug.print("Error: no _start or main function exported\n", .{});
         std.process.exit(1);
     };
 
-    // Execute
     const func_type = module.inner.getFuncType(start_func.index);
     const param_count = if (func_type) |ft| ft.params.len else 0;
 
@@ -100,10 +141,9 @@ pub fn main() !void {
     };
     defer env.destroy();
 
-    // Push dummy args if _start expects parameters (argc, argv for WASI)
     if (param_count >= 2) {
-        try env.pushI32(@intCast(wasm_args.items.len + 1)); // argc
-        try env.pushI32(0); // argv (null — no linear memory argv support yet)
+        env.pushI32(@intCast(wasm_args.items.len + 1)) catch {};
+        env.pushI32(0) catch {};
     }
 
     wamr.interp.executeFunction(env, start_func.index) catch |err| {
