@@ -3404,6 +3404,58 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
 
 // ── Atomic operation helpers ─────────────────────────────────────────────
 
+const builtin = @import("builtin");
+
+// On 32-bit targets (e.g. wasm32), 64-bit atomic operations are not
+// supported by the hardware. Fall back to non-atomic access since the
+// interpreter is single-threaded within a wasm instance.
+const has_64bit_atomics = @bitSizeOf(usize) >= 64;
+
+inline fn doAtomicLoad(comptime T: type, ptr: *const T) T {
+    if (@bitSizeOf(T) <= 32 or has_64bit_atomics)
+        return @atomicLoad(T, ptr, .seq_cst)
+    else
+        return ptr.*;
+}
+
+inline fn doAtomicStore(comptime T: type, ptr: *T, val: T) void {
+    if (@bitSizeOf(T) <= 32 or has_64bit_atomics)
+        @atomicStore(T, ptr, val, .seq_cst)
+    else
+        ptr.* = val;
+}
+
+inline fn doAtomicRmw(comptime T: type, ptr: *T, comptime op: std.builtin.AtomicRmwOp, val: T) T {
+    if (@bitSizeOf(T) <= 32 or has_64bit_atomics) {
+        return @atomicRmw(T, ptr, op, val, .seq_cst);
+    } else {
+        const old = ptr.*;
+        ptr.* = switch (op) {
+            .Add => old +% val,
+            .Sub => old -% val,
+            .And => old & val,
+            .Or => old | val,
+            .Xor => old ^ val,
+            .Xchg => val,
+            else => old,
+        };
+        return old;
+    }
+}
+
+inline fn doAtomicCmpxchg(comptime T: type, ptr: *T, expected: T, replacement: T) ?T {
+    if (@bitSizeOf(T) <= 32 or has_64bit_atomics) {
+        return @cmpxchgStrong(T, ptr, expected, replacement, .seq_cst, .seq_cst);
+    } else {
+        const old = ptr.*;
+        if (old == expected) {
+            ptr.* = replacement;
+            return null;
+        }
+        return old;
+    }
+}
+
 fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32) !struct { ptr: [*]u8, addr: usize } {
     const ma = readMemarg(code, ip);
     const addr = try popMemAddr(env, ma.mem_idx) +% ma.offset;
@@ -3417,14 +3469,14 @@ fn getAtomicAddr(env: *ExecEnv, code: []const u8, ip: *usize, comptime size: u32
 fn atomicLoad(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime R: type, comptime size: u32) !void {
     const a = try getAtomicAddr(env, code, ip, size);
     const ptr: *const T = @ptrCast(@alignCast(a.ptr));
-    const val = @atomicLoad(T, ptr, .seq_cst);
+    const val = doAtomicLoad(T, ptr);
     try env.pushI32(@bitCast(@as(R, val)));
 }
 
 fn atomicLoad64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
     const a = try getAtomicAddr(env, code, ip, size);
     const ptr: *const T = @ptrCast(@alignCast(a.ptr));
-    const val = @atomicLoad(T, ptr, .seq_cst);
+    const val = doAtomicLoad(T, ptr);
     try env.pushI64(@bitCast(@as(u64, val)));
 }
 
@@ -3436,7 +3488,7 @@ fn atomicStore(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
-    @atomicStore(T, ptr, val, .seq_cst);
+    doAtomicStore(T, ptr, val);
 }
 
 fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32) !void {
@@ -3447,7 +3499,7 @@ fn atomicStore64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
-    @atomicStore(T, ptr, val, .seq_cst);
+    doAtomicStore(T, ptr, val);
 }
 
 fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comptime size: u32, comptime op: std.builtin.AtomicRmwOp) !void {
@@ -3458,7 +3510,7 @@ fn atomicRmw(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, comp
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
-    const old = @atomicRmw(T, ptr, op, val, .seq_cst);
+    const old = doAtomicRmw(T, ptr, op, val);
     try env.pushI32(@bitCast(@as(u32, old)));
 }
 
@@ -3470,7 +3522,7 @@ fn atomicRmw64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, co
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
-    const old = @atomicRmw(T, ptr, op, val, .seq_cst);
+    const old = doAtomicRmw(T, ptr, op, val);
     try env.pushI64(@bitCast(@as(u64, old)));
 }
 
@@ -3483,7 +3535,7 @@ fn atomicCmpxchg(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type, 
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
-    const result = @cmpxchgStrong(T, ptr, expected, replacement, .seq_cst, .seq_cst);
+    const result = doAtomicCmpxchg(T, ptr, expected, replacement);
     const old: u32 = if (result) |v| v else expected;
     try env.pushI32(@bitCast(old));
 }
@@ -3497,7 +3549,7 @@ fn atomicCmpxchg64(env: *ExecEnv, code: []const u8, ip: *usize, comptime T: type
     if (addr + size > mem.data.len) return error.OutOfBoundsMemoryAccess;
     if (addr % size != 0) return error.UnalignedAtomicAccess;
     const ptr: *T = @ptrCast(@alignCast(mem.data.ptr + @as(usize, @intCast(addr))));
-    const result = @cmpxchgStrong(T, ptr, expected, replacement, .seq_cst, .seq_cst);
+    const result = doAtomicCmpxchg(T, ptr, expected, replacement);
     const old: u64 = if (result) |v| v else expected;
     try env.pushI64(@bitCast(old));
 }

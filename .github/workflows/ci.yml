@@ -30,6 +30,9 @@ jobs:
       - name: Build (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
 
+      - name: Build (wasm32-wasi)
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=wasm32-wasi -Dstrip=true
+
       - name: Spec tests (JSON — 20,901 conformance tests)
         run: |
           if [ -d tests/spec-json ]; then
