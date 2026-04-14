@@ -6,6 +6,7 @@ const std = @import("std");
 const wamr = @import("wamr");
 const emit_aot = wamr.emit_aot;
 const compile = wamr.x86_64_compile;
+const passes = @import("ir/passes.zig");
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -23,12 +24,15 @@ pub fn main() !void {
 
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
+    var optimize = true;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-o") and i + 1 < args.len) {
             i += 1;
             output_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "-O0")) {
+            optimize = false;
         } else {
             input_path = args[i];
         }
@@ -72,7 +76,16 @@ pub fn main() !void {
 
     std.debug.print("Lowered {d} functions to IR\n", .{ir_module.functions.items.len});
 
-    // 4–5. Compile IR to native x86-64 code
+    // 4. Optimize IR (unless -O0)
+    if (optimize) {
+        const opt_changes = passes.runPasses(&ir_module, passes.default_passes, allocator) catch |err| {
+            std.debug.print("Error optimizing IR: {}\n", .{err});
+            std.process.exit(1);
+        };
+        std.debug.print("Optimization: {d} passes made changes\n", .{opt_changes});
+    }
+
+    // 5. Compile IR to native x86-64 code
     const compiled = compile.compileModule(&ir_module, allocator) catch |err| {
         std.debug.print("Error compiling to native code: {}\n", .{err});
         std.process.exit(1);
