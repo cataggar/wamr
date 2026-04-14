@@ -16,6 +16,9 @@ const loader_mod = @import("../runtime/interpreter/loader.zig");
 const instance_mod = @import("../runtime/interpreter/instance.zig");
 const interp = @import("../runtime/interpreter/interp.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+const comp_types = @import("../component/types.zig");
+const comp_loader = @import("../component/loader.zig");
+const comp_instance = @import("../component/instance.zig");
 
 /// The WAMR runtime — manages the lifecycle of modules and instances.
 pub const Runtime = struct {
@@ -30,11 +33,20 @@ pub const Runtime = struct {
     }
 
     /// Load a WebAssembly module from binary data.
+    /// Returns error.IsComponent if the binary is a component (use loadComponent instead).
     pub fn loadModule(self: *Runtime, wasm_bytes: []const u8) !Module {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const mod = try loader_mod.load(wasm_bytes, arena.allocator());
         return .{ .inner = mod, .arena = arena, .allocator = self.allocator };
+    }
+
+    /// Load a WebAssembly Component from binary data.
+    pub fn loadComponent(self: *Runtime, wasm_bytes: []const u8) !Component {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        const comp = try comp_loader.load(wasm_bytes, arena.allocator());
+        return .{ .inner = comp, .arena = arena, .allocator = self.allocator };
     }
 };
 
@@ -64,6 +76,38 @@ pub const Module = struct {
     /// Find an exported function by name.
     pub fn findExport(self: *const Module, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
         return self.inner.findExport(name, kind);
+    }
+};
+
+/// A loaded WebAssembly Component (not yet instantiated).
+pub const Component = struct {
+    inner: comp_types.Component,
+    arena: std.heap.ArenaAllocator,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Component) void {
+        self.arena.deinit();
+    }
+
+    /// Instantiate this component.
+    pub fn instantiate(self: *Component) !ComponentInstance {
+        const inst = try comp_instance.instantiate(&self.inner, self.allocator);
+        return .{ .inner = inst, .allocator = self.allocator };
+    }
+};
+
+/// A running Component instance.
+pub const ComponentInstance = struct {
+    inner: *comp_instance.ComponentInstance,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ComponentInstance) void {
+        self.inner.deinit();
+    }
+
+    /// Look up an exported function by name.
+    pub fn getExport(self: *const ComponentInstance, name: []const u8) ?comp_instance.ComponentInstance.ExportedFunc {
+        return self.inner.getExport(name);
     }
 };
 
@@ -212,4 +256,25 @@ test "wamr: findExport on loaded module" {
     try testing.expectEqual(types.ExternalKind.function, exp.?.kind);
 
     try testing.expect(module.findExport("missing", .function) == null);
+}
+
+test "wamr: load empty component" {
+    var runtime = Runtime.init(testing.allocator);
+    defer runtime.deinit();
+    // Component preamble: magic + version=0x0d + layer=0x01
+    const data = [_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x0d, 0x00, 0x01, 0x00 };
+    var component = try runtime.loadComponent(&data);
+    defer component.deinit();
+
+    var instance = try component.instantiate();
+    defer instance.deinit();
+
+    try testing.expect(instance.getExport("missing") == null);
+}
+
+test "wamr: loadModule rejects component binary" {
+    var runtime = Runtime.init(testing.allocator);
+    defer runtime.deinit();
+    const data = [_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x0d, 0x00, 0x01, 0x00 };
+    try testing.expectError(error.IsComponent, runtime.loadModule(&data));
 }

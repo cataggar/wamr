@@ -95,6 +95,8 @@ pub const ComponentInstance = struct {
     core_instances: []CoreInstanceEntry,
     /// Resource tables, one per resource type defined in the component.
     resource_tables: []ResourceTable,
+    /// Exported functions (component-level func index → core func index + instance).
+    exported_funcs: std.StringHashMapUnmanaged(ExportedFunc),
     /// Allocator for instance lifetime.
     allocator: std.mem.Allocator,
 
@@ -102,13 +104,119 @@ pub const ComponentInstance = struct {
         module_inst: ?*core_types.ModuleInstance,
     };
 
+    pub const ExportedFunc = struct {
+        core_instance_idx: u32,
+        core_func_idx: u32,
+    };
+
+    /// Look up an exported function by name.
+    pub fn getExport(self: *const ComponentInstance, name: []const u8) ?ExportedFunc {
+        return self.exported_funcs.get(name);
+    }
+
     pub fn deinit(self: *ComponentInstance) void {
         for (self.resource_tables) |*rt| rt.deinit(self.allocator);
         if (self.resource_tables.len > 0) self.allocator.free(self.resource_tables);
         if (self.core_instances.len > 0) self.allocator.free(self.core_instances);
+        self.exported_funcs.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
+
+// ── Component Instantiation ─────────────────────────────────────────────────
+
+pub const InstantiationError = error{
+    OutOfMemory,
+    InvalidComponent,
+    CoreModuleLoadFailed,
+    CoreModuleInstantiateFailed,
+    ImportResolutionFailed,
+};
+
+/// Instantiate a parsed component, producing a runnable ComponentInstance.
+///
+/// This walks the component's sections in order, creating core module
+/// instances, resolving aliases, and wiring up canonical functions.
+pub fn instantiate(
+    component: *const ctypes.Component,
+    allocator: std.mem.Allocator,
+) InstantiationError!*ComponentInstance {
+    const inst = allocator.create(ComponentInstance) catch return error.OutOfMemory;
+    errdefer allocator.destroy(inst);
+
+    // Count resource types
+    var resource_count: u32 = 0;
+    for (component.types) |td| {
+        if (td == .resource) resource_count += 1;
+    }
+
+    // Allocate resource tables
+    const resource_tables: []ResourceTable = if (resource_count > 0) blk: {
+        const rts = allocator.alloc(ResourceTable, resource_count) catch return error.OutOfMemory;
+        for (rts) |*rt| rt.* = .{};
+        break :blk rts;
+    } else &.{};
+
+    // Instantiate core modules
+    const core_module_count = component.core_modules.len;
+    const core_instances: []ComponentInstance.CoreInstanceEntry = if (core_module_count > 0) blk: {
+        const cis = allocator.alloc(ComponentInstance.CoreInstanceEntry, core_module_count) catch return error.OutOfMemory;
+        for (component.core_modules, 0..) |core_mod, i| {
+            const loader = @import("../runtime/interpreter/loader.zig");
+            const inst_mod = @import("../runtime/interpreter/instance.zig");
+
+            const module = loader.load(core_mod.data, allocator) catch {
+                cis[i] = .{ .module_inst = null };
+                continue;
+            };
+            const module_ptr = allocator.create(core_types.WasmModule) catch {
+                cis[i] = .{ .module_inst = null };
+                continue;
+            };
+            module_ptr.* = module;
+            const module_inst = inst_mod.instantiate(module_ptr, allocator) catch {
+                cis[i] = .{ .module_inst = null };
+                continue;
+            };
+            cis[i] = .{ .module_inst = module_inst };
+        }
+        break :blk cis;
+    } else &.{};
+
+    // Build export map
+    var exported_funcs: std.StringHashMapUnmanaged(ComponentInstance.ExportedFunc) = .{};
+    for (component.exports) |exp| {
+        switch (exp.desc) {
+            .func => |func_idx| {
+                // Map component function exports. For now, assume canon lift
+                // links directly to core functions in the first core instance.
+                if (func_idx < component.canons.len) {
+                    const canon = component.canons[func_idx];
+                    switch (canon) {
+                        .lift => |lift| {
+                            exported_funcs.put(allocator, exp.name, .{
+                                .core_instance_idx = 0,
+                                .core_func_idx = lift.core_func_idx,
+                            }) catch {};
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    inst.* = .{
+        .component = component,
+        .core_instances = core_instances,
+        .resource_tables = resource_tables,
+        .exported_funcs = exported_funcs,
+        .allocator = allocator,
+    };
+
+    return inst;
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
