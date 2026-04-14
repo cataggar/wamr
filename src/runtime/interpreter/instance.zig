@@ -209,6 +209,12 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     for (inst.tags[inst.module.import_tag_count..]) |t| allocator.destroy(t);
     if (inst.tags.len > 0) allocator.free(inst.tags);
     if (inst.dropped_elems.len > 0) allocator.free(inst.dropped_elems);
+    if (inst.dropped_data.len > 0) allocator.free(inst.dropped_data);
+    // Free cached element segment values
+    for (inst.cached_elem_values) |maybe_vals| {
+        if (maybe_vals) |vals| allocator.free(vals);
+    }
+    if (inst.cached_elem_values.len > 0) allocator.free(inst.cached_elem_values);
     allocator.destroy(inst);
 }
 
