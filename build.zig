@@ -86,6 +86,9 @@ pub fn build(b: *std.Build) void {
     const wasi_nn = b.option(bool, "wasi_nn", "Enable WASI neural network") orelse false;
     options.addOption(bool, "wasi_nn", wasi_nn);
 
+    const component_model = b.option(bool, "component_model", "Enable Component Model") orelse false;
+    options.addOption(bool, "component_model", component_model);
+
     const config_module = options.createModule();
 
     // ── Root module for the library ────────────────────────────────────

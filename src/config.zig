@@ -266,6 +266,9 @@ pub const exce_handling = opt("exce_handling", false);
 /// Enable the tags (exception tags) proposal.
 pub const tags = opt("tags", false);
 
+/// Enable the Component Model (WASIp3).
+pub const component_model = opt("component_model", false);
+
 /// Pass user data pointer to the memory allocator.
 pub const mem_alloc_with_user_data = opt("mem_alloc_with_user_data", false);
 
