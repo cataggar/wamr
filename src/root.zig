@@ -76,6 +76,12 @@ pub const component_types = @import("component/types.zig");
 /// Component Model binary format loader.
 pub const component_loader = @import("component/loader.zig");
 
+/// Component Model canonical ABI (lifting/lowering).
+pub const canonical_abi = @import("component/canonical_abi.zig");
+
+/// Component Model instance and resource store.
+pub const component_instance = @import("component/instance.zig");
+
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).
 pub const platform = @import("platform/platform.zig");
