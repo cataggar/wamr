@@ -98,8 +98,8 @@ fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allo
     }
 
     for (module.memories, 0..) |mem_type, i| {
-        const initial_pages = mem_type.limits.min;
-        const max_pages = mem_type.limits.max orelse 65536;
+        const initial_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
+        const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
         const size = @as(usize, initial_pages) * types.MemoryInstance.page_size;
 
         const data = allocator.alloc(u8, size) catch return error.OutOfMemory;

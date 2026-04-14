@@ -2959,10 +2959,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     8 => { // memory.init
                         const data_idx = readU32(code, &ip);
                         const mem_idx = readU32(code, &ip);
-                        const n: u32 = @bitCast(try env.popI32());
-                        const src: u32 = @bitCast(try env.popI32());
-                        const dst: u32 = @bitCast(try env.popI32());
                         const mem = env.module_inst.getMemory(mem_idx) orelse return error.OutOfBoundsMemoryAccess;
+                        const is_64 = mem.memory_type.is_memory64;
+                        const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+                        const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+                        const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         // Check if segment is dropped
                         if (data_idx < env.module_inst.dropped_data.len and env.module_inst.dropped_data[data_idx]) {
                             if (n > 0) return error.OutOfBoundsMemoryAccess;
@@ -2974,11 +2975,11 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                             continue;
                         }
                         const seg = module.data_segments[data_idx];
-                        if (@as(u64, src) + n > seg.data.len or @as(u64, dst) + n > mem.data.len)
+                        if (src + n > seg.data.len or dst + n > mem.data.len)
                             return error.OutOfBoundsMemoryAccess;
-                        const d: usize = dst;
-                        const s: usize = src;
-                        const len: usize = n;
+                        const d: usize = @intCast(dst);
+                        const s: usize = @intCast(src);
+                        const len: usize = @intCast(n);
                         @memcpy(mem.data[d .. d + len], seg.data[s .. s + len]);
                     },
                     9 => { // data.drop
@@ -2990,15 +2991,17 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     10 => { // memory.copy
                         const dst_mem_idx = readU32(code, &ip);
                         const src_mem_idx = readU32(code, &ip);
-                        const n: u32 = @bitCast(try env.popI32());
-                        const src: u32 = @bitCast(try env.popI32());
-                        const dst: u32 = @bitCast(try env.popI32());
                         const dst_mem = env.module_inst.getMemory(dst_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
                         const src_mem = env.module_inst.getMemory(src_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                        if (@as(u64, dst) + n > dst_mem.data.len or @as(u64, src) + n > src_mem.data.len) return error.OutOfBoundsMemoryAccess;
-                        const d: usize = dst;
-                        const s: usize = src;
-                        const len: usize = n;
+                        // Use the widest address type of either memory
+                        const is_64 = dst_mem.memory_type.is_memory64 or src_mem.memory_type.is_memory64;
+                        const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+                        const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+                        const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+                        if (dst + n > dst_mem.data.len or src + n > src_mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        const d: usize = @intCast(dst);
+                        const s: usize = @intCast(src);
+                        const len: usize = @intCast(n);
                         if (dst_mem == src_mem) {
                             if (d <= s) {
                                 std.mem.copyForwards(u8, dst_mem.data[d .. d + len], src_mem.data[s .. s + len]);
@@ -3011,13 +3014,14 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     },
                     11 => { // memory.fill
                         const fill_mem_idx = readU32(code, &ip);
-                        const n: u32 = @bitCast(try env.popI32());
-                        const val: u8 = @truncate(@as(u32, @bitCast(try env.popI32())));
-                        const dst: u32 = @bitCast(try env.popI32());
                         const mem = env.module_inst.getMemory(fill_mem_idx) orelse return error.OutOfBoundsMemoryAccess;
-                        if (@as(u64, dst) + n > mem.data.len) return error.OutOfBoundsMemoryAccess;
-                        const d: usize = dst;
-                        const len: usize = n;
+                        const is_64 = mem.memory_type.is_memory64;
+                        const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+                        const val: u8 = @truncate(@as(u32, @bitCast(try env.popI32())));
+                        const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
+                        if (dst + n > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        const d: usize = @intCast(dst);
+                        const len: usize = @intCast(n);
                         @memset(mem.data[d .. d + len], val);
                     },
                     12 => { // table.init

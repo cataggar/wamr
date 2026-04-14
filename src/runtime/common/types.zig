@@ -128,10 +128,10 @@ pub const FuncType = struct {
     pub const Kind = enum(u2) { func, struct_, array };
 };
 
-/// Limits (§2.3.4)
+/// Limits (§2.3.4) — uses u64 to support memory64 proposal.
 pub const Limits = struct {
-    min: u32,
-    max: ?u32 = null,
+    min: u64,
+    max: ?u64 = null,
 };
 
 /// Table type (§2.3.6)

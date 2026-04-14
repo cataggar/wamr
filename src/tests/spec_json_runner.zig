@@ -299,7 +299,7 @@ fn buildImportContext(
                     if (imp.memory_type) |mt| {
                         if (mt.is_memory64) return error.ImportResolutionFailed;
                     }
-                    if (!limitsMatch(.{ .min = 1, .max = @as(?u32, 2) }, imp_limits))
+                    if (!limitsMatch(.{ .min = 1, .max = @as(?u64, 2) }, imp_limits))
                         return error.ImportResolutionFailed;
                     memories.append(allocator, makeSpectestMemory(allocator) orelse
                         return error.ImportResolutionFailed) catch return error.ImportResolutionFailed;
@@ -332,7 +332,7 @@ fn buildImportContext(
                         return error.ImportResolutionFailed;
                     const tt = imp.table_type orelse types.TableType{ .elem_type = .funcref, .limits = .{ .min = 10 } };
                     if (!tt.elem_type.isFuncRef()) return error.ImportResolutionFailed;
-                    if (!limitsMatch(.{ .min = 10, .max = @as(?u32, 20) }, tt.limits))
+                    if (!limitsMatch(.{ .min = 10, .max = @as(?u64, 20) }, tt.limits))
                         return error.ImportResolutionFailed;
                     const tbl = makeSpectestTable(allocator, tt.is_table64) orelse
                         return error.ImportResolutionFailed;
