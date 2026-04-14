@@ -5,6 +5,63 @@
 
 const std = @import("std");
 const types = @import("../runtime/common/types.zig");
+const config = @import("config");
+
+/// Default auxiliary stack size per thread (bytes).
+const DEFAULT_AUX_STACK_SIZE: u32 = 8192;
+
+/// Auxiliary stack pool — manages per-thread stack regions in shared linear memory.
+/// Stacks are allocated from a reserved region at the top of linear memory.
+pub const AuxStackPool = struct {
+    /// Stack size per thread (bytes).
+    stack_size: u32 = DEFAULT_AUX_STACK_SIZE,
+    /// Free stack offsets (top-of-stack addresses in linear memory).
+    free_stacks: std.ArrayListUnmanaged(u32) = .{},
+    /// All allocated stacks (for cleanup).
+    all_stacks: std.ArrayListUnmanaged(u32) = .{},
+    mutex: std.Thread.Mutex = .{},
+    pool_allocator: std.mem.Allocator = undefined,
+
+    /// Pre-allocate N auxiliary stacks starting at `base_offset` in linear memory.
+    pub fn init(self: *AuxStackPool, count: u32, base_offset: u32, allocator: std.mem.Allocator) !void {
+        self.pool_allocator = allocator;
+        try self.free_stacks.ensureTotalCapacity(allocator, count);
+        try self.all_stacks.ensureTotalCapacity(allocator, count);
+
+        var offset = base_offset;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            // Stack grows downward; top-of-stack is at offset + stack_size
+            const stack_top = offset + self.stack_size;
+            self.free_stacks.appendAssumeCapacity(stack_top);
+            self.all_stacks.appendAssumeCapacity(stack_top);
+            offset += self.stack_size;
+        }
+    }
+
+    pub fn deinit(self: *AuxStackPool, allocator: std.mem.Allocator) void {
+        self.free_stacks.deinit(allocator);
+        self.all_stacks.deinit(allocator);
+    }
+
+    /// Allocate a stack for a new thread. Returns the top-of-stack offset, or null.
+    pub fn allocate(self: *AuxStackPool) ?u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const items = self.free_stacks.items;
+        if (items.len == 0) return null;
+        const val = items[items.len - 1];
+        self.free_stacks.items.len -= 1;
+        return val;
+    }
+
+    /// Return a stack to the pool.
+    pub fn release(self: *AuxStackPool, stack_top: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.free_stacks.append(self.pool_allocator, stack_top) catch {};
+    }
+};
 
 /// Thread handle tracking a spawned thread and its module instance.
 pub const ThreadHandle = struct {
@@ -23,6 +80,8 @@ pub const ThreadManager = struct {
     /// Global trap flag — set when any thread traps.
     trap_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator,
+    /// Per-thread auxiliary stack pool.
+    aux_stack_pool: AuxStackPool = .{},
 
     pub fn init(allocator: std.mem.Allocator) ThreadManager {
         return .{
@@ -35,6 +94,7 @@ pub const ThreadManager = struct {
         // Join all remaining threads
         self.joinAll();
         self.threads.deinit(self.allocator);
+        self.aux_stack_pool.deinit(self.allocator);
     }
 
     /// Allocate a new thread ID. Range: 1 to 2^29-1.
@@ -103,15 +163,28 @@ pub const ThreadManager = struct {
     /// Spawn a new thread with a cloned module instance.
     /// The new thread calls the exported `wasi_thread_start(tid, start_arg)` function.
     /// Returns the TID on success, or a negative errno on failure.
-    pub fn spawnThread(self: *ThreadManager, parent_inst: *types.ModuleInstance) !i32 {
+    pub fn spawnThread(self: *ThreadManager, parent_inst: *types.ModuleInstance, start_arg: i32) !i32 {
         const tid = self.allocateTid();
 
         // Clone the parent instance (shared memory, independent globals)
         const child_inst = parent_inst.cloneForThread(self.allocator) catch return error.OutOfMemory;
 
+        // Set up per-thread auxiliary stack if available
+        var aux_stack_top: ?u32 = null;
+        if (self.aux_stack_pool.allocate()) |stack_top| {
+            aux_stack_top = stack_top;
+            // Find and set __stack_pointer global in the cloned instance
+            if (child_inst.module.findExport("__stack_pointer", .global)) |exp| {
+                if (exp.index < child_inst.globals.len) {
+                    child_inst.globals[exp.index].value = .{ .i32 = @bitCast(stack_top) };
+                }
+            }
+        }
+
         // Spawn the native thread
-        const thread = std.Thread.spawn(.{}, threadEntry, .{ self, child_inst, tid }) catch {
-            // Clean up cloned instance on spawn failure
+        const thread = std.Thread.spawn(.{}, threadEntry, .{ self, child_inst, tid, start_arg, aux_stack_top }) catch {
+            // Return aux stack on failure
+            if (aux_stack_top) |st| self.aux_stack_pool.release(st);
             destroyClonedInstance(child_inst);
             return error.ThreadSpawnFailed;
         };
@@ -125,8 +198,10 @@ pub const ThreadManager = struct {
         return tid;
     }
 
-    fn threadEntry(self: *ThreadManager, inst: *types.ModuleInstance, tid: i32) void {
+    fn threadEntry(self: *ThreadManager, inst: *types.ModuleInstance, tid: i32, start_arg: i32, aux_stack_top: ?u32) void {
         defer {
+            // Return aux stack to pool
+            if (aux_stack_top) |st| self.aux_stack_pool.release(st);
             self.unregisterThread(tid);
             destroyClonedInstance(inst);
         }
@@ -141,9 +216,9 @@ pub const ThreadManager = struct {
         env.thread_manager = self;
         env.tid = tid;
 
-        // Push arguments: tid and start_arg (0 for now)
+        // Push arguments: tid and start_arg
         env.pushI32(tid) catch return;
-        env.pushI32(0) catch return;
+        env.pushI32(start_arg) catch return;
 
         // Execute
         const interp = @import("../runtime/interpreter/interp.zig");
@@ -247,4 +322,73 @@ test "ModuleInstance: cloneForThread shares memory" {
     try std.testing.expectEqual(@as(u32, 2), mem_inst.ref_count);
 
     allocator.destroy(parent);
+}
+
+test "AuxStackPool: allocate and release" {
+    const allocator = std.testing.allocator;
+
+    var pool = AuxStackPool{};
+    try pool.init(4, 0, allocator);
+    defer pool.deinit(allocator);
+
+    // Should allocate 4 stacks
+    const s1 = pool.allocate();
+    const s2 = pool.allocate();
+    const s3 = pool.allocate();
+    const s4 = pool.allocate();
+    try std.testing.expect(s1 != null);
+    try std.testing.expect(s2 != null);
+    try std.testing.expect(s3 != null);
+    try std.testing.expect(s4 != null);
+
+    // Pool is empty now
+    try std.testing.expect(pool.allocate() == null);
+
+    // Release one, then allocate again
+    pool.release(s1.?);
+    const s5 = pool.allocate();
+    try std.testing.expect(s5 != null);
+    try std.testing.expectEqual(s1.?, s5.?);
+}
+
+test "AuxStackPool: stack addresses are correct" {
+    const allocator = std.testing.allocator;
+
+    var pool = AuxStackPool{ .stack_size = 1024 };
+    try pool.init(3, 4096, allocator);
+    defer pool.deinit(allocator);
+
+    // Allocate all 3 — they are returned in LIFO order
+    const s1 = pool.allocate().?;
+    const s2 = pool.allocate().?;
+    const s3 = pool.allocate().?;
+
+    // Stack tops should be base + (i+1)*stack_size
+    // But LIFO: last pushed = first popped, so s1 is the last one pushed = 4096+3*1024
+    try std.testing.expect(s1 == 4096 + 3 * 1024);
+    try std.testing.expect(s2 == 4096 + 2 * 1024);
+    try std.testing.expect(s3 == 4096 + 1 * 1024);
+}
+
+test "WaiterQueue: notify with no waiters" {
+    const allocator = std.testing.allocator;
+    var wq = try allocator.create(types.WaiterQueue);
+    defer wq.deinit(allocator);
+    wq.* = .{};
+
+    // Notify on empty queue should return 0
+    const woken = wq.notify(0, 10);
+    try std.testing.expectEqual(@as(u32, 0), woken);
+}
+
+test "WaiterQueue: wait with immediate timeout" {
+    const allocator = std.testing.allocator;
+    var wq = try allocator.create(types.WaiterQueue);
+    defer wq.deinit(allocator);
+    wq.* = .{};
+
+    // Wait with 0 timeout should return 2 (timed out) quickly
+    const result = wq.wait(100, 0, allocator);
+    // 0 timeout = immediate timeout or woken (could be either depending on timing)
+    try std.testing.expect(result == 0 or result == 2);
 }

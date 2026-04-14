@@ -11,6 +11,13 @@ pub const ValType = enum(u8) {
     v128 = 0x7B,
     funcref = 0x70,
     externref = 0x6F,
+    anyref = 0x6E,
+    eqref = 0x6D,
+    i31ref = 0x6C,
+    structref = 0x6B,
+    arrayref = 0x6A,
+    exnref = 0x69,
+    nullref = 0x65,
     nonfuncref = 0x14,
     nonexternref = 0x15,
 
@@ -27,7 +34,7 @@ pub const ValType = enum(u8) {
 
     pub fn isRef(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .nonfuncref, .nonexternref => true,
+            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .nullref, .nonfuncref, .nonexternref => true,
             else => false,
         };
     }
@@ -41,9 +48,19 @@ pub const ValType = enum(u8) {
     }
 
     /// Non-nullable types are subtypes of their nullable counterparts.
+    /// Also implements GC type hierarchy subtyping.
     pub fn isSubtypeOf(self: ValType, other: ValType) bool {
-        return (self == .nonfuncref and other == .funcref) or
-            (self == .nonexternref and other == .externref);
+        if (self == other) return true;
+        // non-nullable → nullable
+        if (self == .nonfuncref and other == .funcref) return true;
+        if (self == .nonexternref and other == .externref) return true;
+        // nullref (none) is the bottom type — subtype of all internal ref types
+        if (self == .nullref) return other == .anyref or other == .eqref or other == .i31ref or
+            other == .structref or other == .arrayref or other == .funcref or other == .nonfuncref;
+        // GC type hierarchy: i31ref/structref/arrayref <: eqref <: anyref
+        if (other == .anyref) return self == .eqref or self == .i31ref or self == .structref or self == .arrayref;
+        if (other == .eqref) return self == .i31ref or self == .structref or self == .arrayref;
+        return false;
     }
 
     /// Map non-nullable ref types to their nullable equivalents.
@@ -60,7 +77,7 @@ pub const ValType = enum(u8) {
             .i32, .f32 => 4,
             .i64, .f64 => 8,
             .v128 => 16,
-            .funcref, .externref, .nonfuncref, .nonexternref => @sizeOf(usize),
+            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .nullref, .nonfuncref, .nonexternref => @sizeOf(usize),
         };
     }
 };
@@ -74,11 +91,19 @@ pub const Value = union(ValType) {
     v128: u128,
     funcref: ?u32,
     externref: ?u32,
+    anyref: ?u32,
+    eqref: ?u32,
+    i31ref: ?u32,
+    structref: ?u32,
+    arrayref: ?u32,
+    /// Exception reference — index into ExecEnv.exception_refs pool.
+    exnref: ?u32,
+    nullref: ?u32,
     nonfuncref: ?u32,
     nonexternref: ?u32,
 };
 
-/// Function type (§2.3.5)
+/// Function type (§2.3.5), also used as placeholder for struct/array types.
 pub const FuncType = struct {
     params: []const ValType,
     results: []const ValType,
@@ -86,6 +111,21 @@ pub const FuncType = struct {
     param_tidxs: []const u32 = &.{},
     /// Concrete type indices parallel to results (0xFFFFFFFF = abstract).
     result_tidxs: []const u32 = &.{},
+    /// Type kind (func/struct/array) for iso-recursive equivalence.
+    kind: Kind = .func,
+    /// For struct types: field type indices (for equivalence comparison).
+    /// For array types: single element type index (len=1).
+    field_tidxs: []const u32 = &.{},
+    /// For struct/array: field value types (parallel to field_tidxs).
+    field_types: []const ValType = &.{},
+    /// For struct/array: field mutability (0=immutable, 1=mutable).
+    field_muts: []const u8 = &.{},
+    /// Declared supertype index (0xFFFFFFFF = none).
+    supertype_idx: u32 = 0xFFFFFFFF,
+    /// Whether this type is declared `final` (cannot be subtyped).
+    is_final: bool = false,
+
+    pub const Kind = enum(u2) { func, struct_, array };
 };
 
 /// Limits (§2.3.4)
@@ -100,6 +140,10 @@ pub const TableType = struct {
     limits: Limits,
     /// Concrete type index for elem_type (0xFFFFFFFF = abstract).
     elem_tidx: u32 = 0xFFFFFFFF,
+    /// Init expression for table elements (from 0x40 prefix encoding).
+    init_expr: ?InitExpr = null,
+    /// Whether this table uses 64-bit addressing (table64 proposal).
+    is_table64: bool = false,
 };
 
 /// Memory type (§2.3.7)
@@ -152,6 +196,7 @@ pub const ExternalKind = enum(u8) {
     table = 0x01,
     memory = 0x02,
     global = 0x03,
+    tag = 0x04,
 };
 
 /// Wasm section IDs
@@ -169,6 +214,7 @@ pub const SectionId = enum(u8) {
     code = 10,
     data = 11,
     data_count = 12,
+    tag = 13,
 };
 
 /// Wasm binary magic number
@@ -214,6 +260,7 @@ pub const ImportDesc = struct {
     table_type: ?TableType = null,
     memory_type: ?MemoryType = null,
     global_type: ?GlobalType = null,
+    tag_type_idx: ?u32 = null,
 };
 
 /// Export descriptor (§2.5.2)
@@ -285,13 +332,24 @@ pub const ElemSegment = struct {
     /// Whether element values can be null (expression vectors can, funcidx vectors can't)
     nullable_elements: bool = true,
 
-    pub const ElemKind = enum { func_ref, extern_ref };
+    pub const ElemKind = enum { func_ref, extern_ref, gc_ref };
+};
+
+/// Rec group boundary for a type (used for iso-recursive equivalence).
+pub const RecGroupInfo = struct {
+    group_start: u32,
+    group_size: u32,
 };
 
 /// Full parsed WebAssembly module
 pub const WasmModule = struct {
     // Sections
     types: []const FuncType = &.{},
+    /// Rec group info parallel to types (same length).
+    rec_groups: []const RecGroupInfo = &.{},
+    /// Canonical type index mapping (same length as types).
+    /// canonical_type_map[i] = the canonical index for type i.
+    canonical_type_map: []const u32 = &.{},
     imports: []const ImportDesc = &.{},
     functions: []const WasmFunction = &.{},
     tables: []const TableType = &.{},
@@ -302,6 +360,8 @@ pub const WasmModule = struct {
     elements: []const ElemSegment = &.{},
     data_segments: []const DataSegment = &.{},
     data_count: ?u32 = null,
+    /// Tag type indices (local tags, excluding imports).
+    tag_types: []const u32 = &.{},
 
     // Derived counts (imports + local definitions)
     import_function_count: u32 = 0,
@@ -345,7 +405,14 @@ pub const WasmModule = struct {
     }
 
     /// Get the type index for a given function index (import or local).
+    /// Returns the canonical type index if a canonical mapping exists.
     pub fn getFuncTypeIdx(self: *const WasmModule, func_idx: u32) ?u32 {
+        const raw_tidx = self.getRawFuncTypeIdx(func_idx) orelse return null;
+        if (raw_tidx < self.canonical_type_map.len) return self.canonical_type_map[raw_tidx];
+        return raw_tidx;
+    }
+
+    pub fn getRawFuncTypeIdx(self: *const WasmModule, func_idx: u32) ?u32 {
         if (func_idx < self.import_function_count) {
             var import_func_idx: u32 = 0;
             for (self.imports) |imp| {
@@ -383,6 +450,9 @@ pub const MemoryInstance = struct {
     current_pages: u32,
     max_pages: u32,
     ref_count: u32 = 1,
+    /// Waiter queue for memory.atomic.wait/notify (shared memory only).
+    /// Heap-allocated and shared across threads via ref counting.
+    waiter_queue: ?*WaiterQueue = null,
 
     pub const page_size: u32 = 65536;
 
@@ -411,9 +481,94 @@ pub const MemoryInstance = struct {
     pub fn release(self: *MemoryInstance, allocator: std.mem.Allocator) void {
         self.ref_count -= 1;
         if (self.ref_count == 0) {
+            if (self.waiter_queue) |wq| wq.deinit(allocator);
             if (self.data.len > 0) allocator.free(self.data);
             allocator.destroy(self);
         }
+    }
+};
+
+/// Waiter queue for memory.atomic.wait/notify.
+/// Each waiter is heap-allocated for pointer stability while threads block.
+pub const WaiterQueue = struct {
+    mutex: std.Thread.Mutex = .{},
+    /// Heap-allocated waiter nodes for pointer stability.
+    waiters: std.ArrayListUnmanaged(*Waiter) = .{},
+
+    pub const Waiter = struct {
+        address: u32,
+        cond: std.Thread.Condition = .{},
+        woken: bool = false,
+    };
+
+    pub fn deinit(self: *WaiterQueue, allocator: std.mem.Allocator) void {
+        for (self.waiters.items) |w| allocator.destroy(w);
+        self.waiters.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    /// Park the calling thread until woken or timed out.
+    /// Returns: 0 = woken, 2 = timed out.
+    pub fn wait(self: *WaiterQueue, address: u32, timeout_ns: i64, allocator: std.mem.Allocator) u32 {
+        self.mutex.lock();
+
+        const waiter = allocator.create(Waiter) catch {
+            self.mutex.unlock();
+            return 2; // treat alloc failure as timeout
+        };
+        waiter.* = .{ .address = address };
+
+        self.waiters.append(allocator, waiter) catch {
+            allocator.destroy(waiter);
+            self.mutex.unlock();
+            return 2;
+        };
+
+        defer {
+            // Remove self from waiters list
+            for (self.waiters.items, 0..) |w, i| {
+                if (w == waiter) {
+                    _ = self.waiters.swapRemove(i);
+                    break;
+                }
+            }
+            allocator.destroy(waiter);
+            self.mutex.unlock();
+        }
+
+        if (timeout_ns < 0) {
+            // Infinite wait
+            while (!waiter.woken) {
+                waiter.cond.wait(&self.mutex);
+            }
+            return 0; // woken
+        } else {
+            const timeout: u64 = @intCast(timeout_ns);
+            while (!waiter.woken) {
+                waiter.cond.timedWait(&self.mutex, timeout) catch {
+                    // Timed out
+                    return if (waiter.woken) 0 else 2;
+                };
+            }
+            return 0; // woken
+        }
+    }
+
+    /// Wake up to `count` waiters at the given address. Returns number woken.
+    pub fn notify(self: *WaiterQueue, address: u32, count: u32) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var woken: u32 = 0;
+        for (self.waiters.items) |w| {
+            if (woken >= count) break;
+            if (w.address == address) {
+                w.woken = true;
+                w.cond.signal();
+                woken += 1;
+            }
+        }
+        return woken;
     }
 };
 
@@ -424,10 +579,68 @@ pub const FuncRef = struct {
     module_inst: *ModuleInstance,
 };
 
+/// A table element that preserves the exact Value type (i31ref, structref, etc.)
+/// plus module provenance for function references.
+pub const TableElement = struct {
+    value: Value,
+    /// For funcref/nonfuncref: the originating module instance (for cross-module dispatch).
+    module_inst: ?*ModuleInstance = null,
+
+    /// Create a null element for a given ref type.
+    pub fn nullForType(vt: ValType) TableElement {
+        return .{ .value = switch (vt) {
+            .funcref => .{ .funcref = null },
+            .externref => .{ .externref = null },
+            .anyref => .{ .anyref = null },
+            .eqref => .{ .eqref = null },
+            .i31ref => .{ .i31ref = null },
+            .structref => .{ .structref = null },
+            .arrayref => .{ .arrayref = null },
+            .nullref => .{ .nullref = null },
+            .exnref => .{ .exnref = null },
+            .nonfuncref => .{ .nonfuncref = null },
+            .nonexternref => .{ .nonexternref = null },
+            else => .{ .funcref = null },
+        } };
+    }
+
+    /// Create a table element from a Value, preserving module provenance for funcrefs.
+    pub fn fromValue(val: Value, source_module: ?*ModuleInstance) TableElement {
+        return .{
+            .value = val,
+            .module_inst = switch (val) {
+                .funcref, .nonfuncref => source_module,
+                else => null,
+            },
+        };
+    }
+
+    /// Extract as FuncRef for call_indirect. Returns null if not a callable funcref.
+    pub fn asFuncRef(self: TableElement) ?FuncRef {
+        const func_idx: ?u32 = switch (self.value) {
+            .funcref, .nonfuncref => |r| r,
+            else => null,
+        };
+        const idx = func_idx orelse return null;
+        const mi = self.module_inst orelse return null;
+        return .{ .func_idx = idx, .module_inst = mi };
+    }
+
+    /// Check if this element is a null reference.
+    pub fn isNull(self: TableElement) bool {
+        return switch (self.value) {
+            .funcref, .nonfuncref => |r| r == null,
+            .externref, .nonexternref => |r| r == null,
+            .anyref, .eqref, .i31ref, .structref, .arrayref, .nullref, .exnref => |r| r == null,
+            else => true,
+        };
+    }
+};
+
 /// Runtime table instance (refcounted for cross-module sharing)
 pub const TableInstance = struct {
     table_type: TableType,
-    elements: []?FuncRef,
+    elements: []TableElement,
     ref_count: u32 = 1,
 
     pub fn retain(self: *TableInstance) void {
@@ -464,22 +677,61 @@ pub const GlobalInstance = struct {
     }
 };
 
+/// Tag instance (identity via pointer equality).
+pub const TagInstance = struct {
+    /// Number of parameters this tag carries.
+    param_arity: u32,
+};
+
 /// A resolved imported function target
 pub const ImportedFunction = struct {
     module_inst: *ModuleInstance,
     func_idx: u32,
 };
 
+/// Host function callable from Wasm via imports.
+/// The callback receives an opaque pointer to an ExecEnv (to avoid circular
+/// type dependencies between types.zig and exec_env.zig). Implementations
+/// must cast: `const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));`
+pub const HostFn = *const fn (env_opaque: *anyopaque) HostFnError!void;
+
+pub const HostFnError = error{
+    Trap,
+    StackOverflow,
+    StackUnderflow,
+    OutOfBoundsMemoryAccess,
+};
+
 /// Instantiated module
+/// GC heap object (struct or array instance).
+pub const GcObject = struct {
+    type_idx: u32,
+    fields: []Value,
+};
+
 pub const ModuleInstance = struct {
     module: *const WasmModule,
     memories: []*MemoryInstance,
     tables: []*TableInstance,
     globals: []*GlobalInstance,
     import_functions: []const ImportedFunction = &.{},
+    /// Host (native) functions indexed by import function index.
+    /// `host_functions[i]` is the native callback for import function i, or null.
+    host_functions: []const ?HostFn = &.{},
+    /// Whether host_functions was allocated by this instance (vs shared from parent).
+    owns_host_functions: bool = false,
+    tags: []*TagInstance = &.{},
     allocator: std.mem.Allocator,
+    /// Thread manager (shared across all instances in a thread group).
+    thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager = null,
     /// Track dropped elem segments (active segments dropped after instantiation)
     dropped_elems: []bool = &.{},
+    /// Track dropped data segments (for data.drop instruction)
+    dropped_data: []bool = &.{},
+    /// GC heap for struct/array objects
+    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
+    /// Cached evaluated element segment values (spec requires one-time evaluation)
+    cached_elem_values: []?[]Value = &.{},
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {
         const exp = self.module.findExport(name, .function) orelse return null;
@@ -492,7 +744,7 @@ pub const ModuleInstance = struct {
     }
 
     /// Clone this instance for a new thread (WASI-threads instance-per-thread model).
-    /// Shared: memories, tables, import_functions (retained via ref_count).
+    /// Shared: memories, tables, import_functions, host_functions, thread_manager.
     /// Cloned: globals (mutable globals are thread-local).
     pub fn cloneForThread(self: *const ModuleInstance, allocator: std.mem.Allocator) !*ModuleInstance {
         const inst = try allocator.create(ModuleInstance);
@@ -504,6 +756,9 @@ pub const ModuleInstance = struct {
             .tables = &.{},
             .globals = &.{},
             .import_functions = self.import_functions,
+            .host_functions = self.host_functions, // shared, not owned
+            .owns_host_functions = false,
+            .thread_manager = self.thread_manager,
             .allocator = allocator,
         };
 

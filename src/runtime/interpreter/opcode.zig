@@ -19,7 +19,7 @@ pub const Opcode = enum(u8) {
     @"catch" = 0x07,
     throw = 0x08,
     rethrow = 0x09,
-    // 0x0A unused
+    throw_ref = 0x0A,
     end = 0x0B,
     br = 0x0C,
     br_if = 0x0D,
@@ -39,6 +39,8 @@ pub const Opcode = enum(u8) {
     drop = 0x1A,
     select = 0x1B,
     select_t = 0x1C,
+    // 0x1D-0x1E unused
+    try_table = 0x1F,
 
     // ──── Variable (local / global) ────
     local_get = 0x20,
@@ -493,8 +495,9 @@ pub const Opcode = enum(u8) {
             .gc_prefix, .misc_prefix, .simd_prefix, .atomic_prefix => null,
 
             // exception handling
-            .@"try" => null,
+            .@"try", .try_table => null,
             .@"catch", .throw, .rethrow, .delegate, .catch_all => null,
+            .throw_ref => 0,
 
             // tail calls
             .return_call, .return_call_indirect, .call_ref, .return_call_ref => null,

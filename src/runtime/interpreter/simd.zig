@@ -591,6 +591,59 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
         0xFE => try f64x2ConvertLowI32x4(env, true),    // f64x2.convert_low_i32x4_s
         0xFF => try f64x2ConvertLowI32x4(env, false),   // f64x2.convert_low_i32x4_u
 
+        // ── Relaxed SIMD ───────────────────────────────────────────
+        0x100 => { // i8x16.relaxed_swizzle (same as swizzle but OOB returns 0)
+            const indices: U8x16 = @bitCast(try popV128(env));
+            const a: U8x16 = @bitCast(try popV128(env));
+            var result: U8x16 = undefined;
+            for (0..16) |i| result[i] = if (indices[i] < 16) a[indices[i]] else 0;
+            try pushV128(env, @bitCast(result));
+        },
+        0x105 => try f32x4Ternary(env, false), // f32x4.relaxed_madd (a*b+c)
+        0x106 => try f32x4Ternary(env, true),  // f32x4.relaxed_nmadd (-a*b+c)
+        0x107 => try f64x2Ternary(env, false), // f64x2.relaxed_madd
+        0x108 => try f64x2Ternary(env, true),  // f64x2.relaxed_nmadd
+        0x109, 0x10A, 0x10B, 0x10C => { // relaxed_laneselect (bitselect)
+            const c = try popV128(env);
+            const b = try popV128(env);
+            const a = try popV128(env);
+            try pushV128(env, (a & c) | (b & ~c));
+        },
+        0x10D => try f32x4Binary(env, .min),   // f32x4.relaxed_min
+        0x10E => try f32x4Binary(env, .max),   // f32x4.relaxed_max
+        0x10F => try f64x2Binary(env, .min),   // f64x2.relaxed_min
+        0x110 => try f64x2Binary(env, .max),   // f64x2.relaxed_max
+        0x111 => try q15mulrSatS(env), // i16x8.relaxed_q15mulr_s
+        0x112 => { // i16x8.relaxed_dot_i8x16_i7x16_s
+            const b: U8x16 = @bitCast(try popV128(env));
+            const a: U8x16 = @bitCast(try popV128(env));
+            var result: I16x8 = undefined;
+            for (0..8) |i| {
+                const a0: i16 = @as(i8, @bitCast(a[i * 2]));
+                const a1: i16 = @as(i8, @bitCast(a[i * 2 + 1]));
+                const b0: i16 = @as(i8, @bitCast(b[i * 2]));
+                const b1: i16 = @as(i8, @bitCast(b[i * 2 + 1]));
+                result[i] = a0 * b0 + a1 * b1;
+            }
+            try pushV128(env, @bitCast(result));
+        },
+        0x113 => { // i32x4.relaxed_dot_i8x16_i7x16_add_s
+            const c: I32x4 = @bitCast(try popV128(env));
+            const b: U8x16 = @bitCast(try popV128(env));
+            const a: U8x16 = @bitCast(try popV128(env));
+            var result: I32x4 = undefined;
+            for (0..4) |i| {
+                var sum: i32 = c[i];
+                for (0..4) |j| {
+                    const ai: i32 = @as(i8, @bitCast(a[i * 4 + j]));
+                    const bi: i32 = @as(i8, @bitCast(b[i * 4 + j]));
+                    sum +%= ai * bi;
+                }
+                result[i] = sum;
+            }
+            try pushV128(env, @bitCast(result));
+        },
+
         else => return error.UnknownOpcode,
     }
 }
@@ -1070,6 +1123,36 @@ fn f64x2Binary(env: *ExecEnv, comptime kind: F64x2BinaryKind) SimdError!void {
             .pmin => if (b[i] < a[i]) b[i] else a[i],
             .pmax => if (a[i] < b[i]) b[i] else a[i],
         };
+    }
+    try pushV128(env, @bitCast(result));
+}
+
+// ── Relaxed SIMD ternary ────────────────────────────────────────────────
+
+fn f32x4Ternary(env: *ExecEnv, comptime negate: bool) SimdError!void {
+    const c: F32x4 = @bitCast(try popV128(env));
+    const b: F32x4 = @bitCast(try popV128(env));
+    const a: F32x4 = @bitCast(try popV128(env));
+    var result: F32x4 = undefined;
+    for (0..4) |i| {
+        if (negate)
+            result[i] = canonF32(-a[i] * b[i] + c[i])
+        else
+            result[i] = canonF32(a[i] * b[i] + c[i]);
+    }
+    try pushV128(env, @bitCast(result));
+}
+
+fn f64x2Ternary(env: *ExecEnv, comptime negate: bool) SimdError!void {
+    const c: F64x2 = @bitCast(try popV128(env));
+    const b: F64x2 = @bitCast(try popV128(env));
+    const a: F64x2 = @bitCast(try popV128(env));
+    var result: F64x2 = undefined;
+    for (0..2) |i| {
+        if (negate)
+            result[i] = canonF64(-a[i] * b[i] + c[i])
+        else
+            result[i] = canonF64(a[i] * b[i] + c[i]);
     }
     try pushV128(env, @bitCast(result));
 }
