@@ -45,8 +45,7 @@ samples/workload/include/**
 tests/unit/runtime-common/wasm-apps/main.aot
 tests/unit/aot-stack-frame/wasm-apps/test_aot.h
 
-# Spec test data (generated/cloned — not committed)
-tests/spec/
+# Spec test data (generated — not committed)
 tests/spec-json/
 
 # Zig build artifacts
