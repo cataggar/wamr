@@ -192,5 +192,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    // Compiler IR passes tests (separate module to avoid root/wamr conflict)
+    const passes_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/passes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const passes_tests = b.addTest(.{
+        .root_module = passes_test_module,
+    });
+    const run_passes_tests = b.addRunArtifact(passes_tests);
+    test_step.dependOn(&run_passes_tests.step);
 }
 
