@@ -3,10 +3,14 @@
 //! Compiles .wasm files to WAMR AOT format using the Zig-native compiler backend.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const wamr = @import("wamr");
 const emit_aot = wamr.emit_aot;
-const compile = wamr.x86_64_compile;
+const x86_64_compile = wamr.x86_64_compile;
+const aarch64_compile = @import("codegen/aarch64/compile.zig");
 const passes = @import("ir/passes.zig");
+
+const TargetArch = enum { x86_64, aarch64 };
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -25,6 +29,10 @@ pub fn main() !void {
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var optimize = true;
+    var target_arch: TargetArch = switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    };
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -33,6 +41,16 @@ pub fn main() !void {
             output_path = args[i];
         } else if (std.mem.eql(u8, args[i], "-O0")) {
             optimize = false;
+        } else if (std.mem.eql(u8, args[i], "--target") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "aarch64")) {
+                target_arch = .aarch64;
+            } else if (std.mem.eql(u8, args[i], "x86_64") or std.mem.eql(u8, args[i], "x86-64")) {
+                target_arch = .x86_64;
+            } else {
+                std.debug.print("Error: unknown target '{s}' (supported: x86_64, aarch64)\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else {
             input_path = args[i];
         }
@@ -85,10 +103,20 @@ pub fn main() !void {
         std.debug.print("Optimization: {d} passes made changes\n", .{opt_changes});
     }
 
-    // 5. Compile IR to native x86-64 code
-    const compiled = compile.compileModule(&ir_module, allocator) catch |err| {
-        std.debug.print("Error compiling to native code: {}\n", .{err});
-        std.process.exit(1);
+    // 5. Compile IR to native code (target-dependent)
+    const CompileResult = x86_64_compile.CompileResult;
+    const compiled: CompileResult = switch (target_arch) {
+        .x86_64 => x86_64_compile.compileModule(&ir_module, allocator) catch |err| {
+            std.debug.print("Error compiling to x86-64: {}\n", .{err});
+            std.process.exit(1);
+        },
+        .aarch64 => blk: {
+            const r = aarch64_compile.compileModule(&ir_module, allocator) catch |err| {
+                std.debug.print("Error compiling to AArch64: {}\n", .{err});
+                std.process.exit(1);
+            };
+            break :blk .{ .code = r.code, .offsets = r.offsets };
+        },
     };
     defer allocator.free(compiled.code);
     defer allocator.free(compiled.offsets);
@@ -108,7 +136,10 @@ pub fn main() !void {
 
     // 6. Emit AOT binary
     var arch_name = std.mem.zeroes([16]u8);
-    @memcpy(arch_name[0..6], "x86-64");
+    switch (target_arch) {
+        .x86_64 => @memcpy(arch_name[0..6], "x86-64"),
+        .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
+    }
 
     const aot_binary = try emit_aot.emit(
         allocator,
