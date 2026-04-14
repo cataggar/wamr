@@ -1,34 +1,49 @@
-"""wamr-bin — WebAssembly Micro Runtime CLI tools."""
+"""wamr-bin — WebAssembly Micro Runtime CLI tools.
+
+Provides a helper to locate the wamr binary installed via
+the data/scripts/ wheel layout. The binary is placed directly
+in the scripts directory by pip and does not require Python at runtime.
+"""
+
+from __future__ import annotations
 
 import os
-import subprocess
 import sys
-from pathlib import Path
-
-_TOOLS = [
-    "wamr",
-]
-
-_EXT = ".exe" if sys.platform == "win32" else ""
+import sysconfig
 
 
-def _binary_path(tool_name: str) -> Path:
-    """Return the path to a wamr tool binary."""
-    return Path(__file__).parent / f"{tool_name}{_EXT}"
+def find_wamr_bin() -> str:
+    """Return the path to the wamr binary.
 
+    Searches the scripts directories where pip installs data/scripts/ files.
+    """
+    ext = ".exe" if sys.platform == "win32" else ""
+    exe = f"wamr{ext}"
 
-def _run(tool_name: str) -> None:
-    """Run a wamr tool binary, replacing the current process on Unix."""
-    binary = _binary_path(tool_name)
-    if not binary.exists():
-        print(f"{tool_name} binary not found at {binary}", file=sys.stderr)
-        sys.exit(1)
-    args = [str(binary), *sys.argv[1:]]
-    if sys.platform != "win32":
-        os.execv(args[0], args)
+    targets = [
+        sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
+    ]
+
+    # User scheme
+    if sys.version_info >= (3, 10):
+        user_scheme = sysconfig.get_preferred_scheme("user")
+    elif os.name == "nt":
+        user_scheme = "nt_user"
     else:
-        raise SystemExit(subprocess.call(args))
+        user_scheme = "posix_user"
+    targets.append(sysconfig.get_path("scripts", scheme=user_scheme))
 
+    seen: list[str] = []
+    for target in targets:
+        if not target or target in seen:
+            continue
+        seen.append(target)
+        path = os.path.join(target, exe)
+        if os.path.isfile(path):
+            return path
 
-def wamr() -> None:
-    _run("wamr")
+    locations = "\n".join(f" - {t}" for t in seen)
+    raise FileNotFoundError(
+        f"Could not find {exe} in:\n{locations}\n"
+    )

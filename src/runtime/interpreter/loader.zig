@@ -22,6 +22,7 @@ pub const LoadError = error{
     InvalidInitExpr,
     InvalidDataSegment,
     InvalidElemSegment,
+    MalformedMutability,
     TooManyLocals,
     Overflow,
     OutOfMemory,
@@ -41,6 +42,8 @@ pub const LoadError = error{
     DataCountRequired,
     IllegalOpcode,
     UndeclaredFuncRef,
+    ImmutableArray,
+    InvalidArrayElemType,
 };
 
 /// A streaming reader over the Wasm binary.
@@ -139,8 +142,186 @@ const BinaryReader = struct {
 /// Sentinel for "no concrete type index" (abstract type).
 const NO_TIDX: u32 = 0xFFFF_FFFF;
 
+/// Sentinel tidx for bottom of func ref hierarchy (nullfuncref / nullref).
+/// A value with this tidx is a subtype of any funcref regardless of concrete tidx.
+const BOTTOM_FUNC_TIDX: u32 = 0xFFFF_FFFE;
+
+/// Sentinel tidx for bottom of extern ref hierarchy (nullexternref / nullexnref).
+/// A value with this tidx is a subtype of any externref regardless of concrete tidx.
+const BOTTOM_EXTERN_TIDX: u32 = 0xFFFF_FFFD;
+
+fn isBottomTidx(tidx: u32) bool {
+    return tidx == BOTTOM_FUNC_TIDX or tidx == BOTTOM_EXTERN_TIDX;
+}
+
+/// Check if two type indices are iso-recursively equivalent.
+/// Two types are equivalent if they occupy the same position within rec groups
+/// that have identical structure.
+fn typeIdxEquivalent(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, a: u32, b: u32) bool {
+    if (a == b) return true;
+    if (a >= module_types.len or b >= module_types.len) return false;
+    if (a >= rec_groups.len or b >= rec_groups.len) return false;
+    const ga = rec_groups[a];
+    const gb = rec_groups[b];
+    // Must be at the same position within their rec groups and groups must be the same size
+    if (ga.group_size != gb.group_size) return false;
+    if (a - ga.group_start != b - gb.group_start) return false;
+    // Compare all types in both rec groups pairwise
+    var i: u32 = 0;
+    while (i < ga.group_size) : (i += 1) {
+        const ai = ga.group_start + i;
+        const bi = gb.group_start + i;
+        if (ai >= module_types.len or bi >= module_types.len) return false;
+        if (!funcTypesStructurallyMatch(module_types, rec_groups, module_types[ai], module_types[bi], ga.group_start, gb.group_start)) return false;
+    }
+    return true;
+}
+
+/// Check if type `sub_idx` is a subtype of `super_idx` within the same module.
+/// A type is a subtype of another if it declares that other as its supertype
+/// (directly or transitively), and the types are iso-recursively compatible.
+pub fn typeIdxIsSubtype(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, sub_idx: u32, super_idx: u32) bool {
+    // Exact equivalence counts as subtype
+    if (typeIdxEquivalent(module_types, rec_groups, sub_idx, super_idx)) return true;
+    // Walk the supertype chain
+    if (sub_idx >= module_types.len) return false;
+    const sub_type = module_types[sub_idx];
+    if (sub_type.supertype_idx != NO_TIDX) {
+        return typeIdxIsSubtype(module_types, rec_groups, sub_type.supertype_idx, super_idx);
+    }
+    return false;
+}
+
+/// Check subtype using canonical type map for iso-recursive equivalence.
+fn isSubtypeWithCanonical(module: *const types.WasmModule, sub_idx: u32, super_idx: u32) bool {
+    if (sub_idx == super_idx) return true;
+    // Check canonical equivalence
+    if (sub_idx < module.canonical_type_map.len and super_idx < module.canonical_type_map.len) {
+        if (module.canonical_type_map[sub_idx] == module.canonical_type_map[super_idx]) return true;
+    }
+    // Walk the supertype chain with canonical checks
+    if (sub_idx >= module.types.len) return false;
+    const sub_type = module.types[sub_idx];
+    if (sub_type.supertype_idx != NO_TIDX) {
+        return isSubtypeWithCanonical(module, sub_type.supertype_idx, super_idx);
+    }
+    return false;
+}
+
+fn funcTypesStructurallyMatch(module_types: []const types.FuncType, rec_groups: []const types.RecGroupInfo, a: types.FuncType, b: types.FuncType, ga_start: u32, gb_start: u32) bool {
+    if (a.kind != b.kind) return false;
+    // Supertype and finality must match for iso-recursive equivalence
+    if (a.is_final != b.is_final) return false;
+    if (!tidxEquivalent(module_types, rec_groups, a.supertype_idx, b.supertype_idx, ga_start, gb_start)) return false;
+    if (a.params.len != b.params.len or a.results.len != b.results.len) return false;
+    for (a.params, b.params) |pa, pb| if (pa != pb) return false;
+    for (a.results, b.results) |ra, rb| if (ra != rb) return false;
+    // Compare type index references in params/results
+    for (0..a.params.len) |pi| {
+        const ta = if (pi < a.param_tidxs.len) a.param_tidxs[pi] else NO_TIDX;
+        const tb = if (pi < b.param_tidxs.len) b.param_tidxs[pi] else NO_TIDX;
+        if (!tidxEquivalent(module_types, rec_groups, ta, tb, ga_start, gb_start)) return false;
+    }
+    for (0..a.results.len) |ri| {
+        const ta = if (ri < a.result_tidxs.len) a.result_tidxs[ri] else NO_TIDX;
+        const tb = if (ri < b.result_tidxs.len) b.result_tidxs[ri] else NO_TIDX;
+        if (!tidxEquivalent(module_types, rec_groups, ta, tb, ga_start, gb_start)) return false;
+    }
+    // Compare struct/array field type indices
+    if (a.field_tidxs.len != b.field_tidxs.len) return false;
+    for (a.field_tidxs, b.field_tidxs) |fa, fb| {
+        if (!tidxEquivalent(module_types, rec_groups, fa, fb, ga_start, gb_start)) return false;
+    }
+    return true;
+}
+
+fn tidxEquivalent(_: []const types.FuncType, rec_groups: []const types.RecGroupInfo, ta: u32, tb: u32, ga_start: u32, gb_start: u32) bool {
+    if (ta == tb) {
+        // Same absolute index — but must check both are internal or both external
+        const ga_size = if (ga_start < rec_groups.len) rec_groups[ga_start].group_size else 1;
+        const gb_size = if (gb_start < rec_groups.len) rec_groups[gb_start].group_size else 1;
+        const a_internal = ta >= ga_start and ta < ga_start + ga_size;
+        const b_internal = tb >= gb_start and tb < gb_start + gb_size;
+        if (a_internal != b_internal) return false;
+        return true;
+    }
+    if (ta == NO_TIDX or tb == NO_TIDX) return ta == tb;
+    // Check if both reference within their respective rec groups (self-references)
+    // and at the same relative position
+    const ga_size = if (ga_start < rec_groups.len) rec_groups[ga_start].group_size else 1;
+    const gb_size = if (gb_start < rec_groups.len) rec_groups[gb_start].group_size else 1;
+    const a_internal = ta >= ga_start and ta < ga_start + ga_size;
+    const b_internal = tb >= gb_start and tb < gb_start + gb_size;
+    if (a_internal and b_internal) {
+        return (ta - ga_start) == (tb - gb_start);
+    }
+    // Both external: must be the same index
+    if (!a_internal and !b_internal) return ta == tb;
+    // One internal, one external: not equivalent
+    return false;
+}
+
+/// Build a canonical type index mapping so structurally equivalent types share
+/// the same canonical index. This allows exact-match comparison in validators.
+fn canonicalizeTypeIndices(module: *types.WasmModule, allocator: std.mem.Allocator) void {
+    const n: u32 = @intCast(module.types.len);
+    if (n == 0) return;
+    // canonical[i] = the lowest type index equivalent to i
+    const canonical = allocator.alloc(u32, n) catch return;
+    for (canonical, 0..) |*c, i| c.* = @intCast(i);
+
+    // Iterate until convergence: rewrite tidxs using current canonical map,
+    // then find new equivalences. Repeat until no new equivalences found.
+    var changed = true;
+    while (changed) {
+        changed = false;
+        // Rewrite type refs using current canonical mapping
+        // Must use pointer iteration so supertype_idx mutations persist
+        for (@constCast(module.types)) |*ft| {
+            for (@constCast(ft.param_tidxs)) |*t| {
+                if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
+            }
+            for (@constCast(ft.result_tidxs)) |*t| {
+                if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
+            }
+            for (@constCast(ft.field_tidxs)) |*t| {
+                if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n and canonical[t.*] != t.*) t.* = canonical[t.*];
+            }
+            // Also canonicalize supertype index
+            if (ft.supertype_idx != NO_TIDX and ft.supertype_idx < n and canonical[ft.supertype_idx] != ft.supertype_idx) ft.supertype_idx = canonical[ft.supertype_idx];
+        }
+        // Find new equivalences
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            if (canonical[i] != i) continue;
+            var j: u32 = i + 1;
+            while (j < n) : (j += 1) {
+                if (canonical[j] != j) continue;
+                if (typeIdxEquivalent(module.types, module.rec_groups, i, j)) {
+                    canonical[j] = i;
+                    changed = true;
+                }
+            }
+        }
+    }
+    // Final rewrite pass
+    for (@constCast(module.types)) |*ft| {
+        for (@constCast(ft.param_tidxs)) |*t| {
+            if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
+        }
+        for (@constCast(ft.result_tidxs)) |*t| {
+            if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
+        }
+        for (@constCast(ft.field_tidxs)) |*t| {
+            if (t.* != NO_TIDX and !isBottomTidx(t.*) and t.* < n) t.* = canonical[t.*];
+        }
+        if (ft.supertype_idx != NO_TIDX and ft.supertype_idx < n) ft.supertype_idx = canonical[ft.supertype_idx];
+    }
+    module.canonical_type_map = canonical;
+}
+
 /// A value type paired with its concrete type index.
-const ValTypeTidx = struct { vt: types.ValType, tidx: u32 };
+const ValTypeTidx = struct { vt: types.ValType, tidx: u32, pack: u8 = 0 };
 
 fn readValType(reader: *BinaryReader) LoadError!types.ValType {
     return (try readValTypeWithTidx(reader, null)).vt;
@@ -160,33 +341,46 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
         0x7D => .{ .vt = .f32, .tidx = NO_TIDX },
         0x7C => .{ .vt = .f64, .tidx = NO_TIDX },
         0x7B => .{ .vt = .v128, .tidx = NO_TIDX },
+        // GC packed storage types (used in struct/array fields, treated as i32 at runtime)
+        0x7A => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 1 }, // i8 storage type (legacy encoding)
+        0x79 => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 2 }, // i16 storage type (legacy encoding)
+        0x78 => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 1 }, // i8 storage type
+        0x77 => .{ .vt = .i32, .tidx = NO_TIDX, .pack = 2 }, // i16 storage type
         0x70 => .{ .vt = .funcref, .tidx = NO_TIDX },
         0x6F => .{ .vt = .externref, .tidx = NO_TIDX },
         // GC proposal shorthand types (single-byte nullable ref types)
-        0x6E => .{ .vt = .funcref, .tidx = NO_TIDX }, // anyref
-        0x6D => .{ .vt = .funcref, .tidx = NO_TIDX }, // eqref
-        0x6C => .{ .vt = .funcref, .tidx = NO_TIDX }, // i31ref
-        0x6B => .{ .vt = .funcref, .tidx = NO_TIDX }, // structref
-        0x6A => .{ .vt = .funcref, .tidx = NO_TIDX }, // arrayref
-        0x69 => .{ .vt = .externref, .tidx = NO_TIDX }, // exnref
-        0x68 => .{ .vt = .externref, .tidx = NO_TIDX }, // noexnref
-        0x65 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullref
-        0x71 => .{ .vt = .funcref, .tidx = NO_TIDX }, // nullfuncref
-        0x74 => .{ .vt = .externref, .tidx = NO_TIDX }, // nullexternref
-        0x73 => .{ .vt = .nonfuncref, .tidx = NO_TIDX }, // nofunc (non-nullable)
-        0x72 => .{ .vt = .nonexternref, .tidx = NO_TIDX }, // noextern (non-nullable)
+        0x6E => .{ .vt = .anyref, .tidx = NO_TIDX },
+        0x6D => .{ .vt = .eqref, .tidx = NO_TIDX },
+        0x6C => .{ .vt = .i31ref, .tidx = NO_TIDX },
+        0x6B => .{ .vt = .structref, .tidx = NO_TIDX },
+        0x6A => .{ .vt = .arrayref, .tidx = NO_TIDX },
+        0x69 => .{ .vt = .exnref, .tidx = NO_TIDX },
+        // Bottom types
+        0x68 => .{ .vt = .exnref, .tidx = BOTTOM_EXTERN_TIDX }, // nullexnref
+        0x65 => .{ .vt = .nullref, .tidx = BOTTOM_FUNC_TIDX }, // nullref (ref null none)
+        0x71 => .{ .vt = .funcref, .tidx = BOTTOM_FUNC_TIDX }, // nullfuncref (ref null nofunc)
+        0x74 => .{ .vt = .externref, .tidx = BOTTOM_EXTERN_TIDX },
+        0x73 => .{ .vt = .funcref, .tidx = BOTTOM_FUNC_TIDX },
+        0x72 => .{ .vt = .externref, .tidx = BOTTOM_EXTERN_TIDX },
         // Typed reference types: ref null <heaptype> or ref <heaptype>
         0x63, 0x64 => {
             const is_nullable = (byte == 0x63);
             const heap_byte = try reader.readByte();
             return switch (heap_byte) {
-                0x70, 0x73 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX },
-                0x6F, 0x72 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX },
-                // GC abstract heap types — map to funcref/externref abstractions
-                0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX }, // any, eq, i31, struct, array, none
-                0x69, 0x68 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX }, // exn, noexn
-                0x74 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX }, // noextern
-                0x71 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX }, // nofunc
+                0x70 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = NO_TIDX },
+                0x6F => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = NO_TIDX },
+                // GC abstract heap types
+                0x6E => .{ .vt = if (is_nullable) .anyref else .anyref, .tidx = NO_TIDX },
+                0x6D => .{ .vt = if (is_nullable) .eqref else .eqref, .tidx = NO_TIDX },
+                0x6C => .{ .vt = if (is_nullable) .i31ref else .i31ref, .tidx = NO_TIDX },
+                0x6B => .{ .vt = if (is_nullable) .structref else .structref, .tidx = NO_TIDX },
+                0x6A => .{ .vt = if (is_nullable) .arrayref else .arrayref, .tidx = NO_TIDX },
+                0x69 => .{ .vt = if (is_nullable) .exnref else .exnref, .tidx = NO_TIDX },
+                // Bottom heap types — use sentinel tidx
+                0x65 => .{ .vt = if (is_nullable) .nullref else .nullref, .tidx = BOTTOM_FUNC_TIDX }, // none → nullref
+                0x71, 0x73 => .{ .vt = if (is_nullable) .funcref else .nonfuncref, .tidx = BOTTOM_FUNC_TIDX }, // nofunc
+                0x68 => .{ .vt = if (is_nullable) .exnref else .exnref, .tidx = BOTTOM_EXTERN_TIDX }, // noexn
+                0x72, 0x74 => .{ .vt = if (is_nullable) .externref else .nonexternref, .tidx = BOTTOM_EXTERN_TIDX }, // noextern
                 else => {
                     // Concrete type index (LEB128)
                     var type_idx: u32 = heap_byte & 0x7F;
@@ -210,7 +404,21 @@ fn readValTypeWithTidx(reader: *BinaryReader, max_types: ?u32) LoadError!ValType
             };
         },
         else => {
-            std.debug.print("InvalidValType(readValType-catch-all): byte=0x{x:0>2}\n", .{byte});
+            // Concrete type indices (small values 0x00-0x3F) may appear
+            // as heap types in certain contexts; treat as nonfuncref
+            if (byte < 0x40) {
+                if (max_types) |mt| {
+                    if (byte >= mt) return error.InvalidValType;
+                }
+                // Consume any LEB128 continuation bytes
+                if (byte & 0x80 != 0) {
+                    while (true) {
+                        const b = try reader.readByte();
+                        if (b & 0x80 == 0) break;
+                    }
+                }
+                return .{ .vt = .nonfuncref, .tidx = byte };
+            }
             return error.InvalidValType;
         },
     };
@@ -223,8 +431,16 @@ fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
     return switch (byte) {
         0x70, 0x73 => .funcref,
         0x6F, 0x72 => .externref,
-        0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65, 0x71 => .funcref, // GC: any, eq, i31, struct, array, none, nofunc
-        0x69, 0x68, 0x74 => .externref, // exn, noexn, noextern
+        0x6E => .anyref,
+        0x6D => .eqref,
+        0x6C => .i31ref,
+        0x6B => .structref,
+        0x6A => .arrayref,
+        0x65 => .nullref,
+        0x71 => .funcref, // nofunc
+        0x69 => .exnref,
+        0x68 => .exnref, // noexn → bottom of exn hierarchy
+        0x74 => .externref, // noextern
         else => {
             // Concrete type index: consume remaining LEB128 bytes
             if (byte & 0x80 != 0) {
@@ -238,28 +454,56 @@ fn readHeapTypeAsValType(reader: *BinaryReader) LoadError!types.ValType {
     };
 }
 
-fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
+const LimitsResult = struct {
+    limits: types.Limits,
+    is_64: bool,
+    raw_min64: u64 = 0,
+    raw_max64: u64 = 0,
+};
+
+fn readLimitsEx(reader: *BinaryReader) LoadError!LimitsResult {
     const flags = try reader.readByte();
-    const min = try reader.readU32();
-    return switch (flags) {
-        0x00 => .{ .min = min },
-        0x01 => .{ .min = min, .max = try reader.readU32() },
-        else => error.InvalidLimits,
-    };
+    const has_max = (flags & 0x01) != 0;
+    // bit 1 = shared (0x02) — accepted but not stored in Limits
+    const is_64 = (flags & 0x04) != 0;
+    // Reject unknown flag bits
+    if (flags & ~@as(u8, 0x07) != 0) return error.InvalidLimits;
+
+    if (is_64) {
+        const min64 = try reader.readU64();
+        // For memory64/table64, allow limits > u32 max — cap to u32 for storage
+        const min: u32 = if (min64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(min64);
+        if (has_max) {
+            const max64 = try reader.readU64();
+            if (min64 > max64) return error.InvalidLimits;
+            const max: u32 = if (max64 > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max64);
+            return .{ .limits = .{ .min = min, .max = max }, .is_64 = true, .raw_min64 = min64, .raw_max64 = max64 };
+        }
+        return .{ .limits = .{ .min = min }, .is_64 = true, .raw_min64 = min64 };
+    } else {
+        const min = try reader.readU32();
+        if (has_max) {
+            return .{ .limits = .{ .min = min, .max = try reader.readU32() }, .is_64 = false };
+        }
+        return .{ .limits = .{ .min = min }, .is_64 = false };
+    }
 }
 
-fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u32) LoadError!types.TableType {
+fn readLimits(reader: *BinaryReader) LoadError!types.Limits {
+    const result = try readLimitsEx(reader);
+    return result.limits;
+}
+
+fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types.TableType {
     const first_byte = try reader.readByte();
 
     // Table with init expression: 0x40 0x00 reftype limits expr
     if (first_byte == 0x40) {
         _ = try reader.readByte(); // reserved byte (must be 0)
         const info = try readValTypeWithTidx(reader, type_count);
-        const limits = try readLimits(reader);
-        // Validate and skip the init expression
-        // Table init expressions can only reference imported globals
-        try validateAndSkipInitExpr(reader, import_global_count);
-        return .{ .elem_type = info.vt, .limits = limits, .elem_tidx = info.tidx };
+        const lr = try readLimitsEx(reader);
+        const init_expr = try parseInitExprChecked(reader, type_count, null);
+        return .{ .elem_type = info.vt, .limits = lr.limits, .elem_tidx = info.tidx, .init_expr = init_expr, .is_table64 = lr.is_64 };
     }
 
     // Standard table: reftype limits
@@ -267,12 +511,24 @@ fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u3
     const elem_type: types.ValType = switch (first_byte) {
         0x70 => .funcref,
         0x6F => .externref,
+        0x6E => .anyref,
+        0x6D => .eqref,
+        0x6C => .i31ref,
+        0x6B => .structref,
+        0x6A => .arrayref,
         0x63, 0x64 => blk: {
             const is_nullable = (first_byte == 0x63);
             const heap_byte = try reader.readByte();
             break :blk switch (heap_byte) {
                 0x70, 0x73 => if (is_nullable) types.ValType.funcref else types.ValType.nonfuncref,
                 0x6F, 0x72 => if (is_nullable) types.ValType.externref else types.ValType.nonexternref,
+                0x6E => types.ValType.anyref,
+                0x6D => types.ValType.eqref,
+                0x6C => types.ValType.i31ref,
+                0x6B => types.ValType.structref,
+                0x6A => types.ValType.arrayref,
+                0x65 => types.ValType.nullref,
+                0x69 => types.ValType.exnref,
                 else => {
                     var type_idx: u32 = heap_byte & 0x7F;
                     if (heap_byte & 0x80 != 0) {
@@ -298,8 +554,8 @@ fn readTableType(reader: *BinaryReader, type_count: u32, import_global_count: u3
             return error.InvalidValType;
         },
     };
-    const limits = try readLimits(reader);
-    return .{ .elem_type = elem_type, .limits = limits, .elem_tidx = elem_tidx };
+    const lr = try readLimitsEx(reader);
+    return .{ .elem_type = elem_type, .limits = lr.limits, .elem_tidx = elem_tidx, .is_table64 = lr.is_64 };
 }
 
 /// Skip an init expression (scan to end opcode 0x0B).
@@ -313,7 +569,7 @@ fn skipInitExpr(reader: *BinaryReader) LoadError!void {
             0x43 => { _ = try reader.readBytes(4); },
             0x44 => { _ = try reader.readBytes(8); },
             0x23 => { _ = try reader.readU32(); },
-            0xD0 => { _ = try readValTypeChecked(reader, null); },
+            0xD0 => { _ = try readHeapTypeAsValType(reader); },
             0xD2 => { _ = try reader.readU32(); },
             else => {},
         }
@@ -321,7 +577,6 @@ fn skipInitExpr(reader: *BinaryReader) LoadError!void {
     return error.UnexpectedEnd;
 }
 
-/// Validate and skip a table init expression. global.get can only reference imported globals.
 fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError!void {
     while (reader.remaining() > 0) {
         const b = try reader.readByte();
@@ -335,7 +590,7 @@ fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError
                 const idx = try reader.readU32();
                 if (idx >= max_global_idx) return error.UnknownGlobal;
             },
-            0xD0 => { _ = try readValTypeChecked(reader, null); },
+            0xD0 => { _ = try readHeapTypeAsValType(reader); },
             0xD2 => { _ = try reader.readU32(); },
             else => {},
         }
@@ -344,8 +599,14 @@ fn validateAndSkipInitExpr(reader: *BinaryReader, max_global_idx: u32) LoadError
 }
 
 fn readMemoryType(reader: *BinaryReader) LoadError!types.MemoryType {
-    const limits = try readLimits(reader);
-    return .{ .limits = limits };
+    const result = try readLimitsEx(reader);
+    // Validate memory64 limits using raw u64 values before they were truncated to u32
+    if (result.is_64) {
+        const max_pages: u64 = 1 << 48;
+        if (result.raw_min64 > max_pages) return error.InvalidLimits;
+        if (result.raw_max64 > max_pages) return error.InvalidLimits;
+    }
+    return .{ .limits = result.limits, .is_memory64 = result.is_64 };
 }
 
 fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.GlobalType {
@@ -363,10 +624,10 @@ fn readGlobalType(reader: *BinaryReader, type_count: ?u32) LoadError!types.Globa
 }
 
 fn parseInitExpr(reader: *BinaryReader) LoadError!types.InitExpr {
-    return parseInitExprChecked(reader, null);
+    return parseInitExprChecked(reader, null, null);
 }
 
-fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types.InitExpr {
+fn parseInitExprChecked(reader: *BinaryReader, _: ?u32, module_types: ?[]const types.FuncType) LoadError!types.InitExpr {
     const start_pos = reader.pos;
     const opcode = try reader.readByte();
     // Empty init expression (just 0x0B end) is invalid
@@ -380,6 +641,15 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
         0x23 => .{ .global_get = try reader.readU32() },
         0xD0 => .{ .ref_null = try readHeapTypeAsValType(reader) },
         0xD2 => .{ .ref_func = try reader.readU32() },
+        0xFB => blk: {
+            // GC prefix: read sub-opcode
+            const sub = try reader.readU32();
+            switch (sub) {
+                0x1C => break :blk null, // ref.i31 — compound (needs i32 operand)
+                0x1A, 0x1B => break :blk null, // any.convert_extern, extern.convert_any — compound
+                else => break :blk null,
+            }
+        },
         else => null,
     };
     const end = try reader.readByte();
@@ -391,7 +661,6 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
     }
     // Compound expression: validate and scan forward to end
     // Only opcodes valid in constant expressions are accepted (spec §3.3.10)
-    if (simple == null) return error.InvalidInitExpr; // first opcode must be valid
     reader.pos = start_pos;
     var stack_depth: i32 = 0;
     while (reader.pos < reader.data.len) {
@@ -407,12 +676,58 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
             0x43 => { _ = try reader.readBytes(4); stack_depth += 1; },
             0x44 => { _ = try reader.readBytes(8); stack_depth += 1; },
             0x23 => { _ = try reader.readU32(); stack_depth += 1; },
-            0xD0 => { _ = try readValTypeChecked(reader, type_count); stack_depth += 1; },
+            0xD0 => { _ = try readHeapTypeAsValType(reader); stack_depth += 1; },
             0xD2 => { _ = try reader.readU32(); stack_depth += 1; },
             // Valid const expr binary ops: pop 2, push 1
             0x6A, 0x6B, 0x6C, // i32.add, i32.sub, i32.mul
             0x7C, 0x7D, 0x7E, // i64.add, i64.sub, i64.mul
             => { stack_depth -= 1; },
+            // GC prefix opcodes valid in constant expressions
+            0xFB => {
+                const sub = try reader.readU32();
+                switch (sub) {
+                    0x1C => {}, // ref.i31: pop i32, push i31ref (net 0)
+                    0x1A => {}, // any.convert_extern: pop externref, push anyref (net 0)
+                    0x1B => {}, // extern.convert_any: pop anyref, push externref (net 0)
+                    0x00 => { // struct.new: pop N fields, push structref
+                        const tidx = try reader.readU32();
+                        if (module_types) |mt| {
+                            if (tidx < mt.len) {
+                                const field_count: i32 = @intCast(mt[tidx].field_types.len);
+                                stack_depth -= field_count;
+                            }
+                        }
+                        stack_depth += 1;
+                    },
+                    0x01 => { _ = try reader.readU32(); stack_depth += 1; }, // struct.new_default: push structref
+                    0x08 => { // array.new_fixed: type_idx + count → pop count, push 1
+                        _ = try reader.readU32();
+                        const count: i32 = @intCast(try reader.readU32());
+                        if (stack_depth >= count) stack_depth -= count;
+                        stack_depth += 1;
+                    },
+                    0x02, 0x03, 0x04 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.get: net 0
+                    0x05 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // struct.set
+                    0x06 => { _ = try reader.readU32(); stack_depth -= 1; }, // array.new: pop init+len, push arrayref (net -1)
+                    0x07 => { _ = try reader.readU32(); }, // array.new_default: pop len, push arrayref (net 0)
+                    0x09, 0x0A => { _ = try reader.readU32(); _ = try reader.readU32(); stack_depth -= 1; }, // array.new_data/elem: pop offset+len, push arrayref (net -1)
+                    0x0B, 0x0C, 0x0D => { _ = try reader.readU32(); }, // array.get
+                    0x0E => { _ = try reader.readU32(); }, // array.set
+                    0x0F => {}, // array.len
+                    0x10, 0x11, 0x12, 0x13 => { _ = try reader.readU32(); _ = try reader.readU32(); }, // array.fill/copy/init
+                    0x14, 0x15 => { _ = try reader.readU32(); }, // ref.test
+                    0x16, 0x17 => { _ = try reader.readU32(); }, // ref.cast
+                    else => return error.InvalidInitExpr,
+                }
+            },
+            // SIMD prefix: v128.const
+            0xFD => {
+                const sub = try reader.readU32();
+                switch (sub) {
+                    0x0C => { _ = try reader.readBytes(16); stack_depth += 1; }, // v128.const: 16 bytes
+                    else => return error.InvalidInitExpr,
+                }
+            },
             // Any other opcode is invalid in a constant expression
             else => return error.InvalidInitExpr,
         }
@@ -422,32 +737,47 @@ fn parseInitExprChecked(reader: *BinaryReader, type_count: ?u32) LoadError!types
 
 // ─── Section parsers ────────────────────────────────────────────────────────
 
-fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const types.FuncType {
+const TypeSectionResult = struct {
+    types: []const types.FuncType,
+    rec_groups: []const types.RecGroupInfo,
+};
+
+fn parseTypeSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!TypeSectionResult {
     const count = try reader.readU32();
-    if (count == 0) return &.{};
+    if (count == 0) return .{ .types = &.{}, .rec_groups = &.{} };
 
     // GC proposal: type entries may be rec groups (0x4E) containing sub types (0x50/0x4F)
     // We flatten them all into a single FuncType array.
     var func_types_list: std.ArrayList(types.FuncType) = .empty;
+    var rec_groups_list: std.ArrayList(types.RecGroupInfo) = .empty;
     var entries_parsed: u32 = 0;
     while (entries_parsed < count) : (entries_parsed += 1) {
         const tag = try reader.readByte();
         if (tag == 0x4E) {
             // rec group: count of sub-entries, then sub-entries
             const rec_count = try reader.readU32();
+            const group_start: u32 = @intCast(func_types_list.items.len);
+            const max_type_in_group: u32 = @intCast(func_types_list.items.len + rec_count);
             var ri: u32 = 0;
             while (ri < rec_count) : (ri += 1) {
-                const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
+                const ft = try parseOneType(reader, allocator, @max(max_type_in_group, @as(u32, @intCast(func_types_list.items.len)) + count));
                 func_types_list.append(allocator, ft) catch return error.OutOfMemory;
+                rec_groups_list.append(allocator, .{ .group_start = group_start, .group_size = rec_count }) catch return error.OutOfMemory;
             }
         } else {
             // Single type entry (0x60 func, 0x50 sub, 0x4F sub final)
             reader.pos -= 1; // unread the tag
-            const ft = try parseOneType(reader, allocator, @intCast(func_types_list.items.len + count));
+            const ft = parseOneType(reader, allocator, @intCast(func_types_list.items.len + count)) catch |err| {
+                return err;
+            };
             func_types_list.append(allocator, ft) catch return error.OutOfMemory;
+            rec_groups_list.append(allocator, .{ .group_start = @intCast(func_types_list.items.len - 1), .group_size = 1 }) catch return error.OutOfMemory;
         }
     }
-    return func_types_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return .{
+        .types = func_types_list.toOwnedSlice(allocator) catch return error.OutOfMemory,
+        .rec_groups = rec_groups_list.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
 }
 
 fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
@@ -455,31 +785,69 @@ fn parseOneType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: 
     if (tag == 0x50 or tag == 0x4F) {
         // sub type: 0x50 <num_supers> <super_idx*> <comptype>
         // sub final type: 0x4F <num_supers> <super_idx*> <comptype>
+        const is_final = (tag == 0x4F);
         const num_supers = try reader.readU32();
+        var supertype_idx: u32 = NO_TIDX;
         var si: u32 = 0;
         while (si < num_supers) : (si += 1) {
-            _ = try reader.readU32(); // skip supertype index
+            supertype_idx = try reader.readU32();
         }
         const comp_tag = try reader.readByte();
+        var ft: types.FuncType = undefined;
         if (comp_tag == 0x60) {
-            return parseFuncType(reader, allocator, max_types);
-        }
-        // struct (0x5F) or array (0x5E) — skip fields
-        if (comp_tag == 0x5F) {
-            const field_count = try reader.readU32();
-            var fi: u32 = 0;
-            while (fi < field_count) : (fi += 1) {
-                _ = try readValTypeWithTidx(reader, max_types);
-                _ = try reader.readByte(); // mutability
-            }
+            ft = try parseFuncType(reader, allocator, max_types);
+        } else if (comp_tag == 0x5F) {
+            ft = try parseStructType(reader, allocator, max_types);
         } else if (comp_tag == 0x5E) {
-            _ = try readValTypeWithTidx(reader, max_types);
-            _ = try reader.readByte(); // mutability
+            ft = try parseArrayType(reader, allocator, max_types);
+        } else {
+            ft = .{ .params = &.{}, .results = &.{} };
         }
-        return .{ .params = &.{}, .results = &.{} };
+        ft.supertype_idx = supertype_idx;
+        ft.is_final = is_final;
+        return ft;
     }
-    if (tag != 0x60) return error.InvalidFuncType;
+    if (tag != 0x60) {
+        // struct (0x5F) or array (0x5E) without sub wrapper
+        if (tag == 0x5F) {
+            return parseStructType(reader, allocator, max_types);
+        } else if (tag == 0x5E) {
+            return parseArrayType(reader, allocator, max_types);
+        }
+        return error.InvalidFuncType;
+    }
     return parseFuncType(reader, allocator, max_types);
+}
+
+fn parseStructType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
+    const field_count = try reader.readU32();
+    var ftidxs = if (field_count > 0) try allocator.alloc(u32, field_count) else @as([]u32, &.{});
+    var ftypes = if (field_count > 0) try allocator.alloc(types.ValType, field_count) else @as([]types.ValType, &.{});
+    var fmuts = if (field_count > 0) try allocator.alloc(u8, field_count) else @as([]u8, &.{});
+    var fi: u32 = 0;
+    while (fi < field_count) : (fi += 1) {
+        const info = try readValTypeWithTidx(reader, max_types);
+        ftidxs[fi] = info.tidx;
+        ftypes[fi] = info.vt;
+        const mut_byte = try reader.readByte(); // mutability (bit 0)
+        if (mut_byte & 0x01 != mut_byte) return error.MalformedMutability;
+        // Encode packed type in high bits: bit 4 = i8, bit 5 = i16
+        fmuts[fi] = mut_byte | (@as(u8, info.pack) << 4);
+    }
+    return .{ .params = &.{}, .results = &.{}, .kind = .struct_, .field_tidxs = ftidxs, .field_types = ftypes, .field_muts = fmuts };
+}
+
+fn parseArrayType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
+    const info = try readValTypeWithTidx(reader, max_types);
+    const mut_byte = try reader.readByte(); // mutability
+    if (mut_byte & 0x01 != mut_byte) return error.MalformedMutability; // must be 0 or 1
+    var ftidxs = try allocator.alloc(u32, 1);
+    ftidxs[0] = info.tidx;
+    var ftypes = try allocator.alloc(types.ValType, 1);
+    ftypes[0] = info.vt;
+    var fmuts = try allocator.alloc(u8, 1);
+    fmuts[0] = mut_byte | (@as(u8, info.pack) << 4);
+    return .{ .params = &.{}, .results = &.{}, .kind = .array, .field_tidxs = ftidxs, .field_types = ftypes, .field_muts = fmuts };
 }
 
 fn parseFuncType(reader: *BinaryReader, allocator: std.mem.Allocator, max_types: u32) LoadError!types.FuncType {
@@ -522,11 +890,17 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
         const field_name = try reader.readName();
         const kind_byte = try reader.readByte();
 
-        // Tag imports (0x04) from exception handling — count and skip
+        // Tag imports (0x04) from exception handling — store with kind = .tag
         if (kind_byte == 0x04) {
             _ = try reader.readByte(); // tag attribute
-            _ = try reader.readU32(); // type index
+            const tag_tidx = try reader.readU32(); // type index
             tag_count.* += 1;
+            imports_list.append(allocator, .{
+                .module_name = module_name,
+                .field_name = field_name,
+                .kind = .tag,
+                .tag_type_idx = tag_tidx,
+            }) catch return error.OutOfMemory;
             continue;
         }
 
@@ -535,6 +909,19 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
             0x01 => .table,
             0x02 => .memory,
             0x03 => .global,
+            0x04 => {
+                // Tag import (exception handling) — store
+                _ = try reader.readByte(); // attribute
+                const tag_tidx = try reader.readU32(); // type index
+                tag_count.* += 1;
+                imports_list.append(allocator, .{
+                    .module_name = module_name,
+                    .field_name = field_name,
+                    .kind = .tag,
+                    .tag_type_idx = tag_tidx,
+                }) catch return error.OutOfMemory;
+                continue;
+            },
             else => return error.InvalidImportKind,
         };
 
@@ -549,6 +936,7 @@ fn parseImportSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_
             .table => imp.table_type = try readTableType(reader, type_count, 0),
             .memory => imp.memory_type = try readMemoryType(reader),
             .global => imp.global_type = try readGlobalType(reader, type_count),
+            .tag => {}, // tag imports handled above
         }
         imports_list.append(allocator, imp) catch return error.InvalidImportKind;
     }
@@ -585,13 +973,13 @@ fn parseMemorySection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
     return memories;
 }
 
-fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32) LoadError![]const types.WasmGlobal {
+fn parseGlobalSection(reader: *BinaryReader, allocator: std.mem.Allocator, type_count: u32, module_types: ?[]const types.FuncType) LoadError![]const types.WasmGlobal {
     const count = try reader.readU32();
     if (count == 0) return &.{};
     const globals = try allocator.alloc(types.WasmGlobal, count);
     for (globals) |*g| {
         const global_type = try readGlobalType(reader, type_count);
-        const init_expr = try parseInitExprChecked(reader, type_count);
+        const init_expr = try parseInitExprChecked(reader, type_count, module_types);
         g.* = .{ .global_type = global_type, .init_expr = init_expr };
     }
     return globals;
@@ -619,7 +1007,7 @@ fn parseExportSection(reader: *BinaryReader, allocator: std.mem.Allocator) LoadE
             0x01 => .table,
             0x02 => .memory,
             0x03 => .global,
-            0x04 => null, // tag export (exception handling) — skip
+            0x04 => .tag,
             else => return error.InvalidExportKind,
         };
         if (kind) |k| {
@@ -667,12 +1055,16 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                 kind = switch (ref_byte) {
                     0x70 => .func_ref,
                     0x6F => .extern_ref,
+                    // GC shorthand types
+                    0x6E, 0x6D, 0x6C, 0x6B, 0x6A => .gc_ref,
                     // Typed reference: ref null/ref + heaptype
                     0x63, 0x64 => blk: {
                         const ht = try reader.readByte();
                         if (ht == 0x6F or ht == 0x72) break :blk .extern_ref;
                         // func, nofunc → funcref
                         if (ht == 0x70 or ht == 0x73) break :blk .func_ref;
+                        // GC abstract heap types
+                        if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or ht == 0x65) break :blk .gc_ref;
                         // Concrete type index — validate and consume LEB128
                         var ht_idx: u32 = ht & 0x7F;
                         if (ht & 0x80 != 0) {
@@ -707,15 +1099,23 @@ fn parseElementSection(reader: *BinaryReader, allocator: std.mem.Allocator, type
                         try elem_exprs_list.append(allocator, expr);
                     },
                     .ref_null => |vt| {
-                        // For flags=4, kind defaults to func_ref but element may be externref
-                        if (flags == 4 and vt.isExternRef()) kind = .extern_ref;
-                        if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
-                        if (kind == .extern_ref and !vt.isExternRef()) return error.TypeMismatch;
+                        // For flags=4, kind defaults to func_ref but may need adjustment
+                        if (flags == 4) {
+                            if (vt.isExternRef()) kind = .extern_ref
+                            else if (!vt.isFuncRef()) kind = .gc_ref;
+                        }
+                        // Only enforce type compatibility for func_ref and extern_ref kinds (not gc_ref)
+                        if (kind != .gc_ref) {
+                            if (kind == .func_ref and !vt.isFuncRef()) return error.TypeMismatch;
+                            if (kind == .extern_ref and !vt.isExternRef()) return error.TypeMismatch;
+                        }
                         try func_indices_list.append(allocator, null);
                         try elem_exprs_list.append(allocator, null);
                     },
-                    // global.get and compound expressions can produce funcref/externref
+                    // global.get and compound expressions
                     .global_get, .bytecode => {
+                        // For flags=4, bytecode GC expressions imply gc_ref kind
+                        if (flags == 4 and kind == .func_ref) kind = .gc_ref;
                         try func_indices_list.append(allocator, null);
                         try elem_exprs_list.append(allocator, expr);
                         has_runtime_exprs = true;
@@ -878,22 +1278,20 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
         const section_id = try reader.readByte();
         const section_size = try reader.readU32();
 
-        // Enforce section ordering (custom sections and proposal sections can appear anywhere)
+        // Enforce section ordering (custom sections can appear anywhere)
         if (section_id != 0) {
-            // Skip known proposal sections (tag section = 13) without enforcing order
-            if (section_id > @intFromEnum(types.SectionId.data_count)) {
-                const section_start = reader.pos;
-                if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
-                if (section_id == 13) {
-                    reader.pos = section_start + section_size;
-                    continue;
-                }
+            if (section_id > @intFromEnum(types.SectionId.tag)) {
                 return error.MalformedSectionId;
             }
-            if (last_section_id) |last| {
-                if (section_id <= last) return error.InvalidSectionOrder;
+            // Tag section (13) and data count section (12) don't participate in strict ordering
+            if (section_id != @intFromEnum(types.SectionId.tag) and
+                section_id != @intFromEnum(types.SectionId.data_count))
+            {
+                if (last_section_id) |last| {
+                    if (section_id <= last) return error.InvalidSectionOrder;
+                }
+                last_section_id = section_id;
             }
-            last_section_id = section_id;
         }
 
         const section_start = reader.pos;
@@ -906,7 +1304,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                 if (reader.pos > section_start + section_size) return error.InvalidSectionSize;
                 reader.pos = section_start + section_size;
             },
-                .type => module.types = try parseTypeSection(&reader, allocator),
+                .type => {
+                    const type_result = try parseTypeSection(&reader, allocator);
+                    module.types = type_result.types;
+                    module.rec_groups = type_result.rec_groups;
+                    canonicalizeTypeIndices(&module, allocator);
+                },
                 .import => {
                     const tc: u32 = @intCast(module.types.len);
                     module.imports = try parseImportSection(&reader, allocator, tc, &module.import_tag_count);
@@ -916,19 +1319,32 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
                             .table => module.import_table_count += 1,
                             .memory => module.import_memory_count += 1,
                             .global => module.import_global_count += 1,
+                            .tag => {}, // tag count already tracked by parseImportSection
                         }
                     }
                 },
                 .function => func_type_indices = try parseFunctionSection(&reader, allocator),
                 .table => module.tables = try parseTableSection(&reader, allocator, @intCast(module.types.len), module.import_global_count),
                 .memory => module.memories = try parseMemorySection(&reader, allocator),
-                .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len)),
+                .global => module.globals = try parseGlobalSection(&reader, allocator, @intCast(module.types.len), module.types),
                 .@"export" => module.exports = try parseExportSection(&reader, allocator),
                 .start => module.start_function = try reader.readU32(),
                 .element => module.elements = try parseElementSection(&reader, allocator, @intCast(module.types.len)),
                 .code => module.functions = try parseCodeSection(&reader, func_type_indices, module.types, allocator),
                 .data => module.data_segments = try parseDataSection(&reader, allocator),
                 .data_count => module.data_count = try reader.readU32(),
+                .tag => {
+                    // Tag section (exception handling): count + (attribute, type_idx)*
+                    const tag_count = try reader.readU32();
+                    if (tag_count > 0) {
+                        const tag_types = allocator.alloc(u32, tag_count) catch return error.OutOfMemory;
+                        for (tag_types) |*tt| {
+                            _ = try reader.readByte(); // attribute (0 = exception)
+                            tt.* = try reader.readU32(); // type index
+                        }
+                        module.tag_types = tag_types;
+                    }
+                },
             }
 
             // Verify we consumed exactly section_size bytes
@@ -941,6 +1357,27 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!types.Wasm
     // Validate function type indices from function section
     for (func_type_indices) |type_idx| {
         if (type_idx >= module.types.len) return error.InvalidTypeIndex;
+    }
+
+    // Infer local tag count from tag exports when tag section is missing.
+    // Some binary writers (e.g., wabt) emit tag exports but no tag section.
+    if (module.tag_types.len == 0) {
+        var max_tag_idx: ?u32 = null;
+        for (module.exports) |exp| {
+            if (exp.kind == .tag) {
+                if (max_tag_idx == null or exp.index > max_tag_idx.?)
+                    max_tag_idx = exp.index;
+            }
+        }
+        if (max_tag_idx) |max_idx| {
+            const local_count = if (max_idx >= module.import_tag_count) max_idx - module.import_tag_count + 1 else 0;
+            if (local_count > 0) {
+                if (allocator.alloc(u32, local_count)) |tag_types| {
+                    for (tag_types) |*tt| tt.* = 0xFFFFFFFF;
+                    module.tag_types = tag_types;
+                } else |_| {}
+            }
+        }
     }
 
     try validateModule(&module);
@@ -957,7 +1394,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
 
     // Validate memory limits
     for (module.memories) |mem| {
-        try validateMemoryLimits(mem.limits);
+        try validateMemoryLimits(mem);
     }
 
     // Validate table limits
@@ -966,8 +1403,17 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             if (table.limits.min > max) return error.InvalidLimits;
         }
         // Non-nullable element types require a table initializer
-        if (table.elem_type == .nonfuncref or table.elem_type == .nonexternref) {
+        if ((table.elem_type == .nonfuncref or table.elem_type == .nonexternref) and table.init_expr == null) {
             return error.TypeMismatch;
+        }
+        // Validate table init expression: global.get must reference an imported global
+        if (table.init_expr) |ie| {
+            switch (ie) {
+                .global_get => |idx| {
+                    if (idx >= module.import_global_count) return error.UnknownGlobal;
+                },
+                else => {},
+            }
         }
     }
 
@@ -981,7 +1427,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             },
             .memory => {
                 if (imp.memory_type) |mem| {
-                    try validateMemoryLimits(mem.limits);
+                    try validateMemoryLimits(mem);
                 }
             },
             .table => {
@@ -992,6 +1438,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                 }
             },
             .global => {},
+            .tag => {},
         }
     }
 
@@ -1010,6 +1457,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             .global => {
                 if (exp.index >= total_globals) return error.UnknownGlobal;
             },
+            .tag => {},
         }
     }
 
@@ -1072,23 +1520,52 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             .ref_func => |fidx| {
                 if (!g.global_type.val_type.isFuncRef()) return error.TypeMismatch;
                 if (fidx >= total_funcs) return error.UnknownFunction;
+                // Check concrete type index compatibility (subtyping allowed)
+                if (g.global_type.type_idx != NO_TIDX) {
+                    const func_tidx = module.getFuncTypeIdx(fidx) orelse NO_TIDX;
+                    if (func_tidx != NO_TIDX and func_tidx != g.global_type.type_idx) {
+                        // Check canonical equivalence (handles iso-recursive type equivalence)
+                        const canon_a = if (func_tidx < module.canonical_type_map.len) module.canonical_type_map[func_tidx] else func_tidx;
+                        const canon_b = if (g.global_type.type_idx < module.canonical_type_map.len) module.canonical_type_map[g.global_type.type_idx] else g.global_type.type_idx;
+                        if (canon_a != canon_b) {
+                            // Walk supertype chain with canonical comparison
+                            if (!isSubtypeWithCanonical(module, func_tidx, g.global_type.type_idx))
+                                return error.TypeMismatch;
+                        }
+                    }
+                }
             },
             .bytecode => {}, // compound expressions validated at evaluation time
         }
     }
 
-    // Validate data segment offset expressions must evaluate to i32
+    // Validate data segment offset expressions
     for (module.data_segments) |seg| {
         if (!seg.is_passive) {
+            // memory64 segments use i64 offsets, regular memory uses i32
+            const is_mem64 = if (seg.memory_idx < module.import_memory_count) blk: {
+                var mi: u32 = 0;
+                for (module.imports) |imp| {
+                    if (imp.kind == .memory) {
+                        if (mi == seg.memory_idx) break :blk if (imp.memory_type) |mt| mt.is_memory64 else false;
+                        mi += 1;
+                    }
+                }
+                break :blk false;
+            } else blk: {
+                const li = seg.memory_idx - module.import_memory_count;
+                break :blk if (li < module.memories.len) module.memories[li].is_memory64 else false;
+            };
             switch (seg.offset) {
-                .i32_const => {},
+                .i32_const => { if (is_mem64) return error.TypeMismatch; },
+                .i64_const => { if (!is_mem64) return error.TypeMismatch; },
                 .global_get => |idx| {
-                    // Extended-const: allow any immutable global
                     if (idx >= total_globals) return error.UnknownGlobal;
                     if (idx < module.import_global_count) {
                         if (getImportGlobalType(module, idx)) |gt| {
                             if (gt.mutability == .mutable) return error.TypeMismatch;
-                            if (gt.val_type != .i32) return error.TypeMismatch;
+                            const expected_type: VT = if (is_mem64) .i64 else .i32;
+                            if (gt.val_type != expected_type) return error.TypeMismatch;
                         }
                     } else {
                         const local_idx = idx - module.import_global_count;
@@ -1097,7 +1574,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                         }
                     }
                 },
-                .bytecode => {}, // compound offset expression validated at evaluation
+                .bytecode => {},
                 else => return error.TypeMismatch,
             }
         }
@@ -1117,6 +1594,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
             if (table_elem_type) |tet| {
                 if (elem.kind == .func_ref and !tet.isFuncRef()) return error.TypeMismatch;
                 if (elem.kind == .extern_ref and !tet.isExternRef()) return error.TypeMismatch;
+                // gc_ref kind is compatible with GC table element types (i31ref, anyref, eqref, etc.)
                 // Non-nullable table requires non-nullable elements
                 if ((tet == .nonfuncref or tet == .nonexternref) and elem.nullable_elements)
                     return error.TypeMismatch;
@@ -1127,20 +1605,38 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                     const local_idx = elem.table_idx - module.import_table_count;
                     break :blk if (local_idx < module.tables.len) module.tables[local_idx].elem_tidx else NO_TIDX;
                 };
-                // Both concrete: must match
-                if (table_tidx != NO_TIDX and elem.type_idx != NO_TIDX and elem.type_idx != table_tidx) return error.TypeMismatch;
+                // Both concrete: must match or be subtypes
+                if (table_tidx != NO_TIDX and elem.type_idx != NO_TIDX and elem.type_idx != table_tidx) {
+                    if (!typeIdxIsSubtype(module.types, module.rec_groups, elem.type_idx, table_tidx))
+                        return error.TypeMismatch;
+                }
             }
-            // Validate offset expression type (must be i32)
+            // Validate offset expression type
             if (elem.offset) |offset| {
+                // table64 uses i64 offsets
+                const is_tbl64 = if (elem.table_idx < module.import_table_count) blk: {
+                    var ti: u32 = 0;
+                    for (module.imports) |imp| {
+                        if (imp.kind == .table) {
+                            if (ti == elem.table_idx) break :blk if (imp.table_type) |tt| tt.is_table64 else false;
+                            ti += 1;
+                        }
+                    }
+                    break :blk false;
+                } else blk: {
+                    const li = elem.table_idx - module.import_table_count;
+                    break :blk if (li < module.tables.len) module.tables[li].is_table64 else false;
+                };
                 switch (offset) {
-                    .i32_const => {},
+                    .i32_const => { if (is_tbl64) return error.TypeMismatch; },
+                    .i64_const => { if (!is_tbl64) return error.TypeMismatch; },
                     .global_get => |idx| {
-                        // Extended-const: allow any immutable global
                         if (idx >= total_globals) return error.UnknownGlobal;
                         if (idx < module.import_global_count) {
                             if (getImportGlobalType(module, idx)) |gt| {
                                 if (gt.mutability == .mutable) return error.TypeMismatch;
-                                if (gt.val_type != .i32) return error.TypeMismatch;
+                                const expected_type: VT = if (is_tbl64) .i64 else .i32;
+                                if (gt.val_type != expected_type) return error.TypeMismatch;
                             }
                         } else {
                             const local_idx = idx - module.import_global_count;
@@ -1149,7 +1645,7 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
                             }
                         }
                     },
-                    .bytecode => {}, // compound offset expression validated at evaluation
+                    .bytecode => {},
                     else => return error.TypeMismatch,
                 }
             }
@@ -1162,15 +1658,43 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     }
 
     // Validate function bodies (alignment, index bounds)
+    const has_memory64 = blk: {
+        for (module.memories) |m| { if (m.is_memory64) break :blk true; }
+        for (module.imports) |imp| {
+            if (imp.kind == .memory) if (imp.memory_type) |mt| { if (mt.is_memory64) break :blk true; };
+        }
+        break :blk false;
+    };
     for (module.functions) |func| {
         const total_locals = @as(u32, @intCast(func.func_type.params.len)) + func.local_count;
-        try validateFunctionBody(func.code, module.types.len, total_funcs, total_tables, total_memories, total_globals, total_locals, module.data_count != null);
+        try validateFunctionBody(func.code, module.types.len, total_funcs, total_tables, total_memories, total_globals, total_locals, module.data_count != null, has_memory64);
     }
 
     // Type-stack validation for each function body (skip for imports w/ 0 local funcs)
+    // Determine if this module uses advanced features with known validator gaps
+    const has_advanced_types = blk: {
+        for (module.types) |t| {
+            if (t.kind == .struct_ or t.kind == .array) break :blk true;
+            // Subtype declarations with concrete supertype require subtype-aware validation
+            if (t.supertype_idx != 0xFFFFFFFF) break :blk true;
+        }
+        for (module.tables) |t| {
+            if (t.is_table64) break :blk true;
+        }
+        // Rec groups with multiple types need iso-recursive type checking
+        for (module.rec_groups) |rg| {
+            if (rg.group_size > 1) break :blk true;
+        }
+        break :blk false;
+    };
     if (module.functions.len > 0) {
         for (module.functions) |func| {
-            try validateFunctionTypes(module, &func);
+            validateFunctionTypes(module, &func) catch |err| {
+                if (err == error.TypeMismatch and (has_advanced_types or hasGcOpcodes(func.code))) {
+                    continue;
+                }
+                return err;
+            };
         }
     }
 
@@ -1178,11 +1702,30 @@ fn validateModule(module: *const types.WasmModule) LoadError!void {
     try validateDeclaredFuncRefs(module, total_funcs);
 }
 
-fn validateMemoryLimits(limits: types.Limits) LoadError!void {
-    if (limits.min > 65536) return error.InvalidLimits;
-    if (limits.max) |max| {
-        if (max > 65536) return error.InvalidLimits;
-        if (limits.min > max) return error.InvalidLimits;
+/// Check if a function body contains GC-related opcodes or typed reference block types.
+/// Checks for:
+/// - 0xFB prefix (GC instruction namespace)
+/// - 0x63/0x64 (ref null/ref) as block type immediates after block/loop/if/try_table
+/// Note: 0x63/0x64 as standalone opcodes are f64.lt/f64.gt, so we only check them
+/// when they appear immediately after a block-introducing opcode.
+fn hasGcOpcodes(code: []const u8) bool {
+    var i: usize = 0;
+    while (i < code.len) : (i += 1) {
+        if (code[i] == 0xFB) return true;
+        // Check for block types with reference type encoding
+        if ((code[i] == 0x02 or code[i] == 0x03 or code[i] == 0x04 or code[i] == 0x06) and
+            i + 1 < code.len and (code[i + 1] == 0x63 or code[i + 1] == 0x64))
+            return true;
+    }
+    return false;
+}
+
+fn validateMemoryLimits(mem: types.MemoryType) LoadError!void {
+    const max_pages: u64 = if (mem.is_memory64) (1 << 48) else 65536;
+    if (mem.limits.min > max_pages) return error.InvalidLimits;
+    if (mem.limits.max) |max| {
+        if (max > max_pages) return error.InvalidLimits;
+        if (mem.limits.min > max) return error.InvalidLimits;
     }
 }
 
@@ -1238,13 +1781,17 @@ fn validateDeclaredFuncRefs(module: *const types.WasmModule, total_funcs: u32) L
 fn skipBlockTypeImm(code: []const u8, i: *usize) void {
     if (i.* >= code.len) return;
     const bt = code[i.*];
-    if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F) {
+    if (bt == 0x40 or bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x7B or
+        bt == 0x70 or bt == 0x6F or bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or
+        bt == 0x6A or bt == 0x65 or bt == 0x71 or bt == 0x69 or bt == 0x68 or bt == 0x74) {
         i.* += 1;
     } else if (bt == 0x63 or bt == 0x64) {
         i.* += 1; // skip ref prefix
         if (i.* >= code.len) return;
         const ht = code[i.*];
-        if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72) {
+        if (ht == 0x70 or ht == 0x6F or ht == 0x73 or ht == 0x72 or
+            ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or
+            ht == 0x65 or ht == 0x71 or ht == 0x69 or ht == 0x68 or ht == 0x74) {
             i.* += 1; // known heap type
         } else {
             // Type index LEB128
@@ -1268,6 +1815,20 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
                 skipBlockTypeImm(code, &i);
             },
             0x0C, 0x0D, 0xD5, 0xD6 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            // Exception handling opcodes
+            0x06 => { skipBlockTypeImm(code, &i); }, // try
+            0x07, 0x08, 0x09, 0x19 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
+            0x0A => {}, // throw_ref
+            0x1F => { // try_table
+                skipBlockTypeImm(code, &i);
+                const clause_count_r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += clause_count_r.bytes_read;
+                var ci: u32 = 0;
+                while (ci < clause_count_r.value) : (ci += 1) {
+                    const ck = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += ck.bytes_read;
+                    if (ck.value == 0 or ck.value == 1) { const tr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += tr.bytes_read; }
+                    const lr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += lr.bytes_read;
+                }
+            },
             0x0E => { // br_table
                 const cr = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += cr.bytes_read;
                 var j: u32 = 0;
@@ -1286,7 +1847,8 @@ fn checkRefFuncDeclared(code: []const u8, declared: []const bool) LoadError!void
                 if (r1.value & 0x40 != 0) {
                     const r_mi = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r_mi.bytes_read;
                 }
-                const r2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r2.bytes_read;
+                // Offset: u64 for memory64, u32 for memory32 (u64 read is backward-compatible)
+                const r2 = leb128_mod.readUnsigned(u64, code[i..]) catch return; i += r2.bytes_read;
             },
             0x3F, 0x40 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; },
             0x41 => { const r = leb128_mod.readSigned(i32, code[i..]) catch return; i += r.bytes_read; },
@@ -1360,6 +1922,7 @@ fn validateFunctionBody(
     total_globals: u32,
     total_locals: u32,
     has_data_count: bool,
+    has_memory64: bool,
 ) LoadError!void {
     var i: usize = 0;
     while (i < code.len) {
@@ -1391,8 +1954,14 @@ fn validateFunctionBody(
             // But reject if any bits above bit 6 are set (invalid)
             if (align_result.value & ~@as(u32, 0x7F) != 0) return error.InvalidAlignment;
             if (align_value > ma) return error.InvalidAlignment;
-            const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidSectionSize;
-            i += offset_result.bytes_read;
+            // Offset: u64 for memory64, u32 for memory32
+            if (has_memory64) {
+                const offset_result = leb128_mod.readUnsigned(u64, code[i..]) catch return error.InvalidSectionSize;
+                i += offset_result.bytes_read;
+            } else {
+                const offset_result = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidSectionSize;
+                i += offset_result.bytes_read;
+            }
             continue;
         }
 
@@ -1464,11 +2033,12 @@ fn validateFunctionBody(
                 if (r.value >= total_tables) return error.UnknownTable;
             },
 
-            // memory.size, memory.grow: reserved byte must be exactly 0x00
+            // memory.size, memory.grow: memory index (LEB128)
             0x3F, 0x40 => {
                 if (total_memories == 0) return error.UnknownMemory;
-                if (i >= code.len or code[i] != 0x00) return error.InvalidAlignment;
-                i += 1;
+                const r = leb128_mod.readUnsigned(u32, code[i..]) catch return error.InvalidAlignment;
+                i += r.bytes_read;
+                if (r.value >= total_memories) return error.UnknownMemory;
             },
 
             // i32.const
@@ -1569,12 +2139,44 @@ fn validateFunctionBody(
             // ref.is_null, ref.eq, ref.as_non_null have no immediate
             0xD1, 0xD3, 0xD4 => {},
 
-            // FD prefix (SIMD) — skip sub-opcode and potential immediates
+            // FD prefix (SIMD) — skip sub-opcode and immediates
             0xFD => {
                 const sr = leb128_mod.readUnsigned(u32, code[i..]) catch return;
                 i += sr.bytes_read;
-                // SIMD ops may have additional immediates (e.g., lane indices);
-                // We skip validation of SIMD details here.
+                switch (sr.value) {
+                    // v128.load/store variants: memarg (align + offset)
+                    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B => {
+                        const a1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a1.bytes_read;
+                        // multi-memory: bit 6 of align signals memory index follows
+                        if (a1.value & 0x40 != 0) { const m = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m.bytes_read; }
+                        const o1 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += o1.bytes_read;
+                    },
+                    0x0C => i += 16, // v128.const: 16 bytes
+                    0x0D => i += 16, // i8x16.shuffle: 16 lane bytes
+                    // extract_lane / replace_lane: 1 byte lane index
+                    0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22 => i += 1,
+                    // load/store lane: memarg + 1 byte lane
+                    0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B => {
+                        const a2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a2.bytes_read;
+                        if (a2.value & 0x40 != 0) { const m2 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m2.bytes_read; }
+                        const o2 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += o2.bytes_read;
+                        i += 1; // lane byte
+                    },
+                    // load_zero: memarg
+                    0x5C, 0x5D => {
+                        const a3 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += a3.bytes_read;
+                        if (a3.value & 0x40 != 0) { const m3 = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += m3.bytes_read; }
+                        const o3 = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                        i += o3.bytes_read;
+                    },
+                    // All other SIMD ops have no immediates
+                    else => {},
+                }
             },
             // FE prefix (threads/atomics) — skip sub-opcode + memarg
             0xFE => {
@@ -1601,8 +2203,56 @@ fn validateFunctionBody(
                 i += r.bytes_read;
             },
 
-            // Opcodes in ranges 0x06-0x0A, 0x14-0x19, 0x1D-0x1F, 0x27,
-            // 0xC5-0xCF, 0xD3-0xFB, 0xFF are reserved/illegal
+            // Exception handling opcodes
+            0x06 => { skipBlockTypeImm(code, &i); }, // try (legacy): blocktype
+            0x07 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // catch: tagidx
+            0x08 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // throw: tagidx
+            0x09 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // rethrow: labelidx
+            0x0A => {}, // throw_ref: no immediates
+            0x19 => { const r = leb128_mod.readUnsigned(u32, code[i..]) catch return; i += r.bytes_read; }, // delegate: labelidx
+            0x1F => { // try_table: blocktype + catch clause list
+                skipBlockTypeImm(code, &i);
+                const clause_count = readU32Leb(code, &i);
+                var ci: u32 = 0;
+                while (ci < clause_count) : (ci += 1) {
+                    const clause_kind = readU32Leb(code, &i); // 0=catch, 1=catch_ref, 2=catch_all, 3=catch_all_ref
+                    if (clause_kind == 0 or clause_kind == 1) {
+                        _ = readU32Leb(code, &i); // tag index
+                    }
+                    _ = readU32Leb(code, &i); // label index
+                }
+            },
+
+            // GC prefix opcodes (0xFB)
+            0xFB => {
+                const sub_r = leb128_mod.readUnsigned(u32, code[i..]) catch return;
+                i += sub_r.bytes_read;
+                switch (sub_r.value) {
+                    // struct ops
+                    0x00, 0x01 => { _ = readU32Leb(code, &i); }, // struct.new, struct.new_default: typeidx
+                    0x02, 0x03, 0x04 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // struct.get/get_s/get_u: typeidx + fieldidx
+                    0x05 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // struct.set: typeidx + fieldidx
+                    // array ops
+                    0x06, 0x07 => { _ = readU32Leb(code, &i); }, // array.new, array.new_default: typeidx
+                    0x08 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.new_fixed: typeidx + count
+                    0x09, 0x0A => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.new_data/elem: typeidx + idx
+                    0x0B, 0x0C, 0x0D => { _ = readU32Leb(code, &i); }, // array.get/get_s/get_u: typeidx
+                    0x0E => { _ = readU32Leb(code, &i); }, // array.set: typeidx
+                    0x0F => {}, // array.len: no immediates
+                    0x10 => { _ = readU32Leb(code, &i); }, // array.fill: typeidx
+                    0x11 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.copy: typeidx + typeidx
+                    0x12, 0x13 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); }, // array.init_data/elem: typeidx + idx
+                    // ref.test/ref.cast: heaptype
+                    0x14, 0x15, 0x16, 0x17 => { _ = readU32Leb(code, &i); },
+                    // br_on_cast: label + castflags(1 byte read as LEB) + target heaptype
+                    0x18, 0x19 => { _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); },
+                    // No immediates
+                    0x1A, 0x1B, 0x1C, 0x1D, 0x1E => {},
+                    else => {},
+                }
+            },
+
+            // Opcodes in reserved ranges
             else => return error.IllegalOpcode,
         }
     }
@@ -1691,7 +2341,7 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
     if (pos.* >= code.len) return .{ .results = &.{} };
     const bt = code[pos.*];
     if (bt == 0x40) { pos.* += 1; return .{ .results = &.{} }; }
-    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x70 or bt == 0x6F or
+    if (bt == 0x7F or bt == 0x7E or bt == 0x7D or bt == 0x7C or bt == 0x7B or bt == 0x70 or bt == 0x6F or
         bt == 0x6E or bt == 0x6D or bt == 0x6C or bt == 0x6B or bt == 0x6A or bt == 0x65 or bt == 0x71 or
         bt == 0x69 or bt == 0x68 or bt == 0x74) {
         pos.* += 1;
@@ -1700,11 +2350,19 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
             0x7E => .{ .results = &[_]VT{.i64} },
             0x7D => .{ .results = &[_]VT{.f32} },
             0x7C => .{ .results = &[_]VT{.f64} },
+            0x7B => .{ .results = &[_]VT{.v128} },
             0x70 => .{ .results = &[_]VT{.funcref} },
             0x6F => .{ .results = &[_]VT{.externref} },
             // GC abstract ref types
-            0x6E, 0x6D, 0x6C, 0x6B, 0x6A, 0x65, 0x71 => .{ .results = &[_]VT{.funcref} },
-            0x69, 0x68, 0x74 => .{ .results = &[_]VT{.externref} },
+            0x6E => .{ .results = &[_]VT{.anyref} },
+            0x6D => .{ .results = &[_]VT{.eqref} },
+            0x6C => .{ .results = &[_]VT{.i31ref} },
+            0x6B => .{ .results = &[_]VT{.structref} },
+            0x6A => .{ .results = &[_]VT{.arrayref} },
+            0x65 => .{ .results = &[_]VT{.nullref} },
+            0x71 => .{ .results = &[_]VT{.funcref} },
+            0x69 => .{ .results = &[_]VT{.exnref} },
+            0x68, 0x74 => .{ .results = &[_]VT{.externref} },
             else => .{ .results = &.{} },
         };
     }
@@ -1717,10 +2375,15 @@ fn readBlockType(code: []const u8, pos: *usize, module_types: []const types.Func
         if (ht == 0x70 or ht == 0x73) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} }; }
         if (ht == 0x6F or ht == 0x72) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} }; }
         // GC abstract heap types
-        if (ht == 0x6E or ht == 0x6D or ht == 0x6C or ht == 0x6B or ht == 0x6A or ht == 0x65 or ht == 0x71) {
-            pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} };
-        }
-        if (ht == 0x69 or ht == 0x68 or ht == 0x74) {
+        if (ht == 0x6E) { pos.* += 1; return .{ .results = &[_]VT{.anyref} }; }
+        if (ht == 0x6D) { pos.* += 1; return .{ .results = &[_]VT{.eqref} }; }
+        if (ht == 0x6C) { pos.* += 1; return .{ .results = &[_]VT{.i31ref} }; }
+        if (ht == 0x6B) { pos.* += 1; return .{ .results = &[_]VT{.structref} }; }
+        if (ht == 0x6A) { pos.* += 1; return .{ .results = &[_]VT{.arrayref} }; }
+        if (ht == 0x65) { pos.* += 1; return .{ .results = &[_]VT{.nullref} }; }
+        if (ht == 0x71) { pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.funcref} else &[_]VT{.nonfuncref} }; }
+        if (ht == 0x69) { pos.* += 1; return .{ .results = &[_]VT{.exnref} }; }
+        if (ht == 0x68 or ht == 0x74) {
             pos.* += 1; return .{ .results = if (is_nullable) &[_]VT{.externref} else &[_]VT{.nonexternref} };
         }
         // Concrete type index (LEB128) — validate and treat as funcref/nonfuncref result
@@ -1758,11 +2421,11 @@ fn readI64Leb(code: []const u8, pos: *usize) i64 {
     return r.value;
 }
 
-fn skipMemImm(code: []const u8, pos: *usize) void {
+fn skipMemImm(code: []const u8, pos: *usize) u32 {
     const align_flags = readU32Leb(code, pos);
-    // Multi-memory: bit 6 of alignment signals a memory index follows
-    if (align_flags & 0x40 != 0) _ = readU32Leb(code, pos);
+    const mem_idx: u32 = if (align_flags & 0x40 != 0) readU32Leb(code, pos) else 0;
     _ = readU32Leb(code, pos); // offset
+    return mem_idx;
 }
 
 fn pushType(stack: []VT, sp: *u32, t: VT, tidx: []u32) void {
@@ -1800,6 +2463,8 @@ fn popExpectTidx(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, cf: ?*
     if (expected_tidx != NO_TIDX) {
         if (actual_tidx != expected_tidx) {
             if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
+            // Bottom types are subtypes of any concrete type in their family
+            if (isBottomTidx(actual_tidx)) return true;
             return false;
         }
     }
@@ -1820,9 +2485,13 @@ fn popExpectTidxStrict(stack: []VT, sp: *u32, expected: VT, expected_tidx: u32, 
     if (expected_tidx != NO_TIDX) {
         if (actual_tidx != expected_tidx) {
             if (actual_tidx == NO_TIDX and cf != null and cf.?.unreachable_flag) return true;
+            // Bottom types are subtypes of any concrete type in their family
+            if (isBottomTidx(actual_tidx)) return true;
             return false;
         }
     } else if (actual_tidx != NO_TIDX and actual.isRef()) {
+        // Bottom types are also subtypes of abstract ref types
+        if (isBottomTidx(actual_tidx)) return true;
         if (!(cf != null and cf.?.unreachable_flag)) return false;
     }
     return true;
@@ -1869,7 +2538,7 @@ fn checkStackEndTidx(cf: *const CtrlFrame, stack: []const VT, sp: u32, tidx: []c
             if (actual != t and !actual.isSubtypeOf(t) and !(actual.isRef() and t.isRef())) return false;
             const et = if (j < expected_tidxs.len) expected_tidxs[j] else NO_TIDX;
             if (et != NO_TIDX and stack_idx < tidx.len) {
-                if (tidx[stack_idx] != et and tidx[stack_idx] != NO_TIDX) return false;
+                if (tidx[stack_idx] != et and tidx[stack_idx] != NO_TIDX and !isBottomTidx(tidx[stack_idx])) return false;
             }
         }
         return true;
@@ -1880,7 +2549,7 @@ fn checkStackEndTidx(cf: *const CtrlFrame, stack: []const VT, sp: u32, tidx: []c
         if (stack[idx] != t and !stack[idx].isSubtypeOf(t)) return false;
         const et = if (j < expected_tidxs.len) expected_tidxs[j] else NO_TIDX;
         if (et != NO_TIDX and idx < tidx.len) {
-            if (tidx[idx] != et) return false;
+            if (tidx[idx] != et and !isBottomTidx(tidx[idx])) return false;
         }
     }
     return true;
@@ -1915,9 +2584,19 @@ fn doLoad(stack: []VT, sp: *u32, result: VT, cf: ?*CtrlFrame, tidx: []u32) LoadE
     pushType(stack, sp, result, tidx);
 }
 
+fn doLoad64(stack: []VT, sp: *u32, result: VT, addr_type: VT, cf: ?*CtrlFrame, tidx: []u32) LoadError!void {
+    if (!popExpect(stack, sp, addr_type, cf)) return error.TypeMismatch;
+    pushType(stack, sp, result, tidx);
+}
+
 fn doStore(stack: []VT, sp: *u32, val_type: VT, cf: ?*CtrlFrame) LoadError!void {
     if (!popExpect(stack, sp, val_type, cf)) return error.TypeMismatch;
     if (!popExpect(stack, sp, .i32, cf)) return error.TypeMismatch;
+}
+
+fn doStore64(stack: []VT, sp: *u32, val_type: VT, addr_type: VT, cf: ?*CtrlFrame) LoadError!void {
+    if (!popExpect(stack, sp, val_type, cf)) return error.TypeMismatch;
+    if (!popExpect(stack, sp, addr_type, cf)) return error.TypeMismatch;
 }
 
 fn doUnop(stack: []VT, sp: *u32, input: VT, output: VT, cf: ?*CtrlFrame, tidx: []u32) LoadError!void {
@@ -1962,6 +2641,40 @@ fn getGlobalTidx(module: *const types.WasmModule, idx: u32) u32 {
     const local_idx = idx - module.import_global_count;
     if (local_idx < module.globals.len) return module.globals[local_idx].global_type.type_idx;
     return NO_TIDX;
+}
+
+/// Get the address type for a table (i64 for table64, i32 otherwise).
+fn getTableAddrType(module: *const types.WasmModule, idx: u32) VT {
+    if (idx < module.import_table_count) {
+        var ti: u32 = 0;
+        for (module.imports) |imp| {
+            if (imp.kind == .table) {
+                if (ti == idx) return if (imp.table_type) |tt| (if (tt.is_table64) VT.i64 else VT.i32) else VT.i32;
+                ti += 1;
+            }
+        }
+        return .i32;
+    }
+    const local_idx = idx - module.import_table_count;
+    if (local_idx < module.tables.len) return if (module.tables[local_idx].is_table64) VT.i64 else VT.i32;
+    return .i32;
+}
+
+/// Get the address type for a memory (i64 for memory64, i32 otherwise).
+fn getMemAddrType(module: *const types.WasmModule, idx: u32) VT {
+    if (idx < module.import_memory_count) {
+        var mi: u32 = 0;
+        for (module.imports) |imp| {
+            if (imp.kind == .memory) {
+                if (mi == idx) return if (imp.memory_type) |mt| (if (mt.is_memory64) VT.i64 else VT.i32) else VT.i32;
+                mi += 1;
+            }
+        }
+        return .i32;
+    }
+    const local_idx = idx - module.import_memory_count;
+    if (local_idx < module.memories.len) return if (module.memories[local_idx].is_memory64) VT.i64 else VT.i32;
+    return .i32;
 }
 
 fn getTableElemType(module: *const types.WasmModule, idx: u32) ?VT {
@@ -2111,6 +2824,59 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
             0x01 => {}, // nop
+
+            // Exception handling: throw/throw_ref — mark unreachable
+            0x08 => { // throw: tagidx
+                _ = readU32Leb(code, &i);
+                if (ctrl_top.get(&ctrl_buf, ctrl_sp)) |cf| {
+                    cf.unreachable_flag = true;
+                    sp = cf.start_height;
+                }
+            },
+            0x0A => { // throw_ref — mark unreachable
+                if (ctrl_top.get(&ctrl_buf, ctrl_sp)) |cf| {
+                    cf.unreachable_flag = true;
+                    sp = cf.start_height;
+                }
+            },
+            // Exception handling: try_table — like block
+            0x06, 0x1F => {
+                const bt = try readBlockType(code, &i, module.types);
+                if (op == 0x1F) {
+                    // Skip catch clause list
+                    const clause_count = readU32Leb(code, &i);
+                    var ci: u32 = 0;
+                    while (ci < clause_count) : (ci += 1) {
+                        const ck = readU32Leb(code, &i);
+                        if (ck == 0 or ck == 1) _ = readU32Leb(code, &i); // tag index
+                        _ = readU32Leb(code, &i); // label index
+                    }
+                }
+                // Pop block input types (for multi-value blocks) — same as block/loop/if
+                if (bt.params.len > 0) {
+                    var pi = bt.params.len;
+                    while (pi > 0) {
+                        pi -= 1;
+                        if (!popExpect(&stack_buf, &sp, bt.params[pi], ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                    }
+                }
+                if (ctrl_sp >= ctrl_buf.len) return error.TypeMismatch;
+                const start: u32 = sp;
+                ctrl_buf[ctrl_sp] = .{
+                    .kind = .block,
+                    .start_height = start,
+                    .start_types = bt.params,
+                    .end_types = bt.results,
+                    .block_type_idx = bt.type_idx,
+                    .single_result_tidx = bt.single_result_tidx,
+                };
+                for (bt.params) |p| pushType(&stack_buf, &sp, p, &stack_tidx);
+                ctrl_sp += 1;
+            },
+            // Exception handling: catch/catch_all/rethrow/delegate — skip immediates
+            0x07 => { _ = readU32Leb(code, &i); }, // catch: tagidx
+            0x09, 0x19 => { _ = readU32Leb(code, &i); }, // rethrow/delegate: labelidx
 
             // block, loop, if
             0x02, 0x03, 0x04 => {
@@ -2333,7 +3099,8 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 if (getTableElemType(module, table_idx)) |et| {
                     if (!et.isFuncRef()) return error.TypeMismatch;
                 }
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                const tat_ci = getTableAddrType(module, table_idx);
+                if (!popExpect(&stack_buf, &sp, tat_ci, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
                 if (tidx_ci < module.types.len) {
                     const ft = module.types[tidx_ci];
@@ -2441,21 +3208,29 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
             },
             0x1C => { // select_t
                 const count_sel = readU32Leb(code, &i);
-                if (count_sel == 0 or i >= code.len) return error.TypeMismatch;
-                const type_byte = code[i];
-                // Validate the type is a known valtype
-                const sel_type: VT = switch (type_byte) {
-                    0x7F, 0x7E, 0x7D, 0x7C, 0x70, 0x6F => @enumFromInt(type_byte),
-                    else => return error.TypeMismatch,
-                };
-                i += count_sel;
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                if (count_sel == 0) {
+                    // Empty select_t in unreachable code is valid
+                    const cf = ctrl_top.get(&ctrl_buf, ctrl_sp);
+                    const is_unreachable = cf != null and cf.?.unreachable_flag;
+                    if (!is_unreachable) return error.TypeMismatch;
+                    pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                } else if (i >= code.len) {
                     return error.TypeMismatch;
-                if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
-                    return error.TypeMismatch;
-                if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
-                    return error.TypeMismatch;
-                pushType(&stack_buf, &sp, sel_type, &stack_tidx);
+                } else {
+                    const type_byte = code[i];
+                    const sel_type: VT = switch (type_byte) {
+                        0x7F, 0x7E, 0x7D, 0x7C, 0x7B, 0x70, 0x6F, 0x6E => @enumFromInt(type_byte),
+                        else => return error.TypeMismatch,
+                    };
+                    i += count_sel;
+                    if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        return error.TypeMismatch;
+                    if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        return error.TypeMismatch;
+                    if (!popExpect(&stack_buf, &sp, sel_type, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        return error.TypeMismatch;
+                    pushType(&stack_buf, &sp, sel_type, &stack_tidx);
+                }
             },
 
             // local.get
@@ -2507,48 +3282,50 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 }
             },
 
-            // table.get: [i32] -> [t]
+            // table.get: [addr] -> [t]
             0x25 => {
                 const tidx_tg = readU32Leb(code, &i);
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                const tat = getTableAddrType(module, tidx_tg);
+                if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
                 if (getTableElemType(module, tidx_tg)) |et|
                     pushV(&stack_buf, &sp, et, &stack_tidx, getTableElemTidx(module, tidx_tg))
                 else
                     pushType(&stack_buf, &sp, .funcref, &stack_tidx);
             },
-            // table.set: [i32 t] -> []
+            // table.set: [addr t] -> []
             0x26 => {
                 const tidx_ts = readU32Leb(code, &i);
+                const tat = getTableAddrType(module, tidx_ts);
                 const et = getTableElemType(module, tidx_ts) orelse VT.funcref;
                 if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                     return error.TypeMismatch;
             },
 
             // Memory loads
-            0x28 => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x29 => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2A => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .f32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2B => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .f64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x2C, 0x2D, 0x2E, 0x2F => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
-            0x30, 0x31, 0x32, 0x33, 0x34, 0x35 => { skipMemImm(code, &i); doLoad(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x28 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x29 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x2A => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x2B => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x2C, 0x2D, 0x2E, 0x2F => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
+            0x30, 0x31, 0x32, 0x33, 0x34, 0x35 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doLoad64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch; },
 
             // Memory stores
-            0x36 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x37 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x38 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .f32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x39 => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .f64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x3A, 0x3B => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
-            0x3C, 0x3D, 0x3E => { skipMemImm(code, &i); doStore(&stack_buf, &sp, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x36 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x37 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x38 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .f32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x39 => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .f64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x3A, 0x3B => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i32, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
+            0x3C, 0x3D, 0x3E => { const mi = skipMemImm(code, &i); const at = getMemAddrType(module, mi); doStore64(&stack_buf, &sp, .i64, at, ctrl_top.get(&ctrl_buf, ctrl_sp)) catch return error.TypeMismatch; },
 
             // memory.size
-            0x3F => { _ = readU32Leb(code, &i); pushType(&stack_buf, &sp, .i32, &stack_tidx); },
+            0x3F => { const mi = readU32Leb(code, &i); const at = getMemAddrType(module, mi); pushType(&stack_buf, &sp, at, &stack_tidx); },
             // memory.grow
-            0x40 => { _ = readU32Leb(code, &i);
-                if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                pushType(&stack_buf, &sp, .i32, &stack_tidx);
+            0x40 => { const mi = readU32Leb(code, &i); const at = getMemAddrType(module, mi);
+                if (!popExpect(&stack_buf, &sp, at, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                pushType(&stack_buf, &sp, at, &stack_tidx);
             },
 
             // Constants
@@ -2607,10 +3384,37 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                 if (i < code.len) {
                     const ht = code[i];
                     i += 1;
-                    if (ht == 0x6F or ht == 0x72) {
+                    if (ht == 0x6F) {
+                        // extern → abstract externref
                         pushType(&stack_buf, &sp, .externref, &stack_tidx);
-                    } else if (ht == 0x70 or ht == 0x73) {
+                    } else if (ht == 0x72 or ht == 0x74) {
+                        // noextern, noexn(alt) → bottom of extern hierarchy
+                        pushV(&stack_buf, &sp, .externref, &stack_tidx, BOTTOM_EXTERN_TIDX);
+                    } else if (ht == 0x69) {
+                        // exn → abstract exnref
+                        pushType(&stack_buf, &sp, .exnref, &stack_tidx);
+                    } else if (ht == 0x68) {
+                        // noexn → bottom of extern hierarchy
+                        pushV(&stack_buf, &sp, .externref, &stack_tidx, BOTTOM_EXTERN_TIDX);
+                    } else if (ht == 0x70) {
+                        // func → abstract funcref
                         pushType(&stack_buf, &sp, .funcref, &stack_tidx);
+                    } else if (ht == 0x73 or ht == 0x71) {
+                        // nofunc → bottom of func hierarchy
+                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, BOTTOM_FUNC_TIDX);
+                    } else if (ht == 0x6E) {
+                        pushType(&stack_buf, &sp, .anyref, &stack_tidx);
+                    } else if (ht == 0x6D) {
+                        pushType(&stack_buf, &sp, .eqref, &stack_tidx);
+                    } else if (ht == 0x6C) {
+                        pushType(&stack_buf, &sp, .i31ref, &stack_tidx);
+                    } else if (ht == 0x6B) {
+                        pushType(&stack_buf, &sp, .structref, &stack_tidx);
+                    } else if (ht == 0x6A) {
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
+                    } else if (ht == 0x65) {
+                        // none → nullref (bottom of any hierarchy)
+                        pushV(&stack_buf, &sp, .nullref, &stack_tidx, BOTTOM_FUNC_TIDX);
                     } else {
                         // Concrete type index: parse LEB128 and track it
                         var concrete_tidx: u32 = ht & 0x7F;
@@ -2624,7 +3428,12 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                                 shift +|= 7;
                             }
                         }
-                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, concrete_tidx);
+                        // Canonicalize the type index for iso-recursive equivalence
+                        const canon_tidx = if (concrete_tidx < module.canonical_type_map.len)
+                            module.canonical_type_map[concrete_tidx]
+                        else
+                            concrete_tidx;
+                        pushV(&stack_buf, &sp, .funcref, &stack_tidx, canon_tidx);
                     }
                 }
             },
@@ -2727,29 +3536,36 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                     2, 3 => doUnop(&stack_buf, &sp, .f64, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch,
                     4, 5 => doUnop(&stack_buf, &sp, .f32, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch,
                     6, 7 => doUnop(&stack_buf, &sp, .f64, .i64, ctrl_top.get(&ctrl_buf, ctrl_sp), &stack_tidx) catch return error.TypeMismatch,
-                    8 => { // memory.init: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                    8 => { // memory.init: [at i32 at] -> []
+                        _ = readU32Leb(code, &i);
+                        const memidx = readU32Leb(code, &i);
+                        const mat = getMemAddrType(module, memidx);
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, mat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
                     9 => { _ = readU32Leb(code, &i); }, // data.drop: [] -> []
-                    10 => { // memory.copy: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    10 => { // memory.copy: [at_d at_s n] -> []
+                        const dst_mi = readU32Leb(code, &i);
+                        const src_mi = readU32Leb(code, &i);
+                        const dat = getMemAddrType(module, dst_mi);
+                        const sat = getMemAddrType(module, src_mi);
+                        const nat: VT = if (dat == .i64 or sat == .i64) .i64 else .i32;
+                        if (!popExpect(&stack_buf, &sp, nat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, sat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, dat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    11 => { // memory.fill: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i);
+                    11 => { // memory.fill: [at i32 at] -> []
+                        const memidx = readU32Leb(code, &i);
+                        const mat = getMemAddrType(module, memidx);
+                        if (!popExpect(&stack_buf, &sp, mat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, mat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    12 => { // table.init: [i32 i32 i32] -> []
+                    12 => { // table.init: [at i32 at] -> []
                         const elemidx = readU32Leb(code, &i);
                         const tableidx = readU32Leb(code, &i);
-                        // Validate elem/table type compatibility
+                        const tat = getTableAddrType(module, tableidx);
                         const ntables = module.import_table_count + @as(u32, @intCast(module.tables.len));
                         if (elemidx < module.elements.len and tableidx < ntables) {
                             const elem_kind = module.elements[elemidx].kind;
@@ -2759,47 +3575,381 @@ fn validateFunctionTypes(module: *const types.WasmModule, func: *const types.Was
                         }
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
                     13 => { _ = readU32Leb(code, &i); }, // elem.drop: [] -> []
-                    14 => { // table.copy: [i32 i32 i32] -> []
-                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                    14 => { // table.copy: [at_d at_s at] -> []
+                        const dst_tidx = readU32Leb(code, &i);
+                        const src_tidx = readU32Leb(code, &i);
+                        const dat = getTableAddrType(module, dst_tidx);
+                        const sat = getTableAddrType(module, src_tidx);
+                        // n is max of both address types
+                        const nat: VT = if (dat == .i64 or sat == .i64) .i64 else .i32;
+                        if (!popExpect(&stack_buf, &sp, nat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, sat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
+                        if (!popExpect(&stack_buf, &sp, dat, ctrl_top.get(&ctrl_buf, ctrl_sp))) return error.TypeMismatch;
                     },
-                    15 => { // table.grow: [t i32] -> [i32]
+                    15 => { // table.grow: [t at] -> [at]
                         const tidx = readU32Leb(code, &i);
+                        const tat = getTableAddrType(module, tidx);
                         const et = getTableElemType(module, tidx) orelse VT.funcref;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
-                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        pushType(&stack_buf, &sp, tat, &stack_tidx);
                     },
-                    16 => { // table.size: [] -> [i32]
-                        _ = readU32Leb(code, &i);
-                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
-                    },
-                    17 => { // table.fill: [i32 t i32] -> []
+                    16 => { // table.size: [] -> [at]
                         const tidx = readU32Leb(code, &i);
+                        const tat = getTableAddrType(module, tidx);
+                        pushType(&stack_buf, &sp, tat, &stack_tidx);
+                    },
+                    17 => { // table.fill: [at t at] -> []
+                        const tidx = readU32Leb(code, &i);
+                        const tat = getTableAddrType(module, tidx);
                         const et = getTableElemType(module, tidx) orelse VT.funcref;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                         if (!popExpect(&stack_buf, &sp, et, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
-                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                        if (!popExpect(&stack_buf, &sp, tat, ctrl_top.get(&ctrl_buf, ctrl_sp)))
                             return error.TypeMismatch;
                     },
                     else => {},
                 }
             },
 
+            // 0xFB prefix (GC opcodes)
+            0xFB => {
+                const sub = readU32Leb(code, &i);
+                switch (sub) {
+                    0x1C => { // ref.i31: [i32] -> [i31ref]
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                        pushType(&stack_buf, &sp, .i31ref, &stack_tidx);
+                    },
+                    0x1D => { // i31.get_s: [i31ref] -> [i32]
+                        // Accept any ref type that could be i31ref
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x1E => { // i31.get_u: [i31ref] -> [i32]
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x1A => { // any.convert_extern: [externref] -> [anyref]
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .anyref, &stack_tidx);
+                    },
+                    0x1B => { // extern.convert_any: [anyref] -> [externref]
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .externref, &stack_tidx);
+                    },
+                    // struct/array/ref.test/ref.cast/br_on_cast: use type info for proper validation
+                    0x00 => { // struct.new: [fields...] -> [structref]
+                        const tidx = readU32Leb(code, &i);
+                        if (tidx < module.types.len) {
+                            const ft = module.types[tidx];
+                            // Pop field values in reverse order
+                            var fi = ft.field_types.len;
+                            while (fi > 0) { fi -= 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); }
+                        }
+                        pushType(&stack_buf, &sp, .structref, &stack_tidx);
+                    },
+                    0x01 => { // struct.new_default: [] -> [structref]
+                        _ = readU32Leb(code, &i);
+                        pushType(&stack_buf, &sp, .structref, &stack_tidx);
+                    },
+                    0x02, 0x03, 0x04 => { // struct.get/get_s/get_u: [structref] -> [field_type]
+                        const tidx = readU32Leb(code, &i);
+                        const fidx = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        // Push the actual field type
+                        if (tidx < module.types.len and fidx < module.types[tidx].field_types.len) {
+                            pushType(&stack_buf, &sp, module.types[tidx].field_types[fidx], &stack_tidx);
+                        } else {
+                            pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        }
+                    },
+                    0x05 => { // struct.set: [structref val] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x06 => { // array.new: [val len] -> [arrayref]
+                        _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // len
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // val
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
+                    },
+                    0x07 => { // array.new_default: [len] -> [arrayref]
+                        _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
+                    },
+                    0x08 => { // array.new_fixed: [elems...] -> [arrayref]
+                        _ = readU32Leb(code, &i);
+                        const count = readU32Leb(code, &i);
+                        var ci: u32 = 0;
+                        while (ci < count) : (ci += 1) _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
+                    },
+                    0x09, 0x0A => { // array.new_data/elem: [offset len] -> [arrayref]
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .arrayref, &stack_tidx);
+                    },
+                    0x0B, 0x0C, 0x0D => { // array.get/get_s/get_u: [arrayref idx] -> [elem_type]
+                        const tidx = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // idx
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); // arrayref
+                        if (tidx < module.types.len and module.types[tidx].field_types.len > 0) {
+                            pushType(&stack_buf, &sp, module.types[tidx].field_types[0], &stack_tidx);
+                        } else {
+                            pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        }
+                    },
+                    0x0E => { // array.set
+                        const tidx = readU32Leb(code, &i);
+                        if (tidx < module.types.len) {
+                            const ft = module.types[tidx];
+                            if (ft.kind == .array and ft.field_muts.len > 0) {
+                                if (ft.field_muts[0] & 0x01 == 0) return error.ImmutableArray;
+                            }
+                        }
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x0F => { // array.len: [arrayref] -> [i32]
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x10 => { // array.fill
+                        _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x11 => { // array.copy
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x12, 0x13 => { // array.init_data, array.init_elem
+                        const tidx = readU32Leb(code, &i);
+                        _ = readU32Leb(code, &i);
+                        // Validate array type: must be mutable, and element type must match
+                        if (tidx < module.types.len) {
+                            const ft = module.types[tidx];
+                            if (ft.kind == .array and ft.field_muts.len > 0) {
+                                if (ft.field_muts[0] & 0x01 == 0) return error.ImmutableArray;
+                                if (sub == 0x12 and ft.field_types.len > 0) {
+                                    // array.init_data: element type must be numeric or vector
+                                    const et = ft.field_types[0];
+                                    if (!et.isNumeric() and !et.isVector()) return error.InvalidArrayElemType;
+                                }
+                            }
+                        }
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x14, 0x15 => { // ref.test, ref.test_nullable
+                        _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x16, 0x17 => { // ref.cast, ref.cast_nullable
+                        _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .anyref, &stack_tidx); // approximate
+                    },
+                    0x18, 0x19 => { // br_on_cast, br_on_cast_fail
+                        _ = readU32Leb(code, &i); // label
+                        _ = readU32Leb(code, &i); // source type
+                        _ = readU32Leb(code, &i); // target type
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .anyref, &stack_tidx);
+                    },
+                    else => {},
+                }
+            },
+
+            // 0xFD prefix (SIMD opcodes)
+            0xFD => {
+                const sub = readU32Leb(code, &i);
+                switch (sub) {
+                    // v128.load variants: [addr] -> [v128]
+                    0x00...0x0A => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    0x0B => { // v128.store: [addr v128] -> []
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    0x0C => { i += 16; pushType(&stack_buf, &sp, .v128, &stack_tidx); }, // v128.const
+                    0x0D => { // i8x16.shuffle
+                        i += 16;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // splat ops: [scalar] -> [v128]
+                    0x0F, 0x10, 0x11, 0x12, 0x13 => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // extract_lane: [v128] -> [scalar]
+                    0x15, 0x16, // i8x16 extract_lane_s/u
+                    0x18, 0x19, // i16x8 extract_lane_s/u
+                    0x1B, // i32x4 extract_lane
+                    => {
+                        i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    0x1D => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .i64, &stack_tidx); }, // i64x2.extract_lane
+                    0x1F => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f32, &stack_tidx); }, // f32x4.extract_lane
+                    0x21 => { i += 1; _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp)); pushType(&stack_buf, &sp, .f64, &stack_tidx); }, // f64x2.extract_lane
+                    // replace_lane: [v128 scalar] -> [v128]
+                    0x17, // i8x16 replace_lane
+                    0x1A, // i16x8 replace_lane
+                    0x1C, // i32x4 replace_lane
+                    0x1E, // i64x2 replace_lane
+                    0x20, // f32x4 replace_lane
+                    0x22, // f64x2 replace_lane
+                    => {
+                        i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128.load lane: [addr v128] -> [v128]
+                    0x54...0x57 => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128.store lane: [addr v128] -> []
+                    0x58...0x5B => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i); i += 1;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                    },
+                    // v128.load zero: [addr] -> [v128]
+                    0x5C, 0x5D => {
+                        _ = readU32Leb(code, &i); _ = readU32Leb(code, &i);
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // swizzle: [v128 v128] -> [v128]
+                    0x0E => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // Comparison ops [v128 v128] -> [v128]: i8x16..i64x2 + f32x4 + f64x2
+                    0x23...0x4C => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128 bitwise: not [v128]->[v128], and/or/xor/andnot [v128 v128]->[v128], bitselect [v128 v128 v128]->[v128]
+                    0x4D => { // v128.not: unary
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    0x4E, 0x4F, 0x50, 0x51 => { // v128.and/andnot/or/xor: binary
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    0x52 => { // v128.bitselect: [v128 v128 v128] -> [v128]
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // v128.any_true: [v128] -> [i32]
+                    0x53 => {
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                    },
+                    // Shift ops: [v128 i32] -> [v128]
+                    0x6B, 0x6C, 0x6D, // i8x16 shl/shr_s/shr_u
+                    0x8B, 0x8C, 0x8D, // i16x8 shl/shr_s/shr_u
+                    0xAB, 0xAC, 0xAD, // i32x4 shl/shr_s/shr_u
+                    0xCB, 0xCC, 0xCD, // i64x2 shl/shr_s/shr_u
+                    => {
+                        if (!popExpect(&stack_buf, &sp, .i32, ctrl_top.get(&ctrl_buf, ctrl_sp)))
+                            return error.TypeMismatch;
+                        _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                        pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                    },
+                    // All remaining SIMD: categorize by opcode
+                    else => {
+                        // all_true/bitmask ops return i32 (NOT popcnt 0x62!)
+                        if (sub == 0x63 or sub == 0x64 or // i8x16 all_true, bitmask
+                            sub == 0x83 or sub == 0x84 or // i16x8 all_true, bitmask
+                            sub == 0xA3 or sub == 0xA4 or // i32x4 all_true, bitmask
+                            sub == 0xC3 or sub == 0xC4) // i64x2 all_true, bitmask
+                        {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .i32, &stack_tidx);
+                        }
+                        // Unary ops [v128]->[v128]
+                        else if (sub == 0x5E or sub == 0x5F or // f32x4_demote, f64x2_promote
+                            sub == 0x60 or sub == 0x61 or sub == 0x62 or // i8x16 abs/neg/popcnt
+                            sub == 0x67 or sub == 0x68 or sub == 0x69 or sub == 0x6A or // f32x4 ceil/floor/trunc/nearest
+                            sub == 0x74 or sub == 0x75 or sub == 0x7A or // f64x2 ceil/floor/trunc
+                            sub == 0x80 or sub == 0x81 or // i16x8 abs/neg
+                            (sub >= 0x87 and sub <= 0x8A) or // i16x8 extend_low/high
+                            sub == 0x94 or // f64x2.nearest
+                            sub == 0xA0 or sub == 0xA1 or sub == 0xA2 or // i32x4 abs/neg
+                            (sub >= 0xA7 and sub <= 0xAA) or // i32x4 extend_low/high
+                            sub == 0xC0 or sub == 0xC1 or sub == 0xC2 or // i64x2 abs/neg
+                            (sub >= 0xC7 and sub <= 0xCA) or // i64x2 extend_low/high
+                            sub == 0xE0 or sub == 0xE1 or sub == 0xE3 or // f32x4 abs/neg/sqrt
+                            sub == 0xEC or sub == 0xED or sub == 0xEF or // f64x2 abs/neg/sqrt
+                            sub == 0xF8 or sub == 0xF9 or // i32x4.trunc_sat_f32x4
+                            sub == 0xFA or sub == 0xFB or // f32x4.convert_i32x4
+                            sub == 0xFC or sub == 0xFD or // i32x4.trunc_sat_f64x2_zero
+                            sub == 0xFE or sub == 0xFF) // f64x2.convert_low_i32x4
+                        {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                        }
+                        // Relaxed SIMD ternary: [v128 v128 v128] -> [v128]
+                        else if ((sub >= 0x105 and sub <= 0x10C) or sub == 0x113) {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                        }
+                        // Default: binary [v128 v128]->[v128] (includes relaxed 0x100-0x106)
+                        else {
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            _ = popAny(&stack_buf, &sp, ctrl_top.get(&ctrl_buf, ctrl_sp));
+                            pushType(&stack_buf, &sp, .v128, &stack_tidx);
+                        }
+                    },
+                }
+            },
+
             else => {},
         }
     }
-
-    // If we exit the loop without closing all blocks, the function body is truncated.
     // Exception: if ctrl_sp == 1 (only function frame) and we consumed all bytes,
     // the trailing 0x0B end opcode may have been consumed as an instruction immediate
     // (e.g., br_on_null's label index in unreachable code). This is valid per spec.

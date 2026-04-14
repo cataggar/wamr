@@ -88,6 +88,9 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
     var module_idx: u32 = 0;
     var first = true;
 
+    // Storage for module definitions (module definition $name ...)
+    var module_defs: std.StringHashMapUnmanaged([]const u8) = .{};
+
     while (pos < source.len) {
         pos = wr.skipWhitespaceAndComments(source, pos);
         if (pos >= source.len) break;
@@ -105,6 +108,102 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
         const cmd = wr.classifyCommand(sexpr.text);
         switch (cmd) {
             .module => {
+                // Handle module definition/instance syntax
+                if (wr.isModuleDefinition(sexpr.text)) {
+                    // Store the definition text for later instantiation
+                    if (wr.extractModuleDefName(sexpr.text)) |name| {
+                        module_defs.put(allocator, name, sexpr.text) catch {};
+                    }
+                    // Compile it as a normal module (strip the definition keyword)
+                    const stripped = wr.stripDefinitionKeyword(allocator, sexpr.text) orelse {
+                        try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
+                        continue;
+                    };
+                    defer allocator.free(stripped);
+                    const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    var mod = wabt.text.Parser.parseModule(allocator, stripped) catch {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                        allocator.free(filename);
+                        module_idx += 1;
+                        continue;
+                    };
+                    defer mod.deinit();
+                    const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                        allocator.free(filename);
+                        module_idx += 1;
+                        continue;
+                    };
+                    try modules.put(allocator, filename, wasm_bytes);
+                    const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                    defer allocator.free(fn2);
+                    const mod_name = extractModuleName(sexpr.text);
+                    if (mod_name) |mn| {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\",\"name\":\"{s}\"}}", .{ line_num, fn2, mn });
+                    } else {
+                        try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                    }
+                    module_idx += 1;
+                    continue;
+                } else if (hasDefinitionKw(sexpr.text)) {
+                    // Unnamed module definition — just validate, don't instantiate
+                    first = true; // undo the comma
+                    continue;
+                } else if (wr.isModuleInstance(sexpr.text)) {
+                    // (module instance $inst $def) — compile a fresh copy from the definition
+                    var inst_name: ?[]const u8 = null;
+                    const def_name = blk: {
+                        var i: usize = 1;
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
+                        i += 6; // "module"
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
+                        i += 8; // "instance"
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t' or sexpr.text[i] == '\n' or sexpr.text[i] == '\r')) : (i += 1) {}
+                        // Extract instance name
+                        const ins = i;
+                        while (i < sexpr.text.len and sexpr.text[i] != ' ' and sexpr.text[i] != '\t' and sexpr.text[i] != ')') : (i += 1) {}
+                        inst_name = sexpr.text[ins..i];
+                        while (i < sexpr.text.len and (sexpr.text[i] == ' ' or sexpr.text[i] == '\t')) : (i += 1) {}
+                        // Extract def name
+                        const ds = i;
+                        while (i < sexpr.text.len and sexpr.text[i] != ' ' and sexpr.text[i] != '\t' and sexpr.text[i] != ')') : (i += 1) {}
+                        break :blk sexpr.text[ds..i];
+                    };
+                    if (module_defs.get(def_name)) |def_text| {
+                        const stripped = wr.stripDefinitionKeyword(allocator, def_text) orelse {
+                            try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
+                            continue;
+                        };
+                        defer allocator.free(stripped);
+                        const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                        var mod = wabt.text.Parser.parseModule(allocator, stripped) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        defer mod.deinit();
+                        const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        try modules.put(allocator, filename, wasm_bytes);
+                        const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                        defer allocator.free(fn2);
+                        if (inst_name) |iname| {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\",\"name\":\"{s}\"}}", .{ line_num, fn2, iname });
+                        } else {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, fn2 });
+                        }
+                        module_idx += 1;
+                    } else {
+                        try w.print("{{\"type\":\"module\",\"line\":{d}}}", .{line_num});
+                    }
+                    continue;
+                }
+
                 const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
                 if (wr.isBinaryOrQuoteModule(sexpr.text)) {
                     if (wr.isBinaryModule(sexpr.text)) {
@@ -116,7 +215,41 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                         };
                         try modules.put(allocator, filename, wasm_bytes);
                     } else {
-                        allocator.free(filename);
+                        // Quote module: decode quoted WAT text, parse, and compile
+                        const wat_text = wr.decodeQuoteStrings(allocator, sexpr.text) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        defer allocator.free(wat_text);
+                        // Wrap in (module ...) if not already
+                        const trimmed = std.mem.trimLeft(u8, wat_text, " \t\n\r");
+                        const parse_text = if (std.mem.startsWith(u8, trimmed, "(module"))
+                            wat_text
+                        else blk: {
+                            break :blk std.fmt.allocPrint(allocator, "(module {s})", .{wat_text}) catch {
+                                try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                                allocator.free(filename);
+                                module_idx += 1;
+                                continue;
+                            };
+                        };
+                        defer if (parse_text.ptr != wat_text.ptr) allocator.free(parse_text);
+                        var mod = wabt.text.Parser.parseModule(allocator, parse_text) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        defer mod.deinit();
+                        const wasm_bytes = wabt.binary.writer.writeModule(allocator, &mod) catch {
+                            try w.print("{{\"type\":\"module\",\"line\":{d},\"filename\":\"{s}\"}}", .{ line_num, filename });
+                            allocator.free(filename);
+                            module_idx += 1;
+                            continue;
+                        };
+                        try modules.put(allocator, filename, wasm_bytes);
                     }
                 } else {
                     var mod = wabt.text.Parser.parseModule(allocator, sexpr.text) catch {
@@ -255,10 +388,15 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                 // Write as action command with proper invoke details
                 if (cmd == .invoke) {
                     if (findQuotedString(sexpr.text)) |field_name| {
-                        try w.print("{{\"type\":\"action\",\"line\":{d},\"action\":{{\"type\":\"invoke\",\"field\":\"{s}\",\"args\":[", .{ line_num, field_name });
-                        // Parse args (find all (type.const N) patterns)
-                        const invoke_end = std.mem.indexOf(u8, sexpr.text, "\"") orelse sexpr.text.len;
-                        _ = invoke_end;
+                        try w.print("{{\"type\":\"action\",\"line\":{d},\"action\":{{\"type\":\"invoke\"", .{line_num});
+                        // Include module name if present (e.g., invoke $M1 "store")
+                        if (findDollarName(sexpr.text)) |mod_name| {
+                            const name = if (mod_name.len > 0 and mod_name[0] == '$') mod_name[1..] else mod_name;
+                            try w.print(",\"module\":\"{s}\"", .{name});
+                        }
+                        try w.writeAll(",\"field\":");
+                        try writeJsonFieldName(w, field_name);
+                        try w.writeAll(",\"args\":[");
                         writeConstValues(w, sexpr.text) catch {};
                         try w.writeAll("]}}");
                     } else {
@@ -273,6 +411,17 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
     }
 
     try w.writeAll("]}");
+}
+
+fn hasDefinitionKw(text: []const u8) bool {
+    var i: usize = 1;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) : (i += 1) {}
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) : (i += 1) {}
+    if (i + 10 >= text.len) return false;
+    return std.mem.eql(u8, text[i .. i + 10], "definition");
 }
 
 // ── S-expression parsers for assert commands ─────────────────────────────
@@ -353,7 +502,8 @@ fn writeInvokeFields(w: anytype, invoke_text: []const u8) !void {
     }
     // Extract function name
     if (findQuotedString(invoke_text)) |name| {
-        try w.print(",\"field\":\"{s}\"", .{name});
+        try w.writeAll(",\"field\":");
+        try writeJsonFieldName(w, name);
     }
     // Extract args
     try w.writeAll(",\"args\":[");
@@ -367,7 +517,8 @@ fn writeGetFields(w: anytype, get_text: []const u8) !void {
         try w.print(",\"module\":\"{s}\"", .{name});
     }
     if (findQuotedString(get_text)) |name| {
-        try w.print(",\"field\":\"{s}\"", .{name});
+        try w.writeAll(",\"field\":");
+        try writeJsonFieldName(w, name);
     }
 }
 
@@ -375,16 +526,122 @@ fn writeExpected(w: anytype, text: []const u8) !void {
     try w.writeAll(",\"expected\":[");
     try writeConstValues(w, text);
     try w.writeByte(']');
+    // If there are either alternatives, emit them
+    if (std.mem.indexOf(u8, text, "(either")) |_| {
+        try writeEitherAlternatives(w, text);
+    }
+}
+
+fn writeEitherAlternatives(w: anytype, text: []const u8) !void {
+    const either_start = std.mem.indexOf(u8, text, "(either") orelse return;
+    const after = text[either_start..];
+    // Extract all alternatives
+    var alts: [8][]const u8 = undefined;
+    var count: usize = 0;
+    var pos: usize = 7;
+    while (pos < after.len and count < 8) {
+        if (after[pos] == '(' and pos + 1 < after.len and after[pos + 1] != 'e') {
+            var depth: u32 = 0;
+            const start = pos;
+            for (after[pos..], pos..) |ch, idx| {
+                if (ch == '(') depth += 1;
+                if (ch == ')') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        alts[count] = after[start .. idx + 1];
+                        count += 1;
+                        pos = idx + 1;
+                        break;
+                    }
+                }
+            } else break;
+        } else if (after[pos] == ')') break else { pos += 1; }
+    }
+    if (count <= 1) return; // No alternatives to emit
+    // Skip first alternative (already in "expected"), emit rest
+    try w.writeAll(",\"alternatives\":[");
+    var first = true;
+    for (alts[0..count]) |alt| {
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("[");
+        try writeConstValues(w, alt);
+        try w.writeAll("]");
+    }
+    try w.writeByte(']');
 }
 
 fn writeConstValues(w: anytype, text: []const u8) !void {
+    // Handle (either ...) blocks: emit all alternatives pipe-separated in value
+    var effective_text = text;
+    var either_alternatives: [8][]const u8 = undefined;
+    var either_count: usize = 0;
+    if (std.mem.indexOf(u8, text, "(either")) |either_start| {
+        const after_either = text[either_start..];
+        // Extract all (v128.const ...) alternatives inside the either block
+        var pos: usize = 7; // skip "(either"
+        while (pos < after_either.len and either_count < 8) {
+            if (after_either[pos] == '(' and pos + 1 < after_either.len and after_either[pos + 1] != 'e') {
+                var depth: u32 = 0;
+                const start = pos;
+                for (after_either[pos..], pos..) |ch, idx| {
+                    if (ch == '(') depth += 1;
+                    if (ch == ')') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            either_alternatives[either_count] = after_either[start + 1 .. idx];
+                            either_count += 1;
+                            pos = idx + 1;
+                            break;
+                        }
+                    }
+                } else break;
+            } else if (after_either[pos] == ')') {
+                break; // end of either block
+            } else {
+                pos += 1;
+            }
+        }
+        if (either_count > 0) {
+            // Use last alternative (typically the non-FMA / sequential result)
+            var buf: [4096]u8 = undefined;
+            var len: usize = 0;
+            const prefix = text[0..either_start];
+            // Find the end of the either block
+            var depth: u32 = 0;
+            var either_end = either_start;
+            for (text[either_start..], either_start..) |ch, idx| {
+                if (ch == '(') depth += 1;
+                if (ch == ')') {
+                    depth -= 1;
+                    if (depth == 0) { either_end = idx + 1; break; }
+                }
+            }
+            const suffix = if (either_end < text.len) text[either_end..] else "";
+            const last_alt = either_alternatives[either_count - 1];
+            if (prefix.len + last_alt.len + 2 + suffix.len < buf.len) {
+                @memcpy(buf[len..][0..prefix.len], prefix);
+                len += prefix.len;
+                buf[len] = '(';
+                len += 1;
+                @memcpy(buf[len..][0..last_alt.len], last_alt);
+                len += last_alt.len;
+                buf[len] = ')';
+                len += 1;
+                @memcpy(buf[len..][0..suffix.len], suffix);
+                len += suffix.len;
+                effective_text = buf[0..len];
+            }
+        }
+    }
+
     // Find all (i32.const N), (i64.const N), (f32.const N), (f64.const N), (ref.null ...), (ref.func ...)
     var first_val = true;
     var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        if (text[i] != '(') continue;
+    while (i < effective_text.len) : (i += 1) {
+        if (effective_text[i] != '(') continue;
         // Check for const patterns
-        const remaining = text[i..];
+        const remaining = effective_text[i..];
         if (parseConst(remaining, "i32.const", "i32")) |result| {
             if (!first_val) try w.writeByte(',');
             first_val = false;
@@ -408,13 +665,25 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
         } else if (std.mem.startsWith(u8, remaining, "(ref.null")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
-            if (std.mem.indexOf(u8, remaining, "extern")) |_| {
+            if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "extern")) |_| {
                 try w.writeAll("{\"type\":\"externref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "i31")) |_| {
+                try w.writeAll("{\"type\":\"i31ref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "any")) |_| {
+                try w.writeAll("{\"type\":\"anyref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "eq")) |_| {
+                try w.writeAll("{\"type\":\"eqref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "struct")) |_| {
+                try w.writeAll("{\"type\":\"structref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "array")) |_| {
+                try w.writeAll("{\"type\":\"arrayref\",\"value\":\"null\"}");
+            } else if (std.mem.indexOf(u8, remaining[0..@min(remaining.len, 30)], "none")) |_| {
+                try w.writeAll("{\"type\":\"nullref\",\"value\":\"null\"}");
             } else {
                 try w.writeAll("{\"type\":\"funcref\",\"value\":\"null\"}");
             }
             // Skip to closing paren
-            while (i < text.len and text[i] != ')') : (i += 1) {}
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(ref.func")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
@@ -424,7 +693,7 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 i += result.len - 1;
             } else {
                 try w.writeAll("{\"type\":\"funcref\",\"value\":\"0\"}");
-                while (i < text.len and text[i] != ')') : (i += 1) {}
+                while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
             }
         } else if (std.mem.startsWith(u8, remaining, "(ref.extern")) {
             if (!first_val) try w.writeByte(',');
@@ -434,15 +703,52 @@ fn writeConstValues(w: anytype, text: []const u8) !void {
                 i += result.len - 1;
             } else {
                 try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
-                while (i < text.len and text[i] != ')') : (i += 1) {}
+                while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
             }
+        } else if (std.mem.startsWith(u8, remaining, "(ref.host")) {
+            // ref.host N — spec test opaque externref, map to externref
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            if (parseConst(remaining, "ref.host", "externref")) |result| {
+                try writeConstJson(w, "externref", result.value);
+                i += result.len - 1;
+            } else {
+                try w.writeAll("{\"type\":\"externref\",\"value\":\"0\"}");
+                while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+            }
+        } else if (std.mem.startsWith(u8, remaining, "(ref.i31)")) {
+            // (ref.i31) = any non-null i31ref
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"i31ref\",\"value\":\"1\"}");
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.eq)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"eqref\",\"value\":\"1\"}");
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.any)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"anyref\",\"value\":\"1\"}");
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.struct)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"structref\",\"value\":\"1\"}");
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
+        } else if (std.mem.startsWith(u8, remaining, "(ref.array)")) {
+            if (!first_val) try w.writeByte(',');
+            first_val = false;
+            try w.writeAll("{\"type\":\"arrayref\",\"value\":\"1\"}");
+            while (i < effective_text.len and effective_text[i] != ')') : (i += 1) {}
         } else if (std.mem.startsWith(u8, remaining, "(v128.const")) {
             if (!first_val) try w.writeByte(',');
             first_val = false;
             // Parse v128.const: (v128.const <shape> <lane0> <lane1> ...)
             // Need to find the closing paren and parse all lanes
-            const close = std.mem.indexOfPos(u8, text, i, ")") orelse text.len;
-            const inner = text[i + 1 .. close]; // "v128.const <shape> <lanes>"
+            const close = std.mem.indexOfPos(u8, effective_text, i, ")") orelse effective_text.len;
+            const inner = effective_text[i + 1 .. close]; // "v128.const <shape> <lanes>"
             writeV128Json(w, inner) catch {
                 try w.writeAll("{\"type\":\"v128\",\"value\":\"0\"}");
             };
@@ -595,12 +901,23 @@ fn parseWatI64(raw: []const u8) ?u64 {
 fn parseWatF32(raw: []const u8) ?u32 {
     const stripped = stripUnderscores(raw);
     const s = stripped.slice();
-    // Handle NaN variants
     if (parseWatNanF32(s)) |bits| return bits;
-    // Handle inf
     if (std.mem.eql(u8, s, "inf")) return 0x7F800000;
     if (std.mem.eql(u8, s, "-inf")) return 0xFF800000;
-    // Try standard parse (handles hex float like 0x1.5p+5)
+    const is_hex = std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "-0x");
+    const has_p = std.mem.indexOfAny(u8, s, "pP") != null;
+    if (is_hex and !has_p) {
+        const neg = s[0] == '-';
+        var hex = if (neg) s[3..] else s[2..];
+        if (hex.len > 0 and hex[hex.len - 1] == '.') hex = hex[0 .. hex.len - 1];
+        if (std.mem.indexOfScalar(u8, hex, '.') == null) {
+            const int_val = std.fmt.parseUnsigned(u64, hex, 16) catch return null;
+            const fval: f32 = @floatFromInt(int_val);
+            var bits: u32 = @bitCast(fval);
+            if (neg) bits |= 0x80000000;
+            return bits;
+        }
+    }
     const f = std.fmt.parseFloat(f32, s) catch return null;
     return @bitCast(f);
 }
@@ -612,8 +929,56 @@ fn parseWatF64(raw: []const u8) ?u64 {
     if (parseWatNanF64(s)) |bits| return bits;
     if (std.mem.eql(u8, s, "inf")) return 0x7FF0000000000000;
     if (std.mem.eql(u8, s, "-inf")) return 0xFFF0000000000000;
+    const is_hex = std.mem.startsWith(u8, s, "0x") or std.mem.startsWith(u8, s, "-0x");
+    if (is_hex) {
+        if (parseHexFloat64(s)) |bits| return bits;
+    }
     const f = std.fmt.parseFloat(f64, s) catch return null;
     return @bitCast(f);
+}
+
+/// Parse hex float using integer arithmetic for maximum precision.
+fn parseHexFloat64(s: []const u8) ?u64 {
+    const neg = s[0] == '-';
+    var hex = if (neg) s[3..] else s[2..];
+    // Find p/P exponent
+    const p_idx = std.mem.indexOfAny(u8, hex, "pP");
+    var exp: i32 = 0;
+    var mantissa_hex = hex;
+    if (p_idx) |pi| {
+        const exp_str = hex[pi + 1 ..];
+        exp = std.fmt.parseInt(i32, exp_str, 10) catch 0;
+        mantissa_hex = hex[0..pi];
+    }
+    // Strip trailing dot
+    if (mantissa_hex.len > 0 and mantissa_hex[mantissa_hex.len - 1] == '.') mantissa_hex = mantissa_hex[0 .. mantissa_hex.len - 1];
+    // Split at dot
+    const dot_idx = std.mem.indexOfScalar(u8, mantissa_hex, '.');
+    var int_part = mantissa_hex;
+    var frac_part: []const u8 = &.{};
+    if (dot_idx) |di| {
+        int_part = mantissa_hex[0..di];
+        frac_part = mantissa_hex[di + 1 ..];
+    }
+    // Parse integer part as u128
+    const int_val: u128 = if (int_part.len > 0 and int_part.len <= 32) (std.fmt.parseUnsigned(u128, int_part, 16) catch 0) else 0;
+    // Convert integer part to f64
+    var fval: f64 = @floatFromInt(int_val);
+    // Apply exponent from p using ldexp for subnormal precision
+    if (exp != 0) fval = std.math.ldexp(fval, exp);
+    // Add fractional part (parse up to 16 hex digits for f64 precision)
+    if (frac_part.len > 0) {
+        const max_frac = @min(frac_part.len, 16);
+        const frac_val: u64 = std.fmt.parseUnsigned(u64, frac_part[0..max_frac], 16) catch 0;
+        var frac_f: f64 = @floatFromInt(frac_val);
+        const frac_exp: i32 = -@as(i32, @intCast(max_frac)) * 4 + exp;
+        frac_f = std.math.ldexp(frac_f, frac_exp);
+        fval += frac_f;
+    }
+    if (fval == 0 and neg) return 0x8000000000000000;
+    var bits: u64 = @bitCast(fval);
+    if (neg) bits |= 0x8000000000000000;
+    return bits;
 }
 
 /// Parse WAT NaN notation for f32: nan, -nan, nan:0xN, -nan:0xN
@@ -622,12 +987,10 @@ fn parseWatNanF32(s: []const u8) ?u32 {
     const rest = if (negative) s[1..] else s;
     if (!std.mem.startsWith(u8, rest, "nan")) return null;
     const sign: u32 = if (negative) 0x80000000 else 0;
-    if (rest.len == 3) {
-        // Plain nan → canonical NaN
-        return sign | 0x7FC00000;
-    }
+    if (rest.len == 3) return sign | 0x7FC00000; // plain nan
+    if (std.mem.eql(u8, rest, "nan:canonical")) return sign | 0x7FC00000;
+    if (std.mem.eql(u8, rest, "nan:arithmetic")) return sign | 0x7FC00001;
     if (std.mem.startsWith(u8, rest[3..], ":0x")) {
-        // nan:0xN → custom payload
         const payload = std.fmt.parseUnsigned(u32, rest[6..], 16) catch return null;
         return sign | 0x7F800000 | (payload & 0x7FFFFF);
     }
@@ -640,9 +1003,9 @@ fn parseWatNanF64(s: []const u8) ?u64 {
     const rest = if (negative) s[1..] else s;
     if (!std.mem.startsWith(u8, rest, "nan")) return null;
     const sign: u64 = if (negative) 0x8000000000000000 else 0;
-    if (rest.len == 3) {
-        return sign | 0x7FF8000000000000;
-    }
+    if (rest.len == 3) return sign | 0x7FF8000000000000;
+    if (std.mem.eql(u8, rest, "nan:canonical")) return sign | 0x7FF8000000000000;
+    if (std.mem.eql(u8, rest, "nan:arithmetic")) return sign | 0x7FF8000000000001;
     if (std.mem.startsWith(u8, rest[3..], ":0x")) {
         const payload = std.fmt.parseUnsigned(u64, rest[6..], 16) catch return null;
         return sign | 0x7FF0000000000000 | (payload & 0xFFFFFFFFFFFFF);
@@ -721,6 +1084,75 @@ fn findQuotedString(text: []const u8) ?[]const u8 {
         if (text[end] == '\\' and end + 1 < text.len) end += 1;
     }
     return text[start..end];
+}
+
+/// Write a WAT string (content between quotes, with WAT escapes) as a JSON string value.
+/// Decodes WAT escapes (\xx, \\, \", \n, \t) and re-encodes as valid JSON escapes.
+fn writeJsonFieldName(w: anytype, wat_str: []const u8) !void {
+    try w.writeByte('"');
+    var i: usize = 0;
+    while (i < wat_str.len) {
+        if (wat_str[i] == '\\' and i + 1 < wat_str.len) {
+            const esc = wat_str[i + 1];
+            if (esc == '\\' or esc == '"') {
+                // These WAT escapes are the same in JSON
+                try w.writeByte('\\');
+                try w.writeByte(esc);
+                i += 2;
+            } else if (esc == 'n') {
+                try w.writeAll("\\n");
+                i += 2;
+            } else if (esc == 't') {
+                try w.writeAll("\\t");
+                i += 2;
+            } else if (esc == 'r') {
+                try w.writeAll("\\r");
+                i += 2;
+            } else if (isHexDigit(esc) and i + 2 < wat_str.len and isHexDigit(wat_str[i + 2])) {
+                // WAT \xx hex escape → decode byte, re-encode as JSON
+                const byte = (hexVal(esc) << 4) | hexVal(wat_str[i + 2]);
+                if (byte < 0x20) {
+                    try w.print("\\u{x:0>4}", .{@as(u16, byte)});
+                } else if (byte == '"') {
+                    try w.writeAll("\\\"");
+                } else if (byte == '\\') {
+                    try w.writeAll("\\\\");
+                } else {
+                    try w.writeByte(byte);
+                }
+                i += 3;
+            } else {
+                // Unknown escape: pass through
+                try w.writeByte('\\');
+                try w.writeByte(esc);
+                i += 2;
+            }
+        } else {
+            const ch = wat_str[i];
+            if (ch == '"') {
+                try w.writeAll("\\\"");
+            } else if (ch == '\\') {
+                try w.writeAll("\\\\");
+            } else if (ch < 0x20) {
+                try w.print("\\u{x:0>4}", .{@as(u16, ch)});
+            } else {
+                try w.writeByte(ch);
+            }
+            i += 1;
+        }
+    }
+    try w.writeByte('"');
+}
+
+fn isHexDigit(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+fn hexVal(c: u8) u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return 0;
 }
 
 fn findLastQuotedString(text: []const u8) ?[]const u8 {

@@ -8,6 +8,13 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+/// A stored exception reference (for catch_ref / throw_ref).
+pub const ExceptionRef = struct {
+    tag: ?*types.TagInstance = null,
+    params: [16]types.Value = undefined,
+    param_count: u32 = 0,
+};
+
 /// A single call frame on the call stack.
 pub const CallFrame = struct {
     /// Index of the function being executed.
@@ -44,6 +51,18 @@ pub const ExecEnv = struct {
 
     /// Exception/trap message (null if no trap).
     exception: ?[]const u8 = null,
+
+    /// Pending uncaught exception tag (set by throw when no handler found).
+    pending_exception_tag: ?*types.TagInstance = null,
+    /// Parameter values for the pending exception.
+    pending_exception_params: [16]types.Value = undefined,
+    /// Number of valid entries in pending_exception_params.
+    pending_exception_param_count: u32 = 0,
+
+    /// Exception reference pool for exnref values (catch_ref / throw_ref).
+    exception_refs: [8]ExceptionRef = undefined,
+    /// Number of allocated exception refs.
+    exception_ref_count: u32 = 0,
 
     /// Allocator used for this env's memory.
     allocator: std.mem.Allocator,

@@ -22,14 +22,14 @@ DIST_NAME = "wamrc_bin"
 WAMR_REPO = "cataggar/wamr"
 
 PLATFORMS = {
-    "linux-x64": {"tag": "manylinux_2_17_x86_64.manylinux2014_x86_64"},
-    "linux-arm64": {"tag": "manylinux_2_17_aarch64.manylinux2014_aarch64"},
-    "linux-musl-x64": {"tag": "musllinux_1_1_x86_64"},
-    "linux-musl-arm64": {"tag": "musllinux_1_1_aarch64"},
-    "macos-arm64": {"tag": "macosx_11_0_arm64"},
-    "macos-x64": {"tag": "macosx_10_9_x86_64"},
-    "windows-x64": {"tag": "win_amd64"},
-    "windows-arm64": {"tag": "win_arm64"},
+    "linux-x64": {"tag": "manylinux_2_17_x86_64.manylinux2014_x86_64", "ext": ""},
+    "linux-arm64": {"tag": "manylinux_2_17_aarch64.manylinux2014_aarch64", "ext": ""},
+    "linux-musl-x64": {"tag": "musllinux_1_1_x86_64", "ext": ""},
+    "linux-musl-arm64": {"tag": "musllinux_1_1_aarch64", "ext": ""},
+    "macos-arm64": {"tag": "macosx_11_0_arm64", "ext": ""},
+    "macos-x64": {"tag": "macosx_10_9_x86_64", "ext": ""},
+    "windows-x64": {"tag": "win_amd64", "ext": ".exe"},
+    "windows-arm64": {"tag": "win_arm64", "ext": ".exe"},
 }
 
 _EXEC_ATTR = (
@@ -51,49 +51,37 @@ def download_asset(release_version: str, platform_key: str) -> bytes:
     return resp.content
 
 
-def _is_executable(path: Path) -> bool:
-    name = path.name
-    if name.endswith((".exe", ".so", ".dylib")):
-        return True
-    if "." not in name:
-        return True
-    return False
-
-
 def build_wheel(
-    version: str, platform_key: str, platform_tag: str, dist_dir: Path,
-    release_version: str | None = None,
+    version: str, platform_key: str, platform_tag: str, ext: str,
+    dist_dir: Path, release_version: str | None = None,
 ) -> Path:
+    """Build a single platform wheel with wamrc binary in data/scripts/."""
     data = download_asset(release_version or version, platform_key)
 
+    exe_name = f"wamrc{ext}"
+    binary_data: bytes | None = None
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
-        members = tf.getmembers()
-        bin_prefix = None
-        for m in members:
-            if "/bin/" in m.name and m.isfile():
-                bin_prefix = m.name.split("/bin/")[0] + "/bin/"
+        for m in tf.getmembers():
+            if m.isfile() and m.name.endswith(f"/bin/{exe_name}"):
+                f = tf.extractfile(m)
+                if f is not None:
+                    binary_data = f.read()
                 break
 
-        entries: list[tuple[str, bytes, bool]] = []
+    if binary_data is None:
+        raise RuntimeError(f"Binary {exe_name} not found in archive for {platform_key}")
 
-        init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
-        entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
-
-        # Only include wamrc binary
-        if bin_prefix:
-            for m in members:
-                if m.name.startswith(bin_prefix) and m.isfile():
-                    rel = m.name[len(bin_prefix):]
-                    if not rel or not rel.startswith("wamrc"):
-                        continue
-                    f = tf.extractfile(m)
-                    if f is None:
-                        continue
-                    file_data = f.read()
-                    arcname = f"{IMPORT_NAME}/{rel}"
-                    entries.append((arcname, file_data, _is_executable(Path(rel))))
-
+    data_scripts_dir = f"{DIST_NAME}-{version}.data/scripts"
     dist_info_dir = f"{DIST_NAME}-{version}.dist-info"
+
+    entries: list[tuple[str, bytes, bool]] = []
+
+    # Python package with find helper (for programmatic use)
+    init_py = Path(__file__).resolve().parent.parent / "python" / IMPORT_NAME / "__init__.py"
+    entries.append((f"{IMPORT_NAME}/__init__.py", init_py.read_bytes(), False))
+
+    # Native binary goes in data/scripts/ — pip copies it directly to bin/Scripts
+    entries.append((f"{data_scripts_dir}/{exe_name}", binary_data, True))
 
     readme_path = Path(__file__).resolve().parent.parent / "README.md"
     readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
@@ -120,8 +108,7 @@ def build_wheel(
     )
     entries.append((f"{dist_info_dir}/WHEEL", wheel_meta.encode(), False))
 
-    entry_points = "[console_scripts]\nwamrc = wamrc_cli:wamrc\n"
-    entries.append((f"{dist_info_dir}/entry_points.txt", entry_points.encode(), False))
+    # No entry_points.txt — binary is installed directly via data/scripts
 
     records: list[str] = []
     for arcname, file_data, _ in entries:
@@ -167,7 +154,10 @@ def main() -> None:
     wheels: list[Path] = []
     for platform_key, info in PLATFORMS.items():
         print(f"[{platform_key}]")
-        wheel = build_wheel(version, platform_key, info["tag"], dist_dir, raw_version)
+        wheel = build_wheel(
+            version, platform_key, info["tag"], info["ext"],
+            dist_dir, raw_version,
+        )
         wheels.append(wheel)
         print()
 
