@@ -821,6 +821,13 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
     while (true) {
         const module = env.module_inst.module;
         if (current_func_idx < module.import_function_count) {
+            // Check for native host functions first
+            if (current_func_idx < env.module_inst.host_functions.len) {
+                if (env.module_inst.host_functions[current_func_idx]) |host_fn| {
+                    host_fn(@ptrCast(env)) catch return error.Unreachable;
+                    return;
+                }
+            }
             // Dispatch to the imported module's actual function
             if (current_func_idx < env.module_inst.import_functions.len) {
                 const imported = env.module_inst.import_functions[current_func_idx];
@@ -3356,30 +3363,76 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     0x4C => try atomicCmpxchg64(env, code, &ip, u8, 1),
                     0x4D => try atomicCmpxchg64(env, code, &ip, u16, 2),
                     0x4E => try atomicCmpxchg64(env, code, &ip, u32, 4),
-                    // wait/notify (stub: single-threaded for now)
+                    // wait/notify
                     0x00 => { // memory.atomic.notify
                         _ = readU32(code, &ip); // align
-                        _ = readU32(code, &ip); // offset
-                        _ = try env.popI32(); // count
-                        const _addr = try env.popI32(); // addr
-                        _ = _addr;
-                        try env.pushI32(0); // 0 waiters woken (single-threaded)
+                        const offset = readU32(code, &ip);
+                        const count: u32 = @bitCast(try env.popI32());
+                        const addr: u32 = @bitCast(try env.popI32());
+                        const effective_addr = addr +% offset;
+                        // Alignment check: notify address must be 4-byte aligned
+                        if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
+                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                        if (effective_addr >= mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        if (mem.waiter_queue) |wq| {
+                            const woken = wq.notify(effective_addr, count);
+                            try env.pushI32(@bitCast(woken));
+                        } else {
+                            try env.pushI32(0); // no waiter queue = no waiters
+                        }
                     },
                     0x01 => { // memory.atomic.wait32
                         _ = readU32(code, &ip); // align
-                        _ = readU32(code, &ip); // offset
-                        _ = try env.popI64(); // timeout
-                        _ = try env.popI32(); // expected
-                        _ = try env.popI32(); // addr
-                        try env.pushI32(1); // 1 = "not equal" (value already changed)
+                        const offset = readU32(code, &ip);
+                        const timeout = try env.popI64();
+                        const expected = try env.popI32();
+                        const addr: u32 = @bitCast(try env.popI32());
+                        const effective_addr = addr +% offset;
+                        if (effective_addr & 3 != 0) return error.UnalignedAtomicAccess;
+                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                        if (effective_addr + 4 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        const wq = mem.waiter_queue orelse {
+                            try env.pushI32(1); // no shared memory = "not equal"
+                            continue;
+                        };
+                        // Load current value and compare under the waiter queue lock.
+                        // The mutex provides synchronization, so a regular read suffices.
+                        wq.mutex.lock();
+                        const current: i32 = @bitCast(std.mem.readInt(u32, mem.data[effective_addr..][0..4], .little));
+                        if (current != expected) {
+                            wq.mutex.unlock();
+                            try env.pushI32(1); // "not equal"
+                        } else {
+                            // Park — the wait method will unlock the mutex after enqueuing
+                            wq.mutex.unlock();
+                            const result = wq.wait(effective_addr, timeout, env.allocator);
+                            try env.pushI32(@bitCast(result));
+                        }
                     },
                     0x02 => { // memory.atomic.wait64
                         _ = readU32(code, &ip); // align
-                        _ = readU32(code, &ip); // offset
-                        _ = try env.popI64(); // timeout
-                        _ = try env.popI64(); // expected
-                        _ = try env.popI32(); // addr
-                        try env.pushI32(1); // 1 = "not equal"
+                        const offset = readU32(code, &ip);
+                        const timeout = try env.popI64();
+                        const expected = try env.popI64();
+                        const addr: u32 = @bitCast(try env.popI32());
+                        const effective_addr = addr +% offset;
+                        if (effective_addr & 7 != 0) return error.UnalignedAtomicAccess;
+                        const mem = env.module_inst.getMemory(0) orelse return error.OutOfBoundsMemoryAccess;
+                        if (effective_addr + 8 > mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        const wq = mem.waiter_queue orelse {
+                            try env.pushI32(1);
+                            continue;
+                        };
+                        wq.mutex.lock();
+                        const current: i64 = @bitCast(std.mem.readInt(u64, mem.data[effective_addr..][0..8], .little));
+                        if (current != expected) {
+                            wq.mutex.unlock();
+                            try env.pushI32(1);
+                        } else {
+                            wq.mutex.unlock();
+                            const result = wq.wait(effective_addr, timeout, env.allocator);
+                            try env.pushI32(@bitCast(result));
+                        }
                     },
                     else => return error.UnknownOpcode,
                 }

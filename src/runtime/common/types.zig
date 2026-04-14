@@ -450,6 +450,9 @@ pub const MemoryInstance = struct {
     current_pages: u32,
     max_pages: u32,
     ref_count: u32 = 1,
+    /// Waiter queue for memory.atomic.wait/notify (shared memory only).
+    /// Heap-allocated and shared across threads via ref counting.
+    waiter_queue: ?*WaiterQueue = null,
 
     pub const page_size: u32 = 65536;
 
@@ -478,9 +481,94 @@ pub const MemoryInstance = struct {
     pub fn release(self: *MemoryInstance, allocator: std.mem.Allocator) void {
         self.ref_count -= 1;
         if (self.ref_count == 0) {
+            if (self.waiter_queue) |wq| wq.deinit(allocator);
             if (self.data.len > 0) allocator.free(self.data);
             allocator.destroy(self);
         }
+    }
+};
+
+/// Waiter queue for memory.atomic.wait/notify.
+/// Each waiter is heap-allocated for pointer stability while threads block.
+pub const WaiterQueue = struct {
+    mutex: std.Thread.Mutex = .{},
+    /// Heap-allocated waiter nodes for pointer stability.
+    waiters: std.ArrayListUnmanaged(*Waiter) = .{},
+
+    pub const Waiter = struct {
+        address: u32,
+        cond: std.Thread.Condition = .{},
+        woken: bool = false,
+    };
+
+    pub fn deinit(self: *WaiterQueue, allocator: std.mem.Allocator) void {
+        for (self.waiters.items) |w| allocator.destroy(w);
+        self.waiters.deinit(allocator);
+        allocator.destroy(self);
+    }
+
+    /// Park the calling thread until woken or timed out.
+    /// Returns: 0 = woken, 2 = timed out.
+    pub fn wait(self: *WaiterQueue, address: u32, timeout_ns: i64, allocator: std.mem.Allocator) u32 {
+        self.mutex.lock();
+
+        const waiter = allocator.create(Waiter) catch {
+            self.mutex.unlock();
+            return 2; // treat alloc failure as timeout
+        };
+        waiter.* = .{ .address = address };
+
+        self.waiters.append(allocator, waiter) catch {
+            allocator.destroy(waiter);
+            self.mutex.unlock();
+            return 2;
+        };
+
+        defer {
+            // Remove self from waiters list
+            for (self.waiters.items, 0..) |w, i| {
+                if (w == waiter) {
+                    _ = self.waiters.swapRemove(i);
+                    break;
+                }
+            }
+            allocator.destroy(waiter);
+            self.mutex.unlock();
+        }
+
+        if (timeout_ns < 0) {
+            // Infinite wait
+            while (!waiter.woken) {
+                waiter.cond.wait(&self.mutex);
+            }
+            return 0; // woken
+        } else {
+            const timeout: u64 = @intCast(timeout_ns);
+            while (!waiter.woken) {
+                waiter.cond.timedWait(&self.mutex, timeout) catch {
+                    // Timed out
+                    return if (waiter.woken) 0 else 2;
+                };
+            }
+            return 0; // woken
+        }
+    }
+
+    /// Wake up to `count` waiters at the given address. Returns number woken.
+    pub fn notify(self: *WaiterQueue, address: u32, count: u32) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var woken: u32 = 0;
+        for (self.waiters.items) |w| {
+            if (woken >= count) break;
+            if (w.address == address) {
+                w.woken = true;
+                w.cond.signal();
+                woken += 1;
+            }
+        }
+        return woken;
     }
 };
 
@@ -601,6 +689,19 @@ pub const ImportedFunction = struct {
     func_idx: u32,
 };
 
+/// Host function callable from Wasm via imports.
+/// The callback receives an opaque pointer to an ExecEnv (to avoid circular
+/// type dependencies between types.zig and exec_env.zig). Implementations
+/// must cast: `const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));`
+pub const HostFn = *const fn (env_opaque: *anyopaque) HostFnError!void;
+
+pub const HostFnError = error{
+    Trap,
+    StackOverflow,
+    StackUnderflow,
+    OutOfBoundsMemoryAccess,
+};
+
 /// Instantiated module
 /// GC heap object (struct or array instance).
 pub const GcObject = struct {
@@ -614,8 +715,15 @@ pub const ModuleInstance = struct {
     tables: []*TableInstance,
     globals: []*GlobalInstance,
     import_functions: []const ImportedFunction = &.{},
+    /// Host (native) functions indexed by import function index.
+    /// `host_functions[i]` is the native callback for import function i, or null.
+    host_functions: []const ?HostFn = &.{},
+    /// Whether host_functions was allocated by this instance (vs shared from parent).
+    owns_host_functions: bool = false,
     tags: []*TagInstance = &.{},
     allocator: std.mem.Allocator,
+    /// Thread manager (shared across all instances in a thread group).
+    thread_manager: ?*@import("../../wasi/thread_manager.zig").ThreadManager = null,
     /// Track dropped elem segments (active segments dropped after instantiation)
     dropped_elems: []bool = &.{},
     /// Track dropped data segments (for data.drop instruction)
@@ -636,7 +744,7 @@ pub const ModuleInstance = struct {
     }
 
     /// Clone this instance for a new thread (WASI-threads instance-per-thread model).
-    /// Shared: memories, tables, import_functions (retained via ref_count).
+    /// Shared: memories, tables, import_functions, host_functions, thread_manager.
     /// Cloned: globals (mutable globals are thread-local).
     pub fn cloneForThread(self: *const ModuleInstance, allocator: std.mem.Allocator) !*ModuleInstance {
         const inst = try allocator.create(ModuleInstance);
@@ -648,6 +756,9 @@ pub const ModuleInstance = struct {
             .tables = &.{},
             .globals = &.{},
             .import_functions = self.import_functions,
+            .host_functions = self.host_functions, // shared, not owned
+            .owns_host_functions = false,
+            .thread_manager = self.thread_manager,
             .allocator = allocator,
         };
 

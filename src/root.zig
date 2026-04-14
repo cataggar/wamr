@@ -66,6 +66,9 @@ const _wasi = @import("wasi/wasi.zig");
 /// Thread manager for WASI-threads.
 pub const thread_manager = @import("wasi/thread_manager.zig");
 
+/// WASI host function implementations (thread-spawn, etc.).
+pub const wasi_host = @import("wasi/host_functions.zig");
+
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).
 pub const platform = @import("platform/platform.zig");
