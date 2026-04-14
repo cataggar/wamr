@@ -30,3 +30,4 @@ tests/spec-json/
 
 # Windows NUL device artifacts
 NUL.*
+wasm-spec-temp/
