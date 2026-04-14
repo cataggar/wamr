@@ -82,6 +82,18 @@ pub const canonical_abi = @import("component/canonical_abi.zig");
 /// Component Model instance and resource store.
 pub const component_instance = @import("component/instance.zig");
 
+/// Component Model async ABI (tasks, futures, streams).
+pub const component_async = @import("component/async.zig");
+
+/// Component composition and linking.
+pub const component_compose = @import("component/compose.zig");
+
+/// WASI Preview 2 core interfaces (clocks, random, CLI, filesystem).
+pub const wasi_p2_core = @import("wasi/preview2/core.zig");
+
+/// WASI Preview 2 I/O streams and poll.
+pub const wasi_p2_streams = @import("wasi/preview2/streams.zig");
+
 // Phase 1: Foundation layer
 /// Platform abstraction (mmap, threads, time, cache flush).
 pub const platform = @import("platform/platform.zig");
