@@ -1,61 +1,32 @@
-
+# IDE / Editor
 .cache
-.clangd
 .vs
 .vscode
-.venv
 /.idea
-**/cmake-build-*/
-**/*build*/
-!/build-scripts
+.DS_Store
+.aider*
+
+# Build artifacts
+*.o
 *.obj
 *.a
 *.so
-.clangd
-.DS_Store
-*.o
-.aider*
-
-core/deps/**
-core/shared/mem-alloc/tlsf
-core/iwasm/libraries/lib-wasi-threads/test/*.wasm
-core/iwasm/libraries/lib-socket/test/*.wasm
-
-product-mini/app-samples/hello-world/test.wasm
-product-mini/platforms/linux-sgx/enclave-sample/
-!product-mini/platforms/linux-sgx/enclave-sample/App/App.*
-!product-mini/platforms/linux-sgx/enclave-sample/Enclave/Enclave.*
-
 build_out
-tests/wamr-test-suites/workspace
 
-!/test-tools/wamr-ide/VSCode-Extension/.vscode
-
-samples/socket-api/wasm-src/inc/pthread.h
-
+# Python
 **/__pycache__
-
-tests/benchmarks/coremark/coremark*
-
-samples/workload/include/**
-!samples/workload/include/.gitkeep
-
-# core/iwasm/libraries/wasi-threads
-
-tests/unit/runtime-common/wasm-apps/main.aot
-tests/unit/aot-stack-frame/wasm-apps/test_aot.h
-
-# Spec test data (generated — not committed)
-tests/spec-json/
+.venv
 
 # Zig build artifacts
 .zig-cache/
 zig-out/
 zig-pkg/
 
+# Spec test data (generated — not committed)
+tests/spec-json/
+
 # Wast test runner temp directories
 .wamr-test-*/
 
 # Windows NUL device artifacts
 NUL.*
-wasm-spec-temp/
