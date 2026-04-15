@@ -1,8 +1,9 @@
 //! x86-64 IR Compiler
 //!
 //! Walks IR functions and emits x86-64 machine code via CodeBuffer.
-//! Uses a stack-based operand model: all intermediate values live on the
-//! stack frame (memory), using RAX and RCX as temporary scratch registers.
+//! Uses a register-caching operand stack: the top N values are kept in
+//! registers, falling back to memory when all cache registers are in use.
+//! RAX and RCX serve as temporary scratch registers for instruction operands.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -15,43 +16,114 @@ const param_regs = if (builtin.os.tag == .windows)
 else
     [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 }; // SysV
 
-/// Stack-based operand model. All intermediate values live on the stack
-/// frame at [rbp + offset], using negative offsets that grow downward.
-/// Locals occupy [rbp - 8*1] through [rbp - 8*N], and the operand stack
-/// starts immediately below at [rbp - 8*(N+1)].
-const OperandStack = struct {
-    /// Offset from RBP to the next free operand stack slot (negative, grows down).
-    top: i32,
-    /// Base offset (marks bottom of operand stack area, i.e. the initial top).
+/// Register-caching operand stack. Keeps the top N values in registers,
+/// eliminating redundant store-load pairs. Falls back to memory (via RBP
+/// offsets) when all cache registers are occupied.
+/// Locals occupy [rbp - 8*1] through [rbp - 8*N], and operand stack
+/// slot i lives at [rbp - 8*(N+1) - 8*i].
+const CachedStack = struct {
+    const SlotState = enum { empty, in_reg, in_mem };
+    const Slot = struct {
+        state: SlotState = .empty,
+        reg: emit.Reg = .rax,
+    };
+
+    /// Registers available for caching operand stack values.
+    /// Excludes RAX (scratch/return), RCX (shift count), RDX (div remainder).
+    const cache_regs = [_]emit.Reg{ .r10, .r11, .rsi, .rdi, .r8, .r9 };
+
+    slots: [64]Slot = [_]Slot{.{}} ** 64,
+    depth: u32 = 0,
+    /// Base offset from RBP (marks bottom of operand stack area).
     base: i32,
+    reg_used: [cache_regs.len]bool = [_]bool{false} ** cache_regs.len,
 
-    fn init(local_count: u32) OperandStack {
+    fn init(local_count: u32) CachedStack {
         const base_off = -@as(i32, @intCast((local_count + 1) * 8));
-        return .{ .top = base_off, .base = base_off };
+        return .{ .base = base_off };
     }
 
-    fn push(self: *OperandStack, code: *emit.CodeBuffer, src: emit.Reg) !void {
-        try code.movMemReg(.rbp, self.top, src);
-        self.top -= 8;
+    /// Return the memory offset for operand stack slot `idx`.
+    fn memOffset(self: *const CachedStack, idx: u32) i32 {
+        return self.base - @as(i32, @intCast(idx * 8));
     }
 
-    fn pop(self: *OperandStack, code: *emit.CodeBuffer, dst: emit.Reg) !void {
-        self.top += 8;
-        try code.movRegMem(dst, .rbp, self.top);
+    /// Push a value that is currently in `src` register.
+    fn push(self: *CachedStack, code: *emit.CodeBuffer, src: emit.Reg) !void {
+        const idx = self.depth;
+        self.depth += 1;
+
+        for (cache_regs, 0..) |cr, i| {
+            if (!self.reg_used[i]) {
+                self.reg_used[i] = true;
+                if (src != cr) try code.movRegReg(cr, src);
+                self.slots[idx] = .{ .state = .in_reg, .reg = cr };
+                return;
+            }
+        }
+
+        // No free register – spill to memory.
+        try code.movMemReg(.rbp, self.memOffset(idx), src);
+        self.slots[idx] = .{ .state = .in_mem };
     }
 
-    fn depth(self: *const OperandStack) u32 {
-        return @intCast(@divExact(self.base - self.top, 8));
+    /// Pop the top value into `dst` register.
+    fn pop(self: *CachedStack, code: *emit.CodeBuffer, dst: emit.Reg) !void {
+        self.depth -= 1;
+        const slot = self.slots[self.depth];
+        self.slots[self.depth].state = .empty;
+
+        switch (slot.state) {
+            .in_reg => {
+                for (cache_regs, 0..) |cr, i| {
+                    if (cr == slot.reg) {
+                        self.reg_used[i] = false;
+                        break;
+                    }
+                }
+                if (dst != slot.reg) try code.movRegReg(dst, slot.reg);
+            },
+            .in_mem => {
+                try code.movRegMem(dst, .rbp, self.memOffset(self.depth));
+            },
+            .empty => unreachable,
+        }
     }
 
-    /// Save the current stack depth so we can restore it later (e.g. across blocks).
-    fn save(self: *const OperandStack) i32 {
-        return self.top;
+    /// Flush all register-cached values to memory.
+    /// Must be called before branches, calls, and returns.
+    fn flush(self: *CachedStack, code: *emit.CodeBuffer) !void {
+        for (0..self.depth) |i| {
+            if (self.slots[i].state == .in_reg) {
+                try code.movMemReg(.rbp, self.memOffset(@intCast(i)), self.slots[i].reg);
+                for (cache_regs, 0..) |cr, ci| {
+                    if (cr == self.slots[i].reg) {
+                        self.reg_used[ci] = false;
+                        break;
+                    }
+                }
+                self.slots[i] = .{ .state = .in_mem };
+            }
+        }
     }
 
-    /// Restore a previously saved stack depth.
-    fn restore(self: *OperandStack, saved: i32) void {
-        self.top = saved;
+    fn save(self: *const CachedStack) u32 {
+        return self.depth;
+    }
+
+    fn restore(self: *CachedStack, saved: u32) void {
+        while (self.depth > saved) {
+            self.depth -= 1;
+            if (self.slots[self.depth].state == .in_reg) {
+                for (cache_regs, 0..) |cr, i| {
+                    if (cr == self.slots[self.depth].reg) {
+                        self.reg_used[i] = false;
+                        break;
+                    }
+                }
+            }
+            self.slots[self.depth].state = .empty;
+        }
     }
 };
 
@@ -72,7 +144,7 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
         try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
     }
 
-    var stack = OperandStack.init(func.local_count);
+    var stack = CachedStack.init(func.local_count);
 
     // Track block offsets for branch resolution
     var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
@@ -128,7 +200,7 @@ const CallPatch = struct {
 fn compileInst(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
-    stack: *OperandStack,
+    stack: *CachedStack,
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
 ) !void {
@@ -323,6 +395,7 @@ fn compileInst(
 
         // ── Return ────────────────────────────────────────────────────
         .ret => |maybe_val| {
+            try stack.flush(code);
             if (maybe_val != null) {
                 try stack.pop(code, .rax);
             }
@@ -364,12 +437,14 @@ fn compileInst(
 
         // ── Branches ──────────────────────────────────────────────────
         .br => |target| {
+            try stack.flush(code);
             try code.emitByte(0xE9); // JMP rel32
             const patch_off = code.len();
             try code.emitI32(0);
             try patches.append(code.allocator, .{ .patch_offset = patch_off, .target_block = target });
         },
         .br_if => |br| {
+            try stack.flush(code);
             // Pop condition from operand stack
             try stack.pop(code, .rax);
             try code.testRegReg(.rax, .rax);
@@ -388,6 +463,7 @@ fn compileInst(
 
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
+            try stack.flush(code);
             const n_args = cl.arg_count;
 
             // Pop args from operand stack in reverse order into ABI registers.
@@ -537,7 +613,7 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         var code = emit.CodeBuffer.init(allocator);
         errdefer code.deinit();
 
-        var stack = OperandStack.init(func.local_count);
+        var stack = CachedStack.init(func.local_count);
 
         const raw_size: u32 = (func.local_count + 64) * 8;
         const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8;
@@ -704,22 +780,22 @@ test "compileFunction: empty function produces prologue and epilogue" {
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
 
-test "OperandStack: push and pop maintain depth" {
+test "CachedStack: push and pop maintain depth" {
     var code = emit.CodeBuffer.init(std.testing.allocator);
     defer code.deinit();
 
-    var stack = OperandStack.init(2); // 2 locals
-    try std.testing.expectEqual(@as(u32, 0), stack.depth());
+    var stack = CachedStack.init(2); // 2 locals
+    try std.testing.expectEqual(@as(u32, 0), stack.depth);
 
     try stack.push(&code, .rax);
-    try std.testing.expectEqual(@as(u32, 1), stack.depth());
+    try std.testing.expectEqual(@as(u32, 1), stack.depth);
 
     try stack.push(&code, .rcx);
-    try std.testing.expectEqual(@as(u32, 2), stack.depth());
+    try std.testing.expectEqual(@as(u32, 2), stack.depth);
 
     try stack.pop(&code, .rax);
-    try std.testing.expectEqual(@as(u32, 1), stack.depth());
+    try std.testing.expectEqual(@as(u32, 1), stack.depth);
 
     try stack.pop(&code, .rax);
-    try std.testing.expectEqual(@as(u32, 0), stack.depth());
+    try std.testing.expectEqual(@as(u32, 0), stack.depth);
 }
