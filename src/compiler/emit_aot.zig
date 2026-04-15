@@ -51,6 +51,11 @@ pub const ImportEntry = struct {
     func_type_idx: u32,
 };
 
+pub const MemoryEntry = struct {
+    min_pages: u32,
+    max_pages: ?u32,
+};
+
 /// Emit an AOT binary to an owned byte buffer.
 pub fn emit(
     allocator: std.mem.Allocator,
@@ -60,6 +65,7 @@ pub fn emit(
     options: AotEmitOptions,
     data_segments: ?[]const DataSegmentEntry,
     imports: ?[]const ImportEntry,
+    memories: ?[]const MemoryEntry,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -133,6 +139,25 @@ pub fn emit(
         }
     }
 
+    // Section 9: memories (min_pages, has_max, max_pages per entry)
+    if (memories) |mem_list| {
+        if (mem_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(mem_list.len));
+            for (mem_list) |mem| {
+                try appendU32Le(&tmp, allocator, mem.min_pages);
+                if (mem.max_pages) |max| {
+                    try tmp.append(allocator, 1);
+                    try appendU32Le(&tmp, allocator, max);
+                } else {
+                    try tmp.append(allocator, 0);
+                }
+            }
+            try emitSection(allocator, &buf, 9, tmp.items);
+        }
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -168,7 +193,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
 
 test "emit: minimal (no functions, no exports) has correct magic and version" {
     const allocator = std.testing.allocator;
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null);
     defer allocator.free(data);
 
     // At least header (8) + target_info section (8+40) + text section (8+0) + func section (8+4) + export section (8+4)
@@ -183,7 +208,7 @@ test "emit: one function offset produces valid function section" {
     const allocator = std.testing.allocator;
     const code = [_]u8{ 0xCC, 0xC3 }; // int3; ret
     const offsets = [_]u32{0};
-    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null);
+    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 3 (function)
@@ -214,7 +239,7 @@ test "emit: export section encodes name, kind, and index" {
         .kind = .function,
         .index = 7,
     }};
-    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 4 (export)
@@ -261,7 +286,7 @@ test "roundtrip: emit then load with AOT loader" {
     const data = try emit(allocator, &code, &offsets, &exports, .{
         .arch = arch_name,
         .e_machine = 0x3E,
-    }, null, null);
+    }, null, null, null);
     defer allocator.free(data);
 
     // Parse back with the AOT loader
@@ -302,7 +327,7 @@ test "emit: import section round-trip" {
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -313,4 +338,25 @@ test "emit: import section round-trip" {
     try std.testing.expect(std.mem.eql(u8, module.imports[0].module_name, "wasi_snapshot_preview1"));
     try std.testing.expect(std.mem.eql(u8, module.imports[0].field_name, "fd_write"));
     try std.testing.expect(std.mem.eql(u8, module.imports[1].field_name, "clock_time_get"));
+}
+
+test "emit: memory section round-trip" {
+    const allocator = std.testing.allocator;
+    const aot_loader = @import("../runtime/aot/loader.zig");
+
+    const mem_entries = [_]MemoryEntry{
+        .{ .min_pages = 2, .max_pages = null },
+        .{ .min_pages = 1, .max_pages = 256 },
+    };
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries);
+    defer allocator.free(data);
+
+    const module = try aot_loader.load(data, allocator);
+    defer aot_loader.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), module.memories.len);
+    try std.testing.expectEqual(@as(u64, 2), module.memories[0].limits.min);
+    try std.testing.expect(module.memories[0].limits.max == null);
+    try std.testing.expectEqual(@as(u64, 1), module.memories[1].limits.min);
+    try std.testing.expectEqual(@as(u64, 256), module.memories[1].limits.max.?);
 }

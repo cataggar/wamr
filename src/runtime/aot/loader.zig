@@ -24,6 +24,7 @@ pub const AotSectionType = enum(u32) {
     relocation = 6,
     name = 7,
     @"import" = 8,
+    memory = 9,
     _,
 };
 
@@ -173,6 +174,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             },
             .@"import" => {
                 try parseImportSection(&reader, section_size, &module, allocator);
+            },
+            .memory => {
+                try parseMemorySection(&reader, section_size, &module, allocator);
             },
             else => {
                 // Skip unknown/unhandled sections
@@ -359,6 +363,26 @@ fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
 
     module.imports = import_descs;
     module.import_function_count = func_count;
+}
+
+fn parseMemorySection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const mem_types = allocator.alloc(types.MemoryType, count) catch return error.OutOfMemory;
+    errdefer allocator.free(mem_types);
+
+    for (0..count) |i| {
+        const min_pages = try reader.readU32Le();
+        const has_max = try reader.readByte();
+        const max_pages: ?u64 = if (has_max != 0) @as(u64, try reader.readU32Le()) else null;
+        mem_types[i] = .{
+            .limits = .{ .min = min_pages, .max = max_pages },
+        };
+    }
+
+    module.memories = mem_types;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

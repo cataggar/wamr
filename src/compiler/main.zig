@@ -169,6 +169,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Build memory entries from the parsed wasm module
+    var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
+    defer mem_entries.deinit(allocator);
+    for (module.memories) |mem| {
+        try mem_entries.append(allocator, .{
+            .min_pages = @intCast(mem.limits.min),
+            .max_pages = if (mem.limits.max) |m| @as(?u32, @intCast(m)) else null,
+        });
+    }
+
     const aot_binary = try emit_aot.emit(
         allocator,
         compiled.code,
@@ -177,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .arch = arch_name },
         if (data_segs.items.len > 0) data_segs.items else null,
         if (import_entries.items.len > 0) import_entries.items else null,
+        if (mem_entries.items.len > 0) mem_entries.items else null,
     );
     defer allocator.free(aot_binary);
 
