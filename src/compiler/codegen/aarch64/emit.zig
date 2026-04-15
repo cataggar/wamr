@@ -46,7 +46,7 @@ pub const Cond = enum(u4) {
 
 /// Machine code buffer with AArch64 instruction encoding helpers.
 pub const CodeBuffer = struct {
-    bytes: std.ArrayListUnmanaged(u8) = .{},
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) CodeBuffer {

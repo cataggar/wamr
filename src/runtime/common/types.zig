@@ -2,6 +2,50 @@
 
 const std = @import("std");
 
+/// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
+const Mutex = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    pub const init: Mutex = .{ .state = std.atomic.Value(u8).init(0) };
+    pub fn lock(self: *Mutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null)
+            std.atomic.spinLoopHint();
+    }
+    pub fn unlock(self: *Mutex) void {
+        self.state.store(0, .release);
+    }
+};
+
+/// Simple condition variable (spin-based, for atomic wait/notify).
+const Condition = struct {
+    flag: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        mutex.unlock();
+        while (self.flag.load(.acquire) == 0)
+            std.atomic.spinLoopHint();
+        self.flag.store(0, .release);
+        mutex.lock();
+    }
+    pub fn timedWait(self: *Condition, mutex: *Mutex, _: u64) error{Timeout}!void {
+        mutex.unlock();
+        // Spin-based: no real timed wait, just yield briefly then timeout
+        var spins: u32 = 0;
+        while (spins < 1000) : (spins += 1) {
+            if (self.flag.load(.acquire) != 0) {
+                self.flag.store(0, .release);
+                mutex.lock();
+                return;
+            }
+            std.atomic.spinLoopHint();
+        }
+        mutex.lock();
+        return error.Timeout;
+    }
+
+    pub fn signal(self: *Condition) void {
+        self.flag.store(1, .release);
+    }
+};
+
 /// WebAssembly value types (§2.3.1)
 pub const ValType = enum(u8) {
     i32 = 0x7F,
@@ -495,13 +539,13 @@ pub const MemoryInstance = struct {
 /// Waiter queue for memory.atomic.wait/notify.
 /// Each waiter is heap-allocated for pointer stability while threads block.
 pub const WaiterQueue = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .init,
     /// Heap-allocated waiter nodes for pointer stability.
-    waiters: std.ArrayListUnmanaged(*Waiter) = .{},
+    waiters: std.ArrayListUnmanaged(*Waiter) = .empty,
 
     pub const Waiter = struct {
         address: u32,
-        cond: std.Thread.Condition = .{},
+        cond: Condition = .{},
         woken: bool = false,
     };
 

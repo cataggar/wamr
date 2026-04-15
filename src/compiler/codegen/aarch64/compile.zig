@@ -163,9 +163,9 @@ pub const CompileResult = struct {
 
 /// Compile all functions in an IR module to AArch64 machine code.
 pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator) !CompileResult {
-    var all_code: std.ArrayListUnmanaged(u8) = .{};
+    var all_code: std.ArrayListUnmanaged(u8) = .empty;
     errdefer all_code.deinit(allocator);
-    var offsets: std.ArrayListUnmanaged(u32) = .{};
+    var offsets: std.ArrayListUnmanaged(u32) = .empty;
     errdefer offsets.deinit(allocator);
 
     for (ir_module.functions.items) |func| {

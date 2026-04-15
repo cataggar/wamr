@@ -11,16 +11,14 @@
 const std = @import("std");
 const spec_json_runner = @import("spec_json_runner.zig");
 
-const Dir = std.fs.Dir;
+const Dir = std.Io.Dir;
 const print = std.debug.print;
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         print("Usage: spec-test-runner <dir-or-file>\n", .{});
@@ -34,9 +32,9 @@ pub fn main() !void {
     // Check if argument is a single file
     if (std.mem.endsWith(u8, test_path, ".wast") or std.mem.endsWith(u8, test_path, ".json")) {
         const result = if (std.mem.endsWith(u8, test_path, ".wast"))
-            runWastFile(test_path, allocator)
+            runWastFile(test_path, allocator, io)
         else
-            spec_json_runner.runSpecTestFile(test_path, allocator) catch |err| {
+            spec_json_runner.runSpecTestFile(test_path, allocator, io) catch |err| {
                 print("ERROR: {}\n", .{err});
                 std.process.exit(1);
             };
@@ -49,11 +47,11 @@ pub fn main() !void {
         return;
     }
 
-    var dir = std.fs.cwd().openDir(test_path, .{ .iterate = true }) catch |err| {
+    var dir = std.Io.Dir.cwd().openDir(io, test_path, .{ .iterate = true }) catch |err| {
         print("Error: cannot open directory '{s}': {}\n", .{ test_path, err });
         std.process.exit(1);
     };
-    defer dir.close();
+    defer dir.close(io);
 
     var total_passed: u32 = 0;
     var total_failed: u32 = 0;
@@ -69,7 +67,7 @@ pub fn main() !void {
     }
 
     var iter = dir.iterate();
-    while (iter.next() catch null) |entry| {
+    while (iter.next(io) catch null) |entry| {
         if (entry.kind == .file and
             (std.mem.endsWith(u8, entry.name, ".json") or
             std.mem.endsWith(u8, entry.name, ".wast")))
@@ -106,7 +104,7 @@ pub fn main() !void {
 
         if (std.mem.endsWith(u8, name, ".json")) {
             // Legacy JSON format
-            const result = spec_json_runner.runSpecTestFile(full_path, allocator) catch |err| {
+            const result = spec_json_runner.runSpecTestFile(full_path, allocator, io) catch |err| {
                 print("  {s:<25} ERROR: {}\n", .{ name, err });
                 continue;
             };
@@ -118,7 +116,7 @@ pub fn main() !void {
             file_count += 1;
         } else if (std.mem.endsWith(u8, name, ".wast")) {
             // Native .wast format — use wabt to run
-            const result = runWastFile(full_path, allocator);
+            const result = runWastFile(full_path, allocator, io);
             printResult(name, result);
             total_passed += result.passed;
             total_failed += result.failed;
@@ -158,15 +156,15 @@ fn printResult(name: []const u8, result: TestResult) void {
 }
 
 /// Run a .wast file using wabt's parser + interpreter for conformance.
-fn runWastFile(path: []const u8, allocator: std.mem.Allocator) TestResult {
+fn runWastFile(path: []const u8, allocator: std.mem.Allocator, io: std.Io) TestResult {
     const wast_runner = @import("wast_runner.zig");
-    const source = std.fs.cwd().readFileAlloc(allocator, path, 64 * 1024 * 1024) catch {
+    const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(64 * 1024 * 1024)) catch {
         return .{ .file = path, .passed = 0, .failed = 0, .skipped = 1, .total = 1 };
     };
     defer allocator.free(source);
 
     const base = std.fs.path.stem(path);
-    const result = wast_runner.run(allocator, source, base);
+    const result = wast_runner.run(allocator, source, base, io);
     return .{
         .file = path,
         .passed = result.passed,

@@ -87,9 +87,9 @@ pub fn mprotect(addr: [*]u8, size: usize, prot: MemProt) !void {
 fn mmapWindows(hint: ?[*]u8, size: usize, prot: MemProt, flags: MapFlags) ?[*]u8 {
     if (!is_windows) unreachable;
 
-    var alloc_flags: u32 = win.MEM_RESERVE;
+    var alloc_flags: win.MEM.ALLOCATE = .{ .RESERVE = true };
     if (prot.read or prot.write or prot.exec) {
-        alloc_flags |= win.MEM_COMMIT;
+        alloc_flags.COMMIT = true;
     }
 
     const page_prot = memProtToWindowsPage(prot);
@@ -122,7 +122,7 @@ fn munmapWindows(addr: [*]u8) void {
         win.GetCurrentProcess(),
         @ptrCast(&base),
         &region_size,
-        win.MEM_RELEASE,
+        .{ .RELEASE = true },
     );
 }
 
@@ -130,7 +130,7 @@ fn mprotectWindows(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (!is_windows) unreachable;
 
     const new_prot = memProtToWindowsPage(prot);
-    var old_prot: u32 = undefined;
+    var old_prot: win.PAGE = undefined;
     var base: ?*anyopaque = @ptrCast(addr);
     var region_size: usize = size;
 
@@ -145,17 +145,17 @@ fn mprotectWindows(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (status != .SUCCESS) return error.MprotectFailed;
 }
 
-fn memProtToWindowsPage(prot: MemProt) u32 {
+fn memProtToWindowsPage(prot: MemProt) win.PAGE {
     if (!is_windows) unreachable;
 
     if (prot.exec) {
-        if (prot.write) return win.PAGE_EXECUTE_READWRITE;
-        if (prot.read) return win.PAGE_EXECUTE_READ;
-        return win.PAGE_EXECUTE;
+        if (prot.write) return .{ .EXECUTE_READWRITE = true };
+        if (prot.read) return .{ .EXECUTE_READ = true };
+        return .{ .EXECUTE = true };
     }
-    if (prot.write) return win.PAGE_READWRITE;
-    if (prot.read) return win.PAGE_READONLY;
-    return win.PAGE_NOACCESS;
+    if (prot.write) return .{ .READWRITE = true };
+    if (prot.read) return .{ .READONLY = true };
+    return .{ .NOACCESS = true };
 }
 
 // ── POSIX memory mapping implementation ─────────────────────────────────
@@ -165,10 +165,10 @@ fn mmapPosix(hint: ?[*]u8, size: usize, prot: MemProt, flags: MapFlags) ?[*]u8 {
 
     const posix = std.posix;
 
-    var posix_prot: u32 = posix.PROT.NONE;
-    if (prot.read) posix_prot |= posix.PROT.READ;
-    if (prot.write) posix_prot |= posix.PROT.WRITE;
-    if (prot.exec) posix_prot |= posix.PROT.EXEC;
+    var posix_prot: std.posix.PROT = .{};
+    if (prot.read) posix_prot.READ = true;
+    if (prot.write) posix_prot.WRITE = true;
+    if (prot.exec) posix_prot.EXEC = true;
 
     var map_flags: std.posix.system.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     if (flags.map_fixed) map_flags.FIXED = true;
@@ -209,10 +209,10 @@ fn munmapPosix(addr: [*]u8, size: usize) void {
 fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (is_windows) unreachable;
 
-    var posix_prot: u32 = std.posix.PROT.NONE;
-    if (prot.read) posix_prot |= std.posix.PROT.READ;
-    if (prot.write) posix_prot |= std.posix.PROT.WRITE;
-    if (prot.exec) posix_prot |= std.posix.PROT.EXEC;
+    var posix_prot: std.posix.PROT = .{};
+    if (prot.read) posix_prot.READ = true;
+    if (prot.write) posix_prot.WRITE = true;
+    if (prot.exec) posix_prot.EXEC = true;
 
     const aligned: [*]align(page_size) u8 = @alignCast(addr);
     const rc = std.posix.system.mprotect(aligned, size, posix_prot);
@@ -223,9 +223,45 @@ fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
 // ── 2. Threading ────────────────────────────────────────────────────────
 
 pub const Thread = std.Thread;
-pub const Mutex = std.Thread.Mutex;
-pub const Condition = std.Thread.Condition;
-pub const RwLock = std.Thread.RwLock;
+
+/// Simple spinlock mutex that doesn't require Io (Zig 0.16 moved std.Thread.Mutex behind Io).
+pub const Mutex = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    pub const init: Mutex = .{ .state = std.atomic.Value(u8).init(0) };
+
+    pub fn lock(self: *Mutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        self.state.store(0, .release);
+    }
+};
+
+/// Simple condition variable stub (Zig 0.16 moved std.Thread.Condition behind Io).
+pub const Condition = struct {
+    flag: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        mutex.unlock();
+        while (self.flag.load(.acquire) == 0) {
+            std.atomic.spinLoopHint();
+        }
+        self.flag.store(0, .release);
+        mutex.lock();
+    }
+
+    pub fn signal(self: *Condition) void {
+        self.flag.store(1, .release);
+    }
+
+    pub fn broadcast(self: *Condition) void {
+        self.flag.store(1, .release);
+    }
+};
 
 /// Get the current thread ID.
 pub fn selfThread() std.Thread.Id {
@@ -312,14 +348,17 @@ pub fn usleep(us: u64) void {
 fn usleepWindows(us: u64) void {
     if (!is_windows) unreachable;
 
-    // Sleep takes milliseconds; round up to avoid sleeping 0ms for small values.
-    const ms: u32 = @intCast(@min((us + 999) / 1000, std.math.maxInt(u32)));
-    std.os.windows.kernel32.Sleep(ms);
+    // NtDelayExecution takes a LARGE_INTEGER in 100ns units, negative for relative delay.
+    const hundred_ns = @as(u64, @min(us * 10, @as(u64, @intCast(std.math.maxInt(i64)))));
+    const delay: win.LARGE_INTEGER = -@as(i64, @intCast(hundred_ns));
+    _ = ntdll.NtDelayExecution(.FALSE, &delay);
 }
 
 fn usleepPosix(us: u64) void {
     if (is_windows) unreachable;
-    std.Thread.sleep(us * std.time.ns_per_us);
+    const ns = us * std.time.ns_per_us;
+    const ts = std.posix.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    _ = std.posix.system.nanosleep(&ts, null);
 }
 
 // ── 3. Time ─────────────────────────────────────────────────────────────
@@ -353,8 +392,10 @@ fn timeGetBootUsWindows() u64 {
 
 fn timeGetBootUsPosix() u64 {
     if (is_windows) unreachable;
-    const ns = std.time.nanoTimestamp();
-    return @intCast(@divFloor(ns, std.time.ns_per_us));
+    var ts: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    const ns: u64 = @intCast(ts.sec * std.time.ns_per_s + ts.nsec);
+    return ns / std.time.ns_per_us;
 }
 
 /// Current thread CPU time in microseconds (best-effort).

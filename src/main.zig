@@ -1,17 +1,14 @@
 const std = @import("std");
 const wamr = @import("wamr");
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     // Parse arguments
     var wasm_path: ?[]const u8 = null;
-    var wasm_args: std.ArrayListUnmanaged([]const u8) = .{};
+    var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer wasm_args.deinit(allocator);
     var show_version = false;
     var stack_size: u32 = 64 * 1024;
@@ -59,8 +56,9 @@ pub fn main() !void {
     };
 
     // Load wasm binary
-    const cwd = std.fs.cwd();
-    const wasm_data = cwd.readFileAlloc(allocator, path, 256 * 1024 * 1024) catch |err| {
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    const wasm_data = cwd.readFileAlloc(io, path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
         std.debug.print("Error: cannot read '{s}': {}\n", .{ path, err });
         std.process.exit(1);
     };

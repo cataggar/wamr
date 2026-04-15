@@ -164,42 +164,42 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 8);
             var result: I16x8 = undefined;
-            for (0..8) |i| result[i] = @as(i16, @as(i8, @bitCast(slice[i])));
+            inline for (0..8) |i| result[i] = @as(i16, @as(i8, @bitCast(slice[i])));
             try pushV128(env, @bitCast(result));
         },
         0x02 => { // v128.load8x8_u
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 8);
             var result: U16x8 = undefined;
-            for (0..8) |i| result[i] = @as(u16, slice[i]);
+            inline for (0..8) |i| result[i] = @as(u16, slice[i]);
             try pushV128(env, @bitCast(result));
         },
         0x03 => { // v128.load16x4_s
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 8);
             var result: I32x4 = undefined;
-            for (0..4) |i| result[i] = @as(i32, std.mem.readInt(i16, slice[i * 2 ..][0..2], .little));
+            inline for (0..4) |i| result[i] = @as(i32, std.mem.readInt(i16, slice[i * 2 ..][0..2], .little));
             try pushV128(env, @bitCast(result));
         },
         0x04 => { // v128.load16x4_u
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 8);
             var result: U32x4 = undefined;
-            for (0..4) |i| result[i] = @as(u32, std.mem.readInt(u16, slice[i * 2 ..][0..2], .little));
+            inline for (0..4) |i| result[i] = @as(u32, std.mem.readInt(u16, slice[i * 2 ..][0..2], .little));
             try pushV128(env, @bitCast(result));
         },
         0x05 => { // v128.load32x2_s
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 8);
             var result: I64x2 = undefined;
-            for (0..2) |i| result[i] = @as(i64, std.mem.readInt(i32, slice[i * 4 ..][0..4], .little));
+            inline for (0..2) |i| result[i] = @as(i64, std.mem.readInt(i32, slice[i * 4 ..][0..4], .little));
             try pushV128(env, @bitCast(result));
         },
         0x06 => { // v128.load32x2_u
             const ma = readMemarg(code, ip);
             const slice = try getMemSlice(env, ma, 8);
             var result: U64x2 = undefined;
-            for (0..2) |i| result[i] = @as(u64, std.mem.readInt(u32, slice[i * 4 ..][0..4], .little));
+            inline for (0..2) |i| result[i] = @as(u64, std.mem.readInt(u32, slice[i * 4 ..][0..4], .little));
             try pushV128(env, @bitCast(result));
         },
         0x07 => { // v128.load8_splat
@@ -254,18 +254,21 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
             const b: U8x16 = @bitCast(try popV128(env));
             const a: U8x16 = @bitCast(try popV128(env));
             var result: U8x16 = undefined;
-            for (0..16) |i| {
+            inline for (0..16) |i| {
                 const idx = lanes[i];
-                result[i] = if (idx < 16) a[idx] else if (idx < 32) b[idx - 16] else 0;
+                const a_arr: [16]u8 = a;
+                const b_arr: [16]u8 = b;
+                result[i] = if (idx < 16) a_arr[idx] else if (idx < 32) b_arr[idx - 16] else 0;
             }
             try pushV128(env, @bitCast(result));
         },
         0x0E => { // i8x16.swizzle
             const indices: U8x16 = @bitCast(try popV128(env));
             const a: U8x16 = @bitCast(try popV128(env));
+            const a_arr: [16]u8 = a;
             var result: U8x16 = undefined;
-            for (0..16) |i| {
-                result[i] = if (indices[i] < 16) a[indices[i]] else 0;
+            inline for (0..16) |i| {
+                result[i] = if (indices[i] < 16) a_arr[indices[i]] else 0;
             }
             try pushV128(env, @bitCast(result));
         },
@@ -595,8 +598,9 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
         0x100 => { // i8x16.relaxed_swizzle (same as swizzle but OOB returns 0)
             const indices: U8x16 = @bitCast(try popV128(env));
             const a: U8x16 = @bitCast(try popV128(env));
+            const a_arr: [16]u8 = a;
             var result: U8x16 = undefined;
-            for (0..16) |i| result[i] = if (indices[i] < 16) a[indices[i]] else 0;
+            inline for (0..16) |i| result[i] = if (indices[i] < 16) a_arr[indices[i]] else 0;
             try pushV128(env, @bitCast(result));
         },
         0x105 => try f32x4Ternary(env, false), // f32x4.relaxed_madd (a*b+c)
@@ -618,7 +622,7 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
             const b: U8x16 = @bitCast(try popV128(env));
             const a: U8x16 = @bitCast(try popV128(env));
             var result: I16x8 = undefined;
-            for (0..8) |i| {
+            inline for (0..8) |i| {
                 const a0: i16 = @as(i8, @bitCast(a[i * 2]));
                 const a1: i16 = @as(i8, @bitCast(a[i * 2 + 1]));
                 const b0: i16 = @as(i8, @bitCast(b[i * 2]));
@@ -632,9 +636,9 @@ pub fn executeSIMD(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
             const b: U8x16 = @bitCast(try popV128(env));
             const a: U8x16 = @bitCast(try popV128(env));
             var result: I32x4 = undefined;
-            for (0..4) |i| {
+            inline for (0..4) |i| {
                 var sum: i32 = c[i];
-                for (0..4) |j| {
+                inline for (0..4) |j| {
                     const ai: i32 = @as(i8, @bitCast(a[i * 4 + j]));
                     const bi: i32 = @as(i8, @bitCast(b[i * 4 + j]));
                     sum +%= ai * bi;
@@ -658,110 +662,118 @@ fn extractLaneI8s(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u4 = @intCast(code[ip.*] & 0xF);
     ip.* += 1;
     const v: I8x16 = @bitCast(try popV128(env));
-    try pushI32(env, @as(i32, v[lane]));
+    const arr: [16]i8 = v;
+    try pushI32(env, @as(i32, arr[lane]));
 }
 
 fn extractLaneI8u(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u4 = @intCast(code[ip.*] & 0xF);
     ip.* += 1;
     const v: U8x16 = @bitCast(try popV128(env));
-    try pushI32(env, @as(i32, @intCast(v[lane])));
+    const arr: [16]u8 = v;
+    try pushI32(env, @as(i32, @intCast(arr[lane])));
 }
 
 fn replaceLaneI8(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u4 = @intCast(code[ip.*] & 0xF);
     ip.* += 1;
     const val: u8 = @truncate(@as(u32, @bitCast(try popI32(env))));
-    var v: U8x16 = @bitCast(try popV128(env));
-    v[lane] = val;
-    try pushV128(env, @bitCast(v));
+    var arr: [16]u8 = @bitCast(try popV128(env));
+    arr[lane] = val;
+    try pushV128(env, @bitCast(arr));
 }
 
 fn extractLaneI16s(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u3 = @intCast(code[ip.*] & 0x7);
     ip.* += 1;
     const v: I16x8 = @bitCast(try popV128(env));
-    try pushI32(env, @as(i32, v[lane]));
+    const arr: [8]i16 = v;
+    try pushI32(env, @as(i32, arr[lane]));
 }
 
 fn extractLaneI16u(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u3 = @intCast(code[ip.*] & 0x7);
     ip.* += 1;
     const v: U16x8 = @bitCast(try popV128(env));
-    try pushI32(env, @as(i32, @intCast(v[lane])));
+    const arr: [8]u16 = v;
+    try pushI32(env, @as(i32, @intCast(arr[lane])));
 }
 
 fn replaceLaneI16(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u3 = @intCast(code[ip.*] & 0x7);
     ip.* += 1;
     const val: u16 = @truncate(@as(u32, @bitCast(try popI32(env))));
-    var v: U16x8 = @bitCast(try popV128(env));
-    v[lane] = val;
-    try pushV128(env, @bitCast(v));
+    var arr: [8]u16 = @bitCast(try popV128(env));
+    arr[lane] = val;
+    try pushV128(env, @bitCast(arr));
 }
 
 fn extractLaneI32(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u2 = @intCast(code[ip.*] & 0x3);
     ip.* += 1;
     const v: I32x4 = @bitCast(try popV128(env));
-    try pushI32(env, v[lane]);
+    const arr: [4]i32 = v;
+    try pushI32(env, arr[lane]);
 }
 
 fn replaceLaneI32(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u2 = @intCast(code[ip.*] & 0x3);
     ip.* += 1;
     const val = try popI32(env);
-    var v: I32x4 = @bitCast(try popV128(env));
-    v[lane] = val;
-    try pushV128(env, @bitCast(v));
+    var arr: [4]i32 = @bitCast(try popV128(env));
+    arr[lane] = val;
+    try pushV128(env, @bitCast(arr));
 }
 
 fn extractLaneI64(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u1 = @intCast(code[ip.*] & 0x1);
     ip.* += 1;
     const v: I64x2 = @bitCast(try popV128(env));
-    try pushI64(env, v[lane]);
+    const arr: [2]i64 = v;
+    try pushI64(env, arr[lane]);
 }
 
 fn replaceLaneI64(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u1 = @intCast(code[ip.*] & 0x1);
     ip.* += 1;
     const val = env.popI64() catch return error.StackUnderflow;
-    var v: I64x2 = @bitCast(try popV128(env));
-    v[lane] = val;
-    try pushV128(env, @bitCast(v));
+    var arr: [2]i64 = @bitCast(try popV128(env));
+    arr[lane] = val;
+    try pushV128(env, @bitCast(arr));
 }
 
 fn extractLaneF32(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u2 = @intCast(code[ip.*] & 0x3);
     ip.* += 1;
     const v: F32x4 = @bitCast(try popV128(env));
-    try pushF32(env, v[lane]);
+    const arr: [4]f32 = v;
+    try pushF32(env, arr[lane]);
 }
 
 fn replaceLaneF32(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u2 = @intCast(code[ip.*] & 0x3);
     ip.* += 1;
     const val = env.popF32() catch return error.StackUnderflow;
-    var v: F32x4 = @bitCast(try popV128(env));
-    v[lane] = val;
-    try pushV128(env, @bitCast(v));
+    var arr: [4]f32 = @bitCast(try popV128(env));
+    arr[lane] = val;
+    try pushV128(env, @bitCast(arr));
 }
 
 fn extractLaneF64(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u1 = @intCast(code[ip.*] & 0x1);
     ip.* += 1;
     const v: F64x2 = @bitCast(try popV128(env));
-    try pushF64(env, v[lane]);
+    const arr: [2]f64 = v;
+    try pushF64(env, arr[lane]);
 }
 
 fn replaceLaneF64(env: *ExecEnv, code: []const u8, ip: *usize) SimdError!void {
     const lane: u1 = @intCast(code[ip.*] & 0x1);
     ip.* += 1;
     const val = env.popF64() catch return error.StackUnderflow;
-    var v: F64x2 = @bitCast(try popV128(env));
-    v[lane] = val;
-    try pushV128(env, @bitCast(v));
+    var arr: [2]f64 = @bitCast(try popV128(env));
+    arr[lane] = val;
+    try pushV128(env, @bitCast(arr));
 }
 
 // ── Load/store lane ─────────────────────────────────────────────────────
@@ -824,7 +836,7 @@ fn unaryOp(comptime T: type, env: *ExecEnv, comptime kind: UnaryKind) SimdError!
             if (@typeInfo(Child).int.signedness == .unsigned) break :blk a;
             const lanes = @typeInfo(T).vector.len;
             var r: T = undefined;
-            for (0..lanes) |i| {
+            inline for (0..lanes) |i| {
                 r[i] = if (a[i] == std.math.minInt(Child))
                     std.math.minInt(Child)
                 else if (a[i] < 0)
@@ -902,7 +914,7 @@ fn bitmask(comptime T: type, env: *ExecEnv) SimdError!void {
     const v: T = @bitCast(try popV128(env));
     const lanes = @typeInfo(T).vector.len;
     var result: u32 = 0;
-    for (0..lanes) |i| {
+    inline for (0..lanes) |i| {
         if (v[i] < 0) result |= @as(u32, 1) << @intCast(i);
     }
     try pushI32(env, @bitCast(result));
@@ -913,7 +925,7 @@ fn bitmask(comptime T: type, env: *ExecEnv) SimdError!void {
 fn i8x16Popcnt(env: *ExecEnv) SimdError!void {
     const v: U8x16 = @bitCast(try popV128(env));
     var result: U8x16 = undefined;
-    for (0..16) |i| result[i] = @popCount(v[i]);
+    inline for (0..16) |i| result[i] = @popCount(v[i]);
     try pushV128(env, @bitCast(result));
 }
 
@@ -926,7 +938,7 @@ fn avgr(comptime T: type, env: *ExecEnv) SimdError!void {
     const Child = @typeInfo(T).vector.child;
     const Wide = std.meta.Int(.unsigned, @bitSizeOf(Child) * 2);
     var result: T = undefined;
-    for (0..lanes) |i| {
+    inline for (0..lanes) |i| {
         result[i] = @intCast((@as(Wide, a[i]) + @as(Wide, b[i]) + 1) / 2);
     }
     try pushV128(env, @bitCast(result));
@@ -941,7 +953,7 @@ fn narrowOp(comptime SrcT: type, comptime DstT: type, env: *ExecEnv, comptime si
     const DstChild = @typeInfo(DstT).vector.child;
     const dst_lanes = src_lanes * 2;
     var result: @Vector(dst_lanes, DstChild) = undefined;
-    for (0..src_lanes) |i| {
+    inline for (0..src_lanes) |i| {
         result[i] = saturateTo(DstChild, a[i], signed);
         result[src_lanes + i] = saturateTo(DstChild, b[i], signed);
     }
@@ -975,7 +987,7 @@ fn extendOp(comptime SrcT: type, comptime DstT: type, env: *ExecEnv, comptime ha
     const offset = if (half == .high) dst_lanes else 0;
     const DstChild = @typeInfo(DstT).vector.child;
     var result: @Vector(dst_lanes, DstChild) = undefined;
-    for (0..dst_lanes) |i| {
+    inline for (0..dst_lanes) |i| {
         result[i] = @intCast(v[offset + i]);
     }
     try pushV128(env, @bitCast(result));
@@ -991,7 +1003,7 @@ fn extmulOp(comptime SrcT: type, comptime DstT: type, env: *ExecEnv, comptime ha
     const DstChild = @typeInfo(DstT).vector.child;
     const offset = if (half == .high) dst_lanes else 0;
     var result: @Vector(dst_lanes, DstChild) = undefined;
-    for (0..dst_lanes) |i| {
+    inline for (0..dst_lanes) |i| {
         const a_wide: DstChild = @intCast(aa[offset + i]);
         const b_wide: DstChild = @intCast(bb[offset + i]);
         result[i] = a_wide *% b_wide;
@@ -1007,7 +1019,7 @@ fn extaddPairwise(comptime SrcT: type, comptime DstT: type, env: *ExecEnv, compt
     const dst_lanes = @typeInfo(DstT).vector.len;
     const DstChild = @typeInfo(DstT).vector.child;
     var result: @Vector(dst_lanes, DstChild) = undefined;
-    for (0..dst_lanes) |i| {
+    inline for (0..dst_lanes) |i| {
         const a: DstChild = @intCast(v[i * 2]);
         const b: DstChild = @intCast(v[i * 2 + 1]);
         result[i] = a +% b;
@@ -1021,7 +1033,7 @@ fn q15mulrSatS(env: *ExecEnv) SimdError!void {
     const b: I16x8 = @bitCast(try popV128(env));
     const a: I16x8 = @bitCast(try popV128(env));
     var result: I16x8 = undefined;
-    for (0..8) |i| {
+    inline for (0..8) |i| {
         const prod: i32 = @as(i32, a[i]) * @as(i32, b[i]);
         const rounded = (prod + 0x4000) >> 15;
         result[i] = @intCast(std.math.clamp(rounded, -32768, 32767));
@@ -1035,7 +1047,7 @@ fn i32x4DotI16x8S(env: *ExecEnv) SimdError!void {
     const b: I16x8 = @bitCast(try popV128(env));
     const a: I16x8 = @bitCast(try popV128(env));
     var result: I32x4 = undefined;
-    for (0..4) |i| {
+    inline for (0..4) |i| {
         const lo: i32 = @as(i32, a[i * 2]) * @as(i32, b[i * 2]);
         const hi: i32 = @as(i32, a[i * 2 + 1]) * @as(i32, b[i * 2 + 1]);
         result[i] = lo +% hi;
@@ -1050,7 +1062,7 @@ const F32x4UnaryKind = enum { abs, neg, sqrt, ceil, floor, trunc, nearest };
 fn f32x4Unary(env: *ExecEnv, comptime kind: F32x4UnaryKind) SimdError!void {
     const v: F32x4 = @bitCast(try popV128(env));
     var result: F32x4 = undefined;
-    for (0..4) |i| {
+    inline for (0..4) |i| {
         result[i] = switch (kind) {
             .abs => @abs(v[i]),
             .neg => -v[i],
@@ -1070,7 +1082,7 @@ fn f32x4Binary(env: *ExecEnv, comptime kind: F32x4BinaryKind) SimdError!void {
     const b: F32x4 = @bitCast(try popV128(env));
     const a: F32x4 = @bitCast(try popV128(env));
     var result: F32x4 = undefined;
-    for (0..4) |i| {
+    inline for (0..4) |i| {
         result[i] = switch (kind) {
             .add => canonF32(a[i] + b[i]),
             .sub => canonF32(a[i] - b[i]),
@@ -1092,7 +1104,7 @@ const F64x2UnaryKind = enum { abs, neg, sqrt, ceil, floor, trunc, nearest };
 fn f64x2Unary(env: *ExecEnv, comptime kind: F64x2UnaryKind) SimdError!void {
     const v: F64x2 = @bitCast(try popV128(env));
     var result: F64x2 = undefined;
-    for (0..2) |i| {
+    inline for (0..2) |i| {
         result[i] = switch (kind) {
             .abs => @abs(v[i]),
             .neg => -v[i],
@@ -1112,7 +1124,7 @@ fn f64x2Binary(env: *ExecEnv, comptime kind: F64x2BinaryKind) SimdError!void {
     const b: F64x2 = @bitCast(try popV128(env));
     const a: F64x2 = @bitCast(try popV128(env));
     var result: F64x2 = undefined;
-    for (0..2) |i| {
+    inline for (0..2) |i| {
         result[i] = switch (kind) {
             .add => canonF64(a[i] + b[i]),
             .sub => canonF64(a[i] - b[i]),
@@ -1134,7 +1146,7 @@ fn f32x4Ternary(env: *ExecEnv, comptime negate: bool) SimdError!void {
     const b: F32x4 = @bitCast(try popV128(env));
     const a: F32x4 = @bitCast(try popV128(env));
     var result: F32x4 = undefined;
-    for (0..4) |i| {
+    inline for (0..4) |i| {
         if (negate)
             result[i] = canonF32(-a[i] * b[i] + c[i])
         else
@@ -1148,7 +1160,7 @@ fn f64x2Ternary(env: *ExecEnv, comptime negate: bool) SimdError!void {
     const b: F64x2 = @bitCast(try popV128(env));
     const a: F64x2 = @bitCast(try popV128(env));
     var result: F64x2 = undefined;
-    for (0..2) |i| {
+    inline for (0..2) |i| {
         if (negate)
             result[i] = canonF64(-a[i] * b[i] + c[i])
         else
@@ -1163,7 +1175,7 @@ fn i32x4TruncSatF32x4(env: *ExecEnv, comptime signed: bool) SimdError!void {
     const v: F32x4 = @bitCast(try popV128(env));
     if (signed) {
         var result: I32x4 = undefined;
-        for (0..4) |i| {
+        inline for (0..4) |i| {
             if (std.math.isNan(v[i])) {
                 result[i] = 0;
             } else if (v[i] >= 2147483648.0) {
@@ -1177,7 +1189,7 @@ fn i32x4TruncSatF32x4(env: *ExecEnv, comptime signed: bool) SimdError!void {
         try pushV128(env, @bitCast(result));
     } else {
         var result: U32x4 = undefined;
-        for (0..4) |i| {
+        inline for (0..4) |i| {
             if (std.math.isNan(v[i]) or v[i] <= -1.0) {
                 result[i] = 0;
             } else if (v[i] >= 4294967296.0) {
@@ -1194,12 +1206,12 @@ fn f32x4ConvertI32x4(env: *ExecEnv, comptime signed: bool) SimdError!void {
     if (signed) {
         const v: I32x4 = @bitCast(try popV128(env));
         var result: F32x4 = undefined;
-        for (0..4) |i| result[i] = @floatFromInt(v[i]);
+        inline for (0..4) |i| result[i] = @floatFromInt(v[i]);
         try pushV128(env, @bitCast(result));
     } else {
         const v: U32x4 = @bitCast(try popV128(env));
         var result: F32x4 = undefined;
-        for (0..4) |i| result[i] = @floatFromInt(v[i]);
+        inline for (0..4) |i| result[i] = @floatFromInt(v[i]);
         try pushV128(env, @bitCast(result));
     }
 }
@@ -1208,7 +1220,7 @@ fn i32x4TruncSatF64x2Zero(env: *ExecEnv, comptime signed: bool) SimdError!void {
     const v: F64x2 = @bitCast(try popV128(env));
     var result: I32x4 = .{ 0, 0, 0, 0 };
     if (signed) {
-        for (0..2) |i| {
+        inline for (0..2) |i| {
             if (std.math.isNan(v[i])) {
                 result[i] = 0;
             } else {
@@ -1219,7 +1231,7 @@ fn i32x4TruncSatF64x2Zero(env: *ExecEnv, comptime signed: bool) SimdError!void {
     } else {
         const ru: U32x4 = @bitCast(result);
         var r = ru;
-        for (0..2) |i| {
+        inline for (0..2) |i| {
             if (std.math.isNan(v[i]) or v[i] < 0.0) {
                 r[i] = 0;
             } else {

@@ -23,15 +23,15 @@ pub const WastResult = struct {
 /// 2. Convert modules to .wasm binary via wabt text.Parser + binary.writer
 /// 3. Write JSON + .wasm to temp dir
 /// 4. Run through WAMR's JSON-based spec test runner
-pub fn run(allocator: std.mem.Allocator, source: []const u8, name: []const u8) WastResult {
-    return runInner(allocator, source, name) catch return .{ .skipped = 1 };
+pub fn run(allocator: std.mem.Allocator, source: []const u8, name: []const u8, io: std.Io) WastResult {
+    return runInner(allocator, source, name, io) catch return .{ .skipped = 1 };
 }
 
-fn runInner(allocator: std.mem.Allocator, source: []const u8, name: []const u8) !WastResult {
+fn runInner(allocator: std.mem.Allocator, source: []const u8, name: []const u8, io: std.Io) !WastResult {
     // Convert .wast to JSON + wasm modules in memory
     var json_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer json_buf.deinit(allocator);
-    var modules = std.StringHashMapUnmanaged([]u8){};
+    var modules = std.StringHashMapUnmanaged([]u8).empty;
     defer {
         var it = modules.iterator();
         while (it.next()) |entry| {
@@ -48,29 +48,30 @@ fn runInner(allocator: std.mem.Allocator, source: []const u8, name: []const u8) 
     defer allocator.free(dir_name);
 
     // Create dir (ignore if exists)
-    std.fs.cwd().makeDir(dir_name) catch {};
-    var out_dir = try std.fs.cwd().openDir(dir_name, .{});
-    defer out_dir.close();
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDir(io, dir_name, .default_dir) catch {};
+    var out_dir = try cwd.openDir(io, dir_name, .{});
+    defer out_dir.close(io);
 
     // Write wasm modules
     var mod_it = modules.iterator();
     while (mod_it.next()) |entry| {
-        out_dir.writeFile(.{ .sub_path = entry.key_ptr.*, .data = entry.value_ptr.* }) catch continue;
+        out_dir.writeFile(io, .{ .sub_path = entry.key_ptr.*, .data = entry.value_ptr.* }) catch continue;
     }
 
     // Write JSON
     const json_name = try std.fmt.allocPrint(allocator, "{s}.json", .{name});
     defer allocator.free(json_name);
-    out_dir.writeFile(.{ .sub_path = json_name, .data = json_buf.items }) catch return .{ .skipped = 1 };
+    out_dir.writeFile(io, .{ .sub_path = json_name, .data = json_buf.items }) catch return .{ .skipped = 1 };
 
     // Build full path
     const json_path = try std.fs.path.join(allocator, &.{ dir_name, json_name });
     defer allocator.free(json_path);
 
-    const result = try spec_json_runner.runSpecTestFile(json_path, allocator);
+    const result = try spec_json_runner.runSpecTestFile(json_path, allocator, io);
 
     // Cleanup temp dir
-    std.fs.cwd().deleteTree(dir_name) catch {};
+    cwd.deleteTree(io, dir_name) catch {};
 
     return .{
         .passed = result.passed,
@@ -81,7 +82,9 @@ fn runInner(allocator: std.mem.Allocator, source: []const u8, name: []const u8) 
 
 fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []const u8, json_buf: *std.ArrayListUnmanaged(u8), modules: *std.StringHashMapUnmanaged([]u8)) !void {
     const wr = wabt.wast_runner;
-    const w = json_buf.writer(allocator);
+    var aw: std.Io.Writer.Allocating = .fromArrayList(allocator, json_buf);
+    defer json_buf.* = aw.writer.toArrayList();
+    const w = &aw.writer;
     try w.writeAll("{\"commands\":[");
 
     var pos: usize = 0;
@@ -224,7 +227,7 @@ fn convertWast(allocator: std.mem.Allocator, source: []const u8, base_name: []co
                         };
                         defer allocator.free(wat_text);
                         // Wrap in (module ...) if not already
-                        const trimmed = std.mem.trimLeft(u8, wat_text, " \t\n\r");
+                        const trimmed = std.mem.trimStart(u8, wat_text, " \t\n\r");
                         const parse_text = if (std.mem.startsWith(u8, trimmed, "(module"))
                             wat_text
                         else blk: {
@@ -1232,7 +1235,7 @@ test "wast runner: full pipeline for simple module" {
     // Test the convertWast function specifically
     var json_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer json_buf.deinit(allocator);
-    var modules = std.StringHashMapUnmanaged([]u8){};
+    var modules = std.StringHashMapUnmanaged([]u8).empty;
     defer {
         var it = modules.iterator();
         while (it.next()) |entry| {

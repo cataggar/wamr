@@ -5,6 +5,41 @@
 //! during component instantiation.
 
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// Cross-platform nanosecond wall-clock timestamp (since Unix epoch).
+fn nanoTimestamp() i128 {
+    if (builtin.os.tag == .windows) {
+        const win = std.os.windows;
+        // RtlGetSystemTimePrecise returns 100ns intervals since Windows epoch (1601-01-01).
+        const epoch_adjustment = @as(i128, std.time.epoch.windows) * std.time.ns_per_s;
+        return @as(i128, win.ntdll.RtlGetSystemTimePrecise()) * 100 + epoch_adjustment;
+    } else {
+        const posix = std.posix;
+        var ts: posix.timespec = undefined;
+        _ = posix.system.clock_gettime(.REALTIME, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+}
+
+/// Fill buffer with cryptographically-secure random bytes using OS primitives.
+fn fillRandom(buf: []u8) void {
+    if (builtin.os.tag == .windows) {
+        // Use ProcessPrng from bcryptprimitives.dll (available on Windows 10+).
+        const processPrng = struct {
+            extern "bcryptprimitives" fn ProcessPrng(
+                pbData: [*]u8,
+                cbData: usize,
+            ) callconv(.winapi) std.os.windows.BOOL;
+        }.ProcessPrng;
+        _ = processPrng(buf.ptr, buf.len);
+    } else if (builtin.os.tag == .linux) {
+        _ = std.os.linux.getrandom(buf.ptr, buf.len, 0);
+    } else {
+        // macOS and other BSDs
+        std.c.arc4random_buf(buf.ptr, buf.len);
+    }
+}
 
 // ── wasi:clocks/wall-clock ──────────────────────────────────────────────────
 
@@ -15,7 +50,7 @@ pub const WallClock = struct {
     };
 
     pub fn now() DateTime {
-        const ts = std.time.nanoTimestamp();
+        const ts = nanoTimestamp();
         if (ts < 0) return .{ .seconds = 0, .nanoseconds = 0 };
         const ns: u64 = @intCast(ts);
         return .{
@@ -33,7 +68,7 @@ pub const WallClock = struct {
 
 pub const MonotonicClock = struct {
     pub fn now() u64 {
-        const ts = std.time.nanoTimestamp();
+        const ts = nanoTimestamp();
         if (ts < 0) return 0;
         return @intCast(ts);
     }
@@ -47,11 +82,13 @@ pub const MonotonicClock = struct {
 
 pub const Random = struct {
     pub fn getRandomBytes(buf: []u8) void {
-        std.crypto.random.bytes(buf);
+        fillRandom(buf);
     }
 
     pub fn getRandomU64() u64 {
-        return std.crypto.random.int(u64);
+        var bytes: [8]u8 = undefined;
+        fillRandom(&bytes);
+        return std.mem.readInt(u64, &bytes, .little);
     }
 };
 
