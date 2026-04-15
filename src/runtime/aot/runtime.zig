@@ -10,6 +10,19 @@ const types = @import("../common/types.zig");
 const aot_loader = @import("loader.zig");
 const platform = @import("../../platform/platform.zig");
 
+/// Compact context passed to AOT-compiled functions as a hidden first parameter.
+/// Laid out as a flat struct so compiled code can load fields at known offsets.
+pub const VmCtx = extern struct {
+    /// Base pointer to linear memory (memory 0).
+    memory_base: usize = 0,
+    /// Size of linear memory in bytes.
+    memory_size: usize = 0,
+    /// Pointer to flat globals values array (each global is an i64 at index * 8).
+    globals_ptr: usize = 0,
+    /// Number of globals.
+    globals_count: u32 = 0,
+};
+
 // ─── Comptime target validation ─────────────────────────────────────────────
 
 /// The native machine architecture, resolved at comptime.
@@ -159,13 +172,35 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     if (inst.code_base == null) return error.CodeMappingFailed;
     const addr = getFuncAddr(inst, func_idx) orelse return error.FunctionNotFound;
 
-    // Get linear memory base pointer (first memory, or null)
-    const mem_base: usize = if (inst.memories.len > 0) @intFromPtr(inst.memories[0].data.ptr) else 0;
+    // Build flat globals array for AOT access
+    var globals_buf: [256]i64 = undefined;
+    const n_globals = @min(inst.globals.len, globals_buf.len);
+    for (0..n_globals) |i| {
+        globals_buf[i] = inst.globals[i].value.i64;
+    }
 
-    // AOT-compiled functions receive the memory base as hidden first parameter.
-    const FnPtr = *const fn (usize) callconv(.c) Result;
+    // Build VMContext for the compiled function
+    var vmctx = VmCtx{};
+    if (inst.memories.len > 0) {
+        vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
+        vmctx.memory_size = inst.memories[0].data.len;
+    }
+    if (n_globals > 0) {
+        vmctx.globals_ptr = @intFromPtr(&globals_buf);
+        vmctx.globals_count = @intCast(n_globals);
+    }
+
+    // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
+    const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
-    return func_ptr(mem_base);
+    const result = func_ptr(&vmctx);
+
+    // Sync globals back from flat array to GlobalInstance objects
+    for (0..n_globals) |i| {
+        inst.globals[i].value = .{ .i64 = globals_buf[i] };
+    }
+
+    return result;
 }
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
