@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../common/types.zig");
 const aot_loader = @import("loader.zig");
+const host_bridge = @import("host_bridge.zig");
 const platform = @import("../../platform/platform.zig");
 
 /// Compact context passed to AOT-compiled functions as a hidden first parameter.
@@ -19,8 +20,12 @@ pub const VmCtx = extern struct {
     memory_size: usize = 0,
     /// Pointer to flat globals values array (each global is an i64 at index * 8).
     globals_ptr: usize = 0,
+    /// Pointer to array of host function pointers (one per import).
+    host_functions_ptr: usize = 0,
     /// Number of globals.
     globals_count: u32 = 0,
+    /// Number of host functions.
+    host_functions_count: u32 = 0,
 };
 
 // ─── Comptime target validation ─────────────────────────────────────────────
@@ -47,6 +52,8 @@ pub const AotInstance = struct {
     code_base: ?[*]const u8 = null,
     /// Size of the mapped executable region (for cleanup).
     code_size: usize = 0,
+    /// Resolved AOT host function pointers (one per import).
+    host_functions: []const ?*const anyopaque = &.{},
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -92,6 +99,9 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
     inst.globals = try allocateGlobals(module, allocator);
     errdefer freeGlobals(inst.globals, allocator);
 
+    // Resolve AOT host functions for imports
+    inst.host_functions = try resolveHostFunctions(module, allocator);
+
     return inst;
 }
 
@@ -105,6 +115,7 @@ pub fn destroy(inst: *AotInstance) void {
     freeMemories(inst.memories, allocator);
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, allocator);
+    if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
     allocator.destroy(inst);
 }
 
@@ -116,13 +127,20 @@ pub fn findExportFunc(inst: *const AotInstance, name: []const u8) ?u32 {
     return null;
 }
 
-/// Get the native code pointer for a function by index.
-/// Uses the executable mapping (code_base) if available, otherwise falls back
-/// to the raw text_section (not executable — for inspection only).
+/// Get the native code pointer for a function by module-level index.
+/// Import functions (func_idx < import_function_count) have no native code
+/// and return null.  Local functions are looked up in func_offsets after
+/// subtracting the import count.
 pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
     const module = inst.module;
-    if (func_idx >= module.func_count) return null;
-    const offset = module.func_offsets[func_idx];
+    const import_count = module.import_function_count;
+
+    // Import functions don't have native code
+    if (func_idx < import_count) return null;
+
+    const local_idx = func_idx - import_count;
+    if (local_idx >= module.func_count) return null;
+    const offset = module.func_offsets[local_idx];
     // Prefer the executable mapping.
     if (inst.code_base) |base| {
         if (offset >= inst.code_size) return null;
@@ -173,7 +191,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     const addr = getFuncAddr(inst, func_idx) orelse return error.FunctionNotFound;
 
     // Build flat globals array for AOT access
-    var globals_buf: [256]i64 = undefined;
+    var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
     const n_globals = @min(inst.globals.len, globals_buf.len);
     for (0..n_globals) |i| {
         globals_buf[i] = inst.globals[i].value.i64;
@@ -185,9 +203,13 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
         vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
         vmctx.memory_size = inst.memories[0].data.len;
     }
-    if (n_globals > 0) {
-        vmctx.globals_ptr = @intFromPtr(&globals_buf);
-        vmctx.globals_count = @intCast(n_globals);
+    // Always provide a valid globals pointer — compiled code may access globals
+    // even if none are explicitly initialized (they default to zero).
+    vmctx.globals_ptr = @intFromPtr(&globals_buf);
+    vmctx.globals_count = @intCast(n_globals);
+    if (inst.host_functions.len > 0) {
+        vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
+        vmctx.host_functions_count = @intCast(inst.host_functions.len);
     }
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
@@ -201,6 +223,35 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     }
 
     return result;
+}
+
+// ─── Host function resolution ───────────────────────────────────────────────
+
+/// Resolve AOT host function adapters for each import in the module.
+/// Returns a slice of optional function pointers indexed by import index.
+fn resolveHostFunctions(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+) RuntimeError![]const ?*const anyopaque {
+    if (module.import_function_count == 0) return &.{};
+
+    const host_fns = allocator.alloc(?*const anyopaque, module.import_function_count) catch
+        return error.OutOfMemory;
+    @memset(host_fns, null);
+
+    var func_idx: u32 = 0;
+    for (module.imports) |imp| {
+        if (imp.kind == .function) {
+            if (func_idx < module.import_function_count and
+                host_bridge.isWasiModule(imp.module_name))
+            {
+                host_fns[func_idx] = host_bridge.resolveAotHostFunction(imp.field_name);
+            }
+            func_idx += 1;
+        }
+    }
+
+    return host_fns;
 }
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
@@ -393,5 +444,67 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(VmCtx, "memory_base"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(VmCtx, "memory_size"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(VmCtx, "globals_ptr"));
-    try std.testing.expectEqual(@as(usize, 24), @offsetOf(VmCtx, "globals_count"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(VmCtx, "host_functions_ptr"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(VmCtx, "globals_count"));
+    try std.testing.expectEqual(@as(usize, 36), @offsetOf(VmCtx, "host_functions_count"));
+}
+
+test "getFuncAddr: import indices return null" {
+    const text = [_]u8{ 0xCC, 0x90, 0xC3, 0x55, 0x48, 0x89, 0xE5, 0xC3 };
+    const offsets = [_]u32{ 0, 3 };
+    const module = aot_loader.AotModule{
+        .text_section = &text,
+        .func_offsets = &offsets,
+        .func_count = 2,
+        .import_function_count = 2,
+    };
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    // Import indices (0, 1) should return null (no native code)
+    try std.testing.expectEqual(@as(?[*]const u8, null), getFuncAddr(inst, 0));
+    try std.testing.expectEqual(@as(?[*]const u8, null), getFuncAddr(inst, 1));
+
+    // Local indices (2, 3) map to func_offsets[0], func_offsets[1]
+    const addr2 = getFuncAddr(inst, 2);
+    try std.testing.expect(addr2 != null);
+    try std.testing.expectEqual(@as(u8, 0xCC), addr2.?[0]);
+
+    const addr3 = getFuncAddr(inst, 3);
+    try std.testing.expect(addr3 != null);
+    try std.testing.expectEqual(@as(u8, 0x55), addr3.?[0]);
+}
+
+test "resolveHostFunctions: resolves WASI imports" {
+    const imports = [_]aot_loader.AotImportDesc{
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
+        .{ .module_name = "env", .field_name = "some_func", .kind = .function, .func_type_idx = 2 },
+    };
+    const module = aot_loader.AotModule{
+        .import_function_count = 3,
+        .imports = &imports,
+    };
+    const result = try resolveHostFunctions(&module, std.testing.allocator);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expect(result[0] != null); // fd_write resolved
+    try std.testing.expect(result[1] != null); // clock_time_get resolved
+    try std.testing.expect(result[2] == null); // env.some_func not resolved
+}
+
+test "instantiate: module with WASI imports resolves host functions" {
+    const imports = [_]aot_loader.AotImportDesc{
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
+    };
+    const module = aot_loader.AotModule{
+        .import_function_count = 1,
+        .imports = &imports,
+    };
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    try std.testing.expectEqual(@as(usize, 1), inst.host_functions.len);
+    try std.testing.expect(inst.host_functions[0] != null);
 }

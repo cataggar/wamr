@@ -155,6 +155,20 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // Build import entries from the parsed wasm module
+    var import_entries: std.ArrayList(emit_aot.ImportEntry) = .empty;
+    defer import_entries.deinit(allocator);
+    for (module.imports) |imp| {
+        if (imp.kind == .function) {
+            try import_entries.append(allocator, .{
+                .module_name = imp.module_name,
+                .field_name = imp.field_name,
+                .kind = .function,
+                .func_type_idx = imp.func_type_idx orelse 0,
+            });
+        }
+    }
+
     const aot_binary = try emit_aot.emit(
         allocator,
         compiled.code,
@@ -162,6 +176,7 @@ pub fn main(init: std.process.Init) !void {
         exports.items,
         .{ .arch = arch_name },
         if (data_segs.items.len > 0) data_segs.items else null,
+        if (import_entries.items.len > 0) import_entries.items else null,
     );
     defer allocator.free(aot_binary);
 

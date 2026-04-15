@@ -20,6 +20,8 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
     var ir_module = ir.IrModule.init(allocator);
     errdefer ir_module.deinit();
 
+    ir_module.import_count = wasm_module.import_function_count;
+
     for (wasm_module.functions) |func| {
         const func_type = wasm_module.types[func.type_idx];
         const ir_func = try lowerFunction(&func, &func_type, wasm_module, allocator);

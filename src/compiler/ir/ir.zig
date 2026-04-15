@@ -231,6 +231,10 @@ pub const IrFunction = struct {
 pub const IrModule = struct {
     functions: std.ArrayList(IrFunction) = .empty,
     allocator: std.mem.Allocator,
+    /// Number of imported functions. IR only contains local functions,
+    /// but call instructions use module-level indices where
+    /// indices < import_count refer to imports.
+    import_count: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) IrModule {
         return .{

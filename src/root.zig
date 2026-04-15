@@ -38,6 +38,12 @@ pub const aot_loader = @import("runtime/aot/loader.zig");
 /// AOT runtime.
 pub const aot_runtime = @import("runtime/aot/runtime.zig");
 
+/// AOT ↔ WASI host function bridge.
+pub const aot_host_bridge = @import("runtime/aot/host_bridge.zig");
+
+/// WASI core logic (pure functions, shared by interpreter and AOT).
+pub const wasi_core = @import("wasi/wasi_core.zig");
+
 // Compiler
 /// Compiler IR (SSA-form intermediate representation).
 pub const ir = @import("compiler/ir/ir.zig");

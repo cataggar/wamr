@@ -205,6 +205,7 @@ pub fn resolveWasiHostFunctions(
     for (module.imports) |imp| {
         if (imp.kind == .function) {
             const is_wasi = std.mem.eql(u8, imp.module_name, "wasi_snapshot_preview1") or
+                std.mem.eql(u8, imp.module_name, "wasi_unstable") or
                 std.mem.eql(u8, imp.module_name, "wasi");
 
             if (is_wasi) {

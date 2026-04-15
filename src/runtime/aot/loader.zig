@@ -23,6 +23,7 @@ pub const AotSectionType = enum(u32) {
     data = 5,
     relocation = 6,
     name = 7,
+    @"import" = 8,
     _,
 };
 
@@ -48,6 +49,14 @@ pub const AotDataSegment = struct {
     data: []const u8,
 };
 
+/// An import descriptor parsed from the AOT import section.
+pub const AotImportDesc = struct {
+    module_name: []const u8,
+    field_name: []const u8,
+    kind: types.ExternalKind,
+    func_type_idx: u32,
+};
+
 pub const AotModule = struct {
     target_info: ?TargetInfo = null,
     text_section: ?[]const u8 = null,
@@ -55,6 +64,7 @@ pub const AotModule = struct {
     func_count: u32 = 0,
     exports: []const types.ExportDesc = &.{},
     import_function_count: u32 = 0,
+    imports: []const AotImportDesc = &.{},
     memories: []const types.MemoryType = &.{},
     tables: []const types.TableType = &.{},
     data_segments: []const AotDataSegment = &.{},
@@ -161,6 +171,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .data => {
                 try parseDataSection(&reader, section_size, &module, allocator);
             },
+            .@"import" => {
+                try parseImportSection(&reader, section_size, &module, allocator);
+            },
             else => {
                 // Skip unknown/unhandled sections
                 reader.pos += section_size;
@@ -200,6 +213,13 @@ pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     }
     if (module.tables.len > 0) {
         allocator.free(module.tables);
+    }
+    for (module.imports) |imp| {
+        if (imp.module_name.len > 0) allocator.free(imp.module_name);
+        if (imp.field_name.len > 0) allocator.free(imp.field_name);
+    }
+    if (module.imports.len > 0) {
+        allocator.free(module.imports);
     }
 }
 
@@ -293,6 +313,52 @@ fn parseDataSection(reader: *BinaryReader, section_size: u32, module: *AotModule
         initialized += 1;
     }
     module.data_segments = segments;
+}
+
+fn parseImportSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const import_descs = allocator.alloc(AotImportDesc, count) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |i| {
+            if (import_descs[i].module_name.len > 0) allocator.free(import_descs[i].module_name);
+            if (import_descs[i].field_name.len > 0) allocator.free(import_descs[i].field_name);
+        }
+        allocator.free(import_descs);
+    }
+
+    var func_count: u32 = 0;
+    for (0..count) |i| {
+        const mod_name_len = try reader.readU32Le();
+        const mod_name_bytes = try reader.readBytes(mod_name_len);
+        const mod_name = allocator.alloc(u8, mod_name_len) catch return error.OutOfMemory;
+        @memcpy(mod_name, mod_name_bytes);
+
+        const field_name_len = try reader.readU32Le();
+        const field_name_bytes = try reader.readBytes(field_name_len);
+        const field_name = allocator.alloc(u8, field_name_len) catch return error.OutOfMemory;
+        @memcpy(field_name, field_name_bytes);
+
+        const kind_raw = try reader.readByte();
+        const func_type_idx = try reader.readU32Le();
+        const kind: types.ExternalKind = @enumFromInt(kind_raw);
+
+        if (kind == .function) func_count += 1;
+
+        import_descs[i] = .{
+            .module_name = mod_name,
+            .field_name = field_name,
+            .kind = kind,
+            .func_type_idx = func_type_idx,
+        };
+        initialized += 1;
+    }
+
+    module.imports = import_descs;
+    module.import_function_count = func_count;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

@@ -21,7 +21,8 @@ else
 /// Points to a VmCtx struct with memory_base at +0, globals_base at +16.
 const vmctx_offset: i32 = -8;
 const vmctx_membase_field: i32 = 0; // VmCtx.memory_base offset
-const vmctx_globals_field: i32 = 16; // VmCtx.globals_base offset
+const vmctx_globals_field: i32 = 16; // VmCtx.globals_ptr offset
+const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
 
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
@@ -793,6 +794,12 @@ fn compileInst(
     }
 }
 
+/// Result of compiling a single function.
+const FuncCompileResult = struct {
+    code: []u8,
+    call_patches: []CallPatch,
+};
+
 /// Result of compiling an IR module.
 pub const CompileResult = struct {
     code: []u8,
@@ -816,14 +823,28 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         try offsets.append(allocator, @intCast(func_start));
 
         // Compile function using register allocator
-        const func_code = try compileFunctionRA(&func, allocator);
-        defer allocator.free(func_code);
+        const result = try compileFunctionRA(&func, ir_module.import_count, allocator);
+        defer allocator.free(result.code);
+        defer allocator.free(result.call_patches);
 
-        // Scan for call patches in the compiled code
-        // (compileFunctionRA handles intra-function branch patching internally,
-        //  but inter-function call patches need global resolution)
+        // Accumulate call patches with global offsets
+        for (result.call_patches) |patch| {
+            try global_call_patches.append(allocator, .{
+                .patch_offset = func_start + patch.patch_offset,
+                .target_func_idx = patch.target_func_idx,
+            });
+        }
 
-        try all_code.appendSlice(allocator, func_code);
+        try all_code.appendSlice(allocator, result.code);
+    }
+
+    // Patch inter-function call sites now that all function offsets are known
+    for (global_call_patches.items) |patch| {
+        if (patch.target_func_idx < offsets.items.len) {
+            const target_off = offsets.items[patch.target_func_idx];
+            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
+            std.mem.writeInt(i32, all_code.items[patch.patch_offset..][0..4], rel, .little);
+        }
     }
 
     return .{
@@ -844,7 +865,7 @@ const regalloc = @import("../../ir/regalloc.zig");
 /// Compile an IR function using the linear scan register allocator.
 /// VRegs are assigned to physical registers; instructions operate directly
 /// on assigned registers without push/pop through a CachedStack.
-pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
+pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocator: std.mem.Allocator) !FuncCompileResult {
     var alloc_result = try regalloc.allocate(func, allocator);
     defer alloc_result.deinit();
 
@@ -896,7 +917,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocato
         try block_offsets.put(@intCast(idx), code.len());
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, import_count);
         }
     }
 
@@ -911,7 +932,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocato
         try code.emitEpilogue();
     }
 
-    return code.bytes.toOwnedSlice(allocator);
+    return .{
+        .code = try code.bytes.toOwnedSlice(allocator),
+        .call_patches = try call_patches.toOwnedSlice(allocator),
+    };
 }
 
 /// Get a VReg's value into a physical register, using scratch if spilled.
@@ -966,6 +990,7 @@ fn compileInstRA(
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
+    import_count: u32,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -1072,12 +1097,12 @@ fn compileInstRA(
         // ── Local variable access ─────────────────────────────────────
         .local_get => |idx| {
             const dest = inst.dest orelse return;
-            try code.movRegMem(.rax, .rbp, -@as(i32, @intCast((idx + 1) * 8)));
+            try code.movRegMem(.rax, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
             try writeDef(code, alloc_result, dest, .rax);
         },
         .local_set => |ls| {
             const src_reg = try useVReg(code, alloc_result, ls.val, .rax);
-            try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 1) * 8)), src_reg);
+            try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 2) * 8)), src_reg);
         },
 
         // ── Return ────────────────────────────────────────────────────
@@ -1113,20 +1138,66 @@ fn compileInstRA(
 
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
-            const n_args: u32 = @intCast(cl.args.len);
-            // Load args into ABI registers
-            if (n_args > 0) {
-                const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)));
-                var i: u32 = 0;
-                while (i < max_reg_args) : (i += 1) {
-                    const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
-                    if (arg_reg != param_regs[i]) try code.movRegReg(param_regs[i], arg_reg);
+            if (cl.func_idx < import_count) {
+                // Import call: indirect call via host function pointer table in VmCtx.
+                // Load VmCtx* into first param reg (adapters expect it as arg 0).
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+
+                // Load wasm args into param regs starting at index 1
+                // (param_regs[0] is VmCtx*, wasm args go in param_regs[1..])
+                const n_args: u32 = @intCast(cl.args.len);
+                if (n_args > 0) {
+                    const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+                    var i: u32 = 0;
+                    while (i < max_reg_args) : (i += 1) {
+                        const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
+                        if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
+                    }
                 }
+
+                // Load host_functions_ptr from VmCtx
+                try code.movRegMem(.r10, param_regs[0], vmctx_host_functions_field);
+                // Load function pointer: [host_functions_ptr + func_idx * 8]
+                if (cl.func_idx > 0) {
+                    try code.addRegImm32(.r10, @intCast(@as(u32, cl.func_idx) * 8));
+                }
+                try code.movRegMem(.rax, .r10, 0);
+
+                // Reserve shadow space on Win64 (32 bytes)
+                if (comptime builtin.os.tag == .windows) {
+                    try code.subRegImm32(.rsp, 32);
+                }
+
+                // Indirect call
+                try code.callReg(.rax);
+
+                // Restore shadow space on Win64
+                if (comptime builtin.os.tag == .windows) {
+                    try code.addRegImm32(.rsp, 32);
+                }
+            } else {
+                // Local function call: direct CALL rel32 with adjusted index
+                // Load VmCtx into first param reg (callee expects it as hidden first arg)
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                // Wasm args go into param_regs[1..]
+                const n_args: u32 = @intCast(cl.args.len);
+                if (n_args > 0) {
+                    const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+                    var i: u32 = 0;
+                    while (i < max_reg_args) : (i += 1) {
+                        const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
+                        if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
+                    }
+                }
+                try code.emitByte(0xE8);
+                const patch_off = code.len();
+                try code.emitI32(0);
+                // Remap to local function index (subtract import_count)
+                try call_patches.append(code.allocator, .{
+                    .patch_offset = patch_off,
+                    .target_func_idx = cl.func_idx - import_count,
+                });
             }
-            try code.emitByte(0xE8);
-            const patch_off = code.len();
-            try code.emitI32(0);
-            try call_patches.append(code.allocator, .{ .patch_offset = patch_off, .target_func_idx = cl.func_idx });
             if (inst.dest) |dest| {
                 try writeDef(code, alloc_result, dest, .rax);
             }
@@ -2001,7 +2072,9 @@ test "compileFunctionRA: iconst_32 + ret" {
     try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v0 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 5);
@@ -2023,7 +2096,9 @@ test "compileFunctionRA: add two constants" {
     try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
     try block.append(.{ .op = .{ .ret = v2 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 10);
@@ -2047,7 +2122,9 @@ test "compileFunctionRA: global_get emits load from VMContext" {
     try block.append(.{ .op = .{ .global_get = 0 }, .dest = v0, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v0 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 10);
@@ -2067,7 +2144,9 @@ test "compileFunctionRA: wrap_i64 emits mov eax,eax" {
     try block.append(.{ .op = .{ .wrap_i64 = v0 }, .dest = v1, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v1 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain mov eax, eax (89 C0) for wrap_i64
@@ -2088,7 +2167,9 @@ test "compileFunctionRA: extend_i32_s emits MOVSXD" {
     try block.append(.{ .op = .{ .extend_i32_s = v0 }, .dest = v1, .type = .i64 });
     try block.append(.{ .op = .{ .ret = v1 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain MOVSXD rax, eax (48 63 C0)
@@ -2111,7 +2192,9 @@ test "compileFunctionRA: memory_copy emits REP MOVSB" {
     try block.append(.{ .op = .{ .memory_copy = .{ .dst = dst, .src = src, .len = len } } });
     try block.append(.{ .op = .{ .ret = null } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain REP MOVSB (F3 A4)
@@ -2134,7 +2217,9 @@ test "compileFunctionRA: memory_fill emits REP STOSB" {
     try block.append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } });
     try block.append(.{ .op = .{ .ret = null } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain REP STOSB (F3 AA)
@@ -2156,7 +2241,9 @@ test "compileFunctionRA: division uses rax/rdx" {
     try block.append(.{ .op = .{ .div_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
     try block.append(.{ .op = .{ .ret = v2 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain IDIV (F7 F9 for idiv rcx)
@@ -2178,7 +2265,9 @@ test "compileFunctionRA: local_get and local_set" {
     try block.append(.{ .op = .{ .local_get = 0 }, .dest = v1 });
     try block.append(.{ .op = .{ .ret = v1 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 10);
