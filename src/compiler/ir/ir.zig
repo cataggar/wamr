@@ -131,12 +131,23 @@ pub const Inst = struct {
         trunc_sat_f32_u: VReg,
         trunc_sat_f64_s: VReg,
         trunc_sat_f64_u: VReg,
+
+        // Atomic operations
+        atomic_load: struct { base: VReg, offset: u32, size: u8 },
+        atomic_store: struct { base: VReg, offset: u32, size: u8, val: VReg },
+        atomic_rmw: struct { base: VReg, offset: u32, size: u8, val: VReg, op: AtomicRmwOp },
+        atomic_cmpxchg: struct { base: VReg, offset: u32, size: u8, expected: VReg, replacement: VReg },
+        atomic_fence: void,
+        atomic_notify: struct { base: VReg, offset: u32, count: VReg },
+        atomic_wait: struct { base: VReg, offset: u32, expected: VReg, timeout: VReg, size: u8 },
     };
 
     pub const BinOp = struct {
         lhs: VReg,
         rhs: VReg,
     };
+
+    pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };
 };
 
 /// A basic block — a sequence of instructions with a single entry point.

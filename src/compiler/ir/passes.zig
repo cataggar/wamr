@@ -83,6 +83,32 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(sel.if_true);
             list.append(sel.if_false);
         },
+
+        // Atomic operations
+        .atomic_fence => {},
+        .atomic_load => |al| list.append(al.base),
+        .atomic_store => |ast| {
+            list.append(ast.base);
+            list.append(ast.val);
+        },
+        .atomic_rmw => |ar| {
+            list.append(ar.base);
+            list.append(ar.val);
+        },
+        .atomic_cmpxchg => |ac| {
+            list.append(ac.base);
+            list.append(ac.expected);
+            list.append(ac.replacement);
+        },
+        .atomic_notify => |an| {
+            list.append(an.base);
+            list.append(an.count);
+        },
+        .atomic_wait => |aw| {
+            list.append(aw.base);
+            list.append(aw.expected);
+            list.append(aw.timeout);
+        },
     }
     return list;
 }
@@ -149,6 +175,32 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (sel.cond == old) sel.cond = new;
             if (sel.if_true == old) sel.if_true = new;
             if (sel.if_false == old) sel.if_false = new;
+        },
+
+        // Atomic operations
+        .atomic_fence => {},
+        .atomic_load => |*al| if (al.base == old) { al.base = new; },
+        .atomic_store => |*ast| {
+            if (ast.base == old) ast.base = new;
+            if (ast.val == old) ast.val = new;
+        },
+        .atomic_rmw => |*ar| {
+            if (ar.base == old) ar.base = new;
+            if (ar.val == old) ar.val = new;
+        },
+        .atomic_cmpxchg => |*ac| {
+            if (ac.base == old) ac.base = new;
+            if (ac.expected == old) ac.expected = new;
+            if (ac.replacement == old) ac.replacement = new;
+        },
+        .atomic_notify => |*an| {
+            if (an.base == old) an.base = new;
+            if (an.count == old) an.count = new;
+        },
+        .atomic_wait => |*aw| {
+            if (aw.base == old) aw.base = new;
+            if (aw.expected == old) aw.expected = new;
+            if (aw.timeout == old) aw.timeout = new;
         },
     }
 }
@@ -255,7 +307,10 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
 
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .store, .local_set, .global_set, .call, .ret, .br, .br_if, .@"unreachable" => true,
+        .store, .local_set, .global_set, .call, .ret, .br, .br_if, .@"unreachable",
+        .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
+        .atomic_notify, .atomic_wait,
+        => true,
         else => false,
     };
 }

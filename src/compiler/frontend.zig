@@ -7,6 +7,7 @@ const types = @import("../runtime/common/types.zig");
 const ir = @import("ir/ir.zig");
 const Opcode = @import("../runtime/interpreter/opcode.zig").Opcode;
 const MiscOpcode = @import("../runtime/interpreter/opcode.zig").MiscOpcode;
+const AtomicOpcode = @import("../runtime/interpreter/opcode.zig").AtomicOpcode;
 
 pub const LowerError = error{
     OutOfMemory,
@@ -719,6 +720,163 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
                         try vreg_stack.append(allocator, dest);
                     },
+                    else => return error.UnsupportedOpcode,
+                }
+            },
+
+            // ── Atomic operations (0xFE prefix) ───────────────────────
+            .atomic_prefix => {
+                const sub_opcode: AtomicOpcode = @enumFromInt(readU32(code, &ip));
+                switch (sub_opcode) {
+                    .atomic_fence => {
+                        _ = readU32(code, &ip);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_fence = {} } });
+                    },
+
+                    .memory_atomic_notify => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const count = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_notify = .{ .base = base, .offset = offset, .count = count } }, .dest = dest, .type = .i32 });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .memory_atomic_wait32, .memory_atomic_wait64 => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const timeout = vreg_stack.pop().?;
+                        const expected = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const size: u8 = switch (sub_opcode) {
+                            .memory_atomic_wait32 => 4,
+                            .memory_atomic_wait64 => 8,
+                            else => unreachable,
+                        };
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_wait = .{ .base = base, .offset = offset, .expected = expected, .timeout = timeout, .size = size } }, .dest = dest, .type = .i32 });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .i32_atomic_load, .i64_atomic_load,
+                    .i32_atomic_load8_u, .i32_atomic_load16_u,
+                    .i64_atomic_load8_u, .i64_atomic_load16_u, .i64_atomic_load32_u,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_load => 4,
+                            .i64_atomic_load => 8,
+                            .i32_atomic_load8_u, .i64_atomic_load8_u => 1,
+                            .i32_atomic_load16_u, .i64_atomic_load16_u => 2,
+                            .i64_atomic_load32_u => 4,
+                            else => unreachable,
+                        };
+                        const ir_type: ir.IrType = switch (sub_opcode) {
+                            .i32_atomic_load, .i32_atomic_load8_u, .i32_atomic_load16_u => .i32,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_load = .{ .base = base, .offset = offset, .size = size } }, .dest = dest, .type = ir_type });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .i32_atomic_store, .i64_atomic_store,
+                    .i32_atomic_store8, .i32_atomic_store16,
+                    .i64_atomic_store8, .i64_atomic_store16, .i64_atomic_store32,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const val = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_store => 4,
+                            .i64_atomic_store => 8,
+                            .i32_atomic_store8, .i64_atomic_store8 => 1,
+                            .i32_atomic_store16, .i64_atomic_store16 => 2,
+                            .i64_atomic_store32 => 4,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_store = .{ .base = base, .offset = offset, .size = size, .val = val } } });
+                    },
+
+                    .i32_atomic_rmw_add, .i64_atomic_rmw_add,
+                    .i32_atomic_rmw8_add_u, .i32_atomic_rmw16_add_u,
+                    .i64_atomic_rmw8_add_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw32_add_u,
+                    .i32_atomic_rmw_sub, .i64_atomic_rmw_sub,
+                    .i32_atomic_rmw8_sub_u, .i32_atomic_rmw16_sub_u,
+                    .i64_atomic_rmw8_sub_u, .i64_atomic_rmw16_sub_u, .i64_atomic_rmw32_sub_u,
+                    .i32_atomic_rmw_and, .i64_atomic_rmw_and,
+                    .i32_atomic_rmw8_and_u, .i32_atomic_rmw16_and_u,
+                    .i64_atomic_rmw8_and_u, .i64_atomic_rmw16_and_u, .i64_atomic_rmw32_and_u,
+                    .i32_atomic_rmw_or, .i64_atomic_rmw_or,
+                    .i32_atomic_rmw8_or_u, .i32_atomic_rmw16_or_u,
+                    .i64_atomic_rmw8_or_u, .i64_atomic_rmw16_or_u, .i64_atomic_rmw32_or_u,
+                    .i32_atomic_rmw_xor, .i64_atomic_rmw_xor,
+                    .i32_atomic_rmw8_xor_u, .i32_atomic_rmw16_xor_u,
+                    .i64_atomic_rmw8_xor_u, .i64_atomic_rmw16_xor_u, .i64_atomic_rmw32_xor_u,
+                    .i32_atomic_rmw_xchg, .i64_atomic_rmw_xchg,
+                    .i32_atomic_rmw8_xchg_u, .i32_atomic_rmw16_xchg_u,
+                    .i64_atomic_rmw8_xchg_u, .i64_atomic_rmw16_xchg_u, .i64_atomic_rmw32_xchg_u,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const val = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        const rmw_op: ir.Inst.AtomicRmwOp = switch (sub_opcode) {
+                            .i32_atomic_rmw_add, .i64_atomic_rmw_add, .i32_atomic_rmw8_add_u, .i32_atomic_rmw16_add_u, .i64_atomic_rmw8_add_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw32_add_u => .add,
+                            .i32_atomic_rmw_sub, .i64_atomic_rmw_sub, .i32_atomic_rmw8_sub_u, .i32_atomic_rmw16_sub_u, .i64_atomic_rmw8_sub_u, .i64_atomic_rmw16_sub_u, .i64_atomic_rmw32_sub_u => .sub,
+                            .i32_atomic_rmw_and, .i64_atomic_rmw_and, .i32_atomic_rmw8_and_u, .i32_atomic_rmw16_and_u, .i64_atomic_rmw8_and_u, .i64_atomic_rmw16_and_u, .i64_atomic_rmw32_and_u => .@"and",
+                            .i32_atomic_rmw_or, .i64_atomic_rmw_or, .i32_atomic_rmw8_or_u, .i32_atomic_rmw16_or_u, .i64_atomic_rmw8_or_u, .i64_atomic_rmw16_or_u, .i64_atomic_rmw32_or_u => .@"or",
+                            .i32_atomic_rmw_xor, .i64_atomic_rmw_xor, .i32_atomic_rmw8_xor_u, .i32_atomic_rmw16_xor_u, .i64_atomic_rmw8_xor_u, .i64_atomic_rmw16_xor_u, .i64_atomic_rmw32_xor_u => .xor,
+                            .i32_atomic_rmw_xchg, .i64_atomic_rmw_xchg, .i32_atomic_rmw8_xchg_u, .i32_atomic_rmw16_xchg_u, .i64_atomic_rmw8_xchg_u, .i64_atomic_rmw16_xchg_u, .i64_atomic_rmw32_xchg_u => .xchg,
+                            else => unreachable,
+                        };
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_rmw_add, .i32_atomic_rmw_sub, .i32_atomic_rmw_and, .i32_atomic_rmw_or, .i32_atomic_rmw_xor, .i32_atomic_rmw_xchg => 4,
+                            .i64_atomic_rmw_add, .i64_atomic_rmw_sub, .i64_atomic_rmw_and, .i64_atomic_rmw_or, .i64_atomic_rmw_xor, .i64_atomic_rmw_xchg => 8,
+                            .i32_atomic_rmw8_add_u, .i32_atomic_rmw8_sub_u, .i32_atomic_rmw8_and_u, .i32_atomic_rmw8_or_u, .i32_atomic_rmw8_xor_u, .i32_atomic_rmw8_xchg_u, .i64_atomic_rmw8_add_u, .i64_atomic_rmw8_sub_u, .i64_atomic_rmw8_and_u, .i64_atomic_rmw8_or_u, .i64_atomic_rmw8_xor_u, .i64_atomic_rmw8_xchg_u => 1,
+                            .i32_atomic_rmw16_add_u, .i32_atomic_rmw16_sub_u, .i32_atomic_rmw16_and_u, .i32_atomic_rmw16_or_u, .i32_atomic_rmw16_xor_u, .i32_atomic_rmw16_xchg_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw16_sub_u, .i64_atomic_rmw16_and_u, .i64_atomic_rmw16_or_u, .i64_atomic_rmw16_xor_u, .i64_atomic_rmw16_xchg_u => 2,
+                            .i64_atomic_rmw32_add_u, .i64_atomic_rmw32_sub_u, .i64_atomic_rmw32_and_u, .i64_atomic_rmw32_or_u, .i64_atomic_rmw32_xor_u, .i64_atomic_rmw32_xchg_u => 4,
+                            else => unreachable,
+                        };
+                        const ir_type: ir.IrType = switch (sub_opcode) {
+                            .i32_atomic_rmw_add, .i32_atomic_rmw_sub, .i32_atomic_rmw_and, .i32_atomic_rmw_or, .i32_atomic_rmw_xor, .i32_atomic_rmw_xchg, .i32_atomic_rmw8_add_u, .i32_atomic_rmw8_sub_u, .i32_atomic_rmw8_and_u, .i32_atomic_rmw8_or_u, .i32_atomic_rmw8_xor_u, .i32_atomic_rmw8_xchg_u, .i32_atomic_rmw16_add_u, .i32_atomic_rmw16_sub_u, .i32_atomic_rmw16_and_u, .i32_atomic_rmw16_or_u, .i32_atomic_rmw16_xor_u, .i32_atomic_rmw16_xchg_u => .i32,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_rmw = .{ .base = base, .offset = offset, .size = size, .val = val, .op = rmw_op } }, .dest = dest, .type = ir_type });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .i32_atomic_rmw_cmpxchg, .i64_atomic_rmw_cmpxchg,
+                    .i32_atomic_rmw8_cmpxchg_u, .i32_atomic_rmw16_cmpxchg_u,
+                    .i64_atomic_rmw8_cmpxchg_u, .i64_atomic_rmw16_cmpxchg_u, .i64_atomic_rmw32_cmpxchg_u,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const replacement = vreg_stack.pop().?;
+                        const expected = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_rmw_cmpxchg => 4,
+                            .i64_atomic_rmw_cmpxchg => 8,
+                            .i32_atomic_rmw8_cmpxchg_u, .i64_atomic_rmw8_cmpxchg_u => 1,
+                            .i32_atomic_rmw16_cmpxchg_u, .i64_atomic_rmw16_cmpxchg_u => 2,
+                            .i64_atomic_rmw32_cmpxchg_u => 4,
+                            else => unreachable,
+                        };
+                        const ir_type: ir.IrType = switch (sub_opcode) {
+                            .i32_atomic_rmw_cmpxchg, .i32_atomic_rmw8_cmpxchg_u, .i32_atomic_rmw16_cmpxchg_u => .i32,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_cmpxchg = .{ .base = base, .offset = offset, .size = size, .expected = expected, .replacement = replacement } }, .dest = dest, .type = ir_type });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
                     else => return error.UnsupportedOpcode,
                 }
             },
