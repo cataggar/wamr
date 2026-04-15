@@ -22,10 +22,12 @@ else
 /// Locals occupy [rbp - 8*1] through [rbp - 8*N], and operand stack
 /// slot i lives at [rbp - 8*(N+1) - 8*i].
 const CachedStack = struct {
-    const SlotState = enum { empty, in_reg, in_mem };
+    const SlotState = enum { empty, in_reg, in_mem, is_const, is_cmp };
     const Slot = struct {
         state: SlotState = .empty,
         reg: emit.Reg = .rax,
+        const_val: i64 = 0, // valid when state == .is_const
+        cmp_cc: u4 = 0, // valid when state == .is_cmp
     };
 
     /// Registers available for caching operand stack values.
@@ -67,6 +69,48 @@ const CachedStack = struct {
         self.slots[idx] = .{ .state = .in_mem };
     }
 
+    /// Push a deferred constant — no code emitted, no register consumed.
+    fn pushConst(self: *CachedStack, val: i64) void {
+        const idx = self.depth;
+        self.depth += 1;
+        self.slots[idx] = .{ .state = .is_const, .const_val = val };
+    }
+
+    /// Push a deferred comparison result — no code emitted, no register consumed.
+    fn pushCmp(self: *CachedStack, cc: u4) void {
+        const idx = self.depth;
+        self.depth += 1;
+        self.slots[idx] = .{ .state = .is_cmp, .cmp_cc = cc };
+    }
+
+    /// Return true if the top of stack is a deferred constant.
+    fn topIsConst(self: *const CachedStack) bool {
+        if (self.depth == 0) return false;
+        return self.slots[self.depth - 1].state == .is_const;
+    }
+
+    /// Return the constant value at top of stack. Only valid if topIsConst().
+    fn topConstVal(self: *const CachedStack) i64 {
+        return self.slots[self.depth - 1].const_val;
+    }
+
+    /// Return true if the top of stack is a deferred comparison.
+    fn topIsCmp(self: *const CachedStack) bool {
+        if (self.depth == 0) return false;
+        return self.slots[self.depth - 1].state == .is_cmp;
+    }
+
+    /// Return the condition code at top of stack. Only valid if topIsCmp().
+    fn topCmpCc(self: *const CachedStack) u4 {
+        return self.slots[self.depth - 1].cmp_cc;
+    }
+
+    /// Drop the top slot without emitting any code (for deferred slots consumed by fusion).
+    fn dropTop(self: *CachedStack) void {
+        self.depth -= 1;
+        self.slots[self.depth].state = .empty;
+    }
+
     /// Pop the top value into `dst` register.
     fn pop(self: *CachedStack, code: *emit.CodeBuffer, dst: emit.Reg) !void {
         self.depth -= 1;
@@ -86,6 +130,19 @@ const CachedStack = struct {
             .in_mem => {
                 try code.movRegMem(dst, .rbp, self.memOffset(self.depth));
             },
+            .is_const => {
+                if (slot.const_val == 0) {
+                    try code.xorReg32(dst);
+                } else if (slot.const_val >= std.math.minInt(i32) and slot.const_val <= std.math.maxInt(i32)) {
+                    try code.movRegImm32(dst, @intCast(slot.const_val));
+                } else {
+                    try code.movRegImm64(dst, @bitCast(slot.const_val));
+                }
+            },
+            .is_cmp => {
+                try code.setcc(slot.cmp_cc, dst);
+                try code.movzxByte(dst, dst);
+            },
             .empty => unreachable,
         }
     }
@@ -94,15 +151,34 @@ const CachedStack = struct {
     /// Must be called before branches, calls, and returns.
     fn flush(self: *CachedStack, code: *emit.CodeBuffer) !void {
         for (0..self.depth) |i| {
-            if (self.slots[i].state == .in_reg) {
-                try code.movMemReg(.rbp, self.memOffset(@intCast(i)), self.slots[i].reg);
-                for (cache_regs, 0..) |cr, ci| {
-                    if (cr == self.slots[i].reg) {
-                        self.reg_used[ci] = false;
-                        break;
+            switch (self.slots[i].state) {
+                .in_reg => {
+                    try code.movMemReg(.rbp, self.memOffset(@intCast(i)), self.slots[i].reg);
+                    for (cache_regs, 0..) |cr, ci| {
+                        if (cr == self.slots[i].reg) {
+                            self.reg_used[ci] = false;
+                            break;
+                        }
                     }
-                }
-                self.slots[i] = .{ .state = .in_mem };
+                    self.slots[i] = .{ .state = .in_mem };
+                },
+                .is_const => {
+                    // Use RCX as temp to preserve RAX (may hold return value)
+                    if (self.slots[i].const_val >= std.math.minInt(i32) and self.slots[i].const_val <= std.math.maxInt(i32)) {
+                        try code.movRegImm32(.rcx, @intCast(self.slots[i].const_val));
+                    } else {
+                        try code.movRegImm64(.rcx, @bitCast(self.slots[i].const_val));
+                    }
+                    try code.movMemReg(.rbp, self.memOffset(@intCast(i)), .rcx);
+                    self.slots[i] = .{ .state = .in_mem };
+                },
+                .is_cmp => {
+                    try code.setcc(self.slots[i].cmp_cc, .rcx);
+                    try code.movzxByte(.rcx, .rcx);
+                    try code.movMemReg(.rbp, self.memOffset(@intCast(i)), .rcx);
+                    self.slots[i] = .{ .state = .in_mem };
+                },
+                .in_mem, .empty => {},
             }
         }
     }
@@ -207,12 +283,10 @@ fn compileInst(
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
         .iconst_32 => |val| {
-            try code.movRegImm32(.rax, val);
-            try stack.push(code, .rax);
+            stack.pushConst(val);
         },
         .iconst_64 => |val| {
-            try code.movRegImm64(.rax, @bitCast(val));
-            try stack.push(code, .rax);
+            stack.pushConst(val);
         },
         .fconst_32 => |val| {
             try code.movRegImm32(.rax, @bitCast(val));
@@ -225,15 +299,29 @@ fn compileInst(
 
         // ── Binary arithmetic ─────────────────────────────────────────
         .add => {
-            try stack.pop(code, .rcx); // rhs
-            try stack.pop(code, .rax); // lhs
-            try code.addRegReg(.rax, .rcx);
+            if (stack.topIsConst()) {
+                const imm = stack.topConstVal();
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.addRegImm32(.rax, @intCast(imm));
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                try code.addRegReg(.rax, .rcx);
+            }
             try stack.push(code, .rax);
         },
         .sub => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            try code.subRegReg(.rax, .rcx);
+            if (stack.topIsConst()) {
+                const imm = stack.topConstVal();
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.subRegImm32(.rax, @intCast(imm));
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                try code.subRegReg(.rax, .rcx);
+            }
             try stack.push(code, .rax);
         },
         .mul => {
@@ -243,21 +331,42 @@ fn compileInst(
             try stack.push(code, .rax);
         },
         .@"and" => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            try code.andRegReg(.rax, .rcx);
+            if (stack.topIsConst()) {
+                const imm = stack.topConstVal();
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                try code.andRegImm32(.rax, @intCast(imm));
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                try code.andRegReg(.rax, .rcx);
+            }
             try stack.push(code, .rax);
         },
         .@"or" => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            try code.orRegReg(.rax, .rcx);
+            if (stack.topIsConst()) {
+                const imm = stack.topConstVal();
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.orRegImm32(.rax, @intCast(imm));
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                try code.orRegReg(.rax, .rcx);
+            }
             try stack.push(code, .rax);
         },
         .xor => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            try code.xorRegReg(.rax, .rcx);
+            if (stack.topIsConst()) {
+                const imm = stack.topConstVal();
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.xorRegImm32(.rax, @intCast(imm));
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                try code.xorRegReg(.rax, .rcx);
+            }
             try stack.push(code, .rax);
         },
 
@@ -337,9 +446,16 @@ fn compileInst(
 
         // ── Comparisons ───────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |_, tag| {
-            try stack.pop(code, .rcx); // rhs
-            try stack.pop(code, .rax); // lhs
-            try code.cmpRegReg(.rax, .rcx);
+            if (stack.topIsConst()) {
+                const imm = stack.topConstVal();
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                try code.cmpRegImm32(.rax, @intCast(imm));
+            } else {
+                try stack.pop(code, .rcx); // rhs
+                try stack.pop(code, .rax); // lhs
+                try code.cmpRegReg(.rax, .rcx);
+            }
 
             const cc: u4 = comptime switch (tag) {
                 .eq => 0x4,
@@ -354,9 +470,7 @@ fn compileInst(
                 .ge_u => 0x3,
                 else => unreachable,
             };
-            try code.setcc(cc, .rax);
-            try code.movzxByte(.rax, .rax);
-            try stack.push(code, .rax);
+            stack.pushCmp(cc);
         },
 
         // ── Unary ops ─────────────────────────────────────────────────
@@ -395,10 +509,10 @@ fn compileInst(
 
         // ── Return ────────────────────────────────────────────────────
         .ret => |maybe_val| {
-            try stack.flush(code);
             if (maybe_val != null) {
-                try stack.pop(code, .rax);
+                try stack.pop(code, .rax); // pop before flush to preserve deferred optimizations
             }
+            try stack.flush(code); // flush uses RCX as temp, preserving RAX
             try code.emitEpilogue();
         },
 
@@ -444,16 +558,29 @@ fn compileInst(
             try patches.append(code.allocator, .{ .patch_offset = patch_off, .target_block = target });
         },
         .br_if => |br| {
-            try stack.flush(code);
-            // Pop condition from operand stack
-            try stack.pop(code, .rax);
-            try code.testRegReg(.rax, .rax);
-            // JNE then_block
-            try code.emitByte(0x0F);
-            try code.emitByte(0x85);
-            const then_patch = code.len();
-            try code.emitI32(0);
-            try patches.append(code.allocator, .{ .patch_offset = then_patch, .target_block = br.then_block });
+            if (stack.topIsCmp()) {
+                // Fused compare-and-branch: emit Jcc directly
+                const cc = stack.topCmpCc();
+                stack.dropTop();
+                try stack.flush(code); // flush remaining values (MOV only, flags preserved)
+                // Jcc then_block
+                try code.emitByte(0x0F);
+                try code.emitByte(0x80 | @as(u8, cc));
+                const then_patch = code.len();
+                try code.emitI32(0);
+                try patches.append(code.allocator, .{ .patch_offset = then_patch, .target_block = br.then_block });
+            } else {
+                try stack.flush(code);
+                // Non-fused: pop condition, test, JNE
+                try stack.pop(code, .rax);
+                try code.testRegReg(.rax, .rax);
+                // JNE then_block
+                try code.emitByte(0x0F);
+                try code.emitByte(0x85);
+                const then_patch = code.len();
+                try code.emitI32(0);
+                try patches.append(code.allocator, .{ .patch_offset = then_patch, .target_block = br.then_block });
+            }
             // JMP else_block (fallthrough)
             try code.emitByte(0xE9);
             const else_patch = code.len();
@@ -1051,4 +1178,91 @@ test "compileFunction: atomic_cmpxchg emits LOCK CMPXCHG" {
     // No JNE (single CMPXCHG, no retry loop)
     try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x85 }));
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+// ── Instruction selection optimization tests ──────────────────────
+
+test "compileFunction: iconst_32(0) emits xor (zero idiom)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain XOR r32,r32 (31 xx) instead of MOV rax,0 (48 C7 C0 00000000)
+    try std.testing.expect(containsBytes(code, &.{0x31}));
+    // Should NOT contain the 7-byte mov rax, 0 pattern
+    try std.testing.expect(!containsBytes(code, &.{ 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00 }));
+}
+
+test "compileFunction: iconst + add uses ADD imm32" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain ADD reg, imm32 (81 /0) with value 5
+    try std.testing.expect(containsBytes(code, &.{0x81}));
+    try std.testing.expect(containsBytes(code, &.{ 0x05, 0x00, 0x00, 0x00 }));
+}
+
+test "compileFunction: cmp + br_if fuses to Jcc (no setcc)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+    const block2 = func.getBlock(b2);
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const r1 = func.newVReg();
+    const r2 = func.newVReg();
+    try block0.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try block0.append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try block0.append(.{ .op = .{ .lt_s = .{ .lhs = v0, .rhs = v1 } }, .dest = cond });
+    try block0.append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try block1.append(.{ .op = .{ .iconst_32 = 1 }, .dest = r1 });
+    try block1.append(.{ .op = .{ .ret = r1 } });
+    try block2.append(.{ .op = .{ .iconst_32 = 0 }, .dest = r2 });
+    try block2.append(.{ .op = .{ .ret = r2 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain JL (0F 8C) — fused compare-and-branch
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x8C }));
+    // Should NOT contain SETCC (0F 9x) — comparison was deferred
+    var has_setcc = false;
+    for (code, 0..) |b, j| {
+        if (b == 0x0F and j + 1 < code.len and (code[j + 1] & 0xF0) == 0x90) {
+            has_setcc = true;
+            break;
+        }
+    }
+    try std.testing.expect(!has_setcc);
 }
