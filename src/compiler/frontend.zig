@@ -239,15 +239,17 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 // Look up callee type to determine arg count
                 const callee_type = wasm_module.getFuncType(func_idx);
                 const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
-                // Pop args from vreg stack (they were pushed by the caller)
+                // Capture arg VRegs before popping (args are in stack order: first arg deepest)
+                const args = try allocator.alloc(ir.VReg, arg_count);
                 var i: u32 = 0;
                 while (i < arg_count) : (i += 1) {
-                    _ = vreg_stack.pop();
+                    // Pop in reverse: last arg is on top
+                    args[arg_count - 1 - i] = vreg_stack.pop().?;
                 }
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
                     .func_idx = func_idx,
-                    .arg_count = arg_count,
+                    .args = args,
                 } }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },

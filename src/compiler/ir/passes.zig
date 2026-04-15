@@ -29,12 +29,20 @@ pub fn buildUseDef(func: *const ir.IrFunction, allocator: std.mem.Allocator) !st
                 if (!entry.found_existing) entry.value_ptr.* = .{};
                 entry.value_ptr.def_inst = idx;
             }
-            // Count uses
+            // Count uses from bounded list (most instructions)
             const used_vregs = getUsedVRegs(inst);
             for (used_vregs.slice()) |vreg| {
                 const entry = try info.getOrPut(vreg);
                 if (!entry.found_existing) entry.value_ptr.* = .{};
                 entry.value_ptr.use_count += 1;
+            }
+            // Count uses from call args (unbounded)
+            if (inst.op == .call) {
+                for (inst.op.call.args) |vreg| {
+                    const entry = try info.getOrPut(vreg);
+                    if (!entry.found_existing) entry.value_ptr.* = .{};
+                    entry.value_ptr.use_count += 1;
+                }
             }
         }
     }
@@ -77,7 +85,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         },
         .br_if => |bi| list.append(bi.cond),
         .ret => |maybe_vreg| if (maybe_vreg) |v| list.append(v),
-        .call => {},
+        .call => {}, // call args handled separately in buildUseDef (unbounded)
         .select => |sel| {
             list.append(sel.cond);
             list.append(sel.if_true);
@@ -170,7 +178,11 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         },
         .br_if => |*bi| if (bi.cond == old) { bi.cond = new; },
         .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { if (v == old) maybe_vreg.* = new; },
-        .call => {},
+        .call => |cl| {
+            for (@constCast(cl.args)) |*arg| {
+                if (arg.* == old) arg.* = new;
+            }
+        },
         .select => |*sel| {
             if (sel.cond == old) sel.cond = new;
             if (sel.if_true == old) sel.if_true = new;

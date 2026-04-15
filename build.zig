@@ -205,6 +205,18 @@ pub fn build(b: *std.Build) void {
     const run_passes_tests = b.addRunArtifact(passes_tests);
     test_step.dependOn(&run_passes_tests.step);
 
+    // Compiler IR analysis tests
+    const analysis_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/analysis.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const analysis_tests = b.addTest(.{
+        .root_module = analysis_test_module,
+    });
+    const run_analysis_tests = b.addRunArtifact(analysis_tests);
+    test_step.dependOn(&run_analysis_tests.step);
+
     // ── Benchmark ─────────────────────────────────────────────────────
     const bench_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/bench_codegen.zig"),
