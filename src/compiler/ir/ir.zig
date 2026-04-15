@@ -140,6 +140,10 @@ pub const Inst = struct {
         atomic_fence: void,
         atomic_notify: struct { base: VReg, offset: u32, count: VReg },
         atomic_wait: struct { base: VReg, offset: u32, expected: VReg, timeout: VReg, size: u8 },
+
+        // Bulk memory operations
+        memory_copy: struct { dst: VReg, src: VReg, len: VReg },
+        memory_fill: struct { dst: VReg, val: VReg, len: VReg },
     };
 
     pub const BinOp = struct {

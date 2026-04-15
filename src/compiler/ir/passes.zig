@@ -117,6 +117,16 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(aw.expected);
             list.append(aw.timeout);
         },
+        .memory_copy => |mc| {
+            list.append(mc.dst);
+            list.append(mc.src);
+            list.append(mc.len);
+        },
+        .memory_fill => |mf| {
+            list.append(mf.dst);
+            list.append(mf.val);
+            list.append(mf.len);
+        },
     }
     return list;
 }
@@ -213,6 +223,16 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (aw.base == old) aw.base = new;
             if (aw.expected == old) aw.expected = new;
             if (aw.timeout == old) aw.timeout = new;
+        },
+        .memory_copy => |*mc| {
+            if (mc.dst == old) mc.dst = new;
+            if (mc.src == old) mc.src = new;
+            if (mc.len == old) mc.len = new;
+        },
+        .memory_fill => |*mf| {
+            if (mf.dst == old) mf.dst = new;
+            if (mf.val == old) mf.val = new;
+            if (mf.len == old) mf.len = new;
         },
     }
 }
@@ -321,7 +341,7 @@ fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
         .store, .local_set, .global_set, .call, .ret, .br, .br_if, .@"unreachable",
         .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
-        .atomic_notify, .atomic_wait,
+        .atomic_notify, .atomic_wait, .memory_copy, .memory_fill,
         => true,
         else => false,
     };
