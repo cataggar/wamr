@@ -394,6 +394,137 @@ pub const CodeBuffer = struct {
         }
     }
 
+    // ── Atomic / LOCK-prefix instructions ─────────────────────────────
+
+    /// Emit the LOCK prefix byte (0xF0) for atomic memory operations.
+    pub fn lockPrefix(self: *CodeBuffer) !void {
+        try self.emitByte(0xF0);
+    }
+
+    /// MFENCE — full memory barrier (0F AE /6).
+    pub fn mfence(self: *CodeBuffer) !void {
+        try self.emitSlice(&.{ 0x0F, 0xAE, 0xF0 });
+    }
+
+    /// Emit prefix bytes for sized operations: operand-size override (0x66)
+    /// for 16-bit, REX for extended registers, REX.W for 64-bit.
+    fn emitSizedPrefix(self: *CodeBuffer, r: Reg, b: Reg, size: u8) !void {
+        switch (size) {
+            1, 4 => {
+                if (r.isExtended() or b.isExtended()) try self.rex(false, r, b);
+            },
+            2 => {
+                try self.emitByte(0x66);
+                if (r.isExtended() or b.isExtended()) try self.rex(false, r, b);
+            },
+            8 => try self.rexW(r, b),
+            else => unreachable,
+        }
+    }
+
+    /// Emit ModR/M + optional SIB + disp32 for a [base + disp32] memory operand.
+    fn emitMemOperand(self: *CodeBuffer, reg_op: u3, base: Reg, disp: i32) !void {
+        try self.modrm(0b10, reg_op, base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
+        try self.emitI32(disp);
+    }
+
+    /// Sized MOV load: load `size` bytes from [base + disp] into dst.
+    /// Sub-word sizes (1, 2) are zero-extended via MOVZX.
+    /// Size 4 uses 32-bit MOV (implicit zero-extend to 64-bit).
+    /// Size 8 uses 64-bit MOV (REX.W).
+    pub fn movRegMemSized(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32, size: u8) !void {
+        switch (size) {
+            1 => {
+                // MOVZX r32, BYTE PTR [base+disp]: [REX] 0F B6 /r
+                if (dst.isExtended() or base.isExtended()) try self.rex(false, dst, base);
+                try self.emitSlice(&.{ 0x0F, 0xB6 });
+            },
+            2 => {
+                // MOVZX r32, WORD PTR [base+disp]: [REX] 0F B7 /r
+                if (dst.isExtended() or base.isExtended()) try self.rex(false, dst, base);
+                try self.emitSlice(&.{ 0x0F, 0xB7 });
+            },
+            4 => {
+                // MOV r32, [base+disp]: [REX] 8B /r
+                if (dst.isExtended() or base.isExtended()) try self.rex(false, dst, base);
+                try self.emitByte(0x8B);
+            },
+            8 => {
+                // MOV r64, [base+disp]: REX.W 8B /r
+                try self.rexW(dst, base);
+                try self.emitByte(0x8B);
+            },
+            else => unreachable,
+        }
+        try self.emitMemOperand(dst.low3(), base, disp);
+    }
+
+    /// Sized MOV store: store `size` bytes from src into [base + disp].
+    pub fn movMemRegSized(self: *CodeBuffer, base: Reg, disp: i32, src: Reg, size: u8) !void {
+        const opcode: u8 = if (size == 1) 0x88 else 0x89;
+        try self.emitSizedPrefix(src, base, size);
+        try self.emitByte(opcode);
+        try self.emitMemOperand(src.low3(), base, disp);
+    }
+
+    /// LOCK XADD [base + disp], src — atomic exchange-and-add.
+    /// After execution, src contains the old memory value.
+    pub fn lockXadd(self: *CodeBuffer, base: Reg, disp: i32, src: Reg, size: u8) !void {
+        try self.emitByte(0xF0); // LOCK
+        try self.emitSizedPrefix(src, base, size);
+        const opcode: u8 = if (size == 1) 0xC0 else 0xC1;
+        try self.emitSlice(&.{ 0x0F, opcode });
+        try self.emitMemOperand(src.low3(), base, disp);
+    }
+
+    /// LOCK CMPXCHG [base + disp], src — atomic compare-and-exchange.
+    /// Compares RAX with [base + disp]; if equal, stores src; otherwise loads into RAX.
+    pub fn lockCmpxchg(self: *CodeBuffer, base: Reg, disp: i32, src: Reg, size: u8) !void {
+        try self.emitByte(0xF0); // LOCK
+        try self.emitSizedPrefix(src, base, size);
+        const opcode: u8 = if (size == 1) 0xB0 else 0xB1;
+        try self.emitSlice(&.{ 0x0F, opcode });
+        try self.emitMemOperand(src.low3(), base, disp);
+    }
+
+    /// XCHG [base + disp], reg — atomic exchange (implicit LOCK for memory operands).
+    pub fn xchgMemReg(self: *CodeBuffer, base: Reg, disp: i32, src: Reg, size: u8) !void {
+        const opcode: u8 = if (size == 1) 0x86 else 0x87;
+        try self.emitSizedPrefix(src, base, size);
+        try self.emitByte(opcode);
+        try self.emitMemOperand(src.low3(), base, disp);
+    }
+
+    /// NEG reg — two's complement negate.
+    pub fn negReg(self: *CodeBuffer, reg: Reg, size: u8) !void {
+        const opcode: u8 = if (size == 1) 0xF6 else 0xF7;
+        try self.emitSizedPrefix(.rax, reg, size);
+        try self.emitByte(opcode);
+        try self.modrm(0b11, 3, reg.low3());
+    }
+
+    /// Zero-extend register value to 64-bit based on operand size.
+    /// No-op for sizes 4 and 8 (32-bit writes auto-zero-extend; 64-bit is full width).
+    pub fn zeroExtendReg(self: *CodeBuffer, reg: Reg, size: u8) !void {
+        switch (size) {
+            1 => {
+                // MOVZX r32, r8: [REX] 0F B6 /r
+                if (reg.isExtended()) try self.rex(false, reg, reg);
+                try self.emitSlice(&.{ 0x0F, 0xB6 });
+                try self.modrm(0b11, reg.low3(), reg.low3());
+            },
+            2 => {
+                // MOVZX r32, r16: [REX] 0F B7 /r
+                if (reg.isExtended()) try self.rex(false, reg, reg);
+                try self.emitSlice(&.{ 0x0F, 0xB7 });
+                try self.modrm(0b11, reg.low3(), reg.low3());
+            },
+            4, 8 => {}, // 32-bit writes auto-zero-extend; 64-bit is full width
+            else => unreachable,
+        }
+    }
+
     // ── Function prologue / epilogue ──────────────────────────────────
 
     /// Emit standard function prologue: push rbp; mov rbp, rsp; sub rsp, frame_size.
@@ -695,4 +826,197 @@ test "full prologue + epilogue round-trip" {
         0x90, // nop
         0x48, 0x89, 0xEC, 0x5D, 0xC3, // epilogue
     });
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Atomic instruction tests
+// ═══════════════════════════════════════════════════════════════════════
+
+test "lockPrefix" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lockPrefix();
+    try hexEqual(buf.getCode(), &.{0xF0});
+}
+
+test "mfence" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.mfence();
+    // 0F AE F0
+    try hexEqual(buf.getCode(), &.{ 0x0F, 0xAE, 0xF0 });
+}
+
+test "movRegMemSized 8-bit (MOVZX byte)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegMemSized(.rax, .rcx, 0x10, 1);
+    // MOVZX eax, BYTE PTR [rcx+0x10]: 0F B6 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x0F, 0xB6, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "movRegMemSized 16-bit (MOVZX word)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegMemSized(.rax, .rcx, 0x10, 2);
+    // MOVZX eax, WORD PTR [rcx+0x10]: 0F B7 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x0F, 0xB7, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "movRegMemSized 32-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegMemSized(.rax, .rcx, 0x10, 4);
+    // MOV eax, [rcx+0x10]: 8B 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x8B, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "movRegMemSized 64-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegMemSized(.rax, .rcx, 0x10, 8);
+    // REX.W MOV rax, [rcx+0x10]: 48 8B 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x8B, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "movMemRegSized 8-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movMemRegSized(.rcx, 0x10, .rax, 1);
+    // MOV BYTE PTR [rcx+0x10], al: 88 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x88, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "movMemRegSized 16-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movMemRegSized(.rcx, 0x10, .rax, 2);
+    // MOV WORD PTR [rcx+0x10], ax: 66 89 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x66, 0x89, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "movMemRegSized 32-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movMemRegSized(.rcx, 0x10, .rax, 4);
+    // MOV DWORD PTR [rcx+0x10], eax: 89 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x89, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "movMemRegSized 64-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movMemRegSized(.rcx, 0x10, .rax, 8);
+    // REX.W MOV [rcx+0x10], rax: 48 89 81 10000000
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x89, 0x81, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "lockXadd 32-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lockXadd(.rax, 0, .rcx, 4);
+    // LOCK XADD [rax+0], ecx: F0 0F C1 88 00000000
+    try hexEqual(buf.getCode(), &.{ 0xF0, 0x0F, 0xC1, 0x88, 0x00, 0x00, 0x00, 0x00 });
+}
+
+test "lockXadd 64-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lockXadd(.rax, 0x10, .rcx, 8);
+    // LOCK REX.W XADD [rax+0x10], rcx: F0 48 0F C1 88 10000000
+    try hexEqual(buf.getCode(), &.{ 0xF0, 0x48, 0x0F, 0xC1, 0x88, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "lockXadd 8-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lockXadd(.rax, 0, .rcx, 1);
+    // LOCK XADD BYTE PTR [rax+0], cl: F0 0F C0 88 00000000
+    try hexEqual(buf.getCode(), &.{ 0xF0, 0x0F, 0xC0, 0x88, 0x00, 0x00, 0x00, 0x00 });
+}
+
+test "lockCmpxchg 32-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lockCmpxchg(.rax, 0, .rcx, 4);
+    // LOCK CMPXCHG [rax+0], ecx: F0 0F B1 88 00000000
+    try hexEqual(buf.getCode(), &.{ 0xF0, 0x0F, 0xB1, 0x88, 0x00, 0x00, 0x00, 0x00 });
+}
+
+test "lockCmpxchg 64-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lockCmpxchg(.rax, 0x10, .rcx, 8);
+    // LOCK REX.W CMPXCHG [rax+0x10], rcx: F0 48 0F B1 88 10000000
+    try hexEqual(buf.getCode(), &.{ 0xF0, 0x48, 0x0F, 0xB1, 0x88, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "xchgMemReg 32-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.xchgMemReg(.rax, 0, .rcx, 4);
+    // XCHG [rax+0], ecx: 87 88 00000000
+    try hexEqual(buf.getCode(), &.{ 0x87, 0x88, 0x00, 0x00, 0x00, 0x00 });
+}
+
+test "xchgMemReg 64-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.xchgMemReg(.rax, 0x10, .rcx, 8);
+    // REX.W XCHG [rax+0x10], rcx: 48 87 88 10000000
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x87, 0x88, 0x10, 0x00, 0x00, 0x00 });
+}
+
+test "negReg 64-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.negReg(.rcx, 8);
+    // REX.W NEG rcx: 48 F7 D9
+    try hexEqual(buf.getCode(), &.{ 0x48, 0xF7, 0xD9 });
+}
+
+test "negReg 32-bit" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.negReg(.rcx, 4);
+    // NEG ecx: F7 D9
+    try hexEqual(buf.getCode(), &.{ 0xF7, 0xD9 });
+}
+
+test "negReg extended register (r8, 64-bit)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.negReg(.r8, 8);
+    // REX.WB NEG r8: 49 F7 D8
+    try hexEqual(buf.getCode(), &.{ 0x49, 0xF7, 0xD8 });
+}
+
+test "zeroExtendReg 8-bit (MOVZX r32, r8)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.zeroExtendReg(.rax, 1);
+    // MOVZX eax, al: 0F B6 C0
+    try hexEqual(buf.getCode(), &.{ 0x0F, 0xB6, 0xC0 });
+}
+
+test "zeroExtendReg 16-bit (MOVZX r32, r16)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.zeroExtendReg(.rax, 2);
+    // MOVZX eax, ax: 0F B7 C0
+    try hexEqual(buf.getCode(), &.{ 0x0F, 0xB7, 0xC0 });
+}
+
+test "zeroExtendReg 32-bit (no-op)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.zeroExtendReg(.rax, 4);
+    try hexEqual(buf.getCode(), &.{});
+}
+
+test "zeroExtendReg 64-bit (no-op)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.zeroExtendReg(.rax, 8);
+    try hexEqual(buf.getCode(), &.{});
 }

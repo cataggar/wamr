@@ -204,5 +204,22 @@ pub fn build(b: *std.Build) void {
     });
     const run_passes_tests = b.addRunArtifact(passes_tests);
     test_step.dependOn(&run_passes_tests.step);
+
+    // ── Benchmark ─────────────────────────────────────────────────────
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/bench_codegen.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "codegen-bench",
+        .root_module = bench_module,
+    });
+    b.installArtifact(bench_exe);
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run codegen benchmarks");
+    bench_step.dependOn(&run_bench.step);
 }
 

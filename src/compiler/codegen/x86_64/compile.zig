@@ -547,41 +547,104 @@ fn compileInst(
             try stack.push(code, .rax);
         },
 
-        // ── Atomic stubs ──────────────────────────────────────────────
-        .atomic_fence => {},
-        .atomic_load => {
-            try stack.pop(code, .rax);
-            try code.movRegImm32(.rax, 0);
+        // ── Atomic operations ──────────────────────────────────────────
+        .atomic_fence => {
+            try code.mfence();
+        },
+        .atomic_load => |ld| {
+            try stack.pop(code, .rax); // base address
+            if (ld.offset > 0) {
+                try code.addRegImm32(.rax, @intCast(ld.offset));
+            }
+            try code.movRegMemSized(.rax, .rax, 0, ld.size);
             try stack.push(code, .rax);
         },
-        .atomic_store => {
+        .atomic_store => |st| {
             try stack.pop(code, .rcx); // val
-            try stack.pop(code, .rax); // base
+            try stack.pop(code, .rax); // base address
+            if (st.offset > 0) {
+                try code.addRegImm32(.rax, @intCast(st.offset));
+            }
+            try code.movMemRegSized(.rax, 0, .rcx, st.size);
+            try code.mfence(); // seq-cst ordering
         },
-        .atomic_rmw => {
+        .atomic_rmw => |rmw| {
             try stack.pop(code, .rcx); // val
-            try stack.pop(code, .rax); // base
-            try code.movRegImm32(.rax, 0);
+            try stack.pop(code, .rax); // base address
+            if (rmw.offset > 0) {
+                try code.addRegImm32(.rax, @intCast(rmw.offset));
+            }
+            switch (rmw.op) {
+                .add => {
+                    // LOCK XADD [rax], rcx → rcx gets old value
+                    try code.lockXadd(.rax, 0, .rcx, rmw.size);
+                    try code.movRegReg(.rax, .rcx);
+                    try code.zeroExtendReg(.rax, rmw.size);
+                },
+                .sub => {
+                    // NEG rcx; LOCK XADD → rcx gets old value
+                    try code.negReg(.rcx, rmw.size);
+                    try code.lockXadd(.rax, 0, .rcx, rmw.size);
+                    try code.movRegReg(.rax, .rcx);
+                    try code.zeroExtendReg(.rax, rmw.size);
+                },
+                .xchg => {
+                    // XCHG [rax], rcx → rcx gets old value (implicit LOCK)
+                    try code.xchgMemReg(.rax, 0, .rcx, rmw.size);
+                    try code.movRegReg(.rax, .rcx);
+                    try code.zeroExtendReg(.rax, rmw.size);
+                },
+                .@"and", .@"or", .xor => {
+                    // CAS loop: r8 needed as temp, flush stack to free cache regs
+                    try stack.flush(code);
+                    try code.movRegReg(.rdx, .rax); // rdx = address
+                    try code.movRegMemSized(.rax, .rdx, 0, rmw.size); // rax = current value (zero-extended)
+                    // retry:
+                    const retry_off = code.len();
+                    try code.movRegReg(.r8, .rax); // r8 = copy of old value
+                    switch (rmw.op) {
+                        .@"and" => try code.andRegReg(.r8, .rcx),
+                        .@"or" => try code.orRegReg(.r8, .rcx),
+                        .xor => try code.xorRegReg(.r8, .rcx),
+                        else => unreachable,
+                    }
+                    // LOCK CMPXCHG: if [rdx]==rax → store r8, else rax=[rdx]
+                    try code.lockCmpxchg(.rdx, 0, .r8, rmw.size);
+                    // JNE retry (backward jump on CAS failure)
+                    const jne_off = code.len();
+                    try code.jne(0); // placeholder rel32
+                    const retry_rel: i32 = @intCast(@as(i64, @intCast(retry_off)) - @as(i64, @intCast(jne_off + 6)));
+                    code.patchI32(jne_off + 2, retry_rel);
+                    // rax = old value (zero-extended from initial MOVZX; sub-word
+                    // CMPXCHG failure only writes AL/AX, preserving zero upper bytes)
+                },
+            }
             try stack.push(code, .rax);
         },
-        .atomic_cmpxchg => {
+        .atomic_cmpxchg => |cmpxchg| {
             try stack.pop(code, .rcx); // replacement
-            try stack.pop(code, .rdx); // expected
-            try stack.pop(code, .rax); // base
-            try code.movRegImm32(.rax, 0);
+            try stack.pop(code, .rax); // expected → rax (implicit CMPXCHG operand)
+            try stack.pop(code, .rdx); // base → rdx
+            if (cmpxchg.offset > 0) {
+                try code.addRegImm32(.rdx, @intCast(cmpxchg.offset));
+            }
+            try code.lockCmpxchg(.rdx, 0, .rcx, cmpxchg.size);
+            try code.zeroExtendReg(.rax, cmpxchg.size);
             try stack.push(code, .rax);
         },
         .atomic_notify => {
             try stack.pop(code, .rcx); // count
             try stack.pop(code, .rax); // base
-            try code.movRegImm32(.rax, 0);
+            // TODO: implement with futex runtime (see #76)
+            try code.movRegImm32(.rax, 0); // return 0 waiters woken
             try stack.push(code, .rax);
         },
         .atomic_wait => {
             try stack.pop(code, .rcx); // timeout
             try stack.pop(code, .rdx); // expected
             try stack.pop(code, .rax); // base
-            try code.movRegImm32(.rax, 0);
+            // TODO: implement with futex runtime (see #76)
+            try code.movRegImm32(.rax, 1); // return 1 ("not equal")
             try stack.push(code, .rax);
         },
     }
@@ -798,4 +861,194 @@ test "CachedStack: push and pop maintain depth" {
 
     try stack.pop(&code, .rax);
     try std.testing.expectEqual(@as(u32, 0), stack.depth);
+}
+
+// ── Atomic instruction integration tests ──────────────────────────
+
+fn containsBytes(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.mem.eql(u8, haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+test "compileFunction: atomic_fence emits MFENCE" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    try block.append(.{ .op = .{ .atomic_fence = {} } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // MFENCE = 0F AE F0
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0xAE, 0xF0 }));
+}
+
+test "compileFunction: atomic_load emits sized MOV" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const loaded = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .atomic_load = .{ .base = base, .offset = 0, .size = 4 } }, .dest = loaded, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = loaded } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(code.len > 10);
+    // Should NOT contain LOCK prefix (loads don't need it on x86-64)
+    try std.testing.expect(!containsBytes(code, &.{ 0xF0, 0x0F }));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunction: atomic_store emits MOV + MFENCE" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const val = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = val, .type = .i32 });
+    try block.append(.{ .op = .{ .atomic_store = .{ .base = base, .offset = 0, .size = 4, .val = val } } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Must contain MFENCE for seq-cst ordering
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0xAE, 0xF0 }));
+}
+
+test "compileFunction: atomic_rmw add emits LOCK XADD" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = val, .type = .i32 });
+    try block.append(.{ .op = .{ .atomic_rmw = .{ .base = base, .offset = 0, .size = 4, .val = val, .op = .add } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // LOCK XADD = F0 0F C1
+    try std.testing.expect(containsBytes(code, &.{ 0xF0, 0x0F, 0xC1 }));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunction: atomic_rmw sub emits NEG + LOCK XADD" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = val, .type = .i32 });
+    try block.append(.{ .op = .{ .atomic_rmw = .{ .base = base, .offset = 0, .size = 4, .val = val, .op = .sub } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain NEG (F7 /3) followed later by LOCK XADD (F0 0F C1)
+    try std.testing.expect(containsBytes(code, &.{ 0xF0, 0x0F, 0xC1 }));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunction: atomic_rmw xchg emits XCHG" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 99 }, .dest = val, .type = .i32 });
+    try block.append(.{ .op = .{ .atomic_rmw = .{ .base = base, .offset = 0, .size = 4, .val = val, .op = .xchg } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // XCHG [mem], reg = 87 (no LOCK prefix needed, implicit)
+    try std.testing.expect(containsBytes(code, &.{0x87}));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunction: atomic_rmw and emits CAS loop with LOCK CMPXCHG" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0xFF }, .dest = val, .type = .i32 });
+    try block.append(.{ .op = .{ .atomic_rmw = .{ .base = base, .offset = 0, .size = 4, .val = val, .op = .@"and" } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // LOCK CMPXCHG with r8 src = F0 44 0F B1 (REX.R for r8 in reg field)
+    try std.testing.expect(containsBytes(code, &.{ 0xF0, 0x44, 0x0F, 0xB1 }));
+    // JNE for CAS retry = 0F 85
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x85 }));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunction: atomic_cmpxchg emits LOCK CMPXCHG" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const base = func.newVReg();
+    const expected = func.newVReg();
+    const replacement = func.newVReg();
+    const result = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = expected, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = replacement, .type = .i32 });
+    try block.append(.{ .op = .{ .atomic_cmpxchg = .{ .base = base, .offset = 0, .size = 4, .expected = expected, .replacement = replacement } }, .dest = result, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = result } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // LOCK CMPXCHG = F0 0F B1
+    try std.testing.expect(containsBytes(code, &.{ 0xF0, 0x0F, 0xB1 }));
+    // No JNE (single CMPXCHG, no retry loop)
+    try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x85 }));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
