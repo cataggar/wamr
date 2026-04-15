@@ -25,6 +25,7 @@ pub const AotSectionType = enum(u32) {
     name = 7,
     @"import" = 8,
     memory = 9,
+    global = 10,
     _,
 };
 
@@ -58,6 +59,13 @@ pub const AotImportDesc = struct {
     func_type_idx: u32,
 };
 
+/// A global initial value parsed from the AOT globals section.
+pub const AotGlobalInit = struct {
+    val_type: u8,
+    mutability: u8,
+    init_i64: i64,
+};
+
 pub const AotModule = struct {
     target_info: ?TargetInfo = null,
     text_section: ?[]const u8 = null,
@@ -69,6 +77,7 @@ pub const AotModule = struct {
     memories: []const types.MemoryType = &.{},
     tables: []const types.TableType = &.{},
     data_segments: []const AotDataSegment = &.{},
+    global_inits: []const AotGlobalInit = &.{},
 
     /// Find an export by name and kind.
     pub fn findExport(self: *const AotModule, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
@@ -178,6 +187,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .memory => {
                 try parseMemorySection(&reader, section_size, &module, allocator);
             },
+            .global => {
+                try parseGlobalSection(&reader, section_size, &module, allocator);
+            },
             else => {
                 // Skip unknown/unhandled sections
                 reader.pos += section_size;
@@ -224,6 +236,9 @@ pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     }
     if (module.imports.len > 0) {
         allocator.free(module.imports);
+    }
+    if (module.global_inits.len > 0) {
+        allocator.free(module.global_inits);
     }
 }
 
@@ -383,6 +398,29 @@ fn parseMemorySection(reader: *BinaryReader, section_size: u32, module: *AotModu
     }
 
     module.memories = mem_types;
+}
+
+fn parseGlobalSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const inits = allocator.alloc(AotGlobalInit, count) catch return error.OutOfMemory;
+    errdefer allocator.free(inits);
+
+    for (0..count) |i| {
+        const val_type = try reader.readByte();
+        const mutability = try reader.readByte();
+        const init_bytes = try reader.readBytes(8);
+        const init_i64 = std.mem.readInt(i64, init_bytes[0..8], .little);
+        inits[i] = .{
+            .val_type = val_type,
+            .mutability = mutability,
+            .init_i64 = init_i64,
+        };
+    }
+
+    module.global_inits = inits;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

@@ -144,6 +144,10 @@ pub const Inst = struct {
         // Bulk memory operations
         memory_copy: struct { dst: VReg, src: VReg, len: VReg },
         memory_fill: struct { dst: VReg, val: VReg, len: VReg },
+
+        // Memory management
+        memory_size: void,
+        memory_grow: VReg,
     };
 
     pub const BinOp = struct {

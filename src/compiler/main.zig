@@ -179,6 +179,24 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // Build global entries from the parsed wasm module
+    var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
+    defer global_entries.deinit(allocator);
+    for (module.globals) |g| {
+        const init_val: i64 = switch (g.init_expr) {
+            .i32_const => |v| @as(i64, v),
+            .i64_const => |v| v,
+            .f32_const => |v| @as(i64, @as(i32, @bitCast(v))),
+            .f64_const => |v| @bitCast(v),
+            else => 0,
+        };
+        try global_entries.append(allocator, .{
+            .val_type = @intFromEnum(g.global_type.val_type),
+            .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
+            .init_i64 = init_val,
+        });
+    }
+
     const aot_binary = try emit_aot.emit(
         allocator,
         compiled.code,
@@ -188,6 +206,7 @@ pub fn main(init: std.process.Init) !void {
         if (data_segs.items.len > 0) data_segs.items else null,
         if (import_entries.items.len > 0) import_entries.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
+        if (global_entries.items.len > 0) global_entries.items else null,
     );
     defer allocator.free(aot_binary);
 

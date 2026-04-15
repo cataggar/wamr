@@ -21,8 +21,12 @@ else
 /// Points to a VmCtx struct with memory_base at +0, globals_base at +16.
 const vmctx_offset: i32 = -8;
 const vmctx_membase_field: i32 = 0; // VmCtx.memory_base offset
+const vmctx_memsize_field: i32 = 8; // VmCtx.memory_size offset
 const vmctx_globals_field: i32 = 16; // VmCtx.globals_ptr offset
 const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
+const vmctx_mem_max_size_field: i32 = 32; // VmCtx.memory_max_size offset
+const vmctx_globals_count_field: i32 = 40; // VmCtx.globals_count offset (u32)
+const vmctx_mem_pages_field: i32 = 48; // VmCtx.memory_pages offset (u32)
 
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
@@ -791,6 +795,15 @@ fn compileInst(
             try stack.pop(code, .rax); // dst
             // TODO: implement as memset
         },
+        .memory_size => {
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .memory_grow => {
+            try stack.pop(code, .rax); // pages (discard)
+            try code.movRegImm32(.rax, -1); // always fail in non-RA path
+            try stack.push(code, .rax);
+        },
     }
 }
 
@@ -1045,6 +1058,7 @@ fn compileInstRA(
                         },
                         else => unreachable,
                     }
+                    if (inst.type == .i32) try code.zeroExtend32(.rax);
                     try writeDef(code, alloc_result, dest, .rax);
                     return;
                 }
@@ -1063,6 +1077,7 @@ fn compileInstRA(
                 .xor => try code.xorRegReg(.rax, .rcx),
                 else => unreachable,
             }
+            if (inst.type == .i32) try code.zeroExtend32(.rax);
             try writeDef(code, alloc_result, dest, .rax);
         },
 
@@ -1211,9 +1226,19 @@ fn compileInstRA(
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.zeroExtend32(.rax); // wasm addresses are i32
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             if (ld.offset > 0) try code.addRegImm32(.rax, @intCast(ld.offset));
-            try code.movRegMemNoRex(.rax, .rax, 0);
+            try code.movRegMemSized(.rax, .rax, 0, ld.size);
+            if (ld.sign_extend and ld.size < 8) {
+                // Sign-extend for smaller loads
+                switch (ld.size) {
+                    1 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBE, 0xC0 }), // movsx rax, al
+                    2 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBF, 0xC0 }), // movsx rax, ax
+                    4 => try code.emitSlice(&.{ 0x48, 0x63, 0xC0 }),       // movsxd rax, eax
+                    else => {},
+                }
+            }
             try writeDef(code, alloc_result, dest, .rax);
         },
         .store => |st| {
@@ -1223,9 +1248,10 @@ fn compileInstRA(
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.zeroExtend32(.rax); // wasm addresses are i32
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             if (st.offset > 0) try code.addRegImm32(.rax, @intCast(st.offset));
-            try code.movMemRegNoRex(.rax, 0, .rcx);
+            try code.movMemRegSized(.rax, 0, .rcx, st.size);
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
@@ -1235,9 +1261,11 @@ fn compileInstRA(
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
             const src_reg = try useVReg(code, alloc_result, mc.src, .rsi);
             if (src_reg != .rsi) try code.movRegReg(.rsi, src_reg);
+            try code.zeroExtend32(.rsi); // wasm addresses are i32
             try code.addRegReg(.rsi, .r10); // rsi = mem_base + src
             const dst_reg = try useVReg(code, alloc_result, mc.dst, .rdi);
             if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
+            try code.zeroExtend32(.rdi); // wasm addresses are i32
             try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
             try code.emitSlice(&.{ 0xF3, 0xA4 }); // REP MOVSB
         },
@@ -1251,8 +1279,71 @@ fn compileInstRA(
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
             const dst_reg = try useVReg(code, alloc_result, mf.dst, .rdi);
             if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
+            try code.zeroExtend32(.rdi); // wasm addresses are i32
             try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
             try code.emitSlice(&.{ 0xF3, 0xAA }); // REP STOSB
+        },
+
+        // ── Memory management ─────────────────────────────────────────
+        .memory_size => {
+            const dest = inst.dest orelse return;
+            // Read current page count from VmCtx
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .memory_grow => |pages_vreg| {
+            const dest = inst.dest orelse return;
+            // Load requested pages
+            const pages_reg = try useVReg(code, alloc_result, pages_vreg, .rcx);
+            if (pages_reg != .rcx) try code.movRegReg(.rcx, pages_reg);
+            try code.zeroExtend32(.rcx);
+
+            // Load VmCtx
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            // old_pages = vmctx.memory_pages (i32)
+            try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field);
+
+            // new_pages = old_pages + requested (64-bit to avoid overflow)
+            try code.movRegReg(.rdx, .rax);
+            try code.addRegReg(.rdx, .rcx); // rdx = new_pages
+
+            // new_size_bytes = new_pages * 65536
+            try code.movRegReg(.rsi, .rdx);
+            try code.movRegImm32(.rdi, 16);
+            // shl rsi, cl — but cl is taken. Use imul instead.
+            // rsi = new_pages * 65536
+            try code.emitSlice(&.{ 0x48, 0xC1, 0xE6, 0x10 }); // shl rsi, 16
+
+            // Check: new_size_bytes <= memory_max_size
+            try code.movRegMem(.rdi, .r10, vmctx_mem_max_size_field);
+            try code.cmpRegReg(.rsi, .rdi);
+
+            // ja .fail (if new_size > max, jump to fail)
+            try code.emitSlice(&.{ 0x0F, 0x87 }); // JA rel32
+            const fail_patch = code.len();
+            try code.emitI32(0); // patched below
+
+            // Success: update vmctx.memory_pages and vmctx.memory_size
+            try code.movMemRegNoRex(.r10, vmctx_mem_pages_field, .rdx); // pages = new_pages (32-bit)
+            try code.movMemReg(.r10, vmctx_memsize_field, .rsi); // memory_size = new_bytes
+            // rax = old_pages (return value), jump to done
+            try code.emitSlice(&.{ 0xE9 }); // JMP rel32
+            const done_patch = code.len();
+            try code.emitI32(0);
+
+            // .fail: return -1
+            const fail_off = code.len();
+            try code.movRegImm32(.rax, -1);
+
+            // .done:
+            const done_off = code.len();
+
+            // Patch jump targets
+            code.patchI32(fail_patch, @intCast(@as(i64, @intCast(fail_off)) - @as(i64, @intCast(fail_patch + 4))));
+            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+
+            try writeDef(code, alloc_result, dest, .rax);
         },
 
         // ── Division ──────────────────────────────────────────────────
@@ -1278,6 +1369,7 @@ fn compileInstRA(
                 .rem_s, .rem_u => .rdx,
                 else => unreachable,
             };
+            if (inst.type == .i32) try code.zeroExtend32(result_reg);
             try writeDef(code, alloc_result, dest, result_reg);
         },
 
@@ -1311,6 +1403,7 @@ fn compileInstRA(
                 },
                 else => unreachable,
             }
+            if (inst.type == .i32) try code.zeroExtend32(.rax);
             try writeDef(code, alloc_result, dest, .rax);
         },
 

@@ -127,6 +127,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(mf.val);
             list.append(mf.len);
         },
+        .memory_size => {},
+        .memory_grow => |pages| {
+            list.append(pages);
+        },
     }
     return list;
 }
@@ -233,6 +237,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (mf.dst == old) mf.dst = new;
             if (mf.val == old) mf.val = new;
             if (mf.len == old) mf.len = new;
+        },
+        .memory_size => {},
+        .memory_grow => |*pages| {
+            if (pages.* == old) pages.* = new;
         },
     }
 }
@@ -341,7 +349,7 @@ fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
         .store, .local_set, .global_set, .call, .ret, .br, .br_if, .@"unreachable",
         .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
-        .atomic_notify, .atomic_wait, .memory_copy, .memory_fill,
+        .atomic_notify, .atomic_wait, .memory_copy, .memory_fill, .memory_grow,
         => true,
         else => false,
     };

@@ -528,14 +528,14 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .memory_size => {
                 _ = readU32(code, &ip); // memory index (always 0)
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_32 = 0 }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_size = {} }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .memory_grow => {
                 _ = readU32(code, &ip); // memory index
-                _ = vreg_stack.pop(); // pages
+                const pages = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_32 = -1 }, .dest = dest, .type = .i32 }); // fail
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_grow = pages }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
 

@@ -16,16 +16,20 @@ const platform = @import("../../platform/platform.zig");
 pub const VmCtx = extern struct {
     /// Base pointer to linear memory (memory 0).
     memory_base: usize = 0,
-    /// Size of linear memory in bytes.
+    /// Size of linear memory in bytes (current, may grow).
     memory_size: usize = 0,
     /// Pointer to flat globals values array (each global is an i64 at index * 8).
     globals_ptr: usize = 0,
     /// Pointer to array of host function pointers (one per import).
     host_functions_ptr: usize = 0,
+    /// Maximum allocated memory region size in bytes (for grow bounds checking).
+    memory_max_size: usize = 0,
     /// Number of globals.
     globals_count: u32 = 0,
     /// Number of host functions.
     host_functions_count: u32 = 0,
+    /// Current memory size in pages (for memory.size instruction).
+    memory_pages: u32 = 0,
 };
 
 // ─── Comptime target validation ─────────────────────────────────────────────
@@ -201,7 +205,9 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     var vmctx = VmCtx{};
     if (inst.memories.len > 0) {
         vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
-        vmctx.memory_size = inst.memories[0].data.len;
+        vmctx.memory_size = @as(usize, inst.memories[0].current_pages) * types.MemoryInstance.page_size;
+        vmctx.memory_max_size = inst.memories[0].data.len;
+        vmctx.memory_pages = inst.memories[0].current_pages;
     }
     // Always provide a valid globals pointer — compiled code may access globals
     // even if none are explicitly initialized (they default to zero).
@@ -269,7 +275,9 @@ fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allo
     for (module.memories, 0..) |mem_type, i| {
         const initial_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
         const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
-        const size = @as(usize, initial_pages) * types.MemoryInstance.page_size;
+        // Pre-allocate for memory.grow: use max_pages but cap at a reasonable default
+        const alloc_pages = @min(max_pages, @max(initial_pages, 256));
+        const size = @as(usize, alloc_pages) * types.MemoryInstance.page_size;
 
         const data = allocator.alloc(u8, size) catch return error.OutOfMemory;
         @memset(data, 0);
@@ -316,11 +324,29 @@ fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Alloca
 }
 
 fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.GlobalInstance {
-    // AOT modules don't carry global init exprs in this loader yet;
-    // return empty for now. Full init_data parsing will populate these.
-    _ = module;
-    _ = allocator;
-    return &.{};
+    if (module.global_inits.len == 0) return &.{};
+
+    const globals = allocator.alloc(*types.GlobalInstance, module.global_inits.len) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |i| allocator.destroy(globals[i]);
+        allocator.free(globals);
+    }
+
+    for (module.global_inits, 0..) |ginit, i| {
+        const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
+        g.* = .{
+            .global_type = .{
+                .val_type = @enumFromInt(ginit.val_type),
+                .mutability = if (ginit.mutability != 0) .mutable else .immutable,
+            },
+            .value = .{ .i64 = ginit.init_i64 },
+        };
+        globals[i] = g;
+        initialized += 1;
+    }
+
+    return globals;
 }
 
 fn freeMemories(memories: []*types.MemoryInstance, allocator: std.mem.Allocator) void {
@@ -389,7 +415,8 @@ test "instantiate: module with memory" {
 
     try std.testing.expectEqual(@as(usize, 1), inst.memories.len);
     try std.testing.expectEqual(@as(u32, 1), inst.memories[0].current_pages);
-    try std.testing.expectEqual(@as(usize, 65536), inst.memories[0].data.len);
+    // Pre-allocated to max_pages (4) for memory.grow support
+    try std.testing.expectEqual(@as(usize, 4 * 65536), inst.memories[0].data.len);
 }
 
 test "instantiate: module with table" {
@@ -445,8 +472,10 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(VmCtx, "memory_size"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(VmCtx, "globals_ptr"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(VmCtx, "host_functions_ptr"));
-    try std.testing.expectEqual(@as(usize, 32), @offsetOf(VmCtx, "globals_count"));
-    try std.testing.expectEqual(@as(usize, 36), @offsetOf(VmCtx, "host_functions_count"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(VmCtx, "memory_max_size"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(VmCtx, "globals_count"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(VmCtx, "host_functions_count"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(VmCtx, "memory_pages"));
 }
 
 test "getFuncAddr: import indices return null" {

@@ -416,6 +416,15 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, reg.low3(), reg.low3());
     }
 
+    /// MOV r32, r32 — zero-extend a 32-bit value to 64 bits by clearing
+    /// the upper 32 bits. On x86-64, writing to a 32-bit register
+    /// implicitly zeroes bits 63:32.
+    pub fn zeroExtend32(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.rex(false, reg, reg);
+        try self.emitByte(0x89);
+        try self.modrm(0b11, reg.low3(), reg.low3());
+    }
+
     /// MOV r32, [base + disp32] — 32-bit load (no REX.W, zero-extends to 64).
     pub fn movRegMemNoRex(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
         if (dst.isExtended() or base.isExtended()) {
