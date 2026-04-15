@@ -422,3 +422,32 @@ test "wasiProcExit: signals trap flag" {
     // Trap flag should now be set
     try std.testing.expect(tm.hasTrap());
 }
+
+test "resolveWasiFunction: fd_write resolves" {
+    const result = resolveWasiFunction("fd_write");
+    try std.testing.expect(result != null);
+}
+
+test "resolveWasiFunction: clock_time_get resolves" {
+    const result = resolveWasiFunction("clock_time_get");
+    try std.testing.expect(result != null);
+}
+
+test "resolveWasiFunction: unknown returns null" {
+    const result = resolveWasiFunction("nonexistent_function");
+    try std.testing.expect(result == null);
+}
+
+test "resolveWasiFunction: all 13 functions resolve" {
+    const names = [_][]const u8{
+        "proc_exit",     "thread-spawn",       "fd_write",
+        "fd_seek",       "fd_close",           "fd_fdstat_get",
+        "fd_prestat_get", "fd_prestat_dir_name", "clock_time_get",
+        "environ_sizes_get", "environ_get",    "args_sizes_get",
+        "args_get",
+    };
+    for (names) |name| {
+        const result = resolveWasiFunction(name);
+        try std.testing.expect(result != null);
+    }
+}

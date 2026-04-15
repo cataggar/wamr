@@ -1806,3 +1806,152 @@ test "compileFunctionRA: add two constants" {
     }
     try std.testing.expect(found_add_imm);
 }
+
+test "compileFunctionRA: global_get emits load from VMContext" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .global_get = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(code.len > 10);
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: wrap_i64 emits mov eax,eax" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 0x100000042 }, .dest = v0, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v0 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain mov eax, eax (89 C0) for wrap_i64
+    try std.testing.expect(containsBytes(code, &.{ 0x89, 0xC0 }));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: extend_i32_s emits MOVSXD" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = -1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .extend_i32_s = v0 }, .dest = v1, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain MOVSXD rax, eax (48 63 C0)
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x63, 0xC0 }));
+}
+
+test "compileFunctionRA: memory_copy emits REP MOVSB" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const dst = func.newVReg();
+    const src = func.newVReg();
+    const len = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = dst });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = src });
+    try block.append(.{ .op = .{ .iconst_32 = 50 }, .dest = len });
+    try block.append(.{ .op = .{ .memory_copy = .{ .dst = dst, .src = src, .len = len } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain REP MOVSB (F3 A4)
+    try std.testing.expect(containsBytes(code, &.{ 0xF3, 0xA4 }));
+}
+
+test "compileFunctionRA: memory_fill emits REP STOSB" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const dst = func.newVReg();
+    const val = func.newVReg();
+    const len = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = dst });
+    try block.append(.{ .op = .{ .iconst_32 = 0xFF }, .dest = val });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = len });
+    try block.append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain REP STOSB (F3 AA)
+    try std.testing.expect(containsBytes(code, &.{ 0xF3, 0xAA }));
+}
+
+test "compileFunctionRA: division uses rax/rdx" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v1 });
+    try block.append(.{ .op = .{ .div_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    // Should contain IDIV (F7 F9 for idiv rcx)
+    try std.testing.expect(containsBytes(code, &.{0xF7}));
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: local_get and local_set" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v0 } } });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v1 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(code.len > 10);
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}

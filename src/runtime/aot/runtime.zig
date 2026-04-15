@@ -387,3 +387,11 @@ test "getFuncAddr: returns correct address" {
     // Out of range
     try std.testing.expectEqual(@as(?[*]const u8, null), getFuncAddr(inst, 99));
 }
+
+test "VmCtx layout: fields at expected offsets" {
+    // Verify extern struct field offsets match what the codegen expects
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(VmCtx, "memory_base"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(VmCtx, "memory_size"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(VmCtx, "globals_ptr"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(VmCtx, "globals_count"));
+}

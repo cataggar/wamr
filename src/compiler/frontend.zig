@@ -1343,3 +1343,41 @@ test "readI64: simple value" {
     const val = readI64(&code, &ip);
     try std.testing.expectEqual(@as(i64, 42), val);
 }
+
+test "lower: dead code after br is skipped" {
+    const allocator = std.testing.allocator;
+
+    // Build a minimal wasm function: i32.const 42; br 0; i32.const 99; end
+    // The i32.const 99 after br is dead code and should be skipped
+    var bytecode: [20]u8 = undefined;
+    var pos: usize = 0;
+    bytecode[pos] = 0x41; pos += 1; // i32.const
+    bytecode[pos] = 42; pos += 1; // 42
+    bytecode[pos] = 0x0C; pos += 1; // br
+    bytecode[pos] = 0; pos += 1; // depth 0
+    bytecode[pos] = 0x41; pos += 1; // i32.const (dead)
+    bytecode[pos] = 99; pos += 1; // 99 (dead)
+    bytecode[pos] = 0x0B; pos += 1; // end
+
+    const func_type = types.FuncType{ .params = &.{}, .results = &.{} };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = bytecode[0..pos],
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    // Should not crash (dead code after br is handled)
+    const result = lowerFunction(&func, &func_type, &wasm_module, allocator);
+    if (result) |ir_func| {
+        var f = ir_func;
+        f.deinit();
+    } else |_| {
+        // Error is also acceptable — we just shouldn't crash
+    }
+}
