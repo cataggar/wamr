@@ -870,6 +870,435 @@ const GlobalCallPatch = struct {
     target_func_idx: u32,
 };
 
+// ── Register-Allocated Compilation ────────────────────────────────────
+
+const regalloc = @import("../../ir/regalloc.zig");
+
+/// Compile an IR function using the linear scan register allocator.
+/// VRegs are assigned to physical registers; instructions operate directly
+/// on assigned registers without push/pop through a CachedStack.
+pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
+    var alloc_result = try regalloc.allocate(func, allocator);
+    defer alloc_result.deinit();
+
+    var code = emit.CodeBuffer.init(allocator);
+    errdefer code.deinit();
+
+    // Frame: locals + spill slots, aligned to 16 bytes
+    const spill_slots = alloc_result.spill_count;
+    const raw_size: u32 = (func.local_count + 64 + spill_slots) * 8;
+    const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8;
+    try code.emitPrologue(frame_size);
+
+    // Spill parameters from ABI registers to stack frame slots
+    const spill_count = @min(func.param_count, param_regs.len);
+    for (0..spill_count) |i| {
+        try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
+    }
+
+    // Build constant value table for immediate folding
+    var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer const_vals.deinit();
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |dest| {
+                switch (inst.op) {
+                    .iconst_32 => |v| try const_vals.put(dest, v),
+                    .iconst_64 => |v| try const_vals.put(dest, v),
+                    else => {},
+                }
+            }
+        }
+    }
+
+    var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
+    defer block_offsets.deinit();
+    var branch_patches: std.ArrayList(BranchPatch) = .empty;
+    defer branch_patches.deinit(allocator);
+    var call_patches: std.ArrayList(CallPatch) = .empty;
+    defer call_patches.deinit(allocator);
+
+    var last_was_ret = false;
+    for (func.blocks.items, 0..) |block, idx| {
+        try block_offsets.put(@intCast(idx), code.len());
+        for (block.instructions.items) |inst| {
+            last_was_ret = isRet(inst.op);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches);
+        }
+    }
+
+    for (branch_patches.items) |patch| {
+        if (block_offsets.get(patch.target_block)) |target_off| {
+            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
+            code.patchI32(patch.patch_offset, rel);
+        }
+    }
+
+    if (!last_was_ret) {
+        try code.emitEpilogue();
+    }
+
+    return code.bytes.toOwnedSlice(allocator);
+}
+
+/// Get a VReg's value into a physical register, using scratch if spilled.
+fn useVReg(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    vreg: ir.VReg,
+    scratch: emit.Reg,
+) !emit.Reg {
+    const alloc = alloc_result.get(vreg) orelse return scratch;
+    switch (alloc) {
+        .reg => |preg| return @as(emit.Reg, @enumFromInt(preg)),
+        .stack => |offset| {
+            try code.movRegMem(scratch, .rbp, offset);
+            return scratch;
+        },
+    }
+}
+
+/// Store a result into a VReg's allocated location.
+fn writeDef(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    dest: ir.VReg,
+    result_reg: emit.Reg,
+) !void {
+    const alloc = alloc_result.get(dest) orelse return;
+    switch (alloc) {
+        .reg => |preg| {
+            const dst = @as(emit.Reg, @enumFromInt(preg));
+            if (dst != result_reg) try code.movRegReg(dst, result_reg);
+        },
+        .stack => |offset| {
+            try code.movMemReg(.rbp, offset, result_reg);
+        },
+    }
+}
+
+/// Get the physical register for a VReg (only valid if allocated to a register).
+fn regOf(alloc_result: *const regalloc.AllocResult, vreg: ir.VReg) ?emit.Reg {
+    const alloc = alloc_result.get(vreg) orelse return null;
+    return switch (alloc) {
+        .reg => |preg| @as(emit.Reg, @enumFromInt(preg)),
+        .stack => null,
+    };
+}
+
+fn compileInstRA(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    alloc_result: *const regalloc.AllocResult,
+    const_vals: *const std.AutoHashMap(ir.VReg, i64),
+    patches: *std.ArrayList(BranchPatch),
+    call_patches: *std.ArrayList(CallPatch),
+) !void {
+    switch (inst.op) {
+        // ── Constants ─────────────────────────────────────────────────
+        .iconst_32 => |val| {
+            const dest = inst.dest orelse return;
+            if (val == 0) {
+                try code.xorReg32(.rax);
+            } else {
+                try code.movRegImm32(.rax, val);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .iconst_64 => |val| {
+            const dest = inst.dest orelse return;
+            try code.movRegImm64(.rax, @bitCast(val));
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .fconst_32 => |val| {
+            const dest = inst.dest orelse return;
+            try code.movRegImm32(.rax, @bitCast(val));
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .fconst_64 => |val| {
+            const dest = inst.dest orelse return;
+            try code.movRegImm64(.rax, @bitCast(val));
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        // ── Binary arithmetic ─────────────────────────────────────────
+        .add, .sub, .mul, .@"and", .@"or", .xor => {
+            const dest = inst.dest orelse return;
+            const bin = switch (inst.op) {
+                .add => |b| b, .sub => |b| b, .mul => |b| b,
+                .@"and" => |b| b, .@"or" => |b| b, .xor => |b| b,
+                else => unreachable,
+            };
+            // Check if RHS is a constant for immediate form
+            if (const_vals.get(bin.rhs)) |imm| {
+                if (imm >= std.math.minInt(i32) and imm <= std.math.maxInt(i32)) {
+                    const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+                    if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+                    const imm32: i32 = @intCast(imm);
+                    switch (inst.op) {
+                        .add => if (imm32 != 0) try code.addRegImm32(.rax, imm32),
+                        .sub => if (imm32 != 0) try code.subRegImm32(.rax, imm32),
+                        .@"and" => try code.andRegImm32(.rax, imm32),
+                        .@"or" => if (imm32 != 0) try code.orRegImm32(.rax, imm32),
+                        .xor => if (imm32 != 0) try code.xorRegImm32(.rax, imm32),
+                        .mul => {
+                            try code.movRegImm32(.rcx, imm32);
+                            try code.imulRegReg(.rax, .rcx);
+                        },
+                        else => unreachable,
+                    }
+                    try writeDef(code, alloc_result, dest, .rax);
+                    return;
+                }
+            }
+            // General case: load both operands
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            switch (inst.op) {
+                .add => try code.addRegReg(.rax, .rcx),
+                .sub => try code.subRegReg(.rax, .rcx),
+                .mul => try code.imulRegReg(.rax, .rcx),
+                .@"and" => try code.andRegReg(.rax, .rcx),
+                .@"or" => try code.orRegReg(.rax, .rcx),
+                .xor => try code.xorRegReg(.rax, .rcx),
+                else => unreachable,
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        // ── Comparisons ───────────────────────────────────────────────
+        inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
+            const dest = inst.dest orelse return;
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            try code.cmpRegReg(.rax, .rcx);
+            const cc: u4 = comptime switch (tag) {
+                .eq => 0x4, .ne => 0x5, .lt_s => 0xC, .lt_u => 0x2,
+                .gt_s => 0xF, .gt_u => 0x7, .le_s => 0xE, .le_u => 0x6,
+                .ge_s => 0xD, .ge_u => 0x3, else => unreachable,
+            };
+            try code.setcc(cc, .rax);
+            try code.movzxByte(.rax, .rax);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        .eqz => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            try code.testRegReg(.rax, .rax);
+            try code.setcc(0x4, .rax);
+            try code.movzxByte(.rax, .rax);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        // ── Local variable access ─────────────────────────────────────
+        .local_get => |idx| {
+            const dest = inst.dest orelse return;
+            try code.movRegMem(.rax, .rbp, -@as(i32, @intCast((idx + 1) * 8)));
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .local_set => |ls| {
+            const src_reg = try useVReg(code, alloc_result, ls.val, .rax);
+            try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 1) * 8)), src_reg);
+        },
+
+        // ── Return ────────────────────────────────────────────────────
+        .ret => |maybe_val| {
+            if (maybe_val) |val| {
+                const src_reg = try useVReg(code, alloc_result, val, .rax);
+                if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            }
+            try code.emitEpilogue();
+        },
+
+        // ── Branches ──────────────────────────────────────────────────
+        .br => |target| {
+            try code.emitByte(0xE9);
+            const patch_off = code.len();
+            try code.emitI32(0);
+            try patches.append(code.allocator, .{ .patch_offset = patch_off, .target_block = target });
+        },
+        .br_if => |br| {
+            const cond_reg = try useVReg(code, alloc_result, br.cond, .rax);
+            if (cond_reg != .rax) try code.movRegReg(.rax, cond_reg);
+            try code.testRegReg(.rax, .rax);
+            try code.emitByte(0x0F);
+            try code.emitByte(0x85);
+            const then_patch = code.len();
+            try code.emitI32(0);
+            try patches.append(code.allocator, .{ .patch_offset = then_patch, .target_block = br.then_block });
+            try code.emitByte(0xE9);
+            const else_patch = code.len();
+            try code.emitI32(0);
+            try patches.append(code.allocator, .{ .patch_offset = else_patch, .target_block = br.else_block });
+        },
+
+        // ── Function calls ────────────────────────────────────────────
+        .call => |cl| {
+            const n_args: u32 = @intCast(cl.args.len);
+            // Load args into ABI registers
+            if (n_args > 0) {
+                const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)));
+                var i: u32 = 0;
+                while (i < max_reg_args) : (i += 1) {
+                    const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
+                    if (arg_reg != param_regs[i]) try code.movRegReg(param_regs[i], arg_reg);
+                }
+            }
+            try code.emitByte(0xE8);
+            const patch_off = code.len();
+            try code.emitI32(0);
+            try call_patches.append(code.allocator, .{ .patch_offset = patch_off, .target_func_idx = cl.func_idx });
+            if (inst.dest) |dest| {
+                try writeDef(code, alloc_result, dest, .rax);
+            }
+        },
+
+        // ── Memory ────────────────────────────────────────────────────
+        .load => |ld| {
+            const dest = inst.dest orelse return;
+            const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
+            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            if (ld.offset > 0) try code.addRegImm32(.rax, @intCast(ld.offset));
+            try code.movRegMemNoRex(.rax, .rax, 0);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .store => |st| {
+            const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
+            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
+            const base_reg = try useVReg(code, alloc_result, st.base, .rax);
+            if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            if (st.offset > 0) try code.addRegImm32(.rax, @intCast(st.offset));
+            try code.movMemRegNoRex(.rax, 0, .rcx);
+        },
+
+        // ── Division ──────────────────────────────────────────────────
+        .div_s, .div_u, .rem_s, .rem_u => |bin| {
+            const dest = inst.dest orelse return;
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            switch (inst.op) {
+                .div_s, .rem_s => {
+                    try code.cqo();
+                    try code.idivReg(.rcx);
+                },
+                .div_u, .rem_u => {
+                    try code.movRegImm32(.rdx, 0);
+                    try code.divReg(.rcx);
+                },
+                else => unreachable,
+            }
+            const result_reg: emit.Reg = switch (inst.op) {
+                .div_s, .div_u => .rax,
+                .rem_s, .rem_u => .rdx,
+                else => unreachable,
+            };
+            try writeDef(code, alloc_result, dest, result_reg);
+        },
+
+        // ── Shifts ────────────────────────────────────────────────────
+        .shl, .shr_s, .shr_u, .rotl, .rotr => |bin| {
+            const dest = inst.dest orelse return;
+            const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
+            const val_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
+            switch (inst.op) {
+                .shl => {
+                    try code.rexW(.rax, .rax);
+                    try code.emitSlice(&.{ 0xD3, 0xE0 });
+                },
+                .shr_u => {
+                    try code.rexW(.rax, .rax);
+                    try code.emitSlice(&.{ 0xD3, 0xE8 });
+                },
+                .shr_s => {
+                    try code.rexW(.rax, .rax);
+                    try code.emitSlice(&.{ 0xD3, 0xF8 });
+                },
+                .rotl => {
+                    try code.rexW(.rax, .rax);
+                    try code.emitSlice(&.{ 0xD3, 0xC0 });
+                },
+                .rotr => {
+                    try code.rexW(.rax, .rax);
+                    try code.emitSlice(&.{ 0xD3, 0xC8 });
+                },
+                else => unreachable,
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        // ── Unary ops ─────────────────────────────────────────────────
+        .clz => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            try code.lzcnt(.rax, .rax);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .ctz => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            try code.tzcnt(.rax, .rax);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .popcnt => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            try code.popcntReg(.rax, .rax);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        // ── Select ────────────────────────────────────────────────────
+        .select => |sel| {
+            const dest = inst.dest orelse return;
+            const cond_reg = try useVReg(code, alloc_result, sel.cond, .rax);
+            if (cond_reg != .rax) try code.movRegReg(.rax, cond_reg);
+            const false_reg = try useVReg(code, alloc_result, sel.if_false, .rcx);
+            if (false_reg != .rcx) try code.movRegReg(.rcx, false_reg);
+            const true_reg = try useVReg(code, alloc_result, sel.if_true, .rdx);
+            if (true_reg != .rdx) try code.movRegReg(.rdx, true_reg);
+            try code.testRegReg(.rax, .rax);
+            try code.cmovnz(.rcx, .rdx);
+            try writeDef(code, alloc_result, dest, .rcx);
+        },
+
+        .global_get => |idx| {
+            const dest = inst.dest orelse return;
+            _ = idx;
+            try code.movRegImm32(.rax, 0);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .global_set => |gs| {
+            _ = try useVReg(code, alloc_result, gs.val, .rax);
+        },
+
+        .@"unreachable" => {
+            try code.int3();
+        },
+
+        // ── Stubs for ops not commonly hit ────────────────────────────
+        else => {
+            // For unhandled ops, emit a no-op placeholder
+            // (atomics, float ops, extensions, etc.)
+            if (inst.dest) |dest| {
+                try code.movRegImm32(.rax, 0);
+                try writeDef(code, alloc_result, dest, .rax);
+            }
+        },
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 test "compileFunction: iconst_32 + ret produces mov and epilogue" {
@@ -1260,4 +1689,52 @@ test "compileFunction: cmp + br_if fuses to Jcc (no setcc)" {
         }
     }
     try std.testing.expect(!has_setcc);
+}
+
+// ── Register-allocated compilation tests ──────────────────────────
+
+test "compileFunctionRA: iconst_32 + ret" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(code.len > 5);
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: add two constants" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const code = try compileFunctionRA(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(code.len > 10);
+    try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+    // Should use ADD imm32 (0x81) since rhs is a constant
+    var found_add_imm = false;
+    for (code) |b| {
+        if (b == 0x81) { found_add_imm = true; break; }
+    }
+    try std.testing.expect(found_add_imm);
 }
