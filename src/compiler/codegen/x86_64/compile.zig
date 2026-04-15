@@ -99,12 +99,55 @@ fn compileInst(code: *emit.CodeBuffer, inst: ir.Inst, reg_map: *RegMap) !void {
                 .stack => {},
             }
         },
+        .iconst_64 => |val| {
+            const dest = inst.dest orelse return;
+            const loc = try reg_map.assign(dest);
+            switch (loc) {
+                .reg => |r| try code.movRegImm64(r, @bitCast(val)),
+                .stack => {},
+            }
+        },
         .add => |bin| try emitBinOp(code, inst, bin, reg_map, .add),
         .sub => |bin| try emitBinOp(code, inst, bin, reg_map, .sub),
         .mul => |bin| try emitBinOp(code, inst, bin, reg_map, .mul),
         .@"and" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"and"),
         .@"or" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"or"),
         .xor => |bin| try emitBinOp(code, inst, bin, reg_map, .xor),
+        .shl => |bin| try emitShift(code, inst, bin, reg_map, .shl),
+        .shr_s => |bin| try emitShift(code, inst, bin, reg_map, .shr_s),
+        .shr_u => |bin| try emitShift(code, inst, bin, reg_map, .shr_u),
+
+        // Division/remainder: uses RAX:RDX pair
+        .div_s, .div_u, .rem_s, .rem_u => |bin| try emitDivRem(code, inst, bin, reg_map),
+
+        // Comparisons: cmp + setcc + movzx
+        inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
+            try emitCmp(code, inst, bin, reg_map, tag);
+        },
+
+        // Unary ops
+        .eqz => |src| try emitEqz(code, inst, src, reg_map),
+        .clz => |src| try emitUnary(code, inst, src, reg_map, .clz),
+        .ctz => |src| try emitUnary(code, inst, src, reg_map, .ctz),
+        .popcnt => |src| try emitUnary(code, inst, src, reg_map, .popcnt),
+
+        // Local variable access
+        .local_get => |idx| {
+            const dest = inst.dest orelse return;
+            const loc = try reg_map.assign(dest);
+            switch (loc) {
+                .reg => |r| try code.movRegMem(r, .rbp, -@as(i32, @intCast((idx + 1) * 8))),
+                .stack => {},
+            }
+        },
+        .local_set => |ls| {
+            const src_loc = reg_map.get(ls.val) orelse return;
+            switch (src_loc) {
+                .reg => |r| try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 1) * 8)), r),
+                .stack => {},
+            }
+        },
+
         .ret => |maybe_val| {
             if (maybe_val) |val| {
                 if (reg_map.get(val)) |loc| {
@@ -119,6 +162,7 @@ fn compileInst(code: *emit.CodeBuffer, inst: ir.Inst, reg_map: *RegMap) !void {
             try code.emitEpilogue();
         },
         .@"unreachable" => try code.int3(),
+        .select => |sel| try emitSelect(code, inst, sel, reg_map),
         else => {},
     }
 }
@@ -159,6 +203,197 @@ fn emitBinOp(
         .@"or" => try code.orRegReg(dest_reg, rhs_reg),
         .xor => try code.xorRegReg(dest_reg, rhs_reg),
     }
+}
+
+// ── Shift operations ──────────────────────────────────────────────────
+
+const ShiftKind = enum { shl, shr_s, shr_u };
+
+fn emitShift(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+    kind: ShiftKind,
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs_loc = reg_map.get(bin.lhs) orelse return;
+    const rhs_loc = reg_map.get(bin.rhs) orelse return;
+    const dest_loc = try reg_map.assign(dest);
+
+    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
+    const lhs_reg = switch (lhs_loc) { .reg => |r| r, .stack => return };
+    const rhs_reg = switch (rhs_loc) { .reg => |r| r, .stack => return };
+
+    // x86 shifts require count in CL
+    if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+    if (dest_reg != lhs_reg) try code.movRegReg(dest_reg, lhs_reg);
+
+    // REX.W + D3 /opcode
+    const opcode_ext: u3 = switch (kind) {
+        .shl => 4,
+        .shr_u => 5,
+        .shr_s => 7,
+    };
+    try code.rexW(.rax, dest_reg);
+    try code.emitByte(0xD3);
+    try code.modrm(0b11, opcode_ext, dest_reg.low3());
+}
+
+// ── Division / remainder ──────────────────────────────────────────────
+
+fn emitDivRem(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs_loc = reg_map.get(bin.lhs) orelse return;
+    const rhs_loc = reg_map.get(bin.rhs) orelse return;
+    const dest_loc = try reg_map.assign(dest);
+
+    const lhs_reg = switch (lhs_loc) { .reg => |r| r, .stack => return };
+    const rhs_reg = switch (rhs_loc) { .reg => |r| r, .stack => return };
+    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
+
+    // Move dividend to RAX
+    if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+
+    const is_signed = (inst.op == .div_s or inst.op == .rem_s);
+    const is_rem = (inst.op == .rem_s or inst.op == .rem_u);
+
+    // Sign/zero extend RAX into RDX:RAX
+    if (is_signed) {
+        try code.cqo(); // sign-extend RAX → RDX:RAX
+    } else {
+        try code.xorRegReg(.rdx, .rdx); // zero-extend
+    }
+
+    // Divisor must not be in RAX or RDX
+    var divisor = rhs_reg;
+    if (divisor == .rax or divisor == .rdx) {
+        divisor = .r10;
+        try code.movRegReg(.r10, rhs_reg);
+    }
+
+    // IDIV/DIV r/m64
+    if (is_signed) {
+        try code.idivReg(divisor);
+    } else {
+        try code.divReg(divisor);
+    }
+
+    // Result: quotient in RAX, remainder in RDX
+    const result_reg: emit.Reg = if (is_rem) .rdx else .rax;
+    if (dest_reg != result_reg) try code.movRegReg(dest_reg, result_reg);
+}
+
+// ── Comparison operations ─────────────────────────────────────────────
+
+fn emitCmp(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+    comptime op: std.meta.Tag(ir.Inst.Op),
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs_loc = reg_map.get(bin.lhs) orelse return;
+    const rhs_loc = reg_map.get(bin.rhs) orelse return;
+    const dest_loc = try reg_map.assign(dest);
+
+    const lhs_reg = switch (lhs_loc) { .reg => |r| r, .stack => return };
+    const rhs_reg = switch (rhs_loc) { .reg => |r| r, .stack => return };
+    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
+
+    // CMP lhs, rhs
+    try code.cmpRegReg(lhs_reg, rhs_reg);
+
+    // SETcc to low byte of dest, then MOVZX to clear upper bytes
+    // Map IR comparison to x86 condition code
+    const cc: u4 = comptime switch (op) {
+        .eq => 0x4,   // E/Z
+        .ne => 0x5,   // NE/NZ
+        .lt_s => 0xC, // L (SF≠OF)
+        .lt_u => 0x2, // B (CF=1)
+        .gt_s => 0xF, // G (ZF=0, SF=OF)
+        .gt_u => 0x7, // A (CF=0, ZF=0)
+        .le_s => 0xE, // LE (ZF=1 or SF≠OF)
+        .le_u => 0x6, // BE (CF=1 or ZF=1)
+        .ge_s => 0xD, // GE (SF=OF)
+        .ge_u => 0x3, // AE (CF=0)
+        else => unreachable,
+    };
+    try code.setcc(cc, dest_reg);
+    try code.movzxByte(dest_reg, dest_reg);
+}
+
+// ── Unary operations ──────────────────────────────────────────────────
+
+const UnaryKind = enum { clz, ctz, popcnt };
+
+fn emitUnary(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    reg_map: *RegMap,
+    kind: UnaryKind,
+) !void {
+    const dest = inst.dest orelse return;
+    const src_loc = reg_map.get(src) orelse return;
+    const dest_loc = try reg_map.assign(dest);
+    const src_reg = switch (src_loc) { .reg => |r| r, .stack => return };
+    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
+
+    switch (kind) {
+        .clz => try code.lzcnt(dest_reg, src_reg),
+        .ctz => try code.tzcnt(dest_reg, src_reg),
+        .popcnt => try code.popcntReg(dest_reg, src_reg),
+    }
+}
+
+fn emitEqz(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const src_loc = reg_map.get(src) orelse return;
+    const dest_loc = try reg_map.assign(dest);
+    const src_reg = switch (src_loc) { .reg => |r| r, .stack => return };
+    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
+
+    // TEST src, src; SETZ dest
+    try code.testRegReg(src_reg, src_reg);
+    try code.setcc(0x4, dest_reg); // SETZ (ZF=1)
+    try code.movzxByte(dest_reg, dest_reg);
+}
+
+// ── Select (conditional move) ─────────────────────────────────────────
+
+fn emitSelect(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    sel: @TypeOf(@as(ir.Inst.Op, undefined).select),
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const cond_loc = reg_map.get(sel.cond) orelse return;
+    const true_loc = reg_map.get(sel.if_true) orelse return;
+    const false_loc = reg_map.get(sel.if_false) orelse return;
+    const dest_loc = try reg_map.assign(dest);
+
+    const cond_reg = switch (cond_loc) { .reg => |r| r, .stack => return };
+    const true_reg = switch (true_loc) { .reg => |r| r, .stack => return };
+    const false_reg = switch (false_loc) { .reg => |r| r, .stack => return };
+    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
+
+    // dest = false_val; TEST cond; CMOVNZ dest, true_val
+    try code.movRegReg(dest_reg, false_reg);
+    try code.testRegReg(cond_reg, cond_reg);
+    try code.cmovnz(dest_reg, true_reg);
 }
 
 /// Result of compiling an IR module.

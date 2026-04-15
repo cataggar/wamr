@@ -95,13 +95,13 @@ pub const CodeBuffer = struct {
     }
 
     /// Emit REX.W prefix (64-bit operand size).
-    fn rexW(self: *CodeBuffer, r: Reg, b: Reg) !void {
+    pub fn rexW(self: *CodeBuffer, r: Reg, b: Reg) !void {
         try self.rex(true, r, b);
     }
 
     // ── ModR/M byte ───────────────────────────────────────────────────
 
-    fn modrm(self: *CodeBuffer, mod: u2, reg_op: u3, rm: u3) !void {
+    pub fn modrm(self: *CodeBuffer, mod: u2, reg_op: u3, rm: u3) !void {
         try self.emitByte(@as(u8, mod) << 6 | @as(u8, reg_op) << 3 | rm);
     }
 
@@ -252,6 +252,106 @@ pub const CodeBuffer = struct {
         try self.emitByte(0x0F);
         try self.emitByte(0x8D);
         try self.emitI32(rel);
+    }
+
+    // ── Memory access ─────────────────────────────────────────────────
+
+    /// MOV reg, [base + disp32] (64-bit load from memory).
+    pub fn movRegMem(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        try self.rexW(dst, base);
+        try self.emitByte(0x8B);
+        try self.modrm(0b10, dst.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
+        try self.emitI32(disp);
+    }
+
+    /// MOV [base + disp32], reg (64-bit store to memory).
+    pub fn movMemReg(self: *CodeBuffer, base: Reg, disp: i32, src: Reg) !void {
+        try self.rexW(src, base);
+        try self.emitByte(0x89);
+        try self.modrm(0b10, src.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24); // SIB for RSP-based
+        try self.emitI32(disp);
+    }
+
+    // ── SETcc / MOVZX / TEST / CQO / DIV / CMOV ──────────────────────
+
+    /// SETcc r/m8 — set byte based on condition code.
+    pub fn setcc(self: *CodeBuffer, cc: u4, dst: Reg) !void {
+        try self.rex(false, .rax, dst);
+        try self.emitByte(0x0F);
+        try self.emitByte(0x90 | @as(u8, cc));
+        try self.modrm(0b11, 0, dst.low3());
+    }
+
+    /// MOVZX r64, r/m8 — zero-extend byte to 64-bit.
+    pub fn movzxByte(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xB6);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// TEST reg, reg (64-bit).
+    pub fn testRegReg(self: *CodeBuffer, a: Reg, b: Reg) !void {
+        try self.rexW(b, a);
+        try self.emitByte(0x85);
+        try self.modrm(0b11, b.low3(), a.low3());
+    }
+
+    /// CQO — sign-extend RAX into RDX:RAX (REX.W + 99).
+    pub fn cqo(self: *CodeBuffer) !void {
+        try self.emitByte(0x48); // REX.W
+        try self.emitByte(0x99);
+    }
+
+    /// IDIV r/m64 — signed divide RDX:RAX by reg.
+    pub fn idivReg(self: *CodeBuffer, src: Reg) !void {
+        try self.rexW(.rax, src);
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 7, src.low3());
+    }
+
+    /// DIV r/m64 — unsigned divide RDX:RAX by reg.
+    pub fn divReg(self: *CodeBuffer, src: Reg) !void {
+        try self.rexW(.rax, src);
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 6, src.low3());
+    }
+
+    /// CMOVNZ dst, src (64-bit conditional move if not zero).
+    pub fn cmovnz(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0x45);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// LZCNT dst, src — count leading zeros (BMI1).
+    pub fn lzcnt(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3); // mandatory prefix
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBD);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// TZCNT dst, src — count trailing zeros (BMI1).
+    pub fn tzcnt(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3); // mandatory prefix
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBC);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// POPCNT dst, src — population count.
+    pub fn popcntReg(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3); // mandatory prefix
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xB8);
+        try self.modrm(0b11, dst.low3(), src.low3());
     }
 
     // ── Function prologue / epilogue ──────────────────────────────────
