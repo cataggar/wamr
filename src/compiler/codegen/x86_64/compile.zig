@@ -16,6 +16,10 @@ const param_regs = if (builtin.os.tag == .windows)
 else
     [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 }; // SysV
 
+/// Fixed frame offset for the VMContext (memory base pointer).
+/// Stored at [rbp - 8] by compileFunctionRA at function entry.
+const vmctx_offset: i32 = -8;
+
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
 /// offsets) when all cache registers are occupied.
@@ -844,16 +848,22 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocato
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
-    // Frame: locals + spill slots, aligned to 16 bytes
+    // Frame: locals + spill slots + 1 vmctx slot, aligned to 16 bytes
     const spill_slots = alloc_result.spill_count;
-    const raw_size: u32 = (func.local_count + 64 + spill_slots) * 8;
+    const raw_size: u32 = (func.local_count + 64 + spill_slots + 1) * 8;
     const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8;
     try code.emitPrologue(frame_size);
 
-    // Spill parameters from ABI registers to stack frame slots
-    const spill_count = @min(func.param_count, param_regs.len);
+    // Save memory base (VMContext) from first ABI register to [rbp - 8]
+    // The runtime passes the linear memory base pointer as a hidden first parameter.
+    const vmctx_reg = param_regs[0]; // rcx on Win64, rdi on SysV
+    try code.movMemReg(.rbp, vmctx_offset, vmctx_reg);
+
+    // Spill wasm parameters from ABI registers to stack frame slots.
+    // Wasm params are shifted by 1 because the first ABI register is the VMContext.
+    const spill_count = @min(func.param_count, param_regs.len - 1);
     for (0..spill_count) |i| {
-        try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
+        try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), param_regs[i + 1]);
     }
 
     // Build constant value table for immediate folding
@@ -1122,8 +1132,11 @@ fn compileInstRA(
         // ── Memory ────────────────────────────────────────────────────
         .load => |ld| {
             const dest = inst.dest orelse return;
+            // Load memory base from VMContext frame slot, add wasm offset
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             if (ld.offset > 0) try code.addRegImm32(.rax, @intCast(ld.offset));
             try code.movRegMemNoRex(.rax, .rax, 0);
             try writeDef(code, alloc_result, dest, .rax);
@@ -1131,10 +1144,37 @@ fn compileInstRA(
         .store => |st| {
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             if (st.offset > 0) try code.addRegImm32(.rax, @intCast(st.offset));
             try code.movMemRegNoRex(.rax, 0, .rcx);
+        },
+        .memory_copy => |mc| {
+            // REP MOVSB: rdi=dst, rsi=src, rcx=len
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // memory base
+            const len_reg = try useVReg(code, alloc_result, mc.len, .rcx);
+            if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
+            const src_reg = try useVReg(code, alloc_result, mc.src, .rsi);
+            if (src_reg != .rsi) try code.movRegReg(.rsi, src_reg);
+            try code.addRegReg(.rsi, .r10); // rsi = mem_base + src
+            const dst_reg = try useVReg(code, alloc_result, mc.dst, .rdi);
+            if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
+            try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
+            try code.emitSlice(&.{ 0xF3, 0xA4 }); // REP MOVSB
+        },
+        .memory_fill => |mf| {
+            // REP STOSB: rdi=dst, al=val, rcx=len
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // memory base
+            const len_reg = try useVReg(code, alloc_result, mf.len, .rcx);
+            if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
+            const val_reg = try useVReg(code, alloc_result, mf.val, .rax);
+            if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
+            const dst_reg = try useVReg(code, alloc_result, mf.dst, .rdi);
+            if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
+            try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
+            try code.emitSlice(&.{ 0xF3, 0xAA }); // REP STOSB
         },
 
         // ── Division ──────────────────────────────────────────────────
@@ -1245,6 +1285,61 @@ fn compileInstRA(
 
         .@"unreachable" => {
             try code.int3();
+        },
+
+        // ── Type conversions ──────────────────────────────────────────
+        .wrap_i64 => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // Truncate to 32-bit: writing to eax zero-extends to rax
+            try code.emitSlice(&.{ 0x89, 0xC0 }); // mov eax, eax
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .extend_i32_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // MOVSXD rax, eax: sign-extend 32→64
+            try code.emitSlice(&.{ 0x48, 0x63, 0xC0 });
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .extend_i32_u => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // mov eax, eax: zero-extend 32→64 (implicit on x86-64)
+            try code.emitSlice(&.{ 0x89, 0xC0 });
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .extend8_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // MOVSX rax, al: REX.W 0F BE C0
+            try code.emitSlice(&.{ 0x48, 0x0F, 0xBE, 0xC0 });
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .extend16_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // MOVSX rax, ax: REX.W 0F BF C0
+            try code.emitSlice(&.{ 0x48, 0x0F, 0xBF, 0xC0 });
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .extend32_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // MOVSXD rax, eax
+            try code.emitSlice(&.{ 0x48, 0x63, 0xC0 });
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .reinterpret => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            try writeDef(code, alloc_result, dest, src_reg);
         },
 
         // ── Stubs for ops not commonly hit ────────────────────────────
