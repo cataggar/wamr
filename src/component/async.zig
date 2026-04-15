@@ -36,9 +36,9 @@ pub const Task = struct {
 /// registered items are ready.
 pub const WaitableSet = struct {
     /// Registered items that can become ready.
-    items: std.ArrayListUnmanaged(WaitableItem) = .{},
+    items: std.ArrayListUnmanaged(WaitableItem) = .empty,
     /// Items that have become ready since the last wait/poll.
-    ready_queue: std.ArrayListUnmanaged(u32) = .{}, // indices into items
+    ready_queue: std.ArrayListUnmanaged(u32) = .empty, // indices into items
 
     pub const WaitableItem = struct {
         kind: Kind,
@@ -88,7 +88,7 @@ pub const WaitableSet = struct {
 
 /// Manages the lifecycle of async tasks within a component instance.
 pub const TaskManager = struct {
-    tasks: std.ArrayListUnmanaged(Task) = .{},
+    tasks: std.ArrayListUnmanaged(Task) = .empty,
     next_id: u32 = 1,
 
     /// Create a new task. Returns the task handle.
@@ -176,7 +176,7 @@ pub const Future = struct {
 
 /// A component-level async stream — multi-value channel with backpressure.
 pub const AsyncStream = struct {
-    buffer: std.ArrayListUnmanaged(u32) = .{},
+    buffer: std.ArrayListUnmanaged(u32) = .empty,
     state: State = .open,
     waitable_set: ?*WaitableSet = null,
     read_waitable_idx: ?u32 = null,

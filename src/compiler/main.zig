@@ -7,18 +7,15 @@ const builtin = @import("builtin");
 const wamr = @import("wamr");
 const emit_aot = wamr.emit_aot;
 const x86_64_compile = wamr.x86_64_compile;
-const aarch64_compile = @import("codegen/aarch64/compile.zig");
-const passes = @import("ir/passes.zig");
+const aarch64_compile = wamr.aarch64_compile;
+const passes = wamr.passes;
 
 const TargetArch = enum { x86_64, aarch64 };
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 3) {
         std.debug.print("Usage: wamrc <input.wasm> -o <output.aot>\n", .{});
@@ -66,8 +63,9 @@ pub fn main() !void {
     };
 
     // 1. Read input wasm
-    const cwd = std.fs.cwd();
-    const wasm_data = cwd.readFileAlloc(allocator, in_path, 64 * 1024 * 1024) catch |err| {
+    const io = init.io;
+    const cwd = std.Io.Dir.cwd();
+    const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(64 * 1024 * 1024)) catch |err| {
         std.debug.print("Error reading {s}: {}\n", .{ in_path, err });
         std.process.exit(1);
     };
@@ -151,12 +149,12 @@ pub fn main() !void {
     defer allocator.free(aot_binary);
 
     // 7. Write output
-    const out_file = cwd.createFile(out_path, .{}) catch |err| {
+    const out_file = cwd.createFile(io, out_path, .{}) catch |err| {
         std.debug.print("Error creating {s}: {}\n", .{ out_path, err });
         std.process.exit(1);
     };
-    defer out_file.close();
-    out_file.writeAll(aot_binary) catch |err| {
+    defer out_file.close(io);
+    out_file.writeStreamingAll(io, aot_binary) catch |err| {
         std.debug.print("Error writing {s}: {}\n", .{ out_path, err });
         std.process.exit(1);
     };

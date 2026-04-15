@@ -24,9 +24,9 @@ pub const ResourceTable = struct {
         owned: bool = true,
     };
 
-    slots: std.ArrayListUnmanaged(Slot) = .{},
+    slots: std.ArrayListUnmanaged(Slot) = .empty,
     /// Free list of slot indices for reuse.
-    free_list: std.ArrayListUnmanaged(u32) = .{},
+    free_list: std.ArrayListUnmanaged(u32) = .empty,
 
     /// Allocate a new handle for a representation. Returns the handle index.
     pub fn new(self: *ResourceTable, representation: u32, owned: bool, allocator: std.mem.Allocator) !u32 {

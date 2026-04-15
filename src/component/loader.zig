@@ -102,16 +102,16 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
     if (version != core_types.component_version) return error.InvalidVersion;
 
     // Collect sections into dynamic arrays
-    var core_modules: std.ArrayListUnmanaged(ctypes.CoreModule) = .{};
-    var core_instances: std.ArrayListUnmanaged(ctypes.CoreInstanceExpr) = .{};
-    var core_type_defs: std.ArrayListUnmanaged(ctypes.CoreTypeDef) = .{};
-    var components: std.ArrayListUnmanaged(*ctypes.Component) = .{};
-    var instances: std.ArrayListUnmanaged(ctypes.InstanceExpr) = .{};
-    var aliases: std.ArrayListUnmanaged(ctypes.Alias) = .{};
-    var type_defs: std.ArrayListUnmanaged(ctypes.TypeDef) = .{};
-    var canons: std.ArrayListUnmanaged(ctypes.Canon) = .{};
-    var imports: std.ArrayListUnmanaged(ctypes.ImportDecl) = .{};
-    var exports: std.ArrayListUnmanaged(ctypes.ExportDecl) = .{};
+    var core_modules: std.ArrayListUnmanaged(ctypes.CoreModule) = .empty;
+    var core_instances: std.ArrayListUnmanaged(ctypes.CoreInstanceExpr) = .empty;
+    var core_type_defs: std.ArrayListUnmanaged(ctypes.CoreTypeDef) = .empty;
+    var components: std.ArrayListUnmanaged(*ctypes.Component) = .empty;
+    var instances: std.ArrayListUnmanaged(ctypes.InstanceExpr) = .empty;
+    var aliases: std.ArrayListUnmanaged(ctypes.Alias) = .empty;
+    var type_defs: std.ArrayListUnmanaged(ctypes.TypeDef) = .empty;
+    var canons: std.ArrayListUnmanaged(ctypes.Canon) = .empty;
+    var imports: std.ArrayListUnmanaged(ctypes.ImportDecl) = .empty;
+    var exports: std.ArrayListUnmanaged(ctypes.ExportDecl) = .empty;
     var start: ?ctypes.Start = null;
 
     while (reader.remaining() > 0) {
@@ -121,7 +121,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         const section_start = reader.pos;
         if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
 
-        const section_id = std.meta.intToEnum(SectionId, section_id_byte) catch
+        const section_id = std.enums.fromInt(SectionId, section_id_byte) orelse
             return error.InvalidSectionId;
 
         switch (section_id) {
@@ -249,7 +249,7 @@ fn parseCoreInstance(reader: *BinaryReader, allocator: std.mem.Allocator) LoadEr
                 const sort = try reader.readByte();
                 const idx = try reader.readU32();
                 e.sort_idx = .{
-                    .sort = std.meta.intToEnum(ctypes.CoreSort, sort) catch return error.InvalidEncoding,
+                    .sort = std.enums.fromInt(ctypes.CoreSort, sort) orelse return error.InvalidEncoding,
                     .idx = idx,
                 };
             }
@@ -275,8 +275,8 @@ fn parseCoreType(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
         0x50 => {
             // Core module type
             const decl_count = try reader.readU32();
-            var imp_list: std.ArrayListUnmanaged(ctypes.CoreImportDecl) = .{};
-            var exp_list: std.ArrayListUnmanaged(ctypes.CoreExportDecl) = .{};
+            var imp_list: std.ArrayListUnmanaged(ctypes.CoreImportDecl) = .empty;
+            var exp_list: std.ArrayListUnmanaged(ctypes.CoreExportDecl) = .empty;
             var i: u32 = 0;
             while (i < decl_count) : (i += 1) {
                 const decl_tag = try reader.readByte();
@@ -308,7 +308,7 @@ fn parseCoreType(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
 
 fn readCoreValType(reader: *BinaryReader) LoadError!ctypes.CoreValType {
     const b = try reader.readByte();
-    return std.meta.intToEnum(ctypes.CoreValType, b) catch return error.InvalidEncoding;
+    return std.enums.fromInt(ctypes.CoreValType, b) orelse return error.InvalidEncoding;
 }
 
 fn parseInstance(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.InstanceExpr {
@@ -348,7 +348,7 @@ fn readSort(reader: *BinaryReader) LoadError!ctypes.Sort {
     return switch (b) {
         0x00 => blk: {
             const cs = try reader.readByte();
-            break :blk .{ .core = std.meta.intToEnum(ctypes.CoreSort, cs) catch return error.InvalidEncoding };
+            break :blk .{ .core = std.enums.fromInt(ctypes.CoreSort, cs) orelse return error.InvalidEncoding };
         },
         0x01 => .func,
         0x02 => .value,
@@ -478,8 +478,8 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
         0x41 => blk: {
             // component type
             const count = try reader.readU32();
-            var imp_list: std.ArrayListUnmanaged(ctypes.ImportDecl) = .{};
-            var exp_list: std.ArrayListUnmanaged(ctypes.ExportDecl) = .{};
+            var imp_list: std.ArrayListUnmanaged(ctypes.ImportDecl) = .empty;
+            var exp_list: std.ArrayListUnmanaged(ctypes.ExportDecl) = .empty;
             var i: u32 = 0;
             while (i < count) : (i += 1) {
                 const decl_tag = try reader.readByte();
@@ -497,7 +497,7 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
         0x42 => blk: {
             // instance type
             const count = try reader.readU32();
-            var exp_list: std.ArrayListUnmanaged(ctypes.ExportDecl) = .{};
+            var exp_list: std.ArrayListUnmanaged(ctypes.ExportDecl) = .empty;
             var i: u32 = 0;
             while (i < count) : (i += 1) {
                 const decl_tag = try reader.readByte();

@@ -60,6 +60,9 @@ pub const aarch64_emit = @import("compiler/codegen/aarch64/emit.zig");
 /// AArch64 IR-to-native compiler.
 pub const aarch64_compile = @import("compiler/codegen/aarch64/compile.zig");
 
+/// AOT compiler optimization passes.
+pub const passes = @import("compiler/ir/passes.zig");
+
 // Testing
 /// Spec test runner infrastructure.
 pub const spec_runner = @import("tests/spec_runner.zig");

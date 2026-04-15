@@ -34,7 +34,7 @@ pub const InputStream = struct {
                 b.pos += n;
                 return .{ .ok = n };
             },
-            .fd => |_| {
+            .fd => {
                 // Host fd reading would go here
                 return .{ .ok = 0 };
             },
@@ -70,7 +70,7 @@ pub const OutputStream = struct {
                 b.appendSlice(allocator, data) catch return .{ .err = .would_block };
                 return .{ .ok = data.len };
             },
-            .fd => |_| {
+            .fd => {
                 return .{ .ok = data.len };
             },
             .closed => return .{ .closed = {} },
@@ -79,7 +79,7 @@ pub const OutputStream = struct {
 
     /// Create an output stream backed by a growable buffer.
     pub fn toBuffer() OutputStream {
-        return .{ .sink = .{ .buffer = .{} } };
+        return .{ .sink = .{ .buffer = .empty } };
     }
 
     /// Get the buffer contents (only valid for buffer-backed streams).

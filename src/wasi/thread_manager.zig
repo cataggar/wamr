@@ -7,6 +7,19 @@ const std = @import("std");
 const types = @import("../runtime/common/types.zig");
 const config = @import("config");
 
+/// Simple spinlock mutex (Zig 0.16 moved std.Thread.Mutex behind Io).
+const Mutex = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    pub const init: Mutex = .{ .state = std.atomic.Value(u8).init(0) };
+    pub fn lock(self: *Mutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null)
+            std.atomic.spinLoopHint();
+    }
+    pub fn unlock(self: *Mutex) void {
+        self.state.store(0, .release);
+    }
+};
+
 /// Default auxiliary stack size per thread (bytes).
 const DEFAULT_AUX_STACK_SIZE: u32 = 8192;
 
@@ -16,10 +29,10 @@ pub const AuxStackPool = struct {
     /// Stack size per thread (bytes).
     stack_size: u32 = DEFAULT_AUX_STACK_SIZE,
     /// Free stack offsets (top-of-stack addresses in linear memory).
-    free_stacks: std.ArrayListUnmanaged(u32) = .{},
+    free_stacks: std.ArrayListUnmanaged(u32) = .empty,
     /// All allocated stacks (for cleanup).
-    all_stacks: std.ArrayListUnmanaged(u32) = .{},
-    mutex: std.Thread.Mutex = .{},
+    all_stacks: std.ArrayListUnmanaged(u32) = .empty,
+    mutex: Mutex = .init,
     pool_allocator: std.mem.Allocator = undefined,
 
     /// Pre-allocate N auxiliary stacks starting at `base_offset` in linear memory.
@@ -76,7 +89,7 @@ pub const ThreadManager = struct {
     next_tid: std.atomic.Value(i32) = std.atomic.Value(i32).init(1),
     /// Active threads (protected by mutex).
     threads: std.ArrayList(ThreadHandle),
-    mutex: std.Thread.Mutex = .{},
+    mutex: Mutex = .init,
     /// Global trap flag — set when any thread traps.
     trap_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     allocator: std.mem.Allocator,

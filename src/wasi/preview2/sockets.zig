@@ -19,7 +19,7 @@ pub const IpAddress = union(enum) {
                 }) catch return "";
                 return n;
             },
-            .ipv6 => |_| return "::1", // simplified
+            .ipv6 => return "::1", // simplified
         }
     }
 };

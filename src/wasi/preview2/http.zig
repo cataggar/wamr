@@ -28,7 +28,7 @@ pub const HeaderEntry = struct {
 };
 
 pub const Headers = struct {
-    entries: std.ArrayListUnmanaged(HeaderEntry) = .{},
+    entries: std.ArrayListUnmanaged(HeaderEntry) = .empty,
 
     pub fn append(self: *Headers, name: []const u8, value: []const u8, allocator: std.mem.Allocator) !void {
         try self.entries.append(allocator, .{ .name = name, .value = value });
@@ -74,7 +74,7 @@ pub const IncomingHandler = *const fn (request: *const Request, allocator: std.m
 
 /// A simple handler registry that routes requests to handlers by path prefix.
 pub const Router = struct {
-    routes: std.ArrayListUnmanaged(Route) = .{},
+    routes: std.ArrayListUnmanaged(Route) = .empty,
 
     pub const Route = struct {
         path_prefix: []const u8,

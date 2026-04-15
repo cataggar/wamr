@@ -71,7 +71,7 @@ pub fn resolveImports(
     providers: []const *const ctypes.Component,
     allocator: std.mem.Allocator,
 ) ![]const CompositionPlan.ImportBinding {
-    var bindings = std.ArrayListUnmanaged(CompositionPlan.ImportBinding){};
+    var bindings: std.ArrayListUnmanaged(CompositionPlan.ImportBinding) = .empty;
 
     for (consumer.imports) |imp| {
         for (providers, 0..) |provider, provider_idx| {

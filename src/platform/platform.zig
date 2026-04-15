@@ -87,9 +87,9 @@ pub fn mprotect(addr: [*]u8, size: usize, prot: MemProt) !void {
 fn mmapWindows(hint: ?[*]u8, size: usize, prot: MemProt, flags: MapFlags) ?[*]u8 {
     if (!is_windows) unreachable;
 
-    var alloc_flags: u32 = win.MEM_RESERVE;
+    var alloc_flags: win.MEM.ALLOCATE = .{ .RESERVE = true };
     if (prot.read or prot.write or prot.exec) {
-        alloc_flags |= win.MEM_COMMIT;
+        alloc_flags.COMMIT = true;
     }
 
     const page_prot = memProtToWindowsPage(prot);
@@ -122,7 +122,7 @@ fn munmapWindows(addr: [*]u8) void {
         win.GetCurrentProcess(),
         @ptrCast(&base),
         &region_size,
-        win.MEM_RELEASE,
+        .{ .RELEASE = true },
     );
 }
 
@@ -130,7 +130,7 @@ fn mprotectWindows(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (!is_windows) unreachable;
 
     const new_prot = memProtToWindowsPage(prot);
-    var old_prot: u32 = undefined;
+    var old_prot: win.PAGE = undefined;
     var base: ?*anyopaque = @ptrCast(addr);
     var region_size: usize = size;
 
@@ -145,17 +145,17 @@ fn mprotectWindows(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (status != .SUCCESS) return error.MprotectFailed;
 }
 
-fn memProtToWindowsPage(prot: MemProt) u32 {
+fn memProtToWindowsPage(prot: MemProt) win.PAGE {
     if (!is_windows) unreachable;
 
     if (prot.exec) {
-        if (prot.write) return win.PAGE_EXECUTE_READWRITE;
-        if (prot.read) return win.PAGE_EXECUTE_READ;
-        return win.PAGE_EXECUTE;
+        if (prot.write) return .{ .EXECUTE_READWRITE = true };
+        if (prot.read) return .{ .EXECUTE_READ = true };
+        return .{ .EXECUTE = true };
     }
-    if (prot.write) return win.PAGE_READWRITE;
-    if (prot.read) return win.PAGE_READONLY;
-    return win.PAGE_NOACCESS;
+    if (prot.write) return .{ .READWRITE = true };
+    if (prot.read) return .{ .READONLY = true };
+    return .{ .NOACCESS = true };
 }
 
 // ── POSIX memory mapping implementation ─────────────────────────────────
@@ -223,9 +223,45 @@ fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
 // ── 2. Threading ────────────────────────────────────────────────────────
 
 pub const Thread = std.Thread;
-pub const Mutex = std.Thread.Mutex;
-pub const Condition = std.Thread.Condition;
-pub const RwLock = std.Thread.RwLock;
+
+/// Simple spinlock mutex that doesn't require Io (Zig 0.16 moved std.Thread.Mutex behind Io).
+pub const Mutex = struct {
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    pub const init: Mutex = .{ .state = std.atomic.Value(u8).init(0) };
+
+    pub fn lock(self: *Mutex) void {
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn unlock(self: *Mutex) void {
+        self.state.store(0, .release);
+    }
+};
+
+/// Simple condition variable stub (Zig 0.16 moved std.Thread.Condition behind Io).
+pub const Condition = struct {
+    flag: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    pub fn wait(self: *Condition, mutex: *Mutex) void {
+        mutex.unlock();
+        while (self.flag.load(.acquire) == 0) {
+            std.atomic.spinLoopHint();
+        }
+        self.flag.store(0, .release);
+        mutex.lock();
+    }
+
+    pub fn signal(self: *Condition) void {
+        self.flag.store(1, .release);
+    }
+
+    pub fn broadcast(self: *Condition) void {
+        self.flag.store(1, .release);
+    }
+};
 
 /// Get the current thread ID.
 pub fn selfThread() std.Thread.Id {
@@ -312,9 +348,10 @@ pub fn usleep(us: u64) void {
 fn usleepWindows(us: u64) void {
     if (!is_windows) unreachable;
 
-    // Sleep takes milliseconds; round up to avoid sleeping 0ms for small values.
-    const ms: u32 = @intCast(@min((us + 999) / 1000, std.math.maxInt(u32)));
-    std.os.windows.kernel32.Sleep(ms);
+    // NtDelayExecution takes a LARGE_INTEGER in 100ns units, negative for relative delay.
+    const hundred_ns = @as(u64, @min(us * 10, @as(u64, @intCast(std.math.maxInt(i64)))));
+    const delay: win.LARGE_INTEGER = -@as(i64, @intCast(hundred_ns));
+    _ = ntdll.NtDelayExecution(.FALSE, &delay);
 }
 
 fn usleepPosix(us: u64) void {
