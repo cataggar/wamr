@@ -165,10 +165,10 @@ fn mmapPosix(hint: ?[*]u8, size: usize, prot: MemProt, flags: MapFlags) ?[*]u8 {
 
     const posix = std.posix;
 
-    var posix_prot: u32 = posix.PROT.NONE;
-    if (prot.read) posix_prot |= posix.PROT.READ;
-    if (prot.write) posix_prot |= posix.PROT.WRITE;
-    if (prot.exec) posix_prot |= posix.PROT.EXEC;
+    var posix_prot: std.posix.PROT = .{};
+    if (prot.read) posix_prot.READ = true;
+    if (prot.write) posix_prot.WRITE = true;
+    if (prot.exec) posix_prot.EXEC = true;
 
     var map_flags: std.posix.system.MAP = .{ .TYPE = .PRIVATE, .ANONYMOUS = true };
     if (flags.map_fixed) map_flags.FIXED = true;
