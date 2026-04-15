@@ -354,6 +354,46 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, dst.low3(), src.low3());
     }
 
+    /// ADD reg, imm32 (64-bit).
+    pub fn addRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0x81);
+        try self.modrm(0b11, 0, dst.low3());
+        try self.emitI32(imm);
+    }
+
+    /// MOV r32, [base + disp32] — 32-bit load (no REX.W, zero-extends to 64).
+    pub fn movRegMemNoRex(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        if (dst.isExtended() or base.isExtended()) {
+            try self.rex(false, dst, base);
+        }
+        try self.emitByte(0x8B);
+        if (disp == 0 and base.low3() != 5) {
+            try self.modrm(0b00, dst.low3(), base.low3());
+            if (base.low3() == 4) try self.emitByte(0x24);
+        } else {
+            try self.modrm(0b10, dst.low3(), base.low3());
+            if (base.low3() == 4) try self.emitByte(0x24);
+            try self.emitI32(disp);
+        }
+    }
+
+    /// MOV [base + disp32], r32 — 32-bit store (no REX.W).
+    pub fn movMemRegNoRex(self: *CodeBuffer, base: Reg, disp: i32, src: Reg) !void {
+        if (src.isExtended() or base.isExtended()) {
+            try self.rex(false, src, base);
+        }
+        try self.emitByte(0x89);
+        if (disp == 0 and base.low3() != 5) {
+            try self.modrm(0b00, src.low3(), base.low3());
+            if (base.low3() == 4) try self.emitByte(0x24);
+        } else {
+            try self.modrm(0b10, src.low3(), base.low3());
+            if (base.low3() == 4) try self.emitByte(0x24);
+            try self.emitI32(disp);
+        }
+    }
+
     // ── Function prologue / epilogue ──────────────────────────────────
 
     /// Emit standard function prologue: push rbp; mov rbp, rsp; sub rsp, frame_size.

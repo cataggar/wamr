@@ -230,6 +230,46 @@ fn compileInst(code: *emit.CodeBuffer, inst: ir.Inst, reg_map: *RegMap) !void {
         },
         .@"unreachable" => try code.int3(),
         .select => |sel| try emitSelect(code, inst, sel, reg_map),
+
+        // Memory load: base_reg + offset → dest_reg
+        .load => |ld| {
+            const dest = inst.dest orelse return;
+            const base_loc = reg_map.get(ld.base) orelse return;
+            const dest_loc = try reg_map.assign(dest);
+            const base_reg = switch (base_loc) { .reg => |r| r, .stack => return };
+            const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
+            // MOV dest, [base + offset] (32-bit load, zero-extended)
+            if (ld.offset > 0) {
+                try code.addRegImm32(base_reg, @intCast(ld.offset));
+            }
+            // Use 32-bit mov for i32 loads
+            try code.movRegMemNoRex(dest_reg, base_reg, 0);
+        },
+
+        // Memory store: val → [base + offset]
+        .store => |st| {
+            const base_loc = reg_map.get(st.base) orelse return;
+            const val_loc = reg_map.get(st.val) orelse return;
+            const base_reg = switch (base_loc) { .reg => |r| r, .stack => return };
+            const val_reg = switch (val_loc) { .reg => |r| r, .stack => return };
+            if (st.offset > 0) {
+                try code.addRegImm32(base_reg, @intCast(st.offset));
+            }
+            try code.movMemRegNoRex(base_reg, 0, val_reg);
+        },
+
+        // Function call: setup args, call rel32, collect result
+        .call => |cl| {
+            const dest = inst.dest orelse return;
+            // For now: emit a stub that just returns 0 in the dest register.
+            // Full inter-function calls require knowing function offsets at link time.
+            _ = cl;
+            const dest_loc = try reg_map.assign(dest);
+            switch (dest_loc) {
+                .reg => |r| try code.movRegImm32(r, 0),
+                .stack => {},
+            }
+        },
         else => {},
     }
 }
