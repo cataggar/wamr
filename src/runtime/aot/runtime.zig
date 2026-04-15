@@ -5,8 +5,22 @@
 //! mapping the compiled native code as executable.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("../common/types.zig");
 const aot_loader = @import("loader.zig");
+const platform = @import("../../platform/platform.zig");
+
+// ─── Comptime target validation ─────────────────────────────────────────────
+
+/// The native machine architecture, resolved at comptime.
+const native_arch: enum { x86_64, aarch64, unsupported } = switch (builtin.cpu.arch) {
+    .x86_64 => .x86_64,
+    .aarch64 => .aarch64,
+    else => .unsupported,
+};
+
+/// Whether the current target can execute AOT code.
+const can_execute_native = native_arch != .unsupported;
 
 // ─── Instance ───────────────────────────────────────────────────────────────
 
@@ -18,6 +32,8 @@ pub const AotInstance = struct {
     allocator: std.mem.Allocator,
     /// Base address of the mapped executable code (null if not yet mapped).
     code_base: ?[*]const u8 = null,
+    /// Size of the mapped executable region (for cleanup).
+    code_size: usize = 0,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -60,6 +76,10 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
 /// Destroy an AOT instance, freeing all allocated resources.
 pub fn destroy(inst: *AotInstance) void {
     const allocator = inst.allocator;
+    // Unmap executable code if mapped.
+    if (inst.code_base) |base| {
+        platform.munmap(@constCast(@ptrCast(base)), inst.code_size);
+    }
     freeMemories(inst.memories, allocator);
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, allocator);
@@ -75,14 +95,65 @@ pub fn findExportFunc(inst: *const AotInstance, name: []const u8) ?u32 {
 }
 
 /// Get the native code pointer for a function by index.
-/// Returns the text_section base offset by the function's offset.
+/// Uses the executable mapping (code_base) if available, otherwise falls back
+/// to the raw text_section (not executable — for inspection only).
 pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
     const module = inst.module;
-    const text = module.text_section orelse return null;
     if (func_idx >= module.func_count) return null;
     const offset = module.func_offsets[func_idx];
+    // Prefer the executable mapping.
+    if (inst.code_base) |base| {
+        if (offset >= inst.code_size) return null;
+        return base + offset;
+    }
+    // Fall back to raw text section (read-only, not executable).
+    const text = module.text_section orelse return null;
     if (offset >= text.len) return null;
     return text.ptr + offset;
+}
+
+// ─── Native execution ───────────────────────────────────────────────────────
+
+/// Map the module's native code into executable memory.
+/// After this call, `getFuncAddr` returns pointers suitable for execution.
+pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
+    const text = inst.module.text_section orelse return;
+    if (text.len == 0) return;
+
+    // 1. Allocate RW pages
+    const mem = platform.mmap(null, text.len, .{ .read = true, .write = true }, .{}) orelse
+        return error.CodeMappingFailed;
+
+    // 2. Copy native code
+    @memcpy(mem[0..text.len], text);
+
+    // 3. Flush instruction cache (required on AArch64, no-op on x86-64)
+    if (comptime native_arch == .aarch64) {
+        platform.icacheFlush(mem, text.len);
+    }
+
+    // 4. Transition to RX (W^X)
+    platform.mprotect(mem, text.len, .{ .read = true, .exec = true }) catch
+        return error.CodeMappingFailed;
+
+    inst.code_base = mem;
+    inst.code_size = text.len;
+}
+
+/// Call an AOT-compiled function by index.
+/// The code must have been mapped via `mapCodeExecutable` first.
+///
+/// Uses comptime to select the correct function pointer type based on `Result`.
+pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) RuntimeError!Result {
+    comptime if (!can_execute_native) @compileError("AOT execution not supported on this architecture");
+
+    if (inst.code_base == null) return error.CodeMappingFailed;
+    const addr = getFuncAddr(inst, func_idx) orelse return error.FunctionNotFound;
+
+    // Construct the right function pointer type at comptime.
+    const FnPtr = *const fn () callconv(.c) Result;
+    const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
+    return func_ptr();
 }
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
