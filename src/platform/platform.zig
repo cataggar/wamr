@@ -209,10 +209,10 @@ fn munmapPosix(addr: [*]u8, size: usize) void {
 fn mprotectPosix(addr: [*]u8, size: usize, prot: MemProt) !void {
     if (is_windows) unreachable;
 
-    var posix_prot: u32 = std.posix.PROT.NONE;
-    if (prot.read) posix_prot |= std.posix.PROT.READ;
-    if (prot.write) posix_prot |= std.posix.PROT.WRITE;
-    if (prot.exec) posix_prot |= std.posix.PROT.EXEC;
+    var posix_prot: std.posix.PROT = .{};
+    if (prot.read) posix_prot.READ = true;
+    if (prot.write) posix_prot.WRITE = true;
+    if (prot.exec) posix_prot.EXEC = true;
 
     const aligned: [*]align(page_size) u8 = @alignCast(addr);
     const rc = std.posix.system.mprotect(aligned, size, posix_prot);
@@ -356,7 +356,9 @@ fn usleepWindows(us: u64) void {
 
 fn usleepPosix(us: u64) void {
     if (is_windows) unreachable;
-    std.Thread.sleep(us * std.time.ns_per_us);
+    const ns = us * std.time.ns_per_us;
+    const ts = std.posix.timespec{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    _ = std.posix.system.nanosleep(&ts, null);
 }
 
 // ── 3. Time ─────────────────────────────────────────────────────────────
@@ -390,8 +392,10 @@ fn timeGetBootUsWindows() u64 {
 
 fn timeGetBootUsPosix() u64 {
     if (is_windows) unreachable;
-    const ns = std.time.nanoTimestamp();
-    return @intCast(@divFloor(ns, std.time.ns_per_us));
+    var ts: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.posix.system.clock_gettime(.MONOTONIC, &ts);
+    const ns: u64 = @intCast(ts.sec * std.time.ns_per_s + ts.nsec);
+    return ns / std.time.ns_per_us;
 }
 
 /// Current thread CPU time in microseconds (best-effort).
