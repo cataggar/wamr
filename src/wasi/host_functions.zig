@@ -8,39 +8,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
-const platform = @import("../platform/platform.zig");
+const wasi_core = @import("wasi_core.zig");
 
 const is_single_threaded = builtin.single_threaded;
-
-// WASI errno constants
-const WASI_ESUCCESS: i32 = 0;
-const WASI_EBADF: i32 = 8;
-const WASI_EINVAL: i32 = 28;
-const WASI_ENOSYS: i32 = 52;
-
-// WASI clock IDs
-const WASI_CLOCK_REALTIME: i32 = 0;
-const WASI_CLOCK_MONOTONIC: i32 = 1;
-
-/// Read a little-endian u32 from linear memory at the given offset.
-fn memReadU32(mem: []const u8, offset: u32) ?u32 {
-    if (offset + 4 > mem.len) return null;
-    return std.mem.readInt(u32, mem[offset..][0..4], .little);
-}
-
-/// Write a little-endian u32 to linear memory at the given offset.
-fn memWriteU32(mem: []u8, offset: u32, val: u32) bool {
-    if (offset + 4 > mem.len) return false;
-    std.mem.writeInt(u32, mem[offset..][0..4], val, .little);
-    return true;
-}
-
-/// Write a little-endian u64 to linear memory at the given offset.
-fn memWriteU64(mem: []u8, offset: u32, val: u64) bool {
-    if (offset + 8 > mem.len) return false;
-    std.mem.writeInt(u64, mem[offset..][0..8], val, .little);
-    return true;
-}
 
 /// Get linear memory (memory index 0) from an ExecEnv.
 fn getMemory(env: *ExecEnv) ?[]u8 {
@@ -98,30 +68,12 @@ pub fn wasiFdWrite(env_opaque: *anyopaque) types.HostFnError!void {
     const fd = env.popI32() catch return error.StackUnderflow;
 
     const mem = getMemory(env) orelse {
-        env.pushI32(WASI_EINVAL) catch return error.StackOverflow;
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
         return;
     };
 
-    // Only support stdout (1) and stderr (2)
-    if (fd != 1 and fd != 2) {
-        env.pushI32(WASI_EBADF) catch return error.StackOverflow;
-        return;
-    }
-
-    var total_written: u32 = 0;
-    for (0..iovs_len) |i| {
-        const iov_offset = iovs_ptr + @as(u32, @intCast(i)) * 8;
-        const buf_ptr = memReadU32(mem, iov_offset) orelse break;
-        const buf_len = memReadU32(mem, iov_offset + 4) orelse break;
-        if (buf_ptr + buf_len > mem.len) break;
-        const data = mem[buf_ptr .. buf_ptr + buf_len];
-        // Write to stderr (fd_write output goes through debug print)
-        std.debug.print("{s}", .{data});
-        total_written += buf_len;
-    }
-
-    _ = memWriteU32(mem, nwritten_ptr, total_written);
-    env.pushI32(WASI_ESUCCESS) catch return error.StackOverflow;
+    const result = wasi_core.fdWriteCore(mem, fd, iovs_ptr, iovs_len, nwritten_ptr);
+    env.pushI32(result) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.fd_seek` — seek on a file descriptor.
@@ -131,16 +83,14 @@ pub fn wasiFdSeek(env_opaque: *anyopaque) types.HostFnError!void {
     _ = env.popI32() catch return error.StackUnderflow; // whence
     _ = env.popI64() catch return error.StackUnderflow; // offset
     _ = env.popI32() catch return error.StackUnderflow; // fd
-    env.pushI32(WASI_ENOSYS) catch return error.StackOverflow;
+    env.pushI32(wasi_core.fdSeekCore()) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.fd_close` — close a file descriptor.
 pub fn wasiFdClose(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const fd = env.popI32() catch return error.StackUnderflow;
-    // Don't actually close stdin/stdout/stderr
-    const errno: i32 = if (fd >= 0 and fd <= 2) WASI_ESUCCESS else WASI_EBADF;
-    env.pushI32(errno) catch return error.StackOverflow;
+    env.pushI32(wasi_core.fdCloseCore(fd)) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.fd_fdstat_get` — get fd status.
@@ -149,28 +99,13 @@ pub fn wasiFdFdstatGet(env_opaque: *anyopaque) types.HostFnError!void {
     const buf_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
     const fd = env.popI32() catch return error.StackUnderflow;
 
-    if (fd < 0 or fd > 2) {
-        env.pushI32(WASI_EBADF) catch return error.StackOverflow;
-        return;
-    }
-
     const mem = getMemory(env) orelse {
-        env.pushI32(WASI_EINVAL) catch return error.StackOverflow;
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
         return;
     };
 
-    // fdstat struct: fs_filetype(u8) + fs_flags(u16) + padding + fs_rights_base(u64) + fs_rights_inheriting(u64) = 24 bytes
-    if (buf_ptr + 24 > mem.len) {
-        env.pushI32(WASI_EINVAL) catch return error.StackOverflow;
-        return;
-    }
-    @memset(mem[buf_ptr .. buf_ptr + 24], 0);
-    // fs_filetype: 2 = character device (for stdout/stderr)
-    mem[buf_ptr] = if (fd == 0) 2 else 2;
-    // fs_rights_base: allow fd_write
-    _ = memWriteU64(mem, buf_ptr + 8, 0x1FFFFFFF);
-
-    env.pushI32(WASI_ESUCCESS) catch return error.StackOverflow;
+    const result = wasi_core.fdFdstatGetCore(mem, fd, buf_ptr);
+    env.pushI32(result) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.fd_prestat_get` — get preopened fd info.
@@ -178,7 +113,7 @@ pub fn wasiFdPrestatGet(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     _ = env.popI32() catch return error.StackUnderflow; // buf_ptr
     _ = env.popI32() catch return error.StackUnderflow; // fd
-    env.pushI32(WASI_EBADF) catch return error.StackOverflow;
+    env.pushI32(wasi_core.fdPrestatGetCore()) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.fd_prestat_dir_name` — get preopened dir name.
@@ -187,7 +122,7 @@ pub fn wasiFdPrestatDirName(env_opaque: *anyopaque) types.HostFnError!void {
     _ = env.popI32() catch return error.StackUnderflow; // path_len
     _ = env.popI32() catch return error.StackUnderflow; // path_ptr
     _ = env.popI32() catch return error.StackUnderflow; // fd
-    env.pushI32(WASI_EBADF) catch return error.StackOverflow;
+    env.pushI32(wasi_core.fdPrestatDirNameCore()) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.clock_time_get` — get clock time.
@@ -199,20 +134,12 @@ pub fn wasiClockTimeGet(env_opaque: *anyopaque) types.HostFnError!void {
     const clock_id = env.popI32() catch return error.StackUnderflow;
 
     const mem = getMemory(env) orelse {
-        env.pushI32(WASI_EINVAL) catch return error.StackOverflow;
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
         return;
     };
 
-    const nanos: u64 = switch (clock_id) {
-        WASI_CLOCK_REALTIME, WASI_CLOCK_MONOTONIC => platform.timeGetBootUs() * std.time.ns_per_us,
-        else => {
-            env.pushI32(WASI_EINVAL) catch return error.StackOverflow;
-            return;
-        },
-    };
-
-    _ = memWriteU64(mem, time_ptr, nanos);
-    env.pushI32(WASI_ESUCCESS) catch return error.StackOverflow;
+    const result = wasi_core.clockTimeGetCore(mem, clock_id, time_ptr);
+    env.pushI32(result) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.environ_sizes_get` — get environment variable sizes.
@@ -222,13 +149,12 @@ pub fn wasiEnvironSizesGet(env_opaque: *anyopaque) types.HostFnError!void {
     const count_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
     const mem = getMemory(env) orelse {
-        env.pushI32(WASI_EINVAL) catch return error.StackOverflow;
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
         return;
     };
 
-    _ = memWriteU32(mem, count_ptr, 0);
-    _ = memWriteU32(mem, buf_size_ptr, 0);
-    env.pushI32(WASI_ESUCCESS) catch return error.StackOverflow;
+    const result = wasi_core.environSizesGetCore(mem, count_ptr, buf_size_ptr);
+    env.pushI32(result) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.environ_get` — get environment variables.
@@ -236,7 +162,7 @@ pub fn wasiEnvironGet(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     _ = env.popI32() catch return error.StackUnderflow; // environ_buf
     _ = env.popI32() catch return error.StackUnderflow; // environ
-    env.pushI32(WASI_ESUCCESS) catch return error.StackOverflow;
+    env.pushI32(wasi_core.environGetCore()) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.args_sizes_get` — get argument sizes.
@@ -246,13 +172,12 @@ pub fn wasiArgsSizesGet(env_opaque: *anyopaque) types.HostFnError!void {
     const count_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
     const mem = getMemory(env) orelse {
-        env.pushI32(WASI_EINVAL) catch return error.StackOverflow;
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
         return;
     };
 
-    _ = memWriteU32(mem, count_ptr, 0);
-    _ = memWriteU32(mem, buf_size_ptr, 0);
-    env.pushI32(WASI_ESUCCESS) catch return error.StackOverflow;
+    const result = wasi_core.argsSizesGetCore(mem, count_ptr, buf_size_ptr);
+    env.pushI32(result) catch return error.StackOverflow;
 }
 
 /// `wasi_snapshot_preview1.args_get` — get arguments.
@@ -260,7 +185,7 @@ pub fn wasiArgsGet(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     _ = env.popI32() catch return error.StackUnderflow; // argv_buf
     _ = env.popI32() catch return error.StackUnderflow; // argv
-    env.pushI32(WASI_ESUCCESS) catch return error.StackOverflow;
+    env.pushI32(wasi_core.argsGetCore()) catch return error.StackOverflow;
 }
 
 // ── Import resolution ─────────────────────────────────────────────────
