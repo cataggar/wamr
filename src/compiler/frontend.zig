@@ -6,6 +6,8 @@ const std = @import("std");
 const types = @import("../runtime/common/types.zig");
 const ir = @import("ir/ir.zig");
 const Opcode = @import("../runtime/interpreter/opcode.zig").Opcode;
+const MiscOpcode = @import("../runtime/interpreter/opcode.zig").MiscOpcode;
+const AtomicOpcode = @import("../runtime/interpreter/opcode.zig").AtomicOpcode;
 
 pub const LowerError = error{
     OutOfMemory,
@@ -20,7 +22,7 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
 
     for (wasm_module.functions) |func| {
         const func_type = wasm_module.types[func.type_idx];
-        const ir_func = try lowerFunction(&func, &func_type, allocator);
+        const ir_func = try lowerFunction(&func, &func_type, wasm_module, allocator);
         _ = try ir_module.addFunction(ir_func);
     }
 
@@ -28,7 +30,7 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
 }
 
 /// Lower a single Wasm function into IR.
-fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncType, allocator: std.mem.Allocator) LowerError!ir.IrFunction {
+fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncType, wasm_module: *const types.WasmModule, allocator: std.mem.Allocator) LowerError!ir.IrFunction {
     const param_count: u32 = @intCast(func_type.params.len);
     const result_count: u32 = @intCast(func_type.results.len);
 
@@ -234,12 +236,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .call => {
                 const func_idx = readU32(code, &ip);
-                // For now, emit a call with current stack args.
-                // Full ABI arg passing will be added later.
+                // Look up callee type to determine arg count
+                const callee_type = wasm_module.getFuncType(func_idx);
+                const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                // Pop args from vreg stack (they were pushed by the caller)
+                var i: u32 = 0;
+                while (i < arg_count) : (i += 1) {
+                    _ = vreg_stack.pop();
+                }
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
                     .func_idx = func_idx,
-                    .args = &.{},
+                    .arg_count = arg_count,
                 } }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
@@ -346,10 +354,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
-            .i32_clz => {
+            .i32_clz, .i32_ctz, .i32_popcnt => {
                 const val = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .clz = val }, .dest = dest, .type = .i32 });
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .i32_clz => .{ .clz = val },
+                    .i32_ctz => .{ .ctz = val },
+                    .i32_popcnt => .{ .popcnt = val },
+                    else => unreachable,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .drop => _ = vreg_stack.pop(),
@@ -372,20 +386,54 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const val = vreg_stack.pop().?;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } } });
             },
-            .i32_load => {
+            // ── Load variants ────────────────────────────────────────────
+            .i32_load, .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
+            .i64_load, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u,
+            .f32_load, .f64_load,
+            => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
                 const base = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .load = .{ .base = base, .offset = offset, .size = 4 } }, .dest = dest, .type = .i32 });
+                const size: u8 = switch (op) {
+                    .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u => 1,
+                    .i32_load16_s, .i32_load16_u, .i64_load16_s, .i64_load16_u => 2,
+                    .i32_load, .i64_load32_s, .i64_load32_u, .f32_load => 4,
+                    .i64_load, .f64_load => 8,
+                    else => unreachable,
+                };
+                const sign_extend: bool = switch (op) {
+                    .i32_load8_s, .i32_load16_s,
+                    .i64_load8_s, .i64_load16_s, .i64_load32_s,
+                    => true,
+                    else => false,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .i64_load, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u => .i64,
+                    .f32_load => .f32,
+                    .f64_load => .f64,
+                    else => .i32,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .load = .{ .base = base, .offset = offset, .size = size, .sign_extend = sign_extend } }, .dest = dest, .type = ir_type });
                 try vreg_stack.append(allocator, dest);
             },
-            .i32_store => {
+            // ── Store variants ───────────────────────────────────────────
+            .i32_store, .i32_store8, .i32_store16,
+            .i64_store, .i64_store8, .i64_store16, .i64_store32,
+            .f32_store, .f64_store,
+            => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
                 const val = vreg_stack.pop().?;
                 const base = vreg_stack.pop().?;
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = 4, .val = val } } });
+                const size: u8 = switch (op) {
+                    .i32_store8, .i64_store8 => 1,
+                    .i32_store16, .i64_store16 => 2,
+                    .i32_store, .i64_store32, .f32_store => 4,
+                    .i64_store, .f64_store => 8,
+                    else => unreachable,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = size, .val = val } } });
             },
             .br_table => {
                 // Read count + targets, skip for now (emit unreachable)
@@ -561,6 +609,371 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .extend_i32_u = val }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
+
+            // ── Truncation (float → int) ──────────────────────────────
+            .i32_trunc_f32_s, .i32_trunc_f32_u,
+            .i32_trunc_f64_s, .i32_trunc_f64_u,
+            .i64_trunc_f32_s, .i64_trunc_f32_u,
+            .i64_trunc_f64_s, .i64_trunc_f64_u,
+            => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .i32_trunc_f32_s, .i64_trunc_f32_s => .{ .trunc_f32_s = val },
+                    .i32_trunc_f32_u, .i64_trunc_f32_u => .{ .trunc_f32_u = val },
+                    .i32_trunc_f64_s, .i64_trunc_f64_s => .{ .trunc_f64_s = val },
+                    .i32_trunc_f64_u, .i64_trunc_f64_u => .{ .trunc_f64_u = val },
+                    else => unreachable,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .i32_trunc_f32_s, .i32_trunc_f32_u, .i32_trunc_f64_s, .i32_trunc_f64_u => .i32,
+                    else => .i64,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Conversion (int → float) ──────────────────────────────
+            .f32_convert_i32_s, .f32_convert_i64_s,
+            .f64_convert_i32_s, .f64_convert_i64_s,
+            => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const ir_type: ir.IrType = switch (op) {
+                    .f32_convert_i32_s, .f32_convert_i64_s => .f32,
+                    else => .f64,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .convert_s = val }, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+            .f32_convert_i32_u, .f32_convert_i64_u,
+            .f64_convert_i32_u, .f64_convert_i64_u,
+            => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const ir_type: ir.IrType = switch (op) {
+                    .f32_convert_i32_u, .f32_convert_i64_u => .f32,
+                    else => .f64,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .convert_u = val }, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Demote / promote ───────────────────────────────────────
+            .f32_demote_f64 => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .demote_f64 = val }, .dest = dest, .type = .f32 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .f64_promote_f32 => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .promote_f32 = val }, .dest = dest, .type = .f64 });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Reinterpret (bitcast) ──────────────────────────────────
+            .i32_reinterpret_f32 => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .i32 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .i64_reinterpret_f64 => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .i64 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .f32_reinterpret_i32 => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .f32 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .f64_reinterpret_i64 => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .f64 });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Saturating truncation (0xFC prefix) ────────────────────
+            .misc_prefix => {
+                const sub_opcode: MiscOpcode = @enumFromInt(readU32(code, &ip));
+                switch (sub_opcode) {
+                    .i32_trunc_sat_f32_s, .i32_trunc_sat_f32_u,
+                    .i32_trunc_sat_f64_s, .i32_trunc_sat_f64_u,
+                    .i64_trunc_sat_f32_s, .i64_trunc_sat_f32_u,
+                    .i64_trunc_sat_f64_s, .i64_trunc_sat_f64_u,
+                    => {
+                        const val = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        const ir_op: ir.Inst.Op = switch (sub_opcode) {
+                            .i32_trunc_sat_f32_s, .i64_trunc_sat_f32_s => .{ .trunc_sat_f32_s = val },
+                            .i32_trunc_sat_f32_u, .i64_trunc_sat_f32_u => .{ .trunc_sat_f32_u = val },
+                            .i32_trunc_sat_f64_s, .i64_trunc_sat_f64_s => .{ .trunc_sat_f64_s = val },
+                            .i32_trunc_sat_f64_u, .i64_trunc_sat_f64_u => .{ .trunc_sat_f64_u = val },
+                            else => unreachable,
+                        };
+                        const ir_type: ir.IrType = switch (sub_opcode) {
+                            .i32_trunc_sat_f32_s, .i32_trunc_sat_f32_u,
+                            .i32_trunc_sat_f64_s, .i32_trunc_sat_f64_u,
+                            => .i32,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    else => return error.UnsupportedOpcode,
+                }
+            },
+
+            // ── Atomic operations (0xFE prefix) ───────────────────────
+            .atomic_prefix => {
+                const sub_opcode: AtomicOpcode = @enumFromInt(readU32(code, &ip));
+                switch (sub_opcode) {
+                    .atomic_fence => {
+                        _ = readU32(code, &ip);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_fence = {} } });
+                    },
+
+                    .memory_atomic_notify => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const count = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_notify = .{ .base = base, .offset = offset, .count = count } }, .dest = dest, .type = .i32 });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .memory_atomic_wait32, .memory_atomic_wait64 => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const timeout = vreg_stack.pop().?;
+                        const expected = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const size: u8 = switch (sub_opcode) {
+                            .memory_atomic_wait32 => 4,
+                            .memory_atomic_wait64 => 8,
+                            else => unreachable,
+                        };
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_wait = .{ .base = base, .offset = offset, .expected = expected, .timeout = timeout, .size = size } }, .dest = dest, .type = .i32 });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .i32_atomic_load, .i64_atomic_load,
+                    .i32_atomic_load8_u, .i32_atomic_load16_u,
+                    .i64_atomic_load8_u, .i64_atomic_load16_u, .i64_atomic_load32_u,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_load => 4,
+                            .i64_atomic_load => 8,
+                            .i32_atomic_load8_u, .i64_atomic_load8_u => 1,
+                            .i32_atomic_load16_u, .i64_atomic_load16_u => 2,
+                            .i64_atomic_load32_u => 4,
+                            else => unreachable,
+                        };
+                        const ir_type: ir.IrType = switch (sub_opcode) {
+                            .i32_atomic_load, .i32_atomic_load8_u, .i32_atomic_load16_u => .i32,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_load = .{ .base = base, .offset = offset, .size = size } }, .dest = dest, .type = ir_type });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .i32_atomic_store, .i64_atomic_store,
+                    .i32_atomic_store8, .i32_atomic_store16,
+                    .i64_atomic_store8, .i64_atomic_store16, .i64_atomic_store32,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const val = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_store => 4,
+                            .i64_atomic_store => 8,
+                            .i32_atomic_store8, .i64_atomic_store8 => 1,
+                            .i32_atomic_store16, .i64_atomic_store16 => 2,
+                            .i64_atomic_store32 => 4,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_store = .{ .base = base, .offset = offset, .size = size, .val = val } } });
+                    },
+
+                    .i32_atomic_rmw_add, .i64_atomic_rmw_add,
+                    .i32_atomic_rmw8_add_u, .i32_atomic_rmw16_add_u,
+                    .i64_atomic_rmw8_add_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw32_add_u,
+                    .i32_atomic_rmw_sub, .i64_atomic_rmw_sub,
+                    .i32_atomic_rmw8_sub_u, .i32_atomic_rmw16_sub_u,
+                    .i64_atomic_rmw8_sub_u, .i64_atomic_rmw16_sub_u, .i64_atomic_rmw32_sub_u,
+                    .i32_atomic_rmw_and, .i64_atomic_rmw_and,
+                    .i32_atomic_rmw8_and_u, .i32_atomic_rmw16_and_u,
+                    .i64_atomic_rmw8_and_u, .i64_atomic_rmw16_and_u, .i64_atomic_rmw32_and_u,
+                    .i32_atomic_rmw_or, .i64_atomic_rmw_or,
+                    .i32_atomic_rmw8_or_u, .i32_atomic_rmw16_or_u,
+                    .i64_atomic_rmw8_or_u, .i64_atomic_rmw16_or_u, .i64_atomic_rmw32_or_u,
+                    .i32_atomic_rmw_xor, .i64_atomic_rmw_xor,
+                    .i32_atomic_rmw8_xor_u, .i32_atomic_rmw16_xor_u,
+                    .i64_atomic_rmw8_xor_u, .i64_atomic_rmw16_xor_u, .i64_atomic_rmw32_xor_u,
+                    .i32_atomic_rmw_xchg, .i64_atomic_rmw_xchg,
+                    .i32_atomic_rmw8_xchg_u, .i32_atomic_rmw16_xchg_u,
+                    .i64_atomic_rmw8_xchg_u, .i64_atomic_rmw16_xchg_u, .i64_atomic_rmw32_xchg_u,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const val = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        const rmw_op: ir.Inst.AtomicRmwOp = switch (sub_opcode) {
+                            .i32_atomic_rmw_add, .i64_atomic_rmw_add, .i32_atomic_rmw8_add_u, .i32_atomic_rmw16_add_u, .i64_atomic_rmw8_add_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw32_add_u => .add,
+                            .i32_atomic_rmw_sub, .i64_atomic_rmw_sub, .i32_atomic_rmw8_sub_u, .i32_atomic_rmw16_sub_u, .i64_atomic_rmw8_sub_u, .i64_atomic_rmw16_sub_u, .i64_atomic_rmw32_sub_u => .sub,
+                            .i32_atomic_rmw_and, .i64_atomic_rmw_and, .i32_atomic_rmw8_and_u, .i32_atomic_rmw16_and_u, .i64_atomic_rmw8_and_u, .i64_atomic_rmw16_and_u, .i64_atomic_rmw32_and_u => .@"and",
+                            .i32_atomic_rmw_or, .i64_atomic_rmw_or, .i32_atomic_rmw8_or_u, .i32_atomic_rmw16_or_u, .i64_atomic_rmw8_or_u, .i64_atomic_rmw16_or_u, .i64_atomic_rmw32_or_u => .@"or",
+                            .i32_atomic_rmw_xor, .i64_atomic_rmw_xor, .i32_atomic_rmw8_xor_u, .i32_atomic_rmw16_xor_u, .i64_atomic_rmw8_xor_u, .i64_atomic_rmw16_xor_u, .i64_atomic_rmw32_xor_u => .xor,
+                            .i32_atomic_rmw_xchg, .i64_atomic_rmw_xchg, .i32_atomic_rmw8_xchg_u, .i32_atomic_rmw16_xchg_u, .i64_atomic_rmw8_xchg_u, .i64_atomic_rmw16_xchg_u, .i64_atomic_rmw32_xchg_u => .xchg,
+                            else => unreachable,
+                        };
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_rmw_add, .i32_atomic_rmw_sub, .i32_atomic_rmw_and, .i32_atomic_rmw_or, .i32_atomic_rmw_xor, .i32_atomic_rmw_xchg => 4,
+                            .i64_atomic_rmw_add, .i64_atomic_rmw_sub, .i64_atomic_rmw_and, .i64_atomic_rmw_or, .i64_atomic_rmw_xor, .i64_atomic_rmw_xchg => 8,
+                            .i32_atomic_rmw8_add_u, .i32_atomic_rmw8_sub_u, .i32_atomic_rmw8_and_u, .i32_atomic_rmw8_or_u, .i32_atomic_rmw8_xor_u, .i32_atomic_rmw8_xchg_u, .i64_atomic_rmw8_add_u, .i64_atomic_rmw8_sub_u, .i64_atomic_rmw8_and_u, .i64_atomic_rmw8_or_u, .i64_atomic_rmw8_xor_u, .i64_atomic_rmw8_xchg_u => 1,
+                            .i32_atomic_rmw16_add_u, .i32_atomic_rmw16_sub_u, .i32_atomic_rmw16_and_u, .i32_atomic_rmw16_or_u, .i32_atomic_rmw16_xor_u, .i32_atomic_rmw16_xchg_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw16_sub_u, .i64_atomic_rmw16_and_u, .i64_atomic_rmw16_or_u, .i64_atomic_rmw16_xor_u, .i64_atomic_rmw16_xchg_u => 2,
+                            .i64_atomic_rmw32_add_u, .i64_atomic_rmw32_sub_u, .i64_atomic_rmw32_and_u, .i64_atomic_rmw32_or_u, .i64_atomic_rmw32_xor_u, .i64_atomic_rmw32_xchg_u => 4,
+                            else => unreachable,
+                        };
+                        const ir_type: ir.IrType = switch (sub_opcode) {
+                            .i32_atomic_rmw_add, .i32_atomic_rmw_sub, .i32_atomic_rmw_and, .i32_atomic_rmw_or, .i32_atomic_rmw_xor, .i32_atomic_rmw_xchg, .i32_atomic_rmw8_add_u, .i32_atomic_rmw8_sub_u, .i32_atomic_rmw8_and_u, .i32_atomic_rmw8_or_u, .i32_atomic_rmw8_xor_u, .i32_atomic_rmw8_xchg_u, .i32_atomic_rmw16_add_u, .i32_atomic_rmw16_sub_u, .i32_atomic_rmw16_and_u, .i32_atomic_rmw16_or_u, .i32_atomic_rmw16_xor_u, .i32_atomic_rmw16_xchg_u => .i32,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_rmw = .{ .base = base, .offset = offset, .size = size, .val = val, .op = rmw_op } }, .dest = dest, .type = ir_type });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    .i32_atomic_rmw_cmpxchg, .i64_atomic_rmw_cmpxchg,
+                    .i32_atomic_rmw8_cmpxchg_u, .i32_atomic_rmw16_cmpxchg_u,
+                    .i64_atomic_rmw8_cmpxchg_u, .i64_atomic_rmw16_cmpxchg_u, .i64_atomic_rmw32_cmpxchg_u,
+                    => {
+                        _ = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const replacement = vreg_stack.pop().?;
+                        const expected = vreg_stack.pop().?;
+                        const base = vreg_stack.pop().?;
+                        const dest = ir_func.newVReg();
+                        const size: u8 = switch (sub_opcode) {
+                            .i32_atomic_rmw_cmpxchg => 4,
+                            .i64_atomic_rmw_cmpxchg => 8,
+                            .i32_atomic_rmw8_cmpxchg_u, .i64_atomic_rmw8_cmpxchg_u => 1,
+                            .i32_atomic_rmw16_cmpxchg_u, .i64_atomic_rmw16_cmpxchg_u => 2,
+                            .i64_atomic_rmw32_cmpxchg_u => 4,
+                            else => unreachable,
+                        };
+                        const ir_type: ir.IrType = switch (sub_opcode) {
+                            .i32_atomic_rmw_cmpxchg, .i32_atomic_rmw8_cmpxchg_u, .i32_atomic_rmw16_cmpxchg_u => .i32,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_cmpxchg = .{ .base = base, .offset = offset, .size = size, .expected = expected, .replacement = replacement } }, .dest = dest, .type = ir_type });
+                        try vreg_stack.append(allocator, dest);
+                    },
+
+                    else => return error.UnsupportedOpcode,
+                }
+            },
+
+            // ── Sign-extension ops ─────────────────────────────────────
+            .i32_extend8_s, .i32_extend16_s,
+            .i64_extend8_s, .i64_extend16_s, .i64_extend32_s,
+            => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .i32_extend8_s, .i64_extend8_s => .{ .extend8_s = val },
+                    .i32_extend16_s, .i64_extend16_s => .{ .extend16_s = val },
+                    .i64_extend32_s => .{ .extend32_s = val },
+                    else => unreachable,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .i32_extend8_s, .i32_extend16_s => .i32,
+                    else => .i64,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Float comparisons ──────────────────────────────────────
+            .f32_eq, .f32_ne, .f32_lt, .f32_gt, .f32_le, .f32_ge,
+            .f64_eq, .f64_ne, .f64_lt, .f64_gt, .f64_le, .f64_ge,
+            => {
+                const rhs = vreg_stack.pop().?;
+                const lhs = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_eq, .f64_eq => .{ .eq = bin },
+                    .f32_ne, .f64_ne => .{ .ne = bin },
+                    .f32_lt, .f64_lt => .{ .lt_s = bin },
+                    .f32_gt, .f64_gt => .{ .gt_s = bin },
+                    .f32_le, .f64_le => .{ .le_s = bin },
+                    .f32_ge, .f64_ge => .{ .ge_s = bin },
+                    else => unreachable,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Float unary math ───────────────────────────────────────
+            .f32_abs, .f32_neg, .f32_sqrt, .f32_ceil, .f32_floor, .f32_trunc, .f32_nearest,
+            .f64_abs, .f64_neg, .f64_sqrt, .f64_ceil, .f64_floor, .f64_trunc, .f64_nearest,
+            => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_abs, .f64_abs => .{ .f_abs = val },
+                    .f32_neg, .f64_neg => .{ .f_neg = val },
+                    .f32_sqrt, .f64_sqrt => .{ .f_sqrt = val },
+                    .f32_ceil, .f64_ceil => .{ .f_ceil = val },
+                    .f32_floor, .f64_floor => .{ .f_floor = val },
+                    .f32_trunc, .f64_trunc => .{ .f_trunc = val },
+                    .f32_nearest, .f64_nearest => .{ .f_nearest = val },
+                    else => unreachable,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .f64_abs, .f64_neg, .f64_sqrt, .f64_ceil, .f64_floor, .f64_trunc, .f64_nearest => .f64,
+                    else => .f32,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Float binary math ──────────────────────────────────────
+            .f32_min, .f32_max, .f32_copysign,
+            .f64_min, .f64_max, .f64_copysign,
+            => {
+                const rhs = vreg_stack.pop().?;
+                const lhs = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_min, .f64_min => .{ .f_min = bin },
+                    .f32_max, .f64_max => .{ .f_max = bin },
+                    .f32_copysign, .f64_copysign => .{ .f_copysign = bin },
+                    else => unreachable,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .f64_min, .f64_max, .f64_copysign => .f64,
+                    else => .f32,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
             else => return error.UnsupportedOpcode,
         }
     }

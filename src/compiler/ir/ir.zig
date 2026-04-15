@@ -74,7 +74,7 @@ pub const Inst = struct {
         local_set: struct { idx: u32, val: VReg },
 
         // Memory
-        load: struct { base: VReg, offset: u32, size: u8 },
+        load: struct { base: VReg, offset: u32, size: u8, sign_extend: bool = false },
         store: struct { base: VReg, offset: u32, size: u8, val: VReg },
 
         // Control flow
@@ -84,7 +84,7 @@ pub const Inst = struct {
         @"unreachable": void,
 
         // Function calls
-        call: struct { func_idx: u32, args: []const VReg },
+        call: struct { func_idx: u32, arg_count: u32 },
 
         // Parametric
         select: struct { cond: VReg, if_true: VReg, if_false: VReg },
@@ -93,16 +93,61 @@ pub const Inst = struct {
         global_get: u32,
         global_set: struct { idx: u32, val: VReg },
 
+        // Sign extension
+        extend8_s: VReg,
+        extend16_s: VReg,
+        extend32_s: VReg,
+
+        // Float unary
+        f_neg: VReg,
+        f_abs: VReg,
+        f_sqrt: VReg,
+        f_ceil: VReg,
+        f_floor: VReg,
+        f_trunc: VReg,
+        f_nearest: VReg,
+
+        // Float binary
+        f_min: BinOp,
+        f_max: BinOp,
+        f_copysign: BinOp,
+
         // Conversions
         wrap_i64: VReg,
         extend_i32_s: VReg,
         extend_i32_u: VReg,
+
+        // Type conversions
+        trunc_f32_s: VReg,
+        trunc_f32_u: VReg,
+        trunc_f64_s: VReg,
+        trunc_f64_u: VReg,
+        convert_s: VReg,
+        convert_u: VReg,
+        demote_f64: VReg,
+        promote_f32: VReg,
+        reinterpret: VReg,
+        trunc_sat_f32_s: VReg,
+        trunc_sat_f32_u: VReg,
+        trunc_sat_f64_s: VReg,
+        trunc_sat_f64_u: VReg,
+
+        // Atomic operations
+        atomic_load: struct { base: VReg, offset: u32, size: u8 },
+        atomic_store: struct { base: VReg, offset: u32, size: u8, val: VReg },
+        atomic_rmw: struct { base: VReg, offset: u32, size: u8, val: VReg, op: AtomicRmwOp },
+        atomic_cmpxchg: struct { base: VReg, offset: u32, size: u8, expected: VReg, replacement: VReg },
+        atomic_fence: void,
+        atomic_notify: struct { base: VReg, offset: u32, count: VReg },
+        atomic_wait: struct { base: VReg, offset: u32, expected: VReg, timeout: VReg, size: u8 },
     };
 
     pub const BinOp = struct {
         lhs: VReg,
         rhs: VReg,
     };
+
+    pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };
 };
 
 /// A basic block — a sequence of instructions with a single entry point.

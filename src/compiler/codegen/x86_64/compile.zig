@@ -1,57 +1,57 @@
 //! x86-64 IR Compiler
 //!
 //! Walks IR functions and emits x86-64 machine code via CodeBuffer.
-//! Uses a simple register allocator that maps VRegs to physical registers.
+//! Uses a stack-based operand model: all intermediate values live on the
+//! stack frame (memory), using RAX and RCX as temporary scratch registers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
 
-/// Simple VReg → physical register mapping.
-/// Uses a linear scan over a fixed set of scratch registers.
-/// Spills to stack when registers are exhausted.
-const RegMap = struct {
-    entries: std.AutoHashMap(ir.VReg, Location),
-    reg_used: [scratch_regs.len]bool = [_]bool{false} ** scratch_regs.len,
-    next_stack_offset: u32 = 0,
+/// Platform-specific ABI parameter registers, resolved at comptime.
+const param_regs = if (builtin.os.tag == .windows)
+    [_]emit.Reg{ .rcx, .rdx, .r8, .r9 } // Win64
+else
+    [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 }; // SysV
 
-    const Location = union(enum) {
-        reg: emit.Reg,
-        stack: u32,
-    };
+/// Stack-based operand model. All intermediate values live on the stack
+/// frame at [rbp + offset], using negative offsets that grow downward.
+/// Locals occupy [rbp - 8*1] through [rbp - 8*N], and the operand stack
+/// starts immediately below at [rbp - 8*(N+1)].
+const OperandStack = struct {
+    /// Offset from RBP to the next free operand stack slot (negative, grows down).
+    top: i32,
+    /// Base offset (marks bottom of operand stack area, i.e. the initial top).
+    base: i32,
 
-    // Caller-saved scratch registers (excludes rsp/rbp)
-    const scratch_regs = [_]emit.Reg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9, .r10, .r11 };
-
-    fn init(allocator: std.mem.Allocator) RegMap {
-        return .{
-            .entries = std.AutoHashMap(ir.VReg, Location).init(allocator),
-        };
+    fn init(local_count: u32) OperandStack {
+        const base_off = -@as(i32, @intCast((local_count + 1) * 8));
+        return .{ .top = base_off, .base = base_off };
     }
 
-    fn deinit(self: *RegMap) void {
-        self.entries.deinit();
+    fn push(self: *OperandStack, code: *emit.CodeBuffer, src: emit.Reg) !void {
+        try code.movMemReg(.rbp, self.top, src);
+        self.top -= 8;
     }
 
-    fn assign(self: *RegMap, vreg: ir.VReg) !Location {
-        for (scratch_regs, 0..) |r, i| {
-            if (!self.reg_used[i]) {
-                self.reg_used[i] = true;
-                const loc = Location{ .reg = r };
-                try self.entries.put(vreg, loc);
-                return loc;
-            }
-        }
-        // Spill to stack
-        const offset = self.next_stack_offset;
-        self.next_stack_offset += 8;
-        const loc = Location{ .stack = offset };
-        try self.entries.put(vreg, loc);
-        return loc;
+    fn pop(self: *OperandStack, code: *emit.CodeBuffer, dst: emit.Reg) !void {
+        self.top += 8;
+        try code.movRegMem(dst, .rbp, self.top);
     }
 
-    fn get(self: *const RegMap, vreg: ir.VReg) ?Location {
-        return self.entries.get(vreg);
+    fn depth(self: *const OperandStack) u32 {
+        return @intCast(@divExact(self.base - self.top, 8));
+    }
+
+    /// Save the current stack depth so we can restore it later (e.g. across blocks).
+    fn save(self: *const OperandStack) i32 {
+        return self.top;
+    }
+
+    /// Restore a previously saved stack depth.
+    fn restore(self: *OperandStack, saved: i32) void {
+        self.top = saved;
     }
 };
 
@@ -60,35 +60,35 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
-    var reg_map = RegMap.init(allocator);
-    defer reg_map.deinit();
-
-    const frame_size: u32 = func.local_count * 8 + 256;
+    // Frame: locals + 64 operand stack slots, aligned to 16 bytes
+    // After push rbp (8 bytes), we need frame_size ≡ 8 (mod 16) for 16-byte RSP alignment.
+    const raw_size: u32 = (func.local_count + 64) * 8;
+    const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8; // ensure ≡ 8 mod 16
     try code.emitPrologue(frame_size);
 
-    // Spill parameters from SysV ABI registers to stack frame slots.
-    // Params occupy locals[0..param_count], stored at [rbp - 8*(idx+1)].
-    const param_regs = [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+    // Spill parameters from ABI registers to stack frame slots.
     const spill_count = @min(func.param_count, param_regs.len);
     for (0..spill_count) |i| {
         try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
     }
+
+    var stack = OperandStack.init(func.local_count);
 
     // Track block offsets for branch resolution
     var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
     defer block_offsets.deinit();
 
     var last_was_ret = false;
-    // Two-pass: first collect block start offsets, then emit with patching.
-    // For now, forward branches use placeholder + patch list.
     var branch_patches: std.ArrayList(BranchPatch) = .empty;
     defer branch_patches.deinit(allocator);
+    var call_patches: std.ArrayList(CallPatch) = .empty;
+    defer call_patches.deinit(allocator);
 
     for (func.blocks.items, 0..) |block, idx| {
         try block_offsets.put(@intCast(idx), code.len());
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstEx(&code, inst, &reg_map, &branch_patches, func);
+            try compileInst(&code, inst, &stack, &branch_patches, &call_patches);
         }
     }
 
@@ -116,409 +116,399 @@ fn isRet(op: ir.Inst.Op) bool {
 }
 
 const BranchPatch = struct {
-    patch_offset: usize, // offset of the rel32 in code buffer
+    patch_offset: usize,
     target_block: ir.BlockId,
 };
 
-fn compileInstEx(
+const CallPatch = struct {
+    patch_offset: usize,
+    target_func_idx: u32,
+};
+
+fn compileInst(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
-    reg_map: *RegMap,
+    stack: *OperandStack,
     patches: *std.ArrayList(BranchPatch),
-    func: *const ir.IrFunction,
+    call_patches: *std.ArrayList(CallPatch),
 ) !void {
-    _ = func;
     switch (inst.op) {
+        // ── Constants ─────────────────────────────────────────────────
+        .iconst_32 => |val| {
+            try code.movRegImm32(.rax, val);
+            try stack.push(code, .rax);
+        },
+        .iconst_64 => |val| {
+            try code.movRegImm64(.rax, @bitCast(val));
+            try stack.push(code, .rax);
+        },
+        .fconst_32 => |val| {
+            try code.movRegImm32(.rax, @bitCast(val));
+            try stack.push(code, .rax);
+        },
+        .fconst_64 => |val| {
+            try code.movRegImm64(.rax, @bitCast(val));
+            try stack.push(code, .rax);
+        },
+
+        // ── Binary arithmetic ─────────────────────────────────────────
+        .add => {
+            try stack.pop(code, .rcx); // rhs
+            try stack.pop(code, .rax); // lhs
+            try code.addRegReg(.rax, .rcx);
+            try stack.push(code, .rax);
+        },
+        .sub => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            try code.subRegReg(.rax, .rcx);
+            try stack.push(code, .rax);
+        },
+        .mul => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            try code.imulRegReg(.rax, .rcx);
+            try stack.push(code, .rax);
+        },
+        .@"and" => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            try code.andRegReg(.rax, .rcx);
+            try stack.push(code, .rax);
+        },
+        .@"or" => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            try code.orRegReg(.rax, .rcx);
+            try stack.push(code, .rax);
+        },
+        .xor => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            try code.xorRegReg(.rax, .rcx);
+            try stack.push(code, .rax);
+        },
+
+        // ── Shifts ────────────────────────────────────────────────────
+        .shl => {
+            try stack.pop(code, .rcx); // count → RCX (CL)
+            try stack.pop(code, .rax); // value
+            // SHL RAX, CL: REX.W D3 /4
+            try code.rexW(.rax, .rax);
+            try code.emitByte(0xD3);
+            try code.modrm(0b11, 4, emit.Reg.rax.low3());
+            try stack.push(code, .rax);
+        },
+        .shr_s => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            // SAR RAX, CL: REX.W D3 /7
+            try code.rexW(.rax, .rax);
+            try code.emitByte(0xD3);
+            try code.modrm(0b11, 7, emit.Reg.rax.low3());
+            try stack.push(code, .rax);
+        },
+        .shr_u => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            // SHR RAX, CL: REX.W D3 /5
+            try code.rexW(.rax, .rax);
+            try code.emitByte(0xD3);
+            try code.modrm(0b11, 5, emit.Reg.rax.low3());
+            try stack.push(code, .rax);
+        },
+        .rotl => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            // ROL RAX, CL: REX.W D3 /0
+            try code.rexW(.rax, .rax);
+            try code.emitByte(0xD3);
+            try code.modrm(0b11, 0, emit.Reg.rax.low3());
+            try stack.push(code, .rax);
+        },
+        .rotr => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            // ROR RAX, CL: REX.W D3 /1
+            try code.rexW(.rax, .rax);
+            try code.emitByte(0xD3);
+            try code.modrm(0b11, 1, emit.Reg.rax.low3());
+            try stack.push(code, .rax);
+        },
+
+        // ── Division / remainder ──────────────────────────────────────
+        .div_s, .div_u, .rem_s, .rem_u => {
+            try stack.pop(code, .rcx); // divisor
+            try stack.pop(code, .rax); // dividend
+
+            const is_signed = (inst.op == .div_s or inst.op == .rem_s);
+            const is_rem = (inst.op == .rem_s or inst.op == .rem_u);
+
+            if (is_signed) {
+                try code.cqo();
+            } else {
+                try code.xorRegReg(.rdx, .rdx);
+            }
+
+            if (is_signed) {
+                try code.idivReg(.rcx);
+            } else {
+                try code.divReg(.rcx);
+            }
+
+            if (is_rem) {
+                try stack.push(code, .rdx);
+            } else {
+                try stack.push(code, .rax);
+            }
+        },
+
+        // ── Comparisons ───────────────────────────────────────────────
+        inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |_, tag| {
+            try stack.pop(code, .rcx); // rhs
+            try stack.pop(code, .rax); // lhs
+            try code.cmpRegReg(.rax, .rcx);
+
+            const cc: u4 = comptime switch (tag) {
+                .eq => 0x4,
+                .ne => 0x5,
+                .lt_s => 0xC,
+                .lt_u => 0x2,
+                .gt_s => 0xF,
+                .gt_u => 0x7,
+                .le_s => 0xE,
+                .le_u => 0x6,
+                .ge_s => 0xD,
+                .ge_u => 0x3,
+                else => unreachable,
+            };
+            try code.setcc(cc, .rax);
+            try code.movzxByte(.rax, .rax);
+            try stack.push(code, .rax);
+        },
+
+        // ── Unary ops ─────────────────────────────────────────────────
+        .eqz => {
+            try stack.pop(code, .rax);
+            try code.testRegReg(.rax, .rax);
+            try code.setcc(0x4, .rax); // SETZ
+            try code.movzxByte(.rax, .rax);
+            try stack.push(code, .rax);
+        },
+        .clz => {
+            try stack.pop(code, .rax);
+            try code.lzcnt(.rax, .rax);
+            try stack.push(code, .rax);
+        },
+        .ctz => {
+            try stack.pop(code, .rax);
+            try code.tzcnt(.rax, .rax);
+            try stack.push(code, .rax);
+        },
+        .popcnt => {
+            try stack.pop(code, .rax);
+            try code.popcntReg(.rax, .rax);
+            try stack.push(code, .rax);
+        },
+
+        // ── Local variable access ─────────────────────────────────────
+        .local_get => |idx| {
+            try code.movRegMem(.rax, .rbp, -@as(i32, @intCast((idx + 1) * 8)));
+            try stack.push(code, .rax);
+        },
+        .local_set => |ls| {
+            try stack.pop(code, .rax);
+            try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 1) * 8)), .rax);
+        },
+
+        // ── Return ────────────────────────────────────────────────────
+        .ret => |maybe_val| {
+            if (maybe_val != null) {
+                try stack.pop(code, .rax);
+            }
+            try code.emitEpilogue();
+        },
+
+        .@"unreachable" => try code.int3(),
+
+        // ── Select (conditional move) ─────────────────────────────────
+        .select => {
+            try stack.pop(code, .rax); // cond
+            try stack.pop(code, .rcx); // if_false
+            try stack.pop(code, .rdx); // if_true
+            // TEST RAX, RAX; if cond!=0, pick true (rdx), else keep false (rcx)
+            try code.testRegReg(.rax, .rax);
+            try code.cmovnz(.rcx, .rdx);
+            try stack.push(code, .rcx);
+        },
+
+        // ── Memory load ───────────────────────────────────────────────
+        .load => |ld| {
+            try stack.pop(code, .rax); // base address
+            if (ld.offset > 0) {
+                try code.addRegImm32(.rax, @intCast(ld.offset));
+            }
+            try code.movRegMemNoRex(.rax, .rax, 0);
+            try stack.push(code, .rax);
+        },
+
+        // ── Memory store ──────────────────────────────────────────────
+        .store => |st| {
+            try stack.pop(code, .rcx); // value
+            try stack.pop(code, .rax); // base address
+            if (st.offset > 0) {
+                try code.addRegImm32(.rax, @intCast(st.offset));
+            }
+            try code.movMemRegNoRex(.rax, 0, .rcx);
+        },
+
+        // ── Branches ──────────────────────────────────────────────────
         .br => |target| {
-            // JMP rel32 (placeholder)
-            try code.emitByte(0xE9);
+            try code.emitByte(0xE9); // JMP rel32
             const patch_off = code.len();
             try code.emitI32(0);
             try patches.append(code.allocator, .{ .patch_offset = patch_off, .target_block = target });
         },
         .br_if => |br| {
-            const cond_loc = reg_map.get(br.cond) orelse return;
-            const cond_reg = switch (cond_loc) { .reg => |r| r, .stack => return };
-            // TEST cond, cond; JNZ then_block
-            try code.testRegReg(cond_reg, cond_reg);
+            // Pop condition from operand stack
+            try stack.pop(code, .rax);
+            try code.testRegReg(.rax, .rax);
+            // JNE then_block
             try code.emitByte(0x0F);
-            try code.emitByte(0x85); // JNE rel32
+            try code.emitByte(0x85);
             const then_patch = code.len();
             try code.emitI32(0);
             try patches.append(code.allocator, .{ .patch_offset = then_patch, .target_block = br.then_block });
-            // Fall through to else_block (JMP rel32)
+            // JMP else_block (fallthrough)
             try code.emitByte(0xE9);
             const else_patch = code.len();
             try code.emitI32(0);
             try patches.append(code.allocator, .{ .patch_offset = else_patch, .target_block = br.else_block });
         },
-        else => try compileInst(code, inst, reg_map),
-    }
-}
 
-fn compileInst(code: *emit.CodeBuffer, inst: ir.Inst, reg_map: *RegMap) !void {
-    switch (inst.op) {
-        .iconst_32 => |val| {
-            const dest = inst.dest orelse return;
-            const loc = try reg_map.assign(dest);
-            switch (loc) {
-                .reg => |r| try code.movRegImm32(r, val),
-                .stack => {},
-            }
-        },
-        .iconst_64 => |val| {
-            const dest = inst.dest orelse return;
-            const loc = try reg_map.assign(dest);
-            switch (loc) {
-                .reg => |r| try code.movRegImm64(r, @bitCast(val)),
-                .stack => {},
-            }
-        },
-        .add => |bin| try emitBinOp(code, inst, bin, reg_map, .add),
-        .sub => |bin| try emitBinOp(code, inst, bin, reg_map, .sub),
-        .mul => |bin| try emitBinOp(code, inst, bin, reg_map, .mul),
-        .@"and" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"and"),
-        .@"or" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"or"),
-        .xor => |bin| try emitBinOp(code, inst, bin, reg_map, .xor),
-        .shl => |bin| try emitShift(code, inst, bin, reg_map, .shl),
-        .shr_s => |bin| try emitShift(code, inst, bin, reg_map, .shr_s),
-        .shr_u => |bin| try emitShift(code, inst, bin, reg_map, .shr_u),
+        // ── Function calls ────────────────────────────────────────────
+        .call => |cl| {
+            const n_args = cl.arg_count;
 
-        // Division/remainder: uses RAX:RDX pair
-        .div_s, .div_u, .rem_s, .rem_u => |bin| try emitDivRem(code, inst, bin, reg_map),
-
-        // Comparisons: cmp + setcc + movzx
-        inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
-            try emitCmp(code, inst, bin, reg_map, tag);
-        },
-
-        // Unary ops
-        .eqz => |src| try emitEqz(code, inst, src, reg_map),
-        .clz => |src| try emitUnary(code, inst, src, reg_map, .clz),
-        .ctz => |src| try emitUnary(code, inst, src, reg_map, .ctz),
-        .popcnt => |src| try emitUnary(code, inst, src, reg_map, .popcnt),
-
-        // Local variable access
-        .local_get => |idx| {
-            const dest = inst.dest orelse return;
-            const loc = try reg_map.assign(dest);
-            switch (loc) {
-                .reg => |r| try code.movRegMem(r, .rbp, -@as(i32, @intCast((idx + 1) * 8))),
-                .stack => {},
-            }
-        },
-        .local_set => |ls| {
-            const src_loc = reg_map.get(ls.val) orelse return;
-            switch (src_loc) {
-                .reg => |r| try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 1) * 8)), r),
-                .stack => {},
-            }
-        },
-
-        .ret => |maybe_val| {
-            if (maybe_val) |val| {
-                if (reg_map.get(val)) |loc| {
-                    switch (loc) {
-                        .reg => |r| {
-                            if (r != .rax) try code.movRegReg(.rax, r);
-                        },
-                        .stack => {},
-                    }
+            // Pop args from operand stack in reverse order into ABI registers.
+            // Wasm pushes args left-to-right, so first arg is deepest.
+            // We pop in reverse (last arg first), store to temp slots, then
+            // load in order to ABI regs.
+            if (n_args > 0 and n_args <= param_regs.len) {
+                // Pop all args into temporary frame slots (reuse operand stack area)
+                // We pop in reverse order (topmost = last arg)
+                var i: u32 = n_args;
+                while (i > 0) {
+                    i -= 1;
+                    try stack.pop(code, .rax);
+                    // Store to a temp area: use [rbp - frame_temp_base - i*8]
+                    // We use R11 as a scratch for the offset calculation
+                    // Actually, simpler: just load into the right ABI reg directly
+                    // Since we pop in reverse, arg index = i
+                    try code.movRegReg(param_regs[i], .rax);
+                }
+            } else if (n_args > param_regs.len) {
+                // More than 6 args: pop extras to stack, then first 6 to regs
+                // For now, handle only register-passed args
+                var i: u32 = n_args;
+                while (i > param_regs.len) {
+                    i -= 1;
+                    try stack.pop(code, .rax); // discard overflow args for now
+                }
+                while (i > 0) {
+                    i -= 1;
+                    try stack.pop(code, .rax);
+                    try code.movRegReg(param_regs[i], .rax);
                 }
             }
-            try code.emitEpilogue();
-        },
-        .@"unreachable" => try code.int3(),
-        .select => |sel| try emitSelect(code, inst, sel, reg_map),
 
-        // Memory load: base_reg + offset → dest_reg
-        .load => |ld| {
-            const dest = inst.dest orelse return;
-            const base_loc = reg_map.get(ld.base) orelse return;
-            const dest_loc = try reg_map.assign(dest);
-            const base_reg = switch (base_loc) { .reg => |r| r, .stack => return };
-            const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-            // MOV dest, [base + offset] (32-bit load, zero-extended)
-            if (ld.offset > 0) {
-                try code.addRegImm32(base_reg, @intCast(ld.offset));
-            }
-            // Use 32-bit mov for i32 loads
-            try code.movRegMemNoRex(dest_reg, base_reg, 0);
+            // Emit CALL rel32 (placeholder, patched later)
+            try code.emitByte(0xE8);
+            const patch_off = code.len();
+            try code.emitI32(0);
+            try call_patches.append(code.allocator, .{
+                .patch_offset = patch_off,
+                .target_func_idx = cl.func_idx,
+            });
+
+            // Push return value (RAX) to operand stack
+            try stack.push(code, .rax);
         },
 
-        // Memory store: val → [base + offset]
-        .store => |st| {
-            const base_loc = reg_map.get(st.base) orelse return;
-            const val_loc = reg_map.get(st.val) orelse return;
-            const base_reg = switch (base_loc) { .reg => |r| r, .stack => return };
-            const val_reg = switch (val_loc) { .reg => |r| r, .stack => return };
-            if (st.offset > 0) {
-                try code.addRegImm32(base_reg, @intCast(st.offset));
-            }
-            try code.movMemRegNoRex(base_reg, 0, val_reg);
+        // ── Global access (stubs) ─────────────────────────────────────
+        .global_get => {
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .global_set => {
+            try stack.pop(code, .rax);
         },
 
-        // Function call: setup args, call rel32, collect result
-        // Float constants: store bit pattern in a GPR (no XMM allocation yet)
-        .fconst_32 => |val| {
-            const dest = inst.dest orelse return;
-            const loc = try reg_map.assign(dest);
-            switch (loc) {
-                .reg => |r| try code.movRegImm32(r, @bitCast(val)),
-                .stack => {},
-            }
-        },
-        .fconst_64 => |val| {
-            const dest = inst.dest orelse return;
-            const loc = try reg_map.assign(dest);
-            switch (loc) {
-                .reg => |r| try code.movRegImm64(r, @bitCast(val)),
-                .stack => {},
-            }
+        // ── Type conversions (pass-through for integer types) ─────────
+        .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .reinterpret,
+        => {
+            // Pop, push back (value stays on stack, no-op for now)
+            try stack.pop(code, .rax);
+            try stack.push(code, .rax);
         },
 
-        .call => |cl| {
-            const dest = inst.dest orelse return;
-            // For now: emit a stub that just returns 0 in the dest register.
-            // Full inter-function calls require knowing function offsets at link time.
-            _ = cl;
-            const dest_loc = try reg_map.assign(dest);
-            switch (dest_loc) {
-                .reg => |r| try code.movRegImm32(r, 0),
-                .stack => {},
-            }
+        // ── Float/conversion stubs (pop input, push placeholder) ──────
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .convert_s, .convert_u, .demote_f64, .promote_f32,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        => {
+            try stack.pop(code, .rax);
+            try stack.push(code, .rax);
         },
-        else => {},
+
+        // ── Float binary stubs ────────────────────────────────────────
+        .f_min, .f_max, .f_copysign => {
+            try stack.pop(code, .rcx);
+            try stack.pop(code, .rax);
+            try stack.push(code, .rax);
+        },
+
+        // ── Atomic stubs ──────────────────────────────────────────────
+        .atomic_fence => {},
+        .atomic_load => {
+            try stack.pop(code, .rax);
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .atomic_store => {
+            try stack.pop(code, .rcx); // val
+            try stack.pop(code, .rax); // base
+        },
+        .atomic_rmw => {
+            try stack.pop(code, .rcx); // val
+            try stack.pop(code, .rax); // base
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .atomic_cmpxchg => {
+            try stack.pop(code, .rcx); // replacement
+            try stack.pop(code, .rdx); // expected
+            try stack.pop(code, .rax); // base
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .atomic_notify => {
+            try stack.pop(code, .rcx); // count
+            try stack.pop(code, .rax); // base
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .atomic_wait => {
+            try stack.pop(code, .rcx); // timeout
+            try stack.pop(code, .rdx); // expected
+            try stack.pop(code, .rax); // base
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
     }
-}
-
-const BinOpKind = enum { add, sub, mul, @"and", @"or", xor };
-
-fn emitBinOp(
-    code: *emit.CodeBuffer,
-    inst: ir.Inst,
-    bin: ir.Inst.BinOp,
-    reg_map: *RegMap,
-    kind: BinOpKind,
-) !void {
-    const dest = inst.dest orelse return;
-    const lhs_loc = reg_map.get(bin.lhs) orelse return;
-    const rhs_loc = reg_map.get(bin.rhs) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-
-    const dest_reg = switch (dest_loc) {
-        .reg => |r| r,
-        .stack => return,
-    };
-    const lhs_reg = switch (lhs_loc) {
-        .reg => |r| r,
-        .stack => return,
-    };
-    const rhs_reg = switch (rhs_loc) {
-        .reg => |r| r,
-        .stack => return,
-    };
-
-    try code.movRegReg(dest_reg, lhs_reg);
-    switch (kind) {
-        .add => try code.addRegReg(dest_reg, rhs_reg),
-        .sub => try code.subRegReg(dest_reg, rhs_reg),
-        .mul => try code.imulRegReg(dest_reg, rhs_reg),
-        .@"and" => try code.andRegReg(dest_reg, rhs_reg),
-        .@"or" => try code.orRegReg(dest_reg, rhs_reg),
-        .xor => try code.xorRegReg(dest_reg, rhs_reg),
-    }
-}
-
-// ── Shift operations ──────────────────────────────────────────────────
-
-const ShiftKind = enum { shl, shr_s, shr_u };
-
-fn emitShift(
-    code: *emit.CodeBuffer,
-    inst: ir.Inst,
-    bin: ir.Inst.BinOp,
-    reg_map: *RegMap,
-    kind: ShiftKind,
-) !void {
-    const dest = inst.dest orelse return;
-    const lhs_loc = reg_map.get(bin.lhs) orelse return;
-    const rhs_loc = reg_map.get(bin.rhs) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-
-    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-    const lhs_reg = switch (lhs_loc) { .reg => |r| r, .stack => return };
-    const rhs_reg = switch (rhs_loc) { .reg => |r| r, .stack => return };
-
-    // x86 shifts require count in CL
-    if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-    if (dest_reg != lhs_reg) try code.movRegReg(dest_reg, lhs_reg);
-
-    // REX.W + D3 /opcode
-    const opcode_ext: u3 = switch (kind) {
-        .shl => 4,
-        .shr_u => 5,
-        .shr_s => 7,
-    };
-    try code.rexW(.rax, dest_reg);
-    try code.emitByte(0xD3);
-    try code.modrm(0b11, opcode_ext, dest_reg.low3());
-}
-
-// ── Division / remainder ──────────────────────────────────────────────
-
-fn emitDivRem(
-    code: *emit.CodeBuffer,
-    inst: ir.Inst,
-    bin: ir.Inst.BinOp,
-    reg_map: *RegMap,
-) !void {
-    const dest = inst.dest orelse return;
-    const lhs_loc = reg_map.get(bin.lhs) orelse return;
-    const rhs_loc = reg_map.get(bin.rhs) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-
-    const lhs_reg = switch (lhs_loc) { .reg => |r| r, .stack => return };
-    const rhs_reg = switch (rhs_loc) { .reg => |r| r, .stack => return };
-    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-
-    // Move dividend to RAX
-    if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-
-    const is_signed = (inst.op == .div_s or inst.op == .rem_s);
-    const is_rem = (inst.op == .rem_s or inst.op == .rem_u);
-
-    // Sign/zero extend RAX into RDX:RAX
-    if (is_signed) {
-        try code.cqo(); // sign-extend RAX → RDX:RAX
-    } else {
-        try code.xorRegReg(.rdx, .rdx); // zero-extend
-    }
-
-    // Divisor must not be in RAX or RDX
-    var divisor = rhs_reg;
-    if (divisor == .rax or divisor == .rdx) {
-        divisor = .r10;
-        try code.movRegReg(.r10, rhs_reg);
-    }
-
-    // IDIV/DIV r/m64
-    if (is_signed) {
-        try code.idivReg(divisor);
-    } else {
-        try code.divReg(divisor);
-    }
-
-    // Result: quotient in RAX, remainder in RDX
-    const result_reg: emit.Reg = if (is_rem) .rdx else .rax;
-    if (dest_reg != result_reg) try code.movRegReg(dest_reg, result_reg);
-}
-
-// ── Comparison operations ─────────────────────────────────────────────
-
-fn emitCmp(
-    code: *emit.CodeBuffer,
-    inst: ir.Inst,
-    bin: ir.Inst.BinOp,
-    reg_map: *RegMap,
-    comptime op: std.meta.Tag(ir.Inst.Op),
-) !void {
-    const dest = inst.dest orelse return;
-    const lhs_loc = reg_map.get(bin.lhs) orelse return;
-    const rhs_loc = reg_map.get(bin.rhs) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-
-    const lhs_reg = switch (lhs_loc) { .reg => |r| r, .stack => return };
-    const rhs_reg = switch (rhs_loc) { .reg => |r| r, .stack => return };
-    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-
-    // CMP lhs, rhs
-    try code.cmpRegReg(lhs_reg, rhs_reg);
-
-    // SETcc to low byte of dest, then MOVZX to clear upper bytes
-    // Map IR comparison to x86 condition code
-    const cc: u4 = comptime switch (op) {
-        .eq => 0x4,   // E/Z
-        .ne => 0x5,   // NE/NZ
-        .lt_s => 0xC, // L (SF≠OF)
-        .lt_u => 0x2, // B (CF=1)
-        .gt_s => 0xF, // G (ZF=0, SF=OF)
-        .gt_u => 0x7, // A (CF=0, ZF=0)
-        .le_s => 0xE, // LE (ZF=1 or SF≠OF)
-        .le_u => 0x6, // BE (CF=1 or ZF=1)
-        .ge_s => 0xD, // GE (SF=OF)
-        .ge_u => 0x3, // AE (CF=0)
-        else => unreachable,
-    };
-    try code.setcc(cc, dest_reg);
-    try code.movzxByte(dest_reg, dest_reg);
-}
-
-// ── Unary operations ──────────────────────────────────────────────────
-
-const UnaryKind = enum { clz, ctz, popcnt };
-
-fn emitUnary(
-    code: *emit.CodeBuffer,
-    inst: ir.Inst,
-    src: ir.VReg,
-    reg_map: *RegMap,
-    kind: UnaryKind,
-) !void {
-    const dest = inst.dest orelse return;
-    const src_loc = reg_map.get(src) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-    const src_reg = switch (src_loc) { .reg => |r| r, .stack => return };
-    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-
-    switch (kind) {
-        .clz => try code.lzcnt(dest_reg, src_reg),
-        .ctz => try code.tzcnt(dest_reg, src_reg),
-        .popcnt => try code.popcntReg(dest_reg, src_reg),
-    }
-}
-
-fn emitEqz(
-    code: *emit.CodeBuffer,
-    inst: ir.Inst,
-    src: ir.VReg,
-    reg_map: *RegMap,
-) !void {
-    const dest = inst.dest orelse return;
-    const src_loc = reg_map.get(src) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-    const src_reg = switch (src_loc) { .reg => |r| r, .stack => return };
-    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-
-    // TEST src, src; SETZ dest
-    try code.testRegReg(src_reg, src_reg);
-    try code.setcc(0x4, dest_reg); // SETZ (ZF=1)
-    try code.movzxByte(dest_reg, dest_reg);
-}
-
-// ── Select (conditional move) ─────────────────────────────────────────
-
-fn emitSelect(
-    code: *emit.CodeBuffer,
-    inst: ir.Inst,
-    sel: @TypeOf(@as(ir.Inst.Op, undefined).select),
-    reg_map: *RegMap,
-) !void {
-    const dest = inst.dest orelse return;
-    const cond_loc = reg_map.get(sel.cond) orelse return;
-    const true_loc = reg_map.get(sel.if_true) orelse return;
-    const false_loc = reg_map.get(sel.if_false) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-
-    const cond_reg = switch (cond_loc) { .reg => |r| r, .stack => return };
-    const true_reg = switch (true_loc) { .reg => |r| r, .stack => return };
-    const false_reg = switch (false_loc) { .reg => |r| r, .stack => return };
-    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-
-    // dest = false_val; TEST cond; CMOVNZ dest, true_val
-    try code.movRegReg(dest_reg, false_reg);
-    try code.testRegReg(cond_reg, cond_reg);
-    try code.cmovnz(dest_reg, true_reg);
 }
 
 /// Result of compiling an IR module.
@@ -528,17 +518,84 @@ pub const CompileResult = struct {
 };
 
 /// Compile all functions in an IR module to x86-64 machine code.
+/// After compiling all functions, patches inter-function call sites.
 pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator) !CompileResult {
     var all_code: std.ArrayList(u8) = .empty;
     errdefer all_code.deinit(allocator);
     var offsets: std.ArrayList(u32) = .empty;
     errdefer offsets.deinit(allocator);
 
+    // Per-function call patches, accumulated across all functions
+    var global_call_patches: std.ArrayList(GlobalCallPatch) = .empty;
+    defer global_call_patches.deinit(allocator);
+
     for (ir_module.functions.items) |func| {
-        try offsets.append(allocator, @intCast(all_code.items.len));
-        const func_code = try compileFunction(&func, allocator);
-        defer allocator.free(func_code);
-        try all_code.appendSlice(allocator, func_code);
+        const func_start = all_code.items.len;
+        try offsets.append(allocator, @intCast(func_start));
+
+        // Compile function, collecting call patches
+        var code = emit.CodeBuffer.init(allocator);
+        errdefer code.deinit();
+
+        var stack = OperandStack.init(func.local_count);
+
+        const raw_size: u32 = (func.local_count + 64) * 8;
+        const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8;
+        try code.emitPrologue(frame_size);
+
+        const spill_count = @min(func.param_count, param_regs.len);
+        for (0..spill_count) |i| {
+            try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
+        }
+
+        var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
+        defer block_offsets.deinit();
+        var branch_patches: std.ArrayList(BranchPatch) = .empty;
+        defer branch_patches.deinit(allocator);
+        var call_patches: std.ArrayList(CallPatch) = .empty;
+        defer call_patches.deinit(allocator);
+
+        var last_was_ret = false;
+        for (func.blocks.items, 0..) |block, idx| {
+            try block_offsets.put(@intCast(idx), code.len());
+            for (block.instructions.items) |inst| {
+                last_was_ret = isRet(inst.op);
+                try compileInst(&code, inst, &stack, &branch_patches, &call_patches);
+            }
+        }
+
+        // Patch intra-function branches
+        for (branch_patches.items) |patch| {
+            if (block_offsets.get(patch.target_block)) |target_off| {
+                const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
+                code.patchI32(patch.patch_offset, rel);
+            }
+        }
+
+        if (!last_was_ret) {
+            try code.emitEpilogue();
+        }
+
+        // Record call patches with global offsets
+        for (call_patches.items) |cp| {
+            try global_call_patches.append(allocator, .{
+                .patch_offset = func_start + cp.patch_offset,
+                .target_func_idx = cp.target_func_idx,
+            });
+        }
+
+        try all_code.appendSlice(allocator, code.getCode());
+        code.deinit();
+    }
+
+    // Patch inter-function calls
+    for (global_call_patches.items) |patch| {
+        if (patch.target_func_idx < offsets.items.len) {
+            const target_off = offsets.items[patch.target_func_idx];
+            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
+            const b: [4]u8 = @bitCast(rel);
+            @memcpy(all_code.items[patch.patch_offset..][0..4], &b);
+        }
     }
 
     return .{
@@ -546,6 +603,11 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         .offsets = try offsets.toOwnedSlice(allocator),
     };
 }
+
+const GlobalCallPatch = struct {
+    patch_offset: usize,
+    target_func_idx: u32,
+};
 
 // ── Tests ──────────────────────────────────────────────────────────
 
@@ -563,7 +625,7 @@ test "compileFunction: iconst_32 + ret produces mov and epilogue" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
 
-    // Should have prologue + mov + epilogue
+    // Should have prologue + mov + stack ops + epilogue
     try std.testing.expect(code.len > 10);
     // Verify the immediate 42 (0x2A) appears in the code
     var found_42 = false;
@@ -596,10 +658,8 @@ test "compileFunction: two iconsts + add + ret produces reasonable code" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
 
-    // Prologue + 2 mov-imm + mov+add + mov-to-rax + epilogue
     try std.testing.expect(code.len > 15);
-    try std.testing.expect(code.len < 200);
-    // Last byte should be ret
+    try std.testing.expect(code.len < 300);
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
 
@@ -640,8 +700,26 @@ test "compileFunction: empty function produces prologue and epilogue" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
 
-    // Should have prologue + epilogue
     try std.testing.expect(code.len > 0);
-    // Last byte should be ret (0xC3)
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "OperandStack: push and pop maintain depth" {
+    var code = emit.CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+
+    var stack = OperandStack.init(2); // 2 locals
+    try std.testing.expectEqual(@as(u32, 0), stack.depth());
+
+    try stack.push(&code, .rax);
+    try std.testing.expectEqual(@as(u32, 1), stack.depth());
+
+    try stack.push(&code, .rcx);
+    try std.testing.expectEqual(@as(u32, 2), stack.depth());
+
+    try stack.pop(&code, .rax);
+    try std.testing.expectEqual(@as(u32, 1), stack.depth());
+
+    try stack.pop(&code, .rax);
+    try std.testing.expectEqual(@as(u32, 0), stack.depth());
 }

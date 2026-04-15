@@ -53,6 +53,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
         => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
@@ -60,6 +61,11 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
 
         // Unary ops
         .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |vreg| list.append(vreg),
 
         .local_set => |ls| list.append(ls.val),
@@ -71,11 +77,37 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         },
         .br_if => |bi| list.append(bi.cond),
         .ret => |maybe_vreg| if (maybe_vreg) |v| list.append(v),
-        .call => |c| for (c.args) |a| list.append(a),
+        .call => {},
         .select => |sel| {
             list.append(sel.cond);
             list.append(sel.if_true);
             list.append(sel.if_false);
+        },
+
+        // Atomic operations
+        .atomic_fence => {},
+        .atomic_load => |al| list.append(al.base),
+        .atomic_store => |ast| {
+            list.append(ast.base);
+            list.append(ast.val);
+        },
+        .atomic_rmw => |ar| {
+            list.append(ar.base);
+            list.append(ar.val);
+        },
+        .atomic_cmpxchg => |ac| {
+            list.append(ac.base);
+            list.append(ac.expected);
+            list.append(ac.replacement);
+        },
+        .atomic_notify => |an| {
+            list.append(an.base);
+            list.append(an.count);
+        },
+        .atomic_wait => |aw| {
+            list.append(aw.base);
+            list.append(aw.expected);
+            list.append(aw.timeout);
         },
     }
     return list;
@@ -115,12 +147,18 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
         => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
         },
 
         .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |*vreg| if (vreg.* == old) { vreg.* = new; },
 
         .local_set => |*ls| if (ls.val == old) { ls.val = new; },
@@ -137,6 +175,32 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (sel.cond == old) sel.cond = new;
             if (sel.if_true == old) sel.if_true = new;
             if (sel.if_false == old) sel.if_false = new;
+        },
+
+        // Atomic operations
+        .atomic_fence => {},
+        .atomic_load => |*al| if (al.base == old) { al.base = new; },
+        .atomic_store => |*ast| {
+            if (ast.base == old) ast.base = new;
+            if (ast.val == old) ast.val = new;
+        },
+        .atomic_rmw => |*ar| {
+            if (ar.base == old) ar.base = new;
+            if (ar.val == old) ar.val = new;
+        },
+        .atomic_cmpxchg => |*ac| {
+            if (ac.base == old) ac.base = new;
+            if (ac.expected == old) ac.expected = new;
+            if (ac.replacement == old) ac.replacement = new;
+        },
+        .atomic_notify => |*an| {
+            if (an.base == old) an.base = new;
+            if (an.count == old) an.count = new;
+        },
+        .atomic_wait => |*aw| {
+            if (aw.base == old) aw.base = new;
+            if (aw.expected == old) aw.expected = new;
+            if (aw.timeout == old) aw.timeout = new;
         },
     }
 }
@@ -243,7 +307,10 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
 
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .store, .local_set, .global_set, .call, .ret, .br, .br_if, .@"unreachable" => true,
+        .store, .local_set, .global_set, .call, .ret, .br, .br_if, .@"unreachable",
+        .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
+        .atomic_notify, .atomic_wait,
+        => true,
         else => false,
     };
 }
@@ -289,6 +356,12 @@ fn isPure(inst: ir.Inst) bool {
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .clz, .ctz, .popcnt, .eqz,
         .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .f_min, .f_max, .f_copysign,
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => true,
         else => false,
     };
@@ -315,6 +388,32 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .clz => |v| v == b.op.clz,
         .ctz => |v| v == b.op.ctz,
         .popcnt => |v| v == b.op.popcnt,
+        .extend8_s => |v| v == b.op.extend8_s,
+        .extend16_s => |v| v == b.op.extend16_s,
+        .extend32_s => |v| v == b.op.extend32_s,
+        .f_neg => |v| v == b.op.f_neg,
+        .f_abs => |v| v == b.op.f_abs,
+        .f_sqrt => |v| v == b.op.f_sqrt,
+        .f_ceil => |v| v == b.op.f_ceil,
+        .f_floor => |v| v == b.op.f_floor,
+        .f_trunc => |v| v == b.op.f_trunc,
+        .f_nearest => |v| v == b.op.f_nearest,
+        .wrap_i64 => |v| v == b.op.wrap_i64,
+        .extend_i32_s => |v| v == b.op.extend_i32_s,
+        .extend_i32_u => |v| v == b.op.extend_i32_u,
+        .trunc_f32_s => |v| v == b.op.trunc_f32_s,
+        .trunc_f32_u => |v| v == b.op.trunc_f32_u,
+        .trunc_f64_s => |v| v == b.op.trunc_f64_s,
+        .trunc_f64_u => |v| v == b.op.trunc_f64_u,
+        .convert_s => |v| v == b.op.convert_s,
+        .convert_u => |v| v == b.op.convert_u,
+        .demote_f64 => |v| v == b.op.demote_f64,
+        .promote_f32 => |v| v == b.op.promote_f32,
+        .reinterpret => |v| v == b.op.reinterpret,
+        .trunc_sat_f32_s => |v| v == b.op.trunc_sat_f32_s,
+        .trunc_sat_f32_u => |v| v == b.op.trunc_sat_f32_u,
+        .trunc_sat_f64_s => |v| v == b.op.trunc_sat_f64_s,
+        .trunc_sat_f64_u => |v| v == b.op.trunc_sat_f64_u,
         else => false,
     };
 }
@@ -335,11 +434,12 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 }
 
 /// The default optimization pipeline.
+/// Note: deadCodeElimination is excluded because the stack-based x86-64
+/// backend does not track call argument VRegs, so DCE incorrectly removes
+/// instructions that compute values consumed implicitly via the operand stack.
 pub const default_passes: []const PassFn = &.{
     &constantFold,
-    &deadCodeElimination,
     &commonSubexprElimination,
-    &deadCodeElimination, // clean up after CSE
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────────
