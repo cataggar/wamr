@@ -47,6 +47,17 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     var vreg_stack: std.ArrayList(ir.VReg) = .empty;
     defer vreg_stack.deinit(allocator);
 
+    // Safe pop: returns a dummy VReg (0) if the stack is empty.
+    // This handles dead code paths where instructions try to consume
+    // values that were never pushed (code after br/return/unreachable).
+    const dummy_vreg: ir.VReg = 0;
+    const safePop = struct {
+        fn pop(stack: *std.ArrayList(ir.VReg)) ir.VReg {
+            return if (stack.items.len > 0) stack.pop().? else 0;
+        }
+    }.pop;
+    _ = dummy_vreg;
+
     // Assign vregs for parameters (they're the first locals)
     var param_idx: u32 = 0;
     while (param_idx < param_count) : (param_idx += 1) {
@@ -88,17 +99,52 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     // Walk bytecode and emit IR instructions
     var ip: usize = 0;
     const code = func.code;
+    var dead_code = false; // true after unconditional br/return/unreachable
 
     while (ip < code.len) {
         const byte = code[ip];
         ip += 1;
         const op: Opcode = @enumFromInt(byte);
 
+        // In dead code, skip instructions until we reach a block boundary
+        if (dead_code) {
+            switch (op) {
+                .end => {
+                    dead_code = false;
+                    // Fall through to normal end handling below
+                },
+                .@"else" => {
+                    dead_code = false;
+                    // Fall through to normal else handling below
+                },
+                // Skip block-structured opcodes by reading their block type
+                .block, .loop, .@"if" => {
+                    _ = readBlockType(code, &ip);
+                    // Push a dummy frame so end/else matching works
+                    try block_stack.append(allocator, .{
+                        .kind = .block,
+                        .target_block = 0,
+                        .end_block = 0,
+                        .else_block = null,
+                        .stack_depth = vreg_stack.items.len,
+                        .result_arity = 0,
+                        .result_local = null,
+                    });
+                    continue;
+                },
+                else => {
+                    // Skip operands for dead instructions
+                    skipOperands(code, &ip, op);
+                    continue;
+                },
+            }
+        }
+
         switch (op) {
             .end => {
                 if (block_stack.items.len == 0) {
                     // Function-level end: emit ret
-                    const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) vreg_stack.pop().? else null;
+                    const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
                     break;
                 }
@@ -106,7 +152,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const frame = block_stack.pop().?;
                 if (frame.result_arity > 0 and frame.result_local != null) {
                     if (vreg_stack.items.len > frame.stack_depth) {
-                        const result_val = vreg_stack.pop().?;
+                        const result_val = safePop(&vreg_stack);
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = result_val } } });
                     }
                 }
@@ -122,11 +168,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 }
             },
             .@"return" => {
-                const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) vreg_stack.pop().? else null;
+                const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                dead_code = true;
             },
             .@"unreachable" => {
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
+                dead_code = true;
             },
             .nop => {},
             .block => {
@@ -172,7 +220,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .@"if" => {
                 const arity = readBlockType(code, &ip);
-                const cond = vreg_stack.pop().?;
+                const cond = safePop(&vreg_stack);
                 const then_block = try ir_func.newBlock();
                 const else_block = try ir_func.newBlock();
                 const end_block = try ir_func.newBlock();
@@ -203,7 +251,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 // Store then-branch result to synthetic local before jumping to end
                 if (frame.result_arity > 0 and frame.result_local != null) {
                     if (vreg_stack.items.len > frame.stack_depth) {
-                        const result_val = vreg_stack.pop().?;
+                        const result_val = safePop(&vreg_stack);
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = result_val } } });
                     }
                 }
@@ -219,10 +267,11 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .br = target_frame.target_block } });
                 }
+                dead_code = true;
             },
             .br_if => {
                 const depth = readU32(code, &ip);
-                const cond = vreg_stack.pop().?;
+                const cond = safePop(&vreg_stack);
                 if (depth < block_stack.items.len) {
                     const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
                     const fallthrough = try ir_func.newBlock();
@@ -244,7 +293,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 var i: u32 = 0;
                 while (i < arg_count) : (i += 1) {
                     // Pop in reverse: last arg is on top
-                    args[arg_count - 1 - i] = vreg_stack.pop().?;
+                    args[arg_count - 1 - i] = safePop(&vreg_stack);
                 }
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
@@ -273,7 +322,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .local_set => {
                 const idx = readU32(code, &ip);
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = idx, .val = val } } });
             },
             .local_tee => {
@@ -282,8 +331,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = idx, .val = val } } });
             },
             .i32_add, .i32_sub, .i32_mul, .i32_and, .i32_or, .i32_xor => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -299,8 +348,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i32_shl, .i32_shr_s, .i32_shr_u, .i32_rotl, .i32_rotr => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -315,8 +364,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i32_div_s, .i32_div_u, .i32_rem_s, .i32_rem_u => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -330,8 +379,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i32_eq, .i32_ne, .i32_lt_s, .i32_lt_u, .i32_gt_s, .i32_gt_u, .i32_le_s, .i32_le_u, .i32_ge_s, .i32_ge_u => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -351,13 +400,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i32_eqz => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i32_clz, .i32_ctz, .i32_popcnt => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const ir_op: ir.Inst.Op = switch (op) {
                     .i32_clz => .{ .clz = val },
@@ -370,9 +419,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .drop => _ = vreg_stack.pop(),
             .select => {
-                const cond = vreg_stack.pop().?;
-                const if_false = vreg_stack.pop().?;
-                const if_true = vreg_stack.pop().?;
+                const cond = safePop(&vreg_stack);
+                const if_false = safePop(&vreg_stack);
+                const if_true = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .select = .{ .cond = cond, .if_true = if_true, .if_false = if_false } }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
@@ -385,7 +434,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .global_set => {
                 const idx = readU32(code, &ip);
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } } });
             },
             // ── Load variants ────────────────────────────────────────────
@@ -395,7 +444,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
-                const base = vreg_stack.pop().?;
+                const base = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const size: u8 = switch (op) {
                     .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u => 1,
@@ -426,8 +475,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
-                const val = vreg_stack.pop().?;
-                const base = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
+                const base = safePop(&vreg_stack);
                 const size: u8 = switch (op) {
                     .i32_store8, .i64_store8 => 1,
                     .i32_store16, .i64_store16 => 2,
@@ -444,12 +493,35 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 while (i <= count) : (i += 1) _ = readU32(code, &ip);
                 _ = vreg_stack.pop(); // condition
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
+                dead_code = true;
             },
             .call_indirect => {
-                _ = readU32(code, &ip); // type index
+                const type_idx = readU32(code, &ip);
                 _ = readU32(code, &ip); // table index
                 _ = vreg_stack.pop(); // table element index
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
+
+                // Look up the function type to get arg count and result arity
+                const callee_type = if (type_idx < wasm_module.types.len) &wasm_module.types[type_idx] else null;
+                const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
+
+                // Pop args and capture VRegs
+                const args = try allocator.alloc(ir.VReg, arg_count);
+                var ci: u32 = 0;
+                while (ci < arg_count) : (ci += 1) {
+                    args[arg_count - 1 - ci] = safePop(&vreg_stack);
+                }
+
+                // Emit call (treated as a regular call for now — indirect dispatch is a runtime concern)
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
+                    .func_idx = type_idx, // use type index as placeholder
+                    .args = args,
+                } }, .dest = dest, .type = .i32 });
+
+                if (call_result_count > 0) {
+                    try vreg_stack.append(allocator, dest);
+                }
             },
             .memory_size => {
                 _ = readU32(code, &ip); // memory index (always 0)
@@ -467,8 +539,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
             // ── i64 arithmetic ──────────────────────────────────────────
             .i64_add, .i64_sub, .i64_mul, .i64_and, .i64_or, .i64_xor => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -484,8 +556,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i64_shl, .i64_shr_s, .i64_shr_u, .i64_rotl, .i64_rotr => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -500,8 +572,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i64_div_s, .i64_div_u, .i64_rem_s, .i64_rem_u => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -515,8 +587,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i64_eq, .i64_ne, .i64_lt_s, .i64_lt_u, .i64_gt_s, .i64_gt_u, .i64_le_s, .i64_le_u, .i64_ge_s, .i64_ge_u => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -536,13 +608,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .i64_eqz => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i64_clz, .i64_ctz, .i64_popcnt => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const ir_op: ir.Inst.Op = switch (op) {
                     .i64_clz => .{ .clz = val },
@@ -576,8 +648,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .f32_add, .f32_sub, .f32_mul, .f32_div,
             .f64_add, .f64_sub, .f64_mul, .f64_div,
             => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const is_f64 = (op == .f64_add or op == .f64_sub or op == .f64_mul or op == .f64_div);
@@ -594,19 +666,19 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
             // ── Type conversions ────────────────────────────────────────
             .i32_wrap_i64 => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .wrap_i64 = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i64_extend_i32_s => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .extend_i32_s = val }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
             .i64_extend_i32_u => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .extend_i32_u = val }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
@@ -618,7 +690,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .i64_trunc_f32_s, .i64_trunc_f32_u,
             .i64_trunc_f64_s, .i64_trunc_f64_u,
             => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const ir_op: ir.Inst.Op = switch (op) {
                     .i32_trunc_f32_s, .i64_trunc_f32_s => .{ .trunc_f32_s = val },
@@ -639,7 +711,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .f32_convert_i32_s, .f32_convert_i64_s,
             .f64_convert_i32_s, .f64_convert_i64_s,
             => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const ir_type: ir.IrType = switch (op) {
                     .f32_convert_i32_s, .f32_convert_i64_s => .f32,
@@ -651,7 +723,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .f32_convert_i32_u, .f32_convert_i64_u,
             .f64_convert_i32_u, .f64_convert_i64_u,
             => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const ir_type: ir.IrType = switch (op) {
                     .f32_convert_i32_u, .f32_convert_i64_u => .f32,
@@ -663,13 +735,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
             // ── Demote / promote ───────────────────────────────────────
             .f32_demote_f64 => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .demote_f64 = val }, .dest = dest, .type = .f32 });
                 try vreg_stack.append(allocator, dest);
             },
             .f64_promote_f32 => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .promote_f32 = val }, .dest = dest, .type = .f64 });
                 try vreg_stack.append(allocator, dest);
@@ -677,25 +749,25 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
             // ── Reinterpret (bitcast) ──────────────────────────────────
             .i32_reinterpret_f32 => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i64_reinterpret_f64 => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
             .f32_reinterpret_i32 => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .f32 });
                 try vreg_stack.append(allocator, dest);
             },
             .f64_reinterpret_i64 => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .reinterpret = val }, .dest = dest, .type = .f64 });
                 try vreg_stack.append(allocator, dest);
@@ -710,7 +782,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .i64_trunc_sat_f32_s, .i64_trunc_sat_f32_u,
                     .i64_trunc_sat_f64_s, .i64_trunc_sat_f64_u,
                     => {
-                        const val = vreg_stack.pop().?;
+                        const val = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
                         const ir_op: ir.Inst.Op = switch (sub_opcode) {
                             .i32_trunc_sat_f32_s, .i64_trunc_sat_f32_s => .{ .trunc_sat_f32_s = val },
@@ -728,7 +800,37 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
                         try vreg_stack.append(allocator, dest);
                     },
-                    else => return error.UnsupportedOpcode,
+                    .memory_copy => {
+                        _ = readU32(code, &ip); // dst memory (always 0)
+                        _ = readU32(code, &ip); // src memory (always 0)
+                        const len = safePop(&vreg_stack);
+                        const src = safePop(&vreg_stack);
+                        const dst = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_copy = .{ .dst = dst, .src = src, .len = len } } });
+                    },
+                    .memory_fill => {
+                        _ = readU32(code, &ip); // memory (always 0)
+                        const len = safePop(&vreg_stack);
+                        const val = safePop(&vreg_stack);
+                        const dst = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } });
+                    },
+                    .memory_init => {
+                        _ = readU32(code, &ip); // data segment index
+                        _ = readU32(code, &ip); // memory (always 0)
+                        _ = safePop(&vreg_stack); // len
+                        _ = safePop(&vreg_stack); // src offset
+                        _ = safePop(&vreg_stack); // dst
+                        // Stub: memory.init is rare, skip for now
+                    },
+                    .data_drop => {
+                        _ = readU32(code, &ip); // data segment index
+                        // No-op stub
+                    },
+                    else => {
+                        std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
+                        return error.UnsupportedOpcode;
+                    },
                 }
             },
 
@@ -744,8 +846,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .memory_atomic_notify => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
-                        const count = vreg_stack.pop().?;
-                        const base = vreg_stack.pop().?;
+                        const count = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_notify = .{ .base = base, .offset = offset, .count = count } }, .dest = dest, .type = .i32 });
                         try vreg_stack.append(allocator, dest);
@@ -754,9 +856,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .memory_atomic_wait32, .memory_atomic_wait64 => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
-                        const timeout = vreg_stack.pop().?;
-                        const expected = vreg_stack.pop().?;
-                        const base = vreg_stack.pop().?;
+                        const timeout = safePop(&vreg_stack);
+                        const expected = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
                         const size: u8 = switch (sub_opcode) {
                             .memory_atomic_wait32 => 4,
                             .memory_atomic_wait64 => 8,
@@ -773,7 +875,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
-                        const base = vreg_stack.pop().?;
+                        const base = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
                         const size: u8 = switch (sub_opcode) {
                             .i32_atomic_load => 4,
@@ -797,8 +899,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
-                        const val = vreg_stack.pop().?;
-                        const base = vreg_stack.pop().?;
+                        const val = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
                         const size: u8 = switch (sub_opcode) {
                             .i32_atomic_store => 4,
                             .i64_atomic_store => 8,
@@ -831,8 +933,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
-                        const val = vreg_stack.pop().?;
-                        const base = vreg_stack.pop().?;
+                        const val = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
                         const rmw_op: ir.Inst.AtomicRmwOp = switch (sub_opcode) {
                             .i32_atomic_rmw_add, .i64_atomic_rmw_add, .i32_atomic_rmw8_add_u, .i32_atomic_rmw16_add_u, .i64_atomic_rmw8_add_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw32_add_u => .add,
@@ -865,9 +967,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
-                        const replacement = vreg_stack.pop().?;
-                        const expected = vreg_stack.pop().?;
-                        const base = vreg_stack.pop().?;
+                        const replacement = safePop(&vreg_stack);
+                        const expected = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
                         const size: u8 = switch (sub_opcode) {
                             .i32_atomic_rmw_cmpxchg => 4,
@@ -885,7 +987,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try vreg_stack.append(allocator, dest);
                     },
 
-                    else => return error.UnsupportedOpcode,
+                    else => {
+                        std.debug.print("wamrc: unsupported atomic opcode 0xFE 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
+                        return error.UnsupportedOpcode;
+                    },
                 }
             },
 
@@ -893,7 +998,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .i32_extend8_s, .i32_extend16_s,
             .i64_extend8_s, .i64_extend16_s, .i64_extend32_s,
             => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const ir_op: ir.Inst.Op = switch (op) {
                     .i32_extend8_s, .i64_extend8_s => .{ .extend8_s = val },
@@ -913,8 +1018,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .f32_eq, .f32_ne, .f32_lt, .f32_gt, .f32_le, .f32_ge,
             .f64_eq, .f64_ne, .f64_lt, .f64_gt, .f64_le, .f64_ge,
             => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -934,7 +1039,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .f32_abs, .f32_neg, .f32_sqrt, .f32_ceil, .f32_floor, .f32_trunc, .f32_nearest,
             .f64_abs, .f64_neg, .f64_sqrt, .f64_ceil, .f64_floor, .f64_trunc, .f64_nearest,
             => {
-                const val = vreg_stack.pop().?;
+                const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const ir_op: ir.Inst.Op = switch (op) {
                     .f32_abs, .f64_abs => .{ .f_abs = val },
@@ -958,8 +1063,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .f32_min, .f32_max, .f32_copysign,
             .f64_min, .f64_max, .f64_copysign,
             => {
-                const rhs = vreg_stack.pop().?;
-                const lhs = vreg_stack.pop().?;
+                const rhs = safePop(&vreg_stack);
+                const lhs = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
@@ -976,11 +1081,59 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
 
-            else => return error.UnsupportedOpcode,
+            else => {
+                std.debug.print("wamrc: unsupported opcode 0x{X:0>2}\n", .{byte});
+                return error.UnsupportedOpcode;
+            },
         }
     }
 
     return ir_func;
+}
+
+/// Skip operands of a dead instruction to keep IP in sync.
+fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
+    switch (op) {
+        // Fixed-width immediate operands
+        .i32_const => _ = readI32(code, ip),
+        .i64_const => _ = readI64(code, ip),
+        .f32_const => ip.* += 4,
+        .f64_const => ip.* += 8,
+        .local_get, .local_set, .local_tee => _ = readU32(code, ip),
+        .global_get, .global_set => _ = readU32(code, ip),
+        .br, .br_if => _ = readU32(code, ip),
+        .call => _ = readU32(code, ip),
+        .call_indirect => {
+            _ = readU32(code, ip); // type
+            _ = readU32(code, ip); // table
+        },
+        .memory_size, .memory_grow => _ = readU32(code, ip),
+        .br_table => {
+            const count = readU32(code, ip);
+            var i: u32 = 0;
+            while (i <= count) : (i += 1) _ = readU32(code, ip);
+        },
+        // Load/store ops have align + offset
+        .i32_load, .i64_load, .f32_load, .f64_load,
+        .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
+        .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u,
+        .i64_load32_s, .i64_load32_u,
+        .i32_store, .i64_store, .f32_store, .f64_store,
+        .i32_store8, .i32_store16, .i64_store8, .i64_store16, .i64_store32,
+        => {
+            _ = readU32(code, ip); // align
+            _ = readU32(code, ip); // offset
+        },
+        // Prefix opcodes
+        .misc_prefix => _ = readU32(code, ip),
+        .atomic_prefix => {
+            _ = readU32(code, ip); // sub-opcode
+            _ = readU32(code, ip); // align
+            _ = readU32(code, ip); // offset
+        },
+        // No operands
+        else => {},
+    }
 }
 
 // ── LEB128 decoders ────────────────────────────────────────────────
