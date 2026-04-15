@@ -22,7 +22,7 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
 
     for (wasm_module.functions) |func| {
         const func_type = wasm_module.types[func.type_idx];
-        const ir_func = try lowerFunction(&func, &func_type, allocator);
+        const ir_func = try lowerFunction(&func, &func_type, wasm_module, allocator);
         _ = try ir_module.addFunction(ir_func);
     }
 
@@ -30,7 +30,7 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
 }
 
 /// Lower a single Wasm function into IR.
-fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncType, allocator: std.mem.Allocator) LowerError!ir.IrFunction {
+fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncType, wasm_module: *const types.WasmModule, allocator: std.mem.Allocator) LowerError!ir.IrFunction {
     const param_count: u32 = @intCast(func_type.params.len);
     const result_count: u32 = @intCast(func_type.results.len);
 
@@ -236,12 +236,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .call => {
                 const func_idx = readU32(code, &ip);
-                // For now, emit a call with current stack args.
-                // Full ABI arg passing will be added later.
+                // Look up callee type to determine arg count
+                const callee_type = wasm_module.getFuncType(func_idx);
+                const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                // Pop args from vreg stack (they were pushed by the caller)
+                var i: u32 = 0;
+                while (i < arg_count) : (i += 1) {
+                    _ = vreg_stack.pop();
+                }
                 const dest = ir_func.newVReg();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
                     .func_idx = func_idx,
-                    .args = &.{},
+                    .arg_count = arg_count,
                 } }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },

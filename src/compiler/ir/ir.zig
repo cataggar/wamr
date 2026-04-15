@@ -84,7 +84,7 @@ pub const Inst = struct {
         @"unreachable": void,
 
         // Function calls
-        call: struct { func_idx: u32, args: []const VReg },
+        call: struct { func_idx: u32, arg_count: u32 },
 
         // Parametric
         select: struct { cond: VReg, if_true: VReg, if_false: VReg },

@@ -77,7 +77,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         },
         .br_if => |bi| list.append(bi.cond),
         .ret => |maybe_vreg| if (maybe_vreg) |v| list.append(v),
-        .call => |c| for (c.args) |a| list.append(a),
+        .call => {},
         .select => |sel| {
             list.append(sel.cond);
             list.append(sel.if_true);
