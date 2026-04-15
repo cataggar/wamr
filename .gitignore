@@ -37,3 +37,4 @@ tests/benchmarks/coremark/coremark/
 tests/benchmarks/**/*.wasm
 tests/benchmarks/**/*.aot
 tests/benchmarks/**/*.exe
+bin/
