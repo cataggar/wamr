@@ -159,10 +159,13 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     if (inst.code_base == null) return error.CodeMappingFailed;
     const addr = getFuncAddr(inst, func_idx) orelse return error.FunctionNotFound;
 
-    // Construct the right function pointer type at comptime.
-    const FnPtr = *const fn () callconv(.c) Result;
+    // Get linear memory base pointer (first memory, or null)
+    const mem_base: usize = if (inst.memories.len > 0) @intFromPtr(inst.memories[0].data.ptr) else 0;
+
+    // AOT-compiled functions receive the memory base as hidden first parameter.
+    const FnPtr = *const fn (usize) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
-    return func_ptr();
+    return func_ptr(mem_base);
 }
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
