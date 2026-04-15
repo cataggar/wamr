@@ -591,7 +591,7 @@ fn compileInst(
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
             try stack.flush(code);
-            const n_args = cl.arg_count;
+            const n_args: u32 = @intCast(cl.args.len);
 
             // Pop args from operand stack in reverse order into ABI registers.
             // Wasm pushes args left-to-right, so first arg is deepest.
@@ -604,15 +604,10 @@ fn compileInst(
                 while (i > 0) {
                     i -= 1;
                     try stack.pop(code, .rax);
-                    // Store to a temp area: use [rbp - frame_temp_base - i*8]
-                    // We use R11 as a scratch for the offset calculation
-                    // Actually, simpler: just load into the right ABI reg directly
-                    // Since we pop in reverse, arg index = i
                     try code.movRegReg(param_regs[i], .rax);
                 }
             } else if (n_args > param_regs.len) {
                 // More than 6 args: pop extras to stack, then first 6 to regs
-                // For now, handle only register-passed args
                 var i: u32 = n_args;
                 while (i > param_regs.len) {
                     i -= 1;
