@@ -34,9 +34,13 @@ pub const AllocResult = struct {
 };
 
 /// Allocatable registers as PhysReg IDs.
-/// Excludes RSP (4) and RBP (5) which are frame pointers.
-const alloc_regs = [_]PhysReg{ 0, 1, 2, 6, 7, 8, 9, 10, 11 };
-// rax=0, rcx=1, rdx=2, rsi=6, rdi=7, r8=8, r9=9, r10=10, r11=11
+/// Excludes RSP (4), RBP (5), and scratch regs R10 (10), R11 (11).
+const alloc_regs = [_]PhysReg{ 0, 1, 2, 6, 7, 8, 9 };
+// rax=0, rcx=1, rdx=2, rsi=6, rdi=7, r8=8, r9=9
+
+/// Scratch registers for spill loads (not allocatable).
+pub const scratch1: PhysReg = 10; // r10
+pub const scratch2: PhysReg = 11; // r11
 
 /// Run linear scan register allocation on a function.
 pub fn allocate(
@@ -155,10 +159,11 @@ fn insertActive(
 
 /// Compute spill slot offset from RBP.
 /// Spill slots start after locals and operand stack area.
+/// `local_count` is needed to position spills after the local variable area.
 fn computeSpillOffset(spill_idx: u32) i32 {
-    // Use a dedicated spill area after the main frame
-    // Offset: -(base + spill_idx * 8) where base is a large offset to avoid conflicts
-    const spill_base: i32 = -1024; // well past the operand stack area
+    // Spill area starts at [rbp - 600] to avoid conflicts with locals and operand stack.
+    // Each spill slot is 8 bytes.
+    const spill_base: i32 = -600;
     return spill_base - @as(i32, @intCast(spill_idx * 8));
 }
 
