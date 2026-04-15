@@ -362,6 +362,53 @@ pub const CodeBuffer = struct {
         try self.emitI32(imm);
     }
 
+    /// SUB reg, imm32 (64-bit).
+    pub fn subRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0x81);
+        try self.modrm(0b11, 5, dst.low3());
+        try self.emitI32(imm);
+    }
+
+    /// AND reg, imm32 (64-bit, sign-extended).
+    pub fn andRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0x81);
+        try self.modrm(0b11, 4, dst.low3());
+        try self.emitI32(imm);
+    }
+
+    /// OR reg, imm32 (64-bit, sign-extended).
+    pub fn orRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0x81);
+        try self.modrm(0b11, 1, dst.low3());
+        try self.emitI32(imm);
+    }
+
+    /// XOR reg, imm32 (64-bit, sign-extended).
+    pub fn xorRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0x81);
+        try self.modrm(0b11, 6, dst.low3());
+        try self.emitI32(imm);
+    }
+
+    /// CMP reg, imm32 (64-bit, sign-extended).
+    pub fn cmpRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0x81);
+        try self.modrm(0b11, 7, dst.low3());
+        try self.emitI32(imm);
+    }
+
+    /// XOR r32, r32 — zero register without REX.W (2 bytes, zero idiom).
+    pub fn xorReg32(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.rex(false, reg, reg);
+        try self.emitByte(0x31);
+        try self.modrm(0b11, reg.low3(), reg.low3());
+    }
+
     /// MOV r32, [base + disp32] — 32-bit load (no REX.W, zero-extends to 64).
     pub fn movRegMemNoRex(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
         if (dst.isExtended() or base.isExtended()) {
@@ -1019,4 +1066,64 @@ test "zeroExtendReg 64-bit (no-op)" {
     defer buf.deinit();
     try buf.zeroExtendReg(.rax, 8);
     try hexEqual(buf.getCode(), &.{});
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Immediate-form instruction tests
+// ═══════════════════════════════════════════════════════════════════════
+
+test "subRegImm32 rax, 10" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.subRegImm32(.rax, 10);
+    // REX.W 81 /5 rax, 0A000000: 48 81 E8 0A 00 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE8, 0x0A, 0x00, 0x00, 0x00 });
+}
+
+test "andRegImm32 rax, 0xFF" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.andRegImm32(.rax, 0xFF);
+    // REX.W 81 /4 rax: 48 81 E0 FF 00 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE0, 0xFF, 0x00, 0x00, 0x00 });
+}
+
+test "orRegImm32 rax, 1" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.orRegImm32(.rax, 1);
+    // REX.W 81 /1 rax: 48 81 C8 01 00 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xC8, 0x01, 0x00, 0x00, 0x00 });
+}
+
+test "xorRegImm32 rax, 0x55" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.xorRegImm32(.rax, 0x55);
+    // REX.W 81 /6 rax: 48 81 F0 55 00 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xF0, 0x55, 0x00, 0x00, 0x00 });
+}
+
+test "cmpRegImm32 rax, 42" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.cmpRegImm32(.rax, 42);
+    // REX.W 81 /7 rax: 48 81 F8 2A 00 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xF8, 0x2A, 0x00, 0x00, 0x00 });
+}
+
+test "xorReg32 rax (zero idiom, 2 bytes)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.xorReg32(.rax);
+    // XOR eax, eax: 31 C0
+    try hexEqual(buf.getCode(), &.{ 0x31, 0xC0 });
+}
+
+test "xorReg32 r8 (extended, 3 bytes)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.xorReg32(.r8);
+    // REX 45 31 C0 (XOR r8d, r8d)
+    try hexEqual(buf.getCode(), &.{ 0x45, 0x31, 0xC0 });
 }
