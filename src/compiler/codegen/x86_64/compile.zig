@@ -1355,6 +1355,235 @@ fn compileInstRA(
             try writeDef(code, alloc_result, dest, src_reg);
         },
 
+        // ── Float unary operations ─────────────────────────────────────
+        .f_neg => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // XOR sign bit: for f64 flip bit 63, for f32 flip bit 31
+            if (inst.type == .f32) {
+                try code.emitSlice(&.{ 0x48, 0xB9 }); // mov rcx, imm64
+                try code.emitU64(0x0000000080000000);
+                try code.xorRegReg(.rax, .rcx);
+            } else {
+                try code.emitSlice(&.{ 0x48, 0xB9 }); // mov rcx, imm64
+                try code.emitU64(0x8000000000000000);
+                try code.xorRegReg(.rax, .rcx);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .f_abs => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // AND clear sign bit
+            if (inst.type == .f32) {
+                try code.emitSlice(&.{ 0x48, 0xB9 }); // mov rcx, imm64
+                try code.emitU64(0x000000007FFFFFFF);
+                try code.andRegReg(.rax, .rcx);
+            } else {
+                try code.emitSlice(&.{ 0x48, 0xB9 }); // mov rcx, imm64
+                try code.emitU64(0x7FFFFFFFFFFFFFFF);
+                try code.andRegReg(.rax, .rcx);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .f_sqrt => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            if (inst.type == .f32) {
+                try code.movdToXmm(.rax, .rax);
+                try code.sqrtss(.rax, .rax);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.sqrtsd(.rax, .rax);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .f_ceil, .f_floor, .f_trunc, .f_nearest => |vreg| {
+            // ROUNDSD/ROUNDSS (SSE4.1): 66 0F 3A 0B/0A xmm, xmm, imm8
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            const round_mode: u8 = switch (inst.op) {
+                .f_ceil => 0x0A,
+                .f_floor => 0x09,
+                .f_trunc => 0x0B,
+                .f_nearest => 0x08,
+                else => unreachable,
+            };
+            if (inst.type == .f32) {
+                try code.movdToXmm(.rax, .rax);
+                // ROUNDSS: 66 0F 3A 0A C0 imm8
+                try code.emitSlice(&.{ 0x66, 0x0F, 0x3A, 0x0A, 0xC0, round_mode });
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                // ROUNDSD: 66 0F 3A 0B C0 imm8
+                try code.emitSlice(&.{ 0x66, 0x0F, 0x3A, 0x0B, 0xC0, round_mode });
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        // ── Float binary operations ───────────────────────────────────
+        .f_min => |bin| {
+            const dest = inst.dest orelse return;
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            if (inst.type == .f32) {
+                try code.movdToXmm(.rax, .rax);
+                try code.movdToXmm(.rcx, .rcx);
+                try code.minss(.rax, .rcx);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.movqToXmm(.rcx, .rcx);
+                try code.minsd(.rax, .rcx);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .f_max => |bin| {
+            const dest = inst.dest orelse return;
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            if (inst.type == .f32) {
+                try code.movdToXmm(.rax, .rax);
+                try code.movdToXmm(.rcx, .rcx);
+                try code.maxss(.rax, .rcx);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.movqToXmm(.rcx, .rcx);
+                try code.maxsd(.rax, .rcx);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .f_copysign => |bin| {
+            const dest = inst.dest orelse return;
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            // copysign: magnitude from lhs, sign from rhs
+            if (inst.type == .f32) {
+                try code.emitSlice(&.{ 0x48, 0xBA }); // mov rdx, imm64
+                try code.emitU64(0x000000007FFFFFFF);
+                try code.andRegReg(.rax, .rdx);
+                try code.emitSlice(&.{ 0x48, 0xBA }); // mov rdx, imm64
+                try code.emitU64(0x0000000080000000);
+                try code.andRegReg(.rcx, .rdx);
+            } else {
+                try code.emitSlice(&.{ 0x48, 0xBA }); // mov rdx, imm64
+                try code.emitU64(0x7FFFFFFFFFFFFFFF);
+                try code.andRegReg(.rax, .rdx);
+                try code.emitSlice(&.{ 0x48, 0xBA }); // mov rdx, imm64
+                try code.emitU64(0x8000000000000000);
+                try code.andRegReg(.rcx, .rdx);
+            }
+            try code.orRegReg(.rax, .rcx);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
+        // ── Int/Float conversions ─────────────────────────────────────
+        .trunc_f32_s, .trunc_f64_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            if (inst.op == .trunc_f32_s) {
+                try code.movdToXmm(.rax, .rax);
+                try code.cvttss2si(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.cvttsd2si(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .trunc_f32_u, .trunc_f64_u => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            if (inst.op == .trunc_f32_u) {
+                try code.movdToXmm(.rax, .rax);
+                try code.cvttss2si(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.cvttsd2si(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .trunc_sat_f32_s, .trunc_sat_f64_s, .trunc_sat_f32_u, .trunc_sat_f64_u => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            switch (inst.op) {
+                .trunc_sat_f32_s, .trunc_sat_f32_u => {
+                    try code.movdToXmm(.rax, .rax);
+                    try code.cvttss2si(.rax, .rax);
+                },
+                .trunc_sat_f64_s, .trunc_sat_f64_u => {
+                    try code.movqToXmm(.rax, .rax);
+                    try code.cvttsd2si(.rax, .rax);
+                },
+                else => unreachable,
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .convert_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            if (inst.type == .f32) {
+                try code.cvtsi2ss(.rax, .rax);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd(.rax, .rax);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .convert_u => |vreg| {
+            // Simplified: treat as signed conversion (correct for values < 2^63)
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            if (inst.type == .f32) {
+                try code.cvtsi2ss(.rax, .rax);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd(.rax, .rax);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .demote_f64 => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            try code.movqToXmm(.rax, .rax);
+            try code.cvtsd2ss(.rax, .rax);
+            try code.movdFromXmm(.rax, .rax);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+        .promote_f32 => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            try code.movdToXmm(.rax, .rax);
+            try code.cvtss2sd(.rax, .rax);
+            try code.movqFromXmm(.rax, .rax);
+            try writeDef(code, alloc_result, dest, .rax);
+        },
+
         // ── Stubs for ops not commonly hit ────────────────────────────
         else => {
             // For unhandled ops, emit a no-op placeholder
