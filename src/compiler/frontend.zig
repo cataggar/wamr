@@ -64,6 +64,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         stack_depth: usize,
         /// Result arity of this block.
         result_arity: u32,
+        /// Synthetic local slot for passing result values across branches.
+        result_local: ?u32,
     };
     var block_stack: std.ArrayList(BlockFrame) = .empty;
     defer block_stack.deinit(allocator);
@@ -98,13 +100,24 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
                     break;
                 }
-                // End of a block/loop/if: branch to continuation
+                // End of a block/loop/if: store result to synthetic local, branch to continuation
                 const frame = block_stack.pop().?;
-                if (frame.result_arity > 0 and vreg_stack.items.len > frame.stack_depth) {
-                    // Pass result value through
+                if (frame.result_arity > 0 and frame.result_local != null) {
+                    if (vreg_stack.items.len > frame.stack_depth) {
+                        const result_val = vreg_stack.pop().?;
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = result_val } } });
+                    }
                 }
+                // Trim stack to block entry depth
+                vreg_stack.items.len = frame.stack_depth;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
                 current_block = frame.end_block;
+                // Load result from synthetic local at merge point
+                if (frame.result_arity > 0 and frame.result_local != null) {
+                    const dest = ir_func.newVReg();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = frame.result_local.? }, .dest = dest, .type = .i32 });
+                    try vreg_stack.append(allocator, dest);
+                }
             },
             .@"return" => {
                 const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) vreg_stack.pop().? else null;
@@ -117,29 +130,42 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .block => {
                 const arity = readBlockType(code, &ip);
                 const end_block = try ir_func.newBlock();
+                const result_local: ?u32 = if (arity > 0) blk: {
+                    const idx = total_locals;
+                    total_locals += 1;
+                    ir_func.local_count = total_locals;
+                    break :blk idx;
+                } else null;
                 try block_stack.append(allocator, .{
                     .kind = .block,
-                    .target_block = end_block, // br targets end
+                    .target_block = end_block,
                     .end_block = end_block,
                     .else_block = null,
                     .stack_depth = vreg_stack.items.len,
                     .result_arity = arity,
+                    .result_local = result_local,
                 });
             },
             .loop => {
                 const arity = readBlockType(code, &ip);
                 const loop_header = try ir_func.newBlock();
                 const end_block = try ir_func.newBlock();
-                // Branch from current to loop header
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br = loop_header } });
                 current_block = loop_header;
+                const result_local: ?u32 = if (arity > 0) blk: {
+                    const idx = total_locals;
+                    total_locals += 1;
+                    ir_func.local_count = total_locals;
+                    break :blk idx;
+                } else null;
                 try block_stack.append(allocator, .{
                     .kind = .loop,
-                    .target_block = loop_header, // br targets header (loop back)
+                    .target_block = loop_header,
                     .end_block = end_block,
                     .else_block = null,
                     .stack_depth = vreg_stack.items.len,
                     .result_arity = arity,
+                    .result_local = result_local,
                 });
             },
             .@"if" => {
@@ -154,18 +180,33 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .else_block = else_block,
                 } } });
                 current_block = then_block;
+                const result_local: ?u32 = if (arity > 0) blk: {
+                    const idx = total_locals;
+                    total_locals += 1;
+                    ir_func.local_count = total_locals;
+                    break :blk idx;
+                } else null;
                 try block_stack.append(allocator, .{
                     .kind = .@"if",
-                    .target_block = end_block, // br targets end
+                    .target_block = end_block,
                     .end_block = end_block,
                     .else_block = else_block,
                     .stack_depth = vreg_stack.items.len,
                     .result_arity = arity,
+                    .result_local = result_local,
                 });
             },
             .@"else" => {
                 const frame = &block_stack.items[block_stack.items.len - 1];
-                // End of then branch: jump to end
+                // Store then-branch result to synthetic local before jumping to end
+                if (frame.result_arity > 0 and frame.result_local != null) {
+                    if (vreg_stack.items.len > frame.stack_depth) {
+                        const result_val = vreg_stack.pop().?;
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = result_val } } });
+                    }
+                }
+                // Trim stack to block entry depth for else branch
+                vreg_stack.items.len = frame.stack_depth;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
                 current_block = frame.else_block orelse return error.InvalidBytecode;
                 frame.else_block = null; // consumed
