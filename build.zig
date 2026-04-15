@@ -217,6 +217,18 @@ pub fn build(b: *std.Build) void {
     const run_analysis_tests = b.addRunArtifact(analysis_tests);
     test_step.dependOn(&run_analysis_tests.step);
 
+    // Compiler register allocator tests
+    const regalloc_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/regalloc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const regalloc_tests = b.addTest(.{
+        .root_module = regalloc_test_module,
+    });
+    const run_regalloc_tests = b.addRunArtifact(regalloc_tests);
+    test_step.dependOn(&run_regalloc_tests.step);
+
     // ── Benchmark ─────────────────────────────────────────────────────
     const bench_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/bench_codegen.zig"),
