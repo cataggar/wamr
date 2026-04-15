@@ -507,3 +507,64 @@ test "computeLiveRanges: call with explicit args" {
     try std.testing.expectEqual(@as(u32, 1), ranges[1].start);
     try std.testing.expectEqual(@as(u32, 2), ranges[1].end);
 }
+
+test "computeLiveness: cross-block value is live" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+
+    const v0 = func.newVReg();
+    try block0.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0 });
+    try block0.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v0 } } });
+    try block0.append(.{ .op = .{ .br = b1 } });
+
+    const v1 = func.newVReg();
+    try block1.append(.{ .op = .{ .local_get = 0 }, .dest = v1 });
+    try block1.append(.{ .op = .{ .ret = v1 } });
+
+    var liveness = try computeLiveness(&func, allocator);
+    defer {
+        var it = liveness.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.live_in.deinit();
+            entry.value_ptr.live_out.deinit();
+        }
+        liveness.deinit();
+    }
+
+    // Block 0 should have nothing live_in (entry block)
+    try std.testing.expectEqual(@as(u32, 0), liveness.get(b0).?.live_in.count());
+}
+
+test "buildSuccessors: loop backedge" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+
+    try block0.append(.{ .op = .{ .br = b1 } });
+    const v0 = func.newVReg();
+    try block1.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try block1.append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b0, .else_block = b1 } } });
+
+    var succs = try buildSuccessors(&func, allocator);
+    defer {
+        var it = succs.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        succs.deinit();
+    }
+
+    // Block 0 has successor b1
+    try std.testing.expectEqual(@as(usize, 1), succs.get(b0).?.len);
+    // Block 1 has successors b0 and b1 (loop)
+    try std.testing.expectEqual(@as(usize, 2), succs.get(b1).?.len);
+}
