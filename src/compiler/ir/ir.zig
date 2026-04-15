@@ -116,6 +116,21 @@ pub const Inst = struct {
         wrap_i64: VReg,
         extend_i32_s: VReg,
         extend_i32_u: VReg,
+
+        // Type conversions
+        trunc_f32_s: VReg,
+        trunc_f32_u: VReg,
+        trunc_f64_s: VReg,
+        trunc_f64_u: VReg,
+        convert_s: VReg,
+        convert_u: VReg,
+        demote_f64: VReg,
+        promote_f32: VReg,
+        reinterpret: VReg,
+        trunc_sat_f32_s: VReg,
+        trunc_sat_f32_u: VReg,
+        trunc_sat_f64_s: VReg,
+        trunc_sat_f64_u: VReg,
     };
 
     pub const BinOp = struct {
