@@ -31,3 +31,9 @@ tests/spec-json/
 # Windows NUL device artifacts
 NUL.*
 wasm-spec-temp/
+
+# Benchmark artifacts
+tests/benchmarks/coremark/coremark/
+tests/benchmarks/**/*.wasm
+tests/benchmarks/**/*.aot
+tests/benchmarks/**/*.exe
