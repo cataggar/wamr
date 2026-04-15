@@ -259,6 +259,24 @@ fn compileInst(code: *emit.CodeBuffer, inst: ir.Inst, reg_map: *RegMap) !void {
         },
 
         // Function call: setup args, call rel32, collect result
+        // Float constants: store bit pattern in a GPR (no XMM allocation yet)
+        .fconst_32 => |val| {
+            const dest = inst.dest orelse return;
+            const loc = try reg_map.assign(dest);
+            switch (loc) {
+                .reg => |r| try code.movRegImm32(r, @bitCast(val)),
+                .stack => {},
+            }
+        },
+        .fconst_64 => |val| {
+            const dest = inst.dest orelse return;
+            const loc = try reg_map.assign(dest);
+            switch (loc) {
+                .reg => |r| try code.movRegImm64(r, @bitCast(val)),
+                .stack => {},
+            }
+        },
+
         .call => |cl| {
             const dest = inst.dest orelse return;
             // For now: emit a stub that just returns 0 in the dest register.

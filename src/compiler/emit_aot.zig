@@ -38,6 +38,12 @@ pub const ExportEntry = struct {
     index: u32,
 };
 
+pub const DataSegmentEntry = struct {
+    memory_idx: u32,
+    offset: u32,
+    data: []const u8,
+};
+
 /// Emit an AOT binary to an owned byte buffer.
 pub fn emit(
     allocator: std.mem.Allocator,
@@ -45,6 +51,7 @@ pub fn emit(
     func_offsets: []const u32,
     exports: []const ExportEntry,
     options: AotEmitOptions,
+    data_segments: ?[]const DataSegmentEntry,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -84,6 +91,22 @@ pub fn emit(
         try emitSection(allocator, &buf, 4, tmp.items);
     }
 
+    // Section 5: data segments
+    if (data_segments) |segments| {
+        if (segments.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(segments.len));
+            for (segments) |seg| {
+                try appendU32Le(&tmp, allocator, seg.memory_idx);
+                try appendU32Le(&tmp, allocator, seg.offset);
+                try appendU32Le(&tmp, allocator, @intCast(seg.data.len));
+                try tmp.appendSlice(allocator, seg.data);
+            }
+            try emitSection(allocator, &buf, 5, tmp.items);
+        }
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -119,7 +142,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
 
 test "emit: minimal (no functions, no exports) has correct magic and version" {
     const allocator = std.testing.allocator;
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{});
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null);
     defer allocator.free(data);
 
     // At least header (8) + target_info section (8+40) + text section (8+0) + func section (8+4) + export section (8+4)
@@ -134,7 +157,7 @@ test "emit: one function offset produces valid function section" {
     const allocator = std.testing.allocator;
     const code = [_]u8{ 0xCC, 0xC3 }; // int3; ret
     const offsets = [_]u32{0};
-    const data = try emit(allocator, &code, &offsets, &.{}, .{});
+    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 3 (function)
@@ -165,7 +188,7 @@ test "emit: export section encodes name, kind, and index" {
         .kind = .function,
         .index = 7,
     }};
-    const data = try emit(allocator, &.{}, &.{}, &exports, .{});
+    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 4 (export)
@@ -212,7 +235,7 @@ test "roundtrip: emit then load with AOT loader" {
     const data = try emit(allocator, &code, &offsets, &exports, .{
         .arch = arch_name,
         .e_machine = 0x3E,
-    });
+    }, null);
     defer allocator.free(data);
 
     // Parse back with the AOT loader

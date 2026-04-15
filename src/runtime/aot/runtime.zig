@@ -64,6 +64,15 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
     inst.memories = try allocateMemories(module, allocator);
     errdefer freeMemories(inst.memories, allocator);
 
+    // Apply data segments to linear memory
+    for (module.data_segments) |seg| {
+        if (seg.memory_idx >= inst.memories.len) continue;
+        const mem = inst.memories[seg.memory_idx];
+        const end = @as(usize, seg.offset) + seg.data.len;
+        if (end > mem.data.len) continue;
+        @memcpy(mem.data[seg.offset..][0..seg.data.len], seg.data);
+    }
+
     inst.tables = try allocateTables(module, allocator);
     errdefer freeTables(inst.tables, allocator);
 

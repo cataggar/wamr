@@ -139,12 +139,29 @@ pub fn main(init: std.process.Init) !void {
         .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
     }
 
+    // Build data segment entries from the parsed wasm module
+    var data_segs: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
+    defer data_segs.deinit(allocator);
+    for (module.data_segments) |seg| {
+        if (seg.is_passive) continue;
+        const offset: u32 = switch (seg.offset) {
+            .i32_const => |v| @bitCast(v),
+            else => continue,
+        };
+        try data_segs.append(allocator, .{
+            .memory_idx = seg.memory_idx,
+            .offset = offset,
+            .data = seg.data,
+        });
+    }
+
     const aot_binary = try emit_aot.emit(
         allocator,
         compiled.code,
         compiled.offsets,
         exports.items,
         .{ .arch = arch_name },
+        if (data_segs.items.len > 0) data_segs.items else null,
     );
     defer allocator.free(aot_binary);
 
