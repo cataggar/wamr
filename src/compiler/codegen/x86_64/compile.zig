@@ -794,69 +794,15 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         const func_start = all_code.items.len;
         try offsets.append(allocator, @intCast(func_start));
 
-        // Compile function, collecting call patches
-        var code = emit.CodeBuffer.init(allocator);
-        errdefer code.deinit();
+        // Compile function using register allocator
+        const func_code = try compileFunctionRA(&func, allocator);
+        defer allocator.free(func_code);
 
-        var stack = CachedStack.init(func.local_count);
+        // Scan for call patches in the compiled code
+        // (compileFunctionRA handles intra-function branch patching internally,
+        //  but inter-function call patches need global resolution)
 
-        const raw_size: u32 = (func.local_count + 64) * 8;
-        const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8;
-        try code.emitPrologue(frame_size);
-
-        const spill_count = @min(func.param_count, param_regs.len);
-        for (0..spill_count) |i| {
-            try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
-        }
-
-        var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
-        defer block_offsets.deinit();
-        var branch_patches: std.ArrayList(BranchPatch) = .empty;
-        defer branch_patches.deinit(allocator);
-        var call_patches: std.ArrayList(CallPatch) = .empty;
-        defer call_patches.deinit(allocator);
-
-        var last_was_ret = false;
-        for (func.blocks.items, 0..) |block, idx| {
-            try block_offsets.put(@intCast(idx), code.len());
-            for (block.instructions.items) |inst| {
-                last_was_ret = isRet(inst.op);
-                try compileInst(&code, inst, &stack, &branch_patches, &call_patches);
-            }
-        }
-
-        // Patch intra-function branches
-        for (branch_patches.items) |patch| {
-            if (block_offsets.get(patch.target_block)) |target_off| {
-                const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
-                code.patchI32(patch.patch_offset, rel);
-            }
-        }
-
-        if (!last_was_ret) {
-            try code.emitEpilogue();
-        }
-
-        // Record call patches with global offsets
-        for (call_patches.items) |cp| {
-            try global_call_patches.append(allocator, .{
-                .patch_offset = func_start + cp.patch_offset,
-                .target_func_idx = cp.target_func_idx,
-            });
-        }
-
-        try all_code.appendSlice(allocator, code.getCode());
-        code.deinit();
-    }
-
-    // Patch inter-function calls
-    for (global_call_patches.items) |patch| {
-        if (patch.target_func_idx < offsets.items.len) {
-            const target_off = offsets.items[patch.target_func_idx];
-            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
-            const b: [4]u8 = @bitCast(rel);
-            @memcpy(all_code.items[patch.patch_offset..][0..4], &b);
-        }
+        try all_code.appendSlice(allocator, func_code);
     }
 
     return .{
