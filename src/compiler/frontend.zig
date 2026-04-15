@@ -40,7 +40,6 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
     // Create entry block
     const entry_id = try ir_func.newBlock();
-    const entry = ir_func.getBlock(entry_id);
 
     // Simple value stack tracking (maps stack positions to vregs)
     var vreg_stack: std.ArrayList(ir.VReg) = .empty;
@@ -52,6 +51,36 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         _ = ir_func.newVReg();
     }
 
+    // ── Control flow block stack ──────────────────────────────────────
+    const BlockFrame = struct {
+        kind: enum { block, loop, @"if" },
+        /// Block to jump to on `br` (end_block for block/if, header for loop).
+        target_block: ir.BlockId,
+        /// Continuation block after this construct ends.
+        end_block: ir.BlockId,
+        /// For if: the else block (if present).
+        else_block: ?ir.BlockId,
+        /// Value stack depth on entry (for multi-value cleanup).
+        stack_depth: usize,
+        /// Result arity of this block.
+        result_arity: u32,
+    };
+    var block_stack: std.ArrayList(BlockFrame) = .empty;
+    defer block_stack.deinit(allocator);
+
+    // Track current block
+    var current_block: ir.BlockId = entry_id;
+
+    // Helper: read block type (-0x40 = void, else valtype)
+    const readBlockType = struct {
+        fn call(code: []const u8, ip_ptr: *usize) u32 {
+            const byte = code[ip_ptr.*];
+            ip_ptr.* += 1;
+            if (byte == 0x40) return 0; // void
+            return 1; // any valtype = 1 result
+        }
+    }.call;
+
     // Walk bytecode and emit IR instructions
     var ip: usize = 0;
     const code = func.code;
@@ -62,38 +91,144 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         const op: Opcode = @enumFromInt(byte);
 
         switch (op) {
-            .end, .@"return" => {
+            .end => {
+                if (block_stack.items.len == 0) {
+                    // Function-level end: emit ret
+                    const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) vreg_stack.pop().? else null;
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                    break;
+                }
+                // End of a block/loop/if: branch to continuation
+                const frame = block_stack.pop().?;
+                if (frame.result_arity > 0 and vreg_stack.items.len > frame.stack_depth) {
+                    // Pass result value through
+                }
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
+                current_block = frame.end_block;
+            },
+            .@"return" => {
                 const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) vreg_stack.pop().? else null;
-                try entry.append(.{ .op = .{ .ret = ret_val } });
-                break;
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
             },
             .@"unreachable" => {
-                try entry.append(.{ .op = .{ .@"unreachable" = {} } });
-                break;
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
             },
             .nop => {},
+            .block => {
+                const arity = readBlockType(code, &ip);
+                const end_block = try ir_func.newBlock();
+                try block_stack.append(allocator, .{
+                    .kind = .block,
+                    .target_block = end_block, // br targets end
+                    .end_block = end_block,
+                    .else_block = null,
+                    .stack_depth = vreg_stack.items.len,
+                    .result_arity = arity,
+                });
+            },
+            .loop => {
+                const arity = readBlockType(code, &ip);
+                const loop_header = try ir_func.newBlock();
+                const end_block = try ir_func.newBlock();
+                // Branch from current to loop header
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .br = loop_header } });
+                current_block = loop_header;
+                try block_stack.append(allocator, .{
+                    .kind = .loop,
+                    .target_block = loop_header, // br targets header (loop back)
+                    .end_block = end_block,
+                    .else_block = null,
+                    .stack_depth = vreg_stack.items.len,
+                    .result_arity = arity,
+                });
+            },
+            .@"if" => {
+                const arity = readBlockType(code, &ip);
+                const cond = vreg_stack.pop().?;
+                const then_block = try ir_func.newBlock();
+                const else_block = try ir_func.newBlock();
+                const end_block = try ir_func.newBlock();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                    .cond = cond,
+                    .then_block = then_block,
+                    .else_block = else_block,
+                } } });
+                current_block = then_block;
+                try block_stack.append(allocator, .{
+                    .kind = .@"if",
+                    .target_block = end_block, // br targets end
+                    .end_block = end_block,
+                    .else_block = else_block,
+                    .stack_depth = vreg_stack.items.len,
+                    .result_arity = arity,
+                });
+            },
+            .@"else" => {
+                const frame = &block_stack.items[block_stack.items.len - 1];
+                // End of then branch: jump to end
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
+                current_block = frame.else_block orelse return error.InvalidBytecode;
+                frame.else_block = null; // consumed
+            },
+            .br => {
+                const depth = readU32(code, &ip);
+                if (depth < block_stack.items.len) {
+                    const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br = target_frame.target_block } });
+                }
+            },
+            .br_if => {
+                const depth = readU32(code, &ip);
+                const cond = vreg_stack.pop().?;
+                if (depth < block_stack.items.len) {
+                    const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
+                    const fallthrough = try ir_func.newBlock();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                        .cond = cond,
+                        .then_block = target_frame.target_block,
+                        .else_block = fallthrough,
+                    } } });
+                    current_block = fallthrough;
+                }
+            },
+            .call => {
+                const func_idx = readU32(code, &ip);
+                // For now, emit a call with current stack args.
+                // Full ABI arg passing will be added later.
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
+                    .func_idx = func_idx,
+                    .args = &.{},
+                } }, .dest = dest, .type = .i32 });
+                try vreg_stack.append(allocator, dest);
+            },
             .i32_const => {
                 const val = readI32(code, &ip);
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .iconst_32 = val }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_32 = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i64_const => {
                 const val = readI64(code, &ip);
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .iconst_64 = val }, .dest = dest, .type = .i64 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_64 = val }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
             .local_get => {
                 const idx = readU32(code, &ip);
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .local_get = idx }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = idx }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .local_set => {
                 const idx = readU32(code, &ip);
                 const val = vreg_stack.pop().?;
-                try entry.append(.{ .op = .{ .local_set = .{ .idx = idx, .val = val } } });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = idx, .val = val } } });
+            },
+            .local_tee => {
+                const idx = readU32(code, &ip);
+                const val = vreg_stack.items[vreg_stack.items.len - 1]; // peek, don't pop
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = idx, .val = val } } });
             },
             .i32_add, .i32_sub, .i32_mul, .i32_and, .i32_or, .i32_xor => {
                 const rhs = vreg_stack.pop().?;
@@ -109,7 +244,23 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .i32_xor => .{ .xor = bin },
                     else => unreachable,
                 };
-                try entry.append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .i32_shl, .i32_shr_s, .i32_shr_u, .i32_rotl, .i32_rotr => {
+                const rhs = vreg_stack.pop().?;
+                const lhs = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .i32_shl => .{ .shl = bin },
+                    .i32_shr_s => .{ .shr_s = bin },
+                    .i32_shr_u => .{ .shr_u = bin },
+                    .i32_rotl => .{ .rotl = bin },
+                    .i32_rotr => .{ .rotr = bin },
+                    else => unreachable,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i32_div_s, .i32_div_u, .i32_rem_s, .i32_rem_u => {
@@ -124,7 +275,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .i32_rem_u => .{ .rem_u = bin },
                     else => unreachable,
                 };
-                try entry.append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i32_eq, .i32_ne, .i32_lt_s, .i32_lt_u, .i32_gt_s, .i32_gt_u, .i32_le_s, .i32_le_u, .i32_ge_s, .i32_ge_u => {
@@ -145,19 +296,19 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .i32_ge_u => .{ .ge_u = bin },
                     else => unreachable,
                 };
-                try entry.append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i32_eqz => {
                 const val = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i32_clz => {
                 const val = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .clz = val }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .clz = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .drop => _ = vreg_stack.pop(),
@@ -166,26 +317,26 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const if_false = vreg_stack.pop().?;
                 const if_true = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .select = .{ .cond = cond, .if_true = if_true, .if_false = if_false } }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .select = .{ .cond = cond, .if_true = if_true, .if_false = if_false } }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .global_get => {
                 const idx = readU32(code, &ip);
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .global_get = idx }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .global_get = idx }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .global_set => {
                 const idx = readU32(code, &ip);
                 const val = vreg_stack.pop().?;
-                try entry.append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } } });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } } });
             },
             .i32_load => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
                 const base = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try entry.append(.{ .op = .{ .load = .{ .base = base, .offset = offset, .size = 4 } }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .load = .{ .base = base, .offset = offset, .size = 4 } }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .i32_store => {
@@ -193,7 +344,34 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const offset = readU32(code, &ip);
                 const val = vreg_stack.pop().?;
                 const base = vreg_stack.pop().?;
-                try entry.append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = 4, .val = val } } });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = 4, .val = val } } });
+            },
+            .br_table => {
+                // Read count + targets, skip for now (emit unreachable)
+                const count = readU32(code, &ip);
+                var i: u32 = 0;
+                while (i <= count) : (i += 1) _ = readU32(code, &ip);
+                _ = vreg_stack.pop(); // condition
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
+            },
+            .call_indirect => {
+                _ = readU32(code, &ip); // type index
+                _ = readU32(code, &ip); // table index
+                _ = vreg_stack.pop(); // table element index
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
+            },
+            .memory_size => {
+                _ = readU32(code, &ip); // memory index (always 0)
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_32 = 0 }, .dest = dest, .type = .i32 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .memory_grow => {
+                _ = readU32(code, &ip); // memory index
+                _ = vreg_stack.pop(); // pages
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_32 = -1 }, .dest = dest, .type = .i32 }); // fail
+                try vreg_stack.append(allocator, dest);
             },
             else => return error.UnsupportedOpcode,
         }

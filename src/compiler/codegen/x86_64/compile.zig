@@ -66,11 +66,37 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
     const frame_size: u32 = func.local_count * 8 + 256;
     try code.emitPrologue(frame_size);
 
+    // Spill parameters from SysV ABI registers to stack frame slots.
+    // Params occupy locals[0..param_count], stored at [rbp - 8*(idx+1)].
+    const param_regs = [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+    const spill_count = @min(func.param_count, param_regs.len);
+    for (0..spill_count) |i| {
+        try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
+    }
+
+    // Track block offsets for branch resolution
+    var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
+    defer block_offsets.deinit();
+
     var last_was_ret = false;
-    for (func.blocks.items) |block| {
+    // Two-pass: first collect block start offsets, then emit with patching.
+    // For now, forward branches use placeholder + patch list.
+    var branch_patches: std.ArrayList(BranchPatch) = .empty;
+    defer branch_patches.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, idx| {
+        try block_offsets.put(@intCast(idx), code.len());
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInst(&code, inst, &reg_map);
+            try compileInstEx(&code, inst, &reg_map, &branch_patches, func);
+        }
+    }
+
+    // Patch forward branches
+    for (branch_patches.items) |patch| {
+        if (block_offsets.get(patch.target_block)) |target_off| {
+            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
+            code.patchI32(patch.patch_offset, rel);
         }
     }
 
@@ -87,6 +113,47 @@ fn isRet(op: ir.Inst.Op) bool {
         .ret => true,
         else => false,
     };
+}
+
+const BranchPatch = struct {
+    patch_offset: usize, // offset of the rel32 in code buffer
+    target_block: ir.BlockId,
+};
+
+fn compileInstEx(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    reg_map: *RegMap,
+    patches: *std.ArrayList(BranchPatch),
+    func: *const ir.IrFunction,
+) !void {
+    _ = func;
+    switch (inst.op) {
+        .br => |target| {
+            // JMP rel32 (placeholder)
+            try code.emitByte(0xE9);
+            const patch_off = code.len();
+            try code.emitI32(0);
+            try patches.append(code.allocator, .{ .patch_offset = patch_off, .target_block = target });
+        },
+        .br_if => |br| {
+            const cond_loc = reg_map.get(br.cond) orelse return;
+            const cond_reg = switch (cond_loc) { .reg => |r| r, .stack => return };
+            // TEST cond, cond; JNZ then_block
+            try code.testRegReg(cond_reg, cond_reg);
+            try code.emitByte(0x0F);
+            try code.emitByte(0x85); // JNE rel32
+            const then_patch = code.len();
+            try code.emitI32(0);
+            try patches.append(code.allocator, .{ .patch_offset = then_patch, .target_block = br.then_block });
+            // Fall through to else_block (JMP rel32)
+            try code.emitByte(0xE9);
+            const else_patch = code.len();
+            try code.emitI32(0);
+            try patches.append(code.allocator, .{ .patch_offset = else_patch, .target_block = br.else_block });
+        },
+        else => try compileInst(code, inst, reg_map),
+    }
 }
 
 fn compileInst(code: *emit.CodeBuffer, inst: ir.Inst, reg_map: *RegMap) !void {
