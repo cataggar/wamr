@@ -16,9 +16,12 @@ const param_regs = if (builtin.os.tag == .windows)
 else
     [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 }; // SysV
 
-/// Fixed frame offset for the VMContext (memory base pointer).
+/// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
+/// Points to a VmCtx struct with memory_base at +0, globals_base at +16.
 const vmctx_offset: i32 = -8;
+const vmctx_membase_field: i32 = 0; // VmCtx.memory_base offset
+const vmctx_globals_field: i32 = 16; // VmCtx.globals_base offset
 
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
@@ -1133,7 +1136,8 @@ fn compileInstRA(
         .load => |ld| {
             const dest = inst.dest orelse return;
             // Load memory base from VMContext frame slot, add wasm offset
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
@@ -1144,7 +1148,8 @@ fn compileInstRA(
         .store => |st| {
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
@@ -1153,7 +1158,8 @@ fn compileInstRA(
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // memory base
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base // memory base
             const len_reg = try useVReg(code, alloc_result, mc.len, .rcx);
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
             const src_reg = try useVReg(code, alloc_result, mc.src, .rsi);
@@ -1166,7 +1172,8 @@ fn compileInstRA(
         },
         .memory_fill => |mf| {
             // REP STOSB: rdi=dst, al=val, rcx=len
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // memory base
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base // memory base
             const len_reg = try useVReg(code, alloc_result, mf.len, .rcx);
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
             const val_reg = try useVReg(code, alloc_result, mf.val, .rax);
@@ -1275,12 +1282,18 @@ fn compileInstRA(
 
         .global_get => |idx| {
             const dest = inst.dest orelse return;
-            _ = idx;
-            try code.movRegImm32(.rax, 0);
+            // Load globals_base from VmCtx, then load global value
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
+            try code.movRegMem(.rax, .r10, @as(i32, @intCast(idx * 8))); // global[idx]
             try writeDef(code, alloc_result, dest, .rax);
         },
         .global_set => |gs| {
-            _ = try useVReg(code, alloc_result, gs.val, .rax);
+            const val_reg = try useVReg(code, alloc_result, gs.val, .rax);
+            if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
+            try code.movMemReg(.r10, @as(i32, @intCast(gs.idx * 8)), .rax); // global[idx] = val
         },
 
         .@"unreachable" => {
