@@ -769,6 +769,20 @@ fn compileInst(
             try code.movRegImm32(.rax, 1); // return 1 ("not equal")
             try stack.push(code, .rax);
         },
+        .memory_copy => |mc| {
+            _ = mc;
+            try stack.pop(code, .rcx); // len
+            try stack.pop(code, .rdx); // src
+            try stack.pop(code, .rax); // dst
+            // TODO: implement as memcpy
+        },
+        .memory_fill => |mf| {
+            _ = mf;
+            try stack.pop(code, .rcx); // len
+            try stack.pop(code, .rdx); // val
+            try stack.pop(code, .rax); // dst
+            // TODO: implement as memset
+        },
     }
 }
 

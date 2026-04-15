@@ -191,6 +191,16 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(aw.expected, {}) catch {};
             live.put(aw.timeout, {}) catch {};
         },
+        .memory_copy => |mc| {
+            live.put(mc.dst, {}) catch {};
+            live.put(mc.src, {}) catch {};
+            live.put(mc.len, {}) catch {};
+        },
+        .memory_fill => |mf| {
+            live.put(mf.dst, {}) catch {};
+            live.put(mf.val, {}) catch {};
+            live.put(mf.len, {}) catch {};
+        },
     }
 }
 
@@ -346,6 +356,16 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(aw.base, pos) catch {};
             last_use.put(aw.expected, pos) catch {};
             last_use.put(aw.timeout, pos) catch {};
+        },
+        .memory_copy => |mc| {
+            last_use.put(mc.dst, pos) catch {};
+            last_use.put(mc.src, pos) catch {};
+            last_use.put(mc.len, pos) catch {};
+        },
+        .memory_fill => |mf| {
+            last_use.put(mf.dst, pos) catch {};
+            last_use.put(mf.val, pos) catch {};
+            last_use.put(mf.len, pos) catch {};
         },
     }
 }
