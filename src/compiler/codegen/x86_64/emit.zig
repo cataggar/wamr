@@ -179,6 +179,13 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// CMP r32, r32 (32-bit compare, sets flags for i32 signed semantics).
+    pub fn cmpRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x39);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// PUSH reg (uses REX prefix only for r8–r15).
     pub fn pushReg(self: *CodeBuffer, reg: Reg) !void {
         if (reg.isExtended()) try self.emitByte(0x41);
