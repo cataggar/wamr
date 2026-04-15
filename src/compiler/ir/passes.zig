@@ -53,6 +53,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
         => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
@@ -60,6 +61,8 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
 
         // Unary ops
         .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         => |vreg| list.append(vreg),
 
         .local_set => |ls| list.append(ls.val),
@@ -115,12 +118,15 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
         => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
         },
 
         .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         => |*vreg| if (vreg.* == old) { vreg.* = new; },
 
         .local_set => |*ls| if (ls.val == old) { ls.val = new; },
@@ -289,6 +295,9 @@ fn isPure(inst: ir.Inst) bool {
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .clz, .ctz, .popcnt, .eqz,
         .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .f_min, .f_max, .f_copysign,
         => true,
         else => false,
     };
@@ -315,6 +324,16 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .clz => |v| v == b.op.clz,
         .ctz => |v| v == b.op.ctz,
         .popcnt => |v| v == b.op.popcnt,
+        .extend8_s => |v| v == b.op.extend8_s,
+        .extend16_s => |v| v == b.op.extend16_s,
+        .extend32_s => |v| v == b.op.extend32_s,
+        .f_neg => |v| v == b.op.f_neg,
+        .f_abs => |v| v == b.op.f_abs,
+        .f_sqrt => |v| v == b.op.f_sqrt,
+        .f_ceil => |v| v == b.op.f_ceil,
+        .f_floor => |v| v == b.op.f_floor,
+        .f_trunc => |v| v == b.op.f_trunc,
+        .f_nearest => |v| v == b.op.f_nearest,
         else => false,
     };
 }

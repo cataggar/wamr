@@ -74,7 +74,7 @@ pub const Inst = struct {
         local_set: struct { idx: u32, val: VReg },
 
         // Memory
-        load: struct { base: VReg, offset: u32, size: u8 },
+        load: struct { base: VReg, offset: u32, size: u8, sign_extend: bool = false },
         store: struct { base: VReg, offset: u32, size: u8, val: VReg },
 
         // Control flow
@@ -92,6 +92,25 @@ pub const Inst = struct {
         // Global access
         global_get: u32,
         global_set: struct { idx: u32, val: VReg },
+
+        // Sign extension
+        extend8_s: VReg,
+        extend16_s: VReg,
+        extend32_s: VReg,
+
+        // Float unary
+        f_neg: VReg,
+        f_abs: VReg,
+        f_sqrt: VReg,
+        f_ceil: VReg,
+        f_floor: VReg,
+        f_trunc: VReg,
+        f_nearest: VReg,
+
+        // Float binary
+        f_min: BinOp,
+        f_max: BinOp,
+        f_copysign: BinOp,
 
         // Conversions
         wrap_i64: VReg,

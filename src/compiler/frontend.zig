@@ -346,10 +346,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
-            .i32_clz => {
+            .i32_clz, .i32_ctz, .i32_popcnt => {
                 const val = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .clz = val }, .dest = dest, .type = .i32 });
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .i32_clz => .{ .clz = val },
+                    .i32_ctz => .{ .ctz = val },
+                    .i32_popcnt => .{ .popcnt = val },
+                    else => unreachable,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .drop => _ = vreg_stack.pop(),
@@ -372,20 +378,54 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const val = vreg_stack.pop().?;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } } });
             },
-            .i32_load => {
+            // ── Load variants ────────────────────────────────────────────
+            .i32_load, .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
+            .i64_load, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u,
+            .f32_load, .f64_load,
+            => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
                 const base = vreg_stack.pop().?;
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .load = .{ .base = base, .offset = offset, .size = 4 } }, .dest = dest, .type = .i32 });
+                const size: u8 = switch (op) {
+                    .i32_load8_s, .i32_load8_u, .i64_load8_s, .i64_load8_u => 1,
+                    .i32_load16_s, .i32_load16_u, .i64_load16_s, .i64_load16_u => 2,
+                    .i32_load, .i64_load32_s, .i64_load32_u, .f32_load => 4,
+                    .i64_load, .f64_load => 8,
+                    else => unreachable,
+                };
+                const sign_extend: bool = switch (op) {
+                    .i32_load8_s, .i32_load16_s,
+                    .i64_load8_s, .i64_load16_s, .i64_load32_s,
+                    => true,
+                    else => false,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .i64_load, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u => .i64,
+                    .f32_load => .f32,
+                    .f64_load => .f64,
+                    else => .i32,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .load = .{ .base = base, .offset = offset, .size = size, .sign_extend = sign_extend } }, .dest = dest, .type = ir_type });
                 try vreg_stack.append(allocator, dest);
             },
-            .i32_store => {
+            // ── Store variants ───────────────────────────────────────────
+            .i32_store, .i32_store8, .i32_store16,
+            .i64_store, .i64_store8, .i64_store16, .i64_store32,
+            .f32_store, .f64_store,
+            => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
                 const val = vreg_stack.pop().?;
                 const base = vreg_stack.pop().?;
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = 4, .val = val } } });
+                const size: u8 = switch (op) {
+                    .i32_store8, .i64_store8 => 1,
+                    .i32_store16, .i64_store16 => 2,
+                    .i32_store, .i64_store32, .f32_store => 4,
+                    .i64_store, .f64_store => 8,
+                    else => unreachable,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = size, .val = val } } });
             },
             .br_table => {
                 // Read count + targets, skip for now (emit unreachable)
@@ -561,6 +601,94 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .extend_i32_u = val }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
+
+            // ── Sign-extension ops ─────────────────────────────────────
+            .i32_extend8_s, .i32_extend16_s,
+            .i64_extend8_s, .i64_extend16_s, .i64_extend32_s,
+            => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .i32_extend8_s, .i64_extend8_s => .{ .extend8_s = val },
+                    .i32_extend16_s, .i64_extend16_s => .{ .extend16_s = val },
+                    .i64_extend32_s => .{ .extend32_s = val },
+                    else => unreachable,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .i32_extend8_s, .i32_extend16_s => .i32,
+                    else => .i64,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Float comparisons ──────────────────────────────────────
+            .f32_eq, .f32_ne, .f32_lt, .f32_gt, .f32_le, .f32_ge,
+            .f64_eq, .f64_ne, .f64_lt, .f64_gt, .f64_le, .f64_ge,
+            => {
+                const rhs = vreg_stack.pop().?;
+                const lhs = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_eq, .f64_eq => .{ .eq = bin },
+                    .f32_ne, .f64_ne => .{ .ne = bin },
+                    .f32_lt, .f64_lt => .{ .lt_s = bin },
+                    .f32_gt, .f64_gt => .{ .gt_s = bin },
+                    .f32_le, .f64_le => .{ .le_s = bin },
+                    .f32_ge, .f64_ge => .{ .ge_s = bin },
+                    else => unreachable,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Float unary math ───────────────────────────────────────
+            .f32_abs, .f32_neg, .f32_sqrt, .f32_ceil, .f32_floor, .f32_trunc, .f32_nearest,
+            .f64_abs, .f64_neg, .f64_sqrt, .f64_ceil, .f64_floor, .f64_trunc, .f64_nearest,
+            => {
+                const val = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_abs, .f64_abs => .{ .f_abs = val },
+                    .f32_neg, .f64_neg => .{ .f_neg = val },
+                    .f32_sqrt, .f64_sqrt => .{ .f_sqrt = val },
+                    .f32_ceil, .f64_ceil => .{ .f_ceil = val },
+                    .f32_floor, .f64_floor => .{ .f_floor = val },
+                    .f32_trunc, .f64_trunc => .{ .f_trunc = val },
+                    .f32_nearest, .f64_nearest => .{ .f_nearest = val },
+                    else => unreachable,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .f64_abs, .f64_neg, .f64_sqrt, .f64_ceil, .f64_floor, .f64_trunc, .f64_nearest => .f64,
+                    else => .f32,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
+            // ── Float binary math ──────────────────────────────────────
+            .f32_min, .f32_max, .f32_copysign,
+            .f64_min, .f64_max, .f64_copysign,
+            => {
+                const rhs = vreg_stack.pop().?;
+                const lhs = vreg_stack.pop().?;
+                const dest = ir_func.newVReg();
+                const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_min, .f64_min => .{ .f_min = bin },
+                    .f32_max, .f64_max => .{ .f_max = bin },
+                    .f32_copysign, .f64_copysign => .{ .f_copysign = bin },
+                    else => unreachable,
+                };
+                const ir_type: ir.IrType = switch (op) {
+                    .f64_min, .f64_max, .f64_copysign => .f64,
+                    else => .f32,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
+                try vreg_stack.append(allocator, dest);
+            },
+
             else => return error.UnsupportedOpcode,
         }
     }
