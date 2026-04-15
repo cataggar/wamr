@@ -5,8 +5,15 @@
 //! stack frame (memory), using RAX and RCX as temporary scratch registers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
+
+/// Platform-specific ABI parameter registers, resolved at comptime.
+const param_regs = if (builtin.os.tag == .windows)
+    [_]emit.Reg{ .rcx, .rdx, .r8, .r9 } // Win64
+else
+    [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 }; // SysV
 
 /// Stack-based operand model. All intermediate values live on the stack
 /// frame at [rbp + offset], using negative offsets that grow downward.
@@ -53,12 +60,13 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
-    // Frame: locals + 64 operand stack slots
-    const frame_size: u32 = (func.local_count + 64) * 8;
+    // Frame: locals + 64 operand stack slots, aligned to 16 bytes
+    // After push rbp (8 bytes), we need frame_size ≡ 8 (mod 16) for 16-byte RSP alignment.
+    const raw_size: u32 = (func.local_count + 64) * 8;
+    const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8; // ensure ≡ 8 mod 16
     try code.emitPrologue(frame_size);
 
-    // Spill parameters from SysV ABI registers to stack frame slots.
-    const param_regs = [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
+    // Spill parameters from ABI registers to stack frame slots.
     const spill_count = @min(func.param_count, param_regs.len);
     for (0..spill_count) |i| {
         try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);
@@ -380,14 +388,13 @@ fn compileInst(
 
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
-            const abi_regs = [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
             const n_args = cl.arg_count;
 
             // Pop args from operand stack in reverse order into ABI registers.
             // Wasm pushes args left-to-right, so first arg is deepest.
             // We pop in reverse (last arg first), store to temp slots, then
             // load in order to ABI regs.
-            if (n_args > 0 and n_args <= abi_regs.len) {
+            if (n_args > 0 and n_args <= param_regs.len) {
                 // Pop all args into temporary frame slots (reuse operand stack area)
                 // We pop in reverse order (topmost = last arg)
                 var i: u32 = n_args;
@@ -398,20 +405,20 @@ fn compileInst(
                     // We use R11 as a scratch for the offset calculation
                     // Actually, simpler: just load into the right ABI reg directly
                     // Since we pop in reverse, arg index = i
-                    try code.movRegReg(abi_regs[i], .rax);
+                    try code.movRegReg(param_regs[i], .rax);
                 }
-            } else if (n_args > abi_regs.len) {
+            } else if (n_args > param_regs.len) {
                 // More than 6 args: pop extras to stack, then first 6 to regs
                 // For now, handle only register-passed args
                 var i: u32 = n_args;
-                while (i > abi_regs.len) {
+                while (i > param_regs.len) {
                     i -= 1;
                     try stack.pop(code, .rax); // discard overflow args for now
                 }
                 while (i > 0) {
                     i -= 1;
                     try stack.pop(code, .rax);
-                    try code.movRegReg(abi_regs[i], .rax);
+                    try code.movRegReg(param_regs[i], .rax);
                 }
             }
 
@@ -532,10 +539,10 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
 
         var stack = OperandStack.init(func.local_count);
 
-        const frame_size: u32 = (func.local_count + 64) * 8;
+        const raw_size: u32 = (func.local_count + 64) * 8;
+        const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8;
         try code.emitPrologue(frame_size);
 
-        const param_regs = [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 };
         const spill_count = @min(func.param_count, param_regs.len);
         for (0..spill_count) |i| {
             try code.movMemReg(.rbp, -@as(i32, @intCast((i + 1) * 8)), param_regs[i]);

@@ -434,11 +434,12 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 }
 
 /// The default optimization pipeline.
+/// Note: deadCodeElimination is excluded because the stack-based x86-64
+/// backend does not track call argument VRegs, so DCE incorrectly removes
+/// instructions that compute values consumed implicitly via the operand stack.
 pub const default_passes: []const PassFn = &.{
     &constantFold,
-    &deadCodeElimination,
     &commonSubexprElimination,
-    &deadCodeElimination, // clean up after CSE
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────────
