@@ -87,20 +87,27 @@ fn runAot(data: []const u8, allocator: std.mem.Allocator) void {
         std.debug.print("Error: failed to instantiate AOT module: {}\n", .{err});
         std.process.exit(1);
     };
-    _ = aot_inst;
+    defer aot_runtime.destroy(aot_inst);
 
-    // AOT execution: find _start export and call native code
-    const start_exp = aot_module.findExport("_start", .function) orelse
-        aot_module.findExport("main", .function) orelse {
+    // Map native code as executable
+    aot_runtime.mapCodeExecutable(aot_inst) catch |err| {
+        std.debug.print("Error: failed to map code as executable: {}\n", .{err});
+        std.process.exit(1);
+    };
+
+    // Find _start or main export
+    const func_idx = aot_runtime.findExportFunc(aot_inst, "_start") orelse
+        aot_runtime.findExportFunc(aot_inst, "main") orelse {
         std.debug.print("Error: no _start or main function exported in AOT module\n", .{});
         std.process.exit(1);
     };
-    _ = start_exp;
 
-    // TODO: map native code as executable and call via function pointer
-    std.debug.print("AOT module loaded ({} functions, {} exports). Native execution not yet implemented.\n", .{
-        aot_module.func_count, aot_module.exports.len,
-    });
+    // Execute
+    const result = aot_runtime.callFunc(aot_inst, func_idx, i32) catch |err| {
+        std.debug.print("Error: AOT execution failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    std.debug.print("{d}\n", .{result});
 }
 
 fn runWasm(

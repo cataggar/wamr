@@ -20,8 +20,9 @@ pub const AotSectionType = enum(u32) {
     text = 2,
     function = 3,
     @"export" = 4,
-    relocation = 5,
-    name = 6,
+    data = 5,
+    relocation = 6,
+    name = 7,
     _,
 };
 
@@ -40,6 +41,13 @@ pub const TargetInfo = struct {
 
 // ─── AOT module ─────────────────────────────────────────────────────────────
 
+/// A data segment parsed from the AOT data section.
+pub const AotDataSegment = struct {
+    memory_idx: u32,
+    offset: u32,
+    data: []const u8,
+};
+
 pub const AotModule = struct {
     target_info: ?TargetInfo = null,
     text_section: ?[]const u8 = null,
@@ -49,6 +57,7 @@ pub const AotModule = struct {
     import_function_count: u32 = 0,
     memories: []const types.MemoryType = &.{},
     tables: []const types.TableType = &.{},
+    data_segments: []const AotDataSegment = &.{},
 
     /// Find an export by name and kind.
     pub fn findExport(self: *const AotModule, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
@@ -149,6 +158,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .@"export" => {
                 try parseExportSection(&reader, section_size, &module, allocator);
             },
+            .data => {
+                try parseDataSection(&reader, section_size, &module, allocator);
+            },
             else => {
                 // Skip unknown/unhandled sections
                 reader.pos += section_size;
@@ -177,6 +189,14 @@ pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     }
     if (module.memories.len > 0) {
         allocator.free(module.memories);
+    }
+    for (module.data_segments) |seg| {
+        if (seg.data.len > 0) {
+            allocator.free(seg.data);
+        }
+    }
+    if (module.data_segments.len > 0) {
+        allocator.free(module.data_segments);
     }
     if (module.tables.len > 0) {
         allocator.free(module.tables);
@@ -241,6 +261,38 @@ fn parseExportSection(reader: *BinaryReader, section_size: u32, module: *AotModu
         };
     }
     module.exports = exports;
+}
+
+fn parseDataSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const segments = allocator.alloc(AotDataSegment, count) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |i| {
+            if (segments[i].data.len > 0) allocator.free(segments[i].data);
+        }
+        allocator.free(segments);
+    }
+
+    for (0..count) |i| {
+        const memory_idx = try reader.readU32Le();
+        const offset = try reader.readU32Le();
+        const data_len = try reader.readU32Le();
+        const data_bytes = try reader.readBytes(data_len);
+        const data_copy = allocator.alloc(u8, data_len) catch return error.OutOfMemory;
+        @memcpy(data_copy, data_bytes);
+
+        segments[i] = .{
+            .memory_idx = memory_idx,
+            .offset = offset,
+            .data = data_copy,
+        };
+        initialized += 1;
+    }
+    module.data_segments = segments;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
