@@ -1557,8 +1557,12 @@ fn compileInstRA(
         // ── Division ──────────────────────────────────────────────────
         .div_s, .div_u, .rem_s, .rem_u => |bin| {
             const dest = inst.dest orelse return;
-            // Save caller-saved regs since idiv clobbers rax and rdx
-            for (caller_saved_alloc, 0..) |reg, cs_i| { if (used_caller_saved[cs_i]) try code.pushReg(reg); }
+            // idiv clobbers rax+rdx. rax is not allocatable, so only rdx
+            // (which IS allocatable) needs saving if it holds a live value.
+            const rdx_in_use = for (caller_saved_alloc, 0..) |reg, i| {
+                if (reg == .rdx and used_caller_saved[i]) break true;
+            } else false;
+            if (rdx_in_use) try code.pushReg(.rdx);
 
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
@@ -1602,15 +1606,19 @@ fn compileInstRA(
                 else => unreachable,
             };
 
-            // Restore caller-saved regs (reverse order)
-            // But first save result to r11 so it survives the pops
-            try code.movRegReg(.r11, result_reg);
-            var ri: usize = caller_saved_alloc.len;
-            while (ri > 0) {
-                ri -= 1;
-                if (used_caller_saved[ri]) try code.popReg(caller_saved_alloc[ri]);
+            // Restore rdx if it was saved
+            if (rdx_in_use) {
+                if (result_reg == .rdx) {
+                    // Remainder result is in rdx — save before restoring
+                    try code.movRegReg(.r11, .rdx);
+                    try code.popReg(.rdx);
+                    try code.movRegReg(.rax, .r11);
+                } else {
+                    try code.popReg(.rdx);
+                }
+            } else {
+                if (result_reg != .rax) try code.movRegReg(.rax, result_reg);
             }
-            try code.movRegReg(.rax, .r11);
 
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
