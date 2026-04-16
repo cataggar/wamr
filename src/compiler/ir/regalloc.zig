@@ -3,6 +3,11 @@
 //! Assigns physical x86-64 registers to VRegs based on live range intervals.
 //! Uses the Poletto & Sarkar algorithm: sort intervals by start, walk in order,
 //! assign from free pool, spill the longest-remaining interval when exhausted.
+//!
+//! Clobber-aware: instructions that destroy register contents (calls,
+//! memory_copy, etc.) are modeled as ClobberPoints. The allocator ensures
+//! no VReg assigned to a clobbered register has its live range span the
+//! clobber, eliminating the need for push/pop at those sites.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -43,10 +48,20 @@ const alloc_regs = [_]PhysReg{ 2, 6, 7, 8, 9 };
 pub const scratch1: PhysReg = 10; // r10
 pub const scratch2: PhysReg = 11; // r11
 
+/// A point in the instruction stream where specific registers are destroyed.
+/// Used to model calls (clobber caller-saved), memory_copy (clobber rsi+rdi), etc.
+pub const ClobberPoint = struct {
+    pos: u32,
+    /// Which alloc_regs indices are clobbered at this position.
+    regs_clobbered: [alloc_regs.len]bool,
+};
+
 /// Run linear scan register allocation on a function.
+/// `clobbers` lists positions where specific registers are destroyed.
 pub fn allocate(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
+    clobbers: []const ClobberPoint,
 ) !AllocResult {
     // Compute live ranges (sorted by start position)
     const ranges = try analysis.computeLiveRanges(func, allocator);
@@ -66,8 +81,8 @@ pub fn allocate(
         // Expire old intervals that ended before this one starts
         expireOldIntervals(&active, range.start, &reg_free);
 
-        // Try to find a free register
-        if (findFreeReg(&reg_free)) |reg_idx| {
+        // Try to find a free register that is safe (not clobbered during this range)
+        if (findSafeReg(&reg_free, range.start, range.end, clobbers)) |reg_idx| {
             reg_free[reg_idx] = false;
             try assignments.put(range.vreg, .{ .reg = alloc_regs[reg_idx] });
             try insertActive(&active, allocator, .{
@@ -76,34 +91,33 @@ pub fn allocate(
                 .reg_idx = reg_idx,
             });
         } else {
-            // No free register — spill the interval with the longest remaining range
-            if (active.items.len > 0) {
-                const last = active.items.len - 1;
-                const spill_candidate = active.items[last];
-                if (spill_candidate.end > range.end) {
-                    // Spill the active interval, assign its register to the new one
-                    const stolen_reg = spill_candidate.reg_idx;
-                    // Move spilled VReg to stack
-                    const spill_offset = computeSpillOffset(spill_count);
-                    try assignments.put(spill_candidate.vreg, .{ .stack = spill_offset });
-                    spill_count += 1;
-                    // Remove spilled from active
-                    _ = active.orderedRemove(last);
-                    // Assign stolen register to new interval
-                    try assignments.put(range.vreg, .{ .reg = alloc_regs[stolen_reg] });
-                    try insertActive(&active, allocator, .{
-                        .vreg = range.vreg,
-                        .end = range.end,
-                        .reg_idx = stolen_reg,
-                    });
-                } else {
-                    // New interval is shorter — spill the new one
-                    const spill_offset = computeSpillOffset(spill_count);
-                    try assignments.put(range.vreg, .{ .stack = spill_offset });
-                    spill_count += 1;
+            // No safe free register — try to evict an active interval
+            // whose register IS safe for this range.
+            var best_evict: ?usize = null;
+            for (active.items, 0..) |ai, idx| {
+                if (ai.end > range.end and
+                    regSafeForRange(ai.reg_idx, range.start, range.end, clobbers))
+                {
+                    if (best_evict == null or ai.end > active.items[best_evict.?].end) {
+                        best_evict = idx;
+                    }
                 }
+            }
+
+            if (best_evict) |evict_idx| {
+                const evicted = active.orderedRemove(evict_idx);
+                const stolen_reg = evicted.reg_idx;
+                const spill_offset = computeSpillOffset(spill_count);
+                try assignments.put(evicted.vreg, .{ .stack = spill_offset });
+                spill_count += 1;
+                try assignments.put(range.vreg, .{ .reg = alloc_regs[stolen_reg] });
+                try insertActive(&active, allocator, .{
+                    .vreg = range.vreg,
+                    .end = range.end,
+                    .reg_idx = stolen_reg,
+                });
             } else {
-                // No active intervals — spill the new one
+                // No safe eviction candidate — spill the new interval
                 const spill_offset = computeSpillOffset(spill_count);
                 try assignments.put(range.vreg, .{ .stack = spill_offset });
                 spill_count += 1;
@@ -136,10 +150,24 @@ fn expireOldIntervals(
     }
 }
 
-/// Find the first free register, or null if all are occupied.
-fn findFreeReg(reg_free: *const [alloc_regs.len]bool) ?usize {
+/// Check if register at `reg_idx` is safe for a live range [start, end].
+/// A register is unsafe if it's clobbered at any point strictly inside the range.
+fn regSafeForRange(reg_idx: usize, start: u32, end: u32, clobbers: []const ClobberPoint) bool {
+    for (clobbers) |cp| {
+        if (cp.pos > start and cp.pos < end and cp.regs_clobbered[reg_idx]) return false;
+    }
+    return true;
+}
+
+/// Find a free register that is not clobbered during [start, end].
+fn findSafeReg(
+    reg_free: *const [alloc_regs.len]bool,
+    start: u32,
+    end: u32,
+    clobbers: []const ClobberPoint,
+) ?usize {
     for (reg_free, 0..) |free, i| {
-        if (free) return i;
+        if (free and regSafeForRange(i, start, end, clobbers)) return i;
     }
     return null;
 }
@@ -185,7 +213,7 @@ test "allocate: simple function gets registers" {
     try block0.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
     try block0.append(.{ .op = .{ .ret = v2 } });
 
-    var result = try allocate(&func, allocator);
+    var result = try allocate(&func, allocator, &.{});
     defer result.deinit();
 
     // All 3 VRegs should get registers (only 3 needed, 9 available)
@@ -220,7 +248,7 @@ test "allocate: no spills with few live values" {
     }
     try block0.append(.{ .op = .{ .ret = prev } });
 
-    var result = try allocate(&func, allocator);
+    var result = try allocate(&func, allocator, &.{});
     defer result.deinit();
 
     // Low register pressure — no spills expected
@@ -250,7 +278,7 @@ test "allocate: spills when pressure exceeds registers" {
     }
     try block0.append(.{ .op = .{ .ret = sum } });
 
-    var result = try allocate(&func, allocator);
+    var result = try allocate(&func, allocator, &.{});
     defer result.deinit();
 
     // Should have some spills (15 values alive > 9 registers)

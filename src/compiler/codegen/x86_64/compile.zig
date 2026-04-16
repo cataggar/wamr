@@ -905,7 +905,48 @@ const regalloc = @import("../../ir/regalloc.zig");
 /// VRegs are assigned to physical registers; instructions operate directly
 /// on assigned registers without push/pop through a CachedStack.
 pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocator: std.mem.Allocator) !FuncCompileResult {
-    var alloc_result = try regalloc.allocate(func, allocator);
+    // Collect clobber points: instructions that destroy specific registers.
+    // Uses the same sequential numbering as computeLiveRanges in analysis.zig.
+    var clobber_points: std.ArrayList(regalloc.ClobberPoint) = .empty;
+    defer clobber_points.deinit(allocator);
+    {
+        var pos: u32 = 0;
+        for (func.blocks.items) |block| {
+            for (block.instructions.items) |ci| {
+                switch (ci.op) {
+                    .call, .call_indirect => {
+                        // Calls clobber caller-saved allocatable regs.
+                        // alloc_regs = [rdx(2), rsi(6), rdi(7), r8(8), r9(9)]
+                        // On Win64: rdx, r8, r9 are volatile (indices 0, 3, 4)
+                        // On SysV: all 5 are volatile
+                        const mask = if (comptime builtin.os.tag == .windows)
+                            [_]bool{ true, false, false, true, true }
+                        else
+                            [_]bool{ true, true, true, true, true };
+                        try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = mask });
+                    },
+                    .memory_copy => {
+                        // REP MOVSB clobbers rsi(6) and rdi(7) → indices 1, 2
+                        try clobber_points.append(allocator, .{
+                            .pos = pos,
+                            .regs_clobbered = .{ false, true, true, false, false },
+                        });
+                    },
+                    .memory_fill => {
+                        // REP STOSB clobbers rdi(7) → index 2
+                        try clobber_points.append(allocator, .{
+                            .pos = pos,
+                            .regs_clobbered = .{ false, false, true, false, false },
+                        });
+                    },
+                    else => {},
+                }
+                pos += 1;
+            }
+        }
+    }
+
+    var alloc_result = try regalloc.allocate(func, allocator, clobber_points.items);
     defer alloc_result.deinit();
 
     // Compute which caller-saved registers are actually used by this function.
@@ -966,13 +1007,15 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     }
 
     // Frame: locals + spill slots + 1 vmctx slot, aligned to 16 bytes.
-    // After push rbp (rsp=0 mod 16), sub rsp + callee-save pushes must
-    // leave rsp ≡ 8 mod 16, so that an odd number of caller-saved pushes
-    // at call sites aligns rsp to 16 for the CALL instruction.
+    // No push/pop at call sites (allocator handles clobbering), so after
+    // push rbp (rsp=0 mod 16) + sub rsp + callee-save pushes, rsp must
+    // be 0 mod 16 for direct CALL alignment.
     const spill_slots = alloc_result.spill_count;
     const raw_size: u32 = (func.local_count + 64 + spill_slots + 1) * 8;
     const aligned: u32 = (raw_size + 15) & ~@as(u32, 15);
-    const frame_size: u32 = if (callee_save_count % 2 == 0) aligned | 8 else aligned;
+    // After push rbp: rsp=0 mod 16. After sub rsp,frame_size + N callee pushes:
+    // want (frame_size + 8*N) ≡ 0 mod 16 → rsp ≡ 0 mod 16 at CALL sites.
+    const frame_size: u32 = if (callee_save_count % 2 == 0) aligned else aligned | 8;
     try code.emitPrologue(frame_size);
 
     // Save memory base (VMContext) from first ABI register to [rbp - 8]
@@ -1317,8 +1360,8 @@ fn compileInstRA(
 
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
-            // Save caller-saved allocatable registers across the call
-            for (caller_saved_alloc, 0..) |reg, cs_i| { if (used_caller_saved[cs_i]) try code.pushReg(reg); }
+            // No push/pop: the allocator ensures no live vreg in a
+            // caller-saved register spans this call instruction.
 
             if (cl.func_idx < import_count) {
                 // Import call: indirect call via host function pointer table in VmCtx.
@@ -1365,13 +1408,6 @@ fn compileInstRA(
                 });
             }
 
-            // Restore caller-saved registers (reverse order)
-            var ri: usize = caller_saved_alloc.len;
-            while (ri > 0) {
-                ri -= 1;
-                if (used_caller_saved[ri]) try code.popReg(caller_saved_alloc[ri]);
-            }
-
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
@@ -1379,8 +1415,8 @@ fn compileInstRA(
 
         // ── Indirect function calls ───────────────────────────────────
         .call_indirect => |ci| {
-            // Save caller-saved allocatable registers across the call
-            for (caller_saved_alloc, 0..) |reg, cs_i| { if (used_caller_saved[cs_i]) try code.pushReg(reg); }
+            // No push/pop: the allocator ensures no live vreg in a
+            // clobbered register spans this call instruction.
 
             // Load table element index
             const idx_reg = try useVReg(code, alloc_result, ci.elem_idx, .rax);
@@ -1416,13 +1452,6 @@ fn compileInstRA(
             try code.callReg(.rax);
             if (comptime builtin.os.tag == .windows) {
                 try code.addRegImm32(.rsp, 32);
-            }
-
-            // Restore caller-saved registers (reverse order)
-            var ri: usize = caller_saved_alloc.len;
-            while (ri > 0) {
-                ri -= 1;
-                if (used_caller_saved[ri]) try code.popReg(caller_saved_alloc[ri]);
             }
 
             if (inst.dest) |dest| {
