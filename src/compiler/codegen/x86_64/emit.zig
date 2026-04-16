@@ -57,6 +57,14 @@ pub const CodeBuffer = struct {
         return self.bytes.items;
     }
 
+    /// Truncate the buffer to `new_len`. Used by block-level peepholes
+    /// (e.g. dropping a trailing fall-through jmp). Must not be called
+    /// with a length greater than current len.
+    pub fn truncate(self: *CodeBuffer, new_len: usize) void {
+        std.debug.assert(new_len <= self.bytes.items.len);
+        self.bytes.shrinkRetainingCapacity(new_len);
+    }
+
     // ── Raw byte emission ─────────────────────────────────────────────
 
     pub fn emitByte(self: *CodeBuffer, byte: u8) !void {

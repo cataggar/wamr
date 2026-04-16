@@ -1085,9 +1085,23 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     var last_was_ret = false;
     for (func.blocks.items, 0..) |block, idx| {
         try block_offsets.put(@intCast(idx), code.len());
+        const next_block_id: ?ir.BlockId = if (idx + 1 < func.blocks.items.len) @intCast(idx + 1) else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
             try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved);
+        }
+        // C3 fall-through peephole: if the block's terminator emitted a
+        // trailing `E9 disp32` (br, or br_if's unconditional else) whose
+        // target is the next block, drop those 5 bytes and the stale patch.
+        // Works for br_if because the else branch is emitted last.
+        if (next_block_id) |nb| {
+            if (branch_patches.items.len > 0) {
+                const last = branch_patches.items[branch_patches.items.len - 1];
+                if (last.target_block == nb and last.patch_offset + 4 == code.len()) {
+                    code.truncate(code.len() - 5);
+                    _ = branch_patches.pop();
+                }
+            }
         }
     }
 
@@ -3160,4 +3174,79 @@ test "compileFunctionRA: add of two non-constant values emits LEA" {
     // ADD reg,reg (01 /r with REX.W) must NOT appear for this add — the
     // LEA replaced it. The 64-bit add encoding is `48 01 ...`.
     try std.testing.expect(!containsBytes(code, &.{ 0x48, 0x01 }));
+}
+
+
+test "compileFunctionRA: br to next block is elided (C3 fallthrough)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+
+    const v0 = func.newVReg();
+    // b0: br b1   (b1 is the immediately-following block → fall through)
+    try block0.append(.{ .op = .{ .br = b1 } });
+    // b1: return 7
+    try block1.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try block1.append(.{ .op = .{ .ret = v0 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // No unconditional E9-relative jump should appear: the only br was
+    // to the next block and must have been elided. Scan for 0xE9.
+    for (code) |b| {
+        try std.testing.expect(b != 0xE9);
+    }
+}
+
+test "compileFunctionRA: br_if else==next drops trailing jmp (C3)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+    const block2 = func.getBlock(b2);
+
+    const cond = func.newVReg();
+    const r = func.newVReg();
+    // b0: br_if cond, then=b2, else=b1  (b1 is next → else falls through)
+    try block0.append(.{ .op = .{ .local_get = 0 }, .dest = cond, .type = .i32 });
+    try block0.append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b2, .else_block = b1 } } });
+    // b1: return 0
+    try block1.append(.{ .op = .{ .iconst_32 = 0 }, .dest = r, .type = .i32 });
+    try block1.append(.{ .op = .{ .ret = r } });
+    // b2: return 1
+    try block2.append(.{ .op = .{ .iconst_32 = 1 }, .dest = r, .type = .i32 });
+    try block2.append(.{ .op = .{ .ret = r } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // The conditional jump 0F 85 must still be present.
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x85 }));
+    // The unconditional E9 that would jump to the else block (b1) must
+    // have been elided: search for 0F 85 rel32 (6 bytes) immediately
+    // followed by 0xE9 — that would be the un-elided pattern.
+    var has_trailing_e9 = false;
+    var i: usize = 0;
+    while (i + 6 < code.len) : (i += 1) {
+        if (code[i] == 0x0F and code[i + 1] == 0x85 and code[i + 6] == 0xE9) {
+            has_trailing_e9 = true;
+            break;
+        }
+    }
+    try std.testing.expect(!has_trailing_e9);
 }
