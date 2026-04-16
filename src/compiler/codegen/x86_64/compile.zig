@@ -19,10 +19,10 @@ else
 /// Caller-saved allocatable registers that must be saved/restored around calls.
 /// On Win64: rdx, r8, r9 are volatile. rsi, rdi are callee-saved.
 /// On SysV: rdx, rsi, rdi, r8, r9 are all volatile.
-const caller_saved_alloc = if (builtin.os.tag == .windows)
-    [_]emit.Reg{ .rdx, .r8, .r9 }
-else
-    [_]emit.Reg{ .rdx, .rsi, .rdi, .r8, .r9 };
+/// Caller-saved allocatable registers that must be saved/restored around calls.
+/// Since our generated functions don't preserve callee-saved registers in their
+/// prologues, ALL allocatable registers must be treated as caller-saved.
+const caller_saved_alloc = [_]emit.Reg{ .rdx, .rsi, .rdi, .r8, .r9 };
 
 /// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
