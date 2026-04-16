@@ -862,6 +862,95 @@ pub const CompileResult = struct {
     offsets: []u32,
 };
 
+fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, allocator: std.mem.Allocator) !void {
+    const p = std.debug.print;
+    p("=== IR DUMP func[{d}] param_count={d} local_count={d} blocks={d} ===\n", .{ fi, func.param_count, func.local_count, func.blocks.items.len });
+
+    // Rebuild clobber points (same logic as compileFunctionRA) so allocation matches.
+    var clobbers: std.ArrayList(regalloc.ClobberPoint) = .empty;
+    defer clobbers.deinit(allocator);
+    var cp_pos: u32 = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |ci| {
+            switch (ci.op) {
+                .call, .call_indirect => {
+                    const mask = if (comptime builtin.os.tag == .windows)
+                        [_]bool{ true, false, false, true, true, false, false }
+                    else
+                        [_]bool{ true, true, true, true, true, false, false };
+                    try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = mask });
+                },
+                .memory_copy => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, true, true, false, false, false, false } }),
+                .memory_fill => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, false, true, false, false, false, false } }),
+                else => {},
+            }
+            cp_pos += 1;
+        }
+    }
+    var alloc = try regalloc.allocate(func, allocator, clobbers.items);
+    defer alloc.deinit();
+
+    var pos: u32 = 0;
+    for (func.blocks.items, 0..) |block, bi| {
+        p("  block[{d}]:\n", .{bi});
+        for (block.instructions.items) |inst| {
+            const dest_str: []const u8 = if (inst.dest != null) "dst" else "   ";
+            var dest_alloc_buf: [32]u8 = undefined;
+            const dest_alloc: []const u8 = if (inst.dest) |d| blk: {
+                if (alloc.get(d)) |a| switch (a) {
+                    .reg => |r| break :blk std.fmt.bufPrint(&dest_alloc_buf, "v{d}→r{d}", .{ d, r }) catch "?",
+                    .stack => |off| break :blk std.fmt.bufPrint(&dest_alloc_buf, "v{d}→[rbp{d}]", .{ d, off }) catch "?",
+                } else break :blk "v?→none";
+            } else "";
+            switch (inst.op) {
+                .iconst_32 => |v| p("    {d:4}: iconst_32 {d}  {s} {s}\n", .{ pos, v, dest_str, dest_alloc }),
+                .iconst_64 => |v| p("    {d:4}: iconst_64 {d}  {s} {s}\n", .{ pos, v, dest_str, dest_alloc }),
+                .add => |b| p("    {d:4}: add v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .sub => |b| p("    {d:4}: sub v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .mul => |b| p("    {d:4}: mul v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .@"and" => |b| p("    {d:4}: and v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .@"or" => |b| p("    {d:4}: or v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .xor => |b| p("    {d:4}: xor v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .shl => |b| p("    {d:4}: shl v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .shr_s => |b| p("    {d:4}: shr_s v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .shr_u => |b| p("    {d:4}: shr_u v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .eq => |b| p("    {d:4}: eq v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .ne => |b| p("    {d:4}: ne v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .lt_s => |b| p("    {d:4}: lt_s v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .lt_u => |b| p("    {d:4}: lt_u v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .gt_s => |b| p("    {d:4}: gt_s v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .gt_u => |b| p("    {d:4}: gt_u v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .le_s => |b| p("    {d:4}: le_s v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .le_u => |b| p("    {d:4}: le_u v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .ge_s => |b| p("    {d:4}: ge_s v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .ge_u => |b| p("    {d:4}: ge_u v{d}, v{d}  {s}\n", .{ pos, b.lhs, b.rhs, dest_alloc }),
+                .eqz => |v| p("    {d:4}: eqz v{d}  {s}\n", .{ pos, v, dest_alloc }),
+                .local_get => |idx| p("    {d:4}: local_get {d}  {s}\n", .{ pos, idx, dest_alloc }),
+                .local_set => |ls| p("    {d:4}: local_set {d}, v{d}\n", .{ pos, ls.idx, ls.val }),
+                .load => |ld| p("    {d:4}: load size={d} se={any} v{d}+{d}  {s}\n", .{ pos, ld.size, ld.sign_extend, ld.base, ld.offset, dest_alloc }),
+                .store => |st| p("    {d:4}: store size={d} v{d}+{d}, v{d}\n", .{ pos, st.size, st.base, st.offset, st.val }),
+                .br => |tgt| p("    {d:4}: br block{d}\n", .{ pos, tgt }),
+                .br_if => |b| p("    {d:4}: br_if v{d} ? block{d} : block{d}\n", .{ pos, b.cond, b.then_block, b.else_block }),
+                .br_table => |bt| p("    {d:4}: br_table v{d} default=block{d} (ntargets={d})\n", .{ pos, bt.index, bt.default, bt.targets.len }),
+                .ret => |rv| {
+                    if (rv) |v| p("    {d:4}: ret v{d}\n", .{ pos, v }) else p("    {d:4}: ret\n", .{pos});
+                },
+                .call => |cl| {
+                    const kind = if (cl.func_idx < import_count) "import" else "func";
+                    p("    {d:4}: call {s}[{d}] nargs={d}  {s}\n", .{ pos, kind, cl.func_idx, cl.args.len, dest_alloc });
+                },
+                .call_indirect => |ci| p("    {d:4}: call_indirect type={d} v{d} nargs={d}  {s}\n", .{ pos, ci.type_idx, ci.elem_idx, ci.args.len, dest_alloc }),
+                .select => |sel| p("    {d:4}: select cond=v{d} t=v{d} f=v{d}  {s}\n", .{ pos, sel.cond, sel.if_true, sel.if_false, dest_alloc }),
+                .global_get => |idx| p("    {d:4}: global_get {d}  {s}\n", .{ pos, idx, dest_alloc }),
+                .global_set => |gs| p("    {d:4}: global_set {d}, v{d}\n", .{ pos, gs.idx, gs.val }),
+                else => p("    {d:4}: <op tag={s}>  {s}\n", .{ pos, @tagName(inst.op), dest_alloc }),
+            }
+            pos += 1;
+        }
+    }
+    p("=== END DUMP func[{d}] ===\n", .{fi});
+}
+
 /// Compile all functions in an IR module to x86-64 machine code.
 /// After compiling all functions, patches inter-function call sites.
 pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator) !CompileResult {
@@ -874,7 +963,7 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
     var global_call_patches: std.ArrayList(GlobalCallPatch) = .empty;
     defer global_call_patches.deinit(allocator);
 
-    for (ir_module.functions.items) |func| {
+    for (ir_module.functions.items, 0..) |func, fi| {
         const func_start = all_code.items.len;
         try offsets.append(allocator, @intCast(func_start));
 
@@ -882,6 +971,12 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         const result = try compileFunctionRA(&func, ir_module.import_count, allocator);
         defer allocator.free(result.code);
         defer allocator.free(result.call_patches);
+
+        // Debug: dump IR+alloc for selected function index (-1 disables).
+        const dump_func_idx: i32 = -1;
+        if (@as(i32, @intCast(fi)) == dump_func_idx) {
+            dumpFuncIRAlloc(&func, @intCast(fi), ir_module.import_count, allocator) catch {};
+        }
 
         // Accumulate call patches with global offsets
         for (result.call_patches) |patch| {
