@@ -902,6 +902,24 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     var alloc_result = try regalloc.allocate(func, allocator);
     defer alloc_result.deinit();
 
+    // Compute which caller-saved registers are actually used by this function.
+    // Only these need to be saved/restored around call sites.
+    var used_caller_saved: [caller_saved_alloc.len]bool = .{false} ** caller_saved_alloc.len;
+    {
+        var it = alloc_result.assignments.iterator();
+        while (it.next()) |entry| {
+            switch (entry.value_ptr.*) {
+                .reg => |preg| {
+                    const reg: emit.Reg = @enumFromInt(preg);
+                    for (caller_saved_alloc, 0..) |cs_reg, i| {
+                        if (reg == cs_reg) used_caller_saved[i] = true;
+                    }
+                },
+                .stack => {},
+            }
+        }
+    }
+
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
@@ -959,7 +977,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         try block_offsets.put(@intCast(idx), code.len());
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, import_count);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, import_count, &used_caller_saved);
         }
     }
 
@@ -1060,6 +1078,7 @@ fn compileInstRA(
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
     import_count: u32,
+    used_caller_saved: *const [caller_saved_alloc.len]bool,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -1119,14 +1138,19 @@ fn compileInstRA(
                     return;
                 }
             }
-            // General case: load LHS first to avoid clobbering if both operands
-            // share the same register
+            // General case: load LHS first, save to r11 only if RHS might clobber it
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            try code.movRegReg(.r11, .rax); // save LHS to scratch reg to rdx
+            // Check if RHS vreg is assigned to rax (would clobber LHS)
+            const rhs_alloc = alloc_result.get(bin.rhs);
+            const rhs_in_rax = if (rhs_alloc) |a| switch (a) {
+                .reg => |p| @as(emit.Reg, @enumFromInt(p)) == .rax,
+                .stack => false,
+            } else false;
+            if (rhs_in_rax) try code.movRegReg(.r11, .rax);
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            try code.movRegReg(.rax, .r11); // restore LHS from scratch
+            if (rhs_in_rax) try code.movRegReg(.rax, .r11);
             switch (inst.op) {
                 .add => try code.addRegReg(.rax, .rcx),
                 .sub => try code.subRegReg(.rax, .rcx),
@@ -1144,11 +1168,15 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            try code.movRegReg(.r11, .rax); // save LHS to scratch reg
+            const rhs_alloc_cmp = alloc_result.get(bin.rhs);
+            const rhs_in_rax_cmp = if (rhs_alloc_cmp) |a| switch (a) {
+                .reg => |p| @as(emit.Reg, @enumFromInt(p)) == .rax,
+                .stack => false,
+            } else false;
+            if (rhs_in_rax_cmp) try code.movRegReg(.r11, .rax);
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            try code.movRegReg(.rax, .r11); // restore LHS from scratch
-            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            if (rhs_in_rax_cmp) try code.movRegReg(.rax, .r11);
             // Use 32-bit compare for i32 to get correct signed semantics
             if (inst.type == .i32) {
                 try code.cmpRegReg32(.rax, .rcx);
@@ -1220,7 +1248,7 @@ fn compileInstRA(
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
             // Save caller-saved allocatable registers across the call
-            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+            for (caller_saved_alloc, 0..) |reg, cs_i| { if (used_caller_saved[cs_i]) try code.pushReg(reg); }
 
             if (cl.func_idx < import_count) {
                 // Import call: indirect call via host function pointer table in VmCtx.
@@ -1282,7 +1310,7 @@ fn compileInstRA(
         // ── Indirect function calls ───────────────────────────────────
         .call_indirect => |ci| {
             // Save caller-saved allocatable registers across the call
-            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+            for (caller_saved_alloc, 0..) |reg, cs_i| { if (used_caller_saved[cs_i]) try code.pushReg(reg); }
 
             // Load table element index
             const idx_reg = try useVReg(code, alloc_result, ci.elem_idx, .rax);
@@ -1455,7 +1483,7 @@ fn compileInstRA(
         .div_s, .div_u, .rem_s, .rem_u => |bin| {
             const dest = inst.dest orelse return;
             // Save caller-saved regs since idiv clobbers rax and rdx
-            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+            for (caller_saved_alloc, 0..) |reg, cs_i| { if (used_caller_saved[cs_i]) try code.pushReg(reg); }
 
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
