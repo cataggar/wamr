@@ -1203,7 +1203,8 @@ fn compileInstRA(
             } else {
                 try code.movRegImm32(dr, val);
             }
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            // 32-bit write already zero-extends upper bits — skip zeroExtend32
+            try writeDef(code, alloc_result, dest, dr);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
@@ -1215,7 +1216,8 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
             try code.movRegImm32(dr, @bitCast(val));
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            // 32-bit write already zero-extends
+            try writeDef(code, alloc_result, dest, dr);
         },
         .fconst_64 => |val| {
             const dest = inst.dest orelse return;
@@ -1294,7 +1296,8 @@ fn compileInstRA(
             };
             try code.setcc(cc, .rax);
             try code.movzxByte(.rax, .rax);
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            // setcc+movzx produces clean 0/1 — skip zeroExtend32
+            try writeDef(code, alloc_result, dest, .rax);
         },
 
         .eqz => |vreg| {
@@ -1304,7 +1307,8 @@ fn compileInstRA(
             try code.testRegReg(.rax, .rax);
             try code.setcc(0x4, .rax);
             try code.movzxByte(.rax, .rax);
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            // setcc+movzx produces clean 0/1 — skip zeroExtend32
+            try writeDef(code, alloc_result, dest, .rax);
         },
 
         // ── Local variable access ─────────────────────────────────────
@@ -1485,7 +1489,14 @@ fn compileInstRA(
                 }
                 if (dr != .rax) try code.movRegReg(dr, .rax);
             }
-            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            // For non-sign-extended loads ≤ 4 bytes, movRegMemSized already
+            // produces a zero-extended (clean) i32 — skip redundant zeroExtend32.
+            const load_is_clean = !ld.sign_extend and ld.size <= 4;
+            if (load_is_clean) {
+                try writeDef(code, alloc_result, dest, dr);
+            } else {
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+            }
         },
         .store => |st| {
             // Load base FIRST to avoid register clobbering if both operands
@@ -1542,7 +1553,8 @@ fn compileInstRA(
             // Read current page count from VmCtx
             try code.movRegMem(.r10, .rbp, vmctx_offset);
             try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field);
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            // 32-bit load already zero-extends
+            try writeDef(code, alloc_result, dest, .rax);
         },
         .memory_grow => |pages_vreg| {
             const dest = inst.dest orelse return;
@@ -1766,7 +1778,8 @@ fn compileInstRA(
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             // Truncate to 32-bit: writing to eax zero-extends to rax
             try code.emitSlice(&.{ 0x89, 0xC0 }); // mov eax, eax
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            // Already zero-extended by the 32-bit write
+            try writeDef(code, alloc_result, dest, .rax);
         },
         .extend_i32_s => |vreg| {
             const dest = inst.dest orelse return;
