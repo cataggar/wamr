@@ -16,6 +16,14 @@ const param_regs = if (builtin.os.tag == .windows)
 else
     [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 }; // SysV
 
+/// Caller-saved allocatable registers that must be saved/restored around calls.
+/// On Win64: rdx, r8, r9 are volatile. rsi, rdi are callee-saved.
+/// On SysV: rdx, rsi, rdi, r8, r9 are all volatile.
+const caller_saved_alloc = if (builtin.os.tag == .windows)
+    [_]emit.Reg{ .rdx, .r8, .r9 }
+else
+    [_]emit.Reg{ .rdx, .rsi, .rdi, .r8, .r9 };
+
 /// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
 /// Points to a VmCtx struct with memory_base at +0, globals_base at +16.
@@ -1205,13 +1213,12 @@ fn compileInstRA(
 
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
+            // Save caller-saved allocatable registers across the call
+            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+
             if (cl.func_idx < import_count) {
                 // Import call: indirect call via host function pointer table in VmCtx.
-                // Load VmCtx* into first param reg (adapters expect it as arg 0).
                 try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
-
-                // Load wasm args into param regs starting at index 1
-                // (param_regs[0] is VmCtx*, wasm args go in param_regs[1..])
                 const n_args: u32 = @intCast(cl.args.len);
                 if (n_args > 0) {
                     const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
@@ -1221,32 +1228,21 @@ fn compileInstRA(
                         if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
                     }
                 }
-
-                // Load host_functions_ptr from VmCtx
                 try code.movRegMem(.r10, param_regs[0], vmctx_host_functions_field);
-                // Load function pointer: [host_functions_ptr + func_idx * 8]
                 if (cl.func_idx > 0) {
                     try code.addRegImm32(.r10, @intCast(@as(u32, cl.func_idx) * 8));
                 }
                 try code.movRegMem(.rax, .r10, 0);
-
-                // Reserve shadow space on Win64 (32 bytes)
                 if (comptime builtin.os.tag == .windows) {
                     try code.subRegImm32(.rsp, 32);
                 }
-
-                // Indirect call
                 try code.callReg(.rax);
-
-                // Restore shadow space on Win64
                 if (comptime builtin.os.tag == .windows) {
                     try code.addRegImm32(.rsp, 32);
                 }
             } else {
-                // Local function call: direct CALL rel32 with adjusted index
-                // Load VmCtx into first param reg (callee expects it as hidden first arg)
+                // Local function call: direct CALL rel32
                 try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
-                // Wasm args go into param_regs[1..]
                 const n_args: u32 = @intCast(cl.args.len);
                 if (n_args > 0) {
                     const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
@@ -1259,12 +1255,19 @@ fn compileInstRA(
                 try code.emitByte(0xE8);
                 const patch_off = code.len();
                 try code.emitI32(0);
-                // Remap to local function index (subtract import_count)
                 try call_patches.append(code.allocator, .{
                     .patch_offset = patch_off,
                     .target_func_idx = cl.func_idx - import_count,
                 });
             }
+
+            // Restore caller-saved registers (reverse order)
+            var ri: usize = caller_saved_alloc.len;
+            while (ri > 0) {
+                ri -= 1;
+                try code.popReg(caller_saved_alloc[ri]);
+            }
+
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
@@ -1272,36 +1275,27 @@ fn compileInstRA(
 
         // ── Indirect function calls ───────────────────────────────────
         .call_indirect => |ci| {
+            // Save caller-saved allocatable registers across the call
+            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+
             // Load table element index
             const idx_reg = try useVReg(code, alloc_result, ci.elem_idx, .rax);
             if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
             try code.zeroExtend32(.rax);
 
-            // Load VmCtx and func_table_ptr
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
-
-            // Look up wasm table to get the module function index
-            // For now, table 0 elements are stored in AotInstance.tables[0]
-            // We use func_table_ptr which maps module func idx → native address
-            // The wasm table has funcref values = module function indices
-            // We need: table[elem_idx] → func_idx → func_table[func_idx] → native addr
-
             // Load func_table_ptr from VmCtx
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
             try code.movRegMem(.r10, .r10, vmctx_func_table_field);
 
-            // Compute func_ptr = func_table[elem_idx * 8]
-            // rax = rax * 8
+            // func_ptr = func_table[elem_idx * 8]
             try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
-            // rax = func_table_ptr + rax
             try code.addRegReg(.rax, .r10);
-            // rax = [rax] (load function pointer)
             try code.movRegMem(.rax, .rax, 0);
 
             // Set up call: VmCtx in param_regs[0], wasm args in param_regs[1..]
             try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
             const n_args: u32 = @intCast(ci.args.len);
             if (n_args > 0) {
-                // Save rax (func ptr) before loading args that might clobber it
                 try code.pushReg(.rax);
                 const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
                 var i: u32 = 0;
@@ -1309,18 +1303,22 @@ fn compileInstRA(
                     const arg_reg = try useVReg(code, alloc_result, ci.args[i], .r10);
                     if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
                 }
-                try code.popReg(.rax); // restore func ptr
+                try code.popReg(.rax);
             }
 
-            // Reserve shadow space on Win64
             if (comptime builtin.os.tag == .windows) {
                 try code.subRegImm32(.rsp, 32);
             }
-
             try code.callReg(.rax);
-
             if (comptime builtin.os.tag == .windows) {
                 try code.addRegImm32(.rsp, 32);
+            }
+
+            // Restore caller-saved registers (reverse order)
+            var ri: usize = caller_saved_alloc.len;
+            while (ri > 0) {
+                ri -= 1;
+                try code.popReg(caller_saved_alloc[ri]);
             }
 
             if (inst.dest) |dest| {
