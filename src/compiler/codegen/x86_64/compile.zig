@@ -1279,7 +1279,22 @@ fn compileInstRA(
                     return;
                 }
             }
-            // General case: load LHS into dest register, RHS into scratch
+            // General case. For add specifically, if lhs is in a different
+            // register than dst, use LEA dst, [lhs + rhs] to fuse the mov
+            // and add into one instruction (C2). LEA requires both operands
+            // to be in real registers (not spilled) and neither to be rsp.
+            if (inst.op == .add) {
+                const lhs_reg_raw = regOf(alloc_result, bin.lhs);
+                const rhs_reg_raw = regOf(alloc_result, bin.rhs);
+                if (lhs_reg_raw != null and rhs_reg_raw != null and
+                    lhs_reg_raw.? != dr and lhs_reg_raw.? != .rsp and rhs_reg_raw.? != .rsp)
+                {
+                    try code.leaRegBaseIndex64(dr, lhs_reg_raw.?, rhs_reg_raw.?);
+                    try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                    return;
+                }
+            }
+            // Fallback: load LHS into dest register, RHS into scratch.
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, dr);
             if (lhs_reg != dr) try code.movRegReg(dr, lhs_reg);
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, scratch);
@@ -3112,4 +3127,37 @@ test "compileFunctionRA: store folds wasm offset into mov disp and omits r11 sav
     try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x83, 0xC3 }));
     // 32-bit store `mov [rax+16], ecx` with disp32 encoding = 89 88 10 00 00 00.
     try std.testing.expect(containsBytes(code, &.{ 0x89, 0x88, 0x10, 0x00, 0x00, 0x00 }));
+}
+
+
+test "compileFunctionRA: add of two non-constant values emits LEA" {
+    // Two local_get results then add — neither is in const_vals so the LEA
+    // path should fire, producing a single `lea dst, [lhs + rhs]` instead
+    // of `mov dst, lhs; add dst, rhs`.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 3, 0); // 2 params so 2 locals
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // Expect a 64-bit LEA (REX.W, opcode 0x8D, SIB form). The 0x8D opcode
+    // only appears for LEA in this function, so checking its presence is
+    // sufficient.
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x8D }));
+    // ADD reg,reg (01 /r with REX.W) must NOT appear for this add — the
+    // LEA replaced it. The 64-bit add encoding is `48 01 ...`.
+    try std.testing.expect(!containsBytes(code, &.{ 0x48, 0x01 }));
 }

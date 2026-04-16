@@ -433,6 +433,30 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, dst.low3(), src.low3());
     }
 
+    /// LEA dst, [base + index] — 3-operand 64-bit add without touching flags.
+    /// Used for non-destructive `dst = base + index` when dst != base, saving
+    /// a `mov dst, base` compared to the mov+add sequence.
+    /// Precondition: index must not be RSP (SIB encodes rsp as "no index").
+    pub fn leaRegBaseIndex64(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg) !void {
+        std.debug.assert(index != .rsp);
+        // REX.W + R (dst) + X (index) + B (base).
+        const rex_byte: u8 = 0x48 |
+            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
+            (@as(u8, @intFromEnum(index) >> 3) << 1) |
+            (@as(u8, @intFromEnum(base) >> 3));
+        try self.emitByte(rex_byte);
+        try self.emitByte(0x8D); // LEA
+        // If base.low3 == 5 (rbp/r13), mod=00 would mean RIP-relative, so use
+        // mod=01 with disp8=0 to encode a plain [base + index] form.
+        const needs_disp8 = base.low3() == 5;
+        const mod: u2 = if (needs_disp8) 0b01 else 0b00;
+        try self.modrm(mod, dst.low3(), 0b100); // rm=100 → SIB follows
+        // SIB: scale=00, index=index.low3, base=base.low3
+        const sib: u8 = (@as(u8, 0) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
+        try self.emitByte(sib);
+        if (needs_disp8) try self.emitByte(0x00);
+    }
+
     /// ADD reg, imm32 (64-bit).
     /// ADD reg, imm (64-bit). Uses the imm8 form (opcode 0x83) when imm fits
     /// in a signed byte, saving 3 bytes vs the imm32 form (opcode 0x81).
@@ -1526,3 +1550,35 @@ test "xorReg32 r8 (extended, 3 bytes)" {
     try hexEqual(buf.getCode(), &.{ 0x45, 0x31, 0xC0 });
 }
 
+
+
+test "leaRegBaseIndex64 rdx, rsi, rdi" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndex64(.rdx, .rsi, .rdi);
+    // REX.W=0x48 (no extension), opcode 0x8D, ModR/M 00_010_100=0x14,
+    // SIB 00_111_110=0x3E (scale=0, index=rdi=7, base=rsi=6).
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x8D, 0x14, 0x3E });
+}
+
+test "leaRegBaseIndex64 r12, r13, rdx (base r13 needs disp8=0)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndex64(.r12, .r13, .rdx);
+    // REX: W=1, R=1 (r12), X=0 (rdx low), B=1 (r13) → 0x4D.
+    // Opcode 0x8D.
+    // ModR/M: mod=01 (disp8), reg=r12.low3=4, rm=100 → 01_100_100 = 0x64.
+    // SIB: scale=0, index=rdx=2, base=r13.low3=5 → 00_010_101 = 0x15.
+    // disp8: 0x00.
+    try hexEqual(buf.getCode(), &.{ 0x4D, 0x8D, 0x64, 0x15, 0x00 });
+}
+
+test "leaRegBaseIndex64 rax, r8, r9" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndex64(.rax, .r8, .r9);
+    // REX: W=1, R=0, X=1 (r9), B=1 (r8) → 0x4B.
+    // Opcode 0x8D. ModR/M mod=00, reg=0, rm=100 → 0x04.
+    // SIB scale=0, index=r9.low3=1, base=r8.low3=0 → 00_001_000 = 0x08.
+    try hexEqual(buf.getCode(), &.{ 0x4B, 0x8D, 0x04, 0x08 });
+}
