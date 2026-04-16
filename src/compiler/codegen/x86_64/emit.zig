@@ -291,8 +291,16 @@ pub const CodeBuffer = struct {
     // ── SETcc / MOVZX / TEST / CQO / DIV / CMOV ──────────────────────
 
     /// SETcc r/m8 — set byte based on condition code.
+    /// Byte-register access requires a REX prefix for SPL/BPL/SIL/DIL
+    /// (encodings 4–7) to distinguish them from AH/CH/DH/BH. We force
+    /// the REX emission in that case even when no extension bits are set.
     pub fn setcc(self: *CodeBuffer, cc: u4, dst: Reg) !void {
-        try self.rex(false, .rax, dst);
+        const idx = @intFromEnum(dst);
+        if (idx >= 4 and idx < 8) {
+            try self.emitByte(0x40); // mandatory REX for SPL/BPL/SIL/DIL
+        } else {
+            try self.rex(false, .rax, dst);
+        }
         try self.emitByte(0x0F);
         try self.emitByte(0x90 | @as(u8, cc));
         try self.modrm(0b11, 0, dst.low3());
@@ -365,6 +373,63 @@ pub const CodeBuffer = struct {
         try self.rexW(dst, src);
         try self.emitByte(0x0F);
         try self.emitByte(0xB8);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// LZCNT r32, r/m32 — 32-bit leading zero count (no REX.W).
+    pub fn lzcnt32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3);
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBD);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// TZCNT r32, r/m32 — 32-bit trailing zero count (no REX.W).
+    pub fn tzcnt32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3);
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBC);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// POPCNT r32, r/m32 — 32-bit population count (no REX.W).
+    pub fn popcnt32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3);
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xB8);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// MOV r32, r/m32 — 32-bit reg-reg move. Implicitly zero-extends to 64.
+    pub fn movRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x89);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// MOVSXD r64, r/m32 — sign-extend 32→64.
+    pub fn movsxd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x63);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// MOVSX r64, r/m8 — sign-extend 8→64.
+    pub fn movsxByteToReg(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBE);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// MOVSX r64, r/m16 — sign-extend 16→64.
+    pub fn movsxWordToReg(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBF);
         try self.modrm(0b11, dst.low3(), src.low3());
     }
 
@@ -1110,6 +1175,93 @@ test "movMemRegSized 8-bit" {
     try hexEqual(buf.getCode(), &.{ 0x88, 0x81, 0x10, 0x00, 0x00, 0x00 });
 }
 
+test "setcc on legacy byte reg (al) omits REX" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x4, .rax); // sete al
+    try hexEqual(buf.getCode(), &.{ 0x0F, 0x94, 0xC0 });
+}
+
+test "setcc on rsi emits mandatory REX for sil" {
+    // Without the REX prefix, 0F 94 C6 encodes `sete DH`, which would be
+    // incorrect — we need `sete SIL`. Ensure the 0x40 REX is emitted.
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x4, .rsi);
+    try hexEqual(buf.getCode(), &.{ 0x40, 0x0F, 0x94, 0xC6 });
+}
+
+test "setcc on rdi emits mandatory REX for dil" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x5, .rdi); // setne dil
+    try hexEqual(buf.getCode(), &.{ 0x40, 0x0F, 0x95, 0xC7 });
+}
+
+test "setcc on extended reg r8 uses REX.B" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x4, .r8); // sete r8b
+    // REX.B = 0x41
+    try hexEqual(buf.getCode(), &.{ 0x41, 0x0F, 0x94, 0xC0 });
+}
+
+test "lzcnt32 on rdx encodes without REX.W" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lzcnt32(.rdx, .rdx);
+    // F3 0F BD /r with ModR/M 11_010_010 = 0xD2 (no REX)
+    try hexEqual(buf.getCode(), &.{ 0xF3, 0x0F, 0xBD, 0xD2 });
+}
+
+test "tzcnt32 on r9 emits REX.RB" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.tzcnt32(.r9, .r9);
+    // F3 REX.RB(0x45) 0F BC /r with ModR/M 11_001_001 = 0xC9
+    try hexEqual(buf.getCode(), &.{ 0xF3, 0x45, 0x0F, 0xBC, 0xC9 });
+}
+
+test "popcnt32 between different regs" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.popcnt32(.rsi, .rdi);
+    // F3 0F B8 /r with ModR/M 11_110_111 = 0xF7 (no REX: both legacy)
+    try hexEqual(buf.getCode(), &.{ 0xF3, 0x0F, 0xB8, 0xF7 });
+}
+
+test "movRegReg32 rdx to rsi" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegReg32(.rsi, .rdx);
+    // MOV r/m32, r32 opcode 0x89 with reg=src=rdx=2, rm=dst=rsi=6 → 11_010_110 = D6
+    try hexEqual(buf.getCode(), &.{ 0x89, 0xD6 });
+}
+
+test "movsxd rsi, edx" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movsxd(.rsi, .rdx);
+    // REX.W 63 /r with ModR/M 11_110_010 = 0xF2
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x63, 0xF2 });
+}
+
+test "movsxByteToReg rdi, dl" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movsxByteToReg(.rdi, .rdx);
+    // REX.W 0F BE /r with ModR/M 11_111_010 = 0xFA
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x0F, 0xBE, 0xFA });
+}
+
+test "movsxWordToReg r8, si" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movsxWordToReg(.r8, .rsi);
+    // REX.WR (0x4C) 0F BF /r with ModR/M 11_000_110 = 0xC6
+    try hexEqual(buf.getCode(), &.{ 0x4C, 0x0F, 0xBF, 0xC6 });
+}
+
 test "movMemRegSized 16-bit" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
@@ -1303,3 +1455,4 @@ test "xorReg32 r8 (extended, 3 bytes)" {
     // REX 45 31 C0 (XOR r8d, r8d)
     try hexEqual(buf.getCode(), &.{ 0x45, 0x31, 0xC0 });
 }
+

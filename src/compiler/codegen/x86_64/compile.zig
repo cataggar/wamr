@@ -1301,37 +1301,37 @@ fn compileInstRA(
         // ── Comparisons ───────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
             const dest = inst.dest orelse return;
-            // setcc writes a byte register; on x86-64, sil/dil need a mandatory
-            // REX prefix that our emitter doesn't force. Use rax (al) to be safe.
-            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
-            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            // Use 32-bit compare for i32 to get correct signed semantics
+            const dr = destReg(alloc_result, dest);
+            // Load lhs and rhs using different spill scratches so spilled
+            // operands don't clobber each other.
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .r11);
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rax);
+            // Use 32-bit compare for i32 to get correct signed semantics.
             if (inst.type == .i32) {
-                try code.cmpRegReg32(.rax, rhs_reg);
+                try code.cmpRegReg32(lhs_reg, rhs_reg);
             } else {
-                try code.cmpRegReg(.rax, rhs_reg);
+                try code.cmpRegReg(lhs_reg, rhs_reg);
             }
             const cc: u4 = comptime switch (tag) {
                 .eq => 0x4, .ne => 0x5, .lt_s => 0xC, .lt_u => 0x2,
                 .gt_s => 0xF, .gt_u => 0x7, .le_s => 0xE, .le_u => 0x6,
                 .ge_s => 0xD, .ge_u => 0x3, else => unreachable,
             };
-            try code.setcc(cc, .rax);
-            try code.movzxByte(.rax, .rax);
+            try code.setcc(cc, dr);
+            try code.movzxByte(dr, dr);
             // setcc+movzx produces clean 0/1 — skip zeroExtend32
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDef(code, alloc_result, dest, dr);
         },
 
         .eqz => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            try code.testRegReg(.rax, .rax);
-            try code.setcc(0x4, .rax);
-            try code.movzxByte(.rax, .rax);
+            try code.testRegReg(src_reg, src_reg);
+            try code.setcc(0x4, dr);
+            try code.movzxByte(dr, dr);
             // setcc+movzx produces clean 0/1 — skip zeroExtend32
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDef(code, alloc_result, dest, dr);
         },
 
         // ── Local variable access ─────────────────────────────────────
@@ -1372,8 +1372,7 @@ fn compileInstRA(
         },
         .br_if => |br| {
             const cond_reg = try useVReg(code, alloc_result, br.cond, .rax);
-            if (cond_reg != .rax) try code.movRegReg(.rax, cond_reg);
-            try code.testRegReg(.rax, .rax);
+            try code.testRegReg(cond_reg, cond_reg);
             try code.emitByte(0x0F);
             try code.emitByte(0x85);
             const then_patch = code.len();
@@ -1552,16 +1551,12 @@ fn compileInstRA(
             const dr = destReg(alloc_result, dest);
             try code.movRegMemSized(dr, .rax, 0, ld.size);
             if (ld.sign_extend and ld.size < 8) {
-                // Sign-extend for smaller loads — uses hardcoded rax encodings,
-                // so move to rax if needed, sign-extend, move back.
-                if (dr != .rax) try code.movRegReg(.rax, dr);
                 switch (ld.size) {
-                    1 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBE, 0xC0 }), // movsx rax, al
-                    2 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBF, 0xC0 }), // movsx rax, ax
-                    4 => try code.emitSlice(&.{ 0x48, 0x63, 0xC0 }),       // movsxd rax, eax
+                    1 => try code.movsxByteToReg(dr, dr),
+                    2 => try code.movsxWordToReg(dr, dr),
+                    4 => try code.movsxd(dr, dr),
                     else => {},
                 }
-                if (dr != .rax) try code.movRegReg(dr, .rax);
             }
             // For non-sign-extended loads ≤ 4 bytes, movRegMemSized already
             // produces a zero-extended (clean) i32 — skip redundant zeroExtend32.
@@ -1624,11 +1619,12 @@ fn compileInstRA(
         // ── Memory management ─────────────────────────────────────────
         .memory_size => {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             // Read current page count from VmCtx
             try code.movRegMem(.r10, .rbp, vmctx_offset);
-            try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field);
+            try code.movRegMemNoRex(dr, .r10, vmctx_mem_pages_field);
             // 32-bit load already zero-extends
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDef(code, alloc_result, dest, dr);
         },
         .memory_grow => |pages_vreg| {
             const dest = inst.dest orelse return;
@@ -1777,37 +1773,36 @@ fn compileInstRA(
         // ── Unary ops ─────────────────────────────────────────────────
         .clz => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             if (inst.type == .i32) {
-                // Use 32-bit LZCNT to count only within the low 32 bits
-                try code.emitSlice(&.{ 0xF3, 0x0F, 0xBD, 0xC0 }); // lzcnt eax, eax
+                try code.lzcnt32(dr, src_reg);
             } else {
-                try code.lzcnt(.rax, .rax);
+                try code.lzcnt(dr, src_reg);
             }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .ctz => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             if (inst.type == .i32) {
-                try code.emitSlice(&.{ 0xF3, 0x0F, 0xBC, 0xC0 }); // tzcnt eax, eax
+                try code.tzcnt32(dr, src_reg);
             } else {
-                try code.tzcnt(.rax, .rax);
+                try code.tzcnt(dr, src_reg);
             }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .popcnt => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             if (inst.type == .i32) {
-                try code.emitSlice(&.{ 0xF3, 0x0F, 0xB8, 0xC0 }); // popcnt eax, eax
+                try code.popcnt32(dr, src_reg);
             } else {
-                try code.popcntReg(.rax, .rax);
+                try code.popcntReg(dr, src_reg);
             }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Select ────────────────────────────────────────────────────
@@ -1835,10 +1830,9 @@ fn compileInstRA(
         },
         .global_set => |gs| {
             const val_reg = try useVReg(code, alloc_result, gs.val, .rax);
-            if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
             try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
             try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
-            try code.movMemReg(.r10, @as(i32, @intCast(gs.idx * 8)), .rax); // global[idx] = val
+            try code.movMemReg(.r10, @as(i32, @intCast(gs.idx * 8)), val_reg); // global[idx] = val
         },
 
         .@"unreachable" => {
@@ -1848,52 +1842,47 @@ fn compileInstRA(
         // ── Type conversions ──────────────────────────────────────────
         .wrap_i64 => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            // Truncate to 32-bit: writing to eax zero-extends to rax
-            try code.emitSlice(&.{ 0x89, 0xC0 }); // mov eax, eax
-            // Already zero-extended by the 32-bit write
-            try writeDef(code, alloc_result, dest, .rax);
+            // 32-bit reg-reg move truncates to 32 bits and zero-extends.
+            try code.movRegReg32(dr, src_reg);
+            try writeDef(code, alloc_result, dest, dr);
         },
         .extend_i32_s => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            // MOVSXD rax, eax: sign-extend 32→64
-            try code.emitSlice(&.{ 0x48, 0x63, 0xC0 });
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try code.movsxd(dr, src_reg);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .extend_i32_u => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            // mov eax, eax: zero-extend 32→64 (implicit on x86-64)
-            try code.emitSlice(&.{ 0x89, 0xC0 });
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            // 32-bit mov zero-extends to 64.
+            try code.movRegReg32(dr, src_reg);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .extend8_s => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            // MOVSX rax, al: REX.W 0F BE C0
-            try code.emitSlice(&.{ 0x48, 0x0F, 0xBE, 0xC0 });
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try code.movsxByteToReg(dr, src_reg);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .extend16_s => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            // MOVSX rax, ax: REX.W 0F BF C0
-            try code.emitSlice(&.{ 0x48, 0x0F, 0xBF, 0xC0 });
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try code.movsxWordToReg(dr, src_reg);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .extend32_s => |vreg| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            // MOVSXD rax, eax
-            try code.emitSlice(&.{ 0x48, 0x63, 0xC0 });
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try code.movsxd(dr, src_reg);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .reinterpret => |vreg| {
             const dest = inst.dest orelse return;
@@ -2677,8 +2666,10 @@ test "compileFunctionRA: wrap_i64 emits mov eax,eax" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // Should contain mov eax, eax (89 C0) for wrap_i64
-    try std.testing.expect(containsBytes(code, &.{ 0x89, 0xC0 }));
+    // Allocator keeps v0 in rdx and puts v1 in rsi (v0's range doesn't end
+    // strictly before v1 begins). wrap_i64 emits `mov esi, edx` = 89 D6
+    // (ModR/M 11_010_110, reg=rdx=2, rm=rsi=6), which zero-extends to rsi.
+    try std.testing.expect(containsBytes(code, &.{ 0x89, 0xD6 }));
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
 
@@ -2700,8 +2691,8 @@ test "compileFunctionRA: extend_i32_s emits MOVSXD" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // Should contain MOVSXD rax, eax (48 63 C0)
-    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x63, 0xC0 }));
+    // MOVSXD rsi, edx (sign-extend v0→v1; v0 in rdx, v1 in rsi): 48 63 F2
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x63, 0xF2 }));
 }
 
 test "compileFunctionRA: memory_copy emits REP MOVSB" {
@@ -2850,4 +2841,92 @@ test "compileFunctionRA: br_table emits jump table + indirect jmp" {
     try std.testing.expect(containsBytes(code, &.{ 0x41, 0xFF, 0xE2 }));
     // jae rel32 (bounds check)
     try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x83 }));
+}
+
+test "compileFunctionRA: eqz targets allocated dest register (rdx)" {
+    // eqz result should use the destReg directly, not funnel through rax.
+    // For a simple function the first allocatable reg is rdx (alloc_regs[0]),
+    // so we expect `setcc dl` (0F 94 C2) and `movzx rdx, dl` (48 0F B6 D2).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .eqz = v0 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // Allocator expires v0 after v1 starts (live-range end==start), so v0 gets
+    // rdx and v1 gets rsi. The setcc result therefore lands in sil, which
+    // requires the mandatory REX prefix to distinguish it from DH.
+    // setcc sil: 40 0F 94 C6  (REX=0x40, opcode 0F 94, ModR/M 11_000_110)
+    try std.testing.expect(containsBytes(code, &.{ 0x40, 0x0F, 0x94, 0xC6 }));
+    // movzx rsi, sil: 48 0F B6 F6  (REX.W, ModR/M 11_110_110)
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x0F, 0xB6, 0xF6 }));
+    // Must NOT emit the old rax-centric `setcc al` (0F 94 C0).
+    try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x94, 0xC0 }));
+}
+
+test "compileFunctionRA: comparison targets allocated dest register" {
+    // eq should use destReg for setcc instead of hardcoded rax. The first
+    // allocatable reg is rdx, so verify `setcc dl` is present.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // Two constants are live simultaneously at the eq, so v0→rdx, v1→rsi,
+    // v2→rdi. The setcc writes dil with mandatory REX.
+    // setcc dil: 40 0F 94 C7  (REX=0x40, opcode 0F 94, ModR/M 11_000_111)
+    try std.testing.expect(containsBytes(code, &.{ 0x40, 0x0F, 0x94, 0xC7 }));
+    // movzx rdi, dil: 48 0F B6 FF  (REX.W, ModR/M 11_111_111)
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x0F, 0xB6, 0xFF }));
+    // No legacy `setcc al`.
+    try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x94, 0xC0 }));
+}
+
+test "compileFunctionRA: memory_size loads into allocated dest register" {
+    // memory_size should emit `mov dr, [r10 + mem_pages_field]` with
+    // dr being the allocated destination register rather than forced rax.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .memory_size, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // mov edx, [r10 + 56] — 32-bit load, no REX.W.
+    // Opcode 0x8B, REX.B=0x41 (because base is r10). ModR/M = 10_010_010 (0x92),
+    // then disp32 = 0x38 00 00 00 (vmctx_mem_pages_field = 56).
+    try std.testing.expect(containsBytes(code, &.{ 0x41, 0x8B, 0x92, 0x38, 0x00, 0x00, 0x00 }));
 }
