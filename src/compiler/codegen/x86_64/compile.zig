@@ -299,6 +299,14 @@ const CallPatch = struct {
     target_func_idx: u32,
 };
 
+/// Patches one 4-byte entry in a br_table jump table. After final layout is
+/// known, `entry_offset` is overwritten with `block_offsets[target_block] - base_offset`.
+const TablePatch = struct {
+    entry_offset: usize,
+    base_offset: usize,
+    target_block: ir.BlockId,
+};
+
 fn compileInst(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -612,6 +620,11 @@ fn compileInst(
             const else_patch = code.len();
             try code.emitI32(0);
             try patches.append(code.allocator, .{ .patch_offset = else_patch, .target_block = br.else_block });
+        },
+        .br_table => {
+            // br_table is only used through compileFunctionRA path in production.
+            // The legacy stack-based compileInst path does not support it.
+            return error.Unsupported;
         },
 
         // ── Function calls ────────────────────────────────────────────
@@ -1067,13 +1080,15 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     defer branch_patches.deinit(allocator);
     var call_patches: std.ArrayList(CallPatch) = .empty;
     defer call_patches.deinit(allocator);
+    var table_patches: std.ArrayList(TablePatch) = .empty;
+    defer table_patches.deinit(allocator);
 
     var last_was_ret = false;
     for (func.blocks.items, 0..) |block, idx| {
         try block_offsets.put(@intCast(idx), code.len());
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, import_count, &used_caller_saved, &used_callee_saved);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved);
         }
     }
 
@@ -1081,6 +1096,13 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         if (block_offsets.get(patch.target_block)) |target_off| {
             const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
             code.patchI32(patch.patch_offset, rel);
+        }
+    }
+
+    for (table_patches.items) |patch| {
+        if (block_offsets.get(patch.target_block)) |target_off| {
+            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.base_offset)));
+            code.patchI32(patch.entry_offset, rel);
         }
     }
 
@@ -1189,6 +1211,7 @@ fn compileInstRA(
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
+    table_patches: *std.ArrayList(TablePatch),
     import_count: u32,
     used_caller_saved: *const [caller_saved_alloc.len]bool,
     used_callee_saved: *const [callee_saved_alloc.len]bool,
@@ -1360,6 +1383,57 @@ fn compileInstRA(
             const else_patch = code.len();
             try code.emitI32(0);
             try patches.append(code.allocator, .{ .patch_offset = else_patch, .target_block = br.else_block });
+        },
+        .br_table => |bt| {
+            // Load index into r11 (scratch) and canonicalize upper 32 bits to zero.
+            const idx_reg = try useVReg(code, alloc_result, bt.index, .r11);
+            if (idx_reg != .r11) try code.movRegReg(.r11, idx_reg);
+            try code.zeroExtend32(.r11);
+
+            // cmp r11, targets.len ; jae default  (unsigned out-of-range goes to default)
+            try code.cmpRegImm32(.r11, @intCast(bt.targets.len));
+            try code.emitByte(0x0F);
+            try code.emitByte(0x83);
+            const default_patch = code.len();
+            try code.emitI32(0);
+            try patches.append(code.allocator, .{ .patch_offset = default_patch, .target_block = bt.default });
+
+            // lea r10, [rip + table]       ; 4C 8D 15 disp32
+            try code.emitByte(0x4C);
+            try code.emitByte(0x8D);
+            try code.emitByte(0x15);
+            const lea_disp_off = code.len();
+            try code.emitI32(0);
+
+            // movsxd r11, dword ptr [r10 + r11*4]
+            // REX.WRXB = 0x4F, opcode 0x63, ModR/M=00_011_100 (0x1C), SIB=10_011_010 (0x9A)
+            try code.emitByte(0x4F);
+            try code.emitByte(0x63);
+            try code.emitByte(0x1C);
+            try code.emitByte(0x9A);
+
+            // add r10, r11
+            try code.addRegReg(.r10, .r11);
+
+            // jmp r10                     ; 41 FF E2
+            try code.emitByte(0x41);
+            try code.emitByte(0xFF);
+            try code.emitByte(0xE2);
+
+            // Emit the jump table inline (no fallthrough from the indirect jmp).
+            const table_off = code.len();
+            const lea_rel: i32 = @intCast(@as(i64, @intCast(table_off)) - @as(i64, @intCast(lea_disp_off + 4)));
+            code.patchI32(lea_disp_off, lea_rel);
+
+            for (bt.targets) |target| {
+                const entry_off = code.len();
+                try code.emitI32(0);
+                try table_patches.append(code.allocator, .{
+                    .entry_offset = entry_off,
+                    .base_offset = table_off,
+                    .target_block = target,
+                });
+            }
         },
 
         // ── Function calls ────────────────────────────────────────────
@@ -2726,4 +2800,54 @@ test "compileFunctionRA: local_get and local_set" {
 
     try std.testing.expect(code.len > 10);
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: br_table emits jump table + indirect jmp" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    // Param 0 is the switch index. 2 targets + default.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const idx = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = idx, .type = .i32 });
+
+    const targets = try allocator.alloc(ir.BlockId, 2);
+    targets[0] = b1;
+    targets[1] = b2;
+    try func.getBlock(b0).append(.{ .op = .{ .br_table = .{
+        .index = idx,
+        .targets = targets,
+        .default = b3,
+    } } });
+
+    const r1 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = r1 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = r1 } });
+    const r2 = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 2 }, .dest = r2 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = r2 } });
+    const r3 = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 3 }, .dest = r3 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = r3 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+    // targets slice is leaked by IR (same pattern as call.args); free explicitly.
+    allocator.free(targets);
+
+    // lea r10, [rip+disp32]
+    try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8D, 0x15 }));
+    // movsxd r11, [r10 + r11*4]
+    try std.testing.expect(containsBytes(code, &.{ 0x4F, 0x63, 0x1C, 0x9A }));
+    // jmp r10
+    try std.testing.expect(containsBytes(code, &.{ 0x41, 0xFF, 0xE2 }));
+    // jae rel32 (bounds check)
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x83 }));
 }
