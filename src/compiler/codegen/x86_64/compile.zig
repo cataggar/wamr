@@ -1105,11 +1105,14 @@ fn compileInstRA(
                     return;
                 }
             }
-            // General case: load both operands
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            // General case: load LHS first to avoid clobbering if both operands
+            // share the same register
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            try code.movRegReg(.r11, .rax); // save LHS to scratch reg to rdx
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            try code.movRegReg(.rax, .r11); // restore LHS from scratch
             switch (inst.op) {
                 .add => try code.addRegReg(.rax, .rcx),
                 .sub => try code.subRegReg(.rax, .rcx),
@@ -1125,9 +1128,12 @@ fn compileInstRA(
         // ── Comparisons ───────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
             const dest = inst.dest orelse return;
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            try code.movRegReg(.r11, .rax); // save LHS to scratch reg
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            try code.movRegReg(.rax, .r11); // restore LHS from scratch
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
             // Use 32-bit compare for i32 to get correct signed semantics
             if (inst.type == .i32) {
@@ -1283,15 +1289,7 @@ fn compileInstRA(
             // Load func_table_ptr from VmCtx
             try code.movRegMem(.r10, .r10, vmctx_func_table_field);
 
-            // func_ptr = func_table[rax * 8] (rax = elem_idx used as func_idx directly
-            // since for simple cases, table[i] = i is common; but we need the actual
-            // table element. For now, use elem_idx as the module function index)
-            // TODO: proper table lookup via VmCtx.tables
-            try code.emitSlice(&.{ 0x48, 0x8B, 0x04, 0xC2 }); // mov rax, [rdx + rax*8]
-            // Actually, let me use a simpler approach: rax = [r10 + rax*8]
-            // SIB: scale=3(8), index=rax(0), base=r10(10)
-            // But r10 is extended... let me just compute the address manually:
-
+            // Compute func_ptr = func_table[elem_idx * 8]
             // rax = rax * 8
             try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
             // rax = func_table_ptr + rax
@@ -1354,16 +1352,22 @@ fn compileInstRA(
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .store => |st| {
-            const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
-            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
+            // Load base FIRST to avoid register clobbering if both operands
+            // are assigned to the same register by the allocator
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
-            try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
-            if (st.offset > 0) try code.addRegImm32(.rax, @intCast(st.offset));
-            try code.movMemRegSized(.rax, 0, .rcx, st.size);
+            // Save base address to r11 (scratch, not allocatable)
+            try code.movRegReg(.r11, .rax);
+            // Now load value — may clobber rax if both operands share a register
+            const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
+            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
+            // Compute final address using saved base in r11
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
+            try code.addRegReg(.r11, .r10); // r11 = mem_base + wasm_addr
+            if (st.offset > 0) try code.addRegImm32(.r11, @intCast(st.offset));
+            try code.movMemRegSized(.r11, 0, .rcx, st.size);
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
