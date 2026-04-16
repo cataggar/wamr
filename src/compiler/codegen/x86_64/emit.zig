@@ -124,6 +124,11 @@ pub const CodeBuffer = struct {
 
     /// MOV dst, src (64-bit register-to-register).
     pub fn movRegReg(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        // Post-allocation peephole (B3): a self-move is a semantic no-op —
+        // the 64-bit mov doesn't even clear upper bits (that's the 32-bit
+        // form). Skip emission so allocator-introduced identity moves
+        // vanish.
+        if (dst == src) return;
         try self.rexW(src, dst);
         try self.emitByte(0x89);
         try self.modrm(0b11, src.low3(), dst.low3());
@@ -1581,4 +1586,22 @@ test "leaRegBaseIndex64 rax, r8, r9" {
     // Opcode 0x8D. ModR/M mod=00, reg=0, rm=100 → 0x04.
     // SIB scale=0, index=r9.low3=1, base=r8.low3=0 → 00_001_000 = 0x08.
     try hexEqual(buf.getCode(), &.{ 0x4B, 0x8D, 0x04, 0x08 });
+}
+
+
+test "movRegReg elides self-move" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegReg(.rax, .rax);
+    try buf.movRegReg(.r12, .r12);
+    // Both self-moves must produce zero bytes.
+    try std.testing.expectEqual(@as(usize, 0), buf.getCode().len);
+}
+
+test "movRegReg still emits for distinct regs" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegReg(.rax, .rdx);
+    // REX.W 89 /r: 48 89 D0 (mov rax, rdx)
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x89, 0xD0 });
 }
