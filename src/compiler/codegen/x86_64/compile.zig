@@ -24,6 +24,12 @@ else
 /// prologues, ALL allocatable registers must be treated as caller-saved.
 const caller_saved_alloc = [_]emit.Reg{ .rdx, .rsi, .rdi, .r8, .r9 };
 
+/// Callee-saved allocatable registers preserved in prologue/epilogue.
+/// On Win64, rsi and rdi are callee-saved per the ABI; compiled functions
+/// must save/restore them if used. On SysV they're caller-saved (handled
+/// at call sites via caller_saved_alloc), so no prologue work is needed.
+const callee_saved_alloc = [_]emit.Reg{ .rsi, .rdi };
+
 /// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
 /// Points to a VmCtx struct with memory_base at +0, globals_base at +16.
@@ -905,6 +911,8 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     // Compute which caller-saved registers are actually used by this function.
     // Only these need to be saved/restored around call sites.
     var used_caller_saved: [caller_saved_alloc.len]bool = .{false} ** caller_saved_alloc.len;
+    // Track which callee-saved registers are used (for prologue/epilogue preservation).
+    var used_callee_saved: [callee_saved_alloc.len]bool = .{false} ** callee_saved_alloc.len;
     {
         var it = alloc_result.assignments.iterator();
         while (it.next()) |entry| {
@@ -914,8 +922,34 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
                     for (caller_saved_alloc, 0..) |cs_reg, i| {
                         if (reg == cs_reg) used_caller_saved[i] = true;
                     }
+                    if (comptime builtin.os.tag == .windows) {
+                        for (callee_saved_alloc, 0..) |cs_reg, i| {
+                            if (reg == cs_reg) used_callee_saved[i] = true;
+                        }
+                    }
                 },
                 .stack => {},
+            }
+        }
+    }
+    // Mark callee-saved regs clobbered by fixed-register instructions:
+    // memory_copy (REP MOVSB) hard-uses rsi+rdi, memory_fill (REP STOSB) uses rdi.
+    if (comptime builtin.os.tag == .windows) {
+        for (func.blocks.items) |block| {
+            for (block.instructions.items) |blk_inst| {
+                switch (blk_inst.op) {
+                    .memory_copy => {
+                        for (callee_saved_alloc, 0..) |cs_reg, i| {
+                            if (cs_reg == .rsi or cs_reg == .rdi) used_callee_saved[i] = true;
+                        }
+                    },
+                    .memory_fill => {
+                        for (callee_saved_alloc, 0..) |cs_reg, i| {
+                            if (cs_reg == .rdi) used_callee_saved[i] = true;
+                        }
+                    },
+                    else => {},
+                }
             }
         }
     }
@@ -923,10 +957,22 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
-    // Frame: locals + spill slots + 1 vmctx slot, aligned to 16 bytes
+    // Count callee-saved pushes for stack alignment calculation.
+    var callee_save_count: u32 = 0;
+    if (comptime builtin.os.tag == .windows) {
+        for (used_callee_saved) |used| {
+            if (used) callee_save_count += 1;
+        }
+    }
+
+    // Frame: locals + spill slots + 1 vmctx slot, aligned to 16 bytes.
+    // After push rbp (rsp=0 mod 16), sub rsp + callee-save pushes must
+    // leave rsp ≡ 8 mod 16, so that an odd number of caller-saved pushes
+    // at call sites aligns rsp to 16 for the CALL instruction.
     const spill_slots = alloc_result.spill_count;
     const raw_size: u32 = (func.local_count + 64 + spill_slots + 1) * 8;
-    const frame_size: u32 = (raw_size + 15) & ~@as(u32, 15) | 8;
+    const aligned: u32 = (raw_size + 15) & ~@as(u32, 15);
+    const frame_size: u32 = if (callee_save_count % 2 == 0) aligned | 8 else aligned;
     try code.emitPrologue(frame_size);
 
     // Save memory base (VMContext) from first ABI register to [rbp - 8]
@@ -947,6 +993,13 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         try code.xorReg32(.rax);
         for (func.param_count..func.local_count) |i| {
             try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), .rax);
+        }
+    }
+
+    // Save callee-saved registers used by this function (Win64 ABI: rsi/rdi).
+    if (comptime builtin.os.tag == .windows) {
+        for (callee_saved_alloc, 0..) |reg, i| {
+            if (used_callee_saved[i]) try code.pushReg(reg);
         }
     }
 
@@ -977,7 +1030,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         try block_offsets.put(@intCast(idx), code.len());
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, import_count, &used_caller_saved);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, import_count, &used_caller_saved, &used_callee_saved);
         }
     }
 
@@ -989,6 +1042,14 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     }
 
     if (!last_was_ret) {
+        // Restore callee-saved registers before epilogue (reverse order).
+        if (comptime builtin.os.tag == .windows) {
+            var ci: usize = callee_saved_alloc.len;
+            while (ci > 0) {
+                ci -= 1;
+                if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
+            }
+        }
         try code.emitEpilogue();
     }
 
@@ -1079,6 +1140,7 @@ fn compileInstRA(
     call_patches: *std.ArrayList(CallPatch),
     import_count: u32,
     used_caller_saved: *const [caller_saved_alloc.len]bool,
+    used_callee_saved: *const [callee_saved_alloc.len]bool,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -1220,6 +1282,14 @@ fn compileInstRA(
                 const src_reg = try useVReg(code, alloc_result, val, .rax);
                 if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             }
+            // Restore callee-saved registers before epilogue (reverse order).
+            if (comptime builtin.os.tag == .windows) {
+                var ci: usize = callee_saved_alloc.len;
+                while (ci > 0) {
+                    ci -= 1;
+                    if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
+                }
+            }
             try code.emitEpilogue();
         },
 
@@ -1299,7 +1369,7 @@ fn compileInstRA(
             var ri: usize = caller_saved_alloc.len;
             while (ri > 0) {
                 ri -= 1;
-                try code.popReg(caller_saved_alloc[ri]);
+                if (used_caller_saved[ri]) try code.popReg(caller_saved_alloc[ri]);
             }
 
             if (inst.dest) |dest| {
@@ -1352,7 +1422,7 @@ fn compileInstRA(
             var ri: usize = caller_saved_alloc.len;
             while (ri > 0) {
                 ri -= 1;
-                try code.popReg(caller_saved_alloc[ri]);
+                if (used_caller_saved[ri]) try code.popReg(caller_saved_alloc[ri]);
             }
 
             if (inst.dest) |dest| {
@@ -1533,7 +1603,7 @@ fn compileInstRA(
             var ri: usize = caller_saved_alloc.len;
             while (ri > 0) {
                 ri -= 1;
-                try code.popReg(caller_saved_alloc[ri]);
+                if (used_caller_saved[ri]) try code.popReg(caller_saved_alloc[ri]);
             }
             try code.movRegReg(.rax, .r11);
 
