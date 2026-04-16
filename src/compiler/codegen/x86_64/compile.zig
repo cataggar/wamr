@@ -1541,10 +1541,9 @@ fn compileInstRA(
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
-            if (ld.offset > 0) try code.addRegImm32(.rax, @intCast(ld.offset));
-            // Load value into dest register (address is in rax)
+            // Load value into dest register (address is in rax); fold offset into disp.
             const dr = destReg(alloc_result, dest);
-            try code.movRegMemSized(dr, .rax, 0, ld.size);
+            try code.movRegMemSized(dr, .rax, @intCast(ld.offset), ld.size);
             if (ld.sign_extend and ld.size < 8) {
                 switch (ld.size) {
                     1 => try code.movsxByteToReg(dr, dr),
@@ -1563,22 +1562,20 @@ fn compileInstRA(
             }
         },
         .store => |st| {
-            // Load base FIRST to avoid register clobbering if both operands
-            // are assigned to the same register by the allocator
+            // Load memory base from VMContext frame slot into r10.
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
+            // Compute final address in rax (not allocatable — safe to clobber).
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
-            // Save base address to r11 (scratch, not allocatable)
-            try code.movRegReg(.r11, .rax);
-            // Now load value — may clobber rax if both operands share a register
+            try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
+            // Load value into rcx (not allocatable — safe to clobber).
+            // useVReg writes spill loads into scratch=.rcx, so rax is preserved.
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            // Compute final address using saved base in r11
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
-            try code.addRegReg(.r11, .r10); // r11 = mem_base + wasm_addr
-            if (st.offset > 0) try code.addRegImm32(.r11, @intCast(st.offset));
-            try code.movMemRegSized(.r11, 0, .rcx, st.size);
+            // Fold wasm offset into the mov displacement.
+            try code.movMemRegSized(.rax, @intCast(st.offset), .rcx, st.size);
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
@@ -3057,4 +3054,61 @@ test "compileFunctionRA: div does not emit dead r11 save around operand load" {
     // rdx-restore path (only when rdx-in-use AND op is rem), so it must NOT
     // appear here because no vreg got rdx (low pressure).
     try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x89, 0xD8 }));
+}
+
+
+test "compileFunctionRA: load folds wasm offset into mov disp" {
+    // Verifies B2: i32.load with offset=8 no longer emits `add rax, 8`
+    // then `mov dst, [rax]`; instead a single `mov dst, [rax+8]`.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v0, .offset = 8, .size = 4, .sign_extend = false } }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // `add rax, 8` = 48 83 C0 08 (with REX.W). It must no longer appear.
+    try std.testing.expect(!containsBytes(code, &.{ 0x48, 0x83, 0xC0, 0x08 }));
+    // `add rax, imm32` form = 48 05 ...  also must not appear.
+    try std.testing.expect(!containsBytes(code, &.{ 0x48, 0x05 }));
+}
+
+test "compileFunctionRA: store folds wasm offset into mov disp and omits r11 save" {
+    // Verifies B2: i32.store with offset=16 emits a single
+    // `mov [rax+16], ecx` and no longer stashes the base into r11.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .store = .{ .base = v0, .val = v1, .offset = 16, .size = 4 } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // No `mov r11, rax` (49 89 C3) — the base is kept in rax directly.
+    try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x89, 0xC3 }));
+    // No `add r11, imm32` (49 81 C3 ... or 49 83 C3 ...) — offset is folded.
+    try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x81, 0xC3 }));
+    try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x83, 0xC3 }));
+    // 32-bit store `mov [rax+16], ecx` with disp32 encoding = 89 88 10 00 00 00.
+    try std.testing.expect(containsBytes(code, &.{ 0x89, 0x88, 0x10, 0x00, 0x00, 0x00 }));
 }
