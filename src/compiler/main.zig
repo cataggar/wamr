@@ -197,6 +197,27 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // Build element segment entries
+    var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
+    defer elem_entries.deinit(allocator);
+    for (module.elements) |seg| {
+        if (seg.is_passive or seg.is_declarative) continue;
+        const offset: u32 = if (seg.offset) |off| switch (off) {
+            .i32_const => |v| @bitCast(v),
+            else => continue,
+        } else continue;
+        // Extract function indices from the segment
+        const indices = try allocator.alloc(u32, seg.func_indices.len);
+        for (seg.func_indices, 0..) |fi, j| {
+            indices[j] = fi orelse 0;
+        }
+        try elem_entries.append(allocator, .{
+            .table_idx = seg.table_idx,
+            .offset = offset,
+            .func_indices = indices,
+        });
+    }
+
     const aot_binary = try emit_aot.emit(
         allocator,
         compiled.code,
@@ -207,6 +228,7 @@ pub fn main(init: std.process.Init) !void {
         if (import_entries.items.len > 0) import_entries.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
         if (global_entries.items.len > 0) global_entries.items else null,
+        if (elem_entries.items.len > 0) elem_entries.items else null,
     );
     defer allocator.free(aot_binary);
 

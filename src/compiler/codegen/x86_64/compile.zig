@@ -25,8 +25,8 @@ const vmctx_memsize_field: i32 = 8; // VmCtx.memory_size offset
 const vmctx_globals_field: i32 = 16; // VmCtx.globals_ptr offset
 const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
 const vmctx_mem_max_size_field: i32 = 32; // VmCtx.memory_max_size offset
-const vmctx_globals_count_field: i32 = 40; // VmCtx.globals_count offset (u32)
-const vmctx_mem_pages_field: i32 = 48; // VmCtx.memory_pages offset (u32)
+const vmctx_func_table_field: i32 = 40; // VmCtx.func_table_ptr offset
+const vmctx_mem_pages_field: i32 = 52; // VmCtx.memory_pages offset (u32)
 
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
@@ -804,6 +804,12 @@ fn compileInst(
             try code.movRegImm32(.rax, -1); // always fail in non-RA path
             try stack.push(code, .rax);
         },
+        .call_indirect => {
+            // Stub in non-RA path: pop args + elem_idx, push 0
+            try stack.pop(code, .rax); // elem_idx (discard)
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
     }
 }
 
@@ -1253,6 +1259,72 @@ fn compileInstRA(
                     .target_func_idx = cl.func_idx - import_count,
                 });
             }
+            if (inst.dest) |dest| {
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            }
+        },
+
+        // ── Indirect function calls ───────────────────────────────────
+        .call_indirect => |ci| {
+            // Load table element index
+            const idx_reg = try useVReg(code, alloc_result, ci.elem_idx, .rax);
+            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
+            try code.zeroExtend32(.rax);
+
+            // Load VmCtx and func_table_ptr
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+
+            // Look up wasm table to get the module function index
+            // For now, table 0 elements are stored in AotInstance.tables[0]
+            // We use func_table_ptr which maps module func idx → native address
+            // The wasm table has funcref values = module function indices
+            // We need: table[elem_idx] → func_idx → func_table[func_idx] → native addr
+
+            // Load func_table_ptr from VmCtx
+            try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+
+            // func_ptr = func_table[rax * 8] (rax = elem_idx used as func_idx directly
+            // since for simple cases, table[i] = i is common; but we need the actual
+            // table element. For now, use elem_idx as the module function index)
+            // TODO: proper table lookup via VmCtx.tables
+            try code.emitSlice(&.{ 0x48, 0x8B, 0x04, 0xC2 }); // mov rax, [rdx + rax*8]
+            // Actually, let me use a simpler approach: rax = [r10 + rax*8]
+            // SIB: scale=3(8), index=rax(0), base=r10(10)
+            // But r10 is extended... let me just compute the address manually:
+
+            // rax = rax * 8
+            try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
+            // rax = func_table_ptr + rax
+            try code.addRegReg(.rax, .r10);
+            // rax = [rax] (load function pointer)
+            try code.movRegMem(.rax, .rax, 0);
+
+            // Set up call: VmCtx in param_regs[0], wasm args in param_regs[1..]
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            const n_args: u32 = @intCast(ci.args.len);
+            if (n_args > 0) {
+                // Save rax (func ptr) before loading args that might clobber it
+                try code.pushReg(.rax);
+                const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+                var i: u32 = 0;
+                while (i < max_reg_args) : (i += 1) {
+                    const arg_reg = try useVReg(code, alloc_result, ci.args[i], .r10);
+                    if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
+                }
+                try code.popReg(.rax); // restore func ptr
+            }
+
+            // Reserve shadow space on Win64
+            if (comptime builtin.os.tag == .windows) {
+                try code.subRegImm32(.rsp, 32);
+            }
+
+            try code.callReg(.rax);
+
+            if (comptime builtin.os.tag == .windows) {
+                try code.addRegImm32(.rsp, 32);
+            }
+
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }

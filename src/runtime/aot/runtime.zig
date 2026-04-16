@@ -24,6 +24,9 @@ pub const VmCtx = extern struct {
     host_functions_ptr: usize = 0,
     /// Maximum allocated memory region size in bytes (for grow bounds checking).
     memory_max_size: usize = 0,
+    /// Pointer to function pointer table (for call_indirect).
+    /// Entry i is the native code address for module function i.
+    func_table_ptr: usize = 0,
     /// Number of globals.
     globals_count: u32 = 0,
     /// Number of host functions.
@@ -58,6 +61,8 @@ pub const AotInstance = struct {
     code_size: usize = 0,
     /// Resolved AOT host function pointers (one per import).
     host_functions: []const ?*const anyopaque = &.{},
+    /// Native function pointer table for call_indirect (one per module function).
+    func_table: []const usize = &.{},
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -100,6 +105,28 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
     inst.tables = try allocateTables(module, allocator);
     errdefer freeTables(inst.tables, allocator);
 
+    // If no tables but we have element segments, create a default table
+    if (inst.tables.len == 0 and module.elem_segments.len > 0) {
+        // Compute required table size from element segments
+        var max_size: u32 = 0;
+        for (module.elem_segments) |seg| {
+            const end = seg.offset + @as(u32, @intCast(seg.func_indices.len));
+            if (end > max_size) max_size = end;
+        }
+        if (max_size > 0) {
+            const tables = allocator.alloc(*types.TableInstance, 1) catch return error.OutOfMemory;
+            const elements = allocator.alloc(types.TableElement, max_size) catch return error.OutOfMemory;
+            for (elements) |*e| e.* = types.TableElement.nullForType(.funcref);
+            const tbl = allocator.create(types.TableInstance) catch return error.OutOfMemory;
+            tbl.* = .{
+                .table_type = .{ .elem_type = .funcref, .limits = .{ .min = max_size, .max = max_size } },
+                .elements = elements,
+            };
+            tables[0] = tbl;
+            inst.tables = tables;
+        }
+    }
+
     inst.globals = try allocateGlobals(module, allocator);
     errdefer freeGlobals(inst.globals, allocator);
 
@@ -120,6 +147,7 @@ pub fn destroy(inst: *AotInstance) void {
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, allocator);
     if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
+    if (inst.func_table.len > 0) allocator.free(inst.func_table);
     allocator.destroy(inst);
 }
 
@@ -182,6 +210,47 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 
     inst.code_base = mem;
     inst.code_size = text.len;
+
+    // Build function pointer table for call_indirect
+    const module = inst.module;
+    const import_count = module.import_function_count;
+
+    // Build module func idx → native address mapping (temporary)
+    const total_funcs = import_count + module.func_count;
+    var func_addrs: [256]usize = std.mem.zeroes([256]usize);
+    const n_addrs = @min(total_funcs, func_addrs.len);
+    // Import functions → host function pointers
+    for (0..@min(import_count, @min(inst.host_functions.len, n_addrs))) |i| {
+        func_addrs[i] = if (inst.host_functions[i]) |ptr| @intFromPtr(ptr) else 0;
+    }
+    // Local functions → code_base + offset
+    for (0..@min(module.func_count, n_addrs - @min(import_count, n_addrs))) |i| {
+        const offset = module.func_offsets[i];
+        func_addrs[import_count + i] = @intFromPtr(mem) + offset;
+    }
+
+    // Build wasm table → native address table for call_indirect
+    if (inst.tables.len > 0) {
+        const tbl = inst.tables[0];
+        const tbl_size = tbl.elements.len;
+        if (tbl_size > 0) {
+            const native_table = inst.allocator.alloc(usize, tbl_size) catch return error.OutOfMemory;
+            @memset(native_table, 0);
+
+            // Apply element segments
+            for (module.elem_segments) |seg| {
+                if (seg.table_idx != 0) continue;
+                for (seg.func_indices, 0..) |func_idx, j| {
+                    const dst = seg.offset + @as(u32, @intCast(j));
+                    if (dst < tbl_size and func_idx < n_addrs) {
+                        native_table[dst] = func_addrs[func_idx];
+                    }
+                }
+            }
+
+            inst.func_table = native_table;
+        }
+    }
 }
 
 /// Call an AOT-compiled function by index.
@@ -216,6 +285,9 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     if (inst.host_functions.len > 0) {
         vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
         vmctx.host_functions_count = @intCast(inst.host_functions.len);
+    }
+    if (inst.func_table.len > 0) {
+        vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
     }
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
@@ -467,15 +539,15 @@ test "getFuncAddr: returns correct address" {
 }
 
 test "VmCtx layout: fields at expected offsets" {
-    // Verify extern struct field offsets match what the codegen expects
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(VmCtx, "memory_base"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(VmCtx, "memory_size"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(VmCtx, "globals_ptr"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(VmCtx, "host_functions_ptr"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(VmCtx, "memory_max_size"));
-    try std.testing.expectEqual(@as(usize, 40), @offsetOf(VmCtx, "globals_count"));
-    try std.testing.expectEqual(@as(usize, 44), @offsetOf(VmCtx, "host_functions_count"));
-    try std.testing.expectEqual(@as(usize, 48), @offsetOf(VmCtx, "memory_pages"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(VmCtx, "func_table_ptr"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(VmCtx, "globals_count"));
+    try std.testing.expectEqual(@as(usize, 52), @offsetOf(VmCtx, "host_functions_count"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(VmCtx, "memory_pages"));
 }
 
 test "getFuncAddr: import indices return null" {

@@ -85,6 +85,7 @@ pub const Inst = struct {
 
         // Function calls
         call: struct { func_idx: u32, args: []const VReg = &.{} },
+        call_indirect: struct { type_idx: u32, elem_idx: VReg, args: []const VReg = &.{} },
 
         // Parametric
         select: struct { cond: VReg, if_true: VReg, if_false: VReg },

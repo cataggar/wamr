@@ -26,6 +26,7 @@ pub const AotSectionType = enum(u32) {
     @"import" = 8,
     memory = 9,
     global = 10,
+    elem = 11,
     _,
 };
 
@@ -66,6 +67,13 @@ pub const AotGlobalInit = struct {
     init_i64: i64,
 };
 
+/// An element segment parsed from the AOT element section.
+pub const AotElemSegment = struct {
+    table_idx: u32,
+    offset: u32,
+    func_indices: []const u32,
+};
+
 pub const AotModule = struct {
     target_info: ?TargetInfo = null,
     text_section: ?[]const u8 = null,
@@ -78,6 +86,7 @@ pub const AotModule = struct {
     tables: []const types.TableType = &.{},
     data_segments: []const AotDataSegment = &.{},
     global_inits: []const AotGlobalInit = &.{},
+    elem_segments: []const AotElemSegment = &.{},
 
     /// Find an export by name and kind.
     pub fn findExport(self: *const AotModule, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
@@ -190,6 +199,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .global => {
                 try parseGlobalSection(&reader, section_size, &module, allocator);
             },
+            .elem => {
+                try parseElemSection(&reader, section_size, &module, allocator);
+            },
             else => {
                 // Skip unknown/unhandled sections
                 reader.pos += section_size;
@@ -239,6 +251,12 @@ pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     }
     if (module.global_inits.len > 0) {
         allocator.free(module.global_inits);
+    }
+    for (module.elem_segments) |seg| {
+        if (seg.func_indices.len > 0) allocator.free(seg.func_indices);
+    }
+    if (module.elem_segments.len > 0) {
+        allocator.free(module.elem_segments);
     }
 }
 
@@ -421,6 +439,39 @@ fn parseGlobalSection(reader: *BinaryReader, section_size: u32, module: *AotModu
     }
 
     module.global_inits = inits;
+}
+
+fn parseElemSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const segs = allocator.alloc(AotElemSegment, count) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |i| {
+            if (segs[i].func_indices.len > 0) allocator.free(segs[i].func_indices);
+        }
+        allocator.free(segs);
+    }
+
+    for (0..count) |i| {
+        const table_idx = try reader.readU32Le();
+        const offset = try reader.readU32Le();
+        const n_funcs = try reader.readU32Le();
+        const indices = allocator.alloc(u32, n_funcs) catch return error.OutOfMemory;
+        for (0..n_funcs) |j| {
+            indices[j] = try reader.readU32Le();
+        }
+        segs[i] = .{
+            .table_idx = table_idx,
+            .offset = offset,
+            .func_indices = indices,
+        };
+        initialized += 1;
+    }
+
+    module.elem_segments = segs;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

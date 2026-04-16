@@ -489,18 +489,57 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = size, .val = val } } });
             },
             .br_table => {
-                // Read count + targets, skip for now (emit unreachable)
                 const count = readU32(code, &ip);
-                var i: u32 = 0;
-                while (i <= count) : (i += 1) _ = readU32(code, &ip);
-                _ = vreg_stack.pop(); // condition
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
+                // Read all targets (count entries + 1 default)
+                var targets = try allocator.alloc(u32, count + 1);
+                defer allocator.free(targets);
+                for (0..count + 1) |i| targets[i] = readU32(code, &ip);
+
+                const index = safePop(&vreg_stack);
+
+                // Lower to if-else chain: for each target, compare index and branch
+                for (0..count) |i| {
+                    const depth = targets[i];
+                    if (depth < block_stack.items.len) {
+                        const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
+
+                        // Compare index == i
+                        const cmp_const = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .iconst_32 = @intCast(i) },
+                            .dest = cmp_const,
+                            .type = .i32,
+                        });
+                        const cmp_result = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .eq = .{ .lhs = index, .rhs = cmp_const } },
+                            .dest = cmp_result,
+                            .type = .i32,
+                        });
+
+                        // Branch if equal
+                        const fallthrough = try ir_func.newBlock();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                            .cond = cmp_result,
+                            .then_block = target_frame.target_block,
+                            .else_block = fallthrough,
+                        } } });
+                        current_block = fallthrough;
+                    }
+                }
+
+                // Default target (last entry)
+                const default_depth = targets[count];
+                if (default_depth < block_stack.items.len) {
+                    const default_frame = block_stack.items[block_stack.items.len - 1 - default_depth];
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br = default_frame.target_block } });
+                }
                 dead_code = true;
             },
             .call_indirect => {
                 const type_idx = readU32(code, &ip);
-                _ = readU32(code, &ip); // table index
-                _ = vreg_stack.pop(); // table element index
+                _ = readU32(code, &ip); // table index (always 0 for now)
+                const elem_idx = safePop(&vreg_stack); // table element index
 
                 // Look up the function type to get arg count and result arity
                 const callee_type = if (type_idx < wasm_module.types.len) &wasm_module.types[type_idx] else null;
@@ -514,10 +553,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     args[arg_count - 1 - ci] = safePop(&vreg_stack);
                 }
 
-                // Emit call (treated as a regular call for now — indirect dispatch is a runtime concern)
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
-                    .func_idx = type_idx, // use type index as placeholder
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call_indirect = .{
+                    .type_idx = type_idx,
+                    .elem_idx = elem_idx,
                     .args = args,
                 } }, .dest = dest, .type = .i32 });
 
