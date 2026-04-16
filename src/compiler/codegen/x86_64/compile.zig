@@ -25,10 +25,14 @@ else
 const caller_saved_alloc = [_]emit.Reg{ .rdx, .rsi, .rdi, .r8, .r9 };
 
 /// Callee-saved allocatable registers preserved in prologue/epilogue.
-/// On Win64, rsi and rdi are callee-saved per the ABI; compiled functions
+/// r12, r13 are callee-saved on both Win64 and SysV.
+/// On Win64, rsi and rdi are also callee-saved per the ABI; compiled functions
 /// must save/restore them if used. On SysV they're caller-saved (handled
-/// at call sites via caller_saved_alloc), so no prologue work is needed.
-const callee_saved_alloc = [_]emit.Reg{ .rsi, .rdi };
+/// at call sites via caller_saved_alloc), so no prologue work is needed for them.
+const callee_saved_alloc = if (builtin.os.tag == .windows)
+    [_]emit.Reg{ .rsi, .rdi, .r12, .r13 }
+else
+    [_]emit.Reg{ .r12, .r13 };
 
 /// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
@@ -929,27 +933,27 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
                 switch (ci.op) {
                     .call, .call_indirect => {
                         // Calls clobber caller-saved allocatable regs.
-                        // alloc_regs = [rdx(2), rsi(6), rdi(7), r8(8), r9(9)]
-                        // On Win64: rdx, r8, r9 are volatile (indices 0, 3, 4)
-                        // On SysV: all 5 are volatile
+                        // alloc_regs = [rdx(2), rsi(6), rdi(7), r8(8), r9(9), r12(12), r13(13)]
+                        // On Win64: rdx, r8, r9 are volatile (indices 0, 3, 4); rsi/rdi/r12/r13 callee-saved.
+                        // On SysV: rdx, rsi, rdi, r8, r9 are volatile; r12, r13 callee-saved.
                         const mask = if (comptime builtin.os.tag == .windows)
-                            [_]bool{ true, false, false, true, true }
+                            [_]bool{ true, false, false, true, true, false, false }
                         else
-                            [_]bool{ true, true, true, true, true };
+                            [_]bool{ true, true, true, true, true, false, false };
                         try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = mask });
                     },
                     .memory_copy => {
                         // REP MOVSB clobbers rsi(6) and rdi(7) → indices 1, 2
                         try clobber_points.append(allocator, .{
                             .pos = pos,
-                            .regs_clobbered = .{ false, true, true, false, false },
+                            .regs_clobbered = .{ false, true, true, false, false, false, false },
                         });
                     },
                     .memory_fill => {
                         // REP STOSB clobbers rdi(7) → index 2
                         try clobber_points.append(allocator, .{
                             .pos = pos,
-                            .regs_clobbered = .{ false, false, true, false, false },
+                            .regs_clobbered = .{ false, false, true, false, false, false, false },
                         });
                     },
                     else => {},
@@ -976,10 +980,8 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
                     for (caller_saved_alloc, 0..) |cs_reg, i| {
                         if (reg == cs_reg) used_caller_saved[i] = true;
                     }
-                    if (comptime builtin.os.tag == .windows) {
-                        for (callee_saved_alloc, 0..) |cs_reg, i| {
-                            if (reg == cs_reg) used_callee_saved[i] = true;
-                        }
+                    for (callee_saved_alloc, 0..) |cs_reg, i| {
+                        if (reg == cs_reg) used_callee_saved[i] = true;
                     }
                 },
                 .stack => {},
@@ -1013,10 +1015,8 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
 
     // Count callee-saved pushes for stack alignment calculation.
     var callee_save_count: u32 = 0;
-    if (comptime builtin.os.tag == .windows) {
-        for (used_callee_saved) |used| {
-            if (used) callee_save_count += 1;
-        }
+    for (used_callee_saved) |used| {
+        if (used) callee_save_count += 1;
     }
 
     // Frame: locals + spill slots + 1 vmctx slot, aligned to 16 bytes.
@@ -1052,11 +1052,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         }
     }
 
-    // Save callee-saved registers used by this function (Win64 ABI: rsi/rdi).
-    if (comptime builtin.os.tag == .windows) {
-        for (callee_saved_alloc, 0..) |reg, i| {
-            if (used_callee_saved[i]) try code.pushReg(reg);
-        }
+    // Save callee-saved registers used by this function.
+    // Win64: rsi, rdi, r12, r13. SysV: r12, r13.
+    for (callee_saved_alloc, 0..) |reg, i| {
+        if (used_callee_saved[i]) try code.pushReg(reg);
     }
 
     // Build constant value table for immediate folding
@@ -1108,12 +1107,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
 
     if (!last_was_ret) {
         // Restore callee-saved registers before epilogue (reverse order).
-        if (comptime builtin.os.tag == .windows) {
-            var ci: usize = callee_saved_alloc.len;
-            while (ci > 0) {
-                ci -= 1;
-                if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
-            }
+        var ci: usize = callee_saved_alloc.len;
+        while (ci > 0) {
+            ci -= 1;
+            if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
         }
         try code.emitEpilogue();
     }
@@ -1353,12 +1350,10 @@ fn compileInstRA(
                 if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             }
             // Restore callee-saved registers before epilogue (reverse order).
-            if (comptime builtin.os.tag == .windows) {
-                var ci: usize = callee_saved_alloc.len;
-                while (ci > 0) {
-                    ci -= 1;
-                    if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
-                }
+            var ci: usize = callee_saved_alloc.len;
+            while (ci > 0) {
+                ci -= 1;
+                if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
             }
             try code.emitEpilogue();
         },
@@ -2929,4 +2924,76 @@ test "compileFunctionRA: memory_size loads into allocated dest register" {
     // Opcode 0x8B, REX.B=0x41 (because base is r10). ModR/M = 10_010_010 (0x92),
     // then disp32 = 0x38 00 00 00 (vmctx_mem_pages_field = 56).
     try std.testing.expect(containsBytes(code, &.{ 0x41, 0x8B, 0x92, 0x38, 0x00, 0x00, 0x00 }));
+}
+
+
+test "compileFunctionRA: r12 allocated under register pressure" {
+    // Seven simultaneously-live values (6 constants + one op) overflow the
+    // first 5 alloc_regs (rdx, rsi, rdi, r8, r9). The 6th and 7th must go to
+    // r12 and r13 (newly added to alloc_regs). We also verify that r12 is
+    // preserved via push/pop in the prologue/epilogue.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    const v4 = func.newVReg();
+    const v5 = func.newVReg();
+    const v6 = func.newVReg();
+    const v7 = func.newVReg();
+    // Produce 7 constants that are all live through an add chain.
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = v3, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v4, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 6 }, .dest = v5, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v6, .type = .i32 });
+    // Consume all of them so their ranges extend here.
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v7, .type = .i32 });
+    // Use the rest (prevents range expiry) by re-summing.
+    const v8 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = v2, .rhs = v3 } }, .dest = v8, .type = .i32 });
+    const v9 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = v4, .rhs = v5 } }, .dest = v9, .type = .i32 });
+    const v10 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = v6, .rhs = v7 } }, .dest = v10, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v10 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // Prologue should push r12 (41 54) because it is callee-saved and used.
+    try std.testing.expect(containsBytes(code, &.{ 0x41, 0x54 }));
+    // Epilogue should pop r12 (41 5C).
+    try std.testing.expect(containsBytes(code, &.{ 0x41, 0x5C }));
+}
+
+test "compileFunctionRA: low-pressure function does not save r12" {
+    // A function that only needs one allocatable register must not touch r12.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // No push r12 (41 54) and no pop r12 (41 5C).
+    try std.testing.expect(!containsBytes(code, &.{ 0x41, 0x54 }));
+    try std.testing.expect(!containsBytes(code, &.{ 0x41, 0x5C }));
 }
