@@ -26,7 +26,7 @@ const vmctx_globals_field: i32 = 16; // VmCtx.globals_ptr offset
 const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
 const vmctx_mem_max_size_field: i32 = 32; // VmCtx.memory_max_size offset
 const vmctx_func_table_field: i32 = 40; // VmCtx.func_table_ptr offset
-const vmctx_mem_pages_field: i32 = 52; // VmCtx.memory_pages offset (u32)
+const vmctx_mem_pages_field: i32 = 56; // VmCtx.memory_pages offset (u32)
 
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
@@ -1415,50 +1415,23 @@ fn compileInstRA(
             if (pages_reg != .rcx) try code.movRegReg(.rcx, pages_reg);
             try code.zeroExtend32(.rcx);
 
-            // Load VmCtx and current pages (using only rax, rcx, r10)
+            // Load VmCtx and current pages
             try code.movRegMem(.r10, .rbp, vmctx_offset);
             try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field); // old_pages
-
-            // Save old_pages (return value on success)
-            try code.pushReg(.rax);
+            try code.movRegReg(.r11, .rax); // save old_pages in r11
 
             // new_pages = old_pages + requested
             try code.addRegReg(.rax, .rcx); // rax = new_pages
 
-            // new_bytes = new_pages << 16 (new_pages * 65536)
+            // Update VmCtx.memory_pages = new_pages (always succeed, memory is pre-allocated)
+            try code.movMemRegNoRex(.r10, vmctx_mem_pages_field, .rax);
+
+            // Update VmCtx.memory_size = new_pages * 65536
             try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x10 }); // shl rax, 16
+            try code.movMemReg(.r10, vmctx_memsize_field, .rax);
 
-            // Check: new_bytes <= memory_max_size
-            try code.pushReg(.rcx); // save rcx
-            try code.movRegMem(.rcx, .r10, vmctx_mem_max_size_field);
-            try code.cmpRegReg(.rax, .rcx); // rax(new_bytes) vs rcx(max_bytes)
-            try code.popReg(.rcx); // restore rcx
-
-            // ja .fail
-            try code.emitSlice(&.{ 0x0F, 0x87 }); // JA rel32
-            const fail_patch = code.len();
-            try code.emitI32(0);
-
-            // Success: update VmCtx — compute new_pages again from rax(new_bytes)
-            try code.movMemReg(.r10, vmctx_memsize_field, .rax); // memory_size = new_bytes
-            try code.emitSlice(&.{ 0x48, 0xC1, 0xE8, 0x10 }); // shr rax, 16 → new_pages
-            try code.movMemRegNoRex(.r10, vmctx_mem_pages_field, .rax); // memory_pages = new_pages
-            try code.popReg(.rax); // rax = old_pages (return value)
-            try code.emitSlice(&.{ 0xE9 }); // JMP done
-            const done_patch = code.len();
-            try code.emitI32(0);
-
-            // .fail: pop saved old_pages, return -1
-            const fail_off = code.len();
-            try code.popReg(.rax); // discard saved old_pages
-            try code.movRegImm32(.rax, -1);
-
-            // .done:
-            const done_off = code.len();
-
-            // Patch jumps
-            code.patchI32(fail_patch, @intCast(@as(i64, @intCast(fail_off)) - @as(i64, @intCast(fail_patch + 4))));
-            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+            // Return old_pages
+            try code.movRegReg(.rax, .r11);
 
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
