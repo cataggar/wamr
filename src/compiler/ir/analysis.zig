@@ -162,6 +162,10 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .call => |cl| {
             for (cl.args) |arg| live.put(arg, {}) catch {};
         },
+        .call_indirect => |ci| {
+            live.put(ci.elem_idx, {}) catch {};
+            for (ci.args) |arg| live.put(arg, {}) catch {};
+        },
         .select => |sel| {
             live.put(sel.cond, {}) catch {};
             live.put(sel.if_true, {}) catch {};
@@ -201,6 +205,16 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(mf.val, {}) catch {};
             live.put(mf.len, {}) catch {};
         },
+        .memory_size => {},
+        .memory_grow => |pages| {
+            live.put(pages, {}) catch {};
+        },
+        .memory_init => |mi| {
+            live.put(mi.dst, {}) catch {};
+            live.put(mi.src, {}) catch {};
+            live.put(mi.len, {}) catch {};
+        },
+        .data_drop => {},
     }
 }
 
@@ -328,6 +342,10 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .call => |cl| {
             for (cl.args) |arg| last_use.put(arg, pos) catch {};
         },
+        .call_indirect => |ci| {
+            last_use.put(ci.elem_idx, pos) catch {};
+            for (ci.args) |arg| last_use.put(arg, pos) catch {};
+        },
         .select => |sel| {
             last_use.put(sel.cond, pos) catch {};
             last_use.put(sel.if_true, pos) catch {};
@@ -367,6 +385,16 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(mf.val, pos) catch {};
             last_use.put(mf.len, pos) catch {};
         },
+        .memory_size => {},
+        .memory_grow => |pages| {
+            last_use.put(pages, pos) catch {};
+        },
+        .memory_init => |mi| {
+            last_use.put(mi.dst, pos) catch {};
+            last_use.put(mi.src, pos) catch {};
+            last_use.put(mi.len, pos) catch {};
+        },
+        .data_drop => {},
     }
 }
 

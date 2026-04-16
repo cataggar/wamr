@@ -86,6 +86,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .br_if => |bi| list.append(bi.cond),
         .ret => |maybe_vreg| if (maybe_vreg) |v| list.append(v),
         .call => {}, // call args handled separately in buildUseDef (unbounded)
+        .call_indirect => {}, // same
         .select => |sel| {
             list.append(sel.cond);
             list.append(sel.if_true);
@@ -127,6 +128,16 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(mf.val);
             list.append(mf.len);
         },
+        .memory_size => {},
+        .memory_grow => |pages| {
+            list.append(pages);
+        },
+        .memory_init => |mi| {
+            list.append(mi.dst);
+            list.append(mi.src);
+            list.append(mi.len);
+        },
+        .data_drop => {},
     }
     return list;
 }
@@ -193,6 +204,12 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
                 if (arg.* == old) arg.* = new;
             }
         },
+        .call_indirect => |ci| {
+            if (ci.elem_idx == old) @constCast(&ci.elem_idx).* = new;
+            for (@constCast(ci.args)) |*arg| {
+                if (arg.* == old) arg.* = new;
+            }
+        },
         .select => |*sel| {
             if (sel.cond == old) sel.cond = new;
             if (sel.if_true == old) sel.if_true = new;
@@ -234,6 +251,16 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (mf.val == old) mf.val = new;
             if (mf.len == old) mf.len = new;
         },
+        .memory_size => {},
+        .memory_grow => |*pages| {
+            if (pages.* == old) pages.* = new;
+        },
+        .memory_init => |*mi| {
+            if (mi.dst == old) mi.dst = new;
+            if (mi.src == old) mi.src = new;
+            if (mi.len == old) mi.len = new;
+        },
+        .data_drop => {},
     }
 }
 
@@ -339,9 +366,10 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
 
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .store, .local_set, .global_set, .call, .ret, .br, .br_if, .@"unreachable",
+        .store, .local_set, .global_set, .call, .call_indirect, .ret, .br, .br_if, .@"unreachable",
         .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
-        .atomic_notify, .atomic_wait, .memory_copy, .memory_fill,
+        .atomic_notify, .atomic_wait, .memory_copy, .memory_fill, .memory_grow,
+        .memory_init, .data_drop,
         => true,
         else => false,
     };

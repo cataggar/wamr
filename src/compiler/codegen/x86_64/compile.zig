@@ -16,12 +16,25 @@ const param_regs = if (builtin.os.tag == .windows)
 else
     [_]emit.Reg{ .rdi, .rsi, .rdx, .rcx, .r8, .r9 }; // SysV
 
+/// Caller-saved allocatable registers that must be saved/restored around calls.
+/// On Win64: rdx, r8, r9 are volatile. rsi, rdi are callee-saved.
+/// On SysV: rdx, rsi, rdi, r8, r9 are all volatile.
+const caller_saved_alloc = if (builtin.os.tag == .windows)
+    [_]emit.Reg{ .rdx, .r8, .r9 }
+else
+    [_]emit.Reg{ .rdx, .rsi, .rdi, .r8, .r9 };
+
 /// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
 /// Points to a VmCtx struct with memory_base at +0, globals_base at +16.
 const vmctx_offset: i32 = -8;
 const vmctx_membase_field: i32 = 0; // VmCtx.memory_base offset
-const vmctx_globals_field: i32 = 16; // VmCtx.globals_base offset
+const vmctx_memsize_field: i32 = 8; // VmCtx.memory_size offset
+const vmctx_globals_field: i32 = 16; // VmCtx.globals_ptr offset
+const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
+const vmctx_mem_max_size_field: i32 = 32; // VmCtx.memory_max_size offset
+const vmctx_func_table_field: i32 = 40; // VmCtx.func_table_ptr offset
+const vmctx_mem_pages_field: i32 = 56; // VmCtx.memory_pages offset (u32)
 
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
@@ -790,8 +803,35 @@ fn compileInst(
             try stack.pop(code, .rax); // dst
             // TODO: implement as memset
         },
+        .memory_size => {
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .memory_grow => {
+            try stack.pop(code, .rax); // pages (discard)
+            try code.movRegImm32(.rax, -1); // always fail in non-RA path
+            try stack.push(code, .rax);
+        },
+        .call_indirect => {
+            // Stub in non-RA path: pop args + elem_idx, push 0
+            try stack.pop(code, .rax); // elem_idx (discard)
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .memory_init => {
+            try stack.pop(code, .rax); // len
+            try stack.pop(code, .rax); // src
+            try stack.pop(code, .rax); // dst
+        },
+        .data_drop => {},
     }
 }
+
+/// Result of compiling a single function.
+const FuncCompileResult = struct {
+    code: []u8,
+    call_patches: []CallPatch,
+};
 
 /// Result of compiling an IR module.
 pub const CompileResult = struct {
@@ -816,14 +856,28 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         try offsets.append(allocator, @intCast(func_start));
 
         // Compile function using register allocator
-        const func_code = try compileFunctionRA(&func, allocator);
-        defer allocator.free(func_code);
+        const result = try compileFunctionRA(&func, ir_module.import_count, allocator);
+        defer allocator.free(result.code);
+        defer allocator.free(result.call_patches);
 
-        // Scan for call patches in the compiled code
-        // (compileFunctionRA handles intra-function branch patching internally,
-        //  but inter-function call patches need global resolution)
+        // Accumulate call patches with global offsets
+        for (result.call_patches) |patch| {
+            try global_call_patches.append(allocator, .{
+                .patch_offset = func_start + patch.patch_offset,
+                .target_func_idx = patch.target_func_idx,
+            });
+        }
 
-        try all_code.appendSlice(allocator, func_code);
+        try all_code.appendSlice(allocator, result.code);
+    }
+
+    // Patch inter-function call sites now that all function offsets are known
+    for (global_call_patches.items) |patch| {
+        if (patch.target_func_idx < offsets.items.len) {
+            const target_off = offsets.items[patch.target_func_idx];
+            const rel: i32 = @intCast(@as(i64, @intCast(target_off)) - @as(i64, @intCast(patch.patch_offset + 4)));
+            std.mem.writeInt(i32, all_code.items[patch.patch_offset..][0..4], rel, .little);
+        }
     }
 
     return .{
@@ -844,7 +898,7 @@ const regalloc = @import("../../ir/regalloc.zig");
 /// Compile an IR function using the linear scan register allocator.
 /// VRegs are assigned to physical registers; instructions operate directly
 /// on assigned registers without push/pop through a CachedStack.
-pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
+pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocator: std.mem.Allocator) !FuncCompileResult {
     var alloc_result = try regalloc.allocate(func, allocator);
     defer alloc_result.deinit();
 
@@ -867,6 +921,15 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocato
     const spill_count = @min(func.param_count, param_regs.len - 1);
     for (0..spill_count) |i| {
         try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), param_regs[i + 1]);
+    }
+
+    // Zero-initialize declared locals (wasm spec requires locals to be zero).
+    // Locals start after parameters in the frame layout.
+    if (func.local_count > func.param_count) {
+        try code.xorReg32(.rax);
+        for (func.param_count..func.local_count) |i| {
+            try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), .rax);
+        }
     }
 
     // Build constant value table for immediate folding
@@ -896,7 +959,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocato
         try block_offsets.put(@intCast(idx), code.len());
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, import_count);
         }
     }
 
@@ -911,7 +974,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, allocator: std.mem.Allocato
         try code.emitEpilogue();
     }
 
-    return code.bytes.toOwnedSlice(allocator);
+    return .{
+        .code = try code.bytes.toOwnedSlice(allocator),
+        .call_patches = try call_patches.toOwnedSlice(allocator),
+    };
 }
 
 /// Get a VReg's value into a physical register, using scratch if spilled.
@@ -932,6 +998,7 @@ fn useVReg(
 }
 
 /// Store a result into a VReg's allocated location.
+/// For i32 results, automatically zero-extends to clear upper 32 bits.
 fn writeDef(
     code: *emit.CodeBuffer,
     alloc_result: *const regalloc.AllocResult,
@@ -947,6 +1014,32 @@ fn writeDef(
         .stack => |offset| {
             try code.movMemReg(.rbp, offset, result_reg);
         },
+    }
+}
+
+/// Write an i32 result: zero-extend to clear upper 32 bits, then store.
+fn writeDefI32(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    dest: ir.VReg,
+    result_reg: emit.Reg,
+) !void {
+    try code.zeroExtend32(result_reg);
+    try writeDef(code, alloc_result, dest, result_reg);
+}
+
+/// Type-aware writeDef: applies i32 zero-extension when needed.
+fn writeDefTyped(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    dest: ir.VReg,
+    result_reg: emit.Reg,
+    val_type: ir.IrType,
+) !void {
+    if (val_type == .i32) {
+        try writeDefI32(code, alloc_result, dest, result_reg);
+    } else {
+        try writeDef(code, alloc_result, dest, result_reg);
     }
 }
 
@@ -966,6 +1059,7 @@ fn compileInstRA(
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
+    import_count: u32,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -976,22 +1070,22 @@ fn compileInstRA(
             } else {
                 try code.movRegImm32(.rax, val);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
             try code.movRegImm64(.rax, @bitCast(val));
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .fconst_32 => |val| {
             const dest = inst.dest orelse return;
             try code.movRegImm32(.rax, @bitCast(val));
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .fconst_64 => |val| {
             const dest = inst.dest orelse return;
             try code.movRegImm64(.rax, @bitCast(val));
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Binary arithmetic ─────────────────────────────────────────
@@ -1020,15 +1114,19 @@ fn compileInstRA(
                         },
                         else => unreachable,
                     }
-                    try writeDef(code, alloc_result, dest, .rax);
+                    if (inst.type == .i32) try code.zeroExtend32(.rax);
+                    try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
                     return;
                 }
             }
-            // General case: load both operands
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            // General case: load LHS first to avoid clobbering if both operands
+            // share the same register
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            try code.movRegReg(.r11, .rax); // save LHS to scratch reg to rdx
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            try code.movRegReg(.rax, .r11); // restore LHS from scratch
             switch (inst.op) {
                 .add => try code.addRegReg(.rax, .rcx),
                 .sub => try code.subRegReg(.rax, .rcx),
@@ -1038,17 +1136,25 @@ fn compileInstRA(
                 .xor => try code.xorRegReg(.rax, .rcx),
                 else => unreachable,
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Comparisons ───────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
             const dest = inst.dest orelse return;
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            try code.cmpRegReg(.rax, .rcx);
+            try code.movRegReg(.r11, .rax); // save LHS to scratch reg
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            try code.movRegReg(.rax, .r11); // restore LHS from scratch
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            // Use 32-bit compare for i32 to get correct signed semantics
+            if (inst.type == .i32) {
+                try code.cmpRegReg32(.rax, .rcx);
+            } else {
+                try code.cmpRegReg(.rax, .rcx);
+            }
             const cc: u4 = comptime switch (tag) {
                 .eq => 0x4, .ne => 0x5, .lt_s => 0xC, .lt_u => 0x2,
                 .gt_s => 0xF, .gt_u => 0x7, .le_s => 0xE, .le_u => 0x6,
@@ -1056,7 +1162,7 @@ fn compileInstRA(
             };
             try code.setcc(cc, .rax);
             try code.movzxByte(.rax, .rax);
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         .eqz => |vreg| {
@@ -1066,18 +1172,18 @@ fn compileInstRA(
             try code.testRegReg(.rax, .rax);
             try code.setcc(0x4, .rax);
             try code.movzxByte(.rax, .rax);
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Local variable access ─────────────────────────────────────
         .local_get => |idx| {
             const dest = inst.dest orelse return;
-            try code.movRegMem(.rax, .rbp, -@as(i32, @intCast((idx + 1) * 8)));
-            try writeDef(code, alloc_result, dest, .rax);
+            try code.movRegMem(.rax, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .local_set => |ls| {
             const src_reg = try useVReg(code, alloc_result, ls.val, .rax);
-            try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 1) * 8)), src_reg);
+            try code.movMemReg(.rbp, -@as(i32, @intCast((ls.idx + 2) * 8)), src_reg);
         },
 
         // ── Return ────────────────────────────────────────────────────
@@ -1113,22 +1219,116 @@ fn compileInstRA(
 
         // ── Function calls ────────────────────────────────────────────
         .call => |cl| {
-            const n_args: u32 = @intCast(cl.args.len);
-            // Load args into ABI registers
+            // Save caller-saved allocatable registers across the call
+            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+
+            if (cl.func_idx < import_count) {
+                // Import call: indirect call via host function pointer table in VmCtx.
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                const n_args: u32 = @intCast(cl.args.len);
+                if (n_args > 0) {
+                    const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+                    var i: u32 = 0;
+                    while (i < max_reg_args) : (i += 1) {
+                        const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
+                        if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
+                    }
+                }
+                try code.movRegMem(.r10, param_regs[0], vmctx_host_functions_field);
+                if (cl.func_idx > 0) {
+                    try code.addRegImm32(.r10, @intCast(@as(u32, cl.func_idx) * 8));
+                }
+                try code.movRegMem(.rax, .r10, 0);
+                if (comptime builtin.os.tag == .windows) {
+                    try code.subRegImm32(.rsp, 32);
+                }
+                try code.callReg(.rax);
+                if (comptime builtin.os.tag == .windows) {
+                    try code.addRegImm32(.rsp, 32);
+                }
+            } else {
+                // Local function call: direct CALL rel32
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                const n_args: u32 = @intCast(cl.args.len);
+                if (n_args > 0) {
+                    const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+                    var i: u32 = 0;
+                    while (i < max_reg_args) : (i += 1) {
+                        const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
+                        if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
+                    }
+                }
+                try code.emitByte(0xE8);
+                const patch_off = code.len();
+                try code.emitI32(0);
+                try call_patches.append(code.allocator, .{
+                    .patch_offset = patch_off,
+                    .target_func_idx = cl.func_idx - import_count,
+                });
+            }
+
+            // Restore caller-saved registers (reverse order)
+            var ri: usize = caller_saved_alloc.len;
+            while (ri > 0) {
+                ri -= 1;
+                try code.popReg(caller_saved_alloc[ri]);
+            }
+
+            if (inst.dest) |dest| {
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            }
+        },
+
+        // ── Indirect function calls ───────────────────────────────────
+        .call_indirect => |ci| {
+            // Save caller-saved allocatable registers across the call
+            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+
+            // Load table element index
+            const idx_reg = try useVReg(code, alloc_result, ci.elem_idx, .rax);
+            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
+            try code.zeroExtend32(.rax);
+
+            // Load func_table_ptr from VmCtx
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+
+            // func_ptr = func_table[elem_idx * 8]
+            try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
+            try code.addRegReg(.rax, .r10);
+            try code.movRegMem(.rax, .rax, 0);
+
+            // Set up call: VmCtx in param_regs[0], wasm args in param_regs[1..]
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            const n_args: u32 = @intCast(ci.args.len);
             if (n_args > 0) {
-                const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)));
+                try code.pushReg(.rax);
+                const max_reg_args = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
                 var i: u32 = 0;
                 while (i < max_reg_args) : (i += 1) {
-                    const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
-                    if (arg_reg != param_regs[i]) try code.movRegReg(param_regs[i], arg_reg);
+                    const arg_reg = try useVReg(code, alloc_result, ci.args[i], .r10);
+                    if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
                 }
+                try code.popReg(.rax);
             }
-            try code.emitByte(0xE8);
-            const patch_off = code.len();
-            try code.emitI32(0);
-            try call_patches.append(code.allocator, .{ .patch_offset = patch_off, .target_func_idx = cl.func_idx });
+
+            if (comptime builtin.os.tag == .windows) {
+                try code.subRegImm32(.rsp, 32);
+            }
+            try code.callReg(.rax);
+            if (comptime builtin.os.tag == .windows) {
+                try code.addRegImm32(.rsp, 32);
+            }
+
+            // Restore caller-saved registers (reverse order)
+            var ri: usize = caller_saved_alloc.len;
+            while (ri > 0) {
+                ri -= 1;
+                try code.popReg(caller_saved_alloc[ri]);
+            }
+
             if (inst.dest) |dest| {
-                try writeDef(code, alloc_result, dest, .rax);
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
         },
 
@@ -1140,21 +1340,38 @@ fn compileInstRA(
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
+            try code.zeroExtend32(.rax); // wasm addresses are i32
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             if (ld.offset > 0) try code.addRegImm32(.rax, @intCast(ld.offset));
-            try code.movRegMemNoRex(.rax, .rax, 0);
-            try writeDef(code, alloc_result, dest, .rax);
+            try code.movRegMemSized(.rax, .rax, 0, ld.size);
+            if (ld.sign_extend and ld.size < 8) {
+                // Sign-extend for smaller loads
+                switch (ld.size) {
+                    1 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBE, 0xC0 }), // movsx rax, al
+                    2 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBF, 0xC0 }), // movsx rax, ax
+                    4 => try code.emitSlice(&.{ 0x48, 0x63, 0xC0 }),       // movsxd rax, eax
+                    else => {},
+                }
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .store => |st| {
-            const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
-            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
+            // Load base FIRST to avoid register clobbering if both operands
+            // are assigned to the same register by the allocator
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
-            try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
-            if (st.offset > 0) try code.addRegImm32(.rax, @intCast(st.offset));
-            try code.movMemRegNoRex(.rax, 0, .rcx);
+            try code.zeroExtend32(.rax); // wasm addresses are i32
+            // Save base address to r11 (scratch, not allocatable)
+            try code.movRegReg(.r11, .rax);
+            // Now load value — may clobber rax if both operands share a register
+            const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
+            if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
+            // Compute final address using saved base in r11
+            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
+            try code.addRegReg(.r11, .r10); // r11 = mem_base + wasm_addr
+            if (st.offset > 0) try code.addRegImm32(.r11, @intCast(st.offset));
+            try code.movMemRegSized(.r11, 0, .rcx, st.size);
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
@@ -1164,9 +1381,11 @@ fn compileInstRA(
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
             const src_reg = try useVReg(code, alloc_result, mc.src, .rsi);
             if (src_reg != .rsi) try code.movRegReg(.rsi, src_reg);
+            try code.zeroExtend32(.rsi); // wasm addresses are i32
             try code.addRegReg(.rsi, .r10); // rsi = mem_base + src
             const dst_reg = try useVReg(code, alloc_result, mc.dst, .rdi);
             if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
+            try code.zeroExtend32(.rdi); // wasm addresses are i32
             try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
             try code.emitSlice(&.{ 0xF3, 0xA4 }); // REP MOVSB
         },
@@ -1180,17 +1399,77 @@ fn compileInstRA(
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
             const dst_reg = try useVReg(code, alloc_result, mf.dst, .rdi);
             if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
+            try code.zeroExtend32(.rdi); // wasm addresses are i32
             try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
             try code.emitSlice(&.{ 0xF3, 0xAA }); // REP STOSB
         },
 
+        // ── Memory management ─────────────────────────────────────────
+        .memory_size => {
+            const dest = inst.dest orelse return;
+            // Read current page count from VmCtx
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+        .memory_grow => |pages_vreg| {
+            const dest = inst.dest orelse return;
+            // Load requested pages into rcx
+            const pages_reg = try useVReg(code, alloc_result, pages_vreg, .rcx);
+            if (pages_reg != .rcx) try code.movRegReg(.rcx, pages_reg);
+            try code.zeroExtend32(.rcx);
+
+            // Load VmCtx and current pages
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field); // old_pages
+            try code.movRegReg(.r11, .rax); // save old_pages in r11
+
+            // new_pages = old_pages + requested
+            try code.addRegReg(.rax, .rcx); // rax = new_pages
+
+            // Update VmCtx.memory_pages = new_pages (always succeed, memory is pre-allocated)
+            try code.movMemRegNoRex(.r10, vmctx_mem_pages_field, .rax);
+
+            // Update VmCtx.memory_size = new_pages * 65536
+            try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x10 }); // shl rax, 16
+            try code.movMemReg(.r10, vmctx_memsize_field, .rax);
+
+            // Return old_pages
+            try code.movRegReg(.rax, .r11);
+
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+
+        // memory.init and data.drop — currently no-ops in AOT since data
+        // segments are applied at instantiation. For full passive segment
+        // support, these would need runtime calls via VmCtx.
+        .memory_init => |mi| {
+            // Consume operands (required for correct vreg tracking)
+            _ = try useVReg(code, alloc_result, mi.dst, .rax);
+            _ = try useVReg(code, alloc_result, mi.src, .rax);
+            _ = try useVReg(code, alloc_result, mi.len, .rax);
+        },
+        .data_drop => {},
+
         // ── Division ──────────────────────────────────────────────────
         .div_s, .div_u, .rem_s, .rem_u => |bin| {
             const dest = inst.dest orelse return;
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            // Save caller-saved regs since idiv clobbers rax and rdx
+            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            try code.movRegReg(.r11, .rax); // save LHS
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            try code.movRegReg(.rax, .r11); // restore LHS
+
+            // Zero divisor check
+            try code.testRegReg(.rcx, .rcx);
+            try code.emitSlice(&.{ 0x0F, 0x84 }); // JZ rel32
+            const skip_patch = code.len();
+            try code.emitI32(0);
+
             switch (inst.op) {
                 .div_s, .rem_s => {
                     try code.cqo();
@@ -1202,21 +1481,47 @@ fn compileInstRA(
                 },
                 else => unreachable,
             }
+            try code.emitSlice(&.{ 0xE9 }); // JMP done
+            const done_patch = code.len();
+            try code.emitI32(0);
+
+            const zero_off = code.len();
+            try code.xorReg32(.rax);
+            try code.movRegImm32(.rdx, 0);
+            const done_off = code.len();
+
+            code.patchI32(skip_patch, @intCast(@as(i64, @intCast(zero_off)) - @as(i64, @intCast(skip_patch + 4))));
+            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+
             const result_reg: emit.Reg = switch (inst.op) {
                 .div_s, .div_u => .rax,
                 .rem_s, .rem_u => .rdx,
                 else => unreachable,
             };
-            try writeDef(code, alloc_result, dest, result_reg);
+
+            // Restore caller-saved regs (reverse order)
+            // But first save result to r11 so it survives the pops
+            try code.movRegReg(.r11, result_reg);
+            var ri: usize = caller_saved_alloc.len;
+            while (ri > 0) {
+                ri -= 1;
+                try code.popReg(caller_saved_alloc[ri]);
+            }
+            try code.movRegReg(.rax, .r11);
+
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Shifts ────────────────────────────────────────────────────
         .shl, .shr_s, .shr_u, .rotl, .rotr => |bin| {
             const dest = inst.dest orelse return;
-            const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
+            // Load val first to avoid clobbering if both share a register
             const val_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
+            try code.movRegReg(.r11, .rax); // save val
+            const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
+            try code.movRegReg(.rax, .r11); // restore val
             switch (inst.op) {
                 .shl => {
                     try code.rexW(.rax, .rax);
@@ -1240,7 +1545,7 @@ fn compileInstRA(
                 },
                 else => unreachable,
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Unary ops ─────────────────────────────────────────────────
@@ -1248,22 +1553,35 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            try code.lzcnt(.rax, .rax);
-            try writeDef(code, alloc_result, dest, .rax);
+            if (inst.type == .i32) {
+                // Use 32-bit LZCNT to count only within the low 32 bits
+                try code.emitSlice(&.{ 0xF3, 0x0F, 0xBD, 0xC0 }); // lzcnt eax, eax
+            } else {
+                try code.lzcnt(.rax, .rax);
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .ctz => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            try code.tzcnt(.rax, .rax);
-            try writeDef(code, alloc_result, dest, .rax);
+            if (inst.type == .i32) {
+                try code.emitSlice(&.{ 0xF3, 0x0F, 0xBC, 0xC0 }); // tzcnt eax, eax
+            } else {
+                try code.tzcnt(.rax, .rax);
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .popcnt => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            try code.popcntReg(.rax, .rax);
-            try writeDef(code, alloc_result, dest, .rax);
+            if (inst.type == .i32) {
+                try code.emitSlice(&.{ 0xF3, 0x0F, 0xB8, 0xC0 }); // popcnt eax, eax
+            } else {
+                try code.popcntReg(.rax, .rax);
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Select ────────────────────────────────────────────────────
@@ -1277,7 +1595,7 @@ fn compileInstRA(
             if (true_reg != .rdx) try code.movRegReg(.rdx, true_reg);
             try code.testRegReg(.rax, .rax);
             try code.cmovnz(.rcx, .rdx);
-            try writeDef(code, alloc_result, dest, .rcx);
+            try writeDefTyped(code, alloc_result, dest, .rcx, inst.type);
         },
 
         .global_get => |idx| {
@@ -1286,7 +1604,7 @@ fn compileInstRA(
             try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
             try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
             try code.movRegMem(.rax, .r10, @as(i32, @intCast(idx * 8))); // global[idx]
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .global_set => |gs| {
             const val_reg = try useVReg(code, alloc_result, gs.val, .rax);
@@ -1307,7 +1625,7 @@ fn compileInstRA(
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             // Truncate to 32-bit: writing to eax zero-extends to rax
             try code.emitSlice(&.{ 0x89, 0xC0 }); // mov eax, eax
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .extend_i32_s => |vreg| {
             const dest = inst.dest orelse return;
@@ -1315,7 +1633,7 @@ fn compileInstRA(
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             // MOVSXD rax, eax: sign-extend 32→64
             try code.emitSlice(&.{ 0x48, 0x63, 0xC0 });
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .extend_i32_u => |vreg| {
             const dest = inst.dest orelse return;
@@ -1323,7 +1641,7 @@ fn compileInstRA(
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             // mov eax, eax: zero-extend 32→64 (implicit on x86-64)
             try code.emitSlice(&.{ 0x89, 0xC0 });
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .extend8_s => |vreg| {
             const dest = inst.dest orelse return;
@@ -1331,7 +1649,7 @@ fn compileInstRA(
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             // MOVSX rax, al: REX.W 0F BE C0
             try code.emitSlice(&.{ 0x48, 0x0F, 0xBE, 0xC0 });
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .extend16_s => |vreg| {
             const dest = inst.dest orelse return;
@@ -1339,7 +1657,7 @@ fn compileInstRA(
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             // MOVSX rax, ax: REX.W 0F BF C0
             try code.emitSlice(&.{ 0x48, 0x0F, 0xBF, 0xC0 });
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .extend32_s => |vreg| {
             const dest = inst.dest orelse return;
@@ -1347,12 +1665,12 @@ fn compileInstRA(
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
             // MOVSXD rax, eax
             try code.emitSlice(&.{ 0x48, 0x63, 0xC0 });
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .reinterpret => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            try writeDef(code, alloc_result, dest, src_reg);
+            try writeDefTyped(code, alloc_result, dest, src_reg, inst.type);
         },
 
         // ── Float unary operations ─────────────────────────────────────
@@ -1370,7 +1688,7 @@ fn compileInstRA(
                 try code.emitU64(0x8000000000000000);
                 try code.xorRegReg(.rax, .rcx);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .f_abs => |vreg| {
             const dest = inst.dest orelse return;
@@ -1386,7 +1704,7 @@ fn compileInstRA(
                 try code.emitU64(0x7FFFFFFFFFFFFFFF);
                 try code.andRegReg(.rax, .rcx);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .f_sqrt => |vreg| {
             const dest = inst.dest orelse return;
@@ -1401,7 +1719,7 @@ fn compileInstRA(
                 try code.sqrtsd(.rax, .rax);
                 try code.movqFromXmm(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .f_ceil, .f_floor, .f_trunc, .f_nearest => |vreg| {
             // ROUNDSD/ROUNDSS (SSE4.1): 66 0F 3A 0B/0A xmm, xmm, imm8
@@ -1426,7 +1744,7 @@ fn compileInstRA(
                 try code.emitSlice(&.{ 0x66, 0x0F, 0x3A, 0x0B, 0xC0, round_mode });
                 try code.movqFromXmm(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Float binary operations ───────────────────────────────────
@@ -1447,7 +1765,7 @@ fn compileInstRA(
                 try code.minsd(.rax, .rcx);
                 try code.movqFromXmm(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .f_max => |bin| {
             const dest = inst.dest orelse return;
@@ -1466,7 +1784,7 @@ fn compileInstRA(
                 try code.maxsd(.rax, .rcx);
                 try code.movqFromXmm(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .f_copysign => |bin| {
             const dest = inst.dest orelse return;
@@ -1491,7 +1809,7 @@ fn compileInstRA(
                 try code.andRegReg(.rcx, .rdx);
             }
             try code.orRegReg(.rax, .rcx);
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Int/Float conversions ─────────────────────────────────────
@@ -1506,7 +1824,7 @@ fn compileInstRA(
                 try code.movqToXmm(.rax, .rax);
                 try code.cvttsd2si(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .trunc_f32_u, .trunc_f64_u => |vreg| {
             const dest = inst.dest orelse return;
@@ -1519,24 +1837,46 @@ fn compileInstRA(
                 try code.movqToXmm(.rax, .rax);
                 try code.cvttsd2si(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .trunc_sat_f32_s, .trunc_sat_f64_s, .trunc_sat_f32_u, .trunc_sat_f64_u => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            switch (inst.op) {
-                .trunc_sat_f32_s, .trunc_sat_f32_u => {
-                    try code.movdToXmm(.rax, .rax);
-                    try code.cvttss2si(.rax, .rax);
-                },
-                .trunc_sat_f64_s, .trunc_sat_f64_u => {
-                    try code.movqToXmm(.rax, .rax);
-                    try code.cvttsd2si(.rax, .rax);
-                },
-                else => unreachable,
+
+            // NaN check: compare value with itself (NaN != NaN)
+            const is_f32 = (inst.op == .trunc_sat_f32_s or inst.op == .trunc_sat_f32_u);
+            if (is_f32) {
+                try code.movdToXmm(.rax, .rax);
+                try code.ucomiss(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.ucomisd(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            // JP = parity flag set = NaN → result is 0
+            try code.emitSlice(&.{ 0x0F, 0x8A }); // JP rel32
+            const nan_patch = code.len();
+            try code.emitI32(0);
+
+            // Normal conversion
+            if (is_f32) {
+                try code.cvttss2si(.rax, .rax);
+            } else {
+                try code.cvttsd2si(.rax, .rax);
+            }
+            try code.emitSlice(&.{0xE9}); // JMP done
+            const done_patch = code.len();
+            try code.emitI32(0);
+
+            // NaN path: result = 0
+            const nan_off = code.len();
+            try code.xorReg32(.rax);
+            const done_off = code.len();
+
+            code.patchI32(nan_patch, @intCast(@as(i64, @intCast(nan_off)) - @as(i64, @intCast(nan_patch + 4))));
+            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .convert_s => |vreg| {
             const dest = inst.dest orelse return;
@@ -1549,13 +1889,20 @@ fn compileInstRA(
                 try code.cvtsi2sd(.rax, .rax);
                 try code.movqFromXmm(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .convert_u => |vreg| {
-            // Simplified: treat as signed conversion (correct for values < 2^63)
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+
+            // Check if value >= 2^63 (sign bit set)
+            try code.testRegReg(.rax, .rax);
+            try code.emitSlice(&.{ 0x0F, 0x88 }); // JS rel32 (jump if sign bit set)
+            const large_patch = code.len();
+            try code.emitI32(0);
+
+            // Small path (< 2^63): treat as signed — cvtsi2s{s,d} is correct
             if (inst.type == .f32) {
                 try code.cvtsi2ss(.rax, .rax);
                 try code.movdFromXmm(.rax, .rax);
@@ -1563,7 +1910,32 @@ fn compileInstRA(
                 try code.cvtsi2sd(.rax, .rax);
                 try code.movqFromXmm(.rax, .rax);
             }
-            try writeDef(code, alloc_result, dest, .rax);
+            try code.emitSlice(&.{0xE9}); // JMP done
+            const done_patch = code.len();
+            try code.emitI32(0);
+
+            // Large path (>= 2^63): shift right by 1, convert, then multiply by 2
+            const large_off = code.len();
+            try code.movRegReg(.rcx, .rax); // save original
+            try code.emitSlice(&.{ 0x48, 0xD1, 0xE8 }); // shr rax, 1
+            // Preserve low bit: OR with original & 1
+            try code.andRegImm32(.rcx, 1); // rcx = original & 1
+            try code.orRegReg(.rax, .rcx); // rax = (original >> 1) | (original & 1)
+            if (inst.type == .f32) {
+                try code.cvtsi2ss(.rax, .rax);
+                try code.addss(.rax, .rax); // multiply by 2
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd(.rax, .rax);
+                try code.addsd(.rax, .rax); // multiply by 2
+                try code.movqFromXmm(.rax, .rax);
+            }
+            const done_off = code.len();
+
+            code.patchI32(large_patch, @intCast(@as(i64, @intCast(large_off)) - @as(i64, @intCast(large_patch + 4))));
+            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .demote_f64 => |vreg| {
             const dest = inst.dest orelse return;
@@ -1572,7 +1944,7 @@ fn compileInstRA(
             try code.movqToXmm(.rax, .rax);
             try code.cvtsd2ss(.rax, .rax);
             try code.movdFromXmm(.rax, .rax);
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .promote_f32 => |vreg| {
             const dest = inst.dest orelse return;
@@ -1581,16 +1953,15 @@ fn compileInstRA(
             try code.movdToXmm(.rax, .rax);
             try code.cvtss2sd(.rax, .rax);
             try code.movqFromXmm(.rax, .rax);
-            try writeDef(code, alloc_result, dest, .rax);
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Stubs for ops not commonly hit ────────────────────────────
         else => {
             // For unhandled ops, emit a no-op placeholder
-            // (atomics, float ops, extensions, etc.)
             if (inst.dest) |dest| {
                 try code.movRegImm32(.rax, 0);
-                try writeDef(code, alloc_result, dest, .rax);
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
         },
     }
@@ -2001,7 +2372,9 @@ test "compileFunctionRA: iconst_32 + ret" {
     try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v0 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 5);
@@ -2023,7 +2396,9 @@ test "compileFunctionRA: add two constants" {
     try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
     try block.append(.{ .op = .{ .ret = v2 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 10);
@@ -2047,7 +2422,9 @@ test "compileFunctionRA: global_get emits load from VMContext" {
     try block.append(.{ .op = .{ .global_get = 0 }, .dest = v0, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v0 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 10);
@@ -2067,7 +2444,9 @@ test "compileFunctionRA: wrap_i64 emits mov eax,eax" {
     try block.append(.{ .op = .{ .wrap_i64 = v0 }, .dest = v1, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v1 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain mov eax, eax (89 C0) for wrap_i64
@@ -2088,7 +2467,9 @@ test "compileFunctionRA: extend_i32_s emits MOVSXD" {
     try block.append(.{ .op = .{ .extend_i32_s = v0 }, .dest = v1, .type = .i64 });
     try block.append(.{ .op = .{ .ret = v1 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain MOVSXD rax, eax (48 63 C0)
@@ -2111,7 +2492,9 @@ test "compileFunctionRA: memory_copy emits REP MOVSB" {
     try block.append(.{ .op = .{ .memory_copy = .{ .dst = dst, .src = src, .len = len } } });
     try block.append(.{ .op = .{ .ret = null } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain REP MOVSB (F3 A4)
@@ -2134,7 +2517,9 @@ test "compileFunctionRA: memory_fill emits REP STOSB" {
     try block.append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } });
     try block.append(.{ .op = .{ .ret = null } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain REP STOSB (F3 AA)
@@ -2156,7 +2541,9 @@ test "compileFunctionRA: division uses rax/rdx" {
     try block.append(.{ .op = .{ .div_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
     try block.append(.{ .op = .{ .ret = v2 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     // Should contain IDIV (F7 F9 for idiv rcx)
@@ -2178,7 +2565,9 @@ test "compileFunctionRA: local_get and local_set" {
     try block.append(.{ .op = .{ .local_get = 0 }, .dest = v1 });
     try block.append(.{ .op = .{ .ret = v1 } });
 
-    const code = try compileFunctionRA(&func, allocator);
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
     try std.testing.expect(code.len > 10);

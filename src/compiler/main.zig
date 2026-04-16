@@ -155,6 +155,69 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
+    // Build import entries from the parsed wasm module
+    var import_entries: std.ArrayList(emit_aot.ImportEntry) = .empty;
+    defer import_entries.deinit(allocator);
+    for (module.imports) |imp| {
+        if (imp.kind == .function) {
+            try import_entries.append(allocator, .{
+                .module_name = imp.module_name,
+                .field_name = imp.field_name,
+                .kind = .function,
+                .func_type_idx = imp.func_type_idx orelse 0,
+            });
+        }
+    }
+
+    // Build memory entries from the parsed wasm module
+    var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
+    defer mem_entries.deinit(allocator);
+    for (module.memories) |mem| {
+        try mem_entries.append(allocator, .{
+            .min_pages = @intCast(mem.limits.min),
+            .max_pages = if (mem.limits.max) |m| @as(?u32, @intCast(m)) else null,
+        });
+    }
+
+    // Build global entries from the parsed wasm module
+    var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
+    defer global_entries.deinit(allocator);
+    for (module.globals) |g| {
+        const init_val: i64 = switch (g.init_expr) {
+            .i32_const => |v| @as(i64, v),
+            .i64_const => |v| v,
+            .f32_const => |v| @as(i64, @as(i32, @bitCast(v))),
+            .f64_const => |v| @bitCast(v),
+            else => 0,
+        };
+        try global_entries.append(allocator, .{
+            .val_type = @intFromEnum(g.global_type.val_type),
+            .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
+            .init_i64 = init_val,
+        });
+    }
+
+    // Build element segment entries
+    var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
+    defer elem_entries.deinit(allocator);
+    for (module.elements) |seg| {
+        if (seg.is_passive or seg.is_declarative) continue;
+        const offset: u32 = if (seg.offset) |off| switch (off) {
+            .i32_const => |v| @bitCast(v),
+            else => continue,
+        } else continue;
+        // Extract function indices from the segment
+        const indices = try allocator.alloc(u32, seg.func_indices.len);
+        for (seg.func_indices, 0..) |fi, j| {
+            indices[j] = fi orelse 0;
+        }
+        try elem_entries.append(allocator, .{
+            .table_idx = seg.table_idx,
+            .offset = offset,
+            .func_indices = indices,
+        });
+    }
+
     const aot_binary = try emit_aot.emit(
         allocator,
         compiled.code,
@@ -162,6 +225,10 @@ pub fn main(init: std.process.Init) !void {
         exports.items,
         .{ .arch = arch_name },
         if (data_segs.items.len > 0) data_segs.items else null,
+        if (import_entries.items.len > 0) import_entries.items else null,
+        if (mem_entries.items.len > 0) mem_entries.items else null,
+        if (global_entries.items.len > 0) global_entries.items else null,
+        if (elem_entries.items.len > 0) elem_entries.items else null,
     );
     defer allocator.free(aot_binary);
 

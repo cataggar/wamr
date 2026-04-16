@@ -20,6 +20,8 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
     var ir_module = ir.IrModule.init(allocator);
     errdefer ir_module.deinit();
 
+    ir_module.import_count = wasm_module.import_function_count;
+
     for (wasm_module.functions) |func| {
         const func_type = wasm_module.types[func.type_idx];
         const ir_func = try lowerFunction(&func, &func_type, wasm_module, allocator);
@@ -487,18 +489,57 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .store = .{ .base = base, .offset = offset, .size = size, .val = val } } });
             },
             .br_table => {
-                // Read count + targets, skip for now (emit unreachable)
                 const count = readU32(code, &ip);
-                var i: u32 = 0;
-                while (i <= count) : (i += 1) _ = readU32(code, &ip);
-                _ = vreg_stack.pop(); // condition
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
+                // Read all targets (count entries + 1 default)
+                var targets = try allocator.alloc(u32, count + 1);
+                defer allocator.free(targets);
+                for (0..count + 1) |i| targets[i] = readU32(code, &ip);
+
+                const index = safePop(&vreg_stack);
+
+                // Lower to if-else chain: for each target, compare index and branch
+                for (0..count) |i| {
+                    const depth = targets[i];
+                    if (depth < block_stack.items.len) {
+                        const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
+
+                        // Compare index == i
+                        const cmp_const = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .iconst_32 = @intCast(i) },
+                            .dest = cmp_const,
+                            .type = .i32,
+                        });
+                        const cmp_result = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .eq = .{ .lhs = index, .rhs = cmp_const } },
+                            .dest = cmp_result,
+                            .type = .i32,
+                        });
+
+                        // Branch if equal
+                        const fallthrough = try ir_func.newBlock();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                            .cond = cmp_result,
+                            .then_block = target_frame.target_block,
+                            .else_block = fallthrough,
+                        } } });
+                        current_block = fallthrough;
+                    }
+                }
+
+                // Default target (last entry)
+                const default_depth = targets[count];
+                if (default_depth < block_stack.items.len) {
+                    const default_frame = block_stack.items[block_stack.items.len - 1 - default_depth];
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br = default_frame.target_block } });
+                }
                 dead_code = true;
             },
             .call_indirect => {
                 const type_idx = readU32(code, &ip);
-                _ = readU32(code, &ip); // table index
-                _ = vreg_stack.pop(); // table element index
+                _ = readU32(code, &ip); // table index (always 0 for now)
+                const elem_idx = safePop(&vreg_stack); // table element index
 
                 // Look up the function type to get arg count and result arity
                 const callee_type = if (type_idx < wasm_module.types.len) &wasm_module.types[type_idx] else null;
@@ -512,10 +553,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     args[arg_count - 1 - ci] = safePop(&vreg_stack);
                 }
 
-                // Emit call (treated as a regular call for now — indirect dispatch is a runtime concern)
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
-                    .func_idx = type_idx, // use type index as placeholder
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call_indirect = .{
+                    .type_idx = type_idx,
+                    .elem_idx = elem_idx,
                     .args = args,
                 } }, .dest = dest, .type = .i32 });
 
@@ -526,14 +567,14 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .memory_size => {
                 _ = readU32(code, &ip); // memory index (always 0)
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_32 = 0 }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_size = {} }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
             .memory_grow => {
                 _ = readU32(code, &ip); // memory index
-                _ = vreg_stack.pop(); // pages
+                const pages = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_32 = -1 }, .dest = dest, .type = .i32 }); // fail
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_grow = pages }, .dest = dest, .type = .i32 });
                 try vreg_stack.append(allocator, dest);
             },
 
@@ -816,16 +857,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } });
                     },
                     .memory_init => {
-                        _ = readU32(code, &ip); // data segment index
+                        const seg_idx = readU32(code, &ip);
                         _ = readU32(code, &ip); // memory (always 0)
-                        _ = safePop(&vreg_stack); // len
-                        _ = safePop(&vreg_stack); // src offset
-                        _ = safePop(&vreg_stack); // dst
-                        // Stub: memory.init is rare, skip for now
+                        const len = safePop(&vreg_stack);
+                        const src = safePop(&vreg_stack);
+                        const dst = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_init = .{ .seg_idx = seg_idx, .dst = dst, .src = src, .len = len } } });
                     },
                     .data_drop => {
-                        _ = readU32(code, &ip); // data segment index
-                        // No-op stub
+                        const seg_idx = readU32(code, &ip);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .data_drop = seg_idx } });
                     },
                     else => {
                         std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});

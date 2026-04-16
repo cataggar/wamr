@@ -179,6 +179,13 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// CMP r32, r32 (32-bit compare, sets flags for i32 signed semantics).
+    pub fn cmpRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x39);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// PUSH reg (uses REX prefix only for r8–r15).
     pub fn pushReg(self: *CodeBuffer, reg: Reg) !void {
         if (reg.isExtended()) try self.emitByte(0x41);
@@ -210,6 +217,13 @@ pub const CodeBuffer = struct {
     pub fn callRel32(self: *CodeBuffer, rel: i32) !void {
         try self.emitByte(0xE8);
         try self.emitI32(rel);
+    }
+
+    /// CALL reg — emits an indirect call through a register.
+    pub fn callReg(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.emitByte(0x41); // REX.B
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 2, reg.low3());
     }
 
     /// JMP rel32 — emits a 5-byte near jump with a 32-bit relative offset.
@@ -406,6 +420,15 @@ pub const CodeBuffer = struct {
     pub fn xorReg32(self: *CodeBuffer, reg: Reg) !void {
         if (reg.isExtended()) try self.rex(false, reg, reg);
         try self.emitByte(0x31);
+        try self.modrm(0b11, reg.low3(), reg.low3());
+    }
+
+    /// MOV r32, r32 — zero-extend a 32-bit value to 64 bits by clearing
+    /// the upper 32 bits. On x86-64, writing to a 32-bit register
+    /// implicitly zeroes bits 63:32.
+    pub fn zeroExtend32(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.rex(false, reg, reg);
+        try self.emitByte(0x89);
         try self.modrm(0b11, reg.low3(), reg.low3());
     }
 

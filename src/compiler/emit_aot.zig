@@ -44,6 +44,30 @@ pub const DataSegmentEntry = struct {
     data: []const u8,
 };
 
+pub const ImportEntry = struct {
+    module_name: []const u8,
+    field_name: []const u8,
+    kind: ExternalKind,
+    func_type_idx: u32,
+};
+
+pub const MemoryEntry = struct {
+    min_pages: u32,
+    max_pages: ?u32,
+};
+
+pub const GlobalEntry = struct {
+    val_type: u8,
+    mutability: u8,
+    init_i64: i64,
+};
+
+pub const ElemEntry = struct {
+    table_idx: u32,
+    offset: u32,
+    func_indices: []const u32,
+};
+
 /// Emit an AOT binary to an owned byte buffer.
 pub fn emit(
     allocator: std.mem.Allocator,
@@ -52,6 +76,10 @@ pub fn emit(
     exports: []const ExportEntry,
     options: AotEmitOptions,
     data_segments: ?[]const DataSegmentEntry,
+    imports: ?[]const ImportEntry,
+    memories: ?[]const MemoryEntry,
+    globals: ?[]const GlobalEntry,
+    elems: ?[]const ElemEntry,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -107,6 +135,76 @@ pub fn emit(
         }
     }
 
+    // Section 8: imports (module_name, field_name, kind, func_type_idx per entry)
+    if (imports) |import_list| {
+        if (import_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(import_list.len));
+            for (import_list) |imp| {
+                try appendU32Le(&tmp, allocator, @intCast(imp.module_name.len));
+                try tmp.appendSlice(allocator, imp.module_name);
+                try appendU32Le(&tmp, allocator, @intCast(imp.field_name.len));
+                try tmp.appendSlice(allocator, imp.field_name);
+                try tmp.append(allocator, @intFromEnum(imp.kind));
+                try appendU32Le(&tmp, allocator, imp.func_type_idx);
+            }
+            try emitSection(allocator, &buf, 8, tmp.items);
+        }
+    }
+
+    // Section 9: memories (min_pages, has_max, max_pages per entry)
+    if (memories) |mem_list| {
+        if (mem_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(mem_list.len));
+            for (mem_list) |mem| {
+                try appendU32Le(&tmp, allocator, mem.min_pages);
+                if (mem.max_pages) |max| {
+                    try tmp.append(allocator, 1);
+                    try appendU32Le(&tmp, allocator, max);
+                } else {
+                    try tmp.append(allocator, 0);
+                }
+            }
+            try emitSection(allocator, &buf, 9, tmp.items);
+        }
+    }
+
+    // Section 10: globals (val_type, mutability, init_i64 per entry)
+    if (globals) |global_list| {
+        if (global_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(global_list.len));
+            for (global_list) |g| {
+                try tmp.append(allocator, g.val_type);
+                try tmp.append(allocator, g.mutability);
+                try tmp.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(i64, g.init_i64)));
+            }
+            try emitSection(allocator, &buf, 10, tmp.items);
+        }
+    }
+
+    // Section 11: element segments
+    if (elems) |elem_list| {
+        if (elem_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(elem_list.len));
+            for (elem_list) |e| {
+                try appendU32Le(&tmp, allocator, e.table_idx);
+                try appendU32Le(&tmp, allocator, e.offset);
+                try appendU32Le(&tmp, allocator, @intCast(e.func_indices.len));
+                for (e.func_indices) |fi| {
+                    try appendU32Le(&tmp, allocator, fi);
+                }
+            }
+            try emitSection(allocator, &buf, 11, tmp.items);
+        }
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -142,7 +240,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
 
 test "emit: minimal (no functions, no exports) has correct magic and version" {
     const allocator = std.testing.allocator;
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null);
     defer allocator.free(data);
 
     // At least header (8) + target_info section (8+40) + text section (8+0) + func section (8+4) + export section (8+4)
@@ -157,7 +255,7 @@ test "emit: one function offset produces valid function section" {
     const allocator = std.testing.allocator;
     const code = [_]u8{ 0xCC, 0xC3 }; // int3; ret
     const offsets = [_]u32{0};
-    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null);
+    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 3 (function)
@@ -188,7 +286,7 @@ test "emit: export section encodes name, kind, and index" {
         .kind = .function,
         .index = 7,
     }};
-    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null);
+    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 4 (export)
@@ -235,7 +333,7 @@ test "roundtrip: emit then load with AOT loader" {
     const data = try emit(allocator, &code, &offsets, &exports, .{
         .arch = arch_name,
         .e_machine = 0x3E,
-    }, null);
+    }, null, null, null, null, null);
     defer allocator.free(data);
 
     // Parse back with the AOT loader
@@ -266,4 +364,46 @@ test "roundtrip: emit then load with AOT loader" {
     try std.testing.expectEqual(@as(u32, 0), module.exports[0].index);
     try std.testing.expect(std.mem.eql(u8, module.exports[1].name, "mem"));
     try std.testing.expectEqual(@as(u8, 0x02), @intFromEnum(module.exports[1].kind)); // memory
+}
+
+test "emit: import section round-trip" {
+    const allocator = std.testing.allocator;
+    const aot_loader = @import("../runtime/aot/loader.zig");
+
+    const import_entries = [_]ImportEntry{
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
+    };
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null);
+    defer allocator.free(data);
+
+    const module = try aot_loader.load(data, allocator);
+    defer aot_loader.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), module.import_function_count);
+    try std.testing.expectEqual(@as(usize, 2), module.imports.len);
+    try std.testing.expect(std.mem.eql(u8, module.imports[0].module_name, "wasi_snapshot_preview1"));
+    try std.testing.expect(std.mem.eql(u8, module.imports[0].field_name, "fd_write"));
+    try std.testing.expect(std.mem.eql(u8, module.imports[1].field_name, "clock_time_get"));
+}
+
+test "emit: memory section round-trip" {
+    const allocator = std.testing.allocator;
+    const aot_loader = @import("../runtime/aot/loader.zig");
+
+    const mem_entries = [_]MemoryEntry{
+        .{ .min_pages = 2, .max_pages = null },
+        .{ .min_pages = 1, .max_pages = 256 },
+    };
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null);
+    defer allocator.free(data);
+
+    const module = try aot_loader.load(data, allocator);
+    defer aot_loader.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), module.memories.len);
+    try std.testing.expectEqual(@as(u64, 2), module.memories[0].limits.min);
+    try std.testing.expect(module.memories[0].limits.max == null);
+    try std.testing.expectEqual(@as(u64, 1), module.memories[1].limits.min);
+    try std.testing.expectEqual(@as(u64, 256), module.memories[1].limits.max.?);
 }
