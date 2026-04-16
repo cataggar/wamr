@@ -1131,6 +1131,14 @@ fn regOf(alloc_result: *const regalloc.AllocResult, vreg: ir.VReg) ?emit.Reg {
     };
 }
 
+/// Return the physical register for a destination VReg, or a default scratch
+/// register for stack-spilled destinations. This enables register-flexible
+/// codegen: instructions operate directly on the allocated register instead
+/// of always routing through rax.
+fn destReg(alloc_result: *const regalloc.AllocResult, dest: ir.VReg) emit.Reg {
+    return regOf(alloc_result, dest) orelse .rax;
+}
+
 fn compileInstRA(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -1146,104 +1154,95 @@ fn compileInstRA(
         // ── Constants ─────────────────────────────────────────────────
         .iconst_32 => |val| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             if (val == 0) {
-                try code.xorReg32(.rax);
+                try code.xorReg32(dr);
             } else {
-                try code.movRegImm32(.rax, val);
+                try code.movRegImm32(dr, val);
             }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
-            try code.movRegImm64(.rax, @bitCast(val));
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegImm64(dr, @bitCast(val));
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .fconst_32 => |val| {
             const dest = inst.dest orelse return;
-            try code.movRegImm32(.rax, @bitCast(val));
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegImm32(dr, @bitCast(val));
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .fconst_64 => |val| {
             const dest = inst.dest orelse return;
-            try code.movRegImm64(.rax, @bitCast(val));
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegImm64(dr, @bitCast(val));
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Binary arithmetic ─────────────────────────────────────────
         .add, .sub, .mul, .@"and", .@"or", .xor => {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             const bin = switch (inst.op) {
                 .add => |b| b, .sub => |b| b, .mul => |b| b,
                 .@"and" => |b| b, .@"or" => |b| b, .xor => |b| b,
                 else => unreachable,
             };
+            const scratch: emit.Reg = if (dr == .rax) .rcx else .rax;
             // Check if RHS is a constant for immediate form
             if (const_vals.get(bin.rhs)) |imm| {
                 if (imm >= std.math.minInt(i32) and imm <= std.math.maxInt(i32)) {
-                    const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
-                    if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+                    const lhs_reg = try useVReg(code, alloc_result, bin.lhs, dr);
+                    if (lhs_reg != dr) try code.movRegReg(dr, lhs_reg);
                     const imm32: i32 = @intCast(imm);
                     switch (inst.op) {
-                        .add => if (imm32 != 0) try code.addRegImm32(.rax, imm32),
-                        .sub => if (imm32 != 0) try code.subRegImm32(.rax, imm32),
-                        .@"and" => try code.andRegImm32(.rax, imm32),
-                        .@"or" => if (imm32 != 0) try code.orRegImm32(.rax, imm32),
-                        .xor => if (imm32 != 0) try code.xorRegImm32(.rax, imm32),
+                        .add => if (imm32 != 0) try code.addRegImm32(dr, imm32),
+                        .sub => if (imm32 != 0) try code.subRegImm32(dr, imm32),
+                        .@"and" => try code.andRegImm32(dr, imm32),
+                        .@"or" => if (imm32 != 0) try code.orRegImm32(dr, imm32),
+                        .xor => if (imm32 != 0) try code.xorRegImm32(dr, imm32),
                         .mul => {
-                            try code.movRegImm32(.rcx, imm32);
-                            try code.imulRegReg(.rax, .rcx);
+                            try code.movRegImm32(scratch, imm32);
+                            try code.imulRegReg(dr, scratch);
                         },
                         else => unreachable,
                     }
-                    if (inst.type == .i32) try code.zeroExtend32(.rax);
-                    try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+                    if (inst.type == .i32) try code.zeroExtend32(dr);
+                    try writeDefTyped(code, alloc_result, dest, dr, inst.type);
                     return;
                 }
             }
-            // General case: load LHS first, save to r11 only if RHS might clobber it
-            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
-            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            // Check if RHS vreg is assigned to rax (would clobber LHS)
-            const rhs_alloc = alloc_result.get(bin.rhs);
-            const rhs_in_rax = if (rhs_alloc) |a| switch (a) {
-                .reg => |p| @as(emit.Reg, @enumFromInt(p)) == .rax,
-                .stack => false,
-            } else false;
-            if (rhs_in_rax) try code.movRegReg(.r11, .rax);
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            if (rhs_in_rax) try code.movRegReg(.rax, .r11);
+            // General case: load LHS into dest register, RHS into scratch
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, dr);
+            if (lhs_reg != dr) try code.movRegReg(dr, lhs_reg);
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, scratch);
             switch (inst.op) {
-                .add => try code.addRegReg(.rax, .rcx),
-                .sub => try code.subRegReg(.rax, .rcx),
-                .mul => try code.imulRegReg(.rax, .rcx),
-                .@"and" => try code.andRegReg(.rax, .rcx),
-                .@"or" => try code.orRegReg(.rax, .rcx),
-                .xor => try code.xorRegReg(.rax, .rcx),
+                .add => try code.addRegReg(dr, rhs_reg),
+                .sub => try code.subRegReg(dr, rhs_reg),
+                .mul => try code.imulRegReg(dr, rhs_reg),
+                .@"and" => try code.andRegReg(dr, rhs_reg),
+                .@"or" => try code.orRegReg(dr, rhs_reg),
+                .xor => try code.xorRegReg(dr, rhs_reg),
                 else => unreachable,
             }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Comparisons ───────────────────────────────────────────────
         inline .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u => |bin, tag| {
             const dest = inst.dest orelse return;
+            // setcc writes a byte register; on x86-64, sil/dil need a mandatory
+            // REX prefix that our emitter doesn't force. Use rax (al) to be safe.
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            const rhs_alloc_cmp = alloc_result.get(bin.rhs);
-            const rhs_in_rax_cmp = if (rhs_alloc_cmp) |a| switch (a) {
-                .reg => |p| @as(emit.Reg, @enumFromInt(p)) == .rax,
-                .stack => false,
-            } else false;
-            if (rhs_in_rax_cmp) try code.movRegReg(.r11, .rax);
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            if (rhs_in_rax_cmp) try code.movRegReg(.rax, .r11);
             // Use 32-bit compare for i32 to get correct signed semantics
             if (inst.type == .i32) {
-                try code.cmpRegReg32(.rax, .rcx);
+                try code.cmpRegReg32(.rax, rhs_reg);
             } else {
-                try code.cmpRegReg(.rax, .rcx);
+                try code.cmpRegReg(.rax, rhs_reg);
             }
             const cc: u4 = comptime switch (tag) {
                 .eq => 0x4, .ne => 0x5, .lt_s => 0xC, .lt_u => 0x2,
@@ -1268,8 +1267,9 @@ fn compileInstRA(
         // ── Local variable access ─────────────────────────────────────
         .local_get => |idx| {
             const dest = inst.dest orelse return;
-            try code.movRegMem(.rax, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegMem(dr, .rbp, -@as(i32, @intCast((idx + 2) * 8)));
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .local_set => |ls| {
             const src_reg = try useVReg(code, alloc_result, ls.val, .rax);
@@ -1441,17 +1441,22 @@ fn compileInstRA(
             try code.zeroExtend32(.rax); // wasm addresses are i32
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             if (ld.offset > 0) try code.addRegImm32(.rax, @intCast(ld.offset));
-            try code.movRegMemSized(.rax, .rax, 0, ld.size);
+            // Load value into dest register (address is in rax)
+            const dr = destReg(alloc_result, dest);
+            try code.movRegMemSized(dr, .rax, 0, ld.size);
             if (ld.sign_extend and ld.size < 8) {
-                // Sign-extend for smaller loads
+                // Sign-extend for smaller loads — uses hardcoded rax encodings,
+                // so move to rax if needed, sign-extend, move back.
+                if (dr != .rax) try code.movRegReg(.rax, dr);
                 switch (ld.size) {
                     1 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBE, 0xC0 }), // movsx rax, al
                     2 => try code.emitSlice(&.{ 0x48, 0x0F, 0xBF, 0xC0 }), // movsx rax, ax
                     4 => try code.emitSlice(&.{ 0x48, 0x63, 0xC0 }),       // movsxd rax, eax
                     else => {},
                 }
+                if (dr != .rax) try code.movRegReg(dr, .rax);
             }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .store => |st| {
             // Load base FIRST to avoid register clobbering if both operands
@@ -1698,11 +1703,12 @@ fn compileInstRA(
 
         .global_get => |idx| {
             const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
             // Load globals_base from VmCtx, then load global value
             try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
             try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
-            try code.movRegMem(.rax, .r10, @as(i32, @intCast(idx * 8))); // global[idx]
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            try code.movRegMem(dr, .r10, @as(i32, @intCast(idx * 8))); // global[idx]
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .global_set => |gs| {
             const val_reg = try useVReg(code, alloc_result, gs.val, .rax);
