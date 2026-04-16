@@ -179,6 +179,13 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, src.low3(), dst.low3());
     }
 
+    /// CMP r32, r32 (32-bit compare, sets flags for i32 signed semantics).
+    pub fn cmpRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x39);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
     /// PUSH reg (uses REX prefix only for r8–r15).
     pub fn pushReg(self: *CodeBuffer, reg: Reg) !void {
         if (reg.isExtended()) try self.emitByte(0x41);
@@ -210,6 +217,13 @@ pub const CodeBuffer = struct {
     pub fn callRel32(self: *CodeBuffer, rel: i32) !void {
         try self.emitByte(0xE8);
         try self.emitI32(rel);
+    }
+
+    /// CALL reg — emits an indirect call through a register.
+    pub fn callReg(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.emitByte(0x41); // REX.B
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 2, reg.low3());
     }
 
     /// JMP rel32 — emits a 5-byte near jump with a 32-bit relative offset.
@@ -409,6 +423,15 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, reg.low3(), reg.low3());
     }
 
+    /// MOV r32, r32 — zero-extend a 32-bit value to 64 bits by clearing
+    /// the upper 32 bits. On x86-64, writing to a 32-bit register
+    /// implicitly zeroes bits 63:32.
+    pub fn zeroExtend32(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.rex(false, reg, reg);
+        try self.emitByte(0x89);
+        try self.modrm(0b11, reg.low3(), reg.low3());
+    }
+
     /// MOV r32, [base + disp32] — 32-bit load (no REX.W, zero-extends to 64).
     pub fn movRegMemNoRex(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
         if (dst.isExtended() or base.isExtended()) {
@@ -571,6 +594,159 @@ pub const CodeBuffer = struct {
             else => unreachable,
         }
     }
+
+    // ── SSE/SSE2 floating-point instructions ─────────────────────────
+
+    /// MOVSD xmm, [base + disp32] — load f64 from memory
+    pub fn movsdLoad(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        try self.emitByte(0xF2);
+        if (dst.isExtended() or base.isExtended()) try self.rex(false, dst, base);
+        try self.emitSlice(&.{ 0x0F, 0x10 });
+        try self.modrm(0b10, dst.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24);
+        try self.emitI32(disp);
+    }
+
+    /// MOVSD [base + disp32], xmm — store f64 to memory
+    pub fn movsdStore(self: *CodeBuffer, base: Reg, disp: i32, src: Reg) !void {
+        try self.emitByte(0xF2);
+        if (src.isExtended() or base.isExtended()) try self.rex(false, src, base);
+        try self.emitSlice(&.{ 0x0F, 0x11 });
+        try self.modrm(0b10, src.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24);
+        try self.emitI32(disp);
+    }
+
+    /// MOVSS xmm, [base + disp32] — load f32 from memory
+    pub fn movssLoad(self: *CodeBuffer, dst: Reg, base: Reg, disp: i32) !void {
+        try self.emitByte(0xF3);
+        if (dst.isExtended() or base.isExtended()) try self.rex(false, dst, base);
+        try self.emitSlice(&.{ 0x0F, 0x10 });
+        try self.modrm(0b10, dst.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24);
+        try self.emitI32(disp);
+    }
+
+    /// MOVSS [base + disp32], xmm — store f32 to memory
+    pub fn movssStore(self: *CodeBuffer, base: Reg, disp: i32, src: Reg) !void {
+        try self.emitByte(0xF3);
+        if (src.isExtended() or base.isExtended()) try self.rex(false, src, base);
+        try self.emitSlice(&.{ 0x0F, 0x11 });
+        try self.modrm(0b10, src.low3(), base.low3());
+        if (base.low3() == 4) try self.emitByte(0x24);
+        try self.emitI32(disp);
+    }
+
+    /// MOVQ xmm, r64 — move GPR to XMM (for bitcast/reinterpret)
+    pub fn movqToXmm(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0x66);
+        try self.rexW(xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x6E });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// MOVQ r64, xmm — move XMM to GPR
+    pub fn movqFromXmm(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0x66);
+        try self.rexW(xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x7E });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// MOVD xmm, r32 — move 32-bit GPR to XMM
+    pub fn movdToXmm(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0x66);
+        if (xmm.isExtended() or gpr.isExtended()) try self.rex(false, xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x6E });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// MOVD r32, xmm — move XMM to 32-bit GPR
+    pub fn movdFromXmm(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0x66);
+        if (xmm.isExtended() or gpr.isExtended()) try self.rex(false, xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x7E });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// Generic SSE binary op: prefix opcode xmm1, xmm2
+    fn sseBinOp(self: *CodeBuffer, prefix: u8, opcode: u8, dst: Reg, src: Reg) !void {
+        try self.emitByte(prefix);
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitSlice(&.{ 0x0F, opcode });
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    // ── f64 binary (ADDSD, SUBSD, MULSD, DIVSD) ──
+    pub fn addsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x58, dst, src); }
+    pub fn subsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5C, dst, src); }
+    pub fn mulsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x59, dst, src); }
+    pub fn divsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5E, dst, src); }
+    pub fn sqrtsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x51, dst, src); }
+    pub fn minsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5D, dst, src); }
+    pub fn maxsd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5F, dst, src); }
+
+    // ── f32 binary (ADDSS, SUBSS, MULSS, DIVSS) ──
+    pub fn addss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x58, dst, src); }
+    pub fn subss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5C, dst, src); }
+    pub fn mulss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x59, dst, src); }
+    pub fn divss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5E, dst, src); }
+    pub fn sqrtss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x51, dst, src); }
+    pub fn minss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5D, dst, src); }
+    pub fn maxss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5F, dst, src); }
+
+    // ── Comparisons ──
+    pub fn ucomisd(self: *CodeBuffer, a: Reg, b: Reg) !void { try self.sseBinOp(0x66, 0x2E, a, b); }
+    pub fn ucomiss(self: *CodeBuffer, a: Reg, b: Reg) !void {
+        if (a.isExtended() or b.isExtended()) try self.rex(false, a, b);
+        try self.emitSlice(&.{ 0x0F, 0x2E });
+        try self.modrm(0b11, a.low3(), b.low3());
+    }
+
+    // ── Conversions ──
+    /// CVTSI2SD xmm, r64 — convert signed i64 to f64
+    pub fn cvtsi2sd(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0xF2);
+        try self.rexW(xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x2A });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// CVTSI2SS xmm, r64 — convert signed i64 to f32
+    pub fn cvtsi2ss(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0xF3);
+        try self.rexW(xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x2A });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// CVTTSD2SI r64, xmm — truncate f64 to signed i64
+    pub fn cvttsd2si(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0xF2);
+        try self.rexW(gpr, xmm);
+        try self.emitSlice(&.{ 0x0F, 0x2C });
+        try self.modrm(0b11, gpr.low3(), xmm.low3());
+    }
+
+    /// CVTTSS2SI r64, xmm — truncate f32 to signed i64
+    pub fn cvttss2si(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0xF3);
+        try self.rexW(gpr, xmm);
+        try self.emitSlice(&.{ 0x0F, 0x2C });
+        try self.modrm(0b11, gpr.low3(), xmm.low3());
+    }
+
+    /// CVTSD2SS xmm, xmm — convert f64 to f32
+    pub fn cvtsd2ss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5A, dst, src); }
+
+    /// CVTSS2SD xmm, xmm — convert f32 to f64
+    pub fn cvtss2sd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF3, 0x5A, dst, src); }
+
+    // ── Bitwise XMM ──
+    /// XORPD xmm, xmm — bitwise XOR for f64
+    pub fn xorpd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0x66, 0x57, dst, src); }
+    /// ANDPD xmm, xmm — bitwise AND for f64
+    pub fn andpd(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0x66, 0x54, dst, src); }
 
     // ── Function prologue / epilogue ──────────────────────────────────
 

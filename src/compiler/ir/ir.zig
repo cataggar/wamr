@@ -85,6 +85,7 @@ pub const Inst = struct {
 
         // Function calls
         call: struct { func_idx: u32, args: []const VReg = &.{} },
+        call_indirect: struct { type_idx: u32, elem_idx: VReg, args: []const VReg = &.{} },
 
         // Parametric
         select: struct { cond: VReg, if_true: VReg, if_false: VReg },
@@ -144,6 +145,12 @@ pub const Inst = struct {
         // Bulk memory operations
         memory_copy: struct { dst: VReg, src: VReg, len: VReg },
         memory_fill: struct { dst: VReg, val: VReg, len: VReg },
+        memory_init: struct { seg_idx: u32, dst: VReg, src: VReg, len: VReg },
+        data_drop: u32, // data segment index
+
+        // Memory management
+        memory_size: void,
+        memory_grow: VReg,
     };
 
     pub const BinOp = struct {
@@ -231,6 +238,10 @@ pub const IrFunction = struct {
 pub const IrModule = struct {
     functions: std.ArrayList(IrFunction) = .empty,
     allocator: std.mem.Allocator,
+    /// Number of imported functions. IR only contains local functions,
+    /// but call instructions use module-level indices where
+    /// indices < import_count refer to imports.
+    import_count: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) IrModule {
         return .{

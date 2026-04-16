@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("../common/types.zig");
 const aot_loader = @import("loader.zig");
+const host_bridge = @import("host_bridge.zig");
 const platform = @import("../../platform/platform.zig");
 
 /// Compact context passed to AOT-compiled functions as a hidden first parameter.
@@ -15,12 +16,23 @@ const platform = @import("../../platform/platform.zig");
 pub const VmCtx = extern struct {
     /// Base pointer to linear memory (memory 0).
     memory_base: usize = 0,
-    /// Size of linear memory in bytes.
+    /// Size of linear memory in bytes (current, may grow).
     memory_size: usize = 0,
     /// Pointer to flat globals values array (each global is an i64 at index * 8).
     globals_ptr: usize = 0,
+    /// Pointer to array of host function pointers (one per import).
+    host_functions_ptr: usize = 0,
+    /// Maximum allocated memory region size in bytes (for grow bounds checking).
+    memory_max_size: usize = 0,
+    /// Pointer to function pointer table (for call_indirect).
+    /// Entry i is the native code address for module function i.
+    func_table_ptr: usize = 0,
     /// Number of globals.
     globals_count: u32 = 0,
+    /// Number of host functions.
+    host_functions_count: u32 = 0,
+    /// Current memory size in pages (for memory.size instruction).
+    memory_pages: u32 = 0,
 };
 
 // ─── Comptime target validation ─────────────────────────────────────────────
@@ -47,6 +59,10 @@ pub const AotInstance = struct {
     code_base: ?[*]const u8 = null,
     /// Size of the mapped executable region (for cleanup).
     code_size: usize = 0,
+    /// Resolved AOT host function pointers (one per import).
+    host_functions: []const ?*const anyopaque = &.{},
+    /// Native function pointer table for call_indirect (one per module function).
+    func_table: []const usize = &.{},
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -89,8 +105,33 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
     inst.tables = try allocateTables(module, allocator);
     errdefer freeTables(inst.tables, allocator);
 
+    // If no tables but we have element segments, create a default table
+    if (inst.tables.len == 0 and module.elem_segments.len > 0) {
+        // Compute required table size from element segments
+        var max_size: u32 = 0;
+        for (module.elem_segments) |seg| {
+            const end = seg.offset + @as(u32, @intCast(seg.func_indices.len));
+            if (end > max_size) max_size = end;
+        }
+        if (max_size > 0) {
+            const tables = allocator.alloc(*types.TableInstance, 1) catch return error.OutOfMemory;
+            const elements = allocator.alloc(types.TableElement, max_size) catch return error.OutOfMemory;
+            for (elements) |*e| e.* = types.TableElement.nullForType(.funcref);
+            const tbl = allocator.create(types.TableInstance) catch return error.OutOfMemory;
+            tbl.* = .{
+                .table_type = .{ .elem_type = .funcref, .limits = .{ .min = max_size, .max = max_size } },
+                .elements = elements,
+            };
+            tables[0] = tbl;
+            inst.tables = tables;
+        }
+    }
+
     inst.globals = try allocateGlobals(module, allocator);
     errdefer freeGlobals(inst.globals, allocator);
+
+    // Resolve AOT host functions for imports
+    inst.host_functions = try resolveHostFunctions(module, allocator);
 
     return inst;
 }
@@ -105,6 +146,8 @@ pub fn destroy(inst: *AotInstance) void {
     freeMemories(inst.memories, allocator);
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, allocator);
+    if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
+    if (inst.func_table.len > 0) allocator.free(inst.func_table);
     allocator.destroy(inst);
 }
 
@@ -116,13 +159,20 @@ pub fn findExportFunc(inst: *const AotInstance, name: []const u8) ?u32 {
     return null;
 }
 
-/// Get the native code pointer for a function by index.
-/// Uses the executable mapping (code_base) if available, otherwise falls back
-/// to the raw text_section (not executable — for inspection only).
+/// Get the native code pointer for a function by module-level index.
+/// Import functions (func_idx < import_function_count) have no native code
+/// and return null.  Local functions are looked up in func_offsets after
+/// subtracting the import count.
 pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
     const module = inst.module;
-    if (func_idx >= module.func_count) return null;
-    const offset = module.func_offsets[func_idx];
+    const import_count = module.import_function_count;
+
+    // Import functions don't have native code
+    if (func_idx < import_count) return null;
+
+    const local_idx = func_idx - import_count;
+    if (local_idx >= module.func_count) return null;
+    const offset = module.func_offsets[local_idx];
     // Prefer the executable mapping.
     if (inst.code_base) |base| {
         if (offset >= inst.code_size) return null;
@@ -160,6 +210,47 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
 
     inst.code_base = mem;
     inst.code_size = text.len;
+
+    // Build function pointer table for call_indirect
+    const module = inst.module;
+    const import_count = module.import_function_count;
+
+    // Build module func idx → native address mapping (temporary)
+    const total_funcs = import_count + module.func_count;
+    var func_addrs: [256]usize = std.mem.zeroes([256]usize);
+    const n_addrs = @min(total_funcs, func_addrs.len);
+    // Import functions → host function pointers
+    for (0..@min(import_count, @min(inst.host_functions.len, n_addrs))) |i| {
+        func_addrs[i] = if (inst.host_functions[i]) |ptr| @intFromPtr(ptr) else 0;
+    }
+    // Local functions → code_base + offset
+    for (0..@min(module.func_count, n_addrs - @min(import_count, n_addrs))) |i| {
+        const offset = module.func_offsets[i];
+        func_addrs[import_count + i] = @intFromPtr(mem) + offset;
+    }
+
+    // Build wasm table → native address table for call_indirect
+    if (inst.tables.len > 0) {
+        const tbl = inst.tables[0];
+        const tbl_size = tbl.elements.len;
+        if (tbl_size > 0) {
+            const native_table = inst.allocator.alloc(usize, tbl_size) catch return error.OutOfMemory;
+            @memset(native_table, 0);
+
+            // Apply element segments
+            for (module.elem_segments) |seg| {
+                if (seg.table_idx != 0) continue;
+                for (seg.func_indices, 0..) |func_idx, j| {
+                    const dst = seg.offset + @as(u32, @intCast(j));
+                    if (dst < tbl_size and func_idx < n_addrs) {
+                        native_table[dst] = func_addrs[func_idx];
+                    }
+                }
+            }
+
+            inst.func_table = native_table;
+        }
+    }
 }
 
 /// Call an AOT-compiled function by index.
@@ -173,7 +264,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     const addr = getFuncAddr(inst, func_idx) orelse return error.FunctionNotFound;
 
     // Build flat globals array for AOT access
-    var globals_buf: [256]i64 = undefined;
+    var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
     const n_globals = @min(inst.globals.len, globals_buf.len);
     for (0..n_globals) |i| {
         globals_buf[i] = inst.globals[i].value.i64;
@@ -183,11 +274,20 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     var vmctx = VmCtx{};
     if (inst.memories.len > 0) {
         vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
-        vmctx.memory_size = inst.memories[0].data.len;
+        vmctx.memory_size = @as(usize, inst.memories[0].current_pages) * types.MemoryInstance.page_size;
+        vmctx.memory_max_size = inst.memories[0].data.len;
+        vmctx.memory_pages = inst.memories[0].current_pages;
     }
-    if (n_globals > 0) {
-        vmctx.globals_ptr = @intFromPtr(&globals_buf);
-        vmctx.globals_count = @intCast(n_globals);
+    // Always provide a valid globals pointer — compiled code may access globals
+    // even if none are explicitly initialized (they default to zero).
+    vmctx.globals_ptr = @intFromPtr(&globals_buf);
+    vmctx.globals_count = @intCast(n_globals);
+    if (inst.host_functions.len > 0) {
+        vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
+        vmctx.host_functions_count = @intCast(inst.host_functions.len);
+    }
+    if (inst.func_table.len > 0) {
+        vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
     }
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
@@ -201,6 +301,35 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     }
 
     return result;
+}
+
+// ─── Host function resolution ───────────────────────────────────────────────
+
+/// Resolve AOT host function adapters for each import in the module.
+/// Returns a slice of optional function pointers indexed by import index.
+fn resolveHostFunctions(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+) RuntimeError![]const ?*const anyopaque {
+    if (module.import_function_count == 0) return &.{};
+
+    const host_fns = allocator.alloc(?*const anyopaque, module.import_function_count) catch
+        return error.OutOfMemory;
+    @memset(host_fns, null);
+
+    var func_idx: u32 = 0;
+    for (module.imports) |imp| {
+        if (imp.kind == .function) {
+            if (func_idx < module.import_function_count and
+                host_bridge.isWasiModule(imp.module_name))
+            {
+                host_fns[func_idx] = host_bridge.resolveAotHostFunction(imp.field_name);
+            }
+            func_idx += 1;
+        }
+    }
+
+    return host_fns;
 }
 
 // ─── Allocation helpers ─────────────────────────────────────────────────────
@@ -218,7 +347,9 @@ fn allocateMemories(module: *const aot_loader.AotModule, allocator: std.mem.Allo
     for (module.memories, 0..) |mem_type, i| {
         const initial_pages: u32 = @intCast(@min(mem_type.limits.min, 65536));
         const max_pages: u32 = @intCast(@min(mem_type.limits.max orelse 65536, 65536));
-        const size = @as(usize, initial_pages) * types.MemoryInstance.page_size;
+        // Pre-allocate for memory.grow: use max_pages but cap at a reasonable default
+        const alloc_pages = @min(max_pages, @max(initial_pages, 256));
+        const size = @as(usize, alloc_pages) * types.MemoryInstance.page_size;
 
         const data = allocator.alloc(u8, size) catch return error.OutOfMemory;
         @memset(data, 0);
@@ -265,11 +396,29 @@ fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Alloca
 }
 
 fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.GlobalInstance {
-    // AOT modules don't carry global init exprs in this loader yet;
-    // return empty for now. Full init_data parsing will populate these.
-    _ = module;
-    _ = allocator;
-    return &.{};
+    if (module.global_inits.len == 0) return &.{};
+
+    const globals = allocator.alloc(*types.GlobalInstance, module.global_inits.len) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |i| allocator.destroy(globals[i]);
+        allocator.free(globals);
+    }
+
+    for (module.global_inits, 0..) |ginit, i| {
+        const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
+        g.* = .{
+            .global_type = .{
+                .val_type = @enumFromInt(ginit.val_type),
+                .mutability = if (ginit.mutability != 0) .mutable else .immutable,
+            },
+            .value = .{ .i64 = ginit.init_i64 },
+        };
+        globals[i] = g;
+        initialized += 1;
+    }
+
+    return globals;
 }
 
 fn freeMemories(memories: []*types.MemoryInstance, allocator: std.mem.Allocator) void {
@@ -338,7 +487,8 @@ test "instantiate: module with memory" {
 
     try std.testing.expectEqual(@as(usize, 1), inst.memories.len);
     try std.testing.expectEqual(@as(u32, 1), inst.memories[0].current_pages);
-    try std.testing.expectEqual(@as(usize, 65536), inst.memories[0].data.len);
+    // Pre-allocated to max_pages (4) for memory.grow support
+    try std.testing.expectEqual(@as(usize, 4 * 65536), inst.memories[0].data.len);
 }
 
 test "instantiate: module with table" {
@@ -389,9 +539,73 @@ test "getFuncAddr: returns correct address" {
 }
 
 test "VmCtx layout: fields at expected offsets" {
-    // Verify extern struct field offsets match what the codegen expects
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(VmCtx, "memory_base"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(VmCtx, "memory_size"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(VmCtx, "globals_ptr"));
-    try std.testing.expectEqual(@as(usize, 24), @offsetOf(VmCtx, "globals_count"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(VmCtx, "host_functions_ptr"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(VmCtx, "memory_max_size"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(VmCtx, "func_table_ptr"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(VmCtx, "globals_count"));
+    try std.testing.expectEqual(@as(usize, 52), @offsetOf(VmCtx, "host_functions_count"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(VmCtx, "memory_pages"));
+}
+
+test "getFuncAddr: import indices return null" {
+    const text = [_]u8{ 0xCC, 0x90, 0xC3, 0x55, 0x48, 0x89, 0xE5, 0xC3 };
+    const offsets = [_]u32{ 0, 3 };
+    const module = aot_loader.AotModule{
+        .text_section = &text,
+        .func_offsets = &offsets,
+        .func_count = 2,
+        .import_function_count = 2,
+    };
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    // Import indices (0, 1) should return null (no native code)
+    try std.testing.expectEqual(@as(?[*]const u8, null), getFuncAddr(inst, 0));
+    try std.testing.expectEqual(@as(?[*]const u8, null), getFuncAddr(inst, 1));
+
+    // Local indices (2, 3) map to func_offsets[0], func_offsets[1]
+    const addr2 = getFuncAddr(inst, 2);
+    try std.testing.expect(addr2 != null);
+    try std.testing.expectEqual(@as(u8, 0xCC), addr2.?[0]);
+
+    const addr3 = getFuncAddr(inst, 3);
+    try std.testing.expect(addr3 != null);
+    try std.testing.expectEqual(@as(u8, 0x55), addr3.?[0]);
+}
+
+test "resolveHostFunctions: resolves WASI imports" {
+    const imports = [_]aot_loader.AotImportDesc{
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
+        .{ .module_name = "env", .field_name = "some_func", .kind = .function, .func_type_idx = 2 },
+    };
+    const module = aot_loader.AotModule{
+        .import_function_count = 3,
+        .imports = &imports,
+    };
+    const result = try resolveHostFunctions(&module, std.testing.allocator);
+    defer std.testing.allocator.free(result);
+
+    try std.testing.expectEqual(@as(usize, 3), result.len);
+    try std.testing.expect(result[0] != null); // fd_write resolved
+    try std.testing.expect(result[1] != null); // clock_time_get resolved
+    try std.testing.expect(result[2] == null); // env.some_func not resolved
+}
+
+test "instantiate: module with WASI imports resolves host functions" {
+    const imports = [_]aot_loader.AotImportDesc{
+        .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
+    };
+    const module = aot_loader.AotModule{
+        .import_function_count = 1,
+        .imports = &imports,
+    };
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    try std.testing.expectEqual(@as(usize, 1), inst.host_functions.len);
+    try std.testing.expect(inst.host_functions[0] != null);
 }
