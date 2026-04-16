@@ -1672,10 +1672,10 @@ fn compileInstRA(
 
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            try code.movRegReg(.r11, .rax); // save LHS
+            // useVReg loads spilled rhs into its scratch (.rcx), so it cannot
+            // clobber rax; no need to stash LHS in r11.
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            try code.movRegReg(.rax, .r11); // restore LHS
 
             // Zero divisor check
             try code.testRegReg(.rcx, .rcx);
@@ -1735,10 +1735,10 @@ fn compileInstRA(
             // Load val first to avoid clobbering if both share a register
             const val_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
-            try code.movRegReg(.r11, .rax); // save val
+            // useVReg loads spilled cnt into its scratch (.rcx), so it cannot
+            // clobber rax; no need to stash val in r11.
             const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
-            try code.movRegReg(.rax, .r11); // restore val
             switch (inst.op) {
                 .shl => {
                     try code.rexW(.rax, .rax);
@@ -2996,4 +2996,65 @@ test "compileFunctionRA: low-pressure function does not save r12" {
     // No push r12 (41 54) and no pop r12 (41 5C).
     try std.testing.expect(!containsBytes(code, &.{ 0x41, 0x54 }));
     try std.testing.expect(!containsBytes(code, &.{ 0x41, 0x5C }));
+}
+
+
+test "compileFunctionRA: shift does not emit dead r11 save" {
+    // Before B1, every shl emitted `mov r11, rax; ...; mov rax, r11` around
+    // the rhs load. Since useVReg loads spilled rhs into its scratch (.rcx),
+    // rax is never clobbered, so the save is dead. Verify it's gone.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // `mov r11, rax` = 49 89 C3. `mov rax, r11` = 4C 89 D8. Neither should appear.
+    try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x89, 0xC3 }));
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x89, 0xD8 }));
+    // Shift opcode D3 E0 (shl rax, cl with REX.W) must still appear.
+    try std.testing.expect(containsBytes(code, &.{ 0xD3, 0xE0 }));
+}
+
+test "compileFunctionRA: div does not emit dead r11 save around operand load" {
+    // Before B1, div emitted `mov r11, rax; mov rcx, rhs; mov rax, r11` to
+    // preserve LHS. With distinct scratches the save is dead.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // `mov r11, rax` = 49 89 C3 must not appear before the idiv/div.
+    try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x89, 0xC3 }));
+    // `mov rax, r11` = 4C 89 D8: this sequence also appears in div's rem
+    // rdx-restore path (only when rdx-in-use AND op is rem), so it must NOT
+    // appear here because no vreg got rdx (low pressure).
+    try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x89, 0xD8 }));
 }
