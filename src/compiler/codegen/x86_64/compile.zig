@@ -2503,7 +2503,7 @@ test "compileFunction: iconst_32(0) emits xor (zero idiom)" {
     try std.testing.expect(!containsBytes(code, &.{ 0xC7, 0xC0, 0x00, 0x00, 0x00, 0x00 }));
 }
 
-test "compileFunction: iconst + add uses ADD imm32" {
+test "compileFunction: iconst + add uses ADD imm8 form" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -2521,9 +2521,10 @@ test "compileFunction: iconst + add uses ADD imm32" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
 
-    // Should contain ADD reg, imm32 (81 /0) with value 5
-    try std.testing.expect(containsBytes(code, &.{0x81}));
-    try std.testing.expect(containsBytes(code, &.{ 0x05, 0x00, 0x00, 0x00 }));
+    // 5 fits in i8 → ADD reg, imm8 (opcode 0x83 /0, imm8=0x05).
+    try std.testing.expect(containsBytes(code, &.{ 0x83, 0xC0, 0x05 }));
+    // The 7-byte imm32 form (0x81 /0) must NOT appear for this small imm.
+    try std.testing.expect(!containsBytes(code, &.{ 0x81, 0xC0, 0x05, 0x00, 0x00, 0x00 }));
 }
 
 test "compileFunction: cmp + br_if fuses to Jcc (no setcc)" {

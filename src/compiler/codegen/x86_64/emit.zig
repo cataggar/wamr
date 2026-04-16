@@ -434,51 +434,89 @@ pub const CodeBuffer = struct {
     }
 
     /// ADD reg, imm32 (64-bit).
+    /// ADD reg, imm (64-bit). Uses the imm8 form (opcode 0x83) when imm fits
+    /// in a signed byte, saving 3 bytes vs the imm32 form (opcode 0x81).
     pub fn addRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 0, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 0, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 0, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// SUB reg, imm32 (64-bit).
+    /// SUB reg, imm (64-bit). Uses imm8 form when possible.
     pub fn subRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 5, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 5, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 5, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// AND reg, imm32 (64-bit, sign-extended).
+    /// AND reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn andRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 4, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 4, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 4, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// OR reg, imm32 (64-bit, sign-extended).
+    /// OR reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn orRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 1, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 1, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 1, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// XOR reg, imm32 (64-bit, sign-extended).
+    /// XOR reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn xorRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 6, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 6, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 6, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// CMP reg, imm32 (64-bit, sign-extended).
+    /// CMP reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn cmpRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 7, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 7, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 7, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
     /// XOR r32, r32 — zero register without REX.W (2 bytes, zero idiom).
@@ -1400,44 +1438,76 @@ test "zeroExtendReg 64-bit (no-op)" {
 // Immediate-form instruction tests
 // ═══════════════════════════════════════════════════════════════════════
 
-test "subRegImm32 rax, 10" {
+test "subRegImm32 rax, 10 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.subRegImm32(.rax, 10);
-    // REX.W 81 /5 rax, 0A000000: 48 81 E8 0A 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE8, 0x0A, 0x00, 0x00, 0x00 });
+    // REX.W 83 /5 rax, imm8: 48 83 E8 0A
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xE8, 0x0A });
 }
 
-test "andRegImm32 rax, 0xFF" {
+test "subRegImm32 rax, 1000 uses imm32 form" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.subRegImm32(.rax, 1000);
+    // REX.W 81 /5 rax, imm32: 48 81 E8 E8 03 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE8, 0xE8, 0x03, 0x00, 0x00 });
+}
+
+test "andRegImm32 rax, 0xFF uses imm32 form (0xFF > i8 max)" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.andRegImm32(.rax, 0xFF);
-    // REX.W 81 /4 rax: 48 81 E0 FF 00 00 00
+    // REX.W 81 /4 rax: 48 81 E0 FF 00 00 00 (0xFF doesn't fit in i8)
     try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE0, 0xFF, 0x00, 0x00, 0x00 });
 }
 
-test "orRegImm32 rax, 1" {
+test "andRegImm32 rax, 0x0F uses imm8 form" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.andRegImm32(.rax, 0x0F);
+    // REX.W 83 /4 rax, imm8: 48 83 E0 0F
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xE0, 0x0F });
+}
+
+test "orRegImm32 rax, 1 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.orRegImm32(.rax, 1);
-    // REX.W 81 /1 rax: 48 81 C8 01 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xC8, 0x01, 0x00, 0x00, 0x00 });
+    // REX.W 83 /1 rax, imm8: 48 83 C8 01
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xC8, 0x01 });
 }
 
-test "xorRegImm32 rax, 0x55" {
+test "xorRegImm32 rax, 0x55 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.xorRegImm32(.rax, 0x55);
-    // REX.W 81 /6 rax: 48 81 F0 55 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xF0, 0x55, 0x00, 0x00, 0x00 });
+    // REX.W 83 /6 rax, imm8: 48 83 F0 55
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xF0, 0x55 });
 }
 
-test "cmpRegImm32 rax, 42" {
+test "cmpRegImm32 rax, 42 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.cmpRegImm32(.rax, 42);
-    // REX.W 81 /7 rax: 48 81 F8 2A 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xF8, 0x2A, 0x00, 0x00, 0x00 });
+    // REX.W 83 /7 rax, imm8: 48 83 F8 2A
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xF8, 0x2A });
+}
+
+test "addRegImm32 rax, -1 uses imm8 form (sign-extended)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.addRegImm32(.rax, -1);
+    // REX.W 83 /0 rax, imm8=0xFF: 48 83 C0 FF
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xC0, 0xFF });
+}
+
+test "addRegImm32 rax, 128 uses imm32 form (boundary)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.addRegImm32(.rax, 128);
+    // 128 doesn't fit in i8 — must use imm32: 48 81 C0 80 00 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xC0, 0x80, 0x00, 0x00, 0x00 });
 }
 
 test "xorReg32 rax (zero idiom, 2 bytes)" {
