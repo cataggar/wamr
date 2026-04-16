@@ -491,48 +491,50 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .br_table => {
                 const count = readU32(code, &ip);
                 // Read all targets (count entries + 1 default)
-                var targets = try allocator.alloc(u32, count + 1);
-                defer allocator.free(targets);
-                for (0..count + 1) |i| targets[i] = readU32(code, &ip);
+                const raw_targets = try allocator.alloc(u32, count + 1);
+                defer allocator.free(raw_targets);
+                for (0..count + 1) |i| raw_targets[i] = readU32(code, &ip);
 
                 const index = safePop(&vreg_stack);
 
-                // Lower to if-else chain: for each target, compare index and branch
+                // Resolve depths to target block IDs.
+                // Entries whose depth is out of range are skipped (matches
+                // previous if-else behavior which silently dropped them).
+                const ir_targets = try allocator.alloc(ir.BlockId, count);
+                var resolved_count: u32 = 0;
+                var default_target: ir.BlockId = 0;
+                var have_default = false;
+
                 for (0..count) |i| {
-                    const depth = targets[i];
+                    const depth = raw_targets[i];
                     if (depth < block_stack.items.len) {
                         const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
-
-                        // Compare index == i
-                        const cmp_const = ir_func.newVReg();
-                        try ir_func.getBlock(current_block).append(.{
-                            .op = .{ .iconst_32 = @intCast(i) },
-                            .dest = cmp_const,
-                            .type = .i32,
-                        });
-                        const cmp_result = ir_func.newVReg();
-                        try ir_func.getBlock(current_block).append(.{
-                            .op = .{ .eq = .{ .lhs = index, .rhs = cmp_const } },
-                            .dest = cmp_result,
-                            .type = .i32,
-                        });
-
-                        // Branch if equal
-                        const fallthrough = try ir_func.newBlock();
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
-                            .cond = cmp_result,
-                            .then_block = target_frame.target_block,
-                            .else_block = fallthrough,
-                        } } });
-                        current_block = fallthrough;
+                        ir_targets[resolved_count] = target_frame.target_block;
+                        resolved_count += 1;
                     }
                 }
 
-                // Default target (last entry)
-                const default_depth = targets[count];
+                const default_depth = raw_targets[count];
                 if (default_depth < block_stack.items.len) {
-                    const default_frame = block_stack.items[block_stack.items.len - 1 - default_depth];
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br = default_frame.target_block } });
+                    default_target = block_stack.items[block_stack.items.len - 1 - default_depth].target_block;
+                    have_default = true;
+                }
+
+                if (have_default and resolved_count > 0) {
+                    // Shrink slice ownership to actually-resolved entries.
+                    const final_targets = ir_targets[0..resolved_count];
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br_table = .{
+                        .index = index,
+                        .targets = final_targets,
+                        .default = default_target,
+                    } } });
+                } else if (have_default) {
+                    allocator.free(ir_targets);
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br = default_target } });
+                } else {
+                    // No valid target — fall through as unreachable.
+                    allocator.free(ir_targets);
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .@"unreachable" = {} } });
                 }
                 dead_code = true;
             },

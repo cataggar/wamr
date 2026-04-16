@@ -80,6 +80,7 @@ pub const Inst = struct {
         // Control flow
         br: BlockId,
         br_if: struct { cond: VReg, then_block: BlockId, else_block: BlockId },
+        br_table: struct { index: VReg, targets: []const BlockId, default: BlockId },
         ret: ?VReg,
         @"unreachable": void,
 

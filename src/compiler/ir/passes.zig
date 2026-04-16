@@ -84,6 +84,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(st.val);
         },
         .br_if => |bi| list.append(bi.cond),
+        .br_table => |bt| list.append(bt.index),
         .ret => |maybe_vreg| if (maybe_vreg) |v| list.append(v),
         .call => {}, // call args handled separately in buildUseDef (unbounded)
         .call_indirect => {}, // same
@@ -198,6 +199,7 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (st.val == old) st.val = new;
         },
         .br_if => |*bi| if (bi.cond == old) { bi.cond = new; },
+        .br_table => |*bt| if (bt.index == old) { bt.index = new; },
         .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { if (v == old) maybe_vreg.* = new; },
         .call => |cl| {
             for (@constCast(cl.args)) |*arg| {
@@ -366,7 +368,7 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
 
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .store, .local_set, .global_set, .call, .call_indirect, .ret, .br, .br_if, .@"unreachable",
+        .store, .local_set, .global_set, .call, .call_indirect, .ret, .br, .br_if, .br_table, .@"unreachable",
         .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
         .atomic_notify, .atomic_wait, .memory_copy, .memory_fill, .memory_grow,
         .memory_init, .data_drop,
