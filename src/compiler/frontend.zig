@@ -857,16 +857,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } });
                     },
                     .memory_init => {
-                        _ = readU32(code, &ip); // data segment index
+                        const seg_idx = readU32(code, &ip);
                         _ = readU32(code, &ip); // memory (always 0)
-                        _ = safePop(&vreg_stack); // len
-                        _ = safePop(&vreg_stack); // src offset
-                        _ = safePop(&vreg_stack); // dst
-                        // Stub: memory.init is rare, skip for now
+                        const len = safePop(&vreg_stack);
+                        const src = safePop(&vreg_stack);
+                        const dst = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .memory_init = .{ .seg_idx = seg_idx, .dst = dst, .src = src, .len = len } } });
                     },
                     .data_drop => {
-                        _ = readU32(code, &ip); // data segment index
-                        // No-op stub
+                        const seg_idx = readU32(code, &ip);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .data_drop = seg_idx } });
                     },
                     else => {
                         std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});

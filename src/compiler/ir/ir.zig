@@ -145,6 +145,8 @@ pub const Inst = struct {
         // Bulk memory operations
         memory_copy: struct { dst: VReg, src: VReg, len: VReg },
         memory_fill: struct { dst: VReg, val: VReg, len: VReg },
+        memory_init: struct { seg_idx: u32, dst: VReg, src: VReg, len: VReg },
+        data_drop: u32, // data segment index
 
         // Memory management
         memory_size: void,

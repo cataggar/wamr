@@ -818,6 +818,12 @@ fn compileInst(
             try code.movRegImm32(.rax, 0);
             try stack.push(code, .rax);
         },
+        .memory_init => {
+            try stack.pop(code, .rax); // len
+            try stack.pop(code, .rax); // src
+            try stack.pop(code, .rax); // dst
+        },
+        .data_drop => {},
     }
 }
 
@@ -1434,6 +1440,17 @@ fn compileInstRA(
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
+        // memory.init and data.drop — currently no-ops in AOT since data
+        // segments are applied at instantiation. For full passive segment
+        // support, these would need runtime calls via VmCtx.
+        .memory_init => |mi| {
+            // Consume operands (required for correct vreg tracking)
+            _ = try useVReg(code, alloc_result, mi.dst, .rax);
+            _ = try useVReg(code, alloc_result, mi.src, .rax);
+            _ = try useVReg(code, alloc_result, mi.len, .rax);
+        },
+        .data_drop => {},
+
         // ── Division ──────────────────────────────────────────────────
         .div_s, .div_u, .rem_s, .rem_u => |bin| {
             const dest = inst.dest orelse return;
@@ -1826,17 +1843,39 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            switch (inst.op) {
-                .trunc_sat_f32_s, .trunc_sat_f32_u => {
-                    try code.movdToXmm(.rax, .rax);
-                    try code.cvttss2si(.rax, .rax);
-                },
-                .trunc_sat_f64_s, .trunc_sat_f64_u => {
-                    try code.movqToXmm(.rax, .rax);
-                    try code.cvttsd2si(.rax, .rax);
-                },
-                else => unreachable,
+
+            // NaN check: compare value with itself (NaN != NaN)
+            const is_f32 = (inst.op == .trunc_sat_f32_s or inst.op == .trunc_sat_f32_u);
+            if (is_f32) {
+                try code.movdToXmm(.rax, .rax);
+                try code.ucomiss(.rax, .rax);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.ucomisd(.rax, .rax);
             }
+            // JP = parity flag set = NaN → result is 0
+            try code.emitSlice(&.{ 0x0F, 0x8A }); // JP rel32
+            const nan_patch = code.len();
+            try code.emitI32(0);
+
+            // Normal conversion
+            if (is_f32) {
+                try code.cvttss2si(.rax, .rax);
+            } else {
+                try code.cvttsd2si(.rax, .rax);
+            }
+            try code.emitSlice(&.{0xE9}); // JMP done
+            const done_patch = code.len();
+            try code.emitI32(0);
+
+            // NaN path: result = 0
+            const nan_off = code.len();
+            try code.xorReg32(.rax);
+            const done_off = code.len();
+
+            code.patchI32(nan_patch, @intCast(@as(i64, @intCast(nan_off)) - @as(i64, @intCast(nan_patch + 4))));
+            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .convert_s => |vreg| {
@@ -1853,10 +1892,17 @@ fn compileInstRA(
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .convert_u => |vreg| {
-            // Simplified: treat as signed conversion (correct for values < 2^63)
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+
+            // Check if value >= 2^63 (sign bit set)
+            try code.testRegReg(.rax, .rax);
+            try code.emitSlice(&.{ 0x0F, 0x88 }); // JS rel32 (jump if sign bit set)
+            const large_patch = code.len();
+            try code.emitI32(0);
+
+            // Small path (< 2^63): treat as signed — cvtsi2s{s,d} is correct
             if (inst.type == .f32) {
                 try code.cvtsi2ss(.rax, .rax);
                 try code.movdFromXmm(.rax, .rax);
@@ -1864,6 +1910,31 @@ fn compileInstRA(
                 try code.cvtsi2sd(.rax, .rax);
                 try code.movqFromXmm(.rax, .rax);
             }
+            try code.emitSlice(&.{0xE9}); // JMP done
+            const done_patch = code.len();
+            try code.emitI32(0);
+
+            // Large path (>= 2^63): shift right by 1, convert, then multiply by 2
+            const large_off = code.len();
+            try code.movRegReg(.rcx, .rax); // save original
+            try code.emitSlice(&.{ 0x48, 0xD1, 0xE8 }); // shr rax, 1
+            // Preserve low bit: OR with original & 1
+            try code.andRegImm32(.rcx, 1); // rcx = original & 1
+            try code.orRegReg(.rax, .rcx); // rax = (original >> 1) | (original & 1)
+            if (inst.type == .f32) {
+                try code.cvtsi2ss(.rax, .rax);
+                try code.addss(.rax, .rax); // multiply by 2
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd(.rax, .rax);
+                try code.addsd(.rax, .rax); // multiply by 2
+                try code.movqFromXmm(.rax, .rax);
+            }
+            const done_off = code.len();
+
+            code.patchI32(large_patch, @intCast(@as(i64, @intCast(large_off)) - @as(i64, @intCast(large_patch + 4))));
+            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
         .demote_f64 => |vreg| {
