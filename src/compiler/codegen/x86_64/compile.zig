@@ -1437,10 +1437,22 @@ fn compileInstRA(
         // ── Division ──────────────────────────────────────────────────
         .div_s, .div_u, .rem_s, .rem_u => |bin| {
             const dest = inst.dest orelse return;
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            // Save caller-saved regs since idiv clobbers rax and rdx
+            for (caller_saved_alloc) |reg| try code.pushReg(reg);
+
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            try code.movRegReg(.r11, .rax); // save LHS
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            try code.movRegReg(.rax, .r11); // restore LHS
+
+            // Zero divisor check
+            try code.testRegReg(.rcx, .rcx);
+            try code.emitSlice(&.{ 0x0F, 0x84 }); // JZ rel32
+            const skip_patch = code.len();
+            try code.emitI32(0);
+
             switch (inst.op) {
                 .div_s, .rem_s => {
                     try code.cqo();
@@ -1452,25 +1464,47 @@ fn compileInstRA(
                 },
                 else => unreachable,
             }
+            try code.emitSlice(&.{ 0xE9 }); // JMP done
+            const done_patch = code.len();
+            try code.emitI32(0);
+
+            const zero_off = code.len();
+            try code.xorReg32(.rax);
+            try code.movRegImm32(.rdx, 0);
+            const done_off = code.len();
+
+            code.patchI32(skip_patch, @intCast(@as(i64, @intCast(zero_off)) - @as(i64, @intCast(skip_patch + 4))));
+            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+
             const result_reg: emit.Reg = switch (inst.op) {
                 .div_s, .div_u => .rax,
                 .rem_s, .rem_u => .rdx,
                 else => unreachable,
             };
-            if (inst.type == .i32) {
-                try writeDefI32(code, alloc_result, dest, result_reg);
-            } else {
-                try writeDefTyped(code, alloc_result, dest, result_reg, inst.type);
+
+            // Restore caller-saved regs (reverse order)
+            // But first save result to r11 so it survives the pops
+            try code.movRegReg(.r11, result_reg);
+            var ri: usize = caller_saved_alloc.len;
+            while (ri > 0) {
+                ri -= 1;
+                try code.popReg(caller_saved_alloc[ri]);
             }
+            try code.movRegReg(.rax, .r11);
+
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Shifts ────────────────────────────────────────────────────
         .shl, .shr_s, .shr_u, .rotl, .rotr => |bin| {
             const dest = inst.dest orelse return;
-            const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
+            // Load val first to avoid clobbering if both share a register
             const val_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
+            try code.movRegReg(.r11, .rax); // save val
+            const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
+            try code.movRegReg(.rax, .r11); // restore val
             switch (inst.op) {
                 .shl => {
                     try code.rexW(.rax, .rax);
