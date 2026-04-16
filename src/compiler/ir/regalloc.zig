@@ -79,6 +79,11 @@ pub fn allocate(
 
     var spill_count: u32 = 0;
 
+    // Spill area must start AFTER the operand-stack area in the frame.
+    // Frame layout (compile.zig): [rbp-8]=VmCtx, [rbp-16..-(1+LC)*8]=locals (LC slots),
+    // [-(2+LC)*8..-(65+LC)*8]=op-stack (64 slots). Spills begin at -(66+LC)*8.
+    const spill_base: i32 = -@as(i32, @intCast((func.local_count + 66) * 8));
+
     for (ranges) |range| {
         // Expire old intervals that ended before this one starts
         expireOldIntervals(&active, range.start, &reg_free);
@@ -109,7 +114,7 @@ pub fn allocate(
             if (best_evict) |evict_idx| {
                 const evicted = active.orderedRemove(evict_idx);
                 const stolen_reg = evicted.reg_idx;
-                const spill_offset = computeSpillOffset(spill_count);
+                const spill_offset = spill_base - @as(i32, @intCast(spill_count * 8));
                 try assignments.put(evicted.vreg, .{ .stack = spill_offset });
                 spill_count += 1;
                 try assignments.put(range.vreg, .{ .reg = alloc_regs[stolen_reg] });
@@ -120,7 +125,7 @@ pub fn allocate(
                 });
             } else {
                 // No safe eviction candidate — spill the new interval
-                const spill_offset = computeSpillOffset(spill_count);
+                const spill_offset = spill_base - @as(i32, @intCast(spill_count * 8));
                 try assignments.put(range.vreg, .{ .stack = spill_offset });
                 spill_count += 1;
             }
@@ -188,12 +193,10 @@ fn insertActive(
     try active.insert(allocator, pos, interval);
 }
 
-/// Compute spill slot offset from RBP.
-/// Spill slots start after locals and operand stack area.
-/// `local_count` is needed to position spills after the local variable area.
+/// Compute spill slot offset from RBP (legacy helper; callers now use
+/// `spill_base` computed per-function in `allocate`). Kept for potential
+/// unit-test use with the default operand-stack budget of 64 slots.
 fn computeSpillOffset(spill_idx: u32) i32 {
-    // Spill area starts at [rbp - 600] to avoid conflicts with locals and operand stack.
-    // Each spill slot is 8 bytes.
     const spill_base: i32 = -600;
     return spill_base - @as(i32, @intCast(spill_idx * 8));
 }
