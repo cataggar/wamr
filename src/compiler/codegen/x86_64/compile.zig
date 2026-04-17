@@ -2446,41 +2446,115 @@ fn compileInstRA(
         },
 
         // ── Float binary operations ───────────────────────────────────
-        .f_min => |bin| {
+        .f_min, .f_max => |bin| {
             const dest = inst.dest orelse return;
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            // Wasm f32/f64 min/max:
+            //   1. If either operand is NaN → canonical qNaN.
+            //   2. If operands are bit-equal → bitwise OR (min) / AND (max)
+            //      so that min(-0,+0) = -0 and max(-0,+0) = +0.
+            //   3. Otherwise → MINSS/MINSD (MAXSS/MAXSD).
+            // MINSx/MAXSx alone fail both (1) (returns 2nd op on NaN) and
+            // (2) (returns 2nd op when equal) — hence the explicit checks.
+            const is_min = inst.op == .f_min;
             if (inst.type == .f32) {
-                try code.movdToXmm(.rax, .rax);
-                try code.movdToXmm(.rcx, .rcx);
-                try code.minss(.rax, .rcx);
-                try code.movdFromXmm(.rax, .rax);
+                // Offsets (f32, with UCOMISS for IEEE equality — handles ±0):
+                //  0   mov edx, eax                          2
+                //  2   and edx, 0x7FFFFFFF                   6
+                //  8   cmp edx, 0x7F800000                   6
+                // 14   ja  nan  (rel8 = 59-16 = 43)          2
+                // 16   mov edx, ecx                          2
+                // 18   and edx, 0x7FFFFFFF                   6
+                // 24   cmp edx, 0x7F800000                   6
+                // 30   ja  nan  (rel8 = 59-32 = 27)          2
+                // 32   movd xmm0, eax                        4
+                // 36   movd xmm1, ecx                        4
+                // 40   ucomiss xmm0, xmm1                    3
+                // 43   je  equal (rel8 = 55-45 = 10)         2
+                // 45   minss/maxss xmm0, xmm1                4
+                // 49   movd eax, xmm0                        4
+                // 53   jmp done (rel8 = 64-55 = 9)           2
+                // 55   or/and eax, ecx                       2
+                // 57   jmp done (rel8 = 64-59 = 5)           2
+                // 59   mov eax, 0x7FC00000                   5
+                // 64   <done>
+                const minmax_byte: u8 = if (is_min) 0x5D else 0x5F; // MINSS=5D, MAXSS=5F
+                const or_and_byte: u8 = if (is_min) 0x09 else 0x21; // OR=09, AND=21
+                try code.emitSlice(&.{
+                    0x89, 0xC2,                               // mov edx, eax
+                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F,       // and edx, 0x7FFFFFFF
+                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F,       // cmp edx, 0x7F800000
+                    0x77, 0x2B,                               // ja nan (+43)
+                    0x89, 0xCA,                               // mov edx, ecx
+                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F,       // and edx, 0x7FFFFFFF
+                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F,       // cmp edx, 0x7F800000
+                    0x77, 0x1B,                               // ja nan (+27)
+                    0x66, 0x0F, 0x6E, 0xC0,                   // movd xmm0, eax
+                    0x66, 0x0F, 0x6E, 0xC9,                   // movd xmm1, ecx
+                    0x0F, 0x2E, 0xC1,                         // ucomiss xmm0, xmm1
+                    0x74, 0x0A,                               // je equal (+10)
+                    0xF3, 0x0F, minmax_byte, 0xC1,            // min/maxss xmm0, xmm1
+                    0x66, 0x0F, 0x7E, 0xC0,                   // movd eax, xmm0
+                    0xEB, 0x09,                               // jmp done (+9)
+                    or_and_byte, 0xC8,                        // or/and eax, ecx
+                    0xEB, 0x05,                               // jmp done (+5)
+                    0xB8, 0x00, 0x00, 0xC0, 0x7F,             // mov eax, 0x7FC00000
+                });
             } else {
-                try code.movqToXmm(.rax, .rax);
-                try code.movqToXmm(.rcx, .rcx);
-                try code.minsd(.rax, .rcx);
-                try code.movqFromXmm(.rax, .rax);
-            }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
-        },
-        .f_max => |bin| {
-            const dest = inst.dest orelse return;
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
-            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            if (inst.type == .f32) {
-                try code.movdToXmm(.rax, .rax);
-                try code.movdToXmm(.rcx, .rcx);
-                try code.maxss(.rax, .rcx);
-                try code.movdFromXmm(.rax, .rax);
-            } else {
-                try code.movqToXmm(.rax, .rax);
-                try code.movqToXmm(.rcx, .rcx);
-                try code.maxsd(.rax, .rcx);
-                try code.movqFromXmm(.rax, .rax);
+                // f64: same shape with UCOMISD for IEEE equality.
+                // Offsets:
+                //   0  mov rdx, rax                          3
+                //   3  movabs r11, 0x7FFFFFFFFFFFFFFF       10
+                //  13  and rdx, r11                          3
+                //  16  movabs r11, 0x7FF0000000000000       10
+                //  26  cmp rdx, r11                          3
+                //  29  ja nan (rel8 = 94-31 = 63)            2
+                //  31  mov rdx, rcx                          3
+                //  34  movabs r11, 0x7FFFFFFFFFFFFFFF       10
+                //  44  and rdx, r11                          3
+                //  47  movabs r11, 0x7FF0000000000000       10
+                //  57  cmp rdx, r11                          3
+                //  60  ja nan (rel8 = 94-62 = 32)            2
+                //  62  movq xmm0, rax                        5
+                //  67  movq xmm1, rcx                        5
+                //  72  ucomisd xmm0, xmm1                    4
+                //  76  je equal (rel8 = 89-78 = 11)          2
+                //  78  minsd/maxsd xmm0, xmm1                4
+                //  82  movq rax, xmm0                        5
+                //  87  jmp done (rel8 = 104-89 = 15)         2
+                //  89  or/and rax, rcx                       3
+                //  92  jmp done (rel8 = 104-94 = 10)         2
+                //  94  movabs rax, 0x7FF8000000000000       10
+                // 104  <done>
+                const minmax_byte: u8 = if (is_min) 0x5D else 0x5F;
+                const or_and_byte: u8 = if (is_min) 0x09 else 0x21;
+                try code.emitSlice(&.{
+                    0x48, 0x89, 0xC2,                                                   // mov rdx, rax
+                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,         // movabs r11, 0x7FFF...FF
+                    0x4C, 0x21, 0xDA,                                                   // and rdx, r11
+                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F,         // movabs r11, 0x7FF0...00
+                    0x4C, 0x39, 0xDA,                                                   // cmp rdx, r11
+                    0x77, 0x3F,                                                         // ja nan (+63)
+                    0x48, 0x89, 0xCA,                                                   // mov rdx, rcx
+                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,         // movabs r11, 0x7FFF...FF
+                    0x4C, 0x21, 0xDA,                                                   // and rdx, r11
+                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F,         // movabs r11, 0x7FF0...00
+                    0x4C, 0x39, 0xDA,                                                   // cmp rdx, r11
+                    0x77, 0x20,                                                         // ja nan (+32)
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                                       // movq xmm0, rax
+                    0x66, 0x48, 0x0F, 0x6E, 0xC9,                                       // movq xmm1, rcx
+                    0x66, 0x0F, 0x2E, 0xC1,                                             // ucomisd xmm0, xmm1
+                    0x74, 0x0B,                                                         // je equal (+11)
+                    0xF2, 0x0F, minmax_byte, 0xC1,                                      // min/maxsd xmm0, xmm1
+                    0x66, 0x48, 0x0F, 0x7E, 0xC0,                                       // movq rax, xmm0
+                    0xEB, 0x0F,                                                         // jmp done (+15)
+                    0x48, or_and_byte, 0xC8,                                            // or/and rax, rcx
+                    0xEB, 0x0A,                                                         // jmp done (+10)
+                    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x7F,         // movabs rax, 0x7FF8...00
+                });
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
