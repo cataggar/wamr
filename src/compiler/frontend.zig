@@ -879,7 +879,11 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f32_convert_i32_s, .f32_convert_i64_s => .f32,
                     else => .f64,
                 };
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .convert_s = val }, .dest = dest, .type = ir_type });
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_convert_i32_s, .f64_convert_i32_s => .{ .convert_i32_s = val },
+                    else => .{ .convert_i64_s = val },
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
                 try vreg_stack.append(allocator, dest);
             },
             .f32_convert_i32_u, .f32_convert_i64_u,
@@ -891,7 +895,11 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f32_convert_i32_u, .f32_convert_i64_u => .f32,
                     else => .f64,
                 };
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .convert_u = val }, .dest = dest, .type = ir_type });
+                const ir_op: ir.Inst.Op = switch (op) {
+                    .f32_convert_i32_u, .f64_convert_i32_u => .{ .convert_i32_u = val },
+                    else => .{ .convert_i64_u = val },
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
                 try vreg_stack.append(allocator, dest);
             },
 

@@ -790,7 +790,7 @@ fn compileInst(
 
         // ── Float/conversion stubs (pop input, push placeholder) ──────
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         => {
@@ -2656,12 +2656,18 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            if (inst.op == .trunc_f32_s) {
+            const is_f32 = (inst.op == .trunc_f32_s);
+            if (is_f32) {
                 try code.movdToXmm(.rax, .rax);
-                try code.cvttss2si(.rax, .rax);
             } else {
                 try code.movqToXmm(.rax, .rax);
-                try code.cvttsd2si(.rax, .rax);
+            }
+            // Use the dest-width form so 32-bit trunc fills only EAX (and the
+            // upper 32 bits don't carry stale signed bits across writeDefTyped).
+            if (inst.type == .i32) {
+                if (is_f32) try code.cvttss2si32(.rax, .rax) else try code.cvttsd2si32(.rax, .rax);
+            } else {
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
@@ -2669,12 +2675,18 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            if (inst.op == .trunc_f32_u) {
+            const is_f32 = (inst.op == .trunc_f32_u);
+            if (is_f32) {
                 try code.movdToXmm(.rax, .rax);
-                try code.cvttss2si(.rax, .rax);
             } else {
                 try code.movqToXmm(.rax, .rax);
-                try code.cvttsd2si(.rax, .rax);
+            }
+            if (inst.type == .i32) {
+                // Unsigned i32 fits in signed i64; use 64-bit cvtt then truncate.
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+            } else {
+                // Unsigned i64 trunc not handled here (needs split-range logic).
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
@@ -2683,41 +2695,195 @@ fn compileInstRA(
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
 
-            // NaN check: compare value with itself (NaN != NaN)
             const is_f32 = (inst.op == .trunc_sat_f32_s or inst.op == .trunc_sat_f32_u);
-            if (is_f32) {
-                try code.movdToXmm(.rax, .rax);
-                try code.ucomiss(.rax, .rax);
-            } else {
-                try code.movqToXmm(.rax, .rax);
-                try code.ucomisd(.rax, .rax);
-            }
-            // JP = parity flag set = NaN → result is 0
+            const is_signed = (inst.op == .trunc_sat_f32_s or inst.op == .trunc_sat_f64_s);
+            const dst_is_i32 = (inst.type == .i32);
+
+            // Move source to xmm0
+            if (is_f32) try code.movdToXmm(.rax, .rax) else try code.movqToXmm(.rax, .rax);
+
+            // ── NaN check ──
+            // ucomis* sets PF=1 if unordered (NaN). NaN -> result = 0.
+            if (is_f32) try code.ucomiss(.rax, .rax) else try code.ucomisd(.rax, .rax);
             try code.emitSlice(&.{ 0x0F, 0x8A }); // JP rel32
             const nan_patch = code.len();
             try code.emitI32(0);
 
-            // Normal conversion
+            // ── Lower bound check: if src < MIN_F  -> saturate to MIN_INT ──
+            // Compute MIN_F bits depending on (dst_is_i32, is_signed, is_f32).
+            // For unsigned: MIN_F = 0.0 (any 0-or-negative -> 0).
+            const min_f_bits: u64 = if (is_signed) blk: {
+                if (dst_is_i32) {
+                    // INT32_MIN = -2147483648.0
+                    break :blk if (is_f32) @as(u64, 0xCF000000) else @as(u64, 0xC1E0000000000000);
+                } else {
+                    // INT64_MIN = -9223372036854775808.0
+                    break :blk if (is_f32) @as(u64, 0xDF000000) else @as(u64, 0xC3E0000000000000);
+                }
+            } else 0; // 0.0 for unsigned
+
+            // Load MIN_F into xmm1 via R11
             if (is_f32) {
-                try code.cvttss2si(.rax, .rax);
+                try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(min_f_bits))));
+                try code.movdToXmm(.rcx, .r11);
             } else {
-                try code.cvttsd2si(.rax, .rax);
+                try code.movRegImm64(.r11, min_f_bits);
+                try code.movqToXmm(.rcx, .r11);
+            }
+            // For signed, use UCOMIS; src < MIN_F if CF=1 -> JB
+            // For unsigned, src <= 0 -> JBE saturates to 0.
+            if (is_f32) try code.ucomiss(.rax, .rcx) else try code.ucomisd(.rax, .rcx);
+            try code.emitSlice(&.{ 0x0F, if (is_signed) @as(u8, 0x82) else @as(u8, 0x86) }); // JB / JBE rel32
+            const min_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Upper bound check: if src >= MAX_BOUND_F -> saturate to MAX_INT ──
+            // MAX_BOUND_F is the smallest float >= the *exclusive* upper bound,
+            // i.e. (MAX_INT + 1) as a float, since MAX_INT itself isn't usually
+            // exactly representable.
+            const max_bound_bits: u64 = if (is_signed) blk: {
+                if (dst_is_i32) {
+                    // 2^31 = 2147483648.0
+                    break :blk if (is_f32) @as(u64, 0x4F000000) else @as(u64, 0x41E0000000000000);
+                } else {
+                    // 2^63 = 9223372036854775808.0
+                    break :blk if (is_f32) @as(u64, 0x5F000000) else @as(u64, 0x43E0000000000000);
+                }
+            } else blk: {
+                if (dst_is_i32) {
+                    // 2^32 = 4294967296.0
+                    break :blk if (is_f32) @as(u64, 0x4F800000) else @as(u64, 0x41F0000000000000);
+                } else {
+                    // 2^64 = 18446744073709551616.0
+                    break :blk if (is_f32) @as(u64, 0x5F800000) else @as(u64, 0x43F0000000000000);
+                }
+            };
+            if (is_f32) {
+                try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(max_bound_bits))));
+                try code.movdToXmm(.rcx, .r11);
+            } else {
+                try code.movRegImm64(.r11, max_bound_bits);
+                try code.movqToXmm(.rcx, .r11);
+            }
+            if (is_f32) try code.ucomiss(.rax, .rcx) else try code.ucomisd(.rax, .rcx);
+            // JAE = src >= MAX_BOUND -> saturate to MAX
+            try code.emitSlice(&.{ 0x0F, 0x83 });
+            const max_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Normal conversion ──
+            if (!is_signed and !dst_is_i32) {
+                // Unsigned 64-bit trunc: cvttsx2si is signed, so split at 2^63.
+                // We've already verified 0 <= src < 2^64.
+                // If src >= 2^63: subtract 2^63, cvttsx2si, add back 2^63.
+                const split_bits: u64 = if (is_f32) 0x5F000000 else 0x43E0000000000000;
+                if (is_f32) {
+                    try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(split_bits))));
+                    try code.movdToXmm(.rcx, .r11);
+                    try code.ucomiss(.rax, .rcx);
+                } else {
+                    try code.movRegImm64(.r11, split_bits);
+                    try code.movqToXmm(.rcx, .r11);
+                    try code.ucomisd(.rax, .rcx);
+                }
+                // JB = src < 2^63 -> direct convert
+                try code.emitSlice(&.{ 0x0F, 0x82 });
+                const direct_patch = code.len();
+                try code.emitI32(0);
+                // High range: subtract 2^63, convert, add back
+                if (is_f32) {
+                    try code.subss(.rax, .rcx);
+                    try code.cvttss2si(.rax, .rax);
+                } else {
+                    try code.subsd(.rax, .rcx);
+                    try code.cvttsd2si(.rax, .rax);
+                }
+                try code.movRegImm64(.r11, 0x8000000000000000);
+                try code.addRegReg(.rax, .r11);
+                try code.emitSlice(&.{0xE9}); // JMP done
+                const u64_done_patch = code.len();
+                try code.emitI32(0);
+                // Direct path
+                const direct_off = code.len();
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+                code.patchI32(direct_patch, @intCast(@as(i64, @intCast(direct_off)) - @as(i64, @intCast(direct_patch + 4))));
+                const u64_done_off = code.len();
+                code.patchI32(u64_done_patch, @intCast(@as(i64, @intCast(u64_done_off)) - @as(i64, @intCast(u64_done_patch + 4))));
+            } else if (dst_is_i32) {
+                // i32 dest (signed or unsigned): use 32-bit truncation.
+                if (is_f32) try code.cvttss2si32(.rax, .rax) else try code.cvttsd2si32(.rax, .rax);
+            } else {
+                // Signed i64
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
             }
             try code.emitSlice(&.{0xE9}); // JMP done
             const done_patch = code.len();
             try code.emitI32(0);
 
-            // NaN path: result = 0
+            // ── NaN landing: result = 0 ──
             const nan_off = code.len();
             try code.xorReg32(.rax);
+            try code.emitSlice(&.{0xE9});
+            const nan_done_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Underflow landing: result = MIN_INT ──
+            const min_off = code.len();
+            if (!is_signed) {
+                // unsigned -> 0
+                try code.xorReg32(.rax);
+            } else if (dst_is_i32) {
+                try code.movRegImm32(.rax, @bitCast(@as(u32, 0x80000000)));
+            } else {
+                try code.movRegImm64(.rax, 0x8000000000000000);
+            }
+            try code.emitSlice(&.{0xE9});
+            const min_done_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Overflow landing: result = MAX_INT ──
+            const max_off = code.len();
+            if (!is_signed) {
+                if (dst_is_i32) try code.movRegImm32(.rax, @bitCast(@as(u32, 0xFFFFFFFF)))
+                else try code.movRegImm64(.rax, 0xFFFFFFFFFFFFFFFF);
+            } else if (dst_is_i32) {
+                try code.movRegImm32(.rax, 0x7FFFFFFF);
+            } else {
+                try code.movRegImm64(.rax, 0x7FFFFFFFFFFFFFFF);
+            }
+
+            // ── done ──
             const done_off = code.len();
 
             code.patchI32(nan_patch, @intCast(@as(i64, @intCast(nan_off)) - @as(i64, @intCast(nan_patch + 4))));
+            code.patchI32(min_patch, @intCast(@as(i64, @intCast(min_off)) - @as(i64, @intCast(min_patch + 4))));
+            code.patchI32(max_patch, @intCast(@as(i64, @intCast(max_off)) - @as(i64, @intCast(max_patch + 4))));
             code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+            code.patchI32(nan_done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(nan_done_patch + 4))));
+            code.patchI32(min_done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(min_done_patch + 4))));
 
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
-        .convert_s => |vreg| {
+        .convert_s, .convert_u => {
+            // Legacy ops, no longer emitted by the frontend (replaced by
+            // .convert_i32_s/.convert_i64_s/.convert_i32_u/.convert_i64_u).
+        },
+        .convert_i32_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // Use 32-bit CVTSI2S{S,D} so the source register is interpreted as a
+            // signed dword (so e.g. 0xFFFFFFFF -> -1.0, not 4294967295.0).
+            if (inst.type == .f32) {
+                try code.cvtsi2ss32(.rax, .rax);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd32(.rax, .rax);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+        .convert_i64_s => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
@@ -2730,7 +2896,24 @@ fn compileInstRA(
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
-        .convert_u => |vreg| {
+        .convert_i32_u => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // Zero-extend low 32 bits to 64 bits, then use signed 64-bit conversion.
+            // (mov r32,r32 zero-extends to 64; the eax->rax extension already
+            // happened from any preceding 32-bit op, but be explicit.)
+            try code.emitSlice(&.{ 0x89, 0xC0 }); // mov eax, eax — zero-extends to RAX
+            if (inst.type == .f32) {
+                try code.cvtsi2ss(.rax, .rax);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd(.rax, .rax);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+        .convert_i64_u => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);

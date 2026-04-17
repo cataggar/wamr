@@ -151,7 +151,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |vreg| live.put(vreg, {}) catch {},
 
@@ -333,7 +333,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |vreg| last_use.put(vreg, pos) catch {},
 

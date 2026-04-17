@@ -907,6 +907,38 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, gpr.low3(), xmm.low3());
     }
 
+    /// CVTSI2SD xmm, r32 — convert signed i32 to f64
+    pub fn cvtsi2sd32(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0xF2);
+        try self.rex(false, xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x2A });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// CVTSI2SS xmm, r32 — convert signed i32 to f32
+    pub fn cvtsi2ss32(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0xF3);
+        try self.rex(false, xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x2A });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// CVTTSD2SI r32, xmm — truncate f64 to signed i32
+    pub fn cvttsd2si32(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0xF2);
+        try self.rex(false, gpr, xmm);
+        try self.emitSlice(&.{ 0x0F, 0x2C });
+        try self.modrm(0b11, gpr.low3(), xmm.low3());
+    }
+
+    /// CVTTSS2SI r32, xmm — truncate f32 to signed i32
+    pub fn cvttss2si32(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0xF3);
+        try self.rex(false, gpr, xmm);
+        try self.emitSlice(&.{ 0x0F, 0x2C });
+        try self.modrm(0b11, gpr.low3(), xmm.low3());
+    }
+
     /// CVTSD2SS xmm, xmm — convert f64 to f32
     pub fn cvtsd2ss(self: *CodeBuffer, dst: Reg, src: Reg) !void { try self.sseBinOp(0xF2, 0x5A, dst, src); }
 
