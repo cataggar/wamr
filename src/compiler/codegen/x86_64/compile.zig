@@ -45,6 +45,61 @@ const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
 const vmctx_mem_max_size_field: i32 = 32; // VmCtx.memory_max_size offset
 const vmctx_func_table_field: i32 = 40; // VmCtx.func_table_ptr offset
 const vmctx_mem_pages_field: i32 = 56; // VmCtx.memory_pages offset (u32)
+const vmctx_mem_grow_fn_field: i32 = 64; // VmCtx.mem_grow_fn offset (usize)
+const vmctx_instance_ptr_field: i32 = 72; // VmCtx.instance_ptr offset (usize)
+const vmctx_trap_oob_fn_field: i32 = 80; // VmCtx.trap_oob_fn offset (usize)
+
+/// Emit an inline wasm-memory bounds check.
+///
+/// Preconditions:
+///   - `rax` holds `wasm_addr` already zero-extended to 64 bits (u32 → u64).
+///   - `r10` holds the `VmCtx*` pointer.
+///
+/// Effect:
+///   - Computes `end = wasm_addr + end_offset` in `r11`, where
+///     `end_offset = static_offset + access_size` supplied by the caller.
+///   - Compares `end` with `VmCtx.memory_size` and, if strictly greater,
+///     calls `vmctx.trap_oob_fn(vmctx)` which does not return.
+///   - Preserves `rax` (the wasm_addr) so the caller can continue to add
+///     `mem_base` to it. Preserves `r10` so the caller can subsequently
+///     load `mem_base` via `mov r10, [r10 + membase]`.
+///   - Clobbers `r11` (non-allocatable scratch) and `param_regs[0]`
+///     (Win64: rcx, reserved scratch / SysV: rdi, caller-saved).
+fn emitMemBoundsCheck(code: *emit.CodeBuffer, end_offset: u64) !void {
+    // r11 = rax + end_offset (64-bit).
+    if (end_offset == 0) {
+        // mov r11, rax  (REX.W|B + 0x89 + modrm 11_000_011)
+        try code.emitSlice(&.{ 0x49, 0x89, 0xC3 });
+    } else if (end_offset <= 0x7FFFFFFF) {
+        // lea r11, [rax + disp32]  (REX.W|R + 0x8D + modrm 10_011_000 + disp32)
+        try code.emitSlice(&.{ 0x4C, 0x8D, 0x98 });
+        try code.emitI32(@intCast(end_offset));
+    } else {
+        // For unusually large static offsets: mov r11, imm64; add r11, rax.
+        try code.emitSlice(&.{ 0x49, 0xBB }); // mov r11, imm64
+        var i: u8 = 0;
+        while (i < 8) : (i += 1) {
+            try code.emitByte(@intCast((end_offset >> @as(u6, @intCast(i * 8))) & 0xFF));
+        }
+        // add r11, rax  (REX.W|B + 0x01 + modrm 11_000_011)
+        try code.emitSlice(&.{ 0x49, 0x01, 0xC3 });
+    }
+    // cmp r11, qword ptr [r10 + memsize_field]
+    //   REX.W|R|B=4D, opcode 0x3B, modrm=01_011_010 (mod=disp8, reg=r11 low=3,
+    //   rm=r10 low=2), disp8=memsize_field.
+    try code.emitSlice(&.{ 0x4D, 0x3B, 0x5A, @as(u8, @intCast(vmctx_memsize_field)) });
+    // jbe over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
+    try code.emitByte(0x76);
+    try code.emitByte(12);
+    // Trap block:
+    //   mov param_regs[0], r10            ; arg0 = vmctx (already in r10)
+    //   mov rax, [param_regs[0] + trap_oob_fn_field]
+    //   call rax                          ; noreturn
+    try code.movRegReg(param_regs[0], .r10);
+    try code.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
+    try code.callReg(.rax);
+    // over_trap:
+}
 
 /// Register-caching operand stack. Keeps the top N values in registers,
 /// eliminating redundant store-load pairs. Falls back to memory (via RBP
@@ -873,7 +928,7 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
             switch (ci.op) {
-                .call, .call_indirect => {
+                .call, .call_indirect, .memory_grow => {
                     const mask = if (comptime builtin.os.tag == .windows)
                         [_]bool{ true, false, false, true, true, false, false }
                     else
@@ -1026,8 +1081,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (func.blocks.items) |block| {
             for (block.instructions.items) |ci| {
                 switch (ci.op) {
-                    .call, .call_indirect => {
+                    .call, .call_indirect, .memory_grow => {
                         // Calls clobber caller-saved allocatable regs.
+                        // memory.grow is compiled as a host call, same ABI, so it
+                        // clobbers the same set of caller-saved registers.
                         // alloc_regs = [rdx(2), rsi(6), rdi(7), r8(8), r9(9), r12(12), r13(13)]
                         // On Win64: rdx, r8, r9 are volatile (indices 0, 3, 4); rsi/rdi/r12/r13 callee-saved.
                         // On SysV: rdx, rsi, rdi, r8, r9 are volatile; r12, r13 callee-saved.
@@ -1260,6 +1317,103 @@ fn useVReg(
             try code.movRegMem(scratch, .rbp, offset);
             return scratch;
         },
+    }
+}
+
+/// Emit parallel move of wasm call args into Win64/SysV param_regs[1..].
+/// `args[i]` is placed in `param_regs[i + 1]`. Handles arbitrary source/dest
+/// reg overlaps (including cycles) by:
+///   1. For each arg, find its current location (a phys reg or a spill slot).
+///   2. Emit reg→reg moves in topological order; break cycles via .r10.
+///   3. Load spill-slot args directly into their final param reg.
+/// `.r10` is used as scratch — it is never an allocatable register nor a
+/// param reg, so using it here is always safe.
+fn emitCallRegArgMoves(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    args: []const ir.VReg,
+    max_reg_args: u32,
+) !void {
+    const ArgInfo = struct {
+        source: emit.Reg,
+        is_stack: bool,
+        stack_offset: i32,
+        target: emit.Reg,
+    };
+    var infos: [6]ArgInfo = undefined;
+    var i: u32 = 0;
+    while (i < max_reg_args) : (i += 1) {
+        const target = param_regs[i + 1];
+        if (alloc_result.get(args[i])) |a| switch (a) {
+            .reg => |preg| infos[i] = .{
+                .source = @enumFromInt(preg),
+                .is_stack = false,
+                .stack_offset = 0,
+                .target = target,
+            },
+            .stack => |off| infos[i] = .{
+                .source = target,
+                .is_stack = true,
+                .stack_offset = off,
+                .target = target,
+            },
+        } else {
+            infos[i] = .{ .source = target, .is_stack = false, .stack_offset = 0, .target = target };
+        }
+    }
+
+    // Phase 1: reg→reg parallel move (topological; cycles broken via .r10).
+    var pending: [6]bool = .{ false, false, false, false, false, false };
+    i = 0;
+    while (i < max_reg_args) : (i += 1) {
+        if (!infos[i].is_stack and infos[i].source != infos[i].target) pending[i] = true;
+    }
+    while (true) {
+        var progress = false;
+        var k: u32 = 0;
+        while (k < max_reg_args) : (k += 1) {
+            if (!pending[k]) continue;
+            var blocked = false;
+            var m: u32 = 0;
+            while (m < max_reg_args) : (m += 1) {
+                if (m == k or !pending[m]) continue;
+                if (infos[m].source == infos[k].target) {
+                    blocked = true;
+                    break;
+                }
+            }
+            if (!blocked) {
+                try code.movRegReg(infos[k].target, infos[k].source);
+                pending[k] = false;
+                progress = true;
+            }
+        }
+        var any = false;
+        var p: u32 = 0;
+        while (p < max_reg_args) : (p += 1) if (pending[p]) {
+            any = true;
+            break;
+        };
+        if (!any) break;
+        if (!progress) {
+            // Break a cycle: save one source to .r10 and remap references.
+            var first: u32 = 0;
+            while (first < max_reg_args) : (first += 1) if (pending[first]) break;
+            try code.movRegReg(.r10, infos[first].source);
+            const old = infos[first].source;
+            var u: u32 = 0;
+            while (u < max_reg_args) : (u += 1) {
+                if (pending[u] and infos[u].source == old) infos[u].source = .r10;
+            }
+        }
+    }
+
+    // Phase 2: load spill-slot args directly into their target param reg.
+    i = 0;
+    while (i < max_reg_args) : (i += 1) {
+        if (infos[i].is_stack) {
+            try code.movRegMem(infos[i].target, .rbp, infos[i].stack_offset);
+        }
     }
 }
 
@@ -1600,11 +1754,7 @@ fn compileInstRA(
                     const arg_reg = try useVReg(code, alloc_result, cl.args[max_reg_args + j], .r10);
                     try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
                 }
-                var i: u32 = 0;
-                while (i < max_reg_args) : (i += 1) {
-                    const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
-                    if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
-                }
+                try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
                 try code.callReg(.rax);
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
             } else {
@@ -1612,16 +1762,12 @@ fn compileInstRA(
                 try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
 
                 if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
-                var j: u32 = 0;
-                while (j < extra) : (j += 1) {
-                    const arg_reg = try useVReg(code, alloc_result, cl.args[max_reg_args + j], .r10);
-                    try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
+                var j2: u32 = 0;
+                while (j2 < extra) : (j2 += 1) {
+                    const arg_reg = try useVReg(code, alloc_result, cl.args[max_reg_args + j2], .r10);
+                    try code.movMemReg(.rsp, @intCast(shadow + j2 * 8), arg_reg);
                 }
-                var i: u32 = 0;
-                while (i < max_reg_args) : (i += 1) {
-                    const arg_reg = try useVReg(code, alloc_result, cl.args[i], .r10);
-                    if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
-                }
+                try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
                 try code.emitByte(0xE8);
                 const patch_off = code.len();
                 try code.emitI32(0);
@@ -1675,11 +1821,7 @@ fn compileInstRA(
                 const arg_reg = try useVReg(code, alloc_result, ci.args[max_reg_args + j], .r10);
                 try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
             }
-            var i: u32 = 0;
-            while (i < max_reg_args) : (i += 1) {
-                const arg_reg = try useVReg(code, alloc_result, ci.args[i], .r10);
-                if (arg_reg != param_regs[i + 1]) try code.movRegReg(param_regs[i + 1], arg_reg);
-            }
+            try emitCallRegArgMoves(code, alloc_result, ci.args, max_reg_args);
             try code.callReg(.r11);
             if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
 
@@ -1691,12 +1833,16 @@ fn compileInstRA(
         // ── Memory ────────────────────────────────────────────────────
         .load => |ld| {
             const dest = inst.dest orelse return;
-            // Load memory base from VMContext frame slot, add wasm offset
+            // Load memory base from VMContext frame slot, add wasm offset.
+            // Bounds check is inserted between vmctx load and mem_base load so
+            // the check can read VmCtx.memory_size while r10 still holds the
+            // VmCtx pointer.
             try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
+            try emitMemBoundsCheck(code, @as(u64, ld.offset) + @as(u64, ld.size));
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             // Load value into dest register (address is in rax); fold offset into disp.
             const dr = destReg(alloc_result, dest);
@@ -1720,12 +1866,16 @@ fn compileInstRA(
         },
         .store => |st| {
             // Load memory base from VMContext frame slot into r10.
+            // Bounds check is inserted between vmctx load and mem_base load so
+            // the check can read VmCtx.memory_size while r10 still holds the
+            // VmCtx pointer.
             try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             // Compute final address in rax (not allocatable — safe to clobber).
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
+            try emitMemBoundsCheck(code, @as(u64, st.offset) + @as(u64, st.size));
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             // Load value into rcx (not allocatable — safe to clobber).
             // useVReg writes spill loads into scratch=.rcx, so rax is preserved.
@@ -1777,29 +1927,27 @@ fn compileInstRA(
         },
         .memory_grow => |pages_vreg| {
             const dest = inst.dest orelse return;
-            // Load requested pages into rcx
-            const pages_reg = try useVReg(code, alloc_result, pages_vreg, .rcx);
-            if (pages_reg != .rcx) try code.movRegReg(.rcx, pages_reg);
-            try code.zeroExtend32(.rcx);
+            // Call the host grow helper via vmctx.mem_grow_fn(vmctx, delta_pages).
+            // Win64 ABI: RCX=vmctx, RDX=delta_pages, shadow space = 32 bytes.
+            // The regalloc treats this op as a call (see clobber point collection),
+            // so no caller-saved vregs are live across this instruction.
+            const pages_reg = try useVReg(code, alloc_result, pages_vreg, .rdx);
+            if (pages_reg != .rdx) try code.movRegReg(.rdx, pages_reg);
+            try code.zeroExtend32(.rdx);
 
-            // Load VmCtx and current pages
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
-            try code.movRegMemNoRex(.rax, .r10, vmctx_mem_pages_field); // old_pages
-            try code.movRegReg(.r11, .rax); // save old_pages in r11
+            // Load vmctx into rcx.
+            try code.movRegMem(.rcx, .rbp, vmctx_offset);
+            // Load grow helper pointer into rax.
+            try code.movRegMem(.rax, .rcx, vmctx_mem_grow_fn_field);
 
-            // new_pages = old_pages + requested
-            try code.addRegReg(.rax, .rcx); // rax = new_pages
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
 
-            // Update VmCtx.memory_pages = new_pages (always succeed, memory is pre-allocated)
-            try code.movMemRegNoRex(.r10, vmctx_mem_pages_field, .rax);
-
-            // Update VmCtx.memory_size = new_pages * 65536
-            try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x10 }); // shl rax, 16
-            try code.movMemReg(.r10, vmctx_memsize_field, .rax);
-
-            // Return old_pages
-            try code.movRegReg(.rax, .r11);
-
+            // Helper returns i32 (old pages or -1); sign-extend not needed since
+            // writeDefTyped honors inst.type and consumers use 32-bit semantics.
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
@@ -3465,4 +3613,226 @@ test "compileFunctionRA: caller passes >3 args via stack on Win64" {
     // sub rsp, imm32 (48 81 EC ??) or sub rsp, imm8 (48 83 EC ??) in caller.
     // Just assert the caller compiled successfully with nonzero size.
     try std.testing.expect(result.code.len > 32);
+}
+
+// ── Parallel-copy correctness for call arg materialization (regression tests) ──
+//
+// These tests exercise `emitCallRegArgMoves` directly. The bug fixed here was:
+// a naive left-to-right `mov param_regs[i+1], src(arg[i])` sequence clobbered
+// `arg[j]` (j > i) when `src(arg[j]) == param_regs[i+1]`. Observed in coremark
+// at the malloc→alloc call: `mov rdx, rdi` (arg0) clobbered arg1's value (4,
+// previously placed in rdx by the allocator), yielding `alloc(size+16,
+// size+16)` instead of `alloc(size+16, 4)`.
+
+fn makeAllocResult(allocator: std.mem.Allocator, mapping: []const struct { vreg: ir.VReg, reg: regalloc.PhysReg }) !regalloc.AllocResult {
+    var map = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator);
+    for (mapping) |m| try map.put(m.vreg, .{ .reg = m.reg });
+    return .{ .assignments = map, .spill_count = 0 };
+}
+
+test "emitCallRegArgMoves: resolves arg[0]→rdx / arg[1]→r8 when arg[1] source is rdx" {
+    // Scenario from coremark malloc→alloc: RA placed arg[1] in rdx
+    // (param_regs[1], = arg[0]'s target). Naive sequential copy would
+    // `mov rdx, rdi` (arg0) first, clobbering the 4 in rdx, then `mov r8, rdx`
+    // would pick up the clobbered value. The fixed emitter must move arg[1]
+    // (src=rdx → r8) BEFORE arg[0] (src=rdi → rdx).
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var alloc_result = try makeAllocResult(allocator, &.{
+        .{ .vreg = 0, .reg = 7 }, // arg[0] in rdi
+        .{ .vreg = 1, .reg = 2 }, // arg[1] in rdx
+    });
+    defer alloc_result.deinit();
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    const args = [_]ir.VReg{ 0, 1 };
+    try emitCallRegArgMoves(&code, &alloc_result, &args, 2);
+    const bytes = code.bytes.items;
+
+    // Correct emission: `mov r8, rdx` (49 89 D0) must precede `mov rdx, rdi`
+    // (48 89 FA) so that arg[1]'s value is saved before arg[0]'s move
+    // overwrites rdx.
+    const mov_r8_rdx = [_]u8{ 0x49, 0x89, 0xD0 };
+    const mov_rdx_rdi = [_]u8{ 0x48, 0x89, 0xFA };
+    const idx_r8 = std.mem.indexOf(u8, bytes, &mov_r8_rdx) orelse return error.TestExpectedMovR8RdxEmitted;
+    const idx_rdx = std.mem.indexOf(u8, bytes, &mov_rdx_rdi) orelse return error.TestExpectedMovRdxRdiEmitted;
+    try std.testing.expect(idx_r8 < idx_rdx);
+}
+
+test "emitCallRegArgMoves: identity moves are elided" {
+    // When every arg[i] is already in param_regs[i+1], no moves should be emitted.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var alloc_result = try makeAllocResult(allocator, &.{
+        .{ .vreg = 0, .reg = 2 }, // arg[0] already in rdx = param_regs[1]
+        .{ .vreg = 1, .reg = 8 }, // arg[1] already in r8  = param_regs[2]
+        .{ .vreg = 2, .reg = 9 }, // arg[2] already in r9  = param_regs[3]
+    });
+    defer alloc_result.deinit();
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    const args = [_]ir.VReg{ 0, 1, 2 };
+    try emitCallRegArgMoves(&code, &alloc_result, &args, 3);
+    try std.testing.expectEqual(@as(usize, 0), code.bytes.items.len);
+}
+
+test "emitCallRegArgMoves: breaks 2-cycle via r10 scratch" {
+    // Cycle: arg[0] src=r8 → rdx; arg[1] src=rdx → r8. No topological order
+    // exists; the fix must save one source into r10, then finish the copy.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var alloc_result = try makeAllocResult(allocator, &.{
+        .{ .vreg = 0, .reg = 8 }, // arg[0] in r8  (= arg[1]'s target)
+        .{ .vreg = 1, .reg = 2 }, // arg[1] in rdx (= arg[0]'s target)
+    });
+    defer alloc_result.deinit();
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    const args = [_]ir.VReg{ 0, 1 };
+    try emitCallRegArgMoves(&code, &alloc_result, &args, 2);
+    const bytes = code.bytes.items;
+
+    // Must emit three moves: save one source to r10, then two final moves.
+    // Our algorithm picks the first pending (arg[0], src=r8) as the breaker:
+    //   mov r10, r8   (4D 89 C2)
+    //   mov r8, rdx   (49 89 D0)   ← arg[1]: src=rdx, dst=r8
+    //   mov rdx, r10  (4C 89 D2)   ← arg[0]: src=r10 (was r8), dst=rdx
+    // Whatever the chosen breaker, *some* move into r10 must appear, and the
+    // final register state (rdx := old_r8, r8 := old_rdx) must be achievable.
+    const mov_r10_r8 = [_]u8{ 0x4D, 0x89, 0xC2 }; // r10 <- r8
+    const mov_r10_rdx = [_]u8{ 0x49, 0x89, 0xD2 }; // r10 <- rdx
+    const has_breaker =
+        std.mem.indexOf(u8, bytes, &mov_r10_r8) != null or
+        std.mem.indexOf(u8, bytes, &mov_r10_rdx) != null;
+    try std.testing.expect(has_breaker);
+    // And the buggy naive sequence `mov rdx, r8; mov r8, rdx` must NOT appear
+    // back-to-back (that would clobber r8 before reading it).
+    const mov_rdx_r8 = [_]u8{ 0x4C, 0x89, 0xC2 }; // rdx <- r8
+    const mov_r8_rdx = [_]u8{ 0x49, 0x89, 0xD0 }; // r8  <- rdx
+    const idx_rdx_r8 = std.mem.indexOf(u8, bytes, &mov_rdx_r8);
+    const idx_r8_rdx = std.mem.indexOf(u8, bytes, &mov_r8_rdx);
+    if (idx_rdx_r8) |a| if (idx_r8_rdx) |b| {
+        // If both appear, `mov rdx, r8` must NOT be immediately before
+        // `mov r8, rdx` (which would be the buggy clobbering sequence).
+        try std.testing.expect(!(a + 3 == b));
+    };
+}
+
+test "emitCallRegArgMoves: regression — arg[0]=rdi, arg[1]=rdx, arg[2]=rcx (coremark malloc→alloc)" {
+    // Exact shape observed in the bug: caller emits arg[0] from rdi,
+    // arg[1] from rdx, and vmctx is already in rcx (we don't include vmctx
+    // in the reg-arg move set — the call emitter handles vmctx separately).
+    // This regression test asserts the fix does not re-introduce the
+    // clobber pattern `mov rdx, rdi` followed by `mov r8, rdx`.
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var alloc_result = try makeAllocResult(allocator, &.{
+        .{ .vreg = 0, .reg = 7 }, // arg[0] in rdi
+        .{ .vreg = 1, .reg = 2 }, // arg[1] in rdx (the bug case)
+    });
+    defer alloc_result.deinit();
+
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    const args = [_]ir.VReg{ 0, 1 };
+    try emitCallRegArgMoves(&code, &alloc_result, &args, 2);
+    const bytes = code.bytes.items;
+
+    // Assert the buggy adjacency (`48 89 FA` then `49 89 D0`) is absent.
+    const mov_rdx_rdi = [_]u8{ 0x48, 0x89, 0xFA };
+    if (std.mem.indexOf(u8, bytes, &mov_rdx_rdi)) |a| {
+        const mov_r8_rdx = [_]u8{ 0x49, 0x89, 0xD0 };
+        if (std.mem.indexOf(u8, bytes, &mov_r8_rdx)) |b| {
+            // The buggy pre-fix emitter produced `mov rdx, rdi; mov r8, rdx`
+            // (clobbering). The fixed emitter produces `mov r8, rdx; mov rdx, rdi`.
+            try std.testing.expect(b < a);
+        }
+    }
+}
+
+
+
+test "compileFunctionRA: i32.load emits inline memory bounds check" {
+    // A wasm memory load must emit an inline bounds check before reading,
+    // so out-of-bounds access traps cleanly via vmctx.trap_oob_fn() rather
+    // than SIGSEGVing on unmapped host memory.
+    //
+    // The fixed bounds-check sequence we expect to see (before the load):
+    //   lea r11, [rax + (offset + size)]     ; 4C 8D 98 <disp32>
+    //   cmp r11, [r10 + memsize_field=8]     ; 4D 3B 5A 08
+    //   jbe  +12                             ; 76 0C
+    //   mov  param_regs[0], r10              ; 4C 89 D1 (Win64) / 4C 89 D7 (SysV)
+    //   mov  rax, [param_regs[0] + trap_fn=80] ; 48 8B 81 50 00 00 00 (Win64)
+    //   call rax                             ; FF D0
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    // i32.load16_u at offset=0, size=2 → end_offset = 2.
+    try block.append(.{ .op = .{ .load = .{ .base = v0, .offset = 0, .size = 2, .sign_extend = false } }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // lea r11, [rax + 2] → 4C 8D 98 02 00 00 00
+    try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8D, 0x98, 0x02, 0x00, 0x00, 0x00 }));
+    // cmp r11, [r10 + 8]   → 4D 3B 5A 08
+    try std.testing.expect(containsBytes(code, &.{ 0x4D, 0x3B, 0x5A, 0x08 }));
+    // jbe +12              → 76 0C
+    try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
+    // call qword ptr [vmctx + 80] is encoded as a two-step load+callReg.
+    // mov rax, [p0 + 80] fragment `48 8B ?? 50 00 00 00` + call rax (FF D0).
+    // Verify `call rax` is present (FF D0).
+    try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
+}
+
+test "compileFunctionRA: i32.store emits inline memory bounds check" {
+    // Symmetric to the load case: stores must also bounds-check before
+    // dereferencing. Verify the same lea/cmp/jbe trap dispatch pattern.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v1, .type = .i32 });
+    // i32.store at offset=0, size=4 → end_offset = 4.
+    try block.append(.{ .op = .{ .store = .{ .base = v0, .val = v1, .offset = 0, .size = 4 } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // lea r11, [rax + 4] → 4C 8D 98 04 00 00 00
+    try std.testing.expect(containsBytes(code, &.{ 0x4C, 0x8D, 0x98, 0x04, 0x00, 0x00, 0x00 }));
+    // cmp r11, [r10 + 8]
+    try std.testing.expect(containsBytes(code, &.{ 0x4D, 0x3B, 0x5A, 0x08 }));
+    // jbe +12
+    try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
+    // call rax (trap dispatch)
+    try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
 }
