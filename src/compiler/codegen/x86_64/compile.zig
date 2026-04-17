@@ -49,6 +49,35 @@ const vmctx_mem_grow_fn_field: i32 = 64; // VmCtx.mem_grow_fn offset (usize)
 const vmctx_instance_ptr_field: i32 = 72; // VmCtx.instance_ptr offset (usize)
 const vmctx_trap_oob_fn_field: i32 = 80; // VmCtx.trap_oob_fn offset (usize)
 
+/// Emit the compare-and-trap tail of a bounds check.
+///
+/// Assumes the end-of-access address has just been materialized in `r11`
+/// and `r10` still holds the `VmCtx*` pointer. Emits:
+///   cmp r11, [r10 + memsize_field]
+///   jbe over_trap
+///   mov param_regs[0], r10
+///   mov rax, [param_regs[0] + trap_oob_fn_field]
+///   call rax                 ; noreturn
+/// The `jbe` rel8 is hard-coded to skip 12 bytes — the fixed size of the
+/// trap block below (3 + 7 + 2).
+fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
+    // cmp r11, qword ptr [r10 + memsize_field]
+    //   REX.W|R|B=4D, opcode 0x3B, modrm=01_011_010 (mod=disp8, reg=r11 low=3,
+    //   rm=r10 low=2), disp8=memsize_field.
+    try code.emitSlice(&.{ 0x4D, 0x3B, 0x5A, @as(u8, @intCast(vmctx_memsize_field)) });
+    // jbe over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
+    try code.emitByte(0x76);
+    try code.emitByte(12);
+    // Trap block:
+    //   mov param_regs[0], r10            ; arg0 = vmctx (already in r10)
+    //   mov rax, [param_regs[0] + trap_oob_fn_field]
+    //   call rax                          ; noreturn
+    try code.movRegReg(param_regs[0], .r10);
+    try code.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
+    try code.callReg(.rax);
+    // over_trap:
+}
+
 /// Emit an inline wasm-memory bounds check.
 ///
 /// Preconditions:
@@ -84,21 +113,30 @@ fn emitMemBoundsCheck(code: *emit.CodeBuffer, end_offset: u64) !void {
         // add r11, rax  (REX.W|B + 0x01 + modrm 11_000_011)
         try code.emitSlice(&.{ 0x49, 0x01, 0xC3 });
     }
-    // cmp r11, qword ptr [r10 + memsize_field]
-    //   REX.W|R|B=4D, opcode 0x3B, modrm=01_011_010 (mod=disp8, reg=r11 low=3,
-    //   rm=r10 low=2), disp8=memsize_field.
-    try code.emitSlice(&.{ 0x4D, 0x3B, 0x5A, @as(u8, @intCast(vmctx_memsize_field)) });
-    // jbe over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
-    try code.emitByte(0x76);
-    try code.emitByte(12);
-    // Trap block:
-    //   mov param_regs[0], r10            ; arg0 = vmctx (already in r10)
-    //   mov rax, [param_regs[0] + trap_oob_fn_field]
-    //   call rax                          ; noreturn
-    try code.movRegReg(param_regs[0], .r10);
-    try code.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
-    try code.callReg(.rax);
-    // over_trap:
+    try emitOobCmpAndTrap(code);
+}
+
+/// Emit a bounds check for a bulk memory op (memory.copy / memory.fill) where
+/// the length is held in a register, not known at compile time.
+///
+/// Preconditions:
+///   - `rax` holds the wasm base address, already zero-extended to u64.
+///   - `rcx` holds the byte length, already zero-extended to u64.
+///   - `r10` holds the `VmCtx*` pointer.
+///
+/// Effect:
+///   - Computes `end = rax + rcx` in `r11` and traps if
+///     `end > VmCtx.memory_size` by calling the `trap_oob_fn`.
+///   - Per the wasm spec, `end` cannot overflow u64 because both inputs are
+///     ≤ 2^32 − 1, so `rax + rcx` ≤ 2^33 − 2 < 2^64.
+///   - Preserves `rax`, `rcx`, `r10`. Clobbers `r11` and `param_regs[0]`.
+fn emitMemBoundsCheckDynamic(code: *emit.CodeBuffer) !void {
+    // lea r11, [rax + rcx] — 64-bit, 3 bytes
+    //   REX.W|R = 0x4C, opcode 0x8D,
+    //   modrm=00_011_100 (mod=0, reg=r11 low=3, rm=100 ⇒ SIB),
+    //   SIB=00_001_000 (scale=0, index=rcx=1, base=rax=0)
+    try code.emitSlice(&.{ 0x4C, 0x8D, 0x1C, 0x08 });
+    try emitOobCmpAndTrap(code);
 }
 
 /// Register-caching operand stack. Keeps the top N values in registers,
@@ -1886,31 +1924,55 @@ fn compileInstRA(
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
+            //
+            // Bounds check semantics (wasm spec): trap if either
+            //   src + len > mem_size  OR  dst + len > mem_size.
+            // We materialize len in rcx and each address in rax, call the
+            // dynamic bounds check for src, then again for dst, both while
+            // r10 still holds VmCtx*. Only afterwards do we replace r10
+            // with mem_base and fold it into rsi/rdi for REP MOVSB.
             try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base // memory base
             const len_reg = try useVReg(code, alloc_result, mc.len, .rcx);
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
+            try code.zeroExtend32(.rcx); // wasm lengths are u32
             const src_reg = try useVReg(code, alloc_result, mc.src, .rsi);
             if (src_reg != .rsi) try code.movRegReg(.rsi, src_reg);
             try code.zeroExtend32(.rsi); // wasm addresses are i32
-            try code.addRegReg(.rsi, .r10); // rsi = mem_base + src
             const dst_reg = try useVReg(code, alloc_result, mc.dst, .rdi);
             if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
             try code.zeroExtend32(.rdi); // wasm addresses are i32
+            // Bounds-check src: rax = src, rcx = len.
+            try code.movRegReg(.rax, .rsi);
+            try emitMemBoundsCheckDynamic(code);
+            // Bounds-check dst: rax = dst, rcx = len.
+            try code.movRegReg(.rax, .rdi);
+            try emitMemBoundsCheckDynamic(code);
+            // All checks passed — resolve mem_base and fold into src/dst.
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
+            try code.addRegReg(.rsi, .r10); // rsi = mem_base + src
             try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
             try code.emitSlice(&.{ 0xF3, 0xA4 }); // REP MOVSB
         },
         .memory_fill => |mf| {
             // REP STOSB: rdi=dst, al=val, rcx=len
+            //
+            // Bounds check semantics (wasm spec): trap if dst + len > mem_size.
             try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base // memory base
             const len_reg = try useVReg(code, alloc_result, mf.len, .rcx);
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
+            try code.zeroExtend32(.rcx); // wasm lengths are u32
             const val_reg = try useVReg(code, alloc_result, mf.val, .rax);
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
             const dst_reg = try useVReg(code, alloc_result, mf.dst, .rdi);
             if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
             try code.zeroExtend32(.rdi); // wasm addresses are i32
+            // Bounds-check dst: stash val in r11 while we clobber rax for
+            // the check, then restore it.
+            try code.movRegReg(.r11, .rax); // save fill byte
+            try code.movRegReg(.rax, .rdi);
+            try emitMemBoundsCheckDynamic(code);
+            try code.movRegReg(.rax, .r11); // restore fill byte into rax
+            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
             try code.emitSlice(&.{ 0xF3, 0xAA }); // REP STOSB
         },
