@@ -481,6 +481,16 @@ const CallFn0 = *const fn (*VmCtx) callconv(.c) u64;
 const CallFn1 = *const fn (*VmCtx, u64) callconv(.c) u64;
 const CallFn2 = *const fn (*VmCtx, u64, u64) callconv(.c) u64;
 const CallFn3 = *const fn (*VmCtx, u64, u64, u64) callconv(.c) u64;
+const CallFn4 = *const fn (*VmCtx, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn5 = *const fn (*VmCtx, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn6 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn7 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn8 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn9 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn10 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn11 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const CallFn12 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
+const MaxScalarArgs: usize = 12;
 
 fn isScalarValType(t: types.ValType) bool {
     return switch (t) {
@@ -526,7 +536,7 @@ pub fn callFuncScalar(
     comptime if (!can_execute_native) @compileError("AOT execution not supported on this architecture");
 
     if (param_types.len != args.len) return error.ArgCountMismatch;
-    if (param_types.len > 3) return error.UnsupportedSignature;
+    if (param_types.len > MaxScalarArgs) return error.UnsupportedSignature;
     for (param_types) |pt| {
         if (!isScalarValType(pt)) return error.UnsupportedSignature;
     }
@@ -565,7 +575,7 @@ pub fn callFuncScalar(
     vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
 
     // Marshal args to raw 64-bit bit patterns.
-    var raw: [3]u64 = .{ 0, 0, 0 };
+    var raw: [MaxScalarArgs]u64 = [_]u64{0} ** MaxScalarArgs;
     for (args, param_types, 0..) |v, pt, i| {
         raw[i] = try valueToRawBits(pt, v);
     }
@@ -597,6 +607,42 @@ pub fn callFuncScalar(
         3 => blk: {
             const f: CallFn3 = @ptrCast(@alignCast(addr));
             break :blk f(&vmctx, raw[0], raw[1], raw[2]);
+        },
+        4 => blk: {
+            const f: CallFn4 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3]);
+        },
+        5 => blk: {
+            const f: CallFn5 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4]);
+        },
+        6 => blk: {
+            const f: CallFn6 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
+        },
+        7 => blk: {
+            const f: CallFn7 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
+        },
+        8 => blk: {
+            const f: CallFn8 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7]);
+        },
+        9 => blk: {
+            const f: CallFn9 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8]);
+        },
+        10 => blk: {
+            const f: CallFn10 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9]);
+        },
+        11 => blk: {
+            const f: CallFn11 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10]);
+        },
+        12 => blk: {
+            const f: CallFn12 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8], raw[9], raw[10], raw[11]);
         },
         else => unreachable,
     };

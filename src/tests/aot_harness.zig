@@ -64,9 +64,15 @@ pub const Harness = struct {
 
         const a = arena.allocator();
 
-        const wasm_module = loader_mod.load(wasm_bytes, a) catch return error.CompileFailed;
+        const wasm_module = loader_mod.load(wasm_bytes, a) catch |err| {
+            std.debug.print("aot_harness: loader failed: {}\n", .{err});
+            return error.CompileFailed;
+        };
 
-        const aot_bin = compileToAot(allocator, arena, &wasm_module) catch return error.CompileFailed;
+        const aot_bin = compileToAot(allocator, arena, &wasm_module) catch |err| {
+            std.debug.print("aot_harness: compile failed: {}\n", .{err});
+            return error.CompileFailed;
+        };
         errdefer allocator.free(aot_bin);
 
         const aot_module = aot_loader.load(aot_bin, allocator) catch return error.LoadFailed;
