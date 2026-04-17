@@ -766,13 +766,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .i64_ge_u => .{ .ge_u = bin },
                     else => unreachable,
                 };
-                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
             .i64_eqz => {
                 const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i32 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
             .i64_clz, .i64_ctz, .i64_popcnt => {
