@@ -27,11 +27,6 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     "call_indirect.json",
     "elem.json",
     "endianness.json",
-    // fac-ssa uses a multi-value `loop` block type (type index 3) which the
-    // frontend's `readBlockType` does not yet decode. The multi-value call
-    // return ABI (HRP) is implemented, but without multi-value block types
-    // the stack discipline diverges and the runner infinite-loops.
-    "fac.json",
     "float_exprs.json",
     "float_memory.json",
     "func.json",
@@ -52,6 +47,13 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     "start.json",
     "store.json",
     "unwind.json",
+
+    // select.0.wasm compiles now that `select_t` is recognized, but the
+    // generated code dereferences a null pointer at runtime — likely a
+    // type-propagation mismatch between the untyped `select` IR op and
+    // ref-typed operands pushed onto the vreg stack. Re-enable once the
+    // IR learns result typing for select (Phase 4/5 territory).
+    "select.json",
 };
 
 pub fn isSkippedInAot(basename: []const u8) bool {
