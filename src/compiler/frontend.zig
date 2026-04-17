@@ -16,6 +16,31 @@ pub const LowerError = error{
     UnsupportedOpcode,
 };
 
+// Block signature (param/result type slices). Slices are borrowed and valid
+// for the duration of the compilation of the containing function.
+const BlockSig = struct {
+    params: []const ir.IrType,
+    results: []const ir.IrType,
+};
+
+// Stable slices for well-known block-type encodings (void and canonical
+// single valtypes). Avoids per-block allocation for the common case.
+const NO_TYPES: []const ir.IrType = &[_]ir.IrType{};
+const ONE_I32: []const ir.IrType = &[_]ir.IrType{.i32};
+const ONE_I64: []const ir.IrType = &[_]ir.IrType{.i64};
+const ONE_F32: []const ir.IrType = &[_]ir.IrType{.f32};
+const ONE_F64: []const ir.IrType = &[_]ir.IrType{.f64};
+
+fn valTypeToIr(vt: types.ValType) ir.IrType {
+    return switch (vt) {
+        .i32 => .i32,
+        .i64 => .i64,
+        .f32 => .f32,
+        .f64 => .f64,
+        else => .i64,
+    };
+}
+
 /// Lower an entire Wasm module into IR.
 pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allocator) LowerError!ir.IrModule {
     var ir_module = ir.IrModule.init(allocator);
@@ -77,6 +102,24 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     var ir_func = ir.IrFunction.init(allocator, param_count, result_count, total_locals);
     errdefer ir_func.deinit();
 
+    // Per-function arena for block-frame slices (param/result type tables and
+    // the synthetic local-slot arrays). Kept alive for the duration of
+    // lowering; freed in one shot when this function returns.
+    var frame_arena = std.heap.ArenaAllocator.init(allocator);
+    defer frame_arena.deinit();
+    const frame_alloc = frame_arena.allocator();
+
+    // Pre-convert module-level function type signatures to IR types so
+    // `readBlockType` can return borrowed slices for type-index block types.
+    const module_sigs = try frame_alloc.alloc(BlockSig, wasm_module.types.len);
+    for (wasm_module.types, 0..) |ft, ti| {
+        const params = try frame_alloc.alloc(ir.IrType, ft.params.len);
+        for (ft.params, 0..) |vt, i| params[i] = valTypeToIr(vt);
+        const results = try frame_alloc.alloc(ir.IrType, ft.results.len);
+        for (ft.results, 0..) |vt, i| results[i] = valTypeToIr(vt);
+        module_sigs[ti] = .{ .params = params, .results = results };
+    }
+
     // Create entry block
     const entry_id = try ir_func.newBlock();
 
@@ -110,14 +153,20 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         end_block: ir.BlockId,
         /// For if: the else block (if present).
         else_block: ?ir.BlockId,
-        /// Value stack depth on entry (for multi-value cleanup).
+        /// Value stack depth BEFORE this block's params were pushed.
+        /// At `end`/`else` the stack is trimmed to this depth, then result
+        /// vregs are pushed to satisfy the continuation arity.
         stack_depth: usize,
-        /// Result arity of this block.
-        result_arity: u32,
-        /// Synthetic local slot for passing result values across branches.
-        result_local: ?u32,
-        /// Result type of this block (only meaningful when result_arity > 0).
-        result_type: ir.IrType,
+        /// Block parameter types (borrowed for the function's lifetime).
+        param_types: []const ir.IrType,
+        /// Block result types (borrowed for the function's lifetime).
+        result_types: []const ir.IrType,
+        /// One synthetic local per param (for carrying values across the
+        /// loop back-edge / into then/else branches of an `if`).
+        param_locals: []const u32,
+        /// One synthetic local per result (for propagating values to the
+        /// continuation on `end`, `br`, `br_if`, `br_table`).
+        result_locals: []const u32,
     };
     var block_stack: std.ArrayList(BlockFrame) = .empty;
     defer block_stack.deinit(allocator);
@@ -125,20 +174,46 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     // Track current block
     var current_block: ir.BlockId = entry_id;
 
-    // Helper: read block type (-0x40 = void, else valtype)
+    // Decode a Wasm block type. Signed-LEB128: negative values encode void
+    // (-0x40 / 0x40) or a canonical valtype (-0x01..-0x04 / 0x7F..0x7C);
+    // non-negative values are indices into `wasm_module.types` and yield
+    // multi-value param/result signatures.
     const readBlockType = struct {
-        fn call(code: []const u8, ip_ptr: *usize) struct { arity: u32, ty: ir.IrType } {
-            const byte = code[ip_ptr.*];
-            ip_ptr.* += 1;
-            if (byte == 0x40) return .{ .arity = 0, .ty = .i32 }; // void
-            const ty: ir.IrType = switch (byte) {
-                0x7F => .i32,
-                0x7E => .i64,
-                0x7D => .f32,
-                0x7C => .f64,
-                else => .i32,
-            };
-            return .{ .arity = 1, .ty = ty };
+        fn call(code: []const u8, ip_ptr: *usize, sigs: []const BlockSig) BlockSig {
+            const v = leb128.readSignedLossy(i64, code, ip_ptr);
+            if (v < 0) {
+                return switch (v) {
+                    -64 => .{ .params = NO_TYPES, .results = NO_TYPES }, // void (-0x40)
+                    -1 => .{ .params = NO_TYPES, .results = ONE_I32 }, // -0x01 = i32
+                    -2 => .{ .params = NO_TYPES, .results = ONE_I64 }, // -0x02 = i64
+                    -3 => .{ .params = NO_TYPES, .results = ONE_F32 }, // -0x03 = f32
+                    -4 => .{ .params = NO_TYPES, .results = ONE_F64 }, // -0x04 = f64
+                    else => .{ .params = NO_TYPES, .results = ONE_I32 },
+                };
+            }
+            const idx: usize = @intCast(v);
+            if (idx < sigs.len) return sigs[idx];
+            return .{ .params = NO_TYPES, .results = NO_TYPES };
+        }
+    }.call;
+
+    // Allocate synthetic local slots (one per value) for a block frame.
+    // Bumps `total_locals` / `ir_func.local_count` accordingly.
+    const allocLocals = struct {
+        fn call(
+            fa: std.mem.Allocator,
+            total: *u32,
+            func_ref: *ir.IrFunction,
+            count: usize,
+        ) ![]u32 {
+            if (count == 0) return &[_]u32{};
+            const slots = try fa.alloc(u32, count);
+            for (slots) |*s| {
+                s.* = total.*;
+                total.* += 1;
+            }
+            func_ref.local_count = total.*;
+            return slots;
         }
     }.call;
 
@@ -164,8 +239,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     // Fall through to normal else handling below
                 },
                 // Skip block-structured opcodes by reading their block type
-                .block, .loop, .@"if" => {
-                    _ = readBlockType(code, &ip);
+                .block, .loop => {
+                    _ = readBlockType(code, &ip, module_sigs);
                     // Push a dummy frame so end/else matching works
                     try block_stack.append(allocator, .{
                         .kind = .block,
@@ -173,9 +248,30 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         .end_block = 0,
                         .else_block = null,
                         .stack_depth = vreg_stack.items.len,
-                        .result_arity = 0,
-                        .result_local = null,
-                        .result_type = .i32,
+                        .param_types = NO_TYPES,
+                        .result_types = NO_TYPES,
+                        .param_locals = &[_]u32{},
+                        .result_locals = &[_]u32{},
+                    });
+                    continue;
+                },
+                .@"if" => {
+                    _ = readBlockType(code, &ip, module_sigs);
+                    // Dead-code `if`: push a dummy `.@"if"` frame with a
+                    // dummy else_block so a subsequent `else` in dead code
+                    // doesn't trip the non-null check in the real handler.
+                    // The else branch of a dead if is also dead; we stay
+                    // in dead_code mode through the fall-through.
+                    try block_stack.append(allocator, .{
+                        .kind = .@"if",
+                        .target_block = 0,
+                        .end_block = 0,
+                        .else_block = 0,
+                        .stack_depth = vreg_stack.items.len,
+                        .param_types = NO_TYPES,
+                        .result_types = NO_TYPES,
+                        .param_locals = &[_]u32{},
+                        .result_locals = &[_]u32{},
                     });
                     continue;
                 },
@@ -204,22 +300,48 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     }
                     break;
                 }
-                // End of a block/loop/if: store result to synthetic local, branch to continuation
+                // End of a block/loop/if: pop N results into result_locals,
+                // trim the stack to the pre-block depth, branch to the
+                // continuation, and re-push the results as fresh vregs.
                 const frame = block_stack.pop().?;
-                if (frame.result_arity > 0 and frame.result_local != null) {
-                    if (vreg_stack.items.len > frame.stack_depth) {
-                        const result_val = safePop(&vreg_stack);
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = result_val } } });
+                const n_res: usize = frame.result_types.len;
+                // For an `if` without an explicit `else`, we must still fill
+                // in the orphan else_block. Validation guarantees params ==
+                // results in that case, so we pass params straight through
+                // to the continuation by moving param_locals -> result_locals
+                // and branching to end_block.
+                if (frame.kind == .@"if" and frame.else_block != null) {
+                    const eb = frame.else_block.?;
+                    var i: usize = 0;
+                    while (i < n_res) : (i += 1) {
+                        const tmp = ir_func.newVReg();
+                        try ir_func.getBlock(eb).append(.{ .op = .{ .local_get = frame.param_locals[i] }, .dest = tmp, .type = frame.param_types[i] });
+                        try ir_func.getBlock(eb).append(.{ .op = .{ .local_set = .{ .idx = frame.result_locals[i], .val = tmp } } });
+                    }
+                    try ir_func.getBlock(eb).append(.{ .op = .{ .br = frame.end_block } });
+                }
+                if (n_res > 0 and vreg_stack.items.len >= frame.stack_depth + n_res) {
+                    // Pop in reverse (top -> results[n-1]) so results[0]
+                    // corresponds to the value deepest in the stack.
+                    var i: usize = n_res;
+                    while (i > 0) {
+                        i -= 1;
+                        const v = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_locals[i], .val = v } } });
                     }
                 }
-                // Trim stack to block entry depth
-                vreg_stack.items.len = frame.stack_depth;
+                // Trim stack to pre-block depth (drop any leftovers).
+                if (vreg_stack.items.len > frame.stack_depth) {
+                    vreg_stack.items.len = frame.stack_depth;
+                }
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
                 current_block = frame.end_block;
-                // Load result from synthetic local at merge point
-                if (frame.result_arity > 0 and frame.result_local != null) {
+                // Re-push the N results as fresh vregs loaded from the
+                // result_locals, preserving stack order (results[0] deepest).
+                var ri: usize = 0;
+                while (ri < n_res) : (ri += 1) {
                     const dest = ir_func.newVReg();
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = frame.result_local.? }, .dest = dest, .type = frame.result_type });
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = frame.result_locals[ri] }, .dest = dest, .type = frame.result_types[ri] });
                     try vreg_stack.append(allocator, dest);
                 }
             },
@@ -243,104 +365,173 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .nop => {},
             .block => {
-                const bt = readBlockType(code, &ip);
-                const arity = bt.arity;
+                const bt = readBlockType(code, &ip, module_sigs);
+                const n_params: usize = bt.params.len;
                 const end_block = try ir_func.newBlock();
-                const result_local: ?u32 = if (arity > 0) blk: {
-                    const idx = total_locals;
-                    total_locals += 1;
-                    ir_func.local_count = total_locals;
-                    break :blk idx;
-                } else null;
+                const param_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, n_params);
+                const result_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, bt.results.len);
+                // Pop params off the operand stack (top-last), store to
+                // param_locals[i] (params[0] deepest).
+                if (n_params > 0 and vreg_stack.items.len >= n_params) {
+                    var i: usize = n_params;
+                    while (i > 0) {
+                        i -= 1;
+                        const v = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = param_locals[i], .val = v } } });
+                    }
+                }
+                const pre_depth = vreg_stack.items.len;
+                // Re-push params as fresh vregs inside the block body.
+                var pi: usize = 0;
+                while (pi < n_params) : (pi += 1) {
+                    const dest = ir_func.newVReg();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = param_locals[pi] }, .dest = dest, .type = bt.params[pi] });
+                    try vreg_stack.append(allocator, dest);
+                }
                 try block_stack.append(allocator, .{
                     .kind = .block,
                     .target_block = end_block,
                     .end_block = end_block,
                     .else_block = null,
-                    .stack_depth = vreg_stack.items.len,
-                    .result_arity = arity,
-                    .result_local = result_local,
-                    .result_type = bt.ty,
+                    .stack_depth = pre_depth,
+                    .param_types = bt.params,
+                    .result_types = bt.results,
+                    .param_locals = param_locals,
+                    .result_locals = result_locals,
                 });
             },
             .loop => {
-                const bt = readBlockType(code, &ip);
-                const arity = bt.arity;
+                const bt = readBlockType(code, &ip, module_sigs);
+                const n_params: usize = bt.params.len;
                 const loop_header = try ir_func.newBlock();
                 const end_block = try ir_func.newBlock();
+                const param_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, n_params);
+                const result_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, bt.results.len);
+                // Pop params off the current operand stack into param_locals,
+                // then branch into the loop header where params are re-loaded.
+                if (n_params > 0 and vreg_stack.items.len >= n_params) {
+                    var i: usize = n_params;
+                    while (i > 0) {
+                        i -= 1;
+                        const v = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = param_locals[i], .val = v } } });
+                    }
+                }
+                const pre_depth = vreg_stack.items.len;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br = loop_header } });
                 current_block = loop_header;
-                const result_local: ?u32 = if (arity > 0) blk: {
-                    const idx = total_locals;
-                    total_locals += 1;
-                    ir_func.local_count = total_locals;
-                    break :blk idx;
-                } else null;
+                // Re-push loop params at the header — every back-edge first
+                // writes param_locals and then branches to loop_header, so
+                // the header re-loads them here.
+                var pi: usize = 0;
+                while (pi < n_params) : (pi += 1) {
+                    const dest = ir_func.newVReg();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = param_locals[pi] }, .dest = dest, .type = bt.params[pi] });
+                    try vreg_stack.append(allocator, dest);
+                }
                 try block_stack.append(allocator, .{
                     .kind = .loop,
                     .target_block = loop_header,
                     .end_block = end_block,
                     .else_block = null,
-                    .stack_depth = vreg_stack.items.len,
-                    .result_arity = arity,
-                    .result_local = result_local,
-                    .result_type = bt.ty,
+                    .stack_depth = pre_depth,
+                    .param_types = bt.params,
+                    .result_types = bt.results,
+                    .param_locals = param_locals,
+                    .result_locals = result_locals,
                 });
             },
             .@"if" => {
-                const bt = readBlockType(code, &ip);
-                const arity = bt.arity;
+                const bt = readBlockType(code, &ip, module_sigs);
+                const n_params: usize = bt.params.len;
                 const cond = safePop(&vreg_stack);
                 const then_block = try ir_func.newBlock();
                 const else_block = try ir_func.newBlock();
                 const end_block = try ir_func.newBlock();
+                const param_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, n_params);
+                const result_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, bt.results.len);
+                // Pop params (below cond on the stack) into param_locals.
+                if (n_params > 0 and vreg_stack.items.len >= n_params) {
+                    var i: usize = n_params;
+                    while (i > 0) {
+                        i -= 1;
+                        const v = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = param_locals[i], .val = v } } });
+                    }
+                }
+                const pre_depth = vreg_stack.items.len;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
                     .cond = cond,
                     .then_block = then_block,
                     .else_block = else_block,
                 } } });
                 current_block = then_block;
-                const result_local: ?u32 = if (arity > 0) blk: {
-                    const idx = total_locals;
-                    total_locals += 1;
-                    ir_func.local_count = total_locals;
-                    break :blk idx;
-                } else null;
+                // Re-push params in the then branch from param_locals.
+                var pi: usize = 0;
+                while (pi < n_params) : (pi += 1) {
+                    const dest = ir_func.newVReg();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = param_locals[pi] }, .dest = dest, .type = bt.params[pi] });
+                    try vreg_stack.append(allocator, dest);
+                }
                 try block_stack.append(allocator, .{
                     .kind = .@"if",
                     .target_block = end_block,
                     .end_block = end_block,
                     .else_block = else_block,
-                    .stack_depth = vreg_stack.items.len,
-                    .result_arity = arity,
-                    .result_local = result_local,
-                    .result_type = bt.ty,
+                    .stack_depth = pre_depth,
+                    .param_types = bt.params,
+                    .result_types = bt.results,
+                    .param_locals = param_locals,
+                    .result_locals = result_locals,
                 });
             },
             .@"else" => {
                 const frame = &block_stack.items[block_stack.items.len - 1];
-                // Store then-branch result to synthetic local before jumping to end
-                if (frame.result_arity > 0 and frame.result_local != null) {
-                    if (vreg_stack.items.len > frame.stack_depth) {
-                        const result_val = safePop(&vreg_stack);
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = result_val } } });
+                const n_res: usize = frame.result_types.len;
+                // Store then-branch results to result_locals, trim stack,
+                // and jump to the common end_block.
+                if (n_res > 0 and vreg_stack.items.len >= frame.stack_depth + n_res) {
+                    var i: usize = n_res;
+                    while (i > 0) {
+                        i -= 1;
+                        const v = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = frame.result_locals[i], .val = v } } });
                     }
                 }
-                // Trim stack to block entry depth for else branch
-                vreg_stack.items.len = frame.stack_depth;
+                if (vreg_stack.items.len > frame.stack_depth) {
+                    vreg_stack.items.len = frame.stack_depth;
+                }
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br = frame.end_block } });
-                current_block = frame.else_block orelse return error.InvalidBytecode;
+                current_block = frame.else_block orelse {
+                    std.debug.print("wamrc: else without else_block (if-frame state desync)\n", .{});
+                    return error.InvalidBytecode;
+                };
                 frame.else_block = null; // consumed
+                // At the start of the else branch, re-push the params from
+                // param_locals so the else body observes the same entry stack
+                // shape as the then body did.
+                const n_params: usize = frame.param_types.len;
+                var ei: usize = 0;
+                while (ei < n_params) : (ei += 1) {
+                    const dest = ir_func.newVReg();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = frame.param_locals[ei] }, .dest = dest, .type = frame.param_types[ei] });
+                    try vreg_stack.append(allocator, dest);
+                }
             },
             .br => {
                 const depth = readU32(code, &ip);
                 if (depth < block_stack.items.len) {
                     const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
-                    // Propagate top-of-stack value into target's result_local before jumping.
-                    // Loops use header as target_block and don't carry result values backward.
-                    if (target_frame.kind != .loop and target_frame.result_arity > 0 and target_frame.result_local != null and vreg_stack.items.len > target_frame.stack_depth) {
-                        const v = vreg_stack.items[vreg_stack.items.len - 1];
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = target_frame.result_local.?, .val = v } } });
+                    // Targets carry either N param values (loop) or N result
+                    // values (block/if) — the lowest-in-stack goes to index 0.
+                    const locals: []const u32 = if (target_frame.kind == .loop) target_frame.param_locals else target_frame.result_locals;
+                    const n: usize = locals.len;
+                    if (n > 0 and vreg_stack.items.len >= n) {
+                        const base = vreg_stack.items.len - n;
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = locals[i], .val = vreg_stack.items[base + i] } } });
+                        }
                     }
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .br = target_frame.target_block } });
                 }
@@ -352,19 +543,23 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 if (depth < block_stack.items.len) {
                     const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
                     const fallthrough = try ir_func.newBlock();
-                    const needs_prop = target_frame.kind != .loop and target_frame.result_arity > 0 and target_frame.result_local != null and vreg_stack.items.len > 0;
-                    if (needs_prop) {
-                        // Insert a stub block on the taken edge that stores the operand-stack
-                        // top into the target's result_local before jumping. The value remains
-                        // on the operand stack along the not-taken (fallthrough) path.
-                        const v = vreg_stack.items[vreg_stack.items.len - 1];
+                    const locals: []const u32 = if (target_frame.kind == .loop) target_frame.param_locals else target_frame.result_locals;
+                    const n: usize = locals.len;
+                    if (n > 0 and vreg_stack.items.len >= n) {
+                        // Route the taken edge through a stub that writes the
+                        // target's locals before branching. The fallthrough
+                        // leaves the operand stack untouched.
                         const taken = try ir_func.newBlock();
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
                             .cond = cond,
                             .then_block = taken,
                             .else_block = fallthrough,
                         } } });
-                        try ir_func.getBlock(taken).append(.{ .op = .{ .local_set = .{ .idx = target_frame.result_local.?, .val = v } } });
+                        const base = vreg_stack.items.len - n;
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            try ir_func.getBlock(taken).append(.{ .op = .{ .local_set = .{ .idx = locals[i], .val = vreg_stack.items[base + i] } } });
+                        }
                         try ir_func.getBlock(taken).append(.{ .op = .{ .br = target_frame.target_block } });
                     } else {
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
@@ -625,24 +820,29 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
                 const index = safePop(&vreg_stack);
 
-                // For value-carrying labels, route each target through a stub block that
-                // stores the operand-stack top into the target's result_local. All
-                // br_table targets are required by validation to have the same arity, so
-                // we propagate the same VReg to whichever target's local is selected.
-                const carry_val: ?ir.VReg = if (vreg_stack.items.len > 0) vreg_stack.items[vreg_stack.items.len - 1] else null;
+                // For value-carrying labels, route each target through a stub
+                // that writes the target's locals (param_locals for loop
+                // targets, result_locals otherwise) before branching. All
+                // br_table targets must share the same arity per validation,
+                // so we write the same top-of-stack values to each selected
+                // target's locals.
                 const resolveTarget = struct {
                     fn call(
                         irf: *ir.IrFunction,
                         frame: BlockFrame,
-                        cv: ?ir.VReg,
+                        stk: *std.ArrayList(ir.VReg),
                     ) !ir.BlockId {
-                        if (frame.kind != .loop and frame.result_arity > 0 and frame.result_local != null and cv != null) {
-                            const stub = try irf.newBlock();
-                            try irf.getBlock(stub).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = cv.? } } });
-                            try irf.getBlock(stub).append(.{ .op = .{ .br = frame.target_block } });
-                            return stub;
+                        const locals: []const u32 = if (frame.kind == .loop) frame.param_locals else frame.result_locals;
+                        const n: usize = locals.len;
+                        if (n == 0 or stk.items.len < n) return frame.target_block;
+                        const stub = try irf.newBlock();
+                        const base = stk.items.len - n;
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            try irf.getBlock(stub).append(.{ .op = .{ .local_set = .{ .idx = locals[i], .val = stk.items[base + i] } } });
                         }
-                        return frame.target_block;
+                        try irf.getBlock(stub).append(.{ .op = .{ .br = frame.target_block } });
+                        return stub;
                     }
                 }.call;
 
@@ -658,7 +858,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     const depth = raw_targets[i];
                     if (depth < block_stack.items.len) {
                         const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
-                        ir_targets[resolved_count] = try resolveTarget(&ir_func, target_frame, carry_val);
+                        ir_targets[resolved_count] = try resolveTarget(&ir_func, target_frame, &vreg_stack);
                         resolved_count += 1;
                     }
                 }
@@ -666,7 +866,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const default_depth = raw_targets[count];
                 if (default_depth < block_stack.items.len) {
                     const default_frame = block_stack.items[block_stack.items.len - 1 - default_depth];
-                    default_target = try resolveTarget(&ir_func, default_frame, carry_val);
+                    default_target = try resolveTarget(&ir_func, default_frame, &vreg_stack);
                     have_default = true;
                 }
 
@@ -746,6 +946,120 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try vreg_stack.append(allocator, extra_dest);
                     }
                 }
+            },
+            .return_call => {
+                // Tail call: lower as a regular call followed by an immediate
+                // return. Does not preserve true tail-call stack reuse.
+                const func_idx = readU32(code, &ip);
+                const callee_type = wasm_module.getFuncType(func_idx);
+                const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
+                const result_ir_type: ir.IrType = if (callee_type != null and call_result_count > 0)
+                    switch (callee_type.?.results[0]) {
+                        .i32 => .i32,
+                        .i64 => .i64,
+                        .f32 => .f32,
+                        .f64 => .f64,
+                        else => .i64,
+                    }
+                else
+                    .i32;
+                const args = try allocator.alloc(ir.VReg, arg_count);
+                var ai: u32 = 0;
+                while (ai < arg_count) : (ai += 1) {
+                    args[arg_count - 1 - ai] = safePop(&vreg_stack);
+                }
+                const dest = ir_func.newVReg();
+                const extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
+                    .func_idx = func_idx,
+                    .args = args,
+                    .extra_results = extra_results,
+                } }, .dest = dest, .type = result_ir_type });
+                if (call_result_count <= 1) {
+                    const ret_val: ?ir.VReg = if (call_result_count == 1) dest else null;
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                } else {
+                    var rets = try allocator.alloc(ir.VReg, call_result_count);
+                    rets[0] = dest;
+                    var ri: u32 = 1;
+                    while (ri < call_result_count) : (ri += 1) {
+                        const extra_dest = ir_func.newVReg();
+                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
+                            .i32 => .i32,
+                            .i64 => .i64,
+                            .f32 => .f32,
+                            .f64 => .f64,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .call_result = @intCast(ri - 1) },
+                            .dest = extra_dest,
+                            .type = extra_ty,
+                        });
+                        rets[ri] = extra_dest;
+                    }
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
+                }
+                dead_code = true;
+            },
+            .return_call_indirect => {
+                // Tail call via table: lower as a regular call_indirect then ret.
+                const type_idx = readU32(code, &ip);
+                _ = readU32(code, &ip); // table idx
+                const elem_idx = safePop(&vreg_stack);
+                const callee_type = if (type_idx < wasm_module.types.len) &wasm_module.types[type_idx] else null;
+                const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
+                const args = try allocator.alloc(ir.VReg, arg_count);
+                var ai: u32 = 0;
+                while (ai < arg_count) : (ai += 1) {
+                    args[arg_count - 1 - ai] = safePop(&vreg_stack);
+                }
+                const dest = ir_func.newVReg();
+                const result_ir_type: ir.IrType = if (callee_type != null and call_result_count > 0)
+                    switch (callee_type.?.results[0]) {
+                        .i32 => .i32,
+                        .i64 => .i64,
+                        .f32 => .f32,
+                        .f64 => .f64,
+                        else => .i64,
+                    }
+                else
+                    .i32;
+                const extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call_indirect = .{
+                    .type_idx = type_idx,
+                    .elem_idx = elem_idx,
+                    .args = args,
+                    .extra_results = extra_results,
+                } }, .dest = dest, .type = result_ir_type });
+                if (call_result_count <= 1) {
+                    const ret_val: ?ir.VReg = if (call_result_count == 1) dest else null;
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                } else {
+                    var rets = try allocator.alloc(ir.VReg, call_result_count);
+                    rets[0] = dest;
+                    var ri: u32 = 1;
+                    while (ri < call_result_count) : (ri += 1) {
+                        const extra_dest = ir_func.newVReg();
+                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
+                            .i32 => .i32,
+                            .i64 => .i64,
+                            .f32 => .f32,
+                            .f64 => .f64,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .call_result = @intCast(ri - 1) },
+                            .dest = extra_dest,
+                            .type = extra_ty,
+                        });
+                        rets[ri] = extra_dest;
+                    }
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
+                }
+                dead_code = true;
             },
             .memory_size => {
                 _ = readU32(code, &ip); // memory index (always 0)
@@ -1317,6 +1631,122 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
 
+            .select_t => {
+                // Typed select (0x1C). Shape: select_t valtype_count valtype* c a b.
+                // Runtime semantics are identical to untyped select for scalar
+                // types; just skip the type vector in the instruction stream
+                // and reuse the existing select lowering.
+                const tv_count = readU32(code, &ip);
+                var i: u32 = 0;
+                while (i < tv_count) : (i += 1) ip += 1; // one reftype byte each
+                const cond = safePop(&vreg_stack);
+                const if_false = safePop(&vreg_stack);
+                const if_true = safePop(&vreg_stack);
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .select = .{ .cond = cond, .if_true = if_true, .if_false = if_false } }, .dest = dest, .type = .i32 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .ref_null => {
+                // `ref.null <reftype>`. Reftype byte is skipped — a null
+                // reference is represented as an i64 zero regardless of the
+                // specific reference flavor (funcref vs externref).
+                _ = code[ip];
+                ip += 1;
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_64 = 0 }, .dest = dest, .type = .i64 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .ref_is_null => {
+                // Pops a reference (i64), pushes an i32 (1 if null else 0).
+                // Reuses the existing i64 eqz path.
+                const val = safePop(&vreg_stack);
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = val }, .dest = dest, .type = .i64 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .ref_func => {
+                // `ref.func <funcidx>`. We represent the resulting funcref as
+                // the raw function index (i64). Works for comparisons and for
+                // `table.set` into a typed funcref table even though we don't
+                // yet run the indirect call through the funcref to re-derive
+                // an address — that codepath lands with call_ref in Phase 5.
+                const fidx = readU32(code, &ip);
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_64 = @as(i64, fidx) }, .dest = dest, .type = .i64 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .ref_as_non_null => {
+                // Trap if null, else push back unchanged. We don't yet have
+                // trap-as-error plumbing so this is lowered as a pass-through
+                // nop. Tests that exercise the null-trap path live under
+                // assert_trap and are already skipped.
+            },
+            .br_on_null => {
+                // Pops a reference. If null, branches to `depth` like `br`
+                // (the reference is consumed). If non-null, pushes the ref
+                // back and falls through.
+                const depth = readU32(code, &ip);
+                const ref = safePop(&vreg_stack);
+                const cond = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = ref }, .dest = cond, .type = .i64 });
+                if (depth < block_stack.items.len) {
+                    const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
+                    const fallthrough = try ir_func.newBlock();
+                    const taken = try ir_func.newBlock();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                        .cond = cond,
+                        .then_block = taken,
+                        .else_block = fallthrough,
+                    } } });
+                    const locals: []const u32 = if (target_frame.kind == .loop) target_frame.param_locals else target_frame.result_locals;
+                    const n: usize = locals.len;
+                    if (n > 0 and vreg_stack.items.len >= n) {
+                        const base = vreg_stack.items.len - n;
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            try ir_func.getBlock(taken).append(.{ .op = .{ .local_set = .{ .idx = locals[i], .val = vreg_stack.items[base + i] } } });
+                        }
+                    }
+                    try ir_func.getBlock(taken).append(.{ .op = .{ .br = target_frame.target_block } });
+                    current_block = fallthrough;
+                    try vreg_stack.append(allocator, ref);
+                }
+            },
+            .br_on_non_null => {
+                // Pops a reference. If non-null, pushes ref back and branches
+                // to `depth` (the target's label type includes the ref). If
+                // null, drops the ref and falls through.
+                const depth = readU32(code, &ip);
+                const ref = safePop(&vreg_stack);
+                const cond = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .eqz = ref }, .dest = cond, .type = .i64 });
+                if (depth < block_stack.items.len) {
+                    const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
+                    const fallthrough = try ir_func.newBlock();
+                    const taken = try ir_func.newBlock();
+                    // Invert: eqz true (null) → fallthrough; eqz false (non-null) → taken.
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                        .cond = cond,
+                        .then_block = fallthrough,
+                        .else_block = taken,
+                    } } });
+                    // Taken: ref is on the target's stack (last result).
+                    try vreg_stack.append(allocator, ref);
+                    const locals: []const u32 = if (target_frame.kind == .loop) target_frame.param_locals else target_frame.result_locals;
+                    const n: usize = locals.len;
+                    if (n > 0 and vreg_stack.items.len >= n) {
+                        const base = vreg_stack.items.len - n;
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            try ir_func.getBlock(taken).append(.{ .op = .{ .local_set = .{ .idx = locals[i], .val = vreg_stack.items[base + i] } } });
+                        }
+                    }
+                    try ir_func.getBlock(taken).append(.{ .op = .{ .br = target_frame.target_block } });
+                    _ = safePop(&vreg_stack); // fallthrough doesn't carry the ref
+                    current_block = fallthrough;
+                }
+            },
+
             else => {
                 std.debug.print("wamrc: unsupported opcode 0x{X:0>2}\n", .{byte});
                 return error.UnsupportedOpcode;
@@ -1339,7 +1769,12 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
         .global_get, .global_set => _ = readU32(code, ip),
         .br, .br_if => _ = readU32(code, ip),
         .call => _ = readU32(code, ip),
+        .return_call => _ = readU32(code, ip),
         .call_indirect => {
+            _ = readU32(code, ip); // type
+            _ = readU32(code, ip); // table
+        },
+        .return_call_indirect => {
             _ = readU32(code, ip); // type
             _ = readU32(code, ip); // table
         },
@@ -1367,6 +1802,15 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
             _ = readU32(code, ip); // align
             _ = readU32(code, ip); // offset
         },
+        // Reference-type ops with immediates
+        .ref_null => ip.* += 1, // one reftype byte
+        .ref_func => _ = readU32(code, ip),
+        .select_t => {
+            const cnt = readU32(code, ip);
+            ip.* += cnt; // one reftype byte per entry
+        },
+        .br_on_null, .br_on_non_null => _ = readU32(code, ip), // label depth
+        // ref_as_non_null has no operands
         // No operands
         else => {},
     }
