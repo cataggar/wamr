@@ -41,8 +41,10 @@ pub const AllocResult = struct {
 /// Allocatable registers as PhysReg IDs.
 /// Excludes RAX (0), RCX (1) — used as scratch temporaries by codegen,
 /// RSP (4), RBP (5) — frame pointers, and R10 (10), R11 (11) — scratch regs.
-const alloc_regs = [_]PhysReg{ 2, 6, 7, 8, 9 };
-// rdx=2, rsi=6, rdi=7, r8=8, r9=9
+/// R12/R13 are callee-saved on both Win64 and SysV, so prologue/epilogue
+/// preserves them when used.
+const alloc_regs = [_]PhysReg{ 2, 6, 7, 8, 9, 12, 13 };
+// rdx=2, rsi=6, rdi=7, r8=8, r9=9, r12=12, r13=13
 
 /// Scratch registers for spill loads (not allocatable).
 pub const scratch1: PhysReg = 10; // r10

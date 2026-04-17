@@ -57,6 +57,14 @@ pub const CodeBuffer = struct {
         return self.bytes.items;
     }
 
+    /// Truncate the buffer to `new_len`. Used by block-level peepholes
+    /// (e.g. dropping a trailing fall-through jmp). Must not be called
+    /// with a length greater than current len.
+    pub fn truncate(self: *CodeBuffer, new_len: usize) void {
+        std.debug.assert(new_len <= self.bytes.items.len);
+        self.bytes.shrinkRetainingCapacity(new_len);
+    }
+
     // ── Raw byte emission ─────────────────────────────────────────────
 
     pub fn emitByte(self: *CodeBuffer, byte: u8) !void {
@@ -124,6 +132,11 @@ pub const CodeBuffer = struct {
 
     /// MOV dst, src (64-bit register-to-register).
     pub fn movRegReg(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        // Post-allocation peephole (B3): a self-move is a semantic no-op —
+        // the 64-bit mov doesn't even clear upper bits (that's the 32-bit
+        // form). Skip emission so allocator-introduced identity moves
+        // vanish.
+        if (dst == src) return;
         try self.rexW(src, dst);
         try self.emitByte(0x89);
         try self.modrm(0b11, src.low3(), dst.low3());
@@ -291,8 +304,16 @@ pub const CodeBuffer = struct {
     // ── SETcc / MOVZX / TEST / CQO / DIV / CMOV ──────────────────────
 
     /// SETcc r/m8 — set byte based on condition code.
+    /// Byte-register access requires a REX prefix for SPL/BPL/SIL/DIL
+    /// (encodings 4–7) to distinguish them from AH/CH/DH/BH. We force
+    /// the REX emission in that case even when no extension bits are set.
     pub fn setcc(self: *CodeBuffer, cc: u4, dst: Reg) !void {
-        try self.rex(false, .rax, dst);
+        const idx = @intFromEnum(dst);
+        if (idx >= 4 and idx < 8) {
+            try self.emitByte(0x40); // mandatory REX for SPL/BPL/SIL/DIL
+        } else {
+            try self.rex(false, .rax, dst);
+        }
         try self.emitByte(0x0F);
         try self.emitByte(0x90 | @as(u8, cc));
         try self.modrm(0b11, 0, dst.low3());
@@ -368,52 +389,171 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, dst.low3(), src.low3());
     }
 
+    /// LZCNT r32, r/m32 — 32-bit leading zero count (no REX.W).
+    pub fn lzcnt32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3);
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBD);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// TZCNT r32, r/m32 — 32-bit trailing zero count (no REX.W).
+    pub fn tzcnt32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3);
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBC);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// POPCNT r32, r/m32 — 32-bit population count (no REX.W).
+    pub fn popcnt32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.emitByte(0xF3);
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xB8);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// MOV r32, r/m32 — 32-bit reg-reg move. Implicitly zero-extends to 64.
+    pub fn movRegReg32(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        if (dst.isExtended() or src.isExtended()) try self.rex(false, src, dst);
+        try self.emitByte(0x89);
+        try self.modrm(0b11, src.low3(), dst.low3());
+    }
+
+    /// MOVSXD r64, r/m32 — sign-extend 32→64.
+    pub fn movsxd(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x63);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// MOVSX r64, r/m8 — sign-extend 8→64.
+    pub fn movsxByteToReg(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBE);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// MOVSX r64, r/m16 — sign-extend 16→64.
+    pub fn movsxWordToReg(self: *CodeBuffer, dst: Reg, src: Reg) !void {
+        try self.rexW(dst, src);
+        try self.emitByte(0x0F);
+        try self.emitByte(0xBF);
+        try self.modrm(0b11, dst.low3(), src.low3());
+    }
+
+    /// LEA dst, [base + index] — 3-operand 64-bit add without touching flags.
+    /// Used for non-destructive `dst = base + index` when dst != base, saving
+    /// a `mov dst, base` compared to the mov+add sequence.
+    /// Precondition: index must not be RSP (SIB encodes rsp as "no index").
+    pub fn leaRegBaseIndex64(self: *CodeBuffer, dst: Reg, base: Reg, index: Reg) !void {
+        std.debug.assert(index != .rsp);
+        // REX.W + R (dst) + X (index) + B (base).
+        const rex_byte: u8 = 0x48 |
+            (@as(u8, @intFromEnum(dst) >> 3) << 2) |
+            (@as(u8, @intFromEnum(index) >> 3) << 1) |
+            (@as(u8, @intFromEnum(base) >> 3));
+        try self.emitByte(rex_byte);
+        try self.emitByte(0x8D); // LEA
+        // If base.low3 == 5 (rbp/r13), mod=00 would mean RIP-relative, so use
+        // mod=01 with disp8=0 to encode a plain [base + index] form.
+        const needs_disp8 = base.low3() == 5;
+        const mod: u2 = if (needs_disp8) 0b01 else 0b00;
+        try self.modrm(mod, dst.low3(), 0b100); // rm=100 → SIB follows
+        // SIB: scale=00, index=index.low3, base=base.low3
+        const sib: u8 = (@as(u8, 0) << 6) | (@as(u8, index.low3()) << 3) | @as(u8, base.low3());
+        try self.emitByte(sib);
+        if (needs_disp8) try self.emitByte(0x00);
+    }
+
     /// ADD reg, imm32 (64-bit).
+    /// ADD reg, imm (64-bit). Uses the imm8 form (opcode 0x83) when imm fits
+    /// in a signed byte, saving 3 bytes vs the imm32 form (opcode 0x81).
     pub fn addRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 0, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 0, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 0, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// SUB reg, imm32 (64-bit).
+    /// SUB reg, imm (64-bit). Uses imm8 form when possible.
     pub fn subRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 5, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 5, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 5, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// AND reg, imm32 (64-bit, sign-extended).
+    /// AND reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn andRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 4, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 4, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 4, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// OR reg, imm32 (64-bit, sign-extended).
+    /// OR reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn orRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 1, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 1, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 1, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// XOR reg, imm32 (64-bit, sign-extended).
+    /// XOR reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn xorRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 6, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 6, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 6, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
-    /// CMP reg, imm32 (64-bit, sign-extended).
+    /// CMP reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn cmpRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);
-        try self.emitByte(0x81);
-        try self.modrm(0b11, 7, dst.low3());
-        try self.emitI32(imm);
+        if (imm >= -128 and imm <= 127) {
+            try self.emitByte(0x83);
+            try self.modrm(0b11, 7, dst.low3());
+            try self.emitByte(@bitCast(@as(i8, @intCast(imm))));
+        } else {
+            try self.emitByte(0x81);
+            try self.modrm(0b11, 7, dst.low3());
+            try self.emitI32(imm);
+        }
     }
 
     /// XOR r32, r32 — zero register without REX.W (2 bytes, zero idiom).
@@ -1110,6 +1250,93 @@ test "movMemRegSized 8-bit" {
     try hexEqual(buf.getCode(), &.{ 0x88, 0x81, 0x10, 0x00, 0x00, 0x00 });
 }
 
+test "setcc on legacy byte reg (al) omits REX" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x4, .rax); // sete al
+    try hexEqual(buf.getCode(), &.{ 0x0F, 0x94, 0xC0 });
+}
+
+test "setcc on rsi emits mandatory REX for sil" {
+    // Without the REX prefix, 0F 94 C6 encodes `sete DH`, which would be
+    // incorrect — we need `sete SIL`. Ensure the 0x40 REX is emitted.
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x4, .rsi);
+    try hexEqual(buf.getCode(), &.{ 0x40, 0x0F, 0x94, 0xC6 });
+}
+
+test "setcc on rdi emits mandatory REX for dil" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x5, .rdi); // setne dil
+    try hexEqual(buf.getCode(), &.{ 0x40, 0x0F, 0x95, 0xC7 });
+}
+
+test "setcc on extended reg r8 uses REX.B" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.setcc(0x4, .r8); // sete r8b
+    // REX.B = 0x41
+    try hexEqual(buf.getCode(), &.{ 0x41, 0x0F, 0x94, 0xC0 });
+}
+
+test "lzcnt32 on rdx encodes without REX.W" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.lzcnt32(.rdx, .rdx);
+    // F3 0F BD /r with ModR/M 11_010_010 = 0xD2 (no REX)
+    try hexEqual(buf.getCode(), &.{ 0xF3, 0x0F, 0xBD, 0xD2 });
+}
+
+test "tzcnt32 on r9 emits REX.RB" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.tzcnt32(.r9, .r9);
+    // F3 REX.RB(0x45) 0F BC /r with ModR/M 11_001_001 = 0xC9
+    try hexEqual(buf.getCode(), &.{ 0xF3, 0x45, 0x0F, 0xBC, 0xC9 });
+}
+
+test "popcnt32 between different regs" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.popcnt32(.rsi, .rdi);
+    // F3 0F B8 /r with ModR/M 11_110_111 = 0xF7 (no REX: both legacy)
+    try hexEqual(buf.getCode(), &.{ 0xF3, 0x0F, 0xB8, 0xF7 });
+}
+
+test "movRegReg32 rdx to rsi" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegReg32(.rsi, .rdx);
+    // MOV r/m32, r32 opcode 0x89 with reg=src=rdx=2, rm=dst=rsi=6 → 11_010_110 = D6
+    try hexEqual(buf.getCode(), &.{ 0x89, 0xD6 });
+}
+
+test "movsxd rsi, edx" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movsxd(.rsi, .rdx);
+    // REX.W 63 /r with ModR/M 11_110_010 = 0xF2
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x63, 0xF2 });
+}
+
+test "movsxByteToReg rdi, dl" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movsxByteToReg(.rdi, .rdx);
+    // REX.W 0F BE /r with ModR/M 11_111_010 = 0xFA
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x0F, 0xBE, 0xFA });
+}
+
+test "movsxWordToReg r8, si" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movsxWordToReg(.r8, .rsi);
+    // REX.WR (0x4C) 0F BF /r with ModR/M 11_000_110 = 0xC6
+    try hexEqual(buf.getCode(), &.{ 0x4C, 0x0F, 0xBF, 0xC6 });
+}
+
 test "movMemRegSized 16-bit" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
@@ -1248,44 +1475,76 @@ test "zeroExtendReg 64-bit (no-op)" {
 // Immediate-form instruction tests
 // ═══════════════════════════════════════════════════════════════════════
 
-test "subRegImm32 rax, 10" {
+test "subRegImm32 rax, 10 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.subRegImm32(.rax, 10);
-    // REX.W 81 /5 rax, 0A000000: 48 81 E8 0A 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE8, 0x0A, 0x00, 0x00, 0x00 });
+    // REX.W 83 /5 rax, imm8: 48 83 E8 0A
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xE8, 0x0A });
 }
 
-test "andRegImm32 rax, 0xFF" {
+test "subRegImm32 rax, 1000 uses imm32 form" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.subRegImm32(.rax, 1000);
+    // REX.W 81 /5 rax, imm32: 48 81 E8 E8 03 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE8, 0xE8, 0x03, 0x00, 0x00 });
+}
+
+test "andRegImm32 rax, 0xFF uses imm32 form (0xFF > i8 max)" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.andRegImm32(.rax, 0xFF);
-    // REX.W 81 /4 rax: 48 81 E0 FF 00 00 00
+    // REX.W 81 /4 rax: 48 81 E0 FF 00 00 00 (0xFF doesn't fit in i8)
     try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xE0, 0xFF, 0x00, 0x00, 0x00 });
 }
 
-test "orRegImm32 rax, 1" {
+test "andRegImm32 rax, 0x0F uses imm8 form" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.andRegImm32(.rax, 0x0F);
+    // REX.W 83 /4 rax, imm8: 48 83 E0 0F
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xE0, 0x0F });
+}
+
+test "orRegImm32 rax, 1 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.orRegImm32(.rax, 1);
-    // REX.W 81 /1 rax: 48 81 C8 01 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xC8, 0x01, 0x00, 0x00, 0x00 });
+    // REX.W 83 /1 rax, imm8: 48 83 C8 01
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xC8, 0x01 });
 }
 
-test "xorRegImm32 rax, 0x55" {
+test "xorRegImm32 rax, 0x55 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.xorRegImm32(.rax, 0x55);
-    // REX.W 81 /6 rax: 48 81 F0 55 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xF0, 0x55, 0x00, 0x00, 0x00 });
+    // REX.W 83 /6 rax, imm8: 48 83 F0 55
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xF0, 0x55 });
 }
 
-test "cmpRegImm32 rax, 42" {
+test "cmpRegImm32 rax, 42 uses imm8 form" {
     var buf = CodeBuffer.init(std.testing.allocator);
     defer buf.deinit();
     try buf.cmpRegImm32(.rax, 42);
-    // REX.W 81 /7 rax: 48 81 F8 2A 00 00 00
-    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xF8, 0x2A, 0x00, 0x00, 0x00 });
+    // REX.W 83 /7 rax, imm8: 48 83 F8 2A
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xF8, 0x2A });
+}
+
+test "addRegImm32 rax, -1 uses imm8 form (sign-extended)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.addRegImm32(.rax, -1);
+    // REX.W 83 /0 rax, imm8=0xFF: 48 83 C0 FF
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x83, 0xC0, 0xFF });
+}
+
+test "addRegImm32 rax, 128 uses imm32 form (boundary)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.addRegImm32(.rax, 128);
+    // 128 doesn't fit in i8 — must use imm32: 48 81 C0 80 00 00 00
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x81, 0xC0, 0x80, 0x00, 0x00, 0x00 });
 }
 
 test "xorReg32 rax (zero idiom, 2 bytes)" {
@@ -1302,4 +1561,55 @@ test "xorReg32 r8 (extended, 3 bytes)" {
     try buf.xorReg32(.r8);
     // REX 45 31 C0 (XOR r8d, r8d)
     try hexEqual(buf.getCode(), &.{ 0x45, 0x31, 0xC0 });
+}
+
+
+
+test "leaRegBaseIndex64 rdx, rsi, rdi" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndex64(.rdx, .rsi, .rdi);
+    // REX.W=0x48 (no extension), opcode 0x8D, ModR/M 00_010_100=0x14,
+    // SIB 00_111_110=0x3E (scale=0, index=rdi=7, base=rsi=6).
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x8D, 0x14, 0x3E });
+}
+
+test "leaRegBaseIndex64 r12, r13, rdx (base r13 needs disp8=0)" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndex64(.r12, .r13, .rdx);
+    // REX: W=1, R=1 (r12), X=0 (rdx low), B=1 (r13) → 0x4D.
+    // Opcode 0x8D.
+    // ModR/M: mod=01 (disp8), reg=r12.low3=4, rm=100 → 01_100_100 = 0x64.
+    // SIB: scale=0, index=rdx=2, base=r13.low3=5 → 00_010_101 = 0x15.
+    // disp8: 0x00.
+    try hexEqual(buf.getCode(), &.{ 0x4D, 0x8D, 0x64, 0x15, 0x00 });
+}
+
+test "leaRegBaseIndex64 rax, r8, r9" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.leaRegBaseIndex64(.rax, .r8, .r9);
+    // REX: W=1, R=0, X=1 (r9), B=1 (r8) → 0x4B.
+    // Opcode 0x8D. ModR/M mod=00, reg=0, rm=100 → 0x04.
+    // SIB scale=0, index=r9.low3=1, base=r8.low3=0 → 00_001_000 = 0x08.
+    try hexEqual(buf.getCode(), &.{ 0x4B, 0x8D, 0x04, 0x08 });
+}
+
+
+test "movRegReg elides self-move" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegReg(.rax, .rax);
+    try buf.movRegReg(.r12, .r12);
+    // Both self-moves must produce zero bytes.
+    try std.testing.expectEqual(@as(usize, 0), buf.getCode().len);
+}
+
+test "movRegReg still emits for distinct regs" {
+    var buf = CodeBuffer.init(std.testing.allocator);
+    defer buf.deinit();
+    try buf.movRegReg(.rax, .rdx);
+    // REX.W 89 /r: 48 89 D0 (mov rax, rdx)
+    try hexEqual(buf.getCode(), &.{ 0x48, 0x89, 0xD0 });
 }
