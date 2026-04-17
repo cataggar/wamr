@@ -120,6 +120,49 @@ pub fn readSigned(comptime T: type, bytes: []const u8) Error!Result(T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Lossy convenience wrappers
+//
+// These take `bytes` and a `pos: *usize` cursor and advance it in-place.
+// On malformed/truncated input they return a fallback value and skip any
+// remaining continuation bytes so the caller does not spin. They exist
+// because the interpreter and AOT frontend decode bytecode that has
+// already been validated at load time; a decode error at runtime is
+// effectively "can't happen" and the bytecode dispatch loops cannot
+// propagate errors through their tail-call structure. New code should
+// prefer `readUnsigned` / `readSigned` and handle the error result.
+// ─────────────────────────────────────────────────────────────────────────
+
+fn skipToEnd(bytes: []const u8, pos: *usize) void {
+    // Skip any continuation bytes so callers don't spin on malformed input.
+    while (pos.* < bytes.len and (bytes[pos.*] & 0x80) != 0) pos.* += 1;
+    if (pos.* < bytes.len) pos.* += 1;
+}
+
+/// Decode an unsigned LEB128 from `bytes[pos.*..]`, advance `pos` past it,
+/// and return the value. Returns 0 on malformed or truncated input.
+pub fn readUnsignedLossy(comptime T: type, bytes: []const u8, pos: *usize) T {
+    if (pos.* >= bytes.len) return 0;
+    const r = readUnsigned(T, bytes[pos.*..]) catch {
+        skipToEnd(bytes, pos);
+        return 0;
+    };
+    pos.* += r.bytes_read;
+    return r.value;
+}
+
+/// Decode a signed LEB128 from `bytes[pos.*..]`, advance `pos` past it,
+/// and return the value. Returns 0 on malformed or truncated input.
+pub fn readSignedLossy(comptime T: type, bytes: []const u8, pos: *usize) T {
+    if (pos.* >= bytes.len) return 0;
+    const r = readSigned(T, bytes[pos.*..]) catch {
+        skipToEnd(bytes, pos);
+        return 0;
+    };
+    pos.* += r.bytes_read;
+    return r.value;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -310,4 +353,164 @@ test "extra trailing bytes are ignored" {
     const r = try readUnsigned(u32, &.{ 0x01, 0xFF, 0xFF });
     try testing.expectEqual(@as(u32, 1), r.value);
     try testing.expectEqual(@as(usize, 1), r.bytes_read);
+}
+
+
+// -- Lossy wrapper behavior ------------------------------------------------
+
+test "lossy: valid u32 single byte" {
+    var pos: usize = 0;
+    const v = readUnsignedLossy(u32, &.{0x2A}, &pos);
+    try testing.expectEqual(@as(u32, 42), v);
+    try testing.expectEqual(@as(usize, 1), pos);
+}
+
+test "lossy: valid i32 single-byte -4 (the coremark regression case)" {
+    var pos: usize = 0;
+    const v = readSignedLossy(i32, &.{0x7C}, &pos);
+    try testing.expectEqual(@as(i32, -4), v);
+    try testing.expectEqual(@as(usize, 1), pos);
+}
+
+test "lossy: truncated input advances pos to end and returns 0" {
+    var pos: usize = 0;
+    const v = readUnsignedLossy(u32, &.{0x80}, &pos);
+    try testing.expectEqual(@as(u32, 0), v);
+    try testing.expectEqual(@as(usize, 1), pos);
+}
+
+test "lossy: overflow skips continuation bytes and returns 0" {
+    var pos: usize = 0;
+    const v = readUnsignedLossy(u32, &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0xAA }, &pos);
+    try testing.expectEqual(@as(u32, 0), v);
+    // cursor should be past all 6 continuation/terminator bytes
+    try testing.expectEqual(@as(usize, 6), pos);
+}
+
+test "lossy: empty input returns 0, pos unchanged" {
+    var pos: usize = 0;
+    const v = readUnsignedLossy(u32, &.{}, &pos);
+    try testing.expectEqual(@as(u32, 0), v);
+    try testing.expectEqual(@as(usize, 0), pos);
+}
+
+test "lossy: advances correctly on back-to-back reads" {
+    // Encode: u32 1, i32 -4, u32 624485.
+    const buf = &[_]u8{ 0x01, 0x7C, 0xe5, 0x8e, 0x26 };
+    var pos: usize = 0;
+    try testing.expectEqual(@as(u32, 1), readUnsignedLossy(u32, buf, &pos));
+    try testing.expectEqual(@as(i32, -4), readSignedLossy(i32, buf, &pos));
+    try testing.expectEqual(@as(u32, 624485), readUnsignedLossy(u32, buf, &pos));
+    try testing.expectEqual(buf.len, pos);
+}
+
+// -- Round-trip encode/decode fuzz ----------------------------------------
+
+/// Encode a u64 as unsigned LEB128 into `out`, returning bytes written.
+fn encodeUnsigned(value: u64, out: []u8) usize {
+    var v = value;
+    var i: usize = 0;
+    while (true) {
+        var byte: u8 = @intCast(v & 0x7f);
+        v >>= 7;
+        if (v != 0) {
+            byte |= 0x80;
+            out[i] = byte;
+            i += 1;
+        } else {
+            out[i] = byte;
+            i += 1;
+            return i;
+        }
+    }
+}
+
+/// Encode an i64 as signed LEB128 into `out`, returning bytes written.
+fn encodeSigned(value: i64, out: []u8) usize {
+    var v = value;
+    var i: usize = 0;
+    while (true) {
+        const byte_val: u8 = @as(u8, @truncate(@as(u64, @bitCast(v)))) & 0x7f;
+        // Arithmetic shift right to preserve sign.
+        v >>= 7;
+        const done = (v == 0 and (byte_val & 0x40) == 0) or
+            (v == -1 and (byte_val & 0x40) != 0);
+        if (done) {
+            out[i] = byte_val;
+            i += 1;
+            return i;
+        } else {
+            out[i] = byte_val | 0x80;
+            i += 1;
+        }
+    }
+}
+
+test "round-trip fuzz: u32" {
+    var prng = std.Random.DefaultPrng.init(0xC0DE_0001);
+    const rnd = prng.random();
+    var buf: [10]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const v: u32 = rnd.int(u32);
+        const n = encodeUnsigned(v, &buf);
+        const r = try readUnsigned(u32, buf[0..n]);
+        try testing.expectEqual(v, r.value);
+        try testing.expectEqual(n, r.bytes_read);
+    }
+}
+
+test "round-trip fuzz: u64" {
+    var prng = std.Random.DefaultPrng.init(0xC0DE_0002);
+    const rnd = prng.random();
+    var buf: [10]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const v: u64 = rnd.int(u64);
+        const n = encodeUnsigned(v, &buf);
+        const r = try readUnsigned(u64, buf[0..n]);
+        try testing.expectEqual(v, r.value);
+        try testing.expectEqual(n, r.bytes_read);
+    }
+}
+
+test "round-trip fuzz: i32" {
+    var prng = std.Random.DefaultPrng.init(0xC0DE_0003);
+    const rnd = prng.random();
+    var buf: [10]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const v: i32 = rnd.int(i32);
+        const n = encodeSigned(v, &buf);
+        const r = try readSigned(i32, buf[0..n]);
+        try testing.expectEqual(v, r.value);
+        try testing.expectEqual(n, r.bytes_read);
+    }
+}
+
+test "round-trip fuzz: i64" {
+    var prng = std.Random.DefaultPrng.init(0xC0DE_0004);
+    const rnd = prng.random();
+    var buf: [10]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const v: i64 = rnd.int(i64);
+        const n = encodeSigned(v, &buf);
+        const r = try readSigned(i64, buf[0..n]);
+        try testing.expectEqual(v, r.value);
+        try testing.expectEqual(n, r.bytes_read);
+    }
+}
+
+test "round-trip fuzz: i32 small values (all 1-byte and 2-byte)" {
+    // Exhaustively cover every 1-byte and 2-byte signed LEB128 value, which
+    // is where the frontend's sign-extension bug lived.
+    var buf: [10]u8 = undefined;
+    var v: i32 = -16384;
+    while (v < 16384) : (v += 1) {
+        const n = encodeSigned(v, &buf);
+        const r = try readSigned(i32, buf[0..n]);
+        try testing.expectEqual(v, r.value);
+        try testing.expectEqual(n, r.bytes_read);
+    }
 }

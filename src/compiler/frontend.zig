@@ -8,6 +8,7 @@ const ir = @import("ir/ir.zig");
 const Opcode = @import("../runtime/interpreter/opcode.zig").Opcode;
 const MiscOpcode = @import("../runtime/interpreter/opcode.zig").MiscOpcode;
 const AtomicOpcode = @import("../runtime/interpreter/opcode.zig").AtomicOpcode;
+const leb128 = @import("../shared/utils/leb128.zig");
 
 pub const LowerError = error{
     OutOfMemory,
@@ -1182,55 +1183,15 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
 // ── LEB128 decoders ────────────────────────────────────────────────
 
 fn readU32(code: []const u8, ip_ptr: *usize) u32 {
-    var result: u32 = 0;
-    var shift: u32 = 0;
-    while (true) {
-        const byte = code[ip_ptr.*];
-        ip_ptr.* += 1;
-        result |= @as(u32, byte & 0x7F) << @as(u5, @intCast(shift));
-        if (byte & 0x80 == 0) break;
-        shift += 7;
-        if (shift >= 35) break;
-    }
-    return result;
+    return leb128.readUnsignedLossy(u32, code, ip_ptr);
 }
 
 fn readI32(code: []const u8, ip_ptr: *usize) i32 {
-    var result: u32 = 0;
-    var shift: u32 = 0;
-    var byte: u8 = 0;
-    while (true) {
-        byte = code[ip_ptr.*];
-        ip_ptr.* += 1;
-        result |= @as(u32, byte & 0x7F) << @as(u5, @intCast(shift));
-        shift += 7;
-        if (byte & 0x80 == 0) break;
-        if (shift >= 35) break;
-    }
-    // Sign-extend: bits above the consumed region should copy bit 6 of the final byte.
-    if (shift < 32 and (byte & 0x40) != 0) {
-        result |= @as(u32, 0xFFFFFFFF) << @as(u5, @intCast(shift));
-    }
-    return @bitCast(result);
+    return leb128.readSignedLossy(i32, code, ip_ptr);
 }
 
 fn readI64(code: []const u8, ip_ptr: *usize) i64 {
-    var result: u64 = 0;
-    var shift: u32 = 0;
-    var byte: u8 = 0;
-    while (true) {
-        byte = code[ip_ptr.*];
-        ip_ptr.* += 1;
-        result |= @as(u64, byte & 0x7F) << @as(u6, @intCast(shift));
-        shift += 7;
-        if (byte & 0x80 == 0) break;
-        if (shift >= 70) break;
-    }
-    // Sign-extend: bits above the consumed region should copy bit 6 of the final byte.
-    if (shift < 64 and (byte & 0x40) != 0) {
-        result |= @as(u64, 0xFFFFFFFFFFFFFFFF) << @as(u6, @intCast(shift));
-    }
-    return @bitCast(result);
+    return leb128.readSignedLossy(i64, code, ip_ptr);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -1248,7 +1209,7 @@ test "readI32 decodes signed LEB128 including single-byte negatives" {
         .{ .bytes = &.{0x40}, .expected = -64 },
         .{ .bytes = &.{ 0x80, 0x7F }, .expected = -128 },
         .{ .bytes = &.{ 0xFF, 0x7E }, .expected = -129 },
-        .{ .bytes = &.{ 0x80, 0x80, 0x80, 0x80, 0x08 }, .expected = @bitCast(@as(u32, 0x80000000)) }, // INT32_MIN
+        .{ .bytes = &.{ 0x80, 0x80, 0x80, 0x80, 0x78 }, .expected = @bitCast(@as(u32, 0x80000000)) }, // INT32_MIN
         .{ .bytes = &.{ 0xFF, 0xFF, 0xFF, 0xFF, 0x07 }, .expected = 0x7FFFFFFF }, // INT32_MAX
     };
     for (cases) |c| {
