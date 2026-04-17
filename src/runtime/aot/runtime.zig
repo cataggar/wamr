@@ -446,6 +446,178 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     return result;
 }
 
+// ─── Typed scalar call ──────────────────────────────────────────────────────
+
+/// Scalar result value from a typed AOT call.
+pub const ScalarResult = union(enum) {
+    void,
+    i32: i32,
+    i64: i64,
+    f32: f32,
+    f64: f64,
+};
+
+/// Errors callFuncScalar may return beyond the standard RuntimeError set.
+pub const ScalarCallError = error{
+    UnsupportedSignature,
+    InvalidArgType,
+    ArgCountMismatch,
+} || RuntimeError;
+
+/// ABI note: AOT-compiled functions expect all wasm scalar params (i32/i64/
+/// f32/f64) to be passed in integer registers as raw bit patterns (see
+/// `param_regs` in src/compiler/codegen/x86_64/compile.zig). This does NOT
+/// match the System V / Win64 C ABI for floats, so we call through a
+/// function pointer typed with integer args of matching width. The return
+/// value always lands in RAX, so the "result" register is also treated as
+/// a u64 bit pattern and reinterpreted by the caller.
+///
+/// Registers available for args:
+///   - Win64: RCX/RDX/R8/R9 → VmCtx + up to 3 wasm params.
+///   - SysV AMD64: RDI/RSI/RDX/RCX/R8/R9 → VmCtx + up to 5 wasm params.
+/// We conservatively cap at 3 wasm params so the same typed harness works
+/// on both platforms. Anything outside → `error.UnsupportedSignature`.
+const CallFn0 = *const fn (*VmCtx) callconv(.c) u64;
+const CallFn1 = *const fn (*VmCtx, u64) callconv(.c) u64;
+const CallFn2 = *const fn (*VmCtx, u64, u64) callconv(.c) u64;
+const CallFn3 = *const fn (*VmCtx, u64, u64, u64) callconv(.c) u64;
+
+fn isScalarValType(t: types.ValType) bool {
+    return switch (t) {
+        .i32, .i64, .f32, .f64 => true,
+        else => false,
+    };
+}
+
+fn valueToRawBits(pt: types.ValType, v: types.Value) ScalarCallError!u64 {
+    return switch (pt) {
+        .i32 => blk: {
+            if (v != .i32) return error.InvalidArgType;
+            break :blk @as(u64, @as(u32, @bitCast(v.i32)));
+        },
+        .i64 => blk: {
+            if (v != .i64) return error.InvalidArgType;
+            break :blk @as(u64, @bitCast(v.i64));
+        },
+        .f32 => blk: {
+            if (v != .f32) return error.InvalidArgType;
+            break :blk @as(u64, @as(u32, @bitCast(v.f32)));
+        },
+        .f64 => blk: {
+            if (v != .f64) return error.InvalidArgType;
+            break :blk @as(u64, @bitCast(v.f64));
+        },
+        else => error.UnsupportedSignature,
+    };
+}
+
+/// Call an AOT-compiled function by index with runtime-typed scalar args.
+///
+/// Supports up to 3 params of type i32/i64/f32/f64 and a result of
+/// void/i32/i64/f32/f64. Wider or non-scalar signatures return
+/// `error.UnsupportedSignature` and should be skipped by the caller.
+pub fn callFuncScalar(
+    inst: *AotInstance,
+    func_idx: u32,
+    param_types: []const types.ValType,
+    result_type: ?types.ValType,
+    args: []const types.Value,
+) ScalarCallError!ScalarResult {
+    comptime if (!can_execute_native) @compileError("AOT execution not supported on this architecture");
+
+    if (param_types.len != args.len) return error.ArgCountMismatch;
+    if (param_types.len > 3) return error.UnsupportedSignature;
+    for (param_types) |pt| {
+        if (!isScalarValType(pt)) return error.UnsupportedSignature;
+    }
+    if (result_type) |rt| {
+        if (!isScalarValType(rt)) return error.UnsupportedSignature;
+    }
+
+    if (inst.code_base == null) return error.CodeMappingFailed;
+    const addr = getFuncAddr(inst, func_idx) orelse return error.FunctionNotFound;
+
+    // Build flat globals array for AOT access (mirrors callFunc).
+    var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
+    const n_globals = @min(inst.globals.len, globals_buf.len);
+    for (0..n_globals) |i| {
+        globals_buf[i] = inst.globals[i].value.i64;
+    }
+
+    var vmctx = VmCtx{};
+    if (inst.memories.len > 0) {
+        vmctx.memory_base = @intFromPtr(inst.memories[0].data.ptr);
+        vmctx.memory_size = @as(usize, inst.memories[0].current_pages) * types.MemoryInstance.page_size;
+        vmctx.memory_max_size = inst.memories[0].data.len;
+        vmctx.memory_pages = inst.memories[0].current_pages;
+    }
+    vmctx.globals_ptr = @intFromPtr(&globals_buf);
+    vmctx.globals_count = @intCast(n_globals);
+    if (inst.host_functions.len > 0) {
+        vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
+        vmctx.host_functions_count = @intCast(inst.host_functions.len);
+    }
+    if (inst.func_table.len > 0) {
+        vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
+    }
+    vmctx.instance_ptr = @intFromPtr(inst);
+    vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
+    vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
+
+    // Marshal args to raw 64-bit bit patterns.
+    var raw: [3]u64 = .{ 0, 0, 0 };
+    for (args, param_types, 0..) |v, pt, i| {
+        raw[i] = try valueToRawBits(pt, v);
+    }
+
+    if (comptime builtin.os.tag == .windows) {
+        if (inst.code_base) |cb| {
+            g_code_base = @intFromPtr(cb);
+            g_code_size = inst.code_size;
+            g_func_offsets = inst.module.func_offsets;
+        }
+        g_mem_base = vmctx.memory_base;
+        g_mem_size = vmctx.memory_size;
+        _ = AddVectoredExceptionHandler(1, vehHandler);
+    }
+
+    const raw_result: u64 = switch (args.len) {
+        0 => blk: {
+            const f: CallFn0 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx);
+        },
+        1 => blk: {
+            const f: CallFn1 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0]);
+        },
+        2 => blk: {
+            const f: CallFn2 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1]);
+        },
+        3 => blk: {
+            const f: CallFn3 = @ptrCast(@alignCast(addr));
+            break :blk f(&vmctx, raw[0], raw[1], raw[2]);
+        },
+        else => unreachable,
+    };
+
+    // Sync globals back.
+    for (0..n_globals) |i| {
+        inst.globals[i].value = .{ .i64 = globals_buf[i] };
+    }
+
+    if (result_type) |rt| {
+        return switch (rt) {
+            .i32 => ScalarResult{ .i32 = @bitCast(@as(u32, @truncate(raw_result))) },
+            .i64 => ScalarResult{ .i64 = @bitCast(raw_result) },
+            .f32 => ScalarResult{ .f32 = @bitCast(@as(u32, @truncate(raw_result))) },
+            .f64 => ScalarResult{ .f64 = @bitCast(raw_result) },
+            else => unreachable,
+        };
+    }
+    return .void;
+}
+
 // ─── Host function resolution ───────────────────────────────────────────────
 
 /// Resolve AOT host function adapters for each import in the module.

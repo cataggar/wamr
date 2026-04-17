@@ -183,6 +183,22 @@ fn compileToAot(
         });
     }
 
+    var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
+    for (module.globals) |g| {
+        const init_val: i64 = switch (g.init_expr) {
+            .i32_const => |v| @as(i64, v),
+            .i64_const => |v| v,
+            .f32_const => |v| @as(i64, @as(i32, @bitCast(v))),
+            .f64_const => |v| @bitCast(v),
+            else => 0,
+        };
+        try global_entries.append(a, .{
+            .val_type = @intFromEnum(g.global_type.val_type),
+            .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
+            .init_i64 = init_val,
+        });
+    }
+
     var arch_name = std.mem.zeroes([16]u8);
     switch (builtin.cpu.arch) {
         .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
@@ -198,7 +214,7 @@ fn compileToAot(
         null,
         null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
-        null,
+        if (global_entries.items.len > 0) global_entries.items else null,
         null,
     );
 }
