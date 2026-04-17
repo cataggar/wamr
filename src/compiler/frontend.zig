@@ -1203,11 +1203,11 @@ fn readI32(code: []const u8, ip_ptr: *usize) i32 {
         byte = code[ip_ptr.*];
         ip_ptr.* += 1;
         result |= @as(u32, byte & 0x7F) << @as(u5, @intCast(shift));
-        if (byte & 0x80 == 0) break;
         shift += 7;
+        if (byte & 0x80 == 0) break;
         if (shift >= 35) break;
     }
-    // Sign-extend if the sign bit of the last byte is set
+    // Sign-extend: bits above the consumed region should copy bit 6 of the final byte.
     if (shift < 32 and (byte & 0x40) != 0) {
         result |= @as(u32, 0xFFFFFFFF) << @as(u5, @intCast(shift));
     }
@@ -1222,11 +1222,11 @@ fn readI64(code: []const u8, ip_ptr: *usize) i64 {
         byte = code[ip_ptr.*];
         ip_ptr.* += 1;
         result |= @as(u64, byte & 0x7F) << @as(u6, @intCast(shift));
-        if (byte & 0x80 == 0) break;
         shift += 7;
-        if (shift >= 63) break;
+        if (byte & 0x80 == 0) break;
+        if (shift >= 70) break;
     }
-    // Sign-extend if the sign bit of the last byte is set
+    // Sign-extend: bits above the consumed region should copy bit 6 of the final byte.
     if (shift < 64 and (byte & 0x40) != 0) {
         result |= @as(u64, 0xFFFFFFFFFFFFFFFF) << @as(u6, @intCast(shift));
     }
@@ -1234,6 +1234,44 @@ fn readI64(code: []const u8, ip_ptr: *usize) i64 {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
+
+test "readI32 decodes signed LEB128 including single-byte negatives" {
+    // Coremark hits this with `i32.const -4` (single byte 0x7C) and
+    // `i32.const -1` (single byte 0x7F). Prior to the sign-extend fix,
+    // every single-byte negative value decoded as -1.
+    const cases = [_]struct { bytes: []const u8, expected: i32 }{
+        .{ .bytes = &.{0x00}, .expected = 0 },
+        .{ .bytes = &.{0x2A}, .expected = 42 },
+        .{ .bytes = &.{0x7F}, .expected = -1 },
+        .{ .bytes = &.{0x7E}, .expected = -2 },
+        .{ .bytes = &.{0x7C}, .expected = -4 }, // regression: used to decode as -1
+        .{ .bytes = &.{0x40}, .expected = -64 },
+        .{ .bytes = &.{ 0x80, 0x7F }, .expected = -128 },
+        .{ .bytes = &.{ 0xFF, 0x7E }, .expected = -129 },
+        .{ .bytes = &.{ 0x80, 0x80, 0x80, 0x80, 0x08 }, .expected = @bitCast(@as(u32, 0x80000000)) }, // INT32_MIN
+        .{ .bytes = &.{ 0xFF, 0xFF, 0xFF, 0xFF, 0x07 }, .expected = 0x7FFFFFFF }, // INT32_MAX
+    };
+    for (cases) |c| {
+        var ip: usize = 0;
+        const got = readI32(c.bytes, &ip);
+        try std.testing.expectEqual(c.expected, got);
+        try std.testing.expectEqual(c.bytes.len, ip);
+    }
+}
+
+test "readI64 decodes signed LEB128 including single-byte negatives" {
+    const cases = [_]struct { bytes: []const u8, expected: i64 }{
+        .{ .bytes = &.{0x7C}, .expected = -4 },
+        .{ .bytes = &.{0x7F}, .expected = -1 },
+        .{ .bytes = &.{ 0x80, 0x7F }, .expected = -128 },
+    };
+    for (cases) |c| {
+        var ip: usize = 0;
+        const got = readI64(c.bytes, &ip);
+        try std.testing.expectEqual(c.expected, got);
+        try std.testing.expectEqual(c.bytes.len, ip);
+    }
+}
 
 test "lower i32.const 42; end" {
     const allocator = std.testing.allocator;
