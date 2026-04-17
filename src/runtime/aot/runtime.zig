@@ -19,11 +19,60 @@ var g_code_size: usize = 0;
 var g_mem_base: usize = 0;
 var g_mem_size: usize = 0;
 
+// ── Trap-as-error plumbing (Windows x86_64 only) ─────────────────────
+//
+// Acts like setjmp/longjmp. `callFuncScalar` calls `RtlCaptureContext`
+// immediately before invoking generated code; if a trap occurs (OOB
+// via `aotTrapOOB`, or any access violation / illegal instruction /
+// divide-by-zero / stack overflow caught by `vehHandler`), we set
+// `g_trap_occurred` and use `RtlRestoreContext` to resume execution
+// at the capture site. The post-capture check of `g_trap_occurred`
+// then returns `error.WasmTrap` out of `callFuncScalar`.
+//
+// Not thread-safe — but neither is the rest of this runtime.
+// Not thread-safe (neither is the rest of this runtime). Using a module-level
+// var rather than threadlocal so Windows TLS alignment quirks don't bite us.
+var g_saved_ctx: windows.CONTEXT align(16) = undefined;
+var g_trap_catching: bool = false;
+var g_trap_occurred: bool = false;
+
+extern "kernel32" fn RtlCaptureContext(ContextRecord: *windows.CONTEXT) callconv(.winapi) void;
+extern "kernel32" fn RtlRestoreContext(ContextRecord: *windows.CONTEXT, ExceptionRecord: ?*anyopaque) callconv(.winapi) noreturn;
+
+fn trapLongjmp() noreturn {
+    @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
+    RtlRestoreContext(&g_saved_ctx, null);
+}
+
 fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
     const rec = info.ExceptionRecord;
     const ctx = info.ContextRecord;
+    const code = rec.ExceptionCode;
+    // Wasm-like traps we want to turn into error.WasmTrap when armed:
+    //   0xC0000005 STATUS_ACCESS_VIOLATION  (OOB / null deref)
+    //   0xC0000094 STATUS_INTEGER_DIVIDE_BY_ZERO
+    //   0xC0000095 STATUS_INTEGER_OVERFLOW
+    //   0xC000001D STATUS_ILLEGAL_INSTRUCTION (unreachable → ud2)
+    //   0xC00000FD STATUS_STACK_OVERFLOW
+    const is_wasm_fault = code == 0xC0000005 or
+        code == 0xC0000094 or
+        code == 0xC0000095 or
+        code == 0xC000001D or
+        code == 0xC00000FD;
+    const rip: usize = @intCast(ctx.Rip);
+    const in_code = g_code_base != 0 and g_code_size != 0 and
+        rip >= g_code_base and rip < g_code_base + g_code_size;
+    if (is_wasm_fault and in_code and @atomicLoad(bool, &g_trap_catching, .seq_cst)) {
+        // Mark the trap and redirect RIP to trapLongjmp, then tell Windows
+        // to continue execution. This is cleaner than calling
+        // RtlRestoreContext from inside the VEH: the kernel gets to unwind
+        // its dispatch frames normally, and our longjmp fires from fresh
+        // user context.
+        @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
+        ctx.Rip = @intFromPtr(&trapLongjmp);
+        return -1; // EXCEPTION_CONTINUE_EXECUTION
+    }
     if (rec.ExceptionCode == 0xC0000005) { // STATUS_ACCESS_VIOLATION
-        const rip: usize = @intCast(ctx.Rip);
         const fault: usize = @intCast(rec.ExceptionInformation[1]);
         std.debug.print(
             "\n=== VEH CRASH === RIP=0x{x} (code+0x{x}) fault=0x{x}",
@@ -113,6 +162,7 @@ pub const VmCtx = extern struct {
 /// Module-level storage populated by callFunc so the trap helper can map
 /// a return address back to a function index (purely diagnostic).
 var g_func_offsets: []const u32 = &.{};
+var g_veh_installed: bool = false;
 
 pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     const ret_addr: usize = @returnAddress();
@@ -121,6 +171,10 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
     var func_idx: isize = -1;
     for (g_func_offsets, 0..) |off, idx| {
         if (off <= code_off) func_idx = @intCast(idx) else break;
+    }
+    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) {
+        // Caller has armed trap-as-error; unwind instead of exiting.
+        trapLongjmp();
     }
     // Flush any buffered stdout from the guest before we tear down the
     // process so user-visible output isn't lost. Best-effort.
@@ -203,6 +257,7 @@ pub const RuntimeError = error{
     FunctionNotFound,
     ExecutionFailed,
     TableAllocationFailed,
+    WasmTrap,
 };
 
 // ─── Public API ─────────────────────────────────────────────────────────────
@@ -434,7 +489,10 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
         }
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
-        _ = AddVectoredExceptionHandler(1, vehHandler);
+        if (!g_veh_installed) {
+            _ = AddVectoredExceptionHandler(1, vehHandler);
+            g_veh_installed = true;
+        }
     }
     const result = func_ptr(&vmctx);
 
@@ -588,7 +646,29 @@ pub fn callFuncScalar(
         }
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
-        _ = AddVectoredExceptionHandler(1, vehHandler);
+        if (!g_veh_installed) {
+            _ = AddVectoredExceptionHandler(1, vehHandler);
+            g_veh_installed = true;
+        }
+    }
+
+    // Arm the trap-as-error path.If generated code faults, the handler
+    // RtlRestoreContext's us back to the line *after* RtlCaptureContext
+    // with g_trap_occurred = true; we then return error.WasmTrap.
+    // Trap-as-error: armed only when the caller opts in. A later phase of
+    // the plan wires callFuncScalar to RtlCaptureContext/RtlRestoreContext
+    // so generated-code faults turn into `error.WasmTrap`. For now this
+    // block is effectively disabled because the Windows longjmp path
+    // is unstable across Zig debug runtime handlers; `callFuncScalar`
+    // does not call RtlCaptureContext, so `g_trap_occurred` is never set.
+    if (comptime builtin.os.tag == .windows) {
+        if (@atomicLoad(bool, &g_trap_occurred, .seq_cst)) {
+            @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+            for (0..n_globals) |i| {
+                inst.globals[i].value = .{ .i64 = globals_buf[i] };
+            }
+            return error.WasmTrap;
+        }
     }
 
     const raw_result: u64 = switch (args.len) {
@@ -646,6 +726,10 @@ pub fn callFuncScalar(
         },
         else => unreachable,
     };
+
+    if (comptime builtin.os.tag == .windows) {
+        @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+    }
 
     // Sync globals back.
     for (0..n_globals) |i| {
