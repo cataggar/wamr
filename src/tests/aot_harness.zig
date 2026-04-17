@@ -220,6 +220,32 @@ fn compileToAot(
         });
     }
 
+    // Element segments: forward active segments whose offset is an
+    // i32.const literal and whose entries are all concrete funcidx. This
+    // is sufficient for the bulk of the spec suite; passive/declarative
+    // and init-expr segments are deferred.
+    var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
+    for (module.elements) |seg| {
+        if (seg.is_passive or seg.is_declarative) continue;
+        const offset_expr = seg.offset orelse continue;
+        const offset_val: u32 = switch (offset_expr) {
+            .i32_const => |v| @bitCast(v),
+            else => continue,
+        };
+        var all_concrete = true;
+        for (seg.func_indices) |fi| {
+            if (fi == null) { all_concrete = false; break; }
+        }
+        if (!all_concrete) continue;
+        const indices = try a.alloc(u32, seg.func_indices.len);
+        for (seg.func_indices, 0..) |fi, k| indices[k] = fi.?;
+        try elem_entries.append(a, .{
+            .table_idx = seg.table_idx,
+            .offset = offset_val,
+            .func_indices = indices,
+        });
+    }
+
     var arch_name = std.mem.zeroes([16]u8);
     switch (builtin.cpu.arch) {
         .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
@@ -236,6 +262,6 @@ fn compileToAot(
         if (import_entries.items.len > 0) import_entries.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
         if (global_entries.items.len > 0) global_entries.items else null,
-        null,
+        if (elem_entries.items.len > 0) elem_entries.items else null,
     );
 }
