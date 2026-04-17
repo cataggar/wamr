@@ -2685,8 +2685,40 @@ fn compileInstRA(
                 // Unsigned i32 fits in signed i64; use 64-bit cvtt then truncate.
                 if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
             } else {
-                // Unsigned i64 trunc not handled here (needs split-range logic).
+                // Unsigned i64: split at 2^63. If src < 2^63 direct; else subtract
+                // 2^63, convert, then add back.
+                const split_bits: u64 = if (is_f32) 0x5F000000 else 0x43E0000000000000;
+                if (is_f32) {
+                    try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(split_bits))));
+                    try code.movdToXmm(.rcx, .r11);
+                    try code.ucomiss(.rax, .rcx);
+                } else {
+                    try code.movRegImm64(.r11, split_bits);
+                    try code.movqToXmm(.rcx, .r11);
+                    try code.ucomisd(.rax, .rcx);
+                }
+                // JB = src < 2^63 -> direct convert
+                try code.emitSlice(&.{ 0x0F, 0x82 });
+                const direct_patch = code.len();
+                try code.emitI32(0);
+                // High range: subtract 2^63, convert, add back
+                if (is_f32) {
+                    try code.subss(.rax, .rcx);
+                    try code.cvttss2si(.rax, .rax);
+                } else {
+                    try code.subsd(.rax, .rcx);
+                    try code.cvttsd2si(.rax, .rax);
+                }
+                try code.movRegImm64(.r11, 0x8000000000000000);
+                try code.addRegReg(.rax, .r11);
+                try code.emitSlice(&.{0xE9}); // JMP done
+                const done_patch = code.len();
+                try code.emitI32(0);
+                const direct_off = code.len();
                 if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+                code.patchI32(direct_patch, @intCast(@as(i64, @intCast(direct_off)) - @as(i64, @intCast(direct_patch + 4))));
+                const done_off = code.len();
+                code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
@@ -2810,8 +2842,14 @@ fn compileInstRA(
                 const u64_done_off = code.len();
                 code.patchI32(u64_done_patch, @intCast(@as(i64, @intCast(u64_done_off)) - @as(i64, @intCast(u64_done_patch + 4))));
             } else if (dst_is_i32) {
-                // i32 dest (signed or unsigned): use 32-bit truncation.
-                if (is_f32) try code.cvttss2si32(.rax, .rax) else try code.cvttsd2si32(.rax, .rax);
+                if (is_signed) {
+                    // Signed i32: 32-bit cvtt; bound-check already ensured in-range.
+                    if (is_f32) try code.cvttss2si32(.rax, .rax) else try code.cvttsd2si32(.rax, .rax);
+                } else {
+                    // Unsigned i32 in [0, 2^32): use 64-bit signed cvt (fits in
+                    // positive i63), then low 32 bits are the unsigned result.
+                    if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+                }
             } else {
                 // Signed i64
                 if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
