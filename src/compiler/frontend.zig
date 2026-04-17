@@ -116,6 +116,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         result_arity: u32,
         /// Synthetic local slot for passing result values across branches.
         result_local: ?u32,
+        /// Result type of this block (only meaningful when result_arity > 0).
+        result_type: ir.IrType,
     };
     var block_stack: std.ArrayList(BlockFrame) = .empty;
     defer block_stack.deinit(allocator);
@@ -125,11 +127,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
     // Helper: read block type (-0x40 = void, else valtype)
     const readBlockType = struct {
-        fn call(code: []const u8, ip_ptr: *usize) u32 {
+        fn call(code: []const u8, ip_ptr: *usize) struct { arity: u32, ty: ir.IrType } {
             const byte = code[ip_ptr.*];
             ip_ptr.* += 1;
-            if (byte == 0x40) return 0; // void
-            return 1; // any valtype = 1 result
+            if (byte == 0x40) return .{ .arity = 0, .ty = .i32 }; // void
+            const ty: ir.IrType = switch (byte) {
+                0x7F => .i32,
+                0x7E => .i64,
+                0x7D => .f32,
+                0x7C => .f64,
+                else => .i32,
+            };
+            return .{ .arity = 1, .ty = ty };
         }
     }.call;
 
@@ -166,6 +175,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         .stack_depth = vreg_stack.items.len,
                         .result_arity = 0,
                         .result_local = null,
+                        .result_type = .i32,
                     });
                     continue;
                 },
@@ -200,7 +210,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 // Load result from synthetic local at merge point
                 if (frame.result_arity > 0 and frame.result_local != null) {
                     const dest = ir_func.newVReg();
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = frame.result_local.? }, .dest = dest, .type = .i32 });
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = frame.result_local.? }, .dest = dest, .type = frame.result_type });
                     try vreg_stack.append(allocator, dest);
                 }
             },
@@ -215,7 +225,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .nop => {},
             .block => {
-                const arity = readBlockType(code, &ip);
+                const bt = readBlockType(code, &ip);
+                const arity = bt.arity;
                 const end_block = try ir_func.newBlock();
                 const result_local: ?u32 = if (arity > 0) blk: {
                     const idx = total_locals;
@@ -231,10 +242,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .stack_depth = vreg_stack.items.len,
                     .result_arity = arity,
                     .result_local = result_local,
+                    .result_type = bt.ty,
                 });
             },
             .loop => {
-                const arity = readBlockType(code, &ip);
+                const bt = readBlockType(code, &ip);
+                const arity = bt.arity;
                 const loop_header = try ir_func.newBlock();
                 const end_block = try ir_func.newBlock();
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .br = loop_header } });
@@ -253,10 +266,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .stack_depth = vreg_stack.items.len,
                     .result_arity = arity,
                     .result_local = result_local,
+                    .result_type = bt.ty,
                 });
             },
             .@"if" => {
-                const arity = readBlockType(code, &ip);
+                const bt = readBlockType(code, &ip);
+                const arity = bt.arity;
                 const cond = safePop(&vreg_stack);
                 const then_block = try ir_func.newBlock();
                 const else_block = try ir_func.newBlock();
@@ -281,6 +296,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .stack_depth = vreg_stack.items.len,
                     .result_arity = arity,
                     .result_local = result_local,
+                    .result_type = bt.ty,
                 });
             },
             .@"else" => {
@@ -302,6 +318,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const depth = readU32(code, &ip);
                 if (depth < block_stack.items.len) {
                     const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
+                    // Propagate top-of-stack value into target's result_local before jumping.
+                    // Loops use header as target_block and don't carry result values backward.
+                    if (target_frame.kind != .loop and target_frame.result_arity > 0 and target_frame.result_local != null and vreg_stack.items.len > target_frame.stack_depth) {
+                        const v = vreg_stack.items[vreg_stack.items.len - 1];
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .local_set = .{ .idx = target_frame.result_local.?, .val = v } } });
+                    }
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .br = target_frame.target_block } });
                 }
                 dead_code = true;
@@ -312,19 +334,46 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 if (depth < block_stack.items.len) {
                     const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
                     const fallthrough = try ir_func.newBlock();
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
-                        .cond = cond,
-                        .then_block = target_frame.target_block,
-                        .else_block = fallthrough,
-                    } } });
+                    const needs_prop = target_frame.kind != .loop and target_frame.result_arity > 0 and target_frame.result_local != null and vreg_stack.items.len > 0;
+                    if (needs_prop) {
+                        // Insert a stub block on the taken edge that stores the operand-stack
+                        // top into the target's result_local before jumping. The value remains
+                        // on the operand stack along the not-taken (fallthrough) path.
+                        const v = vreg_stack.items[vreg_stack.items.len - 1];
+                        const taken = try ir_func.newBlock();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                            .cond = cond,
+                            .then_block = taken,
+                            .else_block = fallthrough,
+                        } } });
+                        try ir_func.getBlock(taken).append(.{ .op = .{ .local_set = .{ .idx = target_frame.result_local.?, .val = v } } });
+                        try ir_func.getBlock(taken).append(.{ .op = .{ .br = target_frame.target_block } });
+                    } else {
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                            .cond = cond,
+                            .then_block = target_frame.target_block,
+                            .else_block = fallthrough,
+                        } } });
+                    }
                     current_block = fallthrough;
                 }
             },
             .call => {
                 const func_idx = readU32(code, &ip);
-                // Look up callee type to determine arg count
+                // Look up callee type to determine arg count and result type
                 const callee_type = wasm_module.getFuncType(func_idx);
                 const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
+                const result_ir_type: ir.IrType = if (callee_type != null and call_result_count > 0)
+                    switch (callee_type.?.results[0]) {
+                        .i32 => .i32,
+                        .i64 => .i64,
+                        .f32 => .f32,
+                        .f64 => .f64,
+                        else => .i64,
+                    }
+                else
+                    .i32;
                 // Capture arg VRegs before popping (args are in stack order: first arg deepest)
                 const args = try allocator.alloc(ir.VReg, arg_count);
                 var i: u32 = 0;
@@ -336,8 +385,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
                     .func_idx = func_idx,
                     .args = args,
-                } }, .dest = dest, .type = .i32 });
-                try vreg_stack.append(allocator, dest);
+                } }, .dest = dest, .type = result_ir_type });
+                if (call_result_count > 0) {
+                    try vreg_stack.append(allocator, dest);
+                }
             },
             .i32_const => {
                 const val = readI32(code, &ip);
@@ -533,6 +584,27 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
                 const index = safePop(&vreg_stack);
 
+                // For value-carrying labels, route each target through a stub block that
+                // stores the operand-stack top into the target's result_local. All
+                // br_table targets are required by validation to have the same arity, so
+                // we propagate the same VReg to whichever target's local is selected.
+                const carry_val: ?ir.VReg = if (vreg_stack.items.len > 0) vreg_stack.items[vreg_stack.items.len - 1] else null;
+                const resolveTarget = struct {
+                    fn call(
+                        irf: *ir.IrFunction,
+                        frame: BlockFrame,
+                        cv: ?ir.VReg,
+                    ) !ir.BlockId {
+                        if (frame.kind != .loop and frame.result_arity > 0 and frame.result_local != null and cv != null) {
+                            const stub = try irf.newBlock();
+                            try irf.getBlock(stub).append(.{ .op = .{ .local_set = .{ .idx = frame.result_local.?, .val = cv.? } } });
+                            try irf.getBlock(stub).append(.{ .op = .{ .br = frame.target_block } });
+                            return stub;
+                        }
+                        return frame.target_block;
+                    }
+                }.call;
+
                 // Resolve depths to target block IDs.
                 // Entries whose depth is out of range are skipped (matches
                 // previous if-else behavior which silently dropped them).
@@ -545,14 +617,15 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     const depth = raw_targets[i];
                     if (depth < block_stack.items.len) {
                         const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
-                        ir_targets[resolved_count] = target_frame.target_block;
+                        ir_targets[resolved_count] = try resolveTarget(&ir_func, target_frame, carry_val);
                         resolved_count += 1;
                     }
                 }
 
                 const default_depth = raw_targets[count];
                 if (default_depth < block_stack.items.len) {
-                    default_target = block_stack.items[block_stack.items.len - 1 - default_depth].target_block;
+                    const default_frame = block_stack.items[block_stack.items.len - 1 - default_depth];
+                    default_target = try resolveTarget(&ir_func, default_frame, carry_val);
                     have_default = true;
                 }
 
@@ -592,11 +665,21 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 }
 
                 const dest = ir_func.newVReg();
+                const ind_result_type: ir.IrType = if (callee_type != null and call_result_count > 0)
+                    switch (callee_type.?.results[0]) {
+                        .i32 => .i32,
+                        .i64 => .i64,
+                        .f32 => .f32,
+                        .f64 => .f64,
+                        else => .i64,
+                    }
+                else
+                    .i32;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call_indirect = .{
                     .type_idx = type_idx,
                     .elem_idx = elem_idx,
                     .args = args,
-                } }, .dest = dest, .type = .i32 });
+                } }, .dest = dest, .type = ind_result_type });
 
                 if (call_result_count > 0) {
                     try vreg_stack.append(allocator, dest);
