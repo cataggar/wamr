@@ -381,7 +381,7 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
 
 fn isRet(op: ir.Inst.Op) bool {
     return switch (op) {
-        .ret => true,
+        .ret, .ret_multi => true,
         else => false,
     };
 }
@@ -936,6 +936,15 @@ fn compileInst(
             try code.movRegImm32(.rax, 0);
             try stack.push(code, .rax);
         },
+        .call_result => {
+            // Stub in non-RA path: push 0 as placeholder.
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .ret_multi => {
+            // Stub in non-RA path: emit plain epilogue.
+            try code.emitEpilogue();
+        },
         .memory_init => {
             try stack.pop(code, .rax); // len
             try stack.pop(code, .rax); // src
@@ -1260,6 +1269,24 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         }
     }
 
+    // Multi-value returns: callee receives a hidden return pointer (HRP)
+    // as an implicit trailing user-arg. Save it to a fixed frame slot so
+    // `.ret_multi` can load it at function exit. HRP lives in
+    // param_regs[1 + func.param_count] if that fits, else on the caller's
+    // stack at the usual extra-arg location.
+    if (func.result_count > 1) {
+        const hrp_save_off: i32 = -@as(i32, @intCast((func.local_count + 2) * 8));
+        const max_reg_params_local: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+        if (func.param_count < max_reg_params_local) {
+            try code.movMemReg(.rbp, hrp_save_off, param_regs[1 + func.param_count]);
+        } else {
+            const stack_arg_base: i32 = if (comptime builtin.os.tag == .windows) 48 else 16;
+            const src_off: i32 = stack_arg_base + @as(i32, @intCast((func.param_count - max_reg_params_local) * 8));
+            try code.movRegMem(.rax, .rbp, src_off);
+            try code.movMemReg(.rbp, hrp_save_off, .rax);
+        }
+    }
+
     // Save callee-saved registers used by this function.
     // Win64: rsi, rdi, r12, r13. SysV: r12, r13.
     for (callee_saved_alloc, 0..) |reg, i| {
@@ -1296,7 +1323,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         const next_block_id: ?ir.BlockId = if (idx + 1 < func.blocks.items.len) @intCast(idx + 1) else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count);
         }
         // C3 fall-through peephole: if the block's terminator emitted a
         // trailing `E9 disp32` (br, or br_if's unconditional else) whose
@@ -1531,6 +1558,7 @@ fn compileInstRA(
     import_count: u32,
     used_caller_saved: *const [caller_saved_alloc.len]bool,
     used_callee_saved: *const [callee_saved_alloc.len]bool,
+    local_count: u32,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -1729,6 +1757,35 @@ fn compileInstRA(
             }
             try code.emitEpilogue();
         },
+        .ret_multi => |vregs| {
+            // First result → RAX; remaining → [HRP + (i-1)*8] where HRP is
+            // loaded from the saved-slot in the prologue. We stash HRP in
+            // r11 (non-allocatable scratch) to avoid conflicts with value
+            // regs. Load result vregs into rcx (also non-allocatable).
+            if (vregs.len == 0) {
+                // Degenerate; treat as plain ret.
+            } else {
+                // Move first result to rax.
+                const first_reg = try useVReg(code, alloc_result, vregs[0], .rax);
+                if (first_reg != .rax) try code.movRegReg(.rax, first_reg);
+            }
+            if (vregs.len > 1) {
+                const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                try code.movRegMem(.r11, .rbp, hrp_save_off); // load HRP
+                var i: u32 = 1;
+                while (i < vregs.len) : (i += 1) {
+                    const vr = try useVReg(code, alloc_result, vregs[i], .rcx);
+                    const off: i32 = @intCast((i - 1) * 8);
+                    try code.movMemReg(.r11, off, vr);
+                }
+            }
+            var ci: usize = callee_saved_alloc.len;
+            while (ci > 0) {
+                ci -= 1;
+                if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
+            }
+            try code.emitEpilogue();
+        },
 
         // ── Branches ──────────────────────────────────────────────────
         .br => |target| {
@@ -1810,12 +1867,19 @@ fn compileInstRA(
             // No push/pop: the allocator ensures no live vreg in a
             // caller-saved register spans this call instruction.
             const n_args: u32 = @intCast(cl.args.len);
-            const max_reg_args: u32 = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+            const has_hrp: bool = cl.extra_results > 0;
+            const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+            const hrp_in_reg: bool = has_hrp and (n_args < max_reg_slots);
+            const max_reg_args: u32 = @min(n_args, max_reg_slots);
             const extra: u32 = n_args - max_reg_args;
+            const hrp_on_stack: bool = has_hrp and !hrp_in_reg;
+            const hrp_stack_k: u32 = if (hrp_on_stack) n_args - max_reg_slots else 0;
+            const total_stack_args: u32 = extra + (if (hrp_on_stack) @as(u32, 1) else 0);
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
-            const stack_need: u32 = shadow + extra * 8;
+            const stack_need: u32 = shadow + total_stack_args * 8;
             // Keep rsp 16-aligned across the CALL (prologue established 16-alignment at rbp+8).
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
 
             if (cl.func_idx < import_count) {
                 // Import call: indirect via host_functions_ptr table in VmCtx.
@@ -1836,6 +1900,17 @@ fn compileInstRA(
                     try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
                 }
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                if (has_hrp) {
+                    if (hrp_in_reg) {
+                        const hrp_dst = param_regs[1 + n_args];
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    } else {
+                        try code.movRegReg(.r10, .rbp);
+                        try code.addRegImm32(.r10, scratch_base_off);
+                        try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                    }
+                }
                 try code.callReg(.rax);
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
             } else {
@@ -1849,6 +1924,17 @@ fn compileInstRA(
                     try code.movMemReg(.rsp, @intCast(shadow + j2 * 8), arg_reg);
                 }
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                if (has_hrp) {
+                    if (hrp_in_reg) {
+                        const hrp_dst = param_regs[1 + n_args];
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    } else {
+                        try code.movRegReg(.r10, .rbp);
+                        try code.addRegImm32(.r10, scratch_base_off);
+                        try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                    }
+                }
                 try code.emitByte(0xE8);
                 const patch_off = code.len();
                 try code.emitI32(0);
@@ -1889,11 +1975,18 @@ fn compileInstRA(
             try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
 
             const n_args: u32 = @intCast(ci.args.len);
-            const max_reg_args: u32 = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+            const has_hrp: bool = ci.extra_results > 0;
+            const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+            const hrp_in_reg: bool = has_hrp and (n_args < max_reg_slots);
+            const max_reg_args: u32 = @min(n_args, max_reg_slots);
             const extra: u32 = n_args - max_reg_args;
+            const hrp_on_stack: bool = has_hrp and !hrp_in_reg;
+            const hrp_stack_k: u32 = if (hrp_on_stack) n_args - max_reg_slots else 0;
+            const total_stack_args: u32 = extra + (if (hrp_on_stack) @as(u32, 1) else 0);
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
-            const stack_need: u32 = shadow + extra * 8;
+            const stack_need: u32 = shadow + total_stack_args * 8;
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
 
             if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
             // Stack args first; sources may live in regs we're about to overwrite.
@@ -1903,12 +1996,33 @@ fn compileInstRA(
                 try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
             }
             try emitCallRegArgMoves(code, alloc_result, ci.args, max_reg_args);
+            if (has_hrp) {
+                if (hrp_in_reg) {
+                    const hrp_dst = param_regs[1 + n_args];
+                    try code.movRegReg(hrp_dst, .rbp);
+                    try code.addRegImm32(hrp_dst, scratch_base_off);
+                } else {
+                    try code.movRegReg(.r10, .rbp);
+                    try code.addRegImm32(.r10, scratch_base_off);
+                    try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                }
+            }
             try code.callReg(.r11);
             if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
 
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
+        },
+
+        // ── Extra result of a preceding multi-value call ──────────────
+        .call_result => |idx| {
+            const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
+            const slot_off: i32 = scratch_base_off + @as(i32, @intCast(@as(u32, idx) * 8));
+            try code.movRegMem(dr, .rbp, slot_off);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Memory ────────────────────────────────────────────────────

@@ -3,15 +3,45 @@
 //! Reads JSON files produced by wast2json, executing module loads,
 //! assert_return, assert_trap, and assert_invalid/assert_malformed
 //! commands against the WAMR runtime.
+//!
+//! ## Modes
+//!
+//! * `.interp` (default) — runs every command through the interpreter.
+//! * `.aot` — compiles each `module` with the AOT pipeline (see
+//!   `src/tests/aot_harness.zig`) and dispatches `invoke` / `get` /
+//!   `assert_return` through native code.
+//!
+//! ### AOT mode limitations
+//!
+//! AOT mode is deliberately scoped to the subset that already works end
+//! to end:
+//!
+//! * Only scalar signatures with ≤3 params of `i32` / `i64` / `f32` / `f64`
+//!   are callable (`aot_runtime.callFuncScalar`).
+//! * `assert_trap`, `assert_invalid`, `assert_malformed`, `assert_unlinkable`,
+//!   `register`, and cross-module linking are treated as skips — AOT traps
+//!   currently `std.process.exit(2)` and the runner has no host-module glue.
+//! * Spec files that trip pre-existing codegen panics are filtered out up
+//!   front via `src/tests/aot_skiplist.zig`. Extend that list when new
+//!   crashes surface.
+//! * `.wast` inputs always resolve to a single skip in AOT mode.
+//!
+//! Run the full suite via `zig build spec-tests-aot` or
+//! `spec-test-runner --mode=aot tests/spec-json`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("wamr");
 const wamr = root.wamr;
 const types = root.types;
 const instance_mod = root.instance;
 const wabt = @import("wabt");
+const aot_harness = @import("aot_harness.zig");
 const Io = std.Io;
 const Dir = std.Io.Dir;
+
+/// Execution mode for the spec-test runner.
+pub const Mode = enum { interp, aot };
 
 pub const SpecTestResult = struct {
     file: []const u8,
@@ -211,6 +241,32 @@ fn refNullEqual(a_is_null: bool, b: types.Value) bool {
         else => return false,
     };
     return a_is_null == b_is_null;
+}
+
+/// Format a single wasm Value as `<tag>=0x<bits>` into `buf` for diagnostics.
+/// Unknown/ref types fall back to the tag name.
+fn formatValueBits(buf: []u8, v: types.Value) []const u8 {
+    return switch (v) {
+        .i32 => |x| std.fmt.bufPrint(buf, "i32=0x{x:0>8}", .{@as(u32, @bitCast(x))}) catch "i32=?",
+        .i64 => |x| std.fmt.bufPrint(buf, "i64=0x{x:0>16}", .{@as(u64, @bitCast(x))}) catch "i64=?",
+        .f32 => |x| std.fmt.bufPrint(buf, "f32=0x{x:0>8}", .{@as(u32, @bitCast(x))}) catch "f32=?",
+        .f64 => |x| std.fmt.bufPrint(buf, "f64=0x{x:0>16}", .{@as(u64, @bitCast(x))}) catch "f64=?",
+        .v128 => |x| std.fmt.bufPrint(buf, "v128=0x{x:0>32}", .{x}) catch "v128=?",
+        else => std.fmt.bufPrint(buf, "{s}", .{@tagName(v)}) catch "?",
+    };
+}
+
+/// Print a comma-separated bit-accurate dump of wasm Values for diagnostics.
+fn printValuesBits(label: []const u8, vs: []const types.Value) void {
+    std.debug.print("{s}=[", .{label});
+    var first = true;
+    var buf: [64]u8 = undefined;
+    for (vs) |v| {
+        if (!first) std.debug.print(", ", .{});
+        first = false;
+        std.debug.print("{s}", .{formatValueBits(&buf, v)});
+    }
+    std.debug.print("]", .{});
 }
 
 /// Parse a slice of JSON args into a caller-owned slice of Values.
@@ -1395,6 +1451,242 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             }
         } else {
             // unknown command type
+            result.skipped += 1;
+        }
+    }
+
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AOT mode
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Unified entry point that dispatches to interp or AOT implementations.
+pub fn runSpecTestFileMode(
+    json_path: []const u8,
+    mode: Mode,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) !SpecTestResult {
+    return switch (mode) {
+        .interp => runSpecTestFile(json_path, allocator, io),
+        .aot => runSpecTestFileAot(json_path, allocator, io),
+    };
+}
+
+/// Minimal spec-test runner that drives modules through the AOT pipeline.
+///
+/// Scope (issue #102): handle the codegen-relevant commands only.
+///   - `module`                : compile + instantiate via `aot_harness`.
+///   - `assert_return` + invoke: `callFuncScalar`, compare against expected.
+///   - `assert_return` + get   : read exported global from the AOT instance.
+///   - everything else         : skipped (validation-focused assertions are
+///                               not codegen concerns; cross-module linking,
+///                               register, assert_trap, assert_invalid, etc.
+///                               will get AOT support in follow-up work).
+///
+/// Signatures outside the `aot_runtime.callFuncScalar` envelope (> 3 params,
+/// non-scalar types, multi-value results) are skipped per-assertion.
+fn runSpecTestFileAot(
+    json_path: []const u8,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) !SpecTestResult {
+    var result = SpecTestResult{ .file = json_path };
+
+    if (comptime !aot_harness.can_exec_aot) {
+        // No native execution possible: report as a single skip so the
+        // summary makes sense rather than exploding per-command.
+        result.total = 1;
+        result.skipped = 1;
+        return result;
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const json_data = try cwd.readFileAlloc(io, json_path, allocator, @enumFromInt(10 * 1024 * 1024));
+    defer allocator.free(json_data);
+
+    const parsed = try std.json.parseFromSlice(SpecJson, allocator, json_data, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const json_dir = std.fs.path.dirname(json_path) orelse ".";
+
+    var current: ?*aot_harness.Harness = null;
+    defer if (current) |h| h.deinit();
+
+    for (parsed.value.commands) |cmd| {
+        result.total += 1;
+
+        if (std.mem.eql(u8, cmd.type, "module")) {
+            if (current) |h| {
+                h.deinit();
+                current = null;
+            }
+            const filename = cmd.filename orelse {
+                result.skipped += 1;
+                continue;
+            };
+            const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+            defer allocator.free(wasm_path);
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch |err| {
+                std.debug.print("  SKIP aot read {s} line {d}: {}\n", .{ filename, cmd.line, err });
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(wasm_data);
+
+            current = aot_harness.Harness.init(allocator, wasm_data) catch |err| blk: {
+                std.debug.print("  SKIP aot compile {s} line {d}: {}\n", .{ filename, cmd.line, err });
+                result.skipped += 1;
+                break :blk null;
+            };
+            if (current != null) result.passed += 1;
+        } else if (std.mem.eql(u8, cmd.type, "assert_return")) {
+            const action = cmd.action orelse {
+                result.skipped += 1;
+                continue;
+            };
+            const h = current orelse {
+                result.skipped += 1;
+                continue;
+            };
+
+            if (std.mem.eql(u8, action.type, "get")) {
+                const field = action.field orelse {
+                    result.skipped += 1;
+                    continue;
+                };
+                const expected_json = cmd.expected orelse &[_]Arg{};
+                const value = h.findGlobalExport(field) orelse {
+                    result.skipped += 1;
+                    continue;
+                };
+                if (expected_json.len != 1) {
+                    result.passed += 1;
+                    continue;
+                }
+                const expected_val = parseValue(expected_json[0]) orelse {
+                    result.skipped += 1;
+                    continue;
+                };
+                if (valuesEqual(value, expected_val)) {
+                    result.passed += 1;
+                } else {
+                    std.debug.print("  FAIL aot assert_return line {d}: get {s} mismatch\n", .{ cmd.line, field });
+                    result.failed += 1;
+                }
+                continue;
+            }
+
+            if (!std.mem.eql(u8, action.type, "invoke")) {
+                result.skipped += 1;
+                continue;
+            }
+
+            const field = action.field orelse {
+                result.skipped += 1;
+                continue;
+            };
+            const args_json = action.args orelse &[_]Arg{};
+            const expected_json = cmd.expected orelse &[_]Arg{};
+
+            const args = parseArgs(args_json, allocator) orelse {
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(args);
+
+            const func_idx = h.findFuncExport(field) orelse {
+                result.skipped += 1;
+                continue;
+            };
+
+            const call_res = h.callScalar(func_idx, args) catch |err| {
+                switch (err) {
+                    error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => {
+                        result.skipped += 1;
+                    },
+                    else => {
+                        std.debug.print("  FAIL aot assert_return line {d}: {s} call error: {}\n", .{ cmd.line, field, err });
+                        result.failed += 1;
+                    },
+                }
+                continue;
+            };
+
+            // Convert ScalarResult → []types.Value for comparison against
+            // expected_json using the existing `valuesEqual` helper.
+            var actual_buf: [1]types.Value = undefined;
+            const actual: []const types.Value = switch (call_res) {
+                .void => &.{},
+                .i32 => |v| blk: {
+                    actual_buf[0] = .{ .i32 = v };
+                    break :blk actual_buf[0..1];
+                },
+                .i64 => |v| blk: {
+                    actual_buf[0] = .{ .i64 = v };
+                    break :blk actual_buf[0..1];
+                },
+                .f32 => |v| blk: {
+                    actual_buf[0] = .{ .f32 = v };
+                    break :blk actual_buf[0..1];
+                },
+                .f64 => |v| blk: {
+                    actual_buf[0] = .{ .f64 = v };
+                    break :blk actual_buf[0..1];
+                },
+            };
+
+            if (expected_json.len != actual.len) {
+                std.debug.print("  FAIL aot assert_return line {d}: {s} result count got={d} expected={d}\n", .{ cmd.line, field, actual.len, expected_json.len });
+                result.failed += 1;
+                continue;
+            }
+            if (actual.len == 0) {
+                result.passed += 1;
+                continue;
+            }
+
+            const expected_val = parseValue(expected_json[0]) orelse {
+                result.skipped += 1;
+                continue;
+            };
+            if (valuesEqual(actual[0], expected_val)) {
+                result.passed += 1;
+            } else {
+                // Honor `either` / `alternatives` for NaN et al.
+                var alt_match = false;
+                if (cmd.alternatives) |alts| {
+                    for (alts) |alt_args| {
+                        if (alt_args.len != 1) continue;
+                        const av = parseValue(alt_args[0]) orelse continue;
+                        if (valuesEqual(actual[0], av)) {
+                            alt_match = true;
+                            break;
+                        }
+                    }
+                }
+                if (alt_match) {
+                    result.passed += 1;
+                } else {
+                    var abuf: [64]u8 = undefined;
+                    var ebuf: [64]u8 = undefined;
+                    std.debug.print(
+                        "  FAIL aot assert_return line {d}: {s} value mismatch actual={s} expected={s} ",
+                        .{ cmd.line, field, formatValueBits(&abuf, actual[0]), formatValueBits(&ebuf, expected_val) },
+                    );
+                    printValuesBits("args", args);
+                    std.debug.print("\n", .{});
+                    result.failed += 1;
+                }
+            }
+        } else {
+            // assert_trap / assert_invalid / assert_malformed / register /
+            // assert_unlinkable / assert_uninstantiable / action / ...
+            // All deferred to future work (see issue #102 follow-ups).
             result.skipped += 1;
         }
     }

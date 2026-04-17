@@ -163,6 +163,15 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(spec_runner_exe);
 
+    // Run the spec suite through the AOT pipeline. Non-blocking convenience
+    // step; not wired into the default `test` aggregate while codegen gaps
+    // and the skiplist stabilize (see src/tests/aot_skiplist.zig).
+    const run_spec_aot = b.addRunArtifact(spec_runner_exe);
+    run_spec_aot.addArg("--mode=aot");
+    run_spec_aot.addArg("tests/spec-json");
+    const spec_aot_step = b.step("spec-tests-aot", "Run the spec-json suite through the AOT pipeline");
+    spec_aot_step.dependOn(&run_spec_aot.step);
+
     // ── Tests ──────────────────────────────────────────────────────────
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),

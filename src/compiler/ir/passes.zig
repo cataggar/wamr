@@ -203,6 +203,12 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .br_if => |*bi| if (bi.cond == old) { bi.cond = new; },
         .br_table => |*bt| if (bt.index == old) { bt.index = new; },
         .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { if (v == old) maybe_vreg.* = new; },
+        .ret_multi => |vregs| {
+            for (@constCast(vregs)) |*v| {
+                if (v.* == old) v.* = new;
+            }
+        },
+        .call_result => {},
         .call => |cl| {
             for (@constCast(cl.args)) |*arg| {
                 if (arg.* == old) arg.* = new;

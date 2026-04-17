@@ -190,9 +190,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         switch (op) {
             .end => {
                 if (block_stack.items.len == 0) {
-                    // Function-level end: emit ret
-                    const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                    // Function-level end: emit ret (single or multi-value)
+                    if (result_count > 1) {
+                        var rets = try allocator.alloc(ir.VReg, result_count);
+                        var k: u32 = 0;
+                        while (k < result_count) : (k += 1) {
+                            rets[result_count - 1 - k] = safePop(&vreg_stack);
+                        }
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
+                    } else {
+                        const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                    }
                     break;
                 }
                 // End of a block/loop/if: store result to synthetic local, branch to continuation
@@ -215,8 +224,17 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 }
             },
             .@"return" => {
-                const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                if (result_count > 1) {
+                    var rets = try allocator.alloc(ir.VReg, result_count);
+                    var k: u32 = 0;
+                    while (k < result_count) : (k += 1) {
+                        rets[result_count - 1 - k] = safePop(&vreg_stack);
+                    }
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
+                } else {
+                    const ret_val: ?ir.VReg = if (vreg_stack.items.len > 0) safePop(&vreg_stack) else null;
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
+                }
                 dead_code = true;
             },
             .@"unreachable" => {
@@ -382,12 +400,35 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     args[arg_count - 1 - i] = safePop(&vreg_stack);
                 }
                 const dest = ir_func.newVReg();
+                const extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call = .{
                     .func_idx = func_idx,
                     .args = args,
+                    .extra_results = extra_results,
                 } }, .dest = dest, .type = result_ir_type });
                 if (call_result_count > 0) {
                     try vreg_stack.append(allocator, dest);
+                }
+                // Emit .call_result ops for extra results (i = 0..extra_results-1
+                // maps to callee result index i+1). Types come from callee_type.results.
+                if (extra_results > 0) {
+                    var ri: u32 = 1;
+                    while (ri < call_result_count) : (ri += 1) {
+                        const extra_dest = ir_func.newVReg();
+                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
+                            .i32 => .i32,
+                            .i64 => .i64,
+                            .f32 => .f32,
+                            .f64 => .f64,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .call_result = @intCast(ri - 1) },
+                            .dest = extra_dest,
+                            .type = extra_ty,
+                        });
+                        try vreg_stack.append(allocator, extra_dest);
+                    }
                 }
             },
             .i32_const => {
@@ -675,14 +716,35 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     }
                 else
                     .i32;
+                const ind_extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .call_indirect = .{
                     .type_idx = type_idx,
                     .elem_idx = elem_idx,
                     .args = args,
+                    .extra_results = ind_extra_results,
                 } }, .dest = dest, .type = ind_result_type });
 
                 if (call_result_count > 0) {
                     try vreg_stack.append(allocator, dest);
+                }
+                if (ind_extra_results > 0) {
+                    var ri: u32 = 1;
+                    while (ri < call_result_count) : (ri += 1) {
+                        const extra_dest = ir_func.newVReg();
+                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
+                            .i32 => .i32,
+                            .i64 => .i64,
+                            .f32 => .f32,
+                            .f64 => .f64,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .call_result = @intCast(ri - 1) },
+                            .dest = extra_dest,
+                            .type = extra_ty,
+                        });
+                        try vreg_stack.append(allocator, extra_dest);
+                    }
                 }
             },
             .memory_size => {

@@ -635,10 +635,12 @@ fn resolveHostFunctions(
     var func_idx: u32 = 0;
     for (module.imports) |imp| {
         if (imp.kind == .function) {
-            if (func_idx < module.import_function_count and
-                host_bridge.isWasiModule(imp.module_name))
-            {
-                host_fns[func_idx] = host_bridge.resolveAotHostFunction(imp.field_name);
+            if (func_idx < module.import_function_count) {
+                if (host_bridge.isWasiModule(imp.module_name)) {
+                    host_fns[func_idx] = host_bridge.resolveAotHostFunction(imp.field_name);
+                } else if (host_bridge.isSpectestModule(imp.module_name)) {
+                    host_fns[func_idx] = host_bridge.resolveAotSpectestFunction(imp.field_name);
+                }
             }
             func_idx += 1;
         }

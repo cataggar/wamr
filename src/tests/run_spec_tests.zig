@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const spec_json_runner = @import("spec_json_runner.zig");
+const aot_skiplist = @import("aot_skiplist.zig");
 
 const Dir = std.Io.Dir;
 const print = std.debug.print;
@@ -20,21 +21,47 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    if (args.len < 2) {
-        print("Usage: spec-test-runner <dir-or-file>\n", .{});
+    // Parse `--mode=interp|aot` (optional; default interp). Remaining
+    // positional arg is the test path.
+    var mode: spec_json_runner.Mode = .interp;
+    var test_path_opt: ?[]const u8 = null;
+    for (args[1..]) |a| {
+        if (std.mem.startsWith(u8, a, "--mode=")) {
+            const v = a["--mode=".len..];
+            if (std.mem.eql(u8, v, "interp")) {
+                mode = .interp;
+            } else if (std.mem.eql(u8, v, "aot")) {
+                mode = .aot;
+            } else {
+                print("Unknown mode '{s}' (expected interp|aot)\n", .{v});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, a, "--mode")) {
+            print("--mode requires =interp or =aot\n", .{});
+            std.process.exit(1);
+        } else if (test_path_opt == null) {
+            test_path_opt = a;
+        } else {
+            print("Unexpected argument: {s}\n", .{a});
+            std.process.exit(1);
+        }
+    }
+
+    if (test_path_opt == null) {
+        print("Usage: spec-test-runner [--mode=interp|aot] <dir-or-file>\n", .{});
         print("  Accepts a directory of .json/.wast files or a single .wast file\n", .{});
         std.process.exit(1);
     }
-    const test_path = args[1];
+    const test_path = test_path_opt.?;
 
-    print("\n=== WebAssembly Spec Test Runner ===\n\n", .{});
+    print("\n=== WebAssembly Spec Test Runner ({s}) ===\n\n", .{@tagName(mode)});
 
     // Check if argument is a single file
     if (std.mem.endsWith(u8, test_path, ".wast") or std.mem.endsWith(u8, test_path, ".json")) {
         const result = if (std.mem.endsWith(u8, test_path, ".wast"))
-            runWastFile(test_path, allocator, io)
+            runWastFile(test_path, mode, allocator, io)
         else
-            spec_json_runner.runSpecTestFile(test_path, allocator, io) catch |err| {
+            spec_json_runner.runSpecTestFileMode(test_path, mode, allocator, io) catch |err| {
                 print("ERROR: {}\n", .{err});
                 std.process.exit(1);
             };
@@ -88,7 +115,8 @@ pub fn main(init: std.process.Init) !void {
         const full_path = try std.fs.path.join(allocator, &.{ test_path, name });
         defer allocator.free(full_path);
 
-        // Skip files known to cause panics (IP misalignment issues)
+        // Skip files known to cause panics (IP misalignment issues for
+        // interp, codegen assertion failures for AOT).
         const skip_files = [_][]const u8{"memory_trap64.wast"};
         var should_skip = false;
         for (skip_files) |skip| {
@@ -97,6 +125,9 @@ pub fn main(init: std.process.Init) !void {
                 break;
             }
         }
+        if (!should_skip and mode == .aot and aot_skiplist.isSkippedInAot(name)) {
+            should_skip = true;
+        }
         if (should_skip) {
             print("  {s:<25} SKIP (known panic)\n", .{name});
             continue;
@@ -104,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
 
         if (std.mem.endsWith(u8, name, ".json")) {
             // Legacy JSON format
-            const result = spec_json_runner.runSpecTestFile(full_path, allocator, io) catch |err| {
+            const result = spec_json_runner.runSpecTestFileMode(full_path, mode, allocator, io) catch |err| {
                 print("  {s:<25} ERROR: {}\n", .{ name, err });
                 continue;
             };
@@ -116,7 +147,7 @@ pub fn main(init: std.process.Init) !void {
             file_count += 1;
         } else if (std.mem.endsWith(u8, name, ".wast")) {
             // Native .wast format — use wabt to run
-            const result = runWastFile(full_path, allocator, io);
+            const result = runWastFile(full_path, mode, allocator, io);
             printResult(name, result);
             total_passed += result.passed;
             total_failed += result.failed;
@@ -156,7 +187,13 @@ fn printResult(name: []const u8, result: TestResult) void {
 }
 
 /// Run a .wast file using wabt's parser + interpreter for conformance.
-fn runWastFile(path: []const u8, allocator: std.mem.Allocator, io: std.Io) TestResult {
+/// In AOT mode, .wast files are currently skipped (see issue #102 —
+/// a .wast-aware AOT harness is follow-up work).
+fn runWastFile(path: []const u8, mode: spec_json_runner.Mode, allocator: std.mem.Allocator, io: std.Io) TestResult {
+    if (mode == .aot) {
+        // Reported as a single skip so summary counters make sense.
+        return .{ .file = path, .passed = 0, .failed = 0, .skipped = 1, .total = 1 };
+    }
     const wast_runner = @import("wast_runner.zig");
     const source = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, @enumFromInt(64 * 1024 * 1024)) catch {
         return .{ .file = path, .passed = 0, .failed = 0, .skipped = 1, .total = 1 };

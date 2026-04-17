@@ -82,11 +82,26 @@ pub const Inst = struct {
         br_if: struct { cond: VReg, then_block: BlockId, else_block: BlockId },
         br_table: struct { index: VReg, targets: []const BlockId, default: BlockId },
         ret: ?VReg,
+        // Multi-value return: first VReg -> RAX, remaining written to
+        // memory via the hidden return pointer passed by the caller.
+        ret_multi: []const VReg,
         @"unreachable": void,
 
-        // Function calls
-        call: struct { func_idx: u32, args: []const VReg = &.{} },
-        call_indirect: struct { type_idx: u32, elem_idx: VReg, args: []const VReg = &.{} },
+        // Function calls. `extra_results` is the number of additional
+        // results beyond the one returned in RAX (i.e. callee.result_count - 1).
+        // When > 0, the caller passes a hidden return pointer as an implicit
+        // trailing argument; the callee writes extras into [hrp + i*8], and
+        // the caller retrieves them via `.call_result` ops emitted right
+        // after the call. The primary result is delivered in `inst.dest` as
+        // before (via RAX).
+        call: struct { func_idx: u32, args: []const VReg = &.{}, extra_results: u8 = 0 },
+        call_indirect: struct { type_idx: u32, elem_idx: VReg, args: []const VReg = &.{}, extra_results: u8 = 0 },
+
+        // Retrieve the i-th extra result (i is 0-based among extras; i=0 is
+        // the callee's 2nd result). Must immediately follow the corresponding
+        // `.call`/`.call_indirect`. `inst.dest` receives the value; codegen
+        // reads it from the caller's pre-reserved scratch slot.
+        call_result: u8,
 
         // Parametric
         select: struct { cond: VReg, if_true: VReg, if_false: VReg },

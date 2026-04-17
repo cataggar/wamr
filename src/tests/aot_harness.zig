@@ -175,6 +175,21 @@ fn compileToAot(
         });
     }
 
+    // Propagate the wasm module's imports so the loaded AOT module has the
+    // correct `import_function_count`. Without this, exported local-function
+    // indices (which include imports in their index space) fail to resolve in
+    // `getFuncAddr` — e.g. names.3.wasm exports `print32` at func_idx=2 after
+    // two spectest imports; skipping imports turns that into out-of-range.
+    var import_entries: std.ArrayList(emit_aot.ImportEntry) = .empty;
+    for (module.imports) |imp| {
+        try import_entries.append(a, .{
+            .module_name = imp.module_name,
+            .field_name = imp.field_name,
+            .kind = @enumFromInt(@intFromEnum(imp.kind)),
+            .func_type_idx = imp.func_type_idx orelse 0,
+        });
+    }
+
     var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
     for (module.memories) |mem| {
         try mem_entries.append(a, .{
@@ -212,7 +227,7 @@ fn compileToAot(
         exports.items,
         .{ .arch = arch_name },
         null,
-        null,
+        if (import_entries.items.len > 0) import_entries.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
         if (global_entries.items.len > 0) global_entries.items else null,
         null,

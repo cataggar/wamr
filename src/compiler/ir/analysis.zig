@@ -165,6 +165,10 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .br_if => |bi| live.put(bi.cond, {}) catch {},
         .br_table => |bt| live.put(bt.index, {}) catch {},
         .ret => |maybe_vreg| if (maybe_vreg) |v| live.put(v, {}) catch {},
+        .ret_multi => |vregs| {
+            for (vregs) |v| live.put(v, {}) catch {};
+        },
+        .call_result => {},
         .call => |cl| {
             for (cl.args) |arg| live.put(arg, {}) catch {};
         },
@@ -347,6 +351,10 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .br_if => |bi| last_use.put(bi.cond, pos) catch {},
         .br_table => |bt| last_use.put(bt.index, pos) catch {},
         .ret => |maybe_vreg| if (maybe_vreg) |v| last_use.put(v, pos) catch {},
+        .ret_multi => |vregs| {
+            for (vregs) |v| last_use.put(v, pos) catch {};
+        },
+        .call_result => {},
         .call => |cl| {
             for (cl.args) |arg| last_use.put(arg, pos) catch {};
         },
