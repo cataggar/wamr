@@ -48,6 +48,10 @@ const vmctx_mem_pages_field: i32 = 56; // VmCtx.memory_pages offset (u32)
 const vmctx_mem_grow_fn_field: i32 = 64; // VmCtx.mem_grow_fn offset (usize)
 const vmctx_instance_ptr_field: i32 = 72; // VmCtx.instance_ptr offset (usize)
 const vmctx_trap_oob_fn_field: i32 = 80; // VmCtx.trap_oob_fn offset (usize)
+const vmctx_trap_unreachable_fn_field: i32 = 88;
+const vmctx_trap_idivz_fn_field: i32 = 96;
+const vmctx_trap_iovf_fn_field: i32 = 104;
+const vmctx_trap_ivc_fn_field: i32 = 112;
 
 /// Emit the compare-and-trap tail of a bounds check.
 ///
@@ -76,6 +80,104 @@ fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
     try code.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
     try code.callReg(.rax);
     // over_trap:
+}
+
+/// Emit an unconditional call to a non-returning trap helper at
+/// `[r10 + field_offset]` (where r10 holds vmctx*). Used for
+/// unreachable, divide-by-zero, integer overflow, and invalid
+/// float→int conversion traps.
+fn emitTrapHelperCall(code: *emit.CodeBuffer, field_offset: i32) !void {
+    try code.movRegReg(param_regs[0], .r10);
+    try code.movRegMem(.rax, param_regs[0], field_offset);
+    try code.callReg(.rax);
+}
+
+/// Emit a conditional skip over a trap-invalid-conversion call.
+/// `skip_cond_byte` is the second byte of a 0x0F-prefixed rel32 Jcc that
+/// branches past the trap when it evaluates to true (i.e. the "safe"
+/// condition). When false, fall through into the noreturn trap call.
+fn emitSkipIvcOnCond(code: *emit.CodeBuffer, skip_cond_byte: u8) !void {
+    try code.emitSlice(&.{ 0x0F, skip_cond_byte });
+    const p = code.len();
+    try code.emitI32(0);
+    try emitTrapHelperCall(code, vmctx_trap_ivc_fn_field);
+    const after = code.len();
+    code.patchI32(p, @intCast(@as(i64, @intCast(after)) - @as(i64, @intCast(p + 4))));
+}
+
+/// Emit NaN + range checks for a non-saturating float→int trunc.
+/// Source float is in xmm0 (rax-aliased); uses xmm1 (rcx) and r11.
+/// On any failing check, calls trap_ivc_fn (noreturn). Otherwise falls
+/// through with xmm0 preserved.
+fn emitTruncRangeCheck(
+    code: *emit.CodeBuffer,
+    dst_is_i32: bool,
+    is_signed: bool,
+    is_f32: bool,
+) !void {
+    // NaN check: ucomi* xmm0, xmm0 sets PF=1 iff unordered. JNP skips trap.
+    if (is_f32) try code.ucomiss(.rax, .rax) else try code.ucomisd(.rax, .rax);
+    try emitSkipIvcOnCond(code, 0x8B); // JNP rel32
+
+    // Lower bound
+    const MinInfo = struct { bits: u64, inclusive_trap: bool };
+    const min_info: MinInfo = if (is_signed) blk: {
+        if (dst_is_i32) {
+            if (is_f32) {
+                break :blk .{ .bits = 0xCF000000, .inclusive_trap = false };
+            } else {
+                // f64 can represent -2^31 - 1 exactly; use inclusive trap.
+                break :blk .{ .bits = 0xC1E0000000200000, .inclusive_trap = true };
+            }
+        } else {
+            break :blk if (is_f32)
+                .{ .bits = 0xDF000000, .inclusive_trap = false }
+            else
+                .{ .bits = 0xC3E0000000000000, .inclusive_trap = false };
+        }
+    } else blk: {
+        // Unsigned: -1.0 inclusive
+        break :blk if (is_f32)
+            .{ .bits = 0xBF800000, .inclusive_trap = true }
+        else
+            .{ .bits = 0xBFF0000000000000, .inclusive_trap = true };
+    };
+    if (is_f32) {
+        try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(min_info.bits))));
+        try code.movdToXmm(.rcx, .r11);
+        try code.ucomiss(.rax, .rcx);
+    } else {
+        try code.movRegImm64(.r11, min_info.bits);
+        try code.movqToXmm(.rcx, .r11);
+        try code.ucomisd(.rax, .rcx);
+    }
+    // Strict (JB traps) -> skip with JNB (0x83). Inclusive (JBE traps) -> skip with JA (0x87).
+    try emitSkipIvcOnCond(code, if (min_info.inclusive_trap) @as(u8, 0x87) else @as(u8, 0x83));
+
+    // Upper bound: always JAE traps -> skip with JB (0x82).
+    const max_bits: u64 = if (is_signed) blk: {
+        if (dst_is_i32) {
+            break :blk if (is_f32) @as(u64, 0x4F000000) else @as(u64, 0x41E0000000000000);
+        } else {
+            break :blk if (is_f32) @as(u64, 0x5F000000) else @as(u64, 0x43E0000000000000);
+        }
+    } else blk: {
+        if (dst_is_i32) {
+            break :blk if (is_f32) @as(u64, 0x4F800000) else @as(u64, 0x41F0000000000000);
+        } else {
+            break :blk if (is_f32) @as(u64, 0x5F800000) else @as(u64, 0x43F0000000000000);
+        }
+    };
+    if (is_f32) {
+        try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(max_bits))));
+        try code.movdToXmm(.rcx, .r11);
+        try code.ucomiss(.rax, .rcx);
+    } else {
+        try code.movRegImm64(.r11, max_bits);
+        try code.movqToXmm(.rcx, .r11);
+        try code.ucomisd(.rax, .rcx);
+    }
+    try emitSkipIvcOnCond(code, 0x82); // JB rel32
 }
 
 /// Emit an inline wasm-memory bounds check.
@@ -647,7 +749,7 @@ fn compileInst(
             try code.emitEpilogue();
         },
 
-        .@"unreachable" => try code.int3(),
+        .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field),
 
         // ── Select (conditional move) ─────────────────────────────────
         .select => {
@@ -2222,84 +2324,103 @@ fn compileInstRA(
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
 
-            // Zero divisor check
+            // Zero divisor check: if rcx == 0, call the trap helper.
+            //   test rcx, rcx
+            //   jne not_zero  (rel32)
+            //   call trap_idivz
+            // not_zero:
             try code.testRegReg(.rcx, .rcx);
-            try code.emitSlice(&.{ 0x0F, 0x84 }); // JZ rel32
-            const skip_patch = code.len();
+            try code.emitSlice(&.{ 0x0F, 0x85 }); // JNE rel32
+            const notzero_patch = code.len();
             try code.emitI32(0);
+            try emitTrapHelperCall(code, vmctx_trap_idivz_fn_field);
+            const notzero_off = code.len();
+            code.patchI32(notzero_patch, @intCast(@as(i64, @intCast(notzero_off)) - @as(i64, @intCast(notzero_patch + 4))));
+
+            const is_rem = (inst.op == .rem_s or inst.op == .rem_u);
 
             switch (inst.op) {
                 .div_s, .rem_s => {
                     if (inst.type == .i32) {
-                        // Guard against INT_MIN / -1 hardware #DE:
-                        //   cmp ecx, -1                 83 F9 FF
-                        //   jne do_div  (+11)           75 0B
-                        //   cmp eax, 0x80000000         3D 00 00 00 80
-                        //   jne do_div  (+4)            75 04
-                        //   xor edx, edx                31 D2
-                        //   jmp after   (+3)            EB 03
+                        // Guard against INT_MIN / -1: div_s traps, rem_s returns 0.
+                        //   cmp ecx, -1
+                        //   jne do_div
+                        //   cmp eax, 0x80000000
+                        //   jne do_div
+                        //   (INT_MIN/-1 case:)
+                        //     rem_s: xor edx, edx; jmp after
+                        //     div_s: call trap_iovf
                         // do_div:
-                        //   cdq                         99
-                        //   idiv ecx                    F7 F9
+                        //   cdq
+                        //   idiv ecx
                         // after:
-                        try code.emitSlice(&.{
-                            0x83, 0xF9, 0xFF,
-                            0x75, 0x0B,
-                            0x3D, 0x00, 0x00, 0x00, 0x80,
-                            0x75, 0x04,
-                            0x31, 0xD2,
-                            0xEB, 0x03,
-                            0x99,
-                            0xF7, 0xF9,
-                        });
+                        try code.emitSlice(&.{ 0x83, 0xF9, 0xFF }); // cmp ecx, -1
+                        try code.emitSlice(&.{ 0x0F, 0x85 }); // jne rel32
+                        const dodiv_patch = code.len();
+                        try code.emitI32(0);
+                        try code.emitSlice(&.{ 0x3D, 0x00, 0x00, 0x00, 0x80 }); // cmp eax, INT_MIN
+                        try code.emitSlice(&.{ 0x0F, 0x85 }); // jne rel32
+                        const dodiv_patch2 = code.len();
+                        try code.emitI32(0);
+                        var after_patch: usize = 0;
+                        if (is_rem) {
+                            try code.emitSlice(&.{ 0x31, 0xD2 }); // xor edx, edx
+                            try code.emitSlice(&.{ 0xE9 }); // jmp rel32
+                            after_patch = code.len();
+                            try code.emitI32(0);
+                        } else {
+                            try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
+                        }
+                        const dodiv_off = code.len();
+                        code.patchI32(dodiv_patch, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch + 4))));
+                        code.patchI32(dodiv_patch2, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch2 + 4))));
+                        try code.emitSlice(&.{ 0x99 }); // cdq
+                        try code.emitSlice(&.{ 0xF7, 0xF9 }); // idiv ecx
+                        if (is_rem) {
+                            const after_off = code.len();
+                            code.patchI32(after_patch, @intCast(@as(i64, @intCast(after_off)) - @as(i64, @intCast(after_patch + 4))));
+                        }
                     } else {
-                        // Guard against INT64_MIN / -1 hardware #DE:
-                        //   cmp rcx, -1                 48 83 F9 FF
-                        //   jne do_div  (+19)           75 13
-                        //   movabs r11, 0x8000...       49 BB 00 00 00 00 00 00 00 80
-                        //   cmp rax, r11                4C 39 D8
-                        //   jne do_div  (+4)            75 04
-                        //   xor edx, edx                31 D2
-                        //   jmp after  (+5)             EB 05
-                        // do_div:
-                        //   cqo                         48 99
-                        //   idiv rcx                    48 F7 F9
-                        // after:
-                        try code.emitSlice(&.{
-                            0x48, 0x83, 0xF9, 0xFF,
-                            0x75, 0x13,
-                            0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
-                            0x4C, 0x39, 0xD8,
-                            0x75, 0x04,
-                            0x31, 0xD2,
-                            0xEB, 0x05,
-                            0x48, 0x99,
-                            0x48, 0xF7, 0xF9,
-                        });
+                        try code.emitSlice(&.{ 0x48, 0x83, 0xF9, 0xFF }); // cmp rcx, -1
+                        try code.emitSlice(&.{ 0x0F, 0x85 });
+                        const dodiv_patch = code.len();
+                        try code.emitI32(0);
+                        // movabs r11, INT64_MIN
+                        try code.emitSlice(&.{ 0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 });
+                        try code.emitSlice(&.{ 0x4C, 0x39, 0xD8 }); // cmp rax, r11
+                        try code.emitSlice(&.{ 0x0F, 0x85 });
+                        const dodiv_patch2 = code.len();
+                        try code.emitI32(0);
+                        var after_patch: usize = 0;
+                        if (is_rem) {
+                            try code.emitSlice(&.{ 0x31, 0xD2 });
+                            try code.emitSlice(&.{ 0xE9 });
+                            after_patch = code.len();
+                            try code.emitI32(0);
+                        } else {
+                            try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
+                        }
+                        const dodiv_off = code.len();
+                        code.patchI32(dodiv_patch, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch + 4))));
+                        code.patchI32(dodiv_patch2, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch2 + 4))));
+                        try code.emitSlice(&.{ 0x48, 0x99 }); // cqo
+                        try code.emitSlice(&.{ 0x48, 0xF7, 0xF9 }); // idiv rcx
+                        if (is_rem) {
+                            const after_off = code.len();
+                            code.patchI32(after_patch, @intCast(@as(i64, @intCast(after_off)) - @as(i64, @intCast(after_patch + 4))));
+                        }
                     }
                 },
                 .div_u, .rem_u => {
                     try code.movRegImm32(.rdx, 0);
                     if (inst.type == .i32) {
-                        // div ecx: F7 F1 (no REX.W, 32-bit form)
-                        try code.emitSlice(&.{ 0xF7, 0xF1 });
+                        try code.emitSlice(&.{ 0xF7, 0xF1 }); // div ecx
                     } else {
                         try code.divReg(.rcx);
                     }
                 },
                 else => unreachable,
             }
-            try code.emitSlice(&.{ 0xE9 }); // JMP done
-            const done_patch = code.len();
-            try code.emitI32(0);
-
-            const zero_off = code.len();
-            try code.xorReg32(.rax);
-            try code.movRegImm32(.rdx, 0);
-            const done_off = code.len();
-
-            code.patchI32(skip_patch, @intCast(@as(i64, @intCast(zero_off)) - @as(i64, @intCast(skip_patch + 4))));
-            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
 
             const result_reg: emit.Reg = switch (inst.op) {
                 .div_s, .div_u => .rax,
@@ -2310,7 +2431,6 @@ fn compileInstRA(
             // Restore rdx if it was saved
             if (rdx_in_use) {
                 if (result_reg == .rdx) {
-                    // Remainder result is in rdx — save before restoring
                     try code.movRegReg(.r11, .rdx);
                     try code.popReg(.rdx);
                     try code.movRegReg(.rax, .r11);
@@ -2431,7 +2551,7 @@ fn compileInstRA(
         },
 
         .@"unreachable" => {
-            try code.int3();
+            try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
         },
 
         // ── Type conversions ──────────────────────────────────────────
@@ -2776,6 +2896,7 @@ fn compileInstRA(
             } else {
                 try code.movqToXmm(.rax, .rax);
             }
+            try emitTruncRangeCheck(code, inst.type == .i32, true, is_f32);
             // Use the dest-width form so 32-bit trunc fills only EAX (and the
             // upper 32 bits don't carry stale signed bits across writeDefTyped).
             if (inst.type == .i32) {
@@ -2795,6 +2916,7 @@ fn compileInstRA(
             } else {
                 try code.movqToXmm(.rax, .rax);
             }
+            try emitTruncRangeCheck(code, inst.type == .i32, false, is_f32);
             if (inst.type == .i32) {
                 // Unsigned i32 fits in signed i64; use 64-bit cvtt then truncate.
                 if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);

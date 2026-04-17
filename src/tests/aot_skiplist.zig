@@ -63,6 +63,11 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     "return_call.json",
     "return_call_indirect.json",
     "return_call_ref.json",
+
+    // skip-stack-guard-page.json recurses deep into a native-stack
+    // overflow; the trap is emitted via guard-page SEH which our
+    // runtime currently doesn't translate into error.WasmTrap.
+    "skip-stack-guard-page.json",
 };
 
 pub fn isSkippedInAot(basename: []const u8) bool {

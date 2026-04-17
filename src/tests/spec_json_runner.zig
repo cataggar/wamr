@@ -1903,10 +1903,55 @@ fn runSpecTestFileAot(
                     result.skipped += 1;
                 },
             }
+        } else if (std.mem.eql(u8, cmd.type, "assert_trap") or std.mem.eql(u8, cmd.type, "assert_exhaustion")) {
+            const h = current orelse {
+                recordSkip("no_module");
+                result.skipped += 1;
+                continue;
+            };
+            const action = cmd.action orelse {
+                recordSkip("action_other");
+                result.skipped += 1;
+                continue;
+            };
+            if (!std.mem.eql(u8, action.type, "invoke")) {
+                recordSkip("action_other");
+                result.skipped += 1;
+                continue;
+            }
+            const field = action.field orelse {
+                recordSkip("invoke_no_field");
+                result.skipped += 1;
+                continue;
+            };
+            const args_json = action.args orelse &[_]Arg{};
+            const args = parseArgs(args_json, allocator) orelse {
+                recordSkip("invoke_parse_args");
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(args);
+            const func_idx = h.findFuncExport(field) orelse {
+                recordSkip("invoke_missing");
+                result.skipped += 1;
+                continue;
+            };
+            if (h.callScalar(func_idx, args)) |_| {
+                std.debug.print("  FAIL aot {s} line {d}: {s} returned normally (expected trap)\n", .{ cmd.type, cmd.line, field });
+                result.failed += 1;
+            } else |err| switch (err) {
+                error.WasmTrap => result.passed += 1,
+                error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => {
+                    recordSkip("bad_sig");
+                    result.skipped += 1;
+                },
+                else => {
+                    std.debug.print("  FAIL aot {s} line {d}: {s} unexpected error: {}\n", .{ cmd.type, cmd.line, field, err });
+                    result.failed += 1;
+                },
+            }
         } else {
-            // assert_trap / assert_exhaustion / register / assert_unlinkable /
-            // ...  — all deferred. assert_trap/exhaustion need
-            // trap-as-error from the AOT runtime (see plan Phase 2).
+            // register / assert_unlinkable / ...  — all deferred.
             recordSkip(staticReasonForCmdType(cmd.type));
             result.skipped += 1;
         }

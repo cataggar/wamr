@@ -148,6 +148,15 @@ pub const VmCtx = extern struct {
     /// Called from inline bounds checks emitted by AOT load/store codegen
     /// when a wasm memory access would exceed `memory_size`.
     trap_oob_fn: usize = 0,
+    /// `fn (*VmCtx) noreturn` — called by AOT code for wasm `unreachable`.
+    trap_unreachable_fn: usize = 0,
+    /// `fn (*VmCtx) noreturn` — called for integer divide-by-zero.
+    trap_idivz_fn: usize = 0,
+    /// `fn (*VmCtx) noreturn` — called for signed INT_MIN/-1 overflow.
+    trap_iovf_fn: usize = 0,
+    /// `fn (*VmCtx) noreturn` — called for invalid float→int conversion
+    /// (NaN or out-of-range) in `trunc_f*_*` opcodes.
+    trap_ivc_fn: usize = 0,
 };
 
 /// Host helper invoked from AOT-compiled memory loads/stores when an
@@ -182,6 +191,39 @@ pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
         "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}], mem_size=0x{x})\n",
         .{ code_off, func_idx, vmctx.memory_size },
     );
+    std.process.exit(2);
+}
+
+/// Host helper invoked from AOT-compiled code for `unreachable`,
+/// integer divide-by-zero, INT_MIN/-1 overflow, and invalid float→int
+/// conversion. When the caller has armed trap-as-error
+/// (`g_trap_catching` true), longjmps back to `callFuncScalar` which
+/// returns `error.WasmTrap`. Otherwise prints a diagnostic and exits.
+pub fn aotTrapUnreachable(vmctx: *VmCtx) callconv(.c) noreturn {
+    _ = vmctx;
+    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    std.debug.print("wasm trap: unreachable\n", .{});
+    std.process.exit(2);
+}
+
+pub fn aotTrapIntDivZero(vmctx: *VmCtx) callconv(.c) noreturn {
+    _ = vmctx;
+    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    std.debug.print("wasm trap: integer divide by zero\n", .{});
+    std.process.exit(2);
+}
+
+pub fn aotTrapIntOverflow(vmctx: *VmCtx) callconv(.c) noreturn {
+    _ = vmctx;
+    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    std.debug.print("wasm trap: integer overflow\n", .{});
+    std.process.exit(2);
+}
+
+pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
+    _ = vmctx;
+    if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
+    std.debug.print("wasm trap: invalid conversion to integer\n", .{});
     std.process.exit(2);
 }
 
@@ -477,6 +519,10 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
     vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
+    vmctx.trap_unreachable_fn = @intFromPtr(&aotTrapUnreachable);
+    vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
+    vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
+    vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -631,6 +677,10 @@ pub fn callFuncScalar(
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
     vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
+    vmctx.trap_unreachable_fn = @intFromPtr(&aotTrapUnreachable);
+    vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
+    vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
+    vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
 
     // Marshal args to raw 64-bit bit patterns.
     var raw: [MaxScalarArgs]u64 = [_]u64{0} ** MaxScalarArgs;
@@ -652,16 +702,19 @@ pub fn callFuncScalar(
         }
     }
 
-    // Arm the trap-as-error path.If generated code faults, the handler
-    // RtlRestoreContext's us back to the line *after* RtlCaptureContext
-    // with g_trap_occurred = true; we then return error.WasmTrap.
-    // Trap-as-error: armed only when the caller opts in. A later phase of
-    // the plan wires callFuncScalar to RtlCaptureContext/RtlRestoreContext
-    // so generated-code faults turn into `error.WasmTrap`. For now this
-    // block is effectively disabled because the Windows longjmp path
-    // is unstable across Zig debug runtime handlers; `callFuncScalar`
-    // does not call RtlCaptureContext, so `g_trap_occurred` is never set.
+    // Arm the trap-as-error path. Trap helpers (aotTrapOOB, aotTrapUnreachable,
+    // ...) called from generated code check `g_trap_catching` and longjmp
+    // back to the `RtlCaptureContext` site below with `g_trap_occurred = true`
+    // when armed; we then return `error.WasmTrap`.
+    //
+    // We do NOT arm this for the hardware-VEH path (ud2/int3 traps inside
+    // generated code); those are still routed via the VEH, which proved
+    // unstable for our use case. All wasm traps now go through explicit
+    // helper calls, so the VEH is effectively unused.
     if (comptime builtin.os.tag == .windows) {
+        @atomicStore(bool, &g_trap_occurred, false, .seq_cst);
+        @atomicStore(bool, &g_trap_catching, true, .seq_cst);
+        RtlCaptureContext(&g_saved_ctx);
         if (@atomicLoad(bool, &g_trap_occurred, .seq_cst)) {
             @atomicStore(bool, &g_trap_catching, false, .seq_cst);
             for (0..n_globals) |i| {
