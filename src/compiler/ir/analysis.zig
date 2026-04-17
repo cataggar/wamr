@@ -141,6 +141,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |bin| {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
@@ -322,6 +323,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |bin| {
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};

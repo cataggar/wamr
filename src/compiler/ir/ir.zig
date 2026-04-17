@@ -114,6 +114,14 @@ pub const Inst = struct {
         f_max: BinOp,
         f_copysign: BinOp,
 
+        // Float comparisons (result is i32; operand type via inst.type .f32/.f64)
+        f_eq: BinOp,
+        f_ne: BinOp,
+        f_lt: BinOp,
+        f_gt: BinOp,
+        f_le: BinOp,
+        f_ge: BinOp,
+
         // Conversions
         wrap_i64: VReg,
         extend_i32_s: VReg,

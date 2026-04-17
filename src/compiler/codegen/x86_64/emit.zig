@@ -334,9 +334,26 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, b.low3(), a.low3());
     }
 
+    /// TEST reg, reg (32-bit). Emits REX only if either reg is extended.
+    pub fn testRegReg32(self: *CodeBuffer, a: Reg, b: Reg) !void {
+        if (a.isExtended() or b.isExtended()) {
+            var rex_byte: u8 = 0x40;
+            if (b.isExtended()) rex_byte |= 0x04; // REX.R
+            if (a.isExtended()) rex_byte |= 0x01; // REX.B
+            try self.emitByte(rex_byte);
+        }
+        try self.emitByte(0x85);
+        try self.modrm(0b11, b.low3(), a.low3());
+    }
+
     /// CQO — sign-extend RAX into RDX:RAX (REX.W + 99).
     pub fn cqo(self: *CodeBuffer) !void {
         try self.emitByte(0x48); // REX.W
+        try self.emitByte(0x99);
+    }
+
+    /// CDQ — sign-extend EAX into EDX:EAX (0x99, no REX.W).
+    pub fn cdq(self: *CodeBuffer) !void {
         try self.emitByte(0x99);
     }
 
@@ -347,9 +364,23 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, 7, src.low3());
     }
 
+    /// IDIV r/m32 — signed divide EDX:EAX by reg32.
+    pub fn idivReg32(self: *CodeBuffer, src: Reg) !void {
+        if (src.isExtended()) try self.emitByte(0x41); // REX.B for r8-r15
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 7, src.low3());
+    }
+
     /// DIV r/m64 — unsigned divide RDX:RAX by reg.
     pub fn divReg(self: *CodeBuffer, src: Reg) !void {
         try self.rexW(.rax, src);
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 6, src.low3());
+    }
+
+    /// DIV r/m32 — unsigned divide EDX:EAX by reg32.
+    pub fn divReg32(self: *CodeBuffer, src: Reg) !void {
+        if (src.isExtended()) try self.emitByte(0x41); // REX.B for r8-r15
         try self.emitByte(0xF7);
         try self.modrm(0b11, 6, src.low3());
     }

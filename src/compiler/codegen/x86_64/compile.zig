@@ -799,7 +799,9 @@ fn compileInst(
         },
 
         // ── Float binary stubs ────────────────────────────────────────
-        .f_min, .f_max, .f_copysign => {
+        .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        => {
             try stack.pop(code, .rcx);
             try stack.pop(code, .rax);
             try stack.push(code, .rax);
@@ -1572,6 +1574,44 @@ fn compileInstRA(
                 .@"and" => |b| b, .@"or" => |b| b, .xor => |b| b,
                 else => unreachable,
             };
+
+            // Float path: wasm f32/f64 add/sub/mul are lowered by the frontend
+            // into these integer ops with `inst.type == .f32/.f64`. Dispatch
+            // to SSE scalar ops through the GPR↔XMM bounce pattern used by
+            // f_min/f_max/f_sqrt. Logical ops (and/or/xor) don't have float
+            // variants; they'll fall through to the integer path below
+            // because the frontend never produces them with float type.
+            if (inst.type == .f32 or inst.type == .f64) {
+                const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+                if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+                const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+                if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+                if (inst.type == .f32) {
+                    try code.movdToXmm(.rax, .rax);
+                    try code.movdToXmm(.rcx, .rcx);
+                    switch (inst.op) {
+                        .add => try code.addss(.rax, .rcx),
+                        .sub => try code.subss(.rax, .rcx),
+                        .mul => try code.mulss(.rax, .rcx),
+                        else => unreachable,
+                    }
+                    try code.movdFromXmm(.rax, .rax);
+                } else {
+                    try code.movqToXmm(.rax, .rax);
+                    try code.movqToXmm(.rcx, .rcx);
+                    switch (inst.op) {
+                        .add => try code.addsd(.rax, .rcx),
+                        .sub => try code.subsd(.rax, .rcx),
+                        .mul => try code.mulsd(.rax, .rcx),
+                        else => unreachable,
+                    }
+                    try code.movqFromXmm(.rax, .rax);
+                }
+                if (dr != .rax) try code.movRegReg(dr, .rax);
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                return;
+            }
+
             const scratch: emit.Reg = if (dr == .rax) .rcx else .rax;
             // Check if RHS is a constant for immediate form
             if (const_vals.get(bin.rhs)) |imm| {
@@ -1699,7 +1739,10 @@ fn compileInstRA(
         },
         .br_if => |br| {
             const cond_reg = try useVReg(code, alloc_result, br.cond, .rax);
-            try code.testRegReg(cond_reg, cond_reg);
+            // Wasm br_if condition is always i32; use 32-bit TEST so that
+            // upper-32 garbage (possible after our local_get preserves full
+            // 64 bits) doesn't spuriously flip the branch.
+            try code.testRegReg32(cond_reg, cond_reg);
             try code.emitByte(0x0F);
             try code.emitByte(0x85);
             const then_patch = code.len();
@@ -2027,6 +2070,30 @@ fn compileInstRA(
         // ── Division ──────────────────────────────────────────────────
         .div_s, .div_u, .rem_s, .rem_u => |bin| {
             const dest = inst.dest orelse return;
+
+            // Float div: frontend lowers f32/f64 `div` into `.div_s` with
+            // inst.type == .f32/.f64. Dispatch to SSE divss/divsd. `.div_u`,
+            // `.rem_s`, `.rem_u` are never produced with float type.
+            if (inst.type == .f32 or inst.type == .f64) {
+                const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+                if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+                const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+                if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+                if (inst.type == .f32) {
+                    try code.movdToXmm(.rax, .rax);
+                    try code.movdToXmm(.rcx, .rcx);
+                    try code.divss(.rax, .rcx);
+                    try code.movdFromXmm(.rax, .rax);
+                } else {
+                    try code.movqToXmm(.rax, .rax);
+                    try code.movqToXmm(.rcx, .rcx);
+                    try code.divsd(.rax, .rcx);
+                    try code.movqFromXmm(.rax, .rax);
+                }
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+                return;
+            }
+
             // idiv clobbers rax+rdx. rax is not allocatable, so only rdx
             // (which IS allocatable) needs saving if it holds a live value.
             const rdx_in_use = for (caller_saved_alloc, 0..) |reg, i| {
@@ -2049,12 +2116,62 @@ fn compileInstRA(
 
             switch (inst.op) {
                 .div_s, .rem_s => {
-                    try code.cqo();
-                    try code.idivReg(.rcx);
+                    if (inst.type == .i32) {
+                        // Guard against INT_MIN / -1 hardware #DE:
+                        //   cmp ecx, -1                 83 F9 FF
+                        //   jne do_div  (+11)           75 0B
+                        //   cmp eax, 0x80000000         3D 00 00 00 80
+                        //   jne do_div  (+4)            75 04
+                        //   xor edx, edx                31 D2
+                        //   jmp after   (+3)            EB 03
+                        // do_div:
+                        //   cdq                         99
+                        //   idiv ecx                    F7 F9
+                        // after:
+                        try code.emitSlice(&.{
+                            0x83, 0xF9, 0xFF,
+                            0x75, 0x0B,
+                            0x3D, 0x00, 0x00, 0x00, 0x80,
+                            0x75, 0x04,
+                            0x31, 0xD2,
+                            0xEB, 0x03,
+                            0x99,
+                            0xF7, 0xF9,
+                        });
+                    } else {
+                        // Guard against INT64_MIN / -1 hardware #DE:
+                        //   cmp rcx, -1                 48 83 F9 FF
+                        //   jne do_div  (+19)           75 13
+                        //   movabs r11, 0x8000...       49 BB 00 00 00 00 00 00 00 80
+                        //   cmp rax, r11                4C 39 D8
+                        //   jne do_div  (+4)            75 04
+                        //   xor edx, edx                31 D2
+                        //   jmp after  (+5)             EB 05
+                        // do_div:
+                        //   cqo                         48 99
+                        //   idiv rcx                    48 F7 F9
+                        // after:
+                        try code.emitSlice(&.{
+                            0x48, 0x83, 0xF9, 0xFF,
+                            0x75, 0x13,
+                            0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+                            0x4C, 0x39, 0xD8,
+                            0x75, 0x04,
+                            0x31, 0xD2,
+                            0xEB, 0x05,
+                            0x48, 0x99,
+                            0x48, 0xF7, 0xF9,
+                        });
+                    }
                 },
                 .div_u, .rem_u => {
                     try code.movRegImm32(.rdx, 0);
-                    try code.divReg(.rcx);
+                    if (inst.type == .i32) {
+                        // div ecx: F7 F1 (no REX.W, 32-bit form)
+                        try code.emitSlice(&.{ 0xF7, 0xF1 });
+                    } else {
+                        try code.divReg(.rcx);
+                    }
                 },
                 else => unreachable,
             }
@@ -2103,25 +2220,30 @@ fn compileInstRA(
             // clobber rax; no need to stash val in r11.
             const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
+            // i32 shifts/rotates must use the 32-bit opcode form (no REX.W).
+            // In 64-bit REX.W form x86 masks CL to 6 bits, so shift-by-32
+            // produces wrong results; wasm i32 shifts mask by 5 bits, which
+            // matches the 32-bit x86 form natively.
+            const is64 = inst.type == .i64;
             switch (inst.op) {
                 .shl => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xE0 });
                 },
                 .shr_u => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xE8 });
                 },
                 .shr_s => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xF8 });
                 },
                 .rotl => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xC0 });
                 },
                 .rotr => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xC8 });
                 },
                 else => unreachable,
@@ -2386,6 +2508,73 @@ fn compileInstRA(
             }
             try code.orRegReg(.rax, .rcx);
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+
+        // ── Float comparisons ─────────────────────────────────────────
+        // Operands are f32/f64 (via inst.type); result is i32 (0 or 1).
+        // Uses UCOMIS[SD] xmm0, xmm1, then SETcc. IEEE-754 unordered
+        // (NaN) rules: eq=0/ne=1 when unordered; lt/gt/le/ge all=0.
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge => |bin| {
+            const dest = inst.dest orelse return;
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            if (inst.type == .f32) {
+                try code.movdToXmm(.rax, .rax); // xmm0 = lhs
+                try code.movdToXmm(.rcx, .rcx); // xmm1 = rhs
+                try code.ucomiss(.rax, .rcx);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.movqToXmm(.rcx, .rcx);
+                try code.ucomisd(.rax, .rcx);
+            }
+            // UCOMIS flags:
+            //   equal     : ZF=1, PF=0, CF=0
+            //   a > b     : ZF=0, PF=0, CF=0
+            //   a < b     : ZF=0, PF=0, CF=1
+            //   unordered : ZF=1, PF=1, CF=1
+            //
+            // SETcc codes: B=2, AE=3, E=4, NE=5, BE=6, A=7, P=A, NP=B
+            switch (inst.op) {
+                .f_eq => {
+                    // ordered AND equal: SETE AND SETNP
+                    try code.setcc(0x4, .rax); // sete al
+                    try code.setcc(0xB, .rdx); // setnp dl
+                    try code.andRegReg(.rax, .rdx);
+                },
+                .f_ne => {
+                    // unordered OR not-equal: SETNE OR SETP
+                    try code.setcc(0x5, .rax); // setne al
+                    try code.setcc(0xA, .rdx); // setp dl
+                    try code.orRegReg(.rax, .rdx);
+                },
+                .f_lt => {
+                    // ordered AND below: SETB AND SETNP
+                    try code.setcc(0x2, .rax); // setb al
+                    try code.setcc(0xB, .rdx); // setnp dl
+                    try code.andRegReg(.rax, .rdx);
+                },
+                .f_gt => {
+                    // above (already excludes unordered): SETA
+                    try code.setcc(0x7, .rax); // seta al
+                },
+                .f_le => {
+                    // ordered AND below-or-equal: SETBE AND SETNP
+                    try code.setcc(0x6, .rax); // setbe al
+                    try code.setcc(0xB, .rdx); // setnp dl
+                    try code.andRegReg(.rax, .rdx);
+                },
+                .f_ge => {
+                    // above-or-equal (excludes unordered): SETAE
+                    try code.setcc(0x3, .rax); // setae al
+                },
+                else => unreachable,
+            }
+            try code.movzxByte(.rax, .rax);
+            // Result is i32; explicitly force i32 write (inst.type is the
+            // operand float type, not the result type).
+            try writeDefTyped(code, alloc_result, dest, .rax, .i32);
         },
 
         // ── Int/Float conversions ─────────────────────────────────────

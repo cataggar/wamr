@@ -40,6 +40,40 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     var total_locals: u32 = param_count;
     for (func.locals) |local| total_locals += local.count;
 
+    // Build local type table (params first, then declared locals). Used to
+    // give each `.local_get` IR instruction the correct type so codegen can
+    // emit proper zero-extension for i32/f32 and preserve full 64 bits for
+    // i64/f64.
+    var local_types = try allocator.alloc(ir.IrType, total_locals);
+    defer allocator.free(local_types);
+    {
+        var i: u32 = 0;
+        for (func_type.params) |pt| {
+            local_types[i] = switch (pt) {
+                .i32 => .i32,
+                .i64 => .i64,
+                .f32 => .f32,
+                .f64 => .f64,
+                else => .i64,
+            };
+            i += 1;
+        }
+        for (func.locals) |decl| {
+            const ir_t: ir.IrType = switch (decl.val_type) {
+                .i32 => .i32,
+                .i64 => .i64,
+                .f32 => .f32,
+                .f64 => .f64,
+                else => .i64,
+            };
+            var n: u32 = 0;
+            while (n < decl.count) : (n += 1) {
+                local_types[i] = ir_t;
+                i += 1;
+            }
+        }
+    }
+
     var ir_func = ir.IrFunction.init(allocator, param_count, result_count, total_locals);
     errdefer ir_func.deinit();
 
@@ -320,7 +354,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .local_get => {
                 const idx = readU32(code, &ip);
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = idx }, .dest = dest, .type = .i32 });
+                const t: ir.IrType = if (idx < total_locals) local_types[idx] else .i32;
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = idx }, .dest = dest, .type = t });
                 try vreg_stack.append(allocator, dest);
             },
             .local_set => {
@@ -1067,15 +1102,19 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const dest = ir_func.newVReg();
                 const bin = ir.Inst.BinOp{ .lhs = lhs, .rhs = rhs };
                 const ir_op: ir.Inst.Op = switch (op) {
-                    .f32_eq, .f64_eq => .{ .eq = bin },
-                    .f32_ne, .f64_ne => .{ .ne = bin },
-                    .f32_lt, .f64_lt => .{ .lt_s = bin },
-                    .f32_gt, .f64_gt => .{ .gt_s = bin },
-                    .f32_le, .f64_le => .{ .le_s = bin },
-                    .f32_ge, .f64_ge => .{ .ge_s = bin },
+                    .f32_eq, .f64_eq => .{ .f_eq = bin },
+                    .f32_ne, .f64_ne => .{ .f_ne = bin },
+                    .f32_lt, .f64_lt => .{ .f_lt = bin },
+                    .f32_gt, .f64_gt => .{ .f_gt = bin },
+                    .f32_le, .f64_le => .{ .f_le = bin },
+                    .f32_ge, .f64_ge => .{ .f_ge = bin },
                     else => unreachable,
                 };
-                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = .i32 });
+                const operand_type: ir.IrType = switch (op) {
+                    .f32_eq, .f32_ne, .f32_lt, .f32_gt, .f32_le, .f32_ge => .f32,
+                    else => .f64,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = operand_type });
                 try vreg_stack.append(allocator, dest);
             },
 

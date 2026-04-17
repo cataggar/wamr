@@ -62,6 +62,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
@@ -178,6 +179,7 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
@@ -421,6 +423,7 @@ fn isPure(inst: ir.Inst) bool {
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
         .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
