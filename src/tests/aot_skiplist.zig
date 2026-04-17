@@ -21,20 +21,18 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // Files where AOT codegen panics at module-load or produces wrong
     // values. Each entry is tagged with the currently-dominant failure
     // mode; unskip when the relevant bug is fixed.
-    "address.json", // untested after trap-helper path landed
-    "call.json", // stack-overflow via `runaway` + non-recoverable guard page
-    "call_indirect.json", // access violation during exec (beyond null-entry)
-    "elem.json", // active-element table init incomplete
-    "float_exprs.json", // f32/f64 select sign-bit / NaN canonicalization
-    "float_memory.json", // signaling-NaN preservation on i32/i64 <-> f32/f64
-    "func.json", // br_if / br_table result-count mismatches
-    "global.json", // mutable/imported global initial values
-    "imports.json",
-    "linking.json",
-    "memory_grow.json", // 2 value-mismatch fails (memory.grow/size results)
-    "memory_trap.json", // unaligned i64.load value
-    "start.json", // start function side-effect not applied
-    "unwind.json", // 3 value-mismatch fails
+    "address.json", // AV during exec after data-segments landed (needs probe)
+    "call.json", // stack-overflow via runaway (guard page non-recoverable)
+    "call_indirect.json", // AV during exec
+    "elem.json", // 7 value-mismatch fails (passive/declarative elem init)
+    "float_exprs.json", // 28 f32/f64 value-mismatch fails (NaN/select sign)
+    "func.json", // 10 br_if/br_table result-count mismatches
+    "global.json", // 16 mutable/imported global init value mismatches
+    "imports.json", // AV during exec (host-import call path)
+    "linking.json", // 38 cross-module register/resolution fails
+    "memory_grow.json", // 2 cross-module memory-grow value mismatches
+    "start.json", // 6 start-function side-effect not applied
+    "unwind.json", // 3 br_if/br_table value mismatches
 
     // select.0.wasm compiles now that `select_t` is recognized, but the
     // generated code dereferences a null pointer at runtime — likely a

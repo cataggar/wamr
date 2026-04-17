@@ -246,6 +246,21 @@ fn compileToAot(
         });
     }
 
+    // Data segments: forward active segments with i32.const offsets.
+    var data_entries: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
+    for (module.data_segments) |seg| {
+        if (seg.is_passive) continue;
+        const offset_val: u32 = switch (seg.offset) {
+            .i32_const => |v| @bitCast(v),
+            else => continue,
+        };
+        try data_entries.append(a, .{
+            .memory_idx = seg.memory_idx,
+            .offset = offset_val,
+            .data = seg.data,
+        });
+    }
+
     var arch_name = std.mem.zeroes([16]u8);
     switch (builtin.cpu.arch) {
         .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
@@ -258,7 +273,7 @@ fn compileToAot(
         offsets,
         exports.items,
         .{ .arch = arch_name },
-        null,
+        if (data_entries.items.len > 0) data_entries.items else null,
         if (import_entries.items.len > 0) import_entries.items else null,
         if (mem_entries.items.len > 0) mem_entries.items else null,
         if (global_entries.items.len > 0) global_entries.items else null,
