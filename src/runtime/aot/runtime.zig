@@ -62,12 +62,14 @@ fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
     const rip: usize = @intCast(ctx.Rip);
     const in_code = g_code_base != 0 and g_code_size != 0 and
         rip >= g_code_base and rip < g_code_base + g_code_size;
-    if (is_wasm_fault and in_code and @atomicLoad(bool, &g_trap_catching, .seq_cst)) {
-        // Mark the trap and redirect RIP to trapLongjmp, then tell Windows
-        // to continue execution. This is cleaner than calling
-        // RtlRestoreContext from inside the VEH: the kernel gets to unwind
-        // its dispatch frames normally, and our longjmp fires from fresh
-        // user context.
+    // If armed, redirect any wasm-like fault to trapLongjmp. We used to
+    // only redirect when RIP was inside the generated code, but a null
+    // table entry in call_indirect causes RIP=0 at fault time (the
+    // `call r11` has already transferred control), so the fault site is
+    // outside the code region. The armed check is sufficient to
+    // distinguish wasm traps from unrelated process-wide faults.
+    if (is_wasm_fault and @atomicLoad(bool, &g_trap_catching, .seq_cst)) {
+        _ = in_code;
         @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
         ctx.Rip = @intFromPtr(&trapLongjmp);
         return -1; // EXCEPTION_CONTINUE_EXECUTION

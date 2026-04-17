@@ -22,18 +22,16 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // values. Each entry is tagged with the currently-dominant failure
     // mode; unskip when the relevant bug is fixed.
     "address.json", // untested after trap-helper path landed
-    "call.json", // crashes with AV (likely call_indirect with >3 args or imports)
-    "call_indirect.json", // crashes
+    "call.json", // stack-overflow via `runaway` + non-recoverable guard page
+    "call_indirect.json", // access violation during exec (beyond null-entry)
     "elem.json", // active-element table init incomplete
     "float_exprs.json", // f32/f64 select sign-bit / NaN canonicalization
     "float_memory.json", // signaling-NaN preservation on i32/i64 <-> f32/f64
     "func.json", // br_if / br_table result-count mismatches
-    "func_ptrs.json", // crashes
     "global.json", // mutable/imported global initial values
-    "if.json", // crashes
     "imports.json",
     "linking.json",
-    "memory_grow.json", // crashes
+    "memory_grow.json", // 2 value-mismatch fails (memory.grow/size results)
     "memory_trap.json", // unaligned i64.load value
     "start.json", // start function side-effect not applied
     "unwind.json", // 3 value-mismatch fails
