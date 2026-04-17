@@ -73,6 +73,9 @@ pub const passes = @import("compiler/ir/passes.zig");
 /// Spec test runner infrastructure.
 pub const spec_runner = @import("tests/spec_runner.zig");
 
+/// Interp-vs-AOT differential test harness.
+pub const differential = @import("tests/differential.zig");
+
 /// WASI preview1 implementation.
 /// Note: Uses std.fs.File; tests require IO-aware runner.
 /// Excluded from refAllDecls to avoid test runner hang.

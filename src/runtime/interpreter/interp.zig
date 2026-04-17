@@ -62,6 +62,7 @@ inline fn wasmNearestF64(x: f64) f64 {
 
 const Opcode = @import("opcode.zig").Opcode;
 const simd = @import("simd.zig");
+const leb128 = @import("../../shared/utils/leb128.zig");
 
 pub const TrapError = error{
     Unreachable,
@@ -129,60 +130,15 @@ fn popTableIdx(env: *ExecEnv, table: *types.TableInstance) TrapError!u32 {
 }
 
 fn readU32(code: []const u8, ip: *usize) u32 {
-    var result: u32 = 0;
-    var shift: u5 = 0;
-    while (true) {
-        if (ip.* >= code.len) return result;
-        const byte = code[ip.*];
-        ip.* += 1;
-        result |= @as(u32, byte & 0x7F) << shift;
-        if (byte & 0x80 == 0) break;
-        if (shift >= 28) break;
-        shift +|= 7;
-    }
-    return result;
+    return leb128.readUnsignedLossy(u32, code, ip);
 }
 
 fn readI32(code: []const u8, ip: *usize) i32 {
-    var result: u32 = 0;
-    var shift: u32 = 0;
-    var byte: u8 = 0;
-    while (true) {
-        if (ip.* >= code.len) return @bitCast(result);
-        byte = code[ip.*];
-        ip.* += 1;
-        result |= @as(u32, byte & 0x7F) << @intCast(shift);
-        if (byte & 0x80 == 0) break;
-        shift += 7;
-        if (shift >= 35) break;
-    }
-    // Sign-extend from the bit above the last data septet.
-    const sign_shift = shift + 7;
-    if (sign_shift < 32 and (byte & 0x40) != 0) {
-        result |= ~@as(u32, 0) << @intCast(sign_shift);
-    }
-    return @bitCast(result);
+    return leb128.readSignedLossy(i32, code, ip);
 }
 
 fn readI64(code: []const u8, ip: *usize) i64 {
-    var result: u64 = 0;
-    var shift: u32 = 0;
-    var byte: u8 = 0;
-    while (true) {
-        if (ip.* >= code.len) return @bitCast(result);
-        byte = code[ip.*];
-        ip.* += 1;
-        result |= @as(u64, byte & 0x7F) << @intCast(shift);
-        if (byte & 0x80 == 0) break;
-        shift += 7;
-        if (shift >= 70) break;
-    }
-    // Sign-extend from the bit above the last data septet.
-    const sign_shift = shift + 7;
-    if (sign_shift < 64 and (byte & 0x40) != 0) {
-        result |= ~@as(u64, 0) << @intCast(sign_shift);
-    }
-    return @bitCast(result);
+    return leb128.readSignedLossy(i64, code, ip);
 }
 
 /// Check if a ref value matches a target heap type for ref.test/ref.cast.
@@ -1069,18 +1025,7 @@ fn skipLeb128(code: []const u8, pos: usize) usize {
 
 /// Read a u32 from `code` at `pos` (static helper for pre-scan).
 fn readU32Static(code: []const u8, pos: *usize) u32 {
-    var result: u32 = 0;
-    var shift: u5 = 0;
-    while (true) {
-        if (pos.* >= code.len) return result;
-        const byte = code[pos.*];
-        pos.* += 1;
-        result |= @as(u32, byte & 0x7F) << shift;
-        if (byte & 0x80 == 0) break;
-        if (shift >= 28) break;
-        shift +|= 7;
-    }
-    return result;
+    return leb128.readUnsignedLossy(u32, code, pos);
 }
 
 /// Skip a block type immediate in bytecode: handles 0x40 (void), single-byte val types,

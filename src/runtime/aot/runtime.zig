@@ -11,6 +11,59 @@ const aot_loader = @import("loader.zig");
 const host_bridge = @import("host_bridge.zig");
 const platform = @import("../../platform/platform.zig");
 
+// ─── Windows crash handler (debug only) ─────────────────────────────────────
+const windows = std.os.windows;
+
+var g_code_base: usize = 0;
+var g_code_size: usize = 0;
+var g_mem_base: usize = 0;
+var g_mem_size: usize = 0;
+
+fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
+    const rec = info.ExceptionRecord;
+    const ctx = info.ContextRecord;
+    if (rec.ExceptionCode == 0xC0000005) { // STATUS_ACCESS_VIOLATION
+        const rip: usize = @intCast(ctx.Rip);
+        const fault: usize = @intCast(rec.ExceptionInformation[1]);
+        std.debug.print(
+            "\n=== VEH CRASH === RIP=0x{x} (code+0x{x}) fault=0x{x}",
+            .{ rip, rip -% g_code_base, fault },
+        );
+        if (g_mem_base != 0 and fault >= g_mem_base and fault < g_mem_base +% g_mem_size) {
+            std.debug.print(" (wasm mem[0x{x}])", .{fault - g_mem_base});
+        } else if (g_mem_base != 0) {
+            const delta: isize = @as(isize, @bitCast(fault)) - @as(isize, @bitCast(g_mem_base));
+            std.debug.print(" (mem_base+0x{x} delta={d})", .{ fault -% g_mem_base, delta });
+        }
+        std.debug.print("\n", .{});
+        std.debug.print("RAX=0x{x} RCX=0x{x} RDX=0x{x} RBX=0x{x}\n", .{ ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx });
+        std.debug.print("RSI=0x{x} RDI=0x{x} RBP=0x{x} RSP=0x{x}\n", .{ ctx.Rsi, ctx.Rdi, ctx.Rbp, ctx.Rsp });
+        std.debug.print("R8=0x{x} R9=0x{x} R10=0x{x} R11=0x{x}\n", .{ ctx.R8, ctx.R9, ctx.R10, ctx.R11 });
+        std.debug.print("R12=0x{x} R13=0x{x} R14=0x{x} R15=0x{x}\n", .{ ctx.R12, ctx.R13, ctx.R14, ctx.R15 });
+        if (g_code_base != 0 and g_code_size != 0) {
+            const rip_off: usize = rip -% g_code_base;
+            if (rip_off < g_code_size) {
+                const start: usize = if (rip_off > 32) rip_off - 32 else 0;
+                const end: usize = @min(rip_off + 16, g_code_size);
+                const p: [*]const u8 = @ptrFromInt(g_code_base + start);
+                std.debug.print("code@[0x{x}..0x{x}]:", .{ start, end });
+                var i: usize = 0;
+                while (i < end - start) : (i += 1) {
+                    const marker: u8 = if (start + i == rip_off) '>' else ' ';
+                    std.debug.print("{c}{x:0>2}", .{ marker, p[i] });
+                }
+                std.debug.print("\n", .{});
+            }
+        }
+    }
+    return 0; // EXCEPTION_CONTINUE_SEARCH
+}
+
+extern "kernel32" fn AddVectoredExceptionHandler(
+    First: u32,
+    Handler: *const fn (*windows.EXCEPTION_POINTERS) callconv(.winapi) c_long,
+) callconv(.winapi) ?*anyopaque;
+
 /// Compact context passed to AOT-compiled functions as a hidden first parameter.
 /// Laid out as a flat struct so compiled code can load fields at known offsets.
 pub const VmCtx = extern struct {
@@ -33,7 +86,84 @@ pub const VmCtx = extern struct {
     host_functions_count: u32 = 0,
     /// Current memory size in pages (for memory.size instruction).
     memory_pages: u32 = 0,
+    _pad0: u32 = 0,
+    /// Native function pointer for memory.grow host helper.
+    /// Pointer to host function invoked by `memory.grow` in AOT-compiled code.
+    /// Signature: fn (vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32
+    /// Returns previous page count on success, -1 on failure.
+    mem_grow_fn: usize = 0,
+    /// Opaque pointer to the owning AotInstance (used by host helpers).
+    instance_ptr: usize = 0,
+    /// Native function pointer for the out-of-bounds memory trap helper.
+    /// Signature: fn (vmctx: *VmCtx) callconv(.c) noreturn
+    /// Called from inline bounds checks emitted by AOT load/store codegen
+    /// when a wasm memory access would exceed `memory_size`.
+    trap_oob_fn: usize = 0,
 };
+
+/// Host helper invoked from AOT-compiled memory loads/stores when an
+/// out-of-bounds access is detected. Mirrors the interpreter's
+/// `error.OutOfBoundsMemoryAccess` trap. Exits the process with code 2
+/// rather than allowing the native CPU to SIGSEGV on unmapped memory.
+///
+/// NOTE: This terminates the host process. A future change could thread
+/// the trap back through a setjmp/longjmp path so that `callFunc` can
+/// return `error.OutOfBoundsMemoryAccess`, matching interp semantics
+/// for embedded usage. For the current CLI this is sufficient.
+/// Module-level storage populated by callFunc so the trap helper can map
+/// a return address back to a function index (purely diagnostic).
+var g_func_offsets: []const u32 = &.{};
+
+pub fn aotTrapOOB(vmctx: *VmCtx) callconv(.c) noreturn {
+    const ret_addr: usize = @returnAddress();
+    const code_off_s: isize = @as(isize, @bitCast(ret_addr)) - @as(isize, @bitCast(g_code_base));
+    const code_off: usize = if (code_off_s >= 0) @intCast(code_off_s) else 0;
+    var func_idx: isize = -1;
+    for (g_func_offsets, 0..) |off, idx| {
+        if (off <= code_off) func_idx = @intCast(idx) else break;
+    }
+    // Flush any buffered stdout from the guest before we tear down the
+    // process so user-visible output isn't lost. Best-effort.
+    std.debug.print(
+        "wasm trap: out of bounds memory access (code+0x{x}, local_func[{d}], mem_size=0x{x})\n",
+        .{ code_off, func_idx, vmctx.memory_size },
+    );
+    std.process.exit(2);
+}
+
+/// Host helper invoked from AOT-compiled `memory.grow` sites.
+/// Grows `inst.memories[0]` by `delta_pages`, reallocating the host buffer
+/// if needed, updates `vmctx` mirror fields (memory_base/size/pages) so
+/// subsequent loads/stores see the new buffer, and returns the previous
+/// page count. Returns -1 on failure (OOM or exceeds max).
+pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
+    if (vmctx.instance_ptr == 0) return -1;
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    if (inst.memories.len == 0) return -1;
+    const mem = inst.memories[0];
+    const old_pages: u32 = mem.current_pages;
+    if (delta_pages < 0) return -1;
+    const delta: u32 = @intCast(delta_pages);
+    const new_pages_u64: u64 = @as(u64, old_pages) + @as(u64, delta);
+    const cap: u64 = @min(mem.max_pages, 65536);
+    if (new_pages_u64 > cap) return -1;
+    const new_pages: u32 = @intCast(new_pages_u64);
+    const new_size: usize = @as(usize, new_pages) * types.MemoryInstance.page_size;
+    if (new_size > mem.data.len) {
+        const new_data = inst.allocator.realloc(mem.data, new_size) catch return -1;
+        @memset(new_data[mem.data.len..], 0);
+        mem.data = new_data;
+    }
+    mem.current_pages = new_pages;
+    vmctx.memory_base = @intFromPtr(mem.data.ptr);
+    vmctx.memory_size = @as(usize, new_pages) * types.MemoryInstance.page_size;
+    vmctx.memory_pages = new_pages;
+    if (comptime builtin.os.tag == .windows) {
+        g_mem_base = vmctx.memory_base;
+        g_mem_size = vmctx.memory_size;
+    }
+    return @intCast(old_pages);
+}
 
 // ─── Comptime target validation ─────────────────────────────────────────────
 
@@ -289,10 +419,23 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     if (inst.func_table.len > 0) {
         vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
     }
+    vmctx.instance_ptr = @intFromPtr(inst);
+    vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
+    vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
+    if (comptime builtin.os.tag == .windows) {
+        if (inst.code_base) |cb| {
+            g_code_base = @intFromPtr(cb);
+            g_code_size = inst.code_size;
+            g_func_offsets = inst.module.func_offsets;
+        }
+        g_mem_base = vmctx.memory_base;
+        g_mem_size = vmctx.memory_size;
+        _ = AddVectoredExceptionHandler(1, vehHandler);
+    }
     const result = func_ptr(&vmctx);
 
     // Sync globals back from flat array to GlobalInstance objects
@@ -548,6 +691,9 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(VmCtx, "globals_count"));
     try std.testing.expectEqual(@as(usize, 52), @offsetOf(VmCtx, "host_functions_count"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(VmCtx, "memory_pages"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(VmCtx, "mem_grow_fn"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(VmCtx, "instance_ptr"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(VmCtx, "trap_oob_fn"));
 }
 
 test "getFuncAddr: import indices return null" {

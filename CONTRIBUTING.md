@@ -33,6 +33,20 @@ Coding Style
 Please use [K&R](https://en.wikipedia.org/wiki/Indentation_style#K.26R) coding style, such as 4 spaces for indentation rather than tabs etc.
 We suggest using VS Code like IDE or stable coding format tools, like clang-format, to make your code compliant to the customized format(in .clang-format).
 
+Testing conventions
+===================
+
+Binary decoders (LEB128, UTF-8, opcode prefixes, anything that walks bytes at runtime):
+- Prefer reusing the shared decoder in `src/shared/utils/` instead of hand-rolling a copy. When a copy is unavoidable (for example, a very hot dispatch loop), add a comment justifying the duplication and link the test that proves equivalence to the shared version.
+- Every hand-rolled decoder must have unit tests covering, at minimum:
+  - zero, `+1`, `-1`
+  - boundary values on both sides of each encoded-size transition (for LEB128: `±63`, `±64`, `±127`, `±128`)
+  - the min and max of the target type (e.g. `INT32_MIN`, `INT32_MAX`, `0xFFFFFFFF`)
+  - malformed input (truncated stream, overflow)
+- For encoders, prefer a round-trip fuzz test (`for random v: decode(encode(v)) == v`) alongside the boundary tests — see `src/shared/utils/leb128.zig` for the pattern.
+
+Rationale: a drift bug between two copies of `readI32` (AOT frontend vs interpreter) caused a silent mis-decode of single-byte negative signed LEB128 values. The bug survived because the buggy function had no unit tests. See commit `709ad073` and the follow-up unification for context.
+
 Report bugs
 ===================
 We use GitHub issues to track public bugs. Report a bug by [open a new issue](https://github.com/intel/wasm-micro-runtime/issues/new).
