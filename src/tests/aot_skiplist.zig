@@ -18,35 +18,31 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // Existing interpreter-mode skip (IP misalignment panic):
     "memory_trap64.wast",
 
-    // AOT codegen panics observed on 2026-04-17 against tests/spec-json.
-    // See issue #102 follow-ups.
-    "address.json",
-    "align.json",
-    "block.json",
+    // Files where AOT codegen panics at module-load or produces wrong
+    // values. Each entry is tagged with the currently-dominant failure
+    // mode; unskip when the relevant bug is fixed.
+    "address.json", // untested after trap-helper path landed
+    "block.json", // call_indirect fails (pre-existing codegen bug)
     "call.json",
     "call_indirect.json",
-    "elem.json",
-    "endianness.json",
-    "float_exprs.json",
-    "float_memory.json",
-    "func.json",
-    "func_ptrs.json",
-    "global.json",
-    "if.json",
+    "elem.json", // active-element table init incomplete
+    "float_exprs.json", // f32/f64 select sign-bit / NaN canonicalization
+    "float_memory.json", // signaling-NaN preservation on i32/i64 <-> f32/f64
+    "func.json", // br_if / br_table result-count mismatches
+    "func_ptrs.json", // callt = call_indirect
+    "global.json", // mutable/imported global initial values
+    "if.json", // call_indirect-in-if
     "imports.json",
-    "labels.json",
-    "left-to-right.json",
+    "left-to-right.json", // call_indirect in complex exprs
     "linking.json",
-    "load.json",
-    "local_tee.json",
-    "loop.json",
-    "memory_grow.json",
-    "memory_redundancy.json",
-    "memory_trap.json",
-    "nop.json",
-    "start.json",
-    "store.json",
-    "unwind.json",
+    "load.json", // call_indirect-in-load-address
+    "local_tee.json", // call_indirect-in-tee
+    "loop.json", // call_indirect-in-loop
+    "memory_grow.json", // memory.grow/size results + call_indirect
+    "memory_trap.json", // unaligned i64.load value
+    "nop.json", // call_indirect-in-nop
+    "start.json", // start function side-effect not applied
+    "unwind.json", // br_if result value + br_table
 
     // select.0.wasm compiles now that `select_t` is recognized, but the
     // generated code dereferences a null pointer at runtime — likely a
