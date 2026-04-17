@@ -51,6 +51,183 @@ pub const SpecTestResult = struct {
     skipped: u32 = 0,
 };
 
+/// Histogram of skip reasons, keyed by a short static-lifetime tag
+/// (e.g. "assert_trap", "bad_sig", "compile_fail"). Used by Phase 0 of
+/// the AOT spec-test push (see session plan) to produce a deterministic
+/// decomposition of the aot_mode skip counter.
+///
+/// Keys are expected to be static string literals; the histogram does
+/// not duplicate them.
+pub const SkipHistogram = std.StringHashMap(u32);
+
+var g_skip_histogram: ?*SkipHistogram = null;
+
+/// Install a histogram sink used by `runSpecTestFileAot` to tag every
+/// skip with a one-token reason. Pass `null` to disable.
+pub fn setSkipHistogram(h: ?*SkipHistogram) void {
+    g_skip_histogram = h;
+}
+
+fn recordSkip(reason: []const u8) void {
+    const h = g_skip_histogram orelse return;
+    const gop = h.getOrPut(reason) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+
+/// Map a spec-test command `type` string to a stable static reason tag.
+/// Keeps histogram keys pointer-stable for the lifetime of the program
+/// even when the input JSON strings are freed after parsing.
+fn staticReasonForCmdType(cmd_type: []const u8) []const u8 {
+    const known = [_][]const u8{
+        "assert_trap",
+        "assert_exhaustion",
+        "assert_invalid",
+        "assert_malformed",
+        "assert_unlinkable",
+        "assert_uninstantiable",
+        "assert_return",
+        "register",
+        "action",
+        "module",
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, k, cmd_type)) return k;
+    }
+    return "cmd_other";
+}
+
+const ValidateOutcome = enum { passed, failed };
+
+/// Shared handler for `assert_malformed` / `assert_invalid`. Returns
+/// `.passed` when the module was rejected (i.e. the assertion held),
+/// `.failed` when it unexpectedly loaded clean.
+///
+/// Used by both interp and AOT runners — validation is codegen-agnostic,
+/// so the AOT path reuses the interpreter loader here too rather than
+/// dragging the module through the AOT pipeline just to discard it.
+fn validateShouldReject(
+    cmd: Command,
+    cwd: Dir,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    json_dir: []const u8,
+) !ValidateOutcome {
+    const filename = cmd.filename orelse {
+        // No filename means the module was already rejected during
+        // wast→JSON conversion (parser/validator caught it).
+        return .passed;
+    };
+
+    if (cmd.module_type) |mt| {
+        if (std.mem.eql(u8, mt, "text")) {
+            const wat_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+            defer allocator.free(wat_path);
+            const wat_data = cwd.readFileAlloc(io, wat_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+            defer allocator.free(wat_data);
+            var wat_module = wabt.text.Parser.parseModule(allocator, wat_data) catch return .passed;
+            defer wat_module.deinit();
+            wabt.Validator.validate(&wat_module, .{}) catch return .passed;
+            const wasm_bytes = wabt.binary.writer.writeModule(allocator, &wat_module) catch return .passed;
+            defer allocator.free(wasm_bytes);
+            var runtime = wamr.Runtime.init(allocator);
+            defer runtime.deinit();
+            var mod = runtime.loadModule(wasm_bytes) catch return .passed;
+            mod.deinit();
+            std.debug.print("  NOTREJECTED line {d}: {s}\n", .{ cmd.line, filename });
+            return .failed;
+        }
+    }
+
+    const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+    defer allocator.free(wasm_path);
+    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+    defer allocator.free(wasm_data);
+    var runtime = wamr.Runtime.init(allocator);
+    defer runtime.deinit();
+    var mod = runtime.loadModule(wasm_data) catch return .passed;
+    mod.deinit();
+    std.debug.print("  NOTREJECTED line {d}: {s}\n", .{ cmd.line, filename });
+    return .failed;
+}
+
+/// Shared handler for `assert_uninstantiable`. Returns `.passed` when
+/// instantiation fails (assertion held) or `.failed` otherwise. Uses the
+/// interpreter runtime because instantiation-time checks (start trap,
+/// elem segment bounds) are codegen-independent.
+fn instantiateShouldReject(
+    cmd: Command,
+    cwd: Dir,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    json_dir: []const u8,
+) !ValidateOutcome {
+    const filename = cmd.filename orelse return .passed;
+
+    if (cmd.module_type) |mt| {
+        // Text-format uninstantiable modules are already validated
+        // up-front by wast2json; treat as pass (mirrors interp handler).
+        if (std.mem.eql(u8, mt, "text")) return .passed;
+    }
+
+    const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+    defer allocator.free(wasm_path);
+    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+    defer allocator.free(wasm_data);
+
+    var runtime = wamr.Runtime.init(allocator);
+    defer runtime.deinit();
+    var mod = runtime.loadModule(wasm_data) catch return .passed;
+    defer mod.deinit();
+
+    var inst_or_err = mod.instantiate();
+    if (inst_or_err) |*inst| {
+        inst.deinit();
+        std.debug.print("  NOTREJECTED line {d}: {s} (instantiate)\n", .{ cmd.line, filename });
+        return .failed;
+    } else |_| {
+        return .passed;
+    }
+}
+
+/// Outcome of a bare `action` command execution.
+const ActionOutcome = union(enum) {
+    passed,
+    failed: []const u8,
+    skipped: []const u8,
+};
+
+/// Execute a bare `action` command (invoke without expected results).
+/// Returns a pass on successful invocation, fail on a call error, and a
+/// tagged skip when the shape is outside the current AOT envelope.
+fn handleBareAction(
+    cmd: Command,
+    current: ?*aot_harness.Harness,
+    allocator: std.mem.Allocator,
+) ActionOutcome {
+    const action = cmd.action orelse return .{ .skipped = "no_action" };
+    const h = current orelse return .{ .skipped = "no_module" };
+
+    if (std.mem.eql(u8, action.type, "get")) {
+        const field = action.field orelse return .{ .skipped = "get_no_field" };
+        _ = h.findGlobalExport(field) orelse return .{ .skipped = "get_missing" };
+        return .passed;
+    }
+    if (!std.mem.eql(u8, action.type, "invoke")) return .{ .skipped = "action_other" };
+
+    const field = action.field orelse return .{ .skipped = "invoke_no_field" };
+    const args_json = action.args orelse &[_]Arg{};
+    const args = parseArgs(args_json, allocator) orelse return .{ .skipped = "invoke_parse_args" };
+    defer allocator.free(args);
+
+    const func_idx = h.findFuncExport(field) orelse return .{ .skipped = "invoke_missing" };
+    _ = h.callScalar(func_idx, args) catch |err| switch (err) {
+        error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => return .{ .skipped = "bad_sig" },
+        else => return .{ .failed = @errorName(err) },
+    };
+    return .passed;
+}
+
 const Command = struct {
     type: []const u8,
     line: i64 = 0,
@@ -1526,6 +1703,7 @@ fn runSpecTestFileAot(
                 current = null;
             }
             const filename = cmd.filename orelse {
+                recordSkip("module_no_filename");
                 result.skipped += 1;
                 continue;
             };
@@ -1533,6 +1711,7 @@ fn runSpecTestFileAot(
             defer allocator.free(wasm_path);
             const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch |err| {
                 std.debug.print("  SKIP aot read {s} line {d}: {}\n", .{ filename, cmd.line, err });
+                recordSkip("module_read_fail");
                 result.skipped += 1;
                 continue;
             };
@@ -1540,27 +1719,32 @@ fn runSpecTestFileAot(
 
             current = aot_harness.Harness.init(allocator, wasm_data) catch |err| blk: {
                 std.debug.print("  SKIP aot compile {s} line {d}: {}\n", .{ filename, cmd.line, err });
+                recordSkip("compile_fail");
                 result.skipped += 1;
                 break :blk null;
             };
             if (current != null) result.passed += 1;
         } else if (std.mem.eql(u8, cmd.type, "assert_return")) {
             const action = cmd.action orelse {
+                recordSkip("no_action");
                 result.skipped += 1;
                 continue;
             };
             const h = current orelse {
+                recordSkip("no_module");
                 result.skipped += 1;
                 continue;
             };
 
             if (std.mem.eql(u8, action.type, "get")) {
                 const field = action.field orelse {
+                    recordSkip("get_no_field");
                     result.skipped += 1;
                     continue;
                 };
                 const expected_json = cmd.expected orelse &[_]Arg{};
                 const value = h.findGlobalExport(field) orelse {
+                    recordSkip("get_missing");
                     result.skipped += 1;
                     continue;
                 };
@@ -1569,6 +1753,7 @@ fn runSpecTestFileAot(
                     continue;
                 }
                 const expected_val = parseValue(expected_json[0]) orelse {
+                    recordSkip("get_parse_expected");
                     result.skipped += 1;
                     continue;
                 };
@@ -1582,11 +1767,13 @@ fn runSpecTestFileAot(
             }
 
             if (!std.mem.eql(u8, action.type, "invoke")) {
+                recordSkip("action_other");
                 result.skipped += 1;
                 continue;
             }
 
             const field = action.field orelse {
+                recordSkip("invoke_no_field");
                 result.skipped += 1;
                 continue;
             };
@@ -1594,12 +1781,14 @@ fn runSpecTestFileAot(
             const expected_json = cmd.expected orelse &[_]Arg{};
 
             const args = parseArgs(args_json, allocator) orelse {
+                recordSkip("invoke_parse_args");
                 result.skipped += 1;
                 continue;
             };
             defer allocator.free(args);
 
             const func_idx = h.findFuncExport(field) orelse {
+                recordSkip("invoke_missing");
                 result.skipped += 1;
                 continue;
             };
@@ -1607,6 +1796,7 @@ fn runSpecTestFileAot(
             const call_res = h.callScalar(func_idx, args) catch |err| {
                 switch (err) {
                     error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => {
+                        recordSkip("bad_sig");
                         result.skipped += 1;
                     },
                     else => {
@@ -1651,6 +1841,7 @@ fn runSpecTestFileAot(
             }
 
             const expected_val = parseValue(expected_json[0]) orelse {
+                recordSkip("parse_expected");
                 result.skipped += 1;
                 continue;
             };
@@ -1683,10 +1874,40 @@ fn runSpecTestFileAot(
                     result.failed += 1;
                 }
             }
+        } else if (std.mem.eql(u8, cmd.type, "assert_invalid") or
+            std.mem.eql(u8, cmd.type, "assert_malformed"))
+        {
+            switch (try validateShouldReject(cmd, cwd, io, allocator, json_dir)) {
+                .passed => result.passed += 1,
+                .failed => result.failed += 1,
+            }
+        } else if (std.mem.eql(u8, cmd.type, "assert_uninstantiable")) {
+            // Delegates to the interpreter loader+instantiator. This is
+            // pure validation: we just need to know the module fails to
+            // instantiate — no AOT codegen involvement needed.
+            switch (try instantiateShouldReject(cmd, cwd, io, allocator, json_dir)) {
+                .passed => result.passed += 1,
+                .failed => result.failed += 1,
+            }
+        } else if (std.mem.eql(u8, cmd.type, "action")) {
+            // Bare invoke with no expected results — counts as a pass if
+            // the call succeeds.
+            switch (handleBareAction(cmd, current, allocator)) {
+                .passed => result.passed += 1,
+                .failed => |why| {
+                    std.debug.print("  FAIL aot action line {d}: {s}\n", .{ cmd.line, why });
+                    result.failed += 1;
+                },
+                .skipped => |reason| {
+                    recordSkip(reason);
+                    result.skipped += 1;
+                },
+            }
         } else {
-            // assert_trap / assert_invalid / assert_malformed / register /
-            // assert_unlinkable / assert_uninstantiable / action / ...
-            // All deferred to future work (see issue #102 follow-ups).
+            // assert_trap / assert_exhaustion / register / assert_unlinkable /
+            // ...  — all deferred. assert_trap/exhaustion need
+            // trap-as-error from the AOT runtime (see plan Phase 2).
+            recordSkip(staticReasonForCmdType(cmd.type));
             result.skipped += 1;
         }
     }

@@ -25,6 +25,7 @@ pub fn main(init: std.process.Init) !void {
     // positional arg is the test path.
     var mode: spec_json_runner.Mode = .interp;
     var test_path_opt: ?[]const u8 = null;
+    var verbose_skips = false;
     for (args[1..]) |a| {
         if (std.mem.startsWith(u8, a, "--mode=")) {
             const v = a["--mode=".len..];
@@ -39,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, a, "--mode")) {
             print("--mode requires =interp or =aot\n", .{});
             std.process.exit(1);
+        } else if (std.mem.eql(u8, a, "--verbose-skips")) {
+            verbose_skips = true;
         } else if (test_path_opt == null) {
             test_path_opt = a;
         } else {
@@ -55,6 +58,13 @@ pub fn main(init: std.process.Init) !void {
     const test_path = test_path_opt.?;
 
     print("\n=== WebAssembly Spec Test Runner ({s}) ===\n\n", .{@tagName(mode)});
+
+    var skip_histogram = spec_json_runner.SkipHistogram.init(allocator);
+    defer skip_histogram.deinit();
+    if (verbose_skips and mode == .aot) {
+        spec_json_runner.setSkipHistogram(&skip_histogram);
+    }
+    defer spec_json_runner.setSkipHistogram(null);
 
     // Check if argument is a single file
     if (std.mem.endsWith(u8, test_path, ".wast") or std.mem.endsWith(u8, test_path, ".json")) {
@@ -169,7 +179,36 @@ pub fn main(init: std.process.Init) !void {
         print("Pass rate: {d:.1}%\n", .{pass_rate});
     }
 
+    if (verbose_skips and mode == .aot) {
+        printSkipHistogram(&skip_histogram, allocator);
+    }
+
     print("\n", .{});
+}
+
+fn printSkipHistogram(h: *spec_json_runner.SkipHistogram, allocator: std.mem.Allocator) void {
+    const Entry = struct { reason: []const u8, count: u32 };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(allocator);
+
+    var it = h.iterator();
+    while (it.next()) |e| {
+        entries.append(allocator, .{ .reason = e.key_ptr.*, .count = e.value_ptr.* }) catch return;
+    }
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn cmp(_: void, a: Entry, b: Entry) bool {
+            if (a.count != b.count) return a.count > b.count;
+            return std.mem.order(u8, a.reason, b.reason) == .lt;
+        }
+    }.cmp);
+
+    print("\n--- Skip reasons (AOT) ---\n", .{});
+    var total: u32 = 0;
+    for (entries.items) |e| {
+        print("  {s:<22} {d}\n", .{ e.reason, e.count });
+        total += e.count;
+    }
+    print("  {s:<22} {d}\n", .{ "TOTAL", total });
 }
 
 const TestResult = spec_json_runner.SpecTestResult;
