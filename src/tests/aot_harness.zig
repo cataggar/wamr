@@ -95,6 +95,21 @@ pub const Harness = struct {
 
         aot_runtime.mapCodeExecutable(h.inst) catch return error.MapExecutableFailed;
 
+        // Invoke the start function, if any. The start function has type
+        // `() -> ()` per the wasm spec, so we pass no params/results.
+        if (h.aot_module.start_function) |start_idx| {
+            const start_ft = h.wasm_module.getFuncType(start_idx);
+            if (start_ft != null) {
+                _ = aot_runtime.callFuncScalar(
+                    h.inst,
+                    start_idx,
+                    start_ft.?.params,
+                    null,
+                    &.{},
+                ) catch {};
+            }
+        }
+
         return h;
     }
 
@@ -278,5 +293,6 @@ fn compileToAot(
         if (mem_entries.items.len > 0) mem_entries.items else null,
         if (global_entries.items.len > 0) global_entries.items else null,
         if (elem_entries.items.len > 0) elem_entries.items else null,
+        module.start_function,
     );
 }

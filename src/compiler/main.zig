@@ -229,6 +229,7 @@ pub fn main(init: std.process.Init) !void {
         if (mem_entries.items.len > 0) mem_entries.items else null,
         if (global_entries.items.len > 0) global_entries.items else null,
         if (elem_entries.items.len > 0) elem_entries.items else null,
+        module.start_function,
     );
     defer allocator.free(aot_binary);
 

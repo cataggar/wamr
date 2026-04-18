@@ -105,6 +105,7 @@ fn compileToAot(allocator: std.mem.Allocator, wasm: []const u8) ![]u8 {
         null,
         null,
         null,
+        null,
     );
 }
 

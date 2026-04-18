@@ -31,7 +31,7 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     "imports.json", // AV during exec (host-import call path)
     "linking.json", // 38 cross-module register/resolution fails
     "memory_grow.json", // 2 cross-module memory-grow value mismatches
-    "start.json", // 6 start-function side-effect not applied
+    // "start.json", // FIXED: emit start section + invoke after instantiate
     // "unwind.json", // FIXED: function-level br_if/br_table now emit ret
 
     // select.0.wasm compiles now that `select_t` is recognized, but the

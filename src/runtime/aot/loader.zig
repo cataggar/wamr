@@ -27,6 +27,7 @@ pub const AotSectionType = enum(u32) {
     memory = 9,
     global = 10,
     elem = 11,
+    start = 12,
     _,
 };
 
@@ -87,6 +88,7 @@ pub const AotModule = struct {
     data_segments: []const AotDataSegment = &.{},
     global_inits: []const AotGlobalInit = &.{},
     elem_segments: []const AotElemSegment = &.{},
+    start_function: ?u32 = null,
 
     /// Find an export by name and kind.
     pub fn findExport(self: *const AotModule, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
@@ -201,6 +203,11 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             },
             .elem => {
                 try parseElemSection(&reader, section_size, &module, allocator);
+            },
+            .start => {
+                if (section_size >= 4) {
+                    module.start_function = try reader.readU32Le();
+                }
             },
             else => {
                 // Skip unknown/unhandled sections

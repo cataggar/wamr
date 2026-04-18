@@ -80,6 +80,7 @@ pub fn emit(
     memories: ?[]const MemoryEntry,
     globals: ?[]const GlobalEntry,
     elems: ?[]const ElemEntry,
+    start_function: ?u32,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -205,6 +206,14 @@ pub fn emit(
         }
     }
 
+    // Section 12: start function (single u32 funcidx)
+    if (start_function) |start_idx| {
+        var tmp: std.ArrayList(u8) = .empty;
+        defer tmp.deinit(allocator);
+        try appendU32Le(&tmp, allocator, start_idx);
+        try emitSection(allocator, &buf, 12, tmp.items);
+    }
+
     return buf.toOwnedSlice(allocator);
 }
 
@@ -240,7 +249,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
 
 test "emit: minimal (no functions, no exports) has correct magic and version" {
     const allocator = std.testing.allocator;
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // At least header (8) + target_info section (8+40) + text section (8+0) + func section (8+4) + export section (8+4)
@@ -255,7 +264,7 @@ test "emit: one function offset produces valid function section" {
     const allocator = std.testing.allocator;
     const code = [_]u8{ 0xCC, 0xC3 }; // int3; ret
     const offsets = [_]u32{0};
-    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null);
+    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 3 (function)
@@ -286,7 +295,7 @@ test "emit: export section encodes name, kind, and index" {
         .kind = .function,
         .index = 7,
     }};
-    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 4 (export)
@@ -333,7 +342,7 @@ test "roundtrip: emit then load with AOT loader" {
     const data = try emit(allocator, &code, &offsets, &exports, .{
         .arch = arch_name,
         .e_machine = 0x3E,
-    }, null, null, null, null, null);
+    }, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Parse back with the AOT loader
@@ -374,7 +383,7 @@ test "emit: import section round-trip" {
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -395,7 +404,7 @@ test "emit: memory section round-trip" {
         .{ .min_pages = 2, .max_pages = null },
         .{ .min_pages = 1, .max_pages = 256 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
