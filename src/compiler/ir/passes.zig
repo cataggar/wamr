@@ -134,6 +134,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .memory_grow => |pages| {
             list.append(pages);
         },
+        .table_size => {},
         .memory_init => |mi| {
             list.append(mi.dst);
             list.append(mi.src);
@@ -265,6 +266,7 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .memory_grow => |*pages| {
             if (pages.* == old) pages.* = new;
         },
+        .table_size => {},
         .memory_init => |*mi| {
             if (mi.dst == old) mi.dst = new;
             if (mi.src == old) mi.src = new;

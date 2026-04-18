@@ -1054,6 +1054,11 @@ fn compileInst(
             try stack.pop(code, .rax); // dst
         },
         .data_drop => {},
+        .table_size => {
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMemNoRex(.rax, .r10, vmctx_func_table_len_field);
+            try stack.push(code, .rax);
+        },
     }
 }
 
@@ -2315,6 +2320,17 @@ fn compileInstRA(
             _ = try useVReg(code, alloc_result, mi.len, .rax);
         },
         .data_drop => {},
+
+        // ── Table management ─────────────────────────────────────────
+        .table_size => {
+            const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
+            // Read func_table_len (u32) from VmCtx
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMemNoRex(dr, .r10, vmctx_func_table_len_field);
+            // 32-bit load already zero-extends
+            try writeDef(code, alloc_result, dest, dr);
+        },
 
         // ── Division ──────────────────────────────────────────────────
         .div_s, .div_u, .rem_s, .rem_u => |bin| {

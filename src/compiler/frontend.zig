@@ -1471,6 +1471,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         const seg_idx = readU32(code, &ip);
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .data_drop = seg_idx } });
                     },
+                    .table_size => {
+                        _ = readU32(code, &ip); // table index (ignored; assume 0)
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .table_size = {} }, .dest = dest, .type = .i32 });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     else => {
                         std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
                         return error.UnsupportedOpcode;

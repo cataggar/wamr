@@ -179,6 +179,9 @@ pub const Inst = struct {
         // Memory management
         memory_size: void,
         memory_grow: VReg,
+
+        // Table operations
+        table_size: void,
     };
 
     pub const BinOp = struct {

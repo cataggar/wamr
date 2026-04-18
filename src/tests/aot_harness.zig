@@ -203,6 +203,12 @@ fn compileToAot(
     // two spectest imports; skipping imports turns that into out-of-range.
     var import_entries: std.ArrayList(emit_aot.ImportEntry) = .empty;
     for (module.imports) |imp| {
+        // Cross-module table linking isn't supported yet (Phase 4). A
+        // module with an imported table currently falls through with an
+        // empty `module.tables`, so `table.size` on it would return 0
+        // instead of the declared min. Surface as UnsupportedOpcode so
+        // the spec runner records a skip rather than a value mismatch.
+        if (imp.kind == .table) return error.UnsupportedOpcode;
         try import_entries.append(a, .{
             .module_name = imp.module_name,
             .field_name = imp.field_name,
