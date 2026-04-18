@@ -779,7 +779,14 @@ fn globalValueToI64(inst: *const AotInstance, v: types.Value) i64 {
             if (idx >= inst.funcptrs.len) break :blk 0;
             break :blk @as(i64, @bitCast(@as(u64, inst.funcptrs[idx])));
         },
-        .externref, .nonexternref => |maybe| @as(i64, @as(u32, maybe orelse 0)),
+        // externref values are opaque host-supplied integer tags. The
+        // wasm-spec test suite uses `(ref.extern 0)` as a non-null handle,
+        // which collides with our convention that 0 == null. Encode as
+        // `N + 1` so the value 0 becomes raw 1 and remains non-null when
+        // passed through `ref.is_null`. The reverse decoding lives in
+        // `globalValueFromI64` and the `ScalarResult` packing in
+        // `callFuncScalar`.
+        .externref, .nonexternref => |maybe| if (maybe) |n| @as(i64, @as(u32, n)) + 1 else 0,
         else => 0,
     };
     return r;
@@ -803,8 +810,8 @@ fn globalValueFromI64(inst: *const AotInstance, old: types.Value, raw: i64) type
             const idx = funcPtrToIndex(inst, ptr);
             break :blk .{ .nonfuncref = if (idx) |x| @as(u32, @truncate(x)) else null };
         },
-        .externref => .{ .externref = if (raw == 0) null else @as(u32, @truncate(@as(u64, @bitCast(raw)))) },
-        .nonexternref => .{ .nonexternref = if (raw == 0) null else @as(u32, @truncate(@as(u64, @bitCast(raw)))) },
+        .externref => .{ .externref = if (raw == 0) null else @as(u32, @truncate(@as(u64, @bitCast(raw)) - 1)) },
+        .nonexternref => .{ .nonexternref = if (raw == 0) null else @as(u32, @truncate(@as(u64, @bitCast(raw)) - 1)) },
         else => old,
     };
 }
@@ -843,11 +850,12 @@ fn valueToRawBits(inst: *const AotInstance, pt: types.ValType, v: types.Value) S
             },
             else => error.InvalidArgType,
         },
-        // externref is opaque in AOT; tests pass small integer tags and
-        // expect the same value back unchanged.
+        // externref is opaque in AOT; tests pass small integer tags (see
+        // `globalValueToI64` for the +1 tagging that disambiguates 0 from
+        // null) and expect the same value back unchanged.
         .externref => switch (v) {
-            .externref => |maybe| @as(u64, maybe orelse 0),
-            .nonexternref => |maybe| @as(u64, maybe orelse 0),
+            .externref => |maybe| if (maybe) |n| @as(u64, n) + 1 else 0,
+            .nonexternref => |maybe| if (maybe) |n| @as(u64, n) + 1 else 0,
             else => error.InvalidArgType,
         },
         else => error.UnsupportedSignature,
@@ -1045,7 +1053,7 @@ pub fn callFuncScalar(
             .f32 => ScalarResult{ .f32 = @bitCast(@as(u32, @truncate(raw_result))) },
             .f64 => ScalarResult{ .f64 = @bitCast(raw_result) },
             .funcref => ScalarResult{ .funcref = funcPtrToIndex(inst, raw_result) },
-            .externref => ScalarResult{ .externref = if (raw_result == 0) null else raw_result },
+            .externref => ScalarResult{ .externref = if (raw_result == 0) null else raw_result - 1 },
             else => unreachable,
         };
     }

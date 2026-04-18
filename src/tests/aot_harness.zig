@@ -311,18 +311,17 @@ fn compileToAot(
         });
     }
 
-    // Element segments: forward active segments whose offset is an
-    // i32.const literal and whose entries are all concrete funcidx. This
-    // is sufficient for the bulk of the spec suite; passive/declarative
-    // and init-expr segments are deferred.
+    // Element segments: forward active segments whose offset reduces to
+    // a constant u32 (`i32.const` literal, or `global.get K` where K is
+    // an i32 immutable global with a known constant value at instantiate
+    // time) and whose entries are all concrete funcidx. This is sufficient
+    // for the bulk of the spec suite; passive/declarative and arbitrary
+    // bytecode segments are deferred.
     var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
     for (module.elements) |seg| {
         if (seg.is_passive or seg.is_declarative) continue;
         const offset_expr = seg.offset orelse continue;
-        const offset_val: u32 = switch (offset_expr) {
-            .i32_const => |v| @bitCast(v),
-            else => continue,
-        };
+        const offset_val: u32 = resolveU32InitExpr(offset_expr, tmp_globals.items) orelse continue;
         var all_concrete = true;
         for (seg.func_indices) |fi| {
             if (fi == null) { all_concrete = false; break; }
@@ -337,14 +336,12 @@ fn compileToAot(
         });
     }
 
-    // Data segments: forward active segments with i32.const offsets.
+    // Data segments: forward active segments whose offset reduces to a
+    // constant u32. See `resolveU32InitExpr` for the supported forms.
     var data_entries: std.ArrayList(emit_aot.DataSegmentEntry) = .empty;
     for (module.data_segments) |seg| {
         if (seg.is_passive) continue;
-        const offset_val: u32 = switch (seg.offset) {
-            .i32_const => |v| @bitCast(v),
-            else => continue,
-        };
+        const offset_val: u32 = resolveU32InitExpr(seg.offset, tmp_globals.items) orelse continue;
         try data_entries.append(a, .{
             .memory_idx = seg.memory_idx,
             .offset = offset_val,
@@ -384,6 +381,31 @@ fn defaultZeroValue(vt: types.ValType) types.Value {
         .f32 => .{ .f32 = 0 },
         .f64 => .{ .f64 = 0 },
         else => .{ .i64 = 0 },
+    };
+}
+
+/// Reduce an `InitExpr` to a constant u32 offset for active elem/data
+/// segments. Handles `i32.const` literals and `global.get K` where K
+/// resolves to an immutable i32 global with a known constant value at
+/// instantiate time (typically a spectest import — see `global.json`,
+/// where active elem/data offsets reference the imported `global_i32`).
+/// Returns null when the expression cannot be resolved at AOT compile
+/// time, in which case the caller skips emitting the segment.
+fn resolveU32InitExpr(
+    expr: types.InitExpr,
+    tmp_globals: []const *types.GlobalInstance,
+) ?u32 {
+    return switch (expr) {
+        .i32_const => |v| @as(u32, @bitCast(v)),
+        .global_get => |idx| blk: {
+            if (idx >= tmp_globals.len) break :blk null;
+            const gv = tmp_globals[idx].value;
+            break :blk switch (gv) {
+                .i32 => |x| @as(u32, @bitCast(x)),
+                else => null,
+            };
+        },
+        else => null,
     };
 }
 
