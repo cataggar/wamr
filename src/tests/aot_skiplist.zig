@@ -24,13 +24,13 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // "address.json", // FIXED round-6: large memory offset no longer panics
     "call.json", // stack-overflow via runaway (guard page non-recoverable)
     "call_indirect.json", // hangs; signature-mismatch traps not emitted
-    "elem.json", // 7 call-in-table WasmTrap (passive elem + imports)
+    // "elem.json", // 7 call-in-table WasmTrap (passive elem + imports)
     // "float_exprs.json", // FIXED round-7: f_le/f_lt/f_eq/f_ne setcc r11 (was rdx)
     // "func.json", // FIXED: function-level br_if/br_table now emit ret
     // "global.json", // FIXED round-6: imported globals + global_get init expr
     "imports.json", // AV during exec (host-import call path)
     "linking.json", // 38 cross-module register/resolution fails
-    "memory_grow.json", // 2 fails: cross-module imported memory (linking)
+    // "memory_grow.json", // 2 fails: cross-module imported memory (linking)
     // "start.json", // FIXED: emit start section + invoke after instantiate
     // "unwind.json", // FIXED: function-level br_if/br_table now emit ret
 
@@ -39,7 +39,7 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // type-propagation mismatch between the untyped `select` IR op and
     // ref-typed operands pushed onto the vreg stack. Re-enable once the
     // IR learns result typing for select (Phase 4/5 territory).
-    "select.json", // 147 pass, 4 call_indirect arg-routing fails (pre-existing)
+    // "select.json", // 147 pass, 4 call_indirect arg-routing fails (pre-existing)
 
     // return_call / return_call_indirect are now lowered as regular
     // call + ret (not true tail-call), which causes a native stack
@@ -54,13 +54,6 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // overflow; the trap is emitted via guard-page SEH which our
     // runtime currently doesn't translate into error.WasmTrap.
     "skip-stack-guard-page.json",
-
-    // Phase 1b unlock surfaced a latent bug: something in the compile path
-    // for unreached-valid.0.wasm corrupts heap state (access violation on
-    // the subsequent file). Individually the file passes; only fails as
-    // part of the full-suite run after unreached-invalid.json. Investigate
-    // once the underlying lifetime issue is understood.
-    "unreached-valid.json",
 };
 
 pub fn isSkippedInAot(basename: []const u8) bool {
