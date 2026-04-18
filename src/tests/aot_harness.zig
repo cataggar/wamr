@@ -322,13 +322,8 @@ fn compileToAot(
         if (seg.is_passive or seg.is_declarative) continue;
         const offset_expr = seg.offset orelse continue;
         const offset_val: u32 = resolveU32InitExpr(offset_expr, tmp_globals.items) orelse continue;
-        var all_concrete = true;
-        for (seg.func_indices) |fi| {
-            if (fi == null) { all_concrete = false; break; }
-        }
-        if (!all_concrete) continue;
         const indices = try a.alloc(u32, seg.func_indices.len);
-        for (seg.func_indices, 0..) |fi, k| indices[k] = fi.?;
+        for (seg.func_indices, 0..) |fi, k| indices[k] = fi orelse std.math.maxInt(u32);
         try elem_entries.append(a, .{
             .table_idx = seg.table_idx,
             .offset = offset_val,
@@ -395,16 +390,27 @@ fn resolveU32InitExpr(
     expr: types.InitExpr,
     tmp_globals: []const *types.GlobalInstance,
 ) ?u32 {
-    return switch (expr) {
-        .i32_const => |v| @as(u32, @bitCast(v)),
-        .global_get => |idx| blk: {
-            if (idx >= tmp_globals.len) break :blk null;
+    // Fast path: avoid invoking the interpreter for trivial cases that
+    // arise frequently in spec tests.
+    switch (expr) {
+        .i32_const => |v| return @as(u32, @bitCast(v)),
+        .global_get => |idx| {
+            if (idx >= tmp_globals.len) return null;
             const gv = tmp_globals[idx].value;
-            break :blk switch (gv) {
+            return switch (gv) {
                 .i32 => |x| @as(u32, @bitCast(x)),
                 else => null,
             };
         },
+        else => {},
+    }
+    // Compound expressions (i32.add/sub/mul, etc.) are stored as raw
+    // bytecode. Delegate to the interpreter's `evalInitExpr` so that
+    // extended constant expressions (the wasm 2.0 proposal) are
+    // supported uniformly.
+    const val = root.instance.evalInitExpr(expr, tmp_globals, null) catch return null;
+    return switch (val) {
+        .i32 => |x| @as(u32, @bitCast(x)),
         else => null,
     };
 }
