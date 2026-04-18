@@ -1871,6 +1871,66 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 }
             },
 
+            .call_ref => {
+                // Call the function referenced by the funcref popped from
+                // the stack. Immediate is the expected typeidx. Traps on
+                // null ref (null-check emitted by codegen).
+                const type_idx = readU32(code, &ip);
+                const func_ref = safePop(&vreg_stack);
+
+                const callee_type = if (type_idx < wasm_module.types.len) &wasm_module.types[type_idx] else null;
+                const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
+
+                const args = try allocator.alloc(ir.VReg, arg_count);
+                var ci: u32 = 0;
+                while (ci < arg_count) : (ci += 1) {
+                    args[arg_count - 1 - ci] = safePop(&vreg_stack);
+                }
+
+                const dest = ir_func.newVReg();
+                const cr_result_type: ir.IrType = if (callee_type != null and call_result_count > 0)
+                    switch (callee_type.?.results[0]) {
+                        .i32 => .i32,
+                        .i64 => .i64,
+                        .f32 => .f32,
+                        .f64 => .f64,
+                        else => .i64,
+                    }
+                else
+                    .i32;
+                const cr_extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call_ref = .{
+                    .type_idx = type_idx,
+                    .func_ref = func_ref,
+                    .args = args,
+                    .extra_results = cr_extra_results,
+                } }, .dest = dest, .type = cr_result_type });
+
+                if (call_result_count > 0) {
+                    try vreg_stack.append(allocator, dest);
+                }
+                if (cr_extra_results > 0) {
+                    var ri: u32 = 1;
+                    while (ri < call_result_count) : (ri += 1) {
+                        const extra_dest = ir_func.newVReg();
+                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
+                            .i32 => .i32,
+                            .i64 => .i64,
+                            .f32 => .f32,
+                            .f64 => .f64,
+                            else => .i64,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .call_result = @intCast(ri - 1) },
+                            .dest = extra_dest,
+                            .type = extra_ty,
+                        });
+                        try vreg_stack.append(allocator, extra_dest);
+                    }
+                }
+            },
+
             else => {
                 std.debug.print("wamrc: unsupported opcode 0x{X:0>2}\n", .{byte});
                 return error.UnsupportedOpcode;

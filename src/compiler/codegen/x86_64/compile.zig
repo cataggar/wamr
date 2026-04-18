@@ -1041,6 +1041,12 @@ fn compileInst(
             try code.movRegImm32(.rax, 0);
             try stack.push(code, .rax);
         },
+        .call_ref => {
+            // Stub in non-RA path: pop funcref, push 0
+            try stack.pop(code, .rax); // func_ref (discard)
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
         .call_result => {
             // Stub in non-RA path: push 0 as placeholder.
             try code.movRegImm32(.rax, 0);
@@ -1108,7 +1114,7 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
             switch (ci.op) {
-                .call, .call_indirect, .memory_grow, .table_grow => {
+                .call, .call_indirect, .call_ref, .memory_grow, .table_grow => {
                     const mask = if (comptime builtin.os.tag == .windows)
                         [_]bool{ true, false, false, true, true, false, false }
                     else
@@ -1175,6 +1181,7 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
                     p("    {d:4}: call {s}[{d}] nargs={d}  {s}\n", .{ pos, kind, cl.func_idx, cl.args.len, dest_alloc });
                 },
                 .call_indirect => |ci| p("    {d:4}: call_indirect type={d} v{d} nargs={d}  {s}\n", .{ pos, ci.type_idx, ci.elem_idx, ci.args.len, dest_alloc }),
+                .call_ref => |cr| p("    {d:4}: call_ref type={d} v{d} nargs={d}  {s}\n", .{ pos, cr.type_idx, cr.func_ref, cr.args.len, dest_alloc }),
                 .select => |sel| p("    {d:4}: select cond=v{d} t=v{d} f=v{d}  {s}\n", .{ pos, sel.cond, sel.if_true, sel.if_false, dest_alloc }),
                 .global_get => |idx| p("    {d:4}: global_get {d}  {s}\n", .{ pos, idx, dest_alloc }),
                 .global_set => |gs| p("    {d:4}: global_set {d}, v{d}\n", .{ pos, gs.idx, gs.val }),
@@ -1261,7 +1268,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (func.blocks.items) |block| {
             for (block.instructions.items) |ci| {
                 switch (ci.op) {
-                    .call, .call_indirect, .memory_grow, .table_grow => {
+                    .call, .call_indirect, .call_ref, .memory_grow, .table_grow => {
                         // Calls clobber caller-saved allocatable regs.
                         // memory.grow is compiled as a host call, same ABI, so it
                         // clobbers the same set of caller-saved registers.
@@ -2142,6 +2149,68 @@ fn compileInstRA(
                 try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
             }
             try emitCallRegArgMoves(code, alloc_result, ci.args, max_reg_args);
+            if (has_hrp) {
+                if (hrp_in_reg) {
+                    const hrp_dst = param_regs[1 + n_args];
+                    try code.movRegReg(hrp_dst, .rbp);
+                    try code.addRegImm32(hrp_dst, scratch_base_off);
+                } else {
+                    try code.movRegReg(.r10, .rbp);
+                    try code.addRegImm32(.r10, scratch_base_off);
+                    try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                }
+            }
+            try code.callReg(.r11);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            if (inst.dest) |dest| {
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            }
+        },
+
+        .call_ref => |cr| {
+            // Load funcref (native pointer) into r11.
+            const ref_reg = try useVReg(code, alloc_result, cr.func_ref, .rax);
+            if (ref_reg != .r11) try code.movRegReg(.r11, ref_reg);
+
+            // Null check: if r11 == 0, trap via trap_unreachable_fn.
+            // Load vmctx into r10 first so the trap call has it handy.
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            // test r11, r11  → 0x4D 0x85 0xDB
+            try code.emitSlice(&.{ 0x4D, 0x85, 0xDB });
+            // jne over_trap (rel8). Trap block is 3 + 7 + 2 = 12 bytes.
+            try code.emitByte(0x75);
+            try code.emitByte(12);
+            // Trap block: call trap_unreachable_fn(vmctx)
+            try code.movRegReg(param_regs[0], .r10);
+            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+            try code.callReg(.rax);
+            // over_trap:
+
+            // Load vmctx into param_regs[0] for the callee.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+
+            const n_args: u32 = @intCast(cr.args.len);
+            const has_hrp: bool = cr.extra_results > 0;
+            const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+            const hrp_in_reg: bool = has_hrp and (n_args < max_reg_slots);
+            const max_reg_args: u32 = @min(n_args, max_reg_slots);
+            const extra: u32 = n_args - max_reg_args;
+            const hrp_on_stack: bool = has_hrp and !hrp_in_reg;
+            const hrp_stack_k: u32 = if (hrp_on_stack) n_args - max_reg_slots else 0;
+            const total_stack_args: u32 = extra + (if (hrp_on_stack) @as(u32, 1) else 0);
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_need: u32 = shadow + total_stack_args * 8;
+            const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
+
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            var j: u32 = 0;
+            while (j < extra) : (j += 1) {
+                const arg_reg = try useVReg(code, alloc_result, cr.args[max_reg_args + j], .r10);
+                try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
+            }
+            try emitCallRegArgMoves(code, alloc_result, cr.args, max_reg_args);
             if (has_hrp) {
                 if (hrp_in_reg) {
                     const hrp_dst = param_regs[1 + n_args];

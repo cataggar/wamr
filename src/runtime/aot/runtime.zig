@@ -551,7 +551,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
     const n_globals = @min(inst.globals.len, globals_buf.len);
     for (0..n_globals) |i| {
-        globals_buf[i] = globalValueToI64(inst.globals[i].value);
+        globals_buf[i] = globalValueToI64(inst, inst.globals[i].value);
     }
 
     // Build VMContext for the compiled function
@@ -606,7 +606,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
 
     // Sync globals back from flat array to GlobalInstance objects
     for (0..n_globals) |i| {
-        inst.globals[i].value = globalValueFromI64(inst.globals[i].value, globals_buf[i]);
+        inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
     }
 
     return result;
@@ -671,29 +671,48 @@ fn isScalarValType(t: types.ValType) bool {
 /// that AOT code accesses via `movRegMem(dr, globals_base, idx*8)`. The tag
 /// determines the bit-cast; using `.value.i64` would be UB when the active
 /// tag is `.f32` / `.f64`.
-fn globalValueToI64(v: types.Value) i64 {
-    return switch (v) {
+fn globalValueToI64(inst: *const AotInstance, v: types.Value) i64 {
+    const r: i64 = switch (v) {
         .i32 => |x| @as(i64, @as(u32, @bitCast(x))),
         .i64 => |x| x,
         .f32 => |x| @as(i64, @as(u32, @bitCast(x))),
         .f64 => |x| @as(i64, @bitCast(x)),
+        .funcref, .nonfuncref => |maybe| blk: {
+            const idx = maybe orelse break :blk 0;
+            if (idx >= inst.funcptrs.len) break :blk 0;
+            break :blk @as(i64, @bitCast(@as(u64, inst.funcptrs[idx])));
+        },
+        .externref, .nonexternref => |maybe| @as(i64, @as(u32, maybe orelse 0)),
         else => 0,
     };
+    return r;
 }
 
 /// Unpack a raw 64-bit slot from globals_buf back into a typed Value,
 /// preserving the active tag.
-fn globalValueFromI64(old: types.Value, raw: i64) types.Value {
+fn globalValueFromI64(inst: *const AotInstance, old: types.Value, raw: i64) types.Value {
     return switch (old) {
         .i32 => .{ .i32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(raw))))) },
         .i64 => .{ .i64 = raw },
         .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(raw))))) },
         .f64 => .{ .f64 = @bitCast(raw) },
+        .funcref => blk: {
+            const ptr: u64 = @bitCast(raw);
+            const idx = funcPtrToIndex(inst, ptr);
+            break :blk .{ .funcref = if (idx) |x| @as(u32, @truncate(x)) else null };
+        },
+        .nonfuncref => blk: {
+            const ptr: u64 = @bitCast(raw);
+            const idx = funcPtrToIndex(inst, ptr);
+            break :blk .{ .nonfuncref = if (idx) |x| @as(u32, @truncate(x)) else null };
+        },
+        .externref => .{ .externref = if (raw == 0) null else @as(u32, @truncate(@as(u64, @bitCast(raw)))) },
+        .nonexternref => .{ .nonexternref = if (raw == 0) null else @as(u32, @truncate(@as(u64, @bitCast(raw)))) },
         else => old,
     };
 }
 
-fn valueToRawBits(pt: types.ValType, v: types.Value) ScalarCallError!u64 {
+fn valueToRawBits(inst: *const AotInstance, pt: types.ValType, v: types.Value) ScalarCallError!u64 {
     return switch (pt) {
         .i32 => blk: {
             if (v != .i32) return error.InvalidArgType;
@@ -711,13 +730,24 @@ fn valueToRawBits(pt: types.ValType, v: types.Value) ScalarCallError!u64 {
             if (v != .f64) return error.InvalidArgType;
             break :blk @as(u64, @bitCast(v.f64));
         },
-        // Reference types: null -> 0, indexed -> index as u64 (tests use small
-        // integer "externref N" literals and null; AOT stores a raw pointer).
+        // funcref in AOT is the native code pointer, not the wasm func
+        // index. Translate the test-harness `.funcref = <idx>` form to
+        // `inst.funcptrs[idx]` so the callee can `call r11` it directly.
         .funcref => switch (v) {
-            .funcref => |maybe| @as(u64, maybe orelse 0),
-            .nonfuncref => |maybe| @as(u64, maybe orelse 0),
+            .funcref => |maybe| blk: {
+                const idx = maybe orelse break :blk 0;
+                if (idx >= inst.funcptrs.len) return error.InvalidArgType;
+                break :blk @as(u64, inst.funcptrs[idx]);
+            },
+            .nonfuncref => |maybe| blk: {
+                const idx = maybe orelse break :blk 0;
+                if (idx >= inst.funcptrs.len) return error.InvalidArgType;
+                break :blk @as(u64, inst.funcptrs[idx]);
+            },
             else => error.InvalidArgType,
         },
+        // externref is opaque in AOT; tests pass small integer tags and
+        // expect the same value back unchanged.
         .externref => switch (v) {
             .externref => |maybe| @as(u64, maybe orelse 0),
             .nonexternref => |maybe| @as(u64, maybe orelse 0),
@@ -725,6 +755,18 @@ fn valueToRawBits(pt: types.ValType, v: types.Value) ScalarCallError!u64 {
         },
         else => error.UnsupportedSignature,
     };
+}
+
+/// Reverse-lookup a funcref native pointer back to the wasm function index
+/// so test-harness comparisons against `.funcref = N` work transparently.
+/// Returns null if `ptr` is 0 (null funcref); returns the u64 ptr unchanged
+/// when no matching function exists (will compare unequal to any index).
+fn funcPtrToIndex(inst: *const AotInstance, ptr: u64) ?u64 {
+    if (ptr == 0) return null;
+    for (inst.funcptrs, 0..) |fp, i| {
+        if (@as(u64, fp) == ptr) return @as(u64, @intCast(i));
+    }
+    return ptr;
 }
 
 /// Call an AOT-compiled function by index with runtime-typed scalar args.
@@ -757,7 +799,7 @@ pub fn callFuncScalar(
     var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
     const n_globals = @min(inst.globals.len, globals_buf.len);
     for (0..n_globals) |i| {
-        globals_buf[i] = globalValueToI64(inst.globals[i].value);
+        globals_buf[i] = globalValueToI64(inst, inst.globals[i].value);
     }
 
     var vmctx = VmCtx{};
@@ -792,7 +834,7 @@ pub fn callFuncScalar(
     // Marshal args to raw 64-bit bit patterns.
     var raw: [MaxScalarArgs]u64 = [_]u64{0} ** MaxScalarArgs;
     for (args, param_types, 0..) |v, pt, i| {
-        raw[i] = try valueToRawBits(pt, v);
+        raw[i] = try valueToRawBits(inst, pt, v);
     }
 
     if (comptime builtin.os.tag == .windows) {
@@ -825,7 +867,7 @@ pub fn callFuncScalar(
         if (@atomicLoad(bool, &g_trap_occurred, .seq_cst)) {
             @atomicStore(bool, &g_trap_catching, false, .seq_cst);
             for (0..n_globals) |i| {
-                inst.globals[i].value = globalValueFromI64(inst.globals[i].value, globals_buf[i]);
+                inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
             }
             return error.WasmTrap;
         }
@@ -893,7 +935,7 @@ pub fn callFuncScalar(
 
     // Sync globals back.
     for (0..n_globals) |i| {
-        inst.globals[i].value = globalValueFromI64(inst.globals[i].value, globals_buf[i]);
+        inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
     }
 
     if (result_type) |rt| {
@@ -902,7 +944,7 @@ pub fn callFuncScalar(
             .i64 => ScalarResult{ .i64 = @bitCast(raw_result) },
             .f32 => ScalarResult{ .f32 = @bitCast(@as(u32, @truncate(raw_result))) },
             .f64 => ScalarResult{ .f64 = @bitCast(raw_result) },
-            .funcref => ScalarResult{ .funcref = if (raw_result == 0) null else raw_result },
+            .funcref => ScalarResult{ .funcref = funcPtrToIndex(inst, raw_result) },
             .externref => ScalarResult{ .externref = if (raw_result == 0) null else raw_result },
             else => unreachable,
         };
@@ -1016,12 +1058,28 @@ fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
 
     for (module.global_inits, 0..) |ginit, i| {
         const g = allocator.create(types.GlobalInstance) catch return error.OutOfMemory;
+        const vt: types.ValType = @enumFromInt(ginit.val_type);
+        // Tag the stored Value per the declared val_type so later
+        // packing/unpacking through globals_buf preserves ref types
+        // (funcref idx ↔ native ptr conversion happens in
+        // globalValueToI64 / globalValueFromI64).
+        const val: types.Value = switch (vt) {
+            .i32 => .{ .i32 = @as(i32, @truncate(ginit.init_i64)) },
+            .i64 => .{ .i64 = ginit.init_i64 },
+            .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64))))) },
+            .f64 => .{ .f64 = @bitCast(ginit.init_i64) },
+            .funcref => .{ .funcref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
+            .nonfuncref => .{ .nonfuncref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
+            .externref => .{ .externref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
+            .nonexternref => .{ .nonexternref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
+            else => .{ .i64 = ginit.init_i64 },
+        };
         g.* = .{
             .global_type = .{
-                .val_type = @enumFromInt(ginit.val_type),
+                .val_type = vt,
                 .mutability = if (ginit.mutability != 0) .mutable else .immutable,
             },
-            .value = .{ .i64 = ginit.init_i64 },
+            .value = val,
         };
         globals[i] = g;
         initialized += 1;

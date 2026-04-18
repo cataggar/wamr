@@ -388,6 +388,11 @@ fn valueToI64(v: types.Value) i64 {
         .i64 => |x| x,
         .f32 => |x| @as(i64, @as(u32, @bitCast(x))),
         .f64 => |x| @as(i64, @bitCast(x)),
+        // Reference types: store the wasm function/extern index as a
+        // plain i64 in the AOT binary; the runtime translates it to a
+        // native code pointer at instantiate time.
+        .funcref, .nonfuncref => |maybe| @as(i64, @as(u32, maybe orelse 0)),
+        .externref, .nonexternref => |maybe| @as(i64, @as(u32, maybe orelse 0)),
         else => 0,
     };
 }
