@@ -229,6 +229,26 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     // multi-value param/result signatures.
     const readBlockType = struct {
         fn call(code: []const u8, ip_ptr: *usize, sigs: []const BlockSig) BlockSig {
+            // Typed reference blocktypes: 0x63 (ref null ht) / 0x64 (ref ht).
+            // These are multi-byte and not pure signed-LEB128, so intercept
+            // them before leb128 parsing (which would only consume the prefix
+            // byte and desync the instruction stream).
+            if (ip_ptr.* < code.len) {
+                const b0 = code[ip_ptr.*];
+                if (b0 == 0x63 or b0 == 0x64) {
+                    ip_ptr.* += 1; // consume prefix
+                    // Skip the heaptype: either a single negative byte
+                    // (e.g. 0x70 func, 0x6F extern, etc.) or a LEB128 type
+                    // index (positive). Treat single-byte if high bit clear
+                    // is the LEB128 terminator.
+                    while (ip_ptr.* < code.len) {
+                        const hb = code[ip_ptr.*];
+                        ip_ptr.* += 1;
+                        if ((hb & 0x80) == 0) break;
+                    }
+                    return .{ .params = NO_TYPES, .results = ONE_I64 };
+                }
+            }
             const v = leb128.readSignedLossy(i64, code, ip_ptr);
             if (v < 0) {
                 return switch (v) {
@@ -237,7 +257,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     -2 => .{ .params = NO_TYPES, .results = ONE_I64 }, // -0x02 = i64
                     -3 => .{ .params = NO_TYPES, .results = ONE_F32 }, // -0x03 = f32
                     -4 => .{ .params = NO_TYPES, .results = ONE_F64 }, // -0x04 = f64
-                    else => .{ .params = NO_TYPES, .results = ONE_I32 },
+                    else => .{ .params = NO_TYPES, .results = ONE_I64 }, // ref types (funcref/externref/anyref/...) → 64-bit slot
                 };
             }
             const idx: usize = @intCast(v);
