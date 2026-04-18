@@ -1694,6 +1694,12 @@ fn runSpecTestFileAot(
     var current: ?*aot_harness.Harness = null;
     defer if (current) |h| h.deinit();
 
+    // Cross-module import registry. Gets populated on `register` commands
+    // by copying the current harness's exported globals. Subsequent module
+    // loads consult this when resolving imported globals.
+    var import_registry = aot_harness.ImportRegistry.init(allocator);
+    defer import_registry.deinit();
+
     for (parsed.value.commands) |cmd| {
         result.total += 1;
 
@@ -1717,13 +1723,34 @@ fn runSpecTestFileAot(
             };
             defer allocator.free(wasm_data);
 
-            current = aot_harness.Harness.init(allocator, wasm_data) catch |err| blk: {
+            current = aot_harness.Harness.initWithRegistry(allocator, wasm_data, &import_registry) catch |err| blk: {
                 std.debug.print("  SKIP aot compile {s} line {d}: {}\n", .{ filename, cmd.line, err });
                 recordSkip("compile_fail");
                 result.skipped += 1;
                 break :blk null;
             };
             if (current != null) result.passed += 1;
+        } else if (std.mem.eql(u8, cmd.type, "register")) {
+            // Publish the current harness's exported globals under the
+            // registration name so subsequent modules can import them.
+            // Other kinds (functions, memories, tables) still fall through
+            // as skips — cross-module func/memory/table linking is TBD.
+            const reg_name = cmd.@"as" orelse {
+                recordSkip("register_no_as");
+                result.skipped += 1;
+                continue;
+            };
+            if (current) |h| {
+                h.exportGlobalsToRegistry(&import_registry, reg_name) catch {
+                    recordSkip("register_oom");
+                    result.skipped += 1;
+                    continue;
+                };
+                result.passed += 1;
+            } else {
+                recordSkip("register_no_module");
+                result.skipped += 1;
+            }
         } else if (std.mem.eql(u8, cmd.type, "assert_return")) {
             const action = cmd.action orelse {
                 recordSkip("no_action");

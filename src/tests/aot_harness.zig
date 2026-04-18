@@ -28,6 +28,44 @@ pub const can_exec_aot = switch (builtin.cpu.arch) {
     else => false,
 };
 
+/// Import registry for cross-module links discovered via `register`.
+/// Currently only tracks exported global values keyed by "module_name/field_name".
+/// Lookups fall through to the spectest fallback if no hit.
+pub const ImportRegistry = struct {
+    allocator: std.mem.Allocator,
+    globals: std.StringHashMap(types.Value),
+
+    pub fn init(allocator: std.mem.Allocator) ImportRegistry {
+        return .{
+            .allocator = allocator,
+            .globals = std.StringHashMap(types.Value).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ImportRegistry) void {
+        var it = self.globals.keyIterator();
+        while (it.next()) |k| self.allocator.free(k.*);
+        self.globals.deinit();
+    }
+
+    /// Record an exported global under "<module_name>/<field>" = value.
+    pub fn putGlobal(self: *ImportRegistry, module_name: []const u8, field: []const u8, value: types.Value) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ module_name, field });
+        errdefer self.allocator.free(key);
+        const gop = try self.globals.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+        }
+        gop.value_ptr.* = value;
+    }
+
+    pub fn getGlobal(self: *const ImportRegistry, module_name: []const u8, field: []const u8) ?types.Value {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
+        return self.globals.get(key);
+    }
+};
+
 pub const Error = error{
     AotUnsupportedArch,
     CompileFailed,
@@ -52,6 +90,18 @@ pub const Harness = struct {
     /// On success the caller owns the harness and must call `deinit` then
     /// free the pointer with the same allocator.
     pub fn init(allocator: std.mem.Allocator, wasm_bytes: []const u8) Error!*Harness {
+        return initWithRegistry(allocator, wasm_bytes, null);
+    }
+
+    /// Like `init` but consults `registry` when resolving imports that the
+    /// built-in spectest fallback doesn't recognize. Currently only
+    /// imported-global values flow through here (enough for the spec suite's
+    /// cross-module global tests in `global.json`).
+    pub fn initWithRegistry(
+        allocator: std.mem.Allocator,
+        wasm_bytes: []const u8,
+        registry: ?*const ImportRegistry,
+    ) Error!*Harness {
         if (comptime !can_exec_aot) return error.AotUnsupportedArch;
 
         const h = allocator.create(Harness) catch return error.OutOfMemory;
@@ -64,12 +114,19 @@ pub const Harness = struct {
 
         const a = arena.allocator();
 
-        const wasm_module = loader_mod.load(wasm_bytes, a) catch |err| {
+        // The interpreter loader returns export/import names (and other
+        // string slices) that alias the input wasm buffer. Callers
+        // typically free the buffer right after `init` returns, so we
+        // copy it into the arena first to guarantee those slices stay
+        // valid for the lifetime of the Harness (needed for `register`).
+        const owned_wasm = a.dupe(u8, wasm_bytes) catch return error.OutOfMemory;
+
+        const wasm_module = loader_mod.load(owned_wasm, a) catch |err| {
             std.debug.print("aot_harness: loader failed: {}\n", .{err});
             return error.CompileFailed;
         };
 
-        const aot_bin = compileToAot(allocator, arena, &wasm_module) catch |err| {
+        const aot_bin = compileToAot(allocator, arena, &wasm_module, registry) catch |err| {
             std.debug.print("aot_harness: compile failed: {}\n", .{err});
             return error.CompileFailed;
         };
@@ -157,6 +214,21 @@ pub const Harness = struct {
         return null;
     }
 
+    /// Copy every exported global of this instance into `registry` keyed by
+    /// `<module_name>/<export_name>`. Used to expose a just-registered
+    /// module's globals to subsequently-compiled modules that import them.
+    pub fn exportGlobalsToRegistry(
+        self: *const Harness,
+        registry: *ImportRegistry,
+        module_name: []const u8,
+    ) !void {
+        for (self.wasm_module.exports) |exp| {
+            if (exp.kind != .global) continue;
+            if (exp.index >= self.inst.globals.len) continue;
+            try registry.putGlobal(module_name, exp.name, self.inst.globals[exp.index].value);
+        }
+    }
+
     /// Invoke an AOT function by index with runtime-typed scalar args.
     /// See `aot_runtime.callFuncScalar` for the supported signature envelope.
     pub fn callScalar(
@@ -204,6 +276,7 @@ fn compileToAot(
     allocator: std.mem.Allocator,
     arena: *std.heap.ArenaAllocator,
     module: *const types.WasmModule,
+    registry: ?*const ImportRegistry,
 ) ![]u8 {
     const a = arena.allocator();
 
@@ -286,8 +359,17 @@ fn compileToAot(
     for (module.imports) |imp| {
         if (imp.kind != .global) continue;
         const gt = imp.global_type orelse continue;
-        const val: types.Value = spectestGlobalInitValue(imp.module_name, imp.field_name, gt.val_type) orelse
-            defaultZeroValue(gt.val_type);
+        const val: types.Value = blk: {
+            if (registry) |reg| {
+                if (reg.getGlobal(imp.module_name, imp.field_name)) |v| {
+                    break :blk v;
+                }
+            }
+            if (spectestGlobalInitValue(imp.module_name, imp.field_name, gt.val_type)) |v| {
+                break :blk v;
+            }
+            break :blk defaultZeroValue(gt.val_type);
+        };
         const g = try a.create(types.GlobalInstance);
         g.* = .{ .global_type = gt, .value = val };
         try tmp_globals.append(a, g);
