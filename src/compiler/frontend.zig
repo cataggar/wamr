@@ -41,6 +41,37 @@ fn valTypeToIr(vt: types.ValType) ir.IrType {
     };
 }
 
+/// Emit a return instruction at the end of `target_block` that returns the
+/// top `result_count` values of `vreg_stack`. Does NOT pop the stack — the
+/// caller either marks dead_code (for br/br_table) or keeps the stack intact
+/// for the fallthrough path (for br_if).
+fn emitFunctionReturn(
+    ir_func: *ir.IrFunction,
+    target_block: ir.BlockId,
+    vreg_stack: *std.ArrayList(ir.VReg),
+    result_count: u32,
+    func_type: *const types.FuncType,
+    allocator: std.mem.Allocator,
+) !void {
+    _ = func_type;
+    if (result_count == 0 or vreg_stack.items.len < result_count) {
+        try ir_func.getBlock(target_block).append(.{ .op = .{ .ret = null } });
+        return;
+    }
+    if (result_count == 1) {
+        const v = vreg_stack.items[vreg_stack.items.len - 1];
+        try ir_func.getBlock(target_block).append(.{ .op = .{ .ret = v } });
+    } else {
+        const rets = try allocator.alloc(ir.VReg, result_count);
+        const base = vreg_stack.items.len - result_count;
+        var i: u32 = 0;
+        while (i < result_count) : (i += 1) {
+            rets[i] = vreg_stack.items[base + i];
+        }
+        try ir_func.getBlock(target_block).append(.{ .op = .{ .ret_multi = rets } });
+    }
+}
+
 /// Lower an entire Wasm module into IR.
 pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allocator) LowerError!ir.IrModule {
     var ir_module = ir.IrModule.init(allocator);
@@ -534,6 +565,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         }
                     }
                     try ir_func.getBlock(current_block).append(.{ .op = .{ .br = target_frame.target_block } });
+                } else if (depth == block_stack.items.len) {
+                    // Function-level label: branch to function return.
+                    try emitFunctionReturn(&ir_func, current_block, &vreg_stack, result_count, func_type, allocator);
                 }
                 dead_code = true;
             },
@@ -568,6 +602,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .else_block = fallthrough,
                         } } });
                     }
+                    current_block = fallthrough;
+                } else if (depth == block_stack.items.len) {
+                    // Function-level br_if: if cond true, return top N values;
+                    // else fall through leaving stack untouched.
+                    const fallthrough = try ir_func.newBlock();
+                    const taken = try ir_func.newBlock();
+                    try ir_func.getBlock(current_block).append(.{ .op = .{ .br_if = .{
+                        .cond = cond,
+                        .then_block = taken,
+                        .else_block = fallthrough,
+                    } } });
+                    try emitFunctionReturn(&ir_func, taken, &vreg_stack, result_count, func_type, allocator);
                     current_block = fallthrough;
                 }
             },
@@ -846,9 +892,29 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     }
                 }.call;
 
+                // Build a function-level return stub if any target depth
+                // references the function label (depth == block_stack.len).
+                // All such targets share the same return shape per validation,
+                // so one stub suffices.
+                var func_return_stub: ?ir.BlockId = null;
+                const needFuncStub = struct {
+                    fn call(
+                        irf: *ir.IrFunction,
+                        stk: *std.ArrayList(ir.VReg),
+                        rc: u32,
+                        ft: *const types.FuncType,
+                        alloc: std.mem.Allocator,
+                        cached: *?ir.BlockId,
+                    ) !ir.BlockId {
+                        if (cached.*) |b| return b;
+                        const stub = try irf.newBlock();
+                        try emitFunctionReturn(irf, stub, stk, rc, ft, alloc);
+                        cached.* = stub;
+                        return stub;
+                    }
+                }.call;
+
                 // Resolve depths to target block IDs.
-                // Entries whose depth is out of range are skipped (matches
-                // previous if-else behavior which silently dropped them).
                 const ir_targets = try allocator.alloc(ir.BlockId, count);
                 var resolved_count: u32 = 0;
                 var default_target: ir.BlockId = 0;
@@ -860,6 +926,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         const target_frame = block_stack.items[block_stack.items.len - 1 - depth];
                         ir_targets[resolved_count] = try resolveTarget(&ir_func, target_frame, &vreg_stack);
                         resolved_count += 1;
+                    } else if (depth == block_stack.items.len) {
+                        ir_targets[resolved_count] = try needFuncStub(&ir_func, &vreg_stack, result_count, func_type, allocator, &func_return_stub);
+                        resolved_count += 1;
                     }
                 }
 
@@ -867,6 +936,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 if (default_depth < block_stack.items.len) {
                     const default_frame = block_stack.items[block_stack.items.len - 1 - default_depth];
                     default_target = try resolveTarget(&ir_func, default_frame, &vreg_stack);
+                    have_default = true;
+                } else if (default_depth == block_stack.items.len) {
+                    default_target = try needFuncStub(&ir_func, &vreg_stack, result_count, func_type, allocator, &func_return_stub);
                     have_default = true;
                 }
 
