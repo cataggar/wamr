@@ -29,16 +29,22 @@ pub const can_exec_aot = switch (builtin.cpu.arch) {
 };
 
 /// Import registry for cross-module links discovered via `register`.
-/// Currently only tracks exported global values keyed by "module_name/field_name".
-/// Lookups fall through to the spectest fallback if no hit.
+/// Tracks exported globals and exported function native code pointers
+/// keyed by "module_name/field_name". Lookups fall through to the
+/// spectest fallback if no hit.
 pub const ImportRegistry = struct {
     allocator: std.mem.Allocator,
     globals: std.StringHashMap(types.Value),
+    /// Exported-function native code pointer (post-mapCodeExecutable).
+    /// Lifetime is tied to the exporter Harness — callers must ensure
+    /// the exporter outlives any importer that consults this entry.
+    functions: std.StringHashMap(usize),
 
     pub fn init(allocator: std.mem.Allocator) ImportRegistry {
         return .{
             .allocator = allocator,
             .globals = std.StringHashMap(types.Value).init(allocator),
+            .functions = std.StringHashMap(usize).init(allocator),
         };
     }
 
@@ -46,6 +52,9 @@ pub const ImportRegistry = struct {
         var it = self.globals.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.globals.deinit();
+        var itf = self.functions.keyIterator();
+        while (itf.next()) |k| self.allocator.free(k.*);
+        self.functions.deinit();
     }
 
     /// Record an exported global under "<module_name>/<field>" = value.
@@ -63,6 +72,25 @@ pub const ImportRegistry = struct {
         var buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
         return self.globals.get(key);
+    }
+
+    /// Record an exported function's native code pointer under
+    /// "<module_name>/<field>". The pointer comes from the exporter's
+    /// `inst.funcptrs[func_idx]` after `mapCodeExecutable` has run.
+    pub fn putFunction(self: *ImportRegistry, module_name: []const u8, field: []const u8, native_ptr: usize) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ module_name, field });
+        errdefer self.allocator.free(key);
+        const gop = try self.functions.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+        }
+        gop.value_ptr.* = native_ptr;
+    }
+
+    pub fn getFunction(self: *const ImportRegistry, module_name: []const u8, field: []const u8) ?usize {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
+        return self.functions.get(key);
     }
 };
 
@@ -163,6 +191,32 @@ pub const Harness = struct {
 
         aot_runtime.mapCodeExecutable(h.inst) catch return error.MapExecutableFailed;
 
+        // Wire cross-module function imports from the registry. The
+        // exporter's `mapCodeExecutable` has already populated its
+        // `funcptrs[exp.index]` with the native code address; patch the
+        // importer's `host_functions[i]` (which the AOT codegen calls
+        // through VmCtx.host_functions_ptr) and `funcptrs[i]` (which
+        // `ref.func N` reads) to that same address. The exporter Harness
+        // must outlive this importer — spec_json_runner keeps harnesses
+        // alive via the ImportRegistry's owning scope.
+        if (registry) |reg| {
+            const hf_mut = @as([]?*const anyopaque, @constCast(h.inst.host_functions));
+            const fp_mut = @as([]usize, @constCast(h.inst.funcptrs));
+            var func_import_idx: u32 = 0;
+            for (wasm_module.imports) |imp| {
+                if (imp.kind != .function) continue;
+                defer func_import_idx += 1;
+                if (reg.getFunction(imp.module_name, imp.field_name)) |native_ptr| {
+                    if (func_import_idx < hf_mut.len) {
+                        hf_mut[func_import_idx] = @ptrFromInt(native_ptr);
+                    }
+                    if (func_import_idx < fp_mut.len) {
+                        fp_mut[func_import_idx] = native_ptr;
+                    }
+                }
+            }
+        }
+
         // Invoke the start function, if any. The start function has type
         // `() -> ()` per the wasm spec, so we pass no params/results.
         if (h.aot_module.start_function) |start_idx| {
@@ -226,6 +280,25 @@ pub const Harness = struct {
             if (exp.kind != .global) continue;
             if (exp.index >= self.inst.globals.len) continue;
             try registry.putGlobal(module_name, exp.name, self.inst.globals[exp.index].value);
+        }
+    }
+
+    /// Copy every exported function's native code pointer into `registry`
+    /// keyed by `<module_name>/<export_name>`. Must be called after
+    /// `mapCodeExecutable`, which populates `inst.funcptrs`. Used to
+    /// expose a just-registered module's functions to subsequently-compiled
+    /// modules that import them (cross-module `call` / `ref.func`).
+    pub fn exportFunctionsToRegistry(
+        self: *const Harness,
+        registry: *ImportRegistry,
+        module_name: []const u8,
+    ) !void {
+        for (self.wasm_module.exports) |exp| {
+            if (exp.kind != .function) continue;
+            if (exp.index >= self.inst.funcptrs.len) continue;
+            const ptr = self.inst.funcptrs[exp.index];
+            if (ptr == 0) continue;
+            try registry.putFunction(module_name, exp.name, ptr);
         }
     }
 
@@ -507,10 +580,11 @@ fn valueToI64(v: types.Value) i64 {
         .f32 => |x| @as(i64, @as(u32, @bitCast(x))),
         .f64 => |x| @as(i64, @bitCast(x)),
         // Reference types: store the wasm function/extern index as a
-        // plain i64 in the AOT binary; the runtime translates it to a
-        // native code pointer at instantiate time.
-        .funcref, .nonfuncref => |maybe| @as(i64, @as(u32, maybe orelse 0)),
-        .externref, .nonexternref => |maybe| @as(i64, @as(u32, maybe orelse 0)),
+        // plain i64 in the AOT binary with a +1 sentinel so `ref.func 0`
+        // is distinguishable from null (0). The runtime decodes via
+        // `allocateGlobals` with the matching `-1` shift.
+        .funcref, .nonfuncref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
+        .externref, .nonexternref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
         else => 0,
     };
 }

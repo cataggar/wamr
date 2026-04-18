@@ -1176,10 +1176,10 @@ fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
             .i64 => .{ .i64 = ginit.init_i64 },
             .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64))))) },
             .f64 => .{ .f64 = @bitCast(ginit.init_i64) },
-            .funcref => .{ .funcref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
-            .nonfuncref => .{ .nonfuncref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
-            .externref => .{ .externref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
-            .nonexternref => .{ .nonexternref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)))) },
+            .funcref => .{ .funcref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)) - 1)) },
+            .nonfuncref => .{ .nonfuncref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)) - 1)) },
+            .externref => .{ .externref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)) - 1)) },
+            .nonexternref => .{ .nonexternref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)) - 1)) },
             else => .{ .i64 = ginit.init_i64 },
         };
         g.* = .{

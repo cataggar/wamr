@@ -1692,7 +1692,17 @@ fn runSpecTestFileAot(
     const json_dir = std.fs.path.dirname(json_path) orelse ".";
 
     var current: ?*aot_harness.Harness = null;
-    defer if (current) |h| h.deinit();
+    // Retain registered harnesses for the duration of this JSON run so
+    // their mmap'd native code outlives any importer that consults
+    // `import_registry` for function pointers. `current` is only
+    // deinit'd on next `module` command when it was not registered.
+    var retained: std.ArrayList(*aot_harness.Harness) = .empty;
+    defer {
+        if (current) |h| h.deinit();
+        for (retained.items) |h| h.deinit();
+        retained.deinit(allocator);
+    }
+    var current_is_retained: bool = false;
 
     // Cross-module import registry. Gets populated on `register` commands
     // by copying the current harness's exported globals. Subsequent module
@@ -1705,8 +1715,9 @@ fn runSpecTestFileAot(
 
         if (std.mem.eql(u8, cmd.type, "module")) {
             if (current) |h| {
-                h.deinit();
+                if (!current_is_retained) h.deinit();
                 current = null;
+                current_is_retained = false;
             }
             const filename = cmd.filename orelse {
                 recordSkip("module_no_filename");
@@ -1733,8 +1744,8 @@ fn runSpecTestFileAot(
         } else if (std.mem.eql(u8, cmd.type, "register")) {
             // Publish the current harness's exported globals under the
             // registration name so subsequent modules can import them.
-            // Other kinds (functions, memories, tables) still fall through
-            // as skips — cross-module func/memory/table linking is TBD.
+            // Other kinds (memories, tables) still fall through as skips —
+            // cross-module memory/table linking is TBD.
             const reg_name = cmd.@"as" orelse {
                 recordSkip("register_no_as");
                 result.skipped += 1;
@@ -1746,6 +1757,21 @@ fn runSpecTestFileAot(
                     result.skipped += 1;
                     continue;
                 };
+                h.exportFunctionsToRegistry(&import_registry, reg_name) catch {
+                    recordSkip("register_oom");
+                    result.skipped += 1;
+                    continue;
+                };
+                // Retain this harness so its native code stays mapped
+                // for future importers that hold pointers into it.
+                if (!current_is_retained) {
+                    retained.append(allocator, h) catch {
+                        recordSkip("register_oom");
+                        result.skipped += 1;
+                        continue;
+                    };
+                    current_is_retained = true;
+                }
                 result.passed += 1;
             } else {
                 recordSkip("register_no_module");
