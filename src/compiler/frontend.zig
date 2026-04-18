@@ -988,7 +988,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
             .call_indirect => {
                 const type_idx = readU32(code, &ip);
-                _ = readU32(code, &ip); // table index (always 0 for now)
+                const table_idx = readU32(code, &ip);
                 const elem_idx = safePop(&vreg_stack); // table element index
 
                 // Look up the function type to get arg count and result arity
@@ -1020,6 +1020,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .elem_idx = elem_idx,
                     .args = args,
                     .extra_results = ind_extra_results,
+                    .table_idx = table_idx,
                 } }, .dest = dest, .type = ind_result_type });
 
                 if (call_result_count > 0) {
@@ -1104,7 +1105,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .return_call_indirect => {
                 // Tail call via table: lower as a regular call_indirect then ret.
                 const type_idx = readU32(code, &ip);
-                _ = readU32(code, &ip); // table idx
+                const table_idx = readU32(code, &ip);
                 const elem_idx = safePop(&vreg_stack);
                 const callee_type = if (type_idx < wasm_module.types.len) &wasm_module.types[type_idx] else null;
                 const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
@@ -1131,6 +1132,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .elem_idx = elem_idx,
                     .args = args,
                     .extra_results = extra_results,
+                    .table_idx = table_idx,
                 } }, .dest = dest, .type = result_ir_type });
                 if (call_result_count <= 1) {
                     const ret_val: ?ir.VReg = if (call_result_count == 1) dest else null;
