@@ -1760,6 +1760,19 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_64 = 0 }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
+            .table_get => {
+                _ = readU32(code, &ip); // table idx (ignored; assume 0)
+                const idx = safePop(&vreg_stack);
+                const dest = ir_func.newVReg();
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .table_get = idx }, .dest = dest, .type = .i64 });
+                try vreg_stack.append(allocator, dest);
+            },
+            .table_set => {
+                _ = readU32(code, &ip); // table idx (ignored; assume 0)
+                const val = safePop(&vreg_stack);
+                const idx = safePop(&vreg_stack);
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .table_set = .{ .idx = idx, .val = val } } });
+            },
             .ref_is_null => {
                 // Pops a reference (i64), pushes an i32 (1 if null else 0).
                 // Reuses the existing i64 eqz path.
@@ -1769,14 +1782,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .ref_func => {
-                // `ref.func <funcidx>`. We represent the resulting funcref as
-                // the raw function index (i64). Works for comparisons and for
-                // `table.set` into a typed funcref table even though we don't
-                // yet run the indirect call through the funcref to re-derive
-                // an address — that codepath lands with call_ref in Phase 5.
+                // `ref.func <funcidx>`. Emit an IR op that loads the native
+                // function pointer from vmctx.funcptrs[fidx] so funcrefs
+                // use the same representation as what call_indirect expects
+                // — native function addresses that survive table round-trips.
                 const fidx = readU32(code, &ip);
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .iconst_64 = @as(i64, fidx) }, .dest = dest, .type = .i64 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .ref_func = fidx }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
             .ref_as_non_null => {
@@ -1911,6 +1923,7 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
             _ = readU32(code, ip); // table
         },
         .memory_size, .memory_grow => _ = readU32(code, ip),
+        .table_get, .table_set => _ = readU32(code, ip),
         .br_table => {
             const count = readU32(code, ip);
             var i: u32 = 0;
@@ -1942,6 +1955,7 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
             ip.* += cnt; // one reftype byte per entry
         },
         .br_on_null, .br_on_non_null => _ = readU32(code, ip), // label depth
+        .call_ref, .return_call_ref => _ = readU32(code, ip), // typeidx
         // ref_as_non_null has no operands
         // No operands
         else => {},

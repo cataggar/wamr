@@ -182,6 +182,9 @@ pub const Inst = struct {
 
         // Table operations
         table_size: void,
+        table_get: VReg, // idx
+        table_set: struct { idx: VReg, val: VReg },
+        ref_func: u32, // funcidx -> native pointer loaded from vmctx.func_table[idx]
     };
 
     pub const BinOp = struct {

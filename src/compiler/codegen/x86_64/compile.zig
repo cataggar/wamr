@@ -53,6 +53,7 @@ const vmctx_trap_unreachable_fn_field: i32 = 88;
 const vmctx_trap_idivz_fn_field: i32 = 96;
 const vmctx_trap_iovf_fn_field: i32 = 104;
 const vmctx_trap_ivc_fn_field: i32 = 112;
+const vmctx_funcptrs_field: i32 = 120; // VmCtx.funcptrs_ptr offset (usize)
 
 /// Emit the compare-and-trap tail of a bounds check.
 ///
@@ -1057,6 +1058,21 @@ fn compileInst(
         .table_size => {
             try code.movRegMem(.r10, .rbp, vmctx_offset);
             try code.movRegMemNoRex(.rax, .r10, vmctx_func_table_len_field);
+            try stack.push(code, .rax);
+        },
+        .table_get => {
+            try stack.pop(code, .rax); // idx (discard in non-RA path)
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .table_set => {
+            try stack.pop(code, .rax); // val
+            try stack.pop(code, .rax); // idx
+        },
+        .ref_func => |fidx| {
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
+            try code.movRegMem(.rax, .r10, @as(i32, @intCast(fidx * 8)));
             try stack.push(code, .rax);
         },
     }
@@ -2330,6 +2346,68 @@ fn compileInstRA(
             try code.movRegMemNoRex(dr, .r10, vmctx_func_table_len_field);
             // 32-bit load already zero-extends
             try writeDef(code, alloc_result, dest, dr);
+        },
+        .table_get => |idx_vreg| {
+            const dest = inst.dest orelse return;
+
+            // Bring idx into rax, zero-extend to 64 bits.
+            const idx_reg = try useVReg(code, alloc_result, idx_vreg, .rax);
+            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
+            try code.zeroExtend32(.rax);
+
+            // r10 = vmctx; bounds-check idx < func_table_len, else trap_unreachable.
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @intCast(vmctx_func_table_len_field)) });
+            try code.emitByte(0x72); // jb over_trap
+            try code.emitByte(12);
+            try code.movRegReg(param_regs[0], .r10);
+            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+            try code.callReg(.rax);
+            // over_trap: rax still holds idx on the fall-through.
+
+            // r10 = func_table_ptr; load qword from [r10 + idx*8].
+            try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+            try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
+            try code.addRegReg(.r10, .rax);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegMem(dr, .r10, 0);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+        },
+        .table_set => |ts| {
+            // Stash val in r11 first so the allocator can move it out from
+            // any alloc-reg it might live in before we clobber via useVReg.
+            const val_reg = try useVReg(code, alloc_result, ts.val, .r11);
+            if (val_reg != .r11) try code.movRegReg(.r11, val_reg);
+
+            // idx -> rax (implicit scratch).
+            const idx_reg = try useVReg(code, alloc_result, ts.idx, .rax);
+            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
+            try code.zeroExtend32(.rax);
+
+            // Bounds check against vmctx.func_table_len.
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @intCast(vmctx_func_table_len_field)) });
+            try code.emitByte(0x72); // jb over_trap
+            try code.emitByte(12);
+            try code.movRegReg(param_regs[0], .r10);
+            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+            try code.callReg(.rax);
+            // over_trap:
+
+            // Store r11 into [func_table_ptr + idx*8].
+            try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+            try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
+            try code.addRegReg(.r10, .rax);
+            try code.movMemReg(.r10, 0, .r11);
+        },
+        .ref_func => |fidx| {
+            const dest = inst.dest orelse return;
+            // Load funcptrs array, then [funcptrs + fidx*8].
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegMem(dr, .r10, @as(i32, @intCast(fidx * 8)));
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Division ──────────────────────────────────────────────────

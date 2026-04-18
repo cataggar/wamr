@@ -162,6 +162,10 @@ pub const VmCtx = extern struct {
     /// `fn (*VmCtx) noreturn` — called for invalid float→int conversion
     /// (NaN or out-of-range) in `trunc_f*_*` opcodes.
     trap_ivc_fn: usize = 0,
+    /// Pointer to native function pointer array indexed by module funcidx.
+    /// Populated in `mapCodeExecutable` and read by AOT code generated for
+    /// `ref.func`. Length is `module.import_function_count + module.func_count`.
+    funcptrs_ptr: usize = 0,
 };
 
 /// Host helper invoked from AOT-compiled memory loads/stores when an
@@ -294,6 +298,10 @@ pub const AotInstance = struct {
     host_functions: []const ?*const anyopaque = &.{},
     /// Native function pointer table for call_indirect (one per module function).
     func_table: []const usize = &.{},
+    /// Native function pointer array indexed by module funcidx (imports + locals).
+    /// Used by `ref.func` which must yield a function's native address even when
+    /// the function was never placed in a wasm table by an element segment.
+    funcptrs: []const usize = &.{},
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -380,6 +388,7 @@ pub fn destroy(inst: *AotInstance) void {
     freeGlobals(inst.globals, allocator);
     if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
     if (inst.func_table.len > 0) allocator.free(inst.func_table);
+    if (inst.funcptrs.len > 0) allocator.free(inst.funcptrs);
     allocator.destroy(inst);
 }
 
@@ -461,6 +470,13 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         func_addrs[import_count + i] = @intFromPtr(mem) + offset;
     }
 
+    // Persist the funcidx → native address map on the instance for ref.func.
+    if (n_addrs > 0) {
+        const persistent = inst.allocator.alloc(usize, n_addrs) catch return error.OutOfMemory;
+        @memcpy(persistent, func_addrs[0..n_addrs]);
+        inst.funcptrs = persistent;
+    }
+
     // Build wasm table → native address table for call_indirect
     if (inst.tables.len > 0) {
         const tbl = inst.tables[0];
@@ -521,6 +537,9 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     if (inst.func_table.len > 0) {
         vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
         vmctx.func_table_len = @intCast(inst.func_table.len);
+    }
+    if (inst.funcptrs.len > 0) {
+        vmctx.funcptrs_ptr = @intFromPtr(inst.funcptrs.ptr);
     }
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
@@ -706,6 +725,9 @@ pub fn callFuncScalar(
     if (inst.func_table.len > 0) {
         vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
         vmctx.func_table_len = @intCast(inst.func_table.len);
+    }
+    if (inst.funcptrs.len > 0) {
+        vmctx.funcptrs_ptr = @intFromPtr(inst.funcptrs.ptr);
     }
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
@@ -1085,6 +1107,8 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(VmCtx, "mem_grow_fn"));
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(VmCtx, "instance_ptr"));
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(VmCtx, "trap_oob_fn"));
+    try std.testing.expectEqual(@as(usize, 88), @offsetOf(VmCtx, "trap_unreachable_fn"));
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(VmCtx, "funcptrs_ptr"));
 }
 
 test "getFuncAddr: import indices return null" {
