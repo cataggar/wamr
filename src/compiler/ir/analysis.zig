@@ -224,8 +224,8 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(pages, {}) catch {};
         },
         .table_size => {},
-        .table_get => |idx| {
-            live.put(idx, {}) catch {};
+        .table_get => |tg| {
+            live.put(tg.idx, {}) catch {};
         },
         .table_set => |ts| {
             live.put(ts.idx, {}) catch {};
@@ -427,8 +427,8 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(pages, pos) catch {};
         },
         .table_size => {},
-        .table_get => |idx| {
-            last_use.put(idx, pos) catch {};
+        .table_get => |tg| {
+            last_use.put(tg.idx, pos) catch {};
         },
         .table_set => |ts| {
             last_use.put(ts.idx, pos) catch {};

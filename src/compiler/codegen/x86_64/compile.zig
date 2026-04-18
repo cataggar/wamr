@@ -55,6 +55,11 @@ const vmctx_trap_iovf_fn_field: i32 = 104;
 const vmctx_trap_ivc_fn_field: i32 = 112;
 const vmctx_funcptrs_field: i32 = 120; // VmCtx.funcptrs_ptr offset (usize)
 const vmctx_table_grow_fn_field: i32 = 128; // VmCtx.table_grow_fn offset (usize)
+const vmctx_tables_info_field: i32 = 136; // VmCtx.tables_info_ptr offset (usize)
+// Per-table descriptor layout (TableInfo, 16 bytes): { ptr: u64, len: u32, _pad: u32 }
+const table_info_ptr_off: i32 = 0;
+const table_info_len_off: i32 = 8;
+const table_info_stride: i32 = 16;
 
 /// Emit the compare-and-trap tail of a bounds check.
 ///
@@ -93,6 +98,19 @@ fn emitTrapHelperCall(code: *emit.CodeBuffer, field_offset: i32) !void {
     try code.movRegReg(param_regs[0], .r10);
     try code.movRegMem(.rax, param_regs[0], field_offset);
     try code.callReg(.rax);
+}
+
+/// Emit `cmp eax, [r10 + disp]`. Selects disp8 (4 bytes total) or disp32
+/// (7 bytes) based on the displacement. Used by table bounds checks and
+/// similar patterns that read a u32 length from an r10-based struct.
+fn emitCmpEaxMemR10Disp8(code: *emit.CodeBuffer, disp: i32) !void {
+    if (disp >= -128 and disp <= 127) {
+        try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @bitCast(@as(i8, @intCast(disp)))) });
+    } else {
+        // 41 3B 82 <disp32>: cmp eax, [r10 + disp32]
+        try code.emitSlice(&.{ 0x41, 0x3B, 0x82 });
+        try code.emitI32(disp);
+    }
 }
 
 /// Emit a conditional skip over a trap-invalid-conversion call.
@@ -2414,35 +2432,41 @@ fn compileInstRA(
         .data_drop => {},
 
         // ── Table management ─────────────────────────────────────────
-        .table_size => {
+        .table_size => |table_idx| {
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
-            // Read func_table_len (u32) from VmCtx
+            // r10 = vmctx.tables_info_ptr; read len (u32) from slot [table_idx].
             try code.movRegMem(.r10, .rbp, vmctx_offset);
-            try code.movRegMemNoRex(dr, .r10, vmctx_func_table_len_field);
-            // 32-bit load already zero-extends
+            try code.movRegMem(.r10, .r10, vmctx_tables_info_field);
+            const len_off: i32 = @as(i32, @intCast(table_idx)) * table_info_stride + table_info_len_off;
+            try code.movRegMemNoRex(dr, .r10, len_off);
             try writeDef(code, alloc_result, dest, dr);
         },
-        .table_get => |idx_vreg| {
+        .table_get => |tg| {
             const dest = inst.dest orelse return;
 
             // Bring idx into rax, zero-extend to 64 bits.
-            const idx_reg = try useVReg(code, alloc_result, idx_vreg, .rax);
+            const idx_reg = try useVReg(code, alloc_result, tg.idx, .rax);
             if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
             try code.zeroExtend32(.rax);
 
-            // r10 = vmctx; bounds-check idx < func_table_len, else trap_unreachable.
+            // r10 = vmctx.tables_info_ptr.
             try code.movRegMem(.r10, .rbp, vmctx_offset);
-            try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @intCast(vmctx_func_table_len_field)) });
-            try code.emitByte(0x72); // jb over_trap
+            try code.movRegMem(.r10, .r10, vmctx_tables_info_field);
+
+            // cmp eax, [r10 + table_idx*16 + 8]   (table len, u32)
+            const len_off: i32 = @as(i32, @intCast(tg.table_idx)) * table_info_stride + table_info_len_off;
+            try emitCmpEaxMemR10Disp8(code, len_off);
+            try code.emitByte(0x72); // jb over_trap (rel8)
             try code.emitByte(12);
             try code.movRegReg(param_regs[0], .r10);
             try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
             try code.callReg(.rax);
             // over_trap: rax still holds idx on the fall-through.
 
-            // r10 = func_table_ptr; load qword from [r10 + idx*8].
-            try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+            // r10 = table_info[table_idx].ptr.
+            const ptr_off: i32 = @as(i32, @intCast(tg.table_idx)) * table_info_stride + table_info_ptr_off;
+            try code.movRegMem(.r10, .r10, ptr_off);
             try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
             try code.addRegReg(.r10, .rax);
             const dr = destReg(alloc_result, dest);
@@ -2460,9 +2484,13 @@ fn compileInstRA(
             if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
             try code.zeroExtend32(.rax);
 
-            // Bounds check against vmctx.func_table_len.
+            // r10 = vmctx.tables_info_ptr.
             try code.movRegMem(.r10, .rbp, vmctx_offset);
-            try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @intCast(vmctx_func_table_len_field)) });
+            try code.movRegMem(.r10, .r10, vmctx_tables_info_field);
+
+            // cmp eax, [r10 + table_idx*16 + 8]
+            const len_off: i32 = @as(i32, @intCast(ts.table_idx)) * table_info_stride + table_info_len_off;
+            try emitCmpEaxMemR10Disp8(code, len_off);
             try code.emitByte(0x72); // jb over_trap
             try code.emitByte(12);
             try code.movRegReg(param_regs[0], .r10);
@@ -2470,8 +2498,9 @@ fn compileInstRA(
             try code.callReg(.rax);
             // over_trap:
 
-            // Store r11 into [func_table_ptr + idx*8].
-            try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+            // Store r11 into [tables_info[table_idx].ptr + idx*8].
+            const ptr_off: i32 = @as(i32, @intCast(ts.table_idx)) * table_info_stride + table_info_ptr_off;
+            try code.movRegMem(.r10, .r10, ptr_off);
             try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
             try code.addRegReg(.r10, .rax);
             try code.movMemReg(.r10, 0, .r11);
@@ -2499,13 +2528,15 @@ fn compileInstRA(
                 const delta_reg = try useVReg(code, alloc_result, tg.delta, .r8);
                 if (delta_reg != .r8) try code.movRegReg(.r8, delta_reg);
                 try code.zeroExtend32(.r8);
+                try code.movRegImm32(.r9, @bitCast(tg.table_idx));
             } else {
-                // SysV: rdi=vmctx, rsi=init, rdx=delta.
+                // SysV: rdi=vmctx, rsi=init, rdx=delta, rcx=table_idx.
                 const init_reg = try useVReg(code, alloc_result, tg.init, .rsi);
                 if (init_reg != .rsi) try code.movRegReg(.rsi, init_reg);
                 const delta_reg = try useVReg(code, alloc_result, tg.delta, .rdx);
                 if (delta_reg != .rdx) try code.movRegReg(.rdx, delta_reg);
                 try code.zeroExtend32(.rdx);
+                try code.movRegImm32(.rcx, @bitCast(tg.table_idx));
             }
 
             // Load vmctx into param_regs[0] and grow fn ptr into rax.

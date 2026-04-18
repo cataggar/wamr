@@ -136,7 +136,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(pages);
         },
         .table_size => {},
-        .table_get => |idx| list.append(idx),
+        .table_get => |tg| list.append(tg.idx),
         .table_set => |ts| {
             list.append(ts.idx);
             list.append(ts.val);
@@ -284,8 +284,8 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (pages.* == old) pages.* = new;
         },
         .table_size => {},
-        .table_get => |*idx| {
-            if (idx.* == old) idx.* = new;
+        .table_get => |*tg| {
+            if (tg.idx == old) tg.idx = new;
         },
         .table_set => |*ts| {
             if (ts.idx == old) ts.idx = new;

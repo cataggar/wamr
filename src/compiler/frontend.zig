@@ -1472,17 +1472,17 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .data_drop = seg_idx } });
                     },
                     .table_size => {
-                        _ = readU32(code, &ip); // table index (ignored; assume 0)
+                        const table_idx = readU32(code, &ip);
                         const dest = ir_func.newVReg();
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .table_size = {} }, .dest = dest, .type = .i32 });
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .table_size = table_idx }, .dest = dest, .type = .i32 });
                         try vreg_stack.append(allocator, dest);
                     },
                     .table_grow => {
-                        _ = readU32(code, &ip); // table index (ignored; assume 0)
+                        const table_idx = readU32(code, &ip);
                         const delta = safePop(&vreg_stack);
                         const init = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
-                        try ir_func.getBlock(current_block).append(.{ .op = .{ .table_grow = .{ .init = init, .delta = delta } }, .dest = dest, .type = .i32 });
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .table_grow = .{ .table_idx = table_idx, .init = init, .delta = delta } }, .dest = dest, .type = .i32 });
                         try vreg_stack.append(allocator, dest);
                     },
                     else => {
@@ -1769,17 +1769,17 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             .table_get => {
-                _ = readU32(code, &ip); // table idx (ignored; assume 0)
+                const table_idx = readU32(code, &ip);
                 const idx = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .table_get = idx }, .dest = dest, .type = .i64 });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .table_get = .{ .table_idx = table_idx, .idx = idx } }, .dest = dest, .type = .i64 });
                 try vreg_stack.append(allocator, dest);
             },
             .table_set => {
-                _ = readU32(code, &ip); // table idx (ignored; assume 0)
+                const table_idx = readU32(code, &ip);
                 const val = safePop(&vreg_stack);
                 const idx = safePop(&vreg_stack);
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .table_set = .{ .idx = idx, .val = val } } });
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .table_set = .{ .table_idx = table_idx, .idx = idx, .val = val } } });
             },
             .ref_is_null => {
                 // Pops a reference (i64), pushes an i32 (1 if null else 0).

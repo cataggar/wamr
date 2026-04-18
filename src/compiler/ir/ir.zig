@@ -182,10 +182,10 @@ pub const Inst = struct {
         memory_grow: VReg,
 
         // Table operations
-        table_size: void,
-        table_get: VReg, // idx
-        table_set: struct { idx: VReg, val: VReg },
-        table_grow: struct { init: VReg, delta: VReg }, // -> i32 (prev size or -1)
+        table_size: u32, // table_idx
+        table_get: struct { table_idx: u32, idx: VReg },
+        table_set: struct { table_idx: u32, idx: VReg, val: VReg },
+        table_grow: struct { table_idx: u32, init: VReg, delta: VReg }, // -> i32 (prev size or -1)
         ref_func: u32, // funcidx -> native pointer loaded from vmctx.func_table[idx]
     };
 

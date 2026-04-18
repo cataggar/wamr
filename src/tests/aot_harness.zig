@@ -99,7 +99,7 @@ pub const Harness = struct {
         // interpreter-loaded `wasm_module` so that `table.grow` has accurate
         // limits and `mapCodeExecutable` allocates a `func_table` of the
         // declared `min` size even without element segments.
-        if (h.inst.tables.len == 0 and wasm_module.tables.len > 0) {
+        if (h.inst.tables.len < wasm_module.tables.len) {
             patchTables(h.inst, allocator, wasm_module.tables) catch
                 return error.InstantiateFailed;
         }
@@ -180,6 +180,14 @@ fn patchTables(
     allocator: std.mem.Allocator,
     wasm_tables: []const types.TableType,
 ) !void {
+    // Free any tables allocated by the default-table fallback in
+    // aot_runtime.instantiate so we can recreate the full set from the
+    // wasm module (which encodes every declared table).
+    if (inst.tables.len > 0) {
+        for (inst.tables) |tbl| tbl.release(allocator);
+        allocator.free(inst.tables);
+        inst.tables = &.{};
+    }
     const tables = try allocator.alloc(*types.TableInstance, wasm_tables.len);
     errdefer allocator.free(tables);
     for (wasm_tables, 0..) |tt, i| {

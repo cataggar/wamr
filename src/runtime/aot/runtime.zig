@@ -170,6 +170,12 @@ pub const VmCtx = extern struct {
     /// Signature: fn (vmctx: *VmCtx, init_val: i64, delta: i32) callconv(.c) i32
     /// Returns previous table size on success, -1 on failure.
     table_grow_fn: usize = 0,
+    /// Pointer to an array of per-table descriptors, one per declared table:
+    /// `extern struct { ptr: u64, len: u32, _pad: u32 }` (16 bytes).
+    /// Used by table_get/table_set/table_size codegen for multi-table support.
+    /// For table 0, `ptr` aliases `func_table_ptr` and `len` aliases
+    /// `func_table_len`.
+    tables_info_ptr: usize = 0,
 };
 
 /// Host helper invoked from AOT-compiled memory loads/stores when an
@@ -279,30 +285,58 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
 /// initializing new slots with `init_val`. Updates `vmctx.func_table_ptr` and
 /// `vmctx.func_table_len` on success. Returns previous table size, or -1 on
 /// failure (allocation failure or max-size violation).
-pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32) callconv(.c) i32 {
+pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32) callconv(.c) i32 {
     if (vmctx.instance_ptr == 0) return -1;
     const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
     if (delta < 0) return -1;
-    const old_size: u32 = @intCast(inst.func_table.len);
     const delta_u: u32 = @intCast(delta);
-    const new_size_u64: u64 = @as(u64, old_size) + @as(u64, delta_u);
-    // Use table metadata if available for an accurate max; otherwise cap at u32 max.
-    const max_cap: u64 = blk: {
-        if (inst.tables.len > 0) {
-            break :blk inst.tables[0].table_type.limits.max orelse 0xFFFF_FFFF;
-        } else {
-            break :blk 0xFFFF_FFFF;
+    const fill_ptr: usize = @as(usize, @bitCast(@as(i64, init_val)));
+
+    // Table 0: resize the shared `func_table` so call_indirect/call_ref
+    // keep seeing the growth. Other tables: resize the backing storage
+    // in `extra_tables_storage`.
+    if (table_idx == 0) {
+        const old_size: u32 = @intCast(inst.func_table.len);
+        const new_size_u64: u64 = @as(u64, old_size) + @as(u64, delta_u);
+        const max_cap: u64 = blk: {
+            if (inst.tables.len > 0) {
+                break :blk inst.tables[0].table_type.limits.max orelse 0xFFFF_FFFF;
+            } else break :blk 0xFFFF_FFFF;
+        };
+        if (new_size_u64 > max_cap) return -1;
+        const new_size: usize = @intCast(new_size_u64);
+        const new_table = inst.allocator.realloc(inst.func_table, new_size) catch return -1;
+        var i: usize = old_size;
+        while (i < new_size) : (i += 1) new_table[i] = fill_ptr;
+        inst.func_table = new_table;
+        vmctx.func_table_ptr = @intFromPtr(new_table.ptr);
+        vmctx.func_table_len = @intCast(new_size);
+        if (inst.tables_info.len > 0) {
+            inst.tables_info[0].ptr = @intFromPtr(new_table.ptr);
+            inst.tables_info[0].len = @intCast(new_size);
         }
+        return @intCast(old_size);
+    }
+
+    if (table_idx >= inst.tables_info.len) return -1;
+    if (table_idx - 1 >= inst.extra_tables_storage.len) return -1;
+    const ti = &inst.tables_info[table_idx];
+    const store = &inst.extra_tables_storage[table_idx - 1];
+    const old_size: u32 = ti.len;
+    const new_size_u64: u64 = @as(u64, old_size) + @as(u64, delta_u);
+    const max_cap: u64 = blk: {
+        if (table_idx < inst.tables.len) {
+            break :blk inst.tables[table_idx].table_type.limits.max orelse 0xFFFF_FFFF;
+        } else break :blk 0xFFFF_FFFF;
     };
     if (new_size_u64 > max_cap) return -1;
     const new_size: usize = @intCast(new_size_u64);
-    const new_table = inst.allocator.realloc(inst.func_table, new_size) catch return -1;
-    const fill_ptr: usize = @as(usize, @bitCast(@as(i64, init_val)));
+    const new_store = inst.allocator.realloc(store.*, new_size) catch return -1;
     var i: usize = old_size;
-    while (i < new_size) : (i += 1) new_table[i] = fill_ptr;
-    inst.func_table = new_table;
-    vmctx.func_table_ptr = @intFromPtr(new_table.ptr);
-    vmctx.func_table_len = @intCast(new_size);
+    while (i < new_size) : (i += 1) new_store[i] = fill_ptr;
+    store.* = new_store;
+    ti.ptr = @intFromPtr(new_store.ptr);
+    ti.len = @intCast(new_size);
     return @intCast(old_size);
 }
 
@@ -338,6 +372,22 @@ pub const AotInstance = struct {
     /// Used by `ref.func` which must yield a function's native address even when
     /// the function was never placed in a wasm table by an element segment.
     funcptrs: []const usize = &.{},
+    /// Per-table native descriptor array (one 16-byte slot per declared table):
+    /// `extern struct { ptr: u64, len: u32, _pad: u32 }`.
+    /// Slot 0 aliases `func_table`; slots 1+ back additional wasm tables so
+    /// multi-table programs can do table.get/set/size/grow per-table without
+    /// cross-table corruption.
+    tables_info: []TableInfo = &.{},
+    /// Backing storage for each per-table `usize` array (excluding table 0,
+    /// which shares `func_table`). Entry `i-1` holds the backing slice for
+    /// wasm table index `i`.
+    extra_tables_storage: [][]usize = &.{},
+};
+
+pub const TableInfo = extern struct {
+    ptr: u64 = 0,
+    len: u32 = 0,
+    _pad: u32 = 0,
 };
 
 // ─── Errors ─────────────────────────────────────────────────────────────────
@@ -535,6 +585,50 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
             inst.func_table = native_table;
         }
     }
+
+    // Build per-table native descriptor array for multi-table support.
+    // Slot 0 aliases `inst.func_table` (so existing call_indirect code which
+    // reads via `func_table_ptr`/`func_table_len` keeps working). Additional
+    // slots back wasm tables 1..n so table.get/set/size/grow can address them
+    // directly via `tables_info_ptr[i]` without corrupting table 0.
+    if (inst.tables.len > 0) {
+        const info = inst.allocator.alloc(TableInfo, inst.tables.len) catch return error.OutOfMemory;
+        @memset(info, .{});
+        const extra = inst.allocator.alloc([]usize, if (inst.tables.len > 1) inst.tables.len - 1 else 0) catch return error.OutOfMemory;
+        for (extra) |*e| e.* = &.{};
+
+        // Slot 0: alias inst.func_table.
+        info[0] = .{
+            .ptr = @intFromPtr(inst.func_table.ptr),
+            .len = @intCast(inst.func_table.len),
+        };
+
+        // Slots 1..n: allocate per-table backing arrays and apply any elem segs
+        // whose `table_idx` targets them.
+        for (inst.tables[1..], 1..) |tbl_i, idx| {
+            const sz = tbl_i.elements.len;
+            if (sz == 0) continue;
+            const backing = inst.allocator.alloc(usize, sz) catch return error.OutOfMemory;
+            @memset(backing, 0);
+            for (module.elem_segments) |seg| {
+                if (seg.table_idx != idx) continue;
+                for (seg.func_indices, 0..) |func_idx, j| {
+                    const dst = seg.offset + @as(u32, @intCast(j));
+                    if (dst < sz and func_idx < n_addrs) {
+                        backing[dst] = func_addrs[func_idx];
+                    }
+                }
+            }
+            extra[idx - 1] = backing;
+            info[idx] = .{
+                .ptr = @intFromPtr(backing.ptr),
+                .len = @intCast(sz),
+            };
+        }
+
+        inst.tables_info = info;
+        inst.extra_tables_storage = extra;
+    }
 }
 
 /// Call an AOT-compiled function by index.
@@ -585,6 +679,9 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
     vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
     vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
+    if (inst.tables_info.len > 0) {
+        vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
+    }
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -830,6 +927,9 @@ pub fn callFuncScalar(
     vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
     vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
     vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
+    if (inst.tables_info.len > 0) {
+        vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
+    }
 
     // Marshal args to raw 64-bit bit patterns.
     var raw: [MaxScalarArgs]u64 = [_]u64{0} ** MaxScalarArgs;
@@ -1222,6 +1322,7 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 88), @offsetOf(VmCtx, "trap_unreachable_fn"));
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(VmCtx, "funcptrs_ptr"));
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(VmCtx, "table_grow_fn"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(VmCtx, "tables_info_ptr"));
 }
 
 test "getFuncAddr: import indices return null" {
