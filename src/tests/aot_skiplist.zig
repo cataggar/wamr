@@ -39,7 +39,7 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // type-propagation mismatch between the untyped `select` IR op and
     // ref-typed operands pushed onto the vreg stack. Re-enable once the
     // IR learns result typing for select (Phase 4/5 territory).
-    "select.json", // 147 pass, 4 call_indirect arg-routing fails (bounds check now correct)
+    "select.json", // 147 pass, 4 call_indirect arg-routing fails (pre-existing)
 
     // return_call / return_call_indirect are now lowered as regular
     // call + ret (not true tail-call), which causes a native stack
