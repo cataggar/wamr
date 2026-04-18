@@ -39,12 +39,20 @@ pub const ImportRegistry = struct {
     /// Lifetime is tied to the exporter Harness — callers must ensure
     /// the exporter outlives any importer that consults this entry.
     functions: std.StringHashMap(usize),
+    /// Exported funcref-typed globals resolved to the native code pointer of
+    /// the referenced function in the exporter. Lets importers whose
+    /// element segments are initialized from an imported funcref global
+    /// (e.g. `(elem ... (global.get 0))`) install a real native pointer
+    /// in their local table rather than a bogus funcidx in the importer's
+    /// index space.
+    funcref_globals: std.StringHashMap(usize),
 
     pub fn init(allocator: std.mem.Allocator) ImportRegistry {
         return .{
             .allocator = allocator,
             .globals = std.StringHashMap(types.Value).init(allocator),
             .functions = std.StringHashMap(usize).init(allocator),
+            .funcref_globals = std.StringHashMap(usize).init(allocator),
         };
     }
 
@@ -55,6 +63,9 @@ pub const ImportRegistry = struct {
         var itf = self.functions.keyIterator();
         while (itf.next()) |k| self.allocator.free(k.*);
         self.functions.deinit();
+        var itfg = self.funcref_globals.keyIterator();
+        while (itfg.next()) |k| self.allocator.free(k.*);
+        self.funcref_globals.deinit();
     }
 
     /// Record an exported global under "<module_name>/<field>" = value.
@@ -91,6 +102,23 @@ pub const ImportRegistry = struct {
         var buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
         return self.functions.get(key);
+    }
+
+    /// Record the native pointer for a funcref-typed global export.
+    pub fn putFuncrefGlobal(self: *ImportRegistry, module_name: []const u8, field: []const u8, native_ptr: usize) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ module_name, field });
+        errdefer self.allocator.free(key);
+        const gop = try self.funcref_globals.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+        }
+        gop.value_ptr.* = native_ptr;
+    }
+
+    pub fn getFuncrefGlobal(self: *const ImportRegistry, module_name: []const u8, field: []const u8) ?usize {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
+        return self.funcref_globals.get(key);
     }
 };
 
@@ -215,6 +243,16 @@ pub const Harness = struct {
                     }
                 }
             }
+
+            // Patch native table entries for active elem segments whose
+            // items are `global.get K` targeting an imported funcref
+            // global. The AOT-emit path leaves these slots as `maxInt(u32)`
+            // (unresolvable at compile time because the exporter's native
+            // pointer isn't known until after `mapCodeExecutable` on the
+            // exporter), so the runtime left them as 0 in the native
+            // table. Now, with the registry populated, write the correct
+            // native pointer directly into the per-table backing store.
+            patchImportedFuncrefElems(h.inst, &wasm_module, reg) catch {};
         }
 
         // Invoke the start function, if any. The start function has type
@@ -279,7 +317,22 @@ pub const Harness = struct {
         for (self.wasm_module.exports) |exp| {
             if (exp.kind != .global) continue;
             if (exp.index >= self.inst.globals.len) continue;
-            try registry.putGlobal(module_name, exp.name, self.inst.globals[exp.index].value);
+            const val = self.inst.globals[exp.index].value;
+            try registry.putGlobal(module_name, exp.name, val);
+            // For funcref globals, also resolve to the exporter's native
+            // code pointer so importers can install it directly in their
+            // local tables (elem_exprs with `global.get <imported funcref>`).
+            switch (val) {
+                .funcref, .nonfuncref => |maybe| if (maybe) |fidx| {
+                    if (fidx < self.inst.funcptrs.len) {
+                        const ptr = self.inst.funcptrs[fidx];
+                        if (ptr != 0) {
+                            try registry.putFuncrefGlobal(module_name, exp.name, ptr);
+                        }
+                    }
+                },
+                else => {},
+            }
         }
     }
 
@@ -343,6 +396,69 @@ fn patchTables(
         tables[i] = tbl;
     }
     inst.tables = tables;
+}
+
+/// After `mapCodeExecutable` has populated the native func_table, fix up
+/// entries written by active elem segments whose items are
+/// `global.get K` where K is an imported funcref global. Such entries are
+/// left as 0 by the runtime (because the AOT binary encodes them as
+/// `maxInt(u32)` sentinels — the exporter's native pointer is unknown at
+/// AOT compile time). Now, with the registry populated, write the real
+/// native pointer directly into the per-table backing store.
+fn patchImportedFuncrefElems(
+    inst: *aot_runtime.AotInstance,
+    wasm_module: *const types.WasmModule,
+    registry: *const ImportRegistry,
+) !void {
+    // Build a per-import-global lookup: for each imported funcref global,
+    // note (import module name, field name) so we can resolve via
+    // registry.getFuncrefGlobal.
+    for (wasm_module.elements) |seg| {
+        if (seg.is_passive or seg.is_declarative) continue;
+        // Reuse the existing compile-time offset reducer; locals-only
+        // globals are available via inst.globals here. Build a slice of
+        // pointers from the interpreter-loaded globals (matches the order
+        // used during compile), then call resolveU32InitExpr.
+        const offset_expr = seg.offset orelse continue;
+        // `tmp_globals` at instantiate time is seeded from wasm_module
+        // globals (import then local). We only need i32/global_get
+        // resolution here, so pass an empty slice and fall through to
+        // evalInitExpr which walks the module's init expressions.
+        const offset_val: u32 = resolveU32InitExpr(offset_expr, &.{}) orelse continue;
+
+        for (seg.elem_exprs, 0..) |maybe_expr, k| {
+            const expr = maybe_expr orelse continue;
+            // Only handle `global.get gidx` where gidx < import_global_count.
+            const gidx: u32 = switch (expr) {
+                .global_get => |g| g,
+                else => continue,
+            };
+            if (gidx >= wasm_module.import_global_count) continue;
+
+            // Walk imports to find the matching import-global entry.
+            var import_global_seen: u32 = 0;
+            var resolved_ptr: ?usize = null;
+            for (wasm_module.imports) |imp| {
+                if (imp.kind != .global) continue;
+                defer import_global_seen += 1;
+                if (import_global_seen != gidx) continue;
+                resolved_ptr = registry.getFuncrefGlobal(imp.module_name, imp.field_name);
+                break;
+            }
+            const native_ptr = resolved_ptr orelse continue;
+
+            // Pick the native backing store for seg.table_idx.
+            const dst_idx: usize = @as(usize, offset_val) + k;
+            if (seg.table_idx == 0) {
+                if (dst_idx < inst.func_table.len) inst.func_table[dst_idx] = native_ptr;
+            } else {
+                const extra_idx = seg.table_idx - 1;
+                if (extra_idx >= inst.extra_tables_storage.len) continue;
+                const backing = inst.extra_tables_storage[extra_idx];
+                if (dst_idx < backing.len) backing[dst_idx] = native_ptr;
+            }
+        }
+    }
 }
 
 fn compileToAot(
