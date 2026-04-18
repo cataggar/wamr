@@ -27,7 +27,7 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     "elem.json", // 7 value-mismatch fails (passive/declarative elem init)
     "float_exprs.json", // 28 f32/f64 value-mismatch fails (NaN/select sign)
     // "func.json", // FIXED: function-level br_if/br_table now emit ret
-    "global.json", // 16 mutable/imported global init value mismatches
+    // "global.json", // FIXED round-6: imported globals + global_get init expr
     "imports.json", // AV during exec (host-import call path)
     "linking.json", // 38 cross-module register/resolution fails
     "memory_grow.json", // 2 cross-module memory-grow value mismatches

@@ -72,6 +72,24 @@ fn emitFunctionReturn(
     }
 }
 
+/// Look up the wasm value type of the global at the given wasm-flat index
+/// (imports come first, then locally-defined globals). Returns null if the
+/// index is out of range.
+fn globalValTypeByIdx(wasm_module: *const types.WasmModule, idx: u32) ?types.ValType {
+    var import_count: u32 = 0;
+    for (wasm_module.imports) |imp| {
+        if (imp.kind != .global) continue;
+        if (import_count == idx) {
+            const gt = imp.global_type orelse return null;
+            return gt.val_type;
+        }
+        import_count += 1;
+    }
+    const local_idx = idx - import_count;
+    if (local_idx >= wasm_module.globals.len) return null;
+    return wasm_module.globals[local_idx].global_type.val_type;
+}
+
 /// Lower an entire Wasm module into IR.
 pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allocator) LowerError!ir.IrModule {
     var ir_module = ir.IrModule.init(allocator);
@@ -800,7 +818,15 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .global_get => {
                 const idx = readU32(code, &ip);
                 const dest = ir_func.newVReg();
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .global_get = idx }, .dest = dest, .type = .i32 });
+                const gt = globalValTypeByIdx(wasm_module, idx) orelse .i32;
+                const ir_ty: ir.IrType = switch (gt) {
+                    .i32 => .i32,
+                    .i64 => .i64,
+                    .f32 => .f32,
+                    .f64 => .f64,
+                    else => .i64,
+                };
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .global_get = idx }, .dest = dest, .type = ir_ty });
                 try vreg_stack.append(allocator, dest);
             },
             .global_set => {

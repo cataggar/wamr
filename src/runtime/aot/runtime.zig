@@ -496,7 +496,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
     const n_globals = @min(inst.globals.len, globals_buf.len);
     for (0..n_globals) |i| {
-        globals_buf[i] = inst.globals[i].value.i64;
+        globals_buf[i] = globalValueToI64(inst.globals[i].value);
     }
 
     // Build VMContext for the compiled function
@@ -546,7 +546,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
 
     // Sync globals back from flat array to GlobalInstance objects
     for (0..n_globals) |i| {
-        inst.globals[i].value = .{ .i64 = globals_buf[i] };
+        inst.globals[i].value = globalValueFromI64(inst.globals[i].value, globals_buf[i]);
     }
 
     return result;
@@ -605,6 +605,32 @@ fn isScalarValType(t: types.ValType) bool {
     };
 }
 
+/// Pack a global's typed value into a raw 64-bit slot for the flat globals_buf
+/// that AOT code accesses via `movRegMem(dr, globals_base, idx*8)`. The tag
+/// determines the bit-cast; using `.value.i64` would be UB when the active
+/// tag is `.f32` / `.f64`.
+fn globalValueToI64(v: types.Value) i64 {
+    return switch (v) {
+        .i32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .i64 => |x| x,
+        .f32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .f64 => |x| @as(i64, @bitCast(x)),
+        else => 0,
+    };
+}
+
+/// Unpack a raw 64-bit slot from globals_buf back into a typed Value,
+/// preserving the active tag.
+fn globalValueFromI64(old: types.Value, raw: i64) types.Value {
+    return switch (old) {
+        .i32 => .{ .i32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(raw))))) },
+        .i64 => .{ .i64 = raw },
+        .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(raw))))) },
+        .f64 => .{ .f64 = @bitCast(raw) },
+        else => old,
+    };
+}
+
 fn valueToRawBits(pt: types.ValType, v: types.Value) ScalarCallError!u64 {
     return switch (pt) {
         .i32 => blk: {
@@ -657,7 +683,7 @@ pub fn callFuncScalar(
     var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
     const n_globals = @min(inst.globals.len, globals_buf.len);
     for (0..n_globals) |i| {
-        globals_buf[i] = inst.globals[i].value.i64;
+        globals_buf[i] = globalValueToI64(inst.globals[i].value);
     }
 
     var vmctx = VmCtx{};
@@ -720,7 +746,7 @@ pub fn callFuncScalar(
         if (@atomicLoad(bool, &g_trap_occurred, .seq_cst)) {
             @atomicStore(bool, &g_trap_catching, false, .seq_cst);
             for (0..n_globals) |i| {
-                inst.globals[i].value = .{ .i64 = globals_buf[i] };
+                inst.globals[i].value = globalValueFromI64(inst.globals[i].value, globals_buf[i]);
             }
             return error.WasmTrap;
         }
@@ -788,7 +814,7 @@ pub fn callFuncScalar(
 
     // Sync globals back.
     for (0..n_globals) |i| {
-        inst.globals[i].value = .{ .i64 = globals_buf[i] };
+        inst.globals[i].value = globalValueFromI64(inst.globals[i].value, globals_buf[i]);
     }
 
     if (result_type) |rt| {

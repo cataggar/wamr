@@ -219,19 +219,53 @@ fn compileToAot(
         });
     }
 
+    // Build the global entries with wasm-flat indexing: imported globals
+    // come first (at wasm indices [0, import_global_count)), then locals.
+    // This matches what the x86_64 codegen expects: `global.get N` emits
+    // a load at offset N*8 from the globals base, where N is the raw
+    // wasm index (imports + locals).
+    //
+    // For imports we resolve values from the spectest module (the spec
+    // suite's canonical host module). Unknown imports fall back to 0.
+    //
+    // For locals we run `evalInitExpr` against all preceding globals so
+    // that `global.get` / arithmetic bytecode inits produce correct
+    // values (e.g. global.wast's $z1..$z6 depend on imported globals).
     var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
+
+    // Temporary GlobalInstance list to feed evalInitExpr.
+    var tmp_globals: std.ArrayList(*types.GlobalInstance) = .empty;
+    defer {
+        for (tmp_globals.items) |g| a.destroy(g);
+        tmp_globals.deinit(a);
+    }
+
+    // Imports first (only globals; other kinds are skipped).
+    for (module.imports) |imp| {
+        if (imp.kind != .global) continue;
+        const gt = imp.global_type orelse continue;
+        const val: types.Value = spectestGlobalInitValue(imp.module_name, imp.field_name, gt.val_type) orelse
+            defaultZeroValue(gt.val_type);
+        const g = try a.create(types.GlobalInstance);
+        g.* = .{ .global_type = gt, .value = val };
+        try tmp_globals.append(a, g);
+        try global_entries.append(a, .{
+            .val_type = @intFromEnum(gt.val_type),
+            .mutability = if (gt.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
+            .init_i64 = valueToI64(val),
+        });
+    }
+
+    // Locals: evaluate init expressions against the preceding globals.
     for (module.globals) |g| {
-        const init_val: i64 = switch (g.init_expr) {
-            .i32_const => |v| @as(i64, v),
-            .i64_const => |v| v,
-            .f32_const => |v| @as(i64, @as(i32, @bitCast(v))),
-            .f64_const => |v| @bitCast(v),
-            else => 0,
-        };
+        const val: types.Value = root.instance.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
+        const gi = try a.create(types.GlobalInstance);
+        gi.* = .{ .global_type = g.global_type, .value = val };
+        try tmp_globals.append(a, gi);
         try global_entries.append(a, .{
             .val_type = @intFromEnum(g.global_type.val_type),
             .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
-            .init_i64 = init_val,
+            .init_i64 = valueToI64(val),
         });
     }
 
@@ -295,4 +329,44 @@ fn compileToAot(
         if (elem_entries.items.len > 0) elem_entries.items else null,
         module.start_function,
     );
+}
+
+// ─── Helpers for global init value resolution ──────────────────────────────
+
+/// Default zero value of the given wasm type. Used as a fallback when an
+/// imported global isn't resolvable or an init expression fails to evaluate.
+fn defaultZeroValue(vt: types.ValType) types.Value {
+    return switch (vt) {
+        .i32 => .{ .i32 = 0 },
+        .i64 => .{ .i64 = 0 },
+        .f32 => .{ .f32 = 0 },
+        .f64 => .{ .f64 = 0 },
+        else => .{ .i64 = 0 },
+    };
+}
+
+/// Pack a typed Value into an i64 for the globals_buf layout expected by
+/// AOT code. Must stay in sync with `globalValueToI64` in
+/// runtime/aot/runtime.zig.
+fn valueToI64(v: types.Value) i64 {
+    return switch (v) {
+        .i32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .i64 => |x| x,
+        .f32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .f64 => |x| @as(i64, @bitCast(x)),
+        else => 0,
+    };
+}
+
+/// Resolve a `spectest.*` imported global to its canonical value. Mirrors
+/// the values in `src/tests/spec_json_runner.zig` (global_i32=666,
+/// global_i64=666, global_f32=666.6, global_f64=666.6). Returns null for
+/// unrecognized imports so the caller can fall back to a default.
+fn spectestGlobalInitValue(module_name: []const u8, field: []const u8, vt: types.ValType) ?types.Value {
+    if (!std.mem.eql(u8, module_name, "spectest")) return null;
+    if (std.mem.eql(u8, field, "global_i32") and vt == .i32) return .{ .i32 = 666 };
+    if (std.mem.eql(u8, field, "global_i64") and vt == .i64) return .{ .i64 = 666 };
+    if (std.mem.eql(u8, field, "global_f32") and vt == .f32) return .{ .f32 = 666.6 };
+    if (std.mem.eql(u8, field, "global_f64") and vt == .f64) return .{ .f64 = 666.6 };
+    return null;
 }
