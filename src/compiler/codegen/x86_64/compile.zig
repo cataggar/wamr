@@ -54,6 +54,7 @@ const vmctx_trap_idivz_fn_field: i32 = 96;
 const vmctx_trap_iovf_fn_field: i32 = 104;
 const vmctx_trap_ivc_fn_field: i32 = 112;
 const vmctx_funcptrs_field: i32 = 120; // VmCtx.funcptrs_ptr offset (usize)
+const vmctx_table_grow_fn_field: i32 = 128; // VmCtx.table_grow_fn offset (usize)
 
 /// Emit the compare-and-trap tail of a bounds check.
 ///
@@ -1069,6 +1070,12 @@ fn compileInst(
             try stack.pop(code, .rax); // val
             try stack.pop(code, .rax); // idx
         },
+        .table_grow => {
+            try stack.pop(code, .rax); // delta
+            try stack.pop(code, .rax); // init
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
         .ref_func => |fidx| {
             try code.movRegMem(.r10, .rbp, vmctx_offset);
             try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
@@ -1101,7 +1108,7 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
             switch (ci.op) {
-                .call, .call_indirect, .memory_grow => {
+                .call, .call_indirect, .memory_grow, .table_grow => {
                     const mask = if (comptime builtin.os.tag == .windows)
                         [_]bool{ true, false, false, true, true, false, false }
                     else
@@ -1254,7 +1261,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (func.blocks.items) |block| {
             for (block.instructions.items) |ci| {
                 switch (ci.op) {
-                    .call, .call_indirect, .memory_grow => {
+                    .call, .call_indirect, .memory_grow, .table_grow => {
                         // Calls clobber caller-saved allocatable regs.
                         // memory.grow is compiled as a host call, same ABI, so it
                         // clobbers the same set of caller-saved registers.
@@ -2408,6 +2415,41 @@ fn compileInstRA(
             const dr = destReg(alloc_result, dest);
             try code.movRegMem(dr, .r10, @as(i32, @intCast(fidx * 8)));
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+        },
+        .table_grow => |tg| {
+            const dest = inst.dest orelse return;
+            // Host helper signature (Win64): RCX=vmctx, RDX=init_val (i64),
+            // R8=delta (i32). Returns i32 old_size in eax or -1.
+            // Like memory_grow, regalloc treats this as a call: no caller-saved
+            // vregs live across.
+
+            // Move init into rdx (Win64 arg1 / SysV arg1 rsi — adjust per ABI).
+            if (comptime builtin.os.tag == .windows) {
+                const init_reg = try useVReg(code, alloc_result, tg.init, .rdx);
+                if (init_reg != .rdx) try code.movRegReg(.rdx, init_reg);
+                const delta_reg = try useVReg(code, alloc_result, tg.delta, .r8);
+                if (delta_reg != .r8) try code.movRegReg(.r8, delta_reg);
+                try code.zeroExtend32(.r8);
+            } else {
+                // SysV: rdi=vmctx, rsi=init, rdx=delta.
+                const init_reg = try useVReg(code, alloc_result, tg.init, .rsi);
+                if (init_reg != .rsi) try code.movRegReg(.rsi, init_reg);
+                const delta_reg = try useVReg(code, alloc_result, tg.delta, .rdx);
+                if (delta_reg != .rdx) try code.movRegReg(.rdx, delta_reg);
+                try code.zeroExtend32(.rdx);
+            }
+
+            // Load vmctx into param_regs[0] and grow fn ptr into rax.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_table_grow_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
         // ── Division ──────────────────────────────────────────────────

@@ -1828,6 +1828,14 @@ fn runSpecTestFileAot(
                     actual_buf[0] = .{ .f64 = v };
                     break :blk actual_buf[0..1];
                 },
+                .funcref => |v| blk: {
+                    actual_buf[0] = .{ .funcref = if (v) |x| @as(u32, @truncate(x)) else null };
+                    break :blk actual_buf[0..1];
+                },
+                .externref => |v| blk: {
+                    actual_buf[0] = .{ .externref = if (v) |x| @as(u32, @truncate(x)) else null };
+                    break :blk actual_buf[0..1];
+                },
             };
 
             if (expected_json.len != actual.len) {

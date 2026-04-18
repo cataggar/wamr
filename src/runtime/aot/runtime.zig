@@ -166,6 +166,10 @@ pub const VmCtx = extern struct {
     /// Populated in `mapCodeExecutable` and read by AOT code generated for
     /// `ref.func`. Length is `module.import_function_count + module.func_count`.
     funcptrs_ptr: usize = 0,
+    /// Native function pointer for the table.grow host helper.
+    /// Signature: fn (vmctx: *VmCtx, init_val: i64, delta: i32) callconv(.c) i32
+    /// Returns previous table size on success, -1 on failure.
+    table_grow_fn: usize = 0,
 };
 
 /// Host helper invoked from AOT-compiled memory loads/stores when an
@@ -270,6 +274,38 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     return @intCast(old_pages);
 }
 
+/// AOT host helper for table.grow.
+/// Grows table 0 by `delta` entries (each holding a native function pointer),
+/// initializing new slots with `init_val`. Updates `vmctx.func_table_ptr` and
+/// `vmctx.func_table_len` on success. Returns previous table size, or -1 on
+/// failure (allocation failure or max-size violation).
+pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32) callconv(.c) i32 {
+    if (vmctx.instance_ptr == 0) return -1;
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    if (delta < 0) return -1;
+    const old_size: u32 = @intCast(inst.func_table.len);
+    const delta_u: u32 = @intCast(delta);
+    const new_size_u64: u64 = @as(u64, old_size) + @as(u64, delta_u);
+    // Use table metadata if available for an accurate max; otherwise cap at u32 max.
+    const max_cap: u64 = blk: {
+        if (inst.tables.len > 0) {
+            break :blk inst.tables[0].table_type.limits.max orelse 0xFFFF_FFFF;
+        } else {
+            break :blk 0xFFFF_FFFF;
+        }
+    };
+    if (new_size_u64 > max_cap) return -1;
+    const new_size: usize = @intCast(new_size_u64);
+    const new_table = inst.allocator.realloc(inst.func_table, new_size) catch return -1;
+    const fill_ptr: usize = @as(usize, @bitCast(@as(i64, init_val)));
+    var i: usize = old_size;
+    while (i < new_size) : (i += 1) new_table[i] = fill_ptr;
+    inst.func_table = new_table;
+    vmctx.func_table_ptr = @intFromPtr(new_table.ptr);
+    vmctx.func_table_len = @intCast(new_size);
+    return @intCast(old_size);
+}
+
 // ─── Comptime target validation ─────────────────────────────────────────────
 
 /// The native machine architecture, resolved at comptime.
@@ -297,7 +333,7 @@ pub const AotInstance = struct {
     /// Resolved AOT host function pointers (one per import).
     host_functions: []const ?*const anyopaque = &.{},
     /// Native function pointer table for call_indirect (one per module function).
-    func_table: []const usize = &.{},
+    func_table: []usize = &.{},
     /// Native function pointer array indexed by module funcidx (imports + locals).
     /// Used by `ref.func` which must yield a function's native address even when
     /// the function was never placed in a wasm table by an element segment.
@@ -548,6 +584,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
     vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
     vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
+    vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -584,6 +621,8 @@ pub const ScalarResult = union(enum) {
     i64: i64,
     f32: f32,
     f64: f64,
+    funcref: ?u64,
+    externref: ?u64,
 };
 
 /// Errors callFuncScalar may return beyond the standard RuntimeError set.
@@ -623,7 +662,7 @@ const MaxScalarArgs: usize = 12;
 
 fn isScalarValType(t: types.ValType) bool {
     return switch (t) {
-        .i32, .i64, .f32, .f64 => true,
+        .i32, .i64, .f32, .f64, .funcref, .externref => true,
         else => false,
     };
 }
@@ -671,6 +710,18 @@ fn valueToRawBits(pt: types.ValType, v: types.Value) ScalarCallError!u64 {
         .f64 => blk: {
             if (v != .f64) return error.InvalidArgType;
             break :blk @as(u64, @bitCast(v.f64));
+        },
+        // Reference types: null -> 0, indexed -> index as u64 (tests use small
+        // integer "externref N" literals and null; AOT stores a raw pointer).
+        .funcref => switch (v) {
+            .funcref => |maybe| @as(u64, maybe orelse 0),
+            .nonfuncref => |maybe| @as(u64, maybe orelse 0),
+            else => error.InvalidArgType,
+        },
+        .externref => switch (v) {
+            .externref => |maybe| @as(u64, maybe orelse 0),
+            .nonexternref => |maybe| @as(u64, maybe orelse 0),
+            else => error.InvalidArgType,
         },
         else => error.UnsupportedSignature,
     };
@@ -736,6 +787,7 @@ pub fn callFuncScalar(
     vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
     vmctx.trap_iovf_fn = @intFromPtr(&aotTrapIntOverflow);
     vmctx.trap_ivc_fn = @intFromPtr(&aotTrapInvalidConversion);
+    vmctx.table_grow_fn = @intFromPtr(&tableGrowHelper);
 
     // Marshal args to raw 64-bit bit patterns.
     var raw: [MaxScalarArgs]u64 = [_]u64{0} ** MaxScalarArgs;
@@ -850,6 +902,8 @@ pub fn callFuncScalar(
             .i64 => ScalarResult{ .i64 = @bitCast(raw_result) },
             .f32 => ScalarResult{ .f32 = @bitCast(@as(u32, @truncate(raw_result))) },
             .f64 => ScalarResult{ .f64 = @bitCast(raw_result) },
+            .funcref => ScalarResult{ .funcref = if (raw_result == 0) null else raw_result },
+            .externref => ScalarResult{ .externref = if (raw_result == 0) null else raw_result },
             else => unreachable,
         };
     }
@@ -1109,6 +1163,7 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(VmCtx, "trap_oob_fn"));
     try std.testing.expectEqual(@as(usize, 88), @offsetOf(VmCtx, "trap_unreachable_fn"));
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(VmCtx, "funcptrs_ptr"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(VmCtx, "table_grow_fn"));
 }
 
 test "getFuncAddr: import indices return null" {

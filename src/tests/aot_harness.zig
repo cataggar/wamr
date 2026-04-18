@@ -93,6 +93,17 @@ pub const Harness = struct {
             return error.InstantiateFailed;
         errdefer aot_runtime.destroy(h.inst);
 
+        // The AOT binary format does not currently encode the table section,
+        // so `aot_runtime.instantiate` produces `inst.tables = &.{}` even when
+        // the module declares local tables. Patch the tables up from the
+        // interpreter-loaded `wasm_module` so that `table.grow` has accurate
+        // limits and `mapCodeExecutable` allocates a `func_table` of the
+        // declared `min` size even without element segments.
+        if (h.inst.tables.len == 0 and wasm_module.tables.len > 0) {
+            patchTables(h.inst, allocator, wasm_module.tables) catch
+                return error.InstantiateFailed;
+        }
+
         aot_runtime.mapCodeExecutable(h.inst) catch return error.MapExecutableFailed;
 
         // Invoke the start function, if any. The start function has type
@@ -163,6 +174,23 @@ pub const Harness = struct {
         return aot_runtime.callFuncScalar(self.inst, func_idx, ft.params, result_type, args);
     }
 };
+
+fn patchTables(
+    inst: *aot_runtime.AotInstance,
+    allocator: std.mem.Allocator,
+    wasm_tables: []const types.TableType,
+) !void {
+    const tables = try allocator.alloc(*types.TableInstance, wasm_tables.len);
+    errdefer allocator.free(tables);
+    for (wasm_tables, 0..) |tt, i| {
+        const elements = try allocator.alloc(types.TableElement, tt.limits.min);
+        for (elements) |*e| e.* = types.TableElement.nullForType(tt.elem_type);
+        const tbl = try allocator.create(types.TableInstance);
+        tbl.* = .{ .table_type = tt, .elements = elements };
+        tables[i] = tbl;
+    }
+    inst.tables = tables;
+}
 
 fn compileToAot(
     allocator: std.mem.Allocator,

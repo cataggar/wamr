@@ -140,6 +140,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(ts.idx);
             list.append(ts.val);
         },
+        .table_grow => |tg| {
+            list.append(tg.init);
+            list.append(tg.delta);
+        },
         .ref_func => {},
         .memory_init => |mi| {
             list.append(mi.dst);
@@ -279,6 +283,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .table_set => |*ts| {
             if (ts.idx == old) ts.idx = new;
             if (ts.val == old) ts.val = new;
+        },
+        .table_grow => |*tg| {
+            if (tg.init == old) tg.init = new;
+            if (tg.delta == old) tg.delta = new;
         },
         .ref_func => {},
         .memory_init => |*mi| {
