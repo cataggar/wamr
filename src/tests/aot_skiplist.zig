@@ -21,7 +21,7 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // Files where AOT codegen panics at module-load or produces wrong
     // values. Each entry is tagged with the currently-dominant failure
     // mode; unskip when the relevant bug is fixed.
-    "address.json", // AV during exec (integer-fit panic in compile.zig:3259 stub)
+    // "address.json", // FIXED round-6: large memory offset no longer panics
     "call.json", // stack-overflow via runaway (guard page non-recoverable)
     "call_indirect.json", // AV during exec
     "elem.json", // 7 value-mismatch fails (passive/declarative elem init)

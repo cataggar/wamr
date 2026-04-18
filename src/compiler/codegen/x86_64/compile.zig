@@ -2141,9 +2141,19 @@ fn compileInstRA(
             try emitMemBoundsCheck(code, @as(u64, ld.offset) + @as(u64, ld.size));
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
-            // Load value into dest register (address is in rax); fold offset into disp.
+            // Fold wasm offset into mov displacement when it fits in i32.
+            // For out-of-range offsets (address.wast uses 0xFFFFFFFF), first
+            // add the offset to rax via a 64-bit imm.
+            var ld_disp: i32 = 0;
+            if (ld.offset <= 0x7FFFFFFF) {
+                ld_disp = @intCast(ld.offset);
+            } else {
+                try code.movRegImm64(.r10, @as(u64, ld.offset));
+                try code.addRegReg(.rax, .r10);
+            }
+            // Load value into dest register (address is in rax).
             const dr = destReg(alloc_result, dest);
-            try code.movRegMemSized(dr, .rax, @intCast(ld.offset), ld.size);
+            try code.movRegMemSized(dr, .rax, ld_disp, ld.size);
             if (ld.sign_extend and ld.size < 8) {
                 switch (ld.size) {
                     1 => try code.movsxByteToReg(dr, dr),
@@ -2178,8 +2188,15 @@ fn compileInstRA(
             // useVReg writes spill loads into scratch=.rcx, so rax is preserved.
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            // Fold wasm offset into the mov displacement.
-            try code.movMemRegSized(.rax, @intCast(st.offset), .rcx, st.size);
+            // Fold wasm offset into the mov displacement when it fits in i32.
+            var st_disp: i32 = 0;
+            if (st.offset <= 0x7FFFFFFF) {
+                st_disp = @intCast(st.offset);
+            } else {
+                try code.movRegImm64(.r10, @as(u64, st.offset));
+                try code.addRegReg(.rax, .r10);
+            }
+            try code.movMemRegSized(.rax, st_disp, .rcx, st.size);
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
