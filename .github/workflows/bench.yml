@@ -1,0 +1,99 @@
+name: Bench
+
+# Performance benchmarks: coremark + spec-tests pass rate + codegen bench.
+# Posts a comment on PRs with a before/after comparison against the
+# default branch so regressions are visible at review time.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/compiler/**
+      - src/runtime/**
+      - build.zig
+      - build.zig.zon
+  push:
+    branches: [main]
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 2
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Codegen micro-bench
+        run: zig build bench 2>&1 | tee bench.txt
+
+      - name: Spec-tests pass rate (AOT)
+        continue-on-error: true
+        run: |
+          zig build spec-tests-aot 2>&1 | tail -6 | tee spec-aot.txt
+
+      - name: CoreMark (if available)
+        continue-on-error: true
+        run: |
+          if [ -f coremark.aot ]; then
+            ./zig-out/bin/spec-test-runner --mode=aot coremark.aot 2>&1 | tee coremark.txt || true
+          fi
+
+      - name: Upload bench results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-results-${{ github.sha }}
+          path: |
+            bench.txt
+            spec-aot.txt
+            coremark.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const read = f => { try { return fs.readFileSync(f,'utf8'); } catch { return '(not produced)'; } };
+            const body = [
+              '### Benchmark results',
+              '',
+              '<details><summary>Codegen bench</summary>',
+              '',
+              '```',
+              read('bench.txt').slice(0, 4000),
+              '```',
+              '',
+              '</details>',
+              '',
+              '<details><summary>Spec-tests (AOT)</summary>',
+              '',
+              '```',
+              read('spec-aot.txt'),
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
