@@ -1,9 +1,10 @@
 name: Fuzz
 
-# Scheduled and on-demand fuzzing of the Zig wasm loader, interpreter,
-# AOT compiler, and a differential interp-vs-AOT oracle. Crashes are
-# uploaded as artifacts and — if any — the job fails so the next PR
-# cannot merge until the crasher is triaged.
+# Scheduled and on-demand fuzzing of the Zig wasm loader and interpreter.
+# Crashes are uploaded as artifacts and — if any — the job fails so the
+# next PR cannot merge until the crasher is triaged. AOT and differential
+# targets are deferred until a shared compile-and-run harness module
+# exists (see plan_fuzz_security.md).
 on:
   schedule:
     # 03:17 UTC daily — off-peak so runners are available.
@@ -15,7 +16,7 @@ on:
         required: false
         default: "300"
       target:
-        description: "Fuzz target (all, loader, interp, aot, diff)"
+        description: "Fuzz target (all, loader, interp)"
         required: false
         default: "all"
   pull_request:
@@ -40,7 +41,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [loader, interp, aot, diff]
+        target: [loader, interp]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
