@@ -1,0 +1,121 @@
+name: Fuzz
+
+# Scheduled and on-demand fuzzing of the Zig wasm loader and interpreter.
+# Crashes are uploaded as artifacts and — if any — the job fails so the
+# next PR cannot merge until the crasher is triaged. AOT and differential
+# targets are deferred until a shared compile-and-run harness module
+# exists (see plan_fuzz_security.md).
+on:
+  schedule:
+    # 03:17 UTC daily — off-peak so runners are available.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "Per-target fuzz duration in seconds"
+        required: false
+        default: "300"
+      target:
+        description: "Fuzz target (all, loader, interp)"
+        required: false
+        default: "all"
+  pull_request:
+    paths:
+      - src/runtime/**
+      - src/compiler/**
+      - src/tests/fuzz/**
+      - .github/workflows/fuzz.yml
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [loader, interp]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Install wasm-tools (generator + validator)
+        run: |
+          set -euo pipefail
+          ver=1.219.0
+          url=https://github.com/bytecodealliance/wasm-tools/releases/download/v${ver}/wasm-tools-${ver}-x86_64-linux.tar.gz
+          curl -fsSL "$url" -o /tmp/wasm-tools.tgz
+          sudo tar -C /usr/local/bin --strip-components=1 -xzf /tmp/wasm-tools.tgz \
+            wasm-tools-${ver}-x86_64-linux/wasm-tools
+
+      - name: Restore fuzz corpus
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .fuzz-corpus
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Seed corpus
+        run: |
+          mkdir -p .fuzz-corpus/${{ matrix.target }}
+          # Seed from the existing malformed corpus and spec-generated wasm.
+          if [ -d tests/malformed/fuzz ]; then
+            cp -n tests/malformed/fuzz/*.wasm .fuzz-corpus/${{ matrix.target }}/ 2>/dev/null || true
+          fi
+          if [ -d tests/spec-json ]; then
+            find tests/spec-json -maxdepth 1 -name '*.wasm' -exec cp -n {} .fuzz-corpus/${{ matrix.target }}/ \; || true
+          fi
+          ls .fuzz-corpus/${{ matrix.target }} | wc -l
+
+      - name: Build fuzz harness
+        run: zig build fuzz -Doptimize=ReleaseSafe
+
+      - name: Fuzz
+        env:
+          FUZZ_DURATION: ${{ github.event.inputs.duration_seconds || '600' }}
+          FUZZ_TARGET: ${{ matrix.target }}
+          FUZZ_CORPUS: .fuzz-corpus/${{ matrix.target }}
+        run: |
+          mkdir -p .fuzz-crashes
+          ./zig-out/bin/fuzz-${FUZZ_TARGET} \
+            --corpus "$FUZZ_CORPUS" \
+            --crashes .fuzz-crashes \
+            --duration "$FUZZ_DURATION"
+
+      - name: Upload crashes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: .fuzz-crashes
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Save corpus
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: .fuzz-corpus/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fail if any crasher was found
+        run: |
+          if [ -n "$(ls -A .fuzz-crashes 2>/dev/null || true)" ]; then
+            echo "::error::Fuzzer found crashes in target ${{ matrix.target }}"
+            ls -la .fuzz-crashes
+            exit 1
+          fi
