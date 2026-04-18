@@ -137,7 +137,10 @@ pub const VmCtx = extern struct {
     host_functions_count: u32 = 0,
     /// Current memory size in pages (for memory.size instruction).
     memory_pages: u32 = 0,
-    _pad0: u32 = 0,
+    /// Number of entries in the func_table (indexed by call_indirect elem idx).
+    /// Used by inline bounds checks emitted for call_indirect to trap on
+    /// out-of-range indices rather than dereferencing past the table.
+    func_table_len: u32 = 0,
     /// Native function pointer for memory.grow host helper.
     /// Pointer to host function invoked by `memory.grow` in AOT-compiled code.
     /// Signature: fn (vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32
@@ -517,6 +520,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     }
     if (inst.func_table.len > 0) {
         vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
+        vmctx.func_table_len = @intCast(inst.func_table.len);
     }
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
@@ -701,6 +705,7 @@ pub fn callFuncScalar(
     }
     if (inst.func_table.len > 0) {
         vmctx.func_table_ptr = @intFromPtr(inst.func_table.ptr);
+        vmctx.func_table_len = @intCast(inst.func_table.len);
     }
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
@@ -1076,6 +1081,7 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(VmCtx, "globals_count"));
     try std.testing.expectEqual(@as(usize, 52), @offsetOf(VmCtx, "host_functions_count"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(VmCtx, "memory_pages"));
+    try std.testing.expectEqual(@as(usize, 60), @offsetOf(VmCtx, "func_table_len"));
     try std.testing.expectEqual(@as(usize, 64), @offsetOf(VmCtx, "mem_grow_fn"));
     try std.testing.expectEqual(@as(usize, 72), @offsetOf(VmCtx, "instance_ptr"));
     try std.testing.expectEqual(@as(usize, 80), @offsetOf(VmCtx, "trap_oob_fn"));

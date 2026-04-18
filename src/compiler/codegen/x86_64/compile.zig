@@ -45,6 +45,7 @@ const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
 const vmctx_mem_max_size_field: i32 = 32; // VmCtx.memory_max_size offset
 const vmctx_func_table_field: i32 = 40; // VmCtx.func_table_ptr offset
 const vmctx_mem_pages_field: i32 = 56; // VmCtx.memory_pages offset (u32)
+const vmctx_func_table_len_field: i32 = 60; // VmCtx.func_table_len offset (u32)
 const vmctx_mem_grow_fn_field: i32 = 64; // VmCtx.mem_grow_fn offset (usize)
 const vmctx_instance_ptr_field: i32 = 72; // VmCtx.instance_ptr offset (usize)
 const vmctx_trap_oob_fn_field: i32 = 80; // VmCtx.trap_oob_fn offset (usize)
@@ -2062,8 +2063,23 @@ fn compileInstRA(
             if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
             try code.zeroExtend32(.rax);
 
-            // Load func_table_ptr from VmCtx
+            // Load vmctx into r10, then bounds-check elem_idx < func_table_len.
+            // If the compare fails, call trap_unreachable_fn (noreturn).
             try code.movRegMem(.r10, .rbp, vmctx_offset);
+            // cmp eax, dword ptr [r10 + func_table_len]
+            //   REX.B=0x41, opcode 0x3B, modrm=01_000_010 (mod=disp8, reg=eax=0,
+            //   rm=r10 low=2), disp8=60.
+            try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @intCast(vmctx_func_table_len_field)) });
+            // jb over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
+            try code.emitByte(0x72);
+            try code.emitByte(12);
+            // Trap block: call trap_unreachable_fn(vmctx)
+            try code.movRegReg(param_regs[0], .r10);
+            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+            try code.callReg(.rax);
+            // over_trap:
+
+            // Load func_table_ptr from VmCtx (r10 still holds vmctx)
             try code.movRegMem(.r10, .r10, vmctx_func_table_field);
 
             // func_ptr = func_table[elem_idx * 8]; stash in r11 across arg setup
