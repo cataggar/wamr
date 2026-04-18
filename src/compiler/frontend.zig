@@ -1852,6 +1852,34 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         }
     }
 
+    // Fix-up pass: the `.select` IR op is emitted with `inst.type = .i32`
+    // because the wasm frontend doesn't know the value type at the point
+    // of lowering (plain `select` opcode is untyped). For f64/i64 values,
+    // using .i32 makes writeDefTyped zero-extend and truncate the upper
+    // 32 bits of the result. Walk the IR to propagate each select's true
+    // value type from its producing instruction.
+    {
+        var vreg_ty = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+        defer vreg_ty.deinit();
+        for (ir_func.blocks.items) |blk| {
+            for (blk.instructions.items) |inst| {
+                if (inst.dest) |d| try vreg_ty.put(d, inst.type);
+            }
+        }
+        // Locals carry their declared wasm type via local_get/local_set,
+        // but the recorded type of local_get is what we already stored.
+        // That's fine: local_get writes the value with .type = <local_type>.
+        for (ir_func.blocks.items) |*blk| {
+            for (blk.instructions.items, 0..) |inst, i| {
+                if (std.meta.activeTag(inst.op) == .select) {
+                    if (vreg_ty.get(inst.op.select.if_true)) |t| {
+                        blk.instructions.items[i].type = t;
+                    }
+                }
+            }
+        }
+    }
+
     return ir_func;
 }
 

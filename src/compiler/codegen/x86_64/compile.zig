@@ -2540,15 +2540,22 @@ fn compileInstRA(
         // ── Select ────────────────────────────────────────────────────
         .select => |sel| {
             const dest = inst.dest orelse return;
+            // Stage operands through non-allocatable scratch registers
+            // (.r10, .r11) so no allocated VReg can collide with our
+            // intermediate storage. The previous implementation loaded
+            // cond into .rax then operands into .rcx/.rdx, which
+            // clobbered the if_true/if_false values whenever the
+            // allocator had placed them in .rax/.rcx/.rdx (seen as
+            // the float-select LSB-ORed-with-cond pattern in
+            // float_exprs.wast).
+            const true_reg = try useVReg(code, alloc_result, sel.if_true, .r10);
+            if (true_reg != .r10) try code.movRegReg(.r10, true_reg);
+            const false_reg = try useVReg(code, alloc_result, sel.if_false, .r11);
+            if (false_reg != .r11) try code.movRegReg(.r11, false_reg);
             const cond_reg = try useVReg(code, alloc_result, sel.cond, .rax);
-            if (cond_reg != .rax) try code.movRegReg(.rax, cond_reg);
-            const false_reg = try useVReg(code, alloc_result, sel.if_false, .rcx);
-            if (false_reg != .rcx) try code.movRegReg(.rcx, false_reg);
-            const true_reg = try useVReg(code, alloc_result, sel.if_true, .rdx);
-            if (true_reg != .rdx) try code.movRegReg(.rdx, true_reg);
-            try code.testRegReg(.rax, .rax);
-            try code.cmovnz(.rcx, .rdx);
-            try writeDefTyped(code, alloc_result, dest, .rcx, inst.type);
+            try code.testRegReg(cond_reg, cond_reg);
+            try code.cmovnz(.r11, .r10); // if cond != 0, r11 = r10 (if_true)
+            try writeDefTyped(code, alloc_result, dest, .r11, inst.type);
         },
 
         .global_get => |idx| {
@@ -2865,20 +2872,20 @@ fn compileInstRA(
                 .f_eq => {
                     // ordered AND equal: SETE AND SETNP
                     try code.setcc(0x4, .rax); // sete al
-                    try code.setcc(0xB, .rdx); // setnp dl
-                    try code.andRegReg(.rax, .rdx);
+                    try code.setcc(0xB, .r11); // setnp r11b
+                    try code.andRegReg(.rax, .r11);
                 },
                 .f_ne => {
                     // unordered OR not-equal: SETNE OR SETP
                     try code.setcc(0x5, .rax); // setne al
-                    try code.setcc(0xA, .rdx); // setp dl
-                    try code.orRegReg(.rax, .rdx);
+                    try code.setcc(0xA, .r11); // setp r11b
+                    try code.orRegReg(.rax, .r11);
                 },
                 .f_lt => {
                     // ordered AND below: SETB AND SETNP
                     try code.setcc(0x2, .rax); // setb al
-                    try code.setcc(0xB, .rdx); // setnp dl
-                    try code.andRegReg(.rax, .rdx);
+                    try code.setcc(0xB, .r11); // setnp r11b
+                    try code.andRegReg(.rax, .r11);
                 },
                 .f_gt => {
                     // above (already excludes unordered): SETA
@@ -2887,8 +2894,8 @@ fn compileInstRA(
                 .f_le => {
                     // ordered AND below-or-equal: SETBE AND SETNP
                     try code.setcc(0x6, .rax); // setbe al
-                    try code.setcc(0xB, .rdx); // setnp dl
-                    try code.andRegReg(.rax, .rdx);
+                    try code.setcc(0xB, .r11); // setnp r11b
+                    try code.andRegReg(.rax, .r11);
                 },
                 .f_ge => {
                     // above-or-equal (excludes unordered): SETAE

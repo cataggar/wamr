@@ -25,7 +25,7 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     "call.json", // stack-overflow via runaway (guard page non-recoverable)
     "call_indirect.json", // AV during exec
     "elem.json", // 7 value-mismatch fails (passive/declarative elem init)
-    "float_exprs.json", // 28 f32/f64 value-mismatch fails (NaN/select sign)
+    // "float_exprs.json", // FIXED round-7: f_le/f_lt/f_eq/f_ne setcc r11 (was rdx)
     // "func.json", // FIXED: function-level br_if/br_table now emit ret
     // "global.json", // FIXED round-6: imported globals + global_get init expr
     "imports.json", // AV during exec (host-import call path)
