@@ -478,7 +478,25 @@ fn compileToAot(
         const offset_expr = seg.offset orelse continue;
         const offset_val: u32 = resolveU32InitExpr(offset_expr, tmp_globals.items) orelse continue;
         const indices = try a.alloc(u32, seg.func_indices.len);
-        for (seg.func_indices, 0..) |fi, k| indices[k] = fi orelse std.math.maxInt(u32);
+        for (seg.func_indices, 0..) |fi, k| {
+            if (fi) |v| {
+                indices[k] = v;
+                continue;
+            }
+            // Fall back to resolving the init expression stored in
+            // elem_exprs (e.g. `global.get K` where global K holds a
+            // funcref produced by `ref.func N`). Unresolvable entries
+            // encode as maxInt(u32) → null slot at runtime.
+            if (k < seg.elem_exprs.len) {
+                if (seg.elem_exprs[k]) |expr| {
+                    if (resolveFuncIdxFromExpr(expr, tmp_globals.items, module.import_global_count)) |resolved| {
+                        indices[k] = resolved;
+                        continue;
+                    }
+                }
+            }
+            indices[k] = std.math.maxInt(u32);
+        }
         try elem_entries.append(a, .{
             .table_idx = seg.table_idx,
             .offset = offset_val,
@@ -566,6 +584,37 @@ fn resolveU32InitExpr(
     const val = root.instance.evalInitExpr(expr, tmp_globals, null) catch return null;
     return switch (val) {
         .i32 => |x| @as(u32, @bitCast(x)),
+        else => null,
+    };
+}
+
+/// Resolve an element segment item init expression to a wasm funcidx,
+/// or return null if the expression represents a null funcref or cannot
+/// be reduced at instantiation time.
+///
+/// NOTE: for `global.get K` we intentionally restrict to LOCAL globals
+/// (K >= module.import_global_count). Imported funcref globals hold a
+/// funcidx in the exporting module's index space, which is not
+/// meaningful in the importing module's table / call_indirect. Writing
+/// such a funcidx into a local table would install the wrong function
+/// pointer and can produce stack-overflow/crash at call time.
+fn resolveFuncIdxFromExpr(
+    expr: types.InitExpr,
+    tmp_globals: []const *types.GlobalInstance,
+    import_global_count: u32,
+) ?u32 {
+    return switch (expr) {
+        .ref_func => |idx| idx,
+        .ref_null => null,
+        .global_get => |gidx| blk: {
+            if (gidx < import_global_count) break :blk null;
+            if (gidx >= tmp_globals.len) break :blk null;
+            const gv = tmp_globals[gidx].value;
+            break :blk switch (gv) {
+                .funcref, .nonfuncref => |maybe| maybe,
+                else => null,
+            };
+        },
         else => null,
     };
 }
