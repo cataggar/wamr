@@ -239,6 +239,13 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, 2, reg.low3());
     }
 
+    /// JMP reg — emits an indirect jump through a register (FF /4).
+    pub fn jmpReg(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.emitByte(0x41); // REX.B
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 4, reg.low3());
+    }
+
     /// JMP rel32 — emits a 5-byte near jump with a 32-bit relative offset.
     pub fn jmpRel32(self: *CodeBuffer, rel: i32) !void {
         try self.emitByte(0xE9);

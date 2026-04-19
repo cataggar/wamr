@@ -1067,8 +1067,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 }
             },
             .return_call => {
-                // Tail call: lower as a regular call followed by an immediate
-                // return. Does not preserve true tail-call stack reuse.
+                // True tail call: emit a single IR op with tail=true; codegen
+                // elides the trailing ret and reuses the current frame where
+                // possible (zero outgoing stack args + HRP-in-reg + non-import).
                 const func_idx = readU32(code, &ip);
                 const callee_type = wasm_module.getFuncType(func_idx);
                 const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
@@ -1094,36 +1095,11 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .func_idx = func_idx,
                     .args = args,
                     .extra_results = extra_results,
+                    .tail = true,
                 } }, .dest = dest, .type = result_ir_type });
-                if (call_result_count <= 1) {
-                    const ret_val: ?ir.VReg = if (call_result_count == 1) dest else null;
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
-                } else {
-                    var rets = try allocator.alloc(ir.VReg, call_result_count);
-                    rets[0] = dest;
-                    var ri: u32 = 1;
-                    while (ri < call_result_count) : (ri += 1) {
-                        const extra_dest = ir_func.newVReg();
-                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
-                            .i32 => .i32,
-                            .i64 => .i64,
-                            .f32 => .f32,
-                            .f64 => .f64,
-                            else => .i64,
-                        };
-                        try ir_func.getBlock(current_block).append(.{
-                            .op = .{ .call_result = @intCast(ri - 1) },
-                            .dest = extra_dest,
-                            .type = extra_ty,
-                        });
-                        rets[ri] = extra_dest;
-                    }
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
-                }
                 dead_code = true;
             },
             .return_call_indirect => {
-                // Tail call via table: lower as a regular call_indirect then ret.
                 const type_idx = readU32(code, &ip);
                 const table_idx = readU32(code, &ip);
                 const elem_idx = safePop(&vreg_stack);
@@ -1153,32 +1129,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .args = args,
                     .extra_results = extra_results,
                     .table_idx = table_idx,
+                    .tail = true,
                 } }, .dest = dest, .type = result_ir_type });
-                if (call_result_count <= 1) {
-                    const ret_val: ?ir.VReg = if (call_result_count == 1) dest else null;
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret = ret_val } });
-                } else {
-                    var rets = try allocator.alloc(ir.VReg, call_result_count);
-                    rets[0] = dest;
-                    var ri: u32 = 1;
-                    while (ri < call_result_count) : (ri += 1) {
-                        const extra_dest = ir_func.newVReg();
-                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
-                            .i32 => .i32,
-                            .i64 => .i64,
-                            .f32 => .f32,
-                            .f64 => .f64,
-                            else => .i64,
-                        };
-                        try ir_func.getBlock(current_block).append(.{
-                            .op = .{ .call_result = @intCast(ri - 1) },
-                            .dest = extra_dest,
-                            .type = extra_ty,
-                        });
-                        rets[ri] = extra_dest;
-                    }
-                    try ir_func.getBlock(current_block).append(.{ .op = .{ .ret_multi = rets } });
-                }
                 dead_code = true;
             },
             .memory_size => {
@@ -1506,6 +1458,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         const dest = ir_func.newVReg();
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .table_grow = .{ .table_idx = table_idx, .init = init, .delta = delta } }, .dest = dest, .type = .i32 });
                         try vreg_stack.append(allocator, dest);
+                    },
+                    .table_init => {
+                        const seg_idx = readU32(code, &ip);
+                        const table_idx = readU32(code, &ip);
+                        const len = safePop(&vreg_stack);
+                        const src = safePop(&vreg_stack);
+                        const dst = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .table_init = .{ .seg_idx = seg_idx, .table_idx = table_idx, .dst = dst, .src = src, .len = len } } });
+                    },
+                    .elem_drop => {
+                        const seg_idx = readU32(code, &ip);
+                        try ir_func.getBlock(current_block).append(.{ .op = .{ .elem_drop = seg_idx } });
                     },
                     else => {
                         std.debug.print("wamrc: unsupported misc opcode 0xFC 0x{X:0>2}\n", .{@intFromEnum(sub_opcode)});
@@ -1891,6 +1855,44 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     _ = safePop(&vreg_stack); // fallthrough doesn't carry the ref
                     current_block = fallthrough;
                 }
+            },
+
+            .return_call_ref => {
+                // Tail call via funcref. Null-check + call emitted by codegen;
+                // codegen elides the trailing ret when tail=true is feasible.
+                const type_idx = readU32(code, &ip);
+                const func_ref = safePop(&vreg_stack);
+
+                const callee_type = if (type_idx < wasm_module.types.len) &wasm_module.types[type_idx] else null;
+                const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
+                const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
+
+                const args = try allocator.alloc(ir.VReg, arg_count);
+                var ci: u32 = 0;
+                while (ci < arg_count) : (ci += 1) {
+                    args[arg_count - 1 - ci] = safePop(&vreg_stack);
+                }
+
+                const dest = ir_func.newVReg();
+                const cr_result_type: ir.IrType = if (callee_type != null and call_result_count > 0)
+                    switch (callee_type.?.results[0]) {
+                        .i32 => .i32,
+                        .i64 => .i64,
+                        .f32 => .f32,
+                        .f64 => .f64,
+                        else => .i64,
+                    }
+                else
+                    .i32;
+                const cr_extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .call_ref = .{
+                    .type_idx = type_idx,
+                    .func_ref = func_ref,
+                    .args = args,
+                    .extra_results = cr_extra_results,
+                    .tail = true,
+                } }, .dest = dest, .type = cr_result_type });
+                dead_code = true;
             },
 
             .call_ref => {

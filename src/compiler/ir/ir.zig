@@ -94,9 +94,9 @@ pub const Inst = struct {
         // the caller retrieves them via `.call_result` ops emitted right
         // after the call. The primary result is delivered in `inst.dest` as
         // before (via RAX).
-        call: struct { func_idx: u32, args: []const VReg = &.{}, extra_results: u8 = 0 },
-        call_indirect: struct { type_idx: u32, elem_idx: VReg, args: []const VReg = &.{}, extra_results: u8 = 0, table_idx: u32 = 0 },
-        call_ref: struct { type_idx: u32, func_ref: VReg, args: []const VReg = &.{}, extra_results: u8 = 0 },
+        call: struct { func_idx: u32, args: []const VReg = &.{}, extra_results: u8 = 0, tail: bool = false },
+        call_indirect: struct { type_idx: u32, elem_idx: VReg, args: []const VReg = &.{}, extra_results: u8 = 0, table_idx: u32 = 0, tail: bool = false },
+        call_ref: struct { type_idx: u32, func_ref: VReg, args: []const VReg = &.{}, extra_results: u8 = 0, tail: bool = false },
 
         // Retrieve the i-th extra result (i is 0-based among extras; i=0 is
         // the callee's 2nd result). Must immediately follow the corresponding

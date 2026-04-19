@@ -41,18 +41,21 @@ pub const aot_file_skiplist: []const []const u8 = &.{
     // IR learns result typing for select (Phase 4/5 territory).
     // "select.json", // 147 pass, 4 call_indirect arg-routing fails (pre-existing)
 
-    // return_call / return_call_indirect are now lowered as regular
-    // call + ret (not true tail-call), which causes a native stack
-    // overflow in the spec tests' recursive fac/loop patterns and
-    // aborts the whole runner. Re-enable once the codegen supports
-    // real tail-call stack reuse.
-    "return_call.json",
-    "return_call_indirect.json",
-    "return_call_ref.json",
+    // return_call / return_call_indirect / return_call_ref now use true
+    // tail-call codegen (JMP into callee with the current frame torn down)
+    // for the common case of ≤ register-param-count args + no HRP on stack.
+    // Deep recursion in the spec tests no longer overflows the native stack.
+    // "return_call.json",
+    "return_call_indirect.json", // 75/79 pass; 4 "indirect call type mismatch" asserts (pre-existing, same as call_indirect.json — no dynamic sig check on indirect calls)
+    // "return_call_ref.json",
 
     // skip-stack-guard-page.json recurses deep into a native-stack
     // overflow; the trap is emitted via guard-page SEH which our
     // runtime currently doesn't translate into error.WasmTrap.
+    // Infrastructure for recovery (SetThreadStackGuarantee +
+    // resetStackGuardPage) exists in runtime.zig but VEH dispatch on
+    // an overflowed stack still hangs — needs deeper investigation,
+    // likely an alternate stack / exception-dispatch rework.
     "skip-stack-guard-page.json",
 };
 

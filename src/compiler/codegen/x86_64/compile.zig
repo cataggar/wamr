@@ -56,6 +56,8 @@ const vmctx_trap_ivc_fn_field: i32 = 112;
 const vmctx_funcptrs_field: i32 = 120; // VmCtx.funcptrs_ptr offset (usize)
 const vmctx_table_grow_fn_field: i32 = 128; // VmCtx.table_grow_fn offset (usize)
 const vmctx_tables_info_field: i32 = 136; // VmCtx.tables_info_ptr offset (usize)
+const vmctx_table_init_fn_field: i32 = 144; // VmCtx.table_init_fn offset (usize)
+const vmctx_elem_drop_fn_field: i32 = 152; // VmCtx.elem_drop_fn offset (usize)
 // Per-table descriptor layout (TableInfo, 16 bytes): { ptr: u64, len: u32, _pad: u32 }
 const table_info_ptr_off: i32 = 0;
 const table_info_len_off: i32 = 8;
@@ -1080,6 +1082,12 @@ fn compileInst(
             try stack.pop(code, .rax); // dst
         },
         .data_drop => {},
+        .table_init => {
+            try stack.pop(code, .rax); // len
+            try stack.pop(code, .rax); // src
+            try stack.pop(code, .rax); // dst
+        },
+        .elem_drop => {},
         .table_size => {
             try code.movRegMem(.r10, .rbp, vmctx_offset);
             try code.movRegMemNoRex(.rax, .r10, vmctx_func_table_len_field);
@@ -2034,14 +2042,40 @@ fn compileInstRA(
             const total_stack_args: u32 = extra + (if (hrp_on_stack) @as(u32, 1) else 0);
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
             const stack_need: u32 = shadow + total_stack_args * 8;
-            // Keep rsp 16-aligned across the CALL (prologue established 16-alignment at rbp+8).
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
             const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
+            const is_import: bool = cl.func_idx < import_count;
 
-            if (cl.func_idx < import_count) {
-                // Import call: indirect via host_functions_ptr table in VmCtx.
-                // Load vmctx, then fetch the host fn pointer into rax BEFORE adjusting
-                // rsp (so base-register moves don't race with stack-arg writes).
+            // Real tail-call is feasible when outgoing stack args are empty,
+            // HRP (if any) goes in a register (so we pass our caller's HRP through),
+            // and the target is a local function (rel32 JMP).
+            const can_real_tail: bool = cl.tail and total_stack_args == 0 and !hrp_on_stack and !is_import;
+            if (can_real_tail) {
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                if (has_hrp) {
+                    const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                    const hrp_dst = param_regs[1 + n_args];
+                    try code.movRegMem(hrp_dst, .rbp, hrp_save_off);
+                }
+                var ci_t: usize = callee_saved_alloc.len;
+                while (ci_t > 0) {
+                    ci_t -= 1;
+                    if (used_callee_saved[ci_t]) try code.popReg(callee_saved_alloc[ci_t]);
+                }
+                try code.movRegReg(.rsp, .rbp);
+                try code.popReg(.rbp);
+                try code.emitByte(0xE9); // JMP rel32
+                const patch_off = code.len();
+                try code.emitI32(0);
+                try call_patches.append(code.allocator, .{
+                    .patch_offset = patch_off,
+                    .target_func_idx = cl.func_idx - import_count,
+                });
+                return;
+            }
+
+            if (is_import) {
                 try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
                 try code.movRegMem(.r10, param_regs[0], vmctx_host_functions_field);
                 if (cl.func_idx > 0) {
@@ -2050,7 +2084,6 @@ fn compileInstRA(
                 try code.movRegMem(.rax, .r10, 0);
 
                 if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
-                // Stack args first — their sources may live in regs we're about to overwrite.
                 var j: u32 = 0;
                 while (j < extra) : (j += 1) {
                     const arg_reg = try useVReg(code, alloc_result, cl.args[max_reg_args + j], .r10);
@@ -2071,7 +2104,6 @@ fn compileInstRA(
                 try code.callReg(.rax);
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
             } else {
-                // Local function call: direct CALL rel32.
                 try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
 
                 if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
@@ -2100,6 +2132,19 @@ fn compileInstRA(
                     .target_func_idx = cl.func_idx - import_count,
                 });
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+            }
+
+            if (cl.tail) {
+                // Fallback tail: result already in rax; multi-result values
+                // already written through our HRP pass-through. Emit inline
+                // epilogue + ret; skip writeDefTyped (dest is dead).
+                var ci_f: usize = callee_saved_alloc.len;
+                while (ci_f > 0) {
+                    ci_f -= 1;
+                    if (used_callee_saved[ci_f]) try code.popReg(callee_saved_alloc[ci_f]);
+                }
+                try code.emitEpilogue();
+                return;
             }
 
             if (inst.dest) |dest| {
@@ -2187,7 +2232,11 @@ fn compileInstRA(
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
             const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
 
-            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            // For real tail we jmp (no return address pushed) so shadow space
+            // isn't needed; skip the rsp adjust entirely to match the working
+            // direct-call tail path.
+            const ci_can_real_tail: bool = ci.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (!ci_can_real_tail and stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
             // Stack args first; sources may live in regs we're about to overwrite.
             var j: u32 = 0;
             while (j < extra) : (j += 1) {
@@ -2198,16 +2247,46 @@ fn compileInstRA(
             if (has_hrp) {
                 if (hrp_in_reg) {
                     const hrp_dst = param_regs[1 + n_args];
-                    try code.movRegReg(hrp_dst, .rbp);
-                    try code.addRegImm32(hrp_dst, scratch_base_off);
+                    if (ci.tail and total_stack_args == 0 and !hrp_on_stack) {
+                        // Real tail: pass-through our caller's HRP.
+                        const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                        try code.movRegMem(hrp_dst, .rbp, hrp_save_off);
+                    } else {
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    }
                 } else {
                     try code.movRegReg(.r10, .rbp);
                     try code.addRegImm32(.r10, scratch_base_off);
                     try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
                 }
             }
+
+            const ci_real_tail: bool = ci.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (ci_real_tail) {
+                var ci_t: usize = callee_saved_alloc.len;
+                while (ci_t > 0) {
+                    ci_t -= 1;
+                    if (used_callee_saved[ci_t]) try code.popReg(callee_saved_alloc[ci_t]);
+                }
+                try code.movRegReg(.rsp, .rbp);
+                try code.popReg(.rbp);
+                try code.jmpReg(.r11);
+                return;
+            }
+
             try code.callReg(.r11);
             if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            if (ci.tail) {
+                var ci_f: usize = callee_saved_alloc.len;
+                while (ci_f > 0) {
+                    ci_f -= 1;
+                    if (used_callee_saved[ci_f]) try code.popReg(callee_saved_alloc[ci_f]);
+                }
+                try code.emitEpilogue();
+                return;
+            }
 
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
@@ -2250,7 +2329,8 @@ fn compileInstRA(
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
             const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
 
-            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            const cr_can_real_tail: bool = cr.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (!cr_can_real_tail and stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
             var j: u32 = 0;
             while (j < extra) : (j += 1) {
                 const arg_reg = try useVReg(code, alloc_result, cr.args[max_reg_args + j], .r10);
@@ -2260,16 +2340,45 @@ fn compileInstRA(
             if (has_hrp) {
                 if (hrp_in_reg) {
                     const hrp_dst = param_regs[1 + n_args];
-                    try code.movRegReg(hrp_dst, .rbp);
-                    try code.addRegImm32(hrp_dst, scratch_base_off);
+                    if (cr.tail and total_stack_args == 0 and !hrp_on_stack) {
+                        const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                        try code.movRegMem(hrp_dst, .rbp, hrp_save_off);
+                    } else {
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    }
                 } else {
                     try code.movRegReg(.r10, .rbp);
                     try code.addRegImm32(.r10, scratch_base_off);
                     try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
                 }
             }
+
+            const cr_real_tail: bool = cr.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (cr_real_tail) {
+                var ci_t: usize = callee_saved_alloc.len;
+                while (ci_t > 0) {
+                    ci_t -= 1;
+                    if (used_callee_saved[ci_t]) try code.popReg(callee_saved_alloc[ci_t]);
+                }
+                try code.movRegReg(.rsp, .rbp);
+                try code.popReg(.rbp);
+                try code.jmpReg(.r11);
+                return;
+            }
+
             try code.callReg(.r11);
             if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            if (cr.tail) {
+                var ci_f: usize = callee_saved_alloc.len;
+                while (ci_f > 0) {
+                    ci_f -= 1;
+                    if (used_callee_saved[ci_f]) try code.popReg(callee_saved_alloc[ci_f]);
+                }
+                try code.emitEpilogue();
+                return;
+            }
 
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
@@ -2458,6 +2567,68 @@ fn compileInstRA(
             _ = try useVReg(code, alloc_result, mi.len, .rax);
         },
         .data_drop => {},
+
+        .table_init => |ti| {
+            // Helper signature (4 args to fit Win64 regs):
+            //   tableInitHelper(vmctx, packed_seg_table, packed_dst_src, len)
+            //   packed_seg_table = seg_idx | (table_idx << 32)
+            //   packed_dst_src   = dst | (src << 32)
+            //
+            // Win64: rcx=vmctx, rdx=packed_seg_table, r8=packed_dst_src, r9=len
+            // SysV:  rdi=vmctx, rsi=packed_seg_table, rdx=packed_dst_src, rcx=len
+            const arg_len_reg = param_regs[3];
+            const arg_packed_ds_reg = param_regs[2];
+            const arg_packed_st_reg = param_regs[1];
+
+            // Stage len into arg_len_reg (zero-extended i32).
+            const len_reg = try useVReg(code, alloc_result, ti.len, arg_len_reg);
+            if (len_reg != arg_len_reg) try code.movRegReg(arg_len_reg, len_reg);
+            try code.zeroExtend32(arg_len_reg);
+
+            // Build packed_dst_src in arg_packed_ds_reg.
+            // 1. src -> r11, zero-extend, shl 32.
+            const src_reg = try useVReg(code, alloc_result, ti.src, .r11);
+            if (src_reg != .r11) try code.movRegReg(.r11, src_reg);
+            try code.zeroExtend32(.r11);
+            try code.emitSlice(&.{ 0x49, 0xC1, 0xE3, 0x20 }); // shl r11, 32
+
+            // 2. dst -> arg_packed_ds_reg, zero-extend.
+            const dst_reg = try useVReg(code, alloc_result, ti.dst, arg_packed_ds_reg);
+            if (dst_reg != arg_packed_ds_reg) try code.movRegReg(arg_packed_ds_reg, dst_reg);
+            try code.zeroExtend32(arg_packed_ds_reg);
+
+            // 3. or arg_packed_ds_reg, r11.
+            try code.orRegReg(arg_packed_ds_reg, .r11);
+
+            // packed_seg_table is compile-time constant.
+            const packed_st: u64 =
+                @as(u64, ti.seg_idx) | (@as(u64, ti.table_idx) << 32);
+            try code.movRegImm64(arg_packed_st_reg, packed_st);
+
+            // vmctx into param_regs[0]; helper ptr into rax.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_table_init_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+        },
+        .elem_drop => |seg_idx| {
+            // Helper: elemDropHelper(vmctx, seg_idx)
+            //   Win64: rcx=vmctx, rdx=seg_idx
+            //   SysV:  rdi=vmctx, rsi=seg_idx
+            try code.movRegImm32(param_regs[1], @bitCast(seg_idx));
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_elem_drop_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+        },
 
         // ── Table management ─────────────────────────────────────────
         .table_size => |table_idx| {
