@@ -46,6 +46,13 @@ pub const ImportRegistry = struct {
     /// in their local table rather than a bogus funcidx in the importer's
     /// index space.
     funcref_globals: std.StringHashMap(usize),
+    /// Exported memory instances keyed by "<module_name>/<field>".
+    /// Values are non-owning pointers into the exporter Harness
+    /// (refcount-shared via `MemoryInstance.retain`/`release` on swap-in).
+    /// Lifetime of the exporter Harness must exceed any importer that
+    /// installs the pointer — spec_json_runner keeps harnesses alive
+    /// via the `retained` list on `register`.
+    memories: std.StringHashMap(*types.MemoryInstance),
 
     pub fn init(allocator: std.mem.Allocator) ImportRegistry {
         return .{
@@ -53,6 +60,7 @@ pub const ImportRegistry = struct {
             .globals = std.StringHashMap(types.Value).init(allocator),
             .functions = std.StringHashMap(usize).init(allocator),
             .funcref_globals = std.StringHashMap(usize).init(allocator),
+            .memories = std.StringHashMap(*types.MemoryInstance).init(allocator),
         };
     }
 
@@ -66,6 +74,9 @@ pub const ImportRegistry = struct {
         var itfg = self.funcref_globals.keyIterator();
         while (itfg.next()) |k| self.allocator.free(k.*);
         self.funcref_globals.deinit();
+        var itm = self.memories.keyIterator();
+        while (itm.next()) |k| self.allocator.free(k.*);
+        self.memories.deinit();
     }
 
     /// Record an exported global under "<module_name>/<field>" = value.
@@ -119,6 +130,24 @@ pub const ImportRegistry = struct {
         var buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
         return self.funcref_globals.get(key);
+    }
+
+    /// Record an exported memory instance under "<module_name>/<field>".
+    /// Pointer is non-owning; the exporter Harness retains ownership.
+    pub fn putMemory(self: *ImportRegistry, module_name: []const u8, field: []const u8, mem: *types.MemoryInstance) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ module_name, field });
+        errdefer self.allocator.free(key);
+        const gop = try self.memories.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+        }
+        gop.value_ptr.* = mem;
+    }
+
+    pub fn getMemory(self: *const ImportRegistry, module_name: []const u8, field: []const u8) ?*types.MemoryInstance {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
+        return self.memories.get(key);
     }
 };
 
@@ -215,6 +244,27 @@ pub const Harness = struct {
         if (h.inst.tables.len < wasm_module.tables.len) {
             patchTables(h.inst, allocator, wasm_module.tables) catch
                 return error.InstantiateFailed;
+        }
+
+        // Swap in shared memories for imported memory slots (by registry
+        // lookup). compileToAot emits imported memories at indices
+        // [0, import_memory_count); `allocateMemories` allocated fresh
+        // MemoryInstances for them, which we release here and replace with
+        // the exporter's `*MemoryInstance` (refcount-retained). This
+        // causes cross-module `memory.grow` / `memory.size` to observe a
+        // single shared buffer. Unresolved imports keep the fresh slot.
+        if (registry) |reg| {
+            var mem_import_idx: u32 = 0;
+            for (wasm_module.imports) |imp| {
+                if (imp.kind != .memory) continue;
+                defer mem_import_idx += 1;
+                if (mem_import_idx >= h.inst.memories.len) break;
+                const shared = reg.getMemory(imp.module_name, imp.field_name) orelse continue;
+                const mem_mut = @as([]*types.MemoryInstance, @constCast(h.inst.memories));
+                mem_mut[mem_import_idx].release(allocator);
+                shared.retain();
+                mem_mut[mem_import_idx] = shared;
+            }
         }
 
         aot_runtime.mapCodeExecutable(h.inst) catch return error.MapExecutableFailed;
@@ -352,6 +402,23 @@ pub const Harness = struct {
             const ptr = self.inst.funcptrs[exp.index];
             if (ptr == 0) continue;
             try registry.putFunction(module_name, exp.name, ptr);
+        }
+    }
+
+    /// Publish every exported memory's `*MemoryInstance` pointer into
+    /// `registry` keyed by `<module_name>/<export_name>`. Subsequent
+    /// importers' `initWithRegistry` will install the shared pointer in
+    /// their own `inst.memories` slot so `memory.grow` / `memory.size`
+    /// observe the same underlying buffer across modules.
+    pub fn exportMemoriesToRegistry(
+        self: *const Harness,
+        registry: *ImportRegistry,
+        module_name: []const u8,
+    ) !void {
+        for (self.wasm_module.exports) |exp| {
+            if (exp.kind != .memory) continue;
+            if (exp.index >= self.inst.memories.len) continue;
+            try registry.putMemory(module_name, exp.name, self.inst.memories[exp.index]);
         }
     }
 
@@ -516,6 +583,18 @@ fn compileToAot(
     }
 
     var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
+    // Imported memories first so `memory_idx` (combined import+local
+    // indexing per interpreter loader) continues to reference the right
+    // slot. `initWithRegistry` swaps the importer's fresh allocations
+    // for the exporter's shared `*MemoryInstance` post-instantiate.
+    for (module.imports) |imp| {
+        if (imp.kind != .memory) continue;
+        const mt = imp.memory_type orelse continue;
+        try mem_entries.append(a, .{
+            .min_pages = @intCast(mt.limits.min),
+            .max_pages = if (mt.limits.max) |m| @as(?u32, @intCast(m)) else null,
+        });
+    }
     for (module.memories) |mem| {
         try mem_entries.append(a, .{
             .min_pages = @intCast(mem.limits.min),
