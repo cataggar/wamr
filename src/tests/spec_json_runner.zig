@@ -204,10 +204,15 @@ const ActionOutcome = union(enum) {
 fn handleBareAction(
     cmd: Command,
     current: ?*aot_harness.Harness,
+    named: *const std.StringHashMap(*aot_harness.Harness),
     allocator: std.mem.Allocator,
 ) ActionOutcome {
     const action = cmd.action orelse return .{ .skipped = "no_action" };
-    const h = current orelse return .{ .skipped = "no_module" };
+    const resolved: ?*aot_harness.Harness = if (action.module) |mod_name|
+        (named.get(mod_name) orelse current)
+    else
+        current;
+    const h = resolved orelse return .{ .skipped = "no_module" };
 
     if (std.mem.eql(u8, action.type, "get")) {
         const field = action.field orelse return .{ .skipped = "get_no_field" };
@@ -1694,17 +1699,27 @@ fn runSpecTestFileAot(
     const json_dir = std.fs.path.dirname(json_path) orelse ".";
 
     var current: ?*aot_harness.Harness = null;
+    var current_is_retained: bool = false;
     // Retain registered harnesses for the duration of this JSON run so
     // their mmap'd native code outlives any importer that consults
     // `import_registry` for function pointers. `current` is only
     // deinit'd on next `module` command when it was not registered.
     var retained: std.ArrayList(*aot_harness.Harness) = .empty;
     defer {
-        if (current) |h| h.deinit();
+        if (current) |h| {
+            if (!current_is_retained) h.deinit();
+        }
         for (retained.items) |h| h.deinit();
         retained.deinit(allocator);
     }
-    var current_is_retained: bool = false;
+
+    // Named-module dispatch: modules declared as `module $name` in wast are
+    // preserved in the JSON as `cmd.name`. Later `action.module` references
+    // must resolve to the originally-bound harness even after `current` has
+    // been replaced by later `module` commands. Each named harness is moved
+    // into `retained` so its native code stays mapped.
+    var named_harnesses = std.StringHashMap(*aot_harness.Harness).init(allocator);
+    defer named_harnesses.deinit();
 
     // Cross-module import registry. Gets populated on `register` commands
     // by copying the current harness's exported globals. Subsequent module
@@ -1743,6 +1758,25 @@ fn runSpecTestFileAot(
                 break :blk null;
             };
             if (current != null) result.passed += 1;
+
+            // If the module was declared with a `$name` binding, retain the
+            // harness so later `action.module=$name` commands can dispatch
+            // to it even after `current` is replaced.
+            if (cmd.name) |mod_name| {
+                if (current) |h| {
+                    if (!current_is_retained) {
+                        retained.append(allocator, h) catch {
+                            recordSkip("retain_oom");
+                            continue;
+                        };
+                        current_is_retained = true;
+                    }
+                    named_harnesses.put(mod_name, h) catch {
+                        recordSkip("retain_oom");
+                        continue;
+                    };
+                }
+            }
         } else if (std.mem.eql(u8, cmd.type, "register")) {
             // Publish the current harness's exported globals under the
             // registration name so subsequent modules can import them.
@@ -1795,7 +1829,11 @@ fn runSpecTestFileAot(
                 result.skipped += 1;
                 continue;
             };
-            const h = current orelse {
+            const resolved_h: ?*aot_harness.Harness = if (action.module) |mod_name|
+                (named_harnesses.get(mod_name) orelse current)
+            else
+                current;
+            const h = resolved_h orelse {
                 recordSkip("no_module");
                 result.skipped += 1;
                 continue;
@@ -1972,7 +2010,7 @@ fn runSpecTestFileAot(
         } else if (std.mem.eql(u8, cmd.type, "action")) {
             // Bare invoke with no expected results — counts as a pass if
             // the call succeeds.
-            switch (handleBareAction(cmd, current, allocator)) {
+            switch (handleBareAction(cmd, current, &named_harnesses, allocator)) {
                 .passed => result.passed += 1,
                 .failed => |why| {
                     std.debug.print("  FAIL aot action line {d}: {s}\n", .{ cmd.line, why });
@@ -1984,16 +2022,21 @@ fn runSpecTestFileAot(
                 },
             }
         } else if (std.mem.eql(u8, cmd.type, "assert_trap") or std.mem.eql(u8, cmd.type, "assert_exhaustion")) {
-            const h = current orelse {
-                recordSkip("no_module");
-                result.skipped += 1;
-                continue;
-            };
-            const action = cmd.action orelse {
+            const action_pre = cmd.action orelse {
                 recordSkip("action_other");
                 result.skipped += 1;
                 continue;
             };
+            const resolved_trap_h: ?*aot_harness.Harness = if (action_pre.module) |mod_name|
+                (named_harnesses.get(mod_name) orelse current)
+            else
+                current;
+            const h = resolved_trap_h orelse {
+                recordSkip("no_module");
+                result.skipped += 1;
+                continue;
+            };
+            const action = action_pre;
             if (!std.mem.eql(u8, action.type, "invoke")) {
                 recordSkip("action_other");
                 result.skipped += 1;
