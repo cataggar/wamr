@@ -53,6 +53,10 @@ pub const ImportRegistry = struct {
     /// installs the pointer — spec_json_runner keeps harnesses alive
     /// via the `retained` list on `register`.
     memories: std.StringHashMap(*types.MemoryInstance),
+    /// Exported table instances keyed by "<module_name>/<field>".
+    /// Same lifetime rules as `memories` (shared via
+    /// `TableInstance.retain`/`release`).
+    tables: std.StringHashMap(*types.TableInstance),
 
     pub fn init(allocator: std.mem.Allocator) ImportRegistry {
         return .{
@@ -61,6 +65,7 @@ pub const ImportRegistry = struct {
             .functions = std.StringHashMap(usize).init(allocator),
             .funcref_globals = std.StringHashMap(usize).init(allocator),
             .memories = std.StringHashMap(*types.MemoryInstance).init(allocator),
+            .tables = std.StringHashMap(*types.TableInstance).init(allocator),
         };
     }
 
@@ -77,6 +82,9 @@ pub const ImportRegistry = struct {
         var itm = self.memories.keyIterator();
         while (itm.next()) |k| self.allocator.free(k.*);
         self.memories.deinit();
+        var itt = self.tables.keyIterator();
+        while (itt.next()) |k| self.allocator.free(k.*);
+        self.tables.deinit();
     }
 
     /// Record an exported global under "<module_name>/<field>" = value.
@@ -148,6 +156,24 @@ pub const ImportRegistry = struct {
         var buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
         return self.memories.get(key);
+    }
+
+    /// Record an exported table instance under "<module_name>/<field>".
+    /// Pointer is non-owning; the exporter Harness retains ownership.
+    pub fn putTable(self: *ImportRegistry, module_name: []const u8, field: []const u8, tbl: *types.TableInstance) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ module_name, field });
+        errdefer self.allocator.free(key);
+        const gop = try self.tables.getOrPut(key);
+        if (gop.found_existing) {
+            self.allocator.free(key);
+        }
+        gop.value_ptr.* = tbl;
+    }
+
+    pub fn getTable(self: *const ImportRegistry, module_name: []const u8, field: []const u8) ?*types.TableInstance {
+        var buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&buf, "{s}/{s}", .{ module_name, field }) catch return null;
+        return self.tables.get(key);
     }
 };
 
@@ -241,8 +267,12 @@ pub const Harness = struct {
         // interpreter-loaded `wasm_module` so that `table.grow` has accurate
         // limits and `mapCodeExecutable` allocates a `func_table` of the
         // declared `min` size even without element segments.
-        if (h.inst.tables.len < wasm_module.tables.len) {
-            patchTables(h.inst, allocator, wasm_module.tables) catch
+        var import_table_count: u32 = 0;
+        for (wasm_module.imports) |imp| {
+            if (imp.kind == .table) import_table_count += 1;
+        }
+        if (h.inst.tables.len < import_table_count + wasm_module.tables.len) {
+            patchTables(h.inst, allocator, wasm_module.imports, wasm_module.tables) catch
                 return error.InstantiateFailed;
         }
 
@@ -264,6 +294,28 @@ pub const Harness = struct {
                 mem_mut[mem_import_idx].release(allocator);
                 shared.retain();
                 mem_mut[mem_import_idx] = shared;
+            }
+        }
+
+        // Swap in shared tables for imported table slots (by registry
+        // lookup). `patchTables` reserved slots at indices
+        // [0, import_table_count) with fresh local TableInstances; replace
+        // each with the exporter's `*TableInstance` (refcount-retained).
+        // Cross-module `table.get`/`table.set` observe the shared
+        // `TableInstance.elements` array. Note: `mapCodeExecutable` reads
+        // the table size/limits from `inst.tables[*]` so this must happen
+        // before that call. Unresolved imports keep the fresh local slot.
+        if (registry) |reg| {
+            var tbl_import_idx: u32 = 0;
+            for (wasm_module.imports) |imp| {
+                if (imp.kind != .table) continue;
+                defer tbl_import_idx += 1;
+                if (tbl_import_idx >= h.inst.tables.len) break;
+                const shared = reg.getTable(imp.module_name, imp.field_name) orelse continue;
+                const tbl_mut = @as([]*types.TableInstance, @constCast(h.inst.tables));
+                tbl_mut[tbl_import_idx].release(allocator);
+                shared.retain();
+                tbl_mut[tbl_import_idx] = shared;
             }
         }
 
@@ -424,6 +476,23 @@ pub const Harness = struct {
         }
     }
 
+    /// Publish every exported table's `*TableInstance` pointer into
+    /// `registry` keyed by `<module_name>/<export_name>`. Subsequent
+    /// importers' `initWithRegistry` will install the shared pointer in
+    /// their own `inst.tables` slot so cross-module `table.get`/`table.set`
+    /// observe the same underlying elements array.
+    pub fn exportTablesToRegistry(
+        self: *const Harness,
+        registry: *ImportRegistry,
+        module_name: []const u8,
+    ) !void {
+        for (self.wasm_module.exports) |exp| {
+            if (exp.kind != .table) continue;
+            if (exp.index >= self.inst.tables.len) continue;
+            try registry.putTable(module_name, exp.name, self.inst.tables[exp.index]);
+        }
+    }
+
     /// Invoke an AOT function by index with runtime-typed scalar args.
     /// See `aot_runtime.callFuncScalar` for the supported signature envelope.
     /// Writes decoded results into `results_buf` and returns a slice into it.
@@ -441,6 +510,7 @@ pub const Harness = struct {
 fn patchTables(
     inst: *aot_runtime.AotInstance,
     allocator: std.mem.Allocator,
+    wasm_imports: []const types.ImportDesc,
     wasm_tables: []const types.TableType,
 ) !void {
     // Free any tables allocated by the default-table fallback in
@@ -451,14 +521,39 @@ fn patchTables(
         allocator.free(inst.tables);
         inst.tables = &.{};
     }
-    const tables = try allocator.alloc(*types.TableInstance, wasm_tables.len);
+
+    var import_count: u32 = 0;
+    for (wasm_imports) |imp| {
+        if (imp.kind == .table) import_count += 1;
+    }
+
+    const total = import_count + wasm_tables.len;
+    const tables = try allocator.alloc(*types.TableInstance, total);
     errdefer allocator.free(tables);
-    for (wasm_tables, 0..) |tt, i| {
+
+    // Imported tables first (they occupy indices [0, import_count)).
+    // Initialize with a fresh local TableInstance sized to the import's
+    // declared `min`; `initWithRegistry` may swap in a shared exporter
+    // instance if the registry has a matching entry.
+    var idx: usize = 0;
+    for (wasm_imports) |imp| {
+        if (imp.kind != .table) continue;
+        const tt = imp.table_type orelse return error.InstantiateFailed;
         const elements = try allocator.alloc(types.TableElement, tt.limits.min);
         for (elements) |*e| e.* = types.TableElement.nullForType(tt.elem_type);
         const tbl = try allocator.create(types.TableInstance);
         tbl.* = .{ .table_type = tt, .elements = elements };
-        tables[i] = tbl;
+        tables[idx] = tbl;
+        idx += 1;
+    }
+
+    for (wasm_tables) |tt| {
+        const elements = try allocator.alloc(types.TableElement, tt.limits.min);
+        for (elements) |*e| e.* = types.TableElement.nullForType(tt.elem_type);
+        const tbl = try allocator.create(types.TableInstance);
+        tbl.* = .{ .table_type = tt, .elements = elements };
+        tables[idx] = tbl;
+        idx += 1;
     }
     inst.tables = tables;
 }
@@ -566,12 +661,6 @@ fn compileToAot(
     // two spectest imports; skipping imports turns that into out-of-range.
     var import_entries: std.ArrayList(emit_aot.ImportEntry) = .empty;
     for (module.imports) |imp| {
-        // Cross-module table linking isn't supported yet (Phase 4). A
-        // module with an imported table currently falls through with an
-        // empty `module.tables`, so `table.size` on it would return 0
-        // instead of the declared min. Surface as UnsupportedOpcode so
-        // the spec runner records a skip rather than a value mismatch.
-        if (imp.kind == .table) return error.UnsupportedOpcode;
         try import_entries.append(a, .{
             .module_name = imp.module_name,
             .field_name = imp.field_name,

@@ -1769,6 +1769,11 @@ fn runSpecTestFileAot(
                     result.skipped += 1;
                     continue;
                 };
+                h.exportTablesToRegistry(&import_registry, reg_name) catch {
+                    recordSkip("register_oom");
+                    result.skipped += 1;
+                    continue;
+                };
                 // Retain this harness so its native code stays mapped
                 // for future importers that hold pointers into it.
                 if (!current_is_retained) {

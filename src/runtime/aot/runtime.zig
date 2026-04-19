@@ -315,6 +315,22 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
             inst.tables_info[0].ptr = @intFromPtr(new_table.ptr);
             inst.tables_info[0].len = @intCast(new_size);
         }
+        // Keep the shared `TableInstance` in sync with the current size.
+        // Future importers that receive this `TableInstance` (via the
+        // ImportRegistry table-swap in the test harness) size their own
+        // `func_table` from `elements.len` in `mapCodeExecutable`; without
+        // reallocating `elements` the importer would see the stale pre-grow
+        // size and return wrong results from `table.size`/`table.grow`.
+        if (inst.tables.len > 0) {
+            const shared = inst.tables[0];
+            shared.table_type.limits.min = @intCast(new_size);
+            const new_elements = inst.allocator.realloc(shared.elements, new_size) catch return -1;
+            var j: usize = old_size;
+            while (j < new_size) : (j += 1) {
+                new_elements[j] = types.TableElement.nullForType(shared.table_type.elem_type);
+            }
+            shared.elements = new_elements;
+        }
         return @intCast(old_size);
     }
 
@@ -337,6 +353,16 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
     store.* = new_store;
     ti.ptr = @intFromPtr(new_store.ptr);
     ti.len = @intCast(new_size);
+    if (table_idx < inst.tables.len) {
+        const shared = inst.tables[table_idx];
+        shared.table_type.limits.min = @intCast(new_size);
+        const new_elements = inst.allocator.realloc(shared.elements, new_size) catch return -1;
+        var j: usize = old_size;
+        while (j < new_size) : (j += 1) {
+            new_elements[j] = types.TableElement.nullForType(shared.table_type.elem_type);
+        }
+        shared.elements = new_elements;
+    }
     return @intCast(old_size);
 }
 
