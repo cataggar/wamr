@@ -35,9 +35,88 @@ var g_mem_size: usize = 0;
 var g_saved_ctx: windows.CONTEXT align(16) = undefined;
 var g_trap_catching: bool = false;
 var g_trap_occurred: bool = false;
+/// Exception code of the last fault vehHandler redirected to trapLongjmp.
+/// Sampled by `callFuncScalar` after trap return to decide whether to
+/// re-arm the thread's stack guard page (see `resetStackGuardPage`).
+var g_last_trap_code: u32 = 0;
 
 extern "kernel32" fn RtlCaptureContext(ContextRecord: *windows.CONTEXT) callconv(.winapi) void;
 extern "kernel32" fn RtlRestoreContext(ContextRecord: *windows.CONTEXT, ExceptionRecord: ?*anyopaque) callconv(.winapi) noreturn;
+
+// Win32 memory-protect flags and APIs used by resetStackGuardPage.
+// Declared locally so we don't depend on std.os.windows exposing them.
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_GUARD: u32 = 0x100;
+const MEM_COMMIT: u32 = 0x1000;
+
+const MEMORY_BASIC_INFORMATION = extern struct {
+    BaseAddress: ?*anyopaque,
+    AllocationBase: ?*anyopaque,
+    AllocationProtect: u32,
+    PartitionId: u16,
+    _pad: u16,
+    RegionSize: usize,
+    State: u32,
+    Protect: u32,
+    Type: u32,
+};
+
+extern "kernel32" fn VirtualProtect(
+    lpAddress: ?*anyopaque,
+    dwSize: usize,
+    flNewProtect: u32,
+    lpflOldProtect: *u32,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn VirtualQuery(
+    lpAddress: ?*const anyopaque,
+    lpBuffer: *MEMORY_BASIC_INFORMATION,
+    dwLength: usize,
+) callconv(.winapi) usize;
+
+extern "kernel32" fn SetThreadStackGuarantee(
+    StackSizeInBytes: *u32,
+) callconv(.winapi) windows.BOOL;
+
+/// Re-arm the current thread's stack guard page after a caught
+/// `STATUS_STACK_OVERFLOW`. The OS removed `PAGE_GUARD` from the page
+/// that was hit and committed it as ordinary R/W memory, so a subsequent
+/// overflow in the same thread walks past the end of the stack and the
+/// process aborts with `STATUS_ACCESS_VIOLATION` — bypassing our VEH.
+///
+/// Mirrors the behaviour of MSVC CRT's `_resetstkoflw`: find the lowest
+/// committed page in the current thread's stack allocation and mark it
+/// `PAGE_READWRITE | PAGE_GUARD` so the OS raises another
+/// `STATUS_STACK_OVERFLOW` on the next overrun.
+///
+/// Must be called on a clean stack — i.e. after `RtlRestoreContext` has
+/// returned us to the capture site in `callFuncScalar`, well above the
+/// former-guard page we're about to touch.
+fn resetStackGuardPage() void {
+    if (comptime builtin.os.tag != .windows) return;
+
+    // Probe any on-stack address to locate the stack's allocation base.
+    var mbi: MEMORY_BASIC_INFORMATION = undefined;
+    var probe: usize = 0;
+    const probe_ptr: *const anyopaque = @ptrCast(&probe);
+    if (VirtualQuery(probe_ptr, &mbi, @sizeOf(MEMORY_BASIC_INFORMATION)) == 0) return;
+    const alloc_base = mbi.AllocationBase orelse return;
+
+    // Walk up from the allocation base skipping uncommitted pages to
+    // find the first committed page — that's where the guard belongs.
+    var cursor: usize = @intFromPtr(alloc_base);
+    while (true) {
+        if (VirtualQuery(@ptrFromInt(cursor), &mbi, @sizeOf(MEMORY_BASIC_INFORMATION)) == 0) return;
+        if (mbi.AllocationBase != alloc_base) return; // walked past the stack
+        if (mbi.State == MEM_COMMIT) break;
+        cursor +%= mbi.RegionSize;
+        if (mbi.RegionSize == 0) return;
+    }
+
+    const page_size: usize = std.heap.page_size_min;
+    var old_protect: u32 = 0;
+    _ = VirtualProtect(@ptrFromInt(cursor), page_size, PAGE_READWRITE | PAGE_GUARD, &old_protect);
+}
 
 fn trapLongjmp() noreturn {
     @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
@@ -71,6 +150,7 @@ fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
     if (is_wasm_fault and @atomicLoad(bool, &g_trap_catching, .seq_cst)) {
         _ = in_code;
         @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
+        @atomicStore(u32, &g_last_trap_code, code, .seq_cst);
         ctx.Rip = @intFromPtr(&trapLongjmp);
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
@@ -176,6 +256,19 @@ pub const VmCtx = extern struct {
     /// For table 0, `ptr` aliases `func_table_ptr` and `len` aliases
     /// `func_table_len`.
     tables_info_ptr: usize = 0,
+    /// Native function pointer for the `table.init` host helper.
+    /// Signature:
+    ///   fn (vmctx: *VmCtx,
+    ///       packed_seg_table: u64,   // seg_idx | (table_idx << 32)
+    ///       packed_dst_src: u64,     // dst     | (src << 32)
+    ///       len: u32) callconv(.c) void
+    /// Traps on OOB (src+len > seg.len, dst+len > table.len) or
+    /// already-dropped passive segment.
+    table_init_fn: usize = 0,
+    /// Native function pointer for the `elem.drop` host helper.
+    /// Signature: fn (vmctx: *VmCtx, seg_idx: u32) callconv(.c) void
+    /// Marks the passive element segment as dropped (idempotent).
+    elem_drop_fn: usize = 0,
 };
 
 /// Host helper invoked from AOT-compiled memory loads/stores when an
@@ -305,10 +398,15 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
         };
         if (new_size_u64 > max_cap) return -1;
         const new_size: usize = @intCast(new_size_u64);
-        const new_table = inst.allocator.realloc(inst.func_table, new_size) catch return -1;
+        const shared0 = if (inst.tables.len > 0) inst.tables[0] else null;
+        // Realloc the shared backing (owned by TableInstance). Also updates
+        // inst.func_table (which aliases it).
+        const old_slice: []usize = if (shared0) |s| s.native_backing else inst.func_table;
+        const new_table = inst.allocator.realloc(old_slice, new_size) catch return -1;
         var i: usize = old_size;
         while (i < new_size) : (i += 1) new_table[i] = fill_ptr;
         inst.func_table = new_table;
+        if (shared0) |s| s.native_backing = new_table;
         vmctx.func_table_ptr = @intFromPtr(new_table.ptr);
         vmctx.func_table_len = @intCast(new_size);
         if (inst.tables_info.len > 0) {
@@ -347,10 +445,13 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
     };
     if (new_size_u64 > max_cap) return -1;
     const new_size: usize = @intCast(new_size_u64);
-    const new_store = inst.allocator.realloc(store.*, new_size) catch return -1;
+    const shared_n = if (table_idx < inst.tables.len) inst.tables[table_idx] else null;
+    const old_slice: []usize = if (shared_n) |s| s.native_backing else store.*;
+    const new_store = inst.allocator.realloc(old_slice, new_size) catch return -1;
     var i: usize = old_size;
     while (i < new_size) : (i += 1) new_store[i] = fill_ptr;
     store.* = new_store;
+    if (shared_n) |s| s.native_backing = new_store;
     ti.ptr = @intFromPtr(new_store.ptr);
     ti.len = @intCast(new_size);
     if (table_idx < inst.tables.len) {
@@ -366,7 +467,94 @@ pub fn tableGrowHelper(vmctx: *VmCtx, init_val: i64, delta: i32, table_idx: u32)
     return @intCast(old_size);
 }
 
-// ─── Comptime target validation ─────────────────────────────────────────────
+/// Host helper invoked from AOT-compiled `table.init` sites.
+///
+/// Copies `len` function references from element segment `seg_idx` starting
+/// at offset `src` into table `table_idx` starting at offset `dst`. Traps
+/// (via `trapLongjmp` when armed, otherwise `process.exit(2)`) on:
+///   - `seg_idx >= module.elem_segments.len`
+///   - segment already dropped AND (`src != 0` or `len != 0`)
+///   - `src + len > segment.func_indices.len`
+///   - `table_idx >= tables_info.len`
+///   - `dst + len > table.len`
+///
+/// Arguments are packed to fit the 4-register fast path of Win64 and SysV
+/// so codegen can avoid stack spills for the typical call site:
+///   packed_seg_table = seg_idx | (table_idx << 32)
+///   packed_dst_src   = dst     | (src << 32)
+pub fn tableInitHelper(
+    vmctx: *VmCtx,
+    packed_seg_table: u64,
+    packed_dst_src: u64,
+    len: u32,
+) callconv(.c) void {
+    if (vmctx.instance_ptr == 0) {
+        aotTrapUnreachable(vmctx);
+    }
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    const module = inst.module_ref orelse inst.module;
+
+    const seg_idx: u32 = @truncate(packed_seg_table);
+    const table_idx: u32 = @truncate(packed_seg_table >> 32);
+    const dst: u32 = @truncate(packed_dst_src);
+    const src: u32 = @truncate(packed_dst_src >> 32);
+
+    if (seg_idx >= module.elem_segments.len) aotTrapUnreachable(vmctx);
+    const dropped = inst.elem_segments_dropped.len > seg_idx and inst.elem_segments_dropped[seg_idx];
+    const seg = module.elem_segments[seg_idx];
+
+    // Spec: table.init with a dropped segment traps iff src or len is non-zero.
+    const seg_len: u64 = if (dropped) 0 else @as(u64, @intCast(seg.func_indices.len));
+    if (@as(u64, src) + @as(u64, len) > seg_len) aotTrapUnreachable(vmctx);
+
+    if (table_idx >= inst.tables_info.len) aotTrapUnreachable(vmctx);
+    const ti = &inst.tables_info[table_idx];
+    if (@as(u64, dst) + @as(u64, len) > @as(u64, ti.len)) aotTrapUnreachable(vmctx);
+
+    if (len == 0) return;
+
+    // Copy native function addresses into the table descriptor's backing.
+    const backing: [*]usize = @ptrFromInt(@as(usize, @intCast(ti.ptr)));
+    var i: u32 = 0;
+    while (i < len) : (i += 1) {
+        const fi = seg.func_indices[src + i];
+        const addr: usize = if (fi == std.math.maxInt(u32) or fi >= inst.funcptrs.len)
+            0
+        else
+            inst.funcptrs[fi];
+        backing[dst + i] = addr;
+    }
+
+    // Mirror into the shared `TableInstance.elements` for importer consistency
+    // (matches tableGrowHelper's pattern). Funcref elements are
+    // `{ .value = .{ .funcref = ?u32 }, .module_inst = ... }`.
+    if (table_idx < inst.tables.len) {
+        const shared = inst.tables[table_idx];
+        if (shared.elements.len >= @as(usize, dst) + @as(usize, len)) {
+            i = 0;
+            while (i < len) : (i += 1) {
+                const fi = seg.func_indices[src + i];
+                if (fi == std.math.maxInt(u32)) {
+                    shared.elements[dst + i] = types.TableElement.nullForType(shared.table_type.elem_type);
+                } else {
+                    shared.elements[dst + i] = .{ .value = .{ .funcref = fi } };
+                }
+            }
+        }
+    }
+}
+
+/// Host helper invoked from AOT-compiled `elem.drop` sites. Marks the
+/// passive element segment as dropped. Idempotent. Out-of-range indices
+/// are treated as a no-op (validation guarantees they don't appear in
+/// well-formed modules).
+pub fn elemDropHelper(vmctx: *VmCtx, seg_idx: u32) callconv(.c) void {
+    if (vmctx.instance_ptr == 0) return;
+    const inst: *AotInstance = @ptrFromInt(vmctx.instance_ptr);
+    if (seg_idx < inst.elem_segments_dropped.len) {
+        inst.elem_segments_dropped[seg_idx] = true;
+    }
+}
 
 /// The native machine architecture, resolved at comptime.
 const native_arch: enum { x86_64, aarch64, unsupported } = switch (builtin.cpu.arch) {
@@ -408,6 +596,16 @@ pub const AotInstance = struct {
     /// which shares `func_table`). Entry `i-1` holds the backing slice for
     /// wasm table index `i`.
     extra_tables_storage: [][]usize = &.{},
+    /// Per element-segment drop flag. `elem_segments_dropped[i]` is true when
+    /// segment `i` has been consumed (either implicitly for active segments
+    /// at instantiation, or by a successful `elem.drop`/`table.init` for
+    /// passive segments). A dropped segment behaves as length-0 — `table.init`
+    /// with `src>0` or `len>0` traps.
+    elem_segments_dropped: []bool = &.{},
+    /// The underlying module — kept on the instance so host helpers invoked
+    /// from AOT code (e.g. `tableInitHelper`) can recover the passive
+    /// segment data via `vmctx.instance_ptr`.
+    module_ref: ?*const aot_loader.AotModule = null,
 };
 
 pub const TableInfo = extern struct {
@@ -440,7 +638,22 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
         .tables = &.{},
         .globals = &.{},
         .allocator = allocator,
+        .module_ref = module,
     };
+
+    // Per-segment drop flag. Active segments are marked dropped immediately
+    // since their bytes have already been applied at instantiation — the spec
+    // treats their post-instantiation state as "as if elem.drop had already
+    // executed", meaning a subsequent table.init with a non-zero src/len must
+    // trap.
+    if (module.elem_segments.len > 0) {
+        const dropped = allocator.alloc(bool, module.elem_segments.len) catch return error.OutOfMemory;
+        for (module.elem_segments, 0..) |seg, i| {
+            dropped[i] = !seg.is_passive;
+        }
+        inst.elem_segments_dropped = dropped;
+    }
+    errdefer if (inst.elem_segments_dropped.len > 0) allocator.free(inst.elem_segments_dropped);
 
     inst.memories = try allocateMemories(module, allocator);
     errdefer freeMemories(inst.memories, allocator);
@@ -499,8 +712,9 @@ pub fn destroy(inst: *AotInstance) void {
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, allocator);
     if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
-    if (inst.func_table.len > 0) allocator.free(inst.func_table);
+    // inst.func_table aliases tables[0].native_backing (freed by TableInstance.release).
     if (inst.funcptrs.len > 0) allocator.free(inst.funcptrs);
+    if (inst.elem_segments_dropped.len > 0) allocator.free(inst.elem_segments_dropped);
     allocator.destroy(inst);
 }
 
@@ -542,30 +756,34 @@ pub fn getFuncAddr(inst: *const AotInstance, func_idx: u32) ?[*]const u8 {
 /// Map the module's native code into executable memory.
 /// After this call, `getFuncAddr` returns pointers suitable for execution.
 pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
-    const text = inst.module.text_section orelse return;
-    if (text.len == 0) return;
+    const module = inst.module;
+    const text_opt = module.text_section;
+    const has_text = text_opt != null and text_opt.?.len > 0;
 
-    // 1. Allocate RW pages
-    const mem = platform.mmap(null, text.len, .{ .read = true, .write = true }, .{}) orelse
-        return error.CodeMappingFailed;
+    var mem: [*]u8 = undefined;
+    if (has_text) {
+        const text = text_opt.?;
+        // 1. Allocate RW pages
+        mem = platform.mmap(null, text.len, .{ .read = true, .write = true }, .{}) orelse
+            return error.CodeMappingFailed;
 
-    // 2. Copy native code
-    @memcpy(mem[0..text.len], text);
+        // 2. Copy native code
+        @memcpy(mem[0..text.len], text);
 
-    // 3. Flush instruction cache (required on AArch64, no-op on x86-64)
-    if (comptime native_arch == .aarch64) {
-        platform.icacheFlush(mem, text.len);
+        // 3. Flush instruction cache (required on AArch64, no-op on x86-64)
+        if (comptime native_arch == .aarch64) {
+            platform.icacheFlush(mem, text.len);
+        }
+
+        // 4. Transition to RX (W^X)
+        platform.mprotect(mem, text.len, .{ .read = true, .exec = true }) catch
+            return error.CodeMappingFailed;
+
+        inst.code_base = mem;
+        inst.code_size = text.len;
     }
 
-    // 4. Transition to RX (W^X)
-    platform.mprotect(mem, text.len, .{ .read = true, .exec = true }) catch
-        return error.CodeMappingFailed;
-
-    inst.code_base = mem;
-    inst.code_size = text.len;
-
     // Build function pointer table for call_indirect
-    const module = inst.module;
     const import_count = module.import_function_count;
 
     // Build module func idx → native address mapping (temporary)
@@ -577,9 +795,11 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         func_addrs[i] = if (inst.host_functions[i]) |ptr| @intFromPtr(ptr) else 0;
     }
     // Local functions → code_base + offset
-    for (0..@min(module.func_count, n_addrs - @min(import_count, n_addrs))) |i| {
-        const offset = module.func_offsets[i];
-        func_addrs[import_count + i] = @intFromPtr(mem) + offset;
+    if (has_text) {
+        for (0..@min(module.func_count, n_addrs - @min(import_count, n_addrs))) |i| {
+            const offset = module.func_offsets[i];
+            func_addrs[import_count + i] = @intFromPtr(mem) + offset;
+        }
     }
 
     // Persist the funcidx → native address map on the instance for ref.func.
@@ -589,20 +809,44 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
         inst.funcptrs = persistent;
     }
 
-    // Build wasm table → native address table for call_indirect
+    // Build wasm table → native address table for call_indirect.
+    //
+    // Native backings live on the shared `TableInstance` so that multiple
+    // modules importing the same table read/write the same slice. The
+    // exporter allocates + publishes; importers alias. Active elem segments
+    // from the importing module are still applied on top (using this
+    // module's funcptrs), mutating the shared backing directly so the
+    // exporter's compiled call_indirect sees the writes.
     if (inst.tables.len > 0) {
         const tbl = inst.tables[0];
         const tbl_size = tbl.elements.len;
         if (tbl_size > 0) {
-            const native_table = inst.allocator.alloc(usize, tbl_size) catch return error.OutOfMemory;
-            @memset(native_table, 0);
+            var native_table: []usize = undefined;
+            if (tbl.native_backing.len == tbl_size) {
+                // Exporter already published a backing; alias it.
+                native_table = tbl.native_backing;
+            } else {
+                native_table = inst.allocator.alloc(usize, tbl_size) catch return error.OutOfMemory;
+                @memset(native_table, 0);
+                tbl.native_backing = native_table;
+            }
 
-            // Apply element segments
+            // Apply this module's active element segments (skip passive —
+            // only usable by table.init). `0xFFFFFFFF` encodes a null
+            // element (emitted by the compiler when the source segment
+            // contained `ref.null` or an externref literal we can't resolve
+            // statically); explicitly zero that slot so an importer's
+            // `(elem (i32.const k) externref (ref.null extern))` can
+            // overwrite an exporter's previously-written value.
             for (module.elem_segments) |seg| {
+                if (seg.is_passive) continue;
                 if (seg.table_idx != 0) continue;
                 for (seg.func_indices, 0..) |func_idx, j| {
                     const dst = seg.offset + @as(u32, @intCast(j));
-                    if (dst < tbl_size and func_idx < n_addrs) {
+                    if (dst >= tbl_size) continue;
+                    if (func_idx == std.math.maxInt(u32)) {
+                        native_table[dst] = 0;
+                    } else if (func_idx < n_addrs) {
                         native_table[dst] = func_addrs[func_idx];
                     }
                 }
@@ -613,10 +857,8 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
     }
 
     // Build per-table native descriptor array for multi-table support.
-    // Slot 0 aliases `inst.func_table` (so existing call_indirect code which
-    // reads via `func_table_ptr`/`func_table_len` keeps working). Additional
-    // slots back wasm tables 1..n so table.get/set/size/grow can address them
-    // directly via `tables_info_ptr[i]` without corrupting table 0.
+    // Slot 0 aliases `inst.func_table`. Additional slots alias their
+    // `TableInstance.native_backing` (allocating on first use).
     if (inst.tables.len > 0) {
         const info = inst.allocator.alloc(TableInfo, inst.tables.len) catch return error.OutOfMemory;
         @memset(info, .{});
@@ -629,18 +871,27 @@ pub fn mapCodeExecutable(inst: *AotInstance) RuntimeError!void {
             .len = @intCast(inst.func_table.len),
         };
 
-        // Slots 1..n: allocate per-table backing arrays and apply any elem segs
-        // whose `table_idx` targets them.
+        // Slots 1..n.
         for (inst.tables[1..], 1..) |tbl_i, idx| {
             const sz = tbl_i.elements.len;
             if (sz == 0) continue;
-            const backing = inst.allocator.alloc(usize, sz) catch return error.OutOfMemory;
-            @memset(backing, 0);
+            var backing: []usize = undefined;
+            if (tbl_i.native_backing.len == sz) {
+                backing = tbl_i.native_backing;
+            } else {
+                backing = inst.allocator.alloc(usize, sz) catch return error.OutOfMemory;
+                @memset(backing, 0);
+                tbl_i.native_backing = backing;
+            }
             for (module.elem_segments) |seg| {
+                if (seg.is_passive) continue;
                 if (seg.table_idx != idx) continue;
                 for (seg.func_indices, 0..) |func_idx, j| {
                     const dst = seg.offset + @as(u32, @intCast(j));
-                    if (dst < sz and func_idx < n_addrs) {
+                    if (dst >= sz) continue;
+                    if (func_idx == std.math.maxInt(u32)) {
+                        backing[dst] = 0;
+                    } else if (func_idx < n_addrs) {
                         backing[dst] = func_addrs[func_idx];
                     }
                 }
@@ -708,6 +959,8 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     if (inst.tables_info.len > 0) {
         vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
     }
+    vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
+    vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
 
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
@@ -982,6 +1235,8 @@ pub fn callFuncScalar(
     if (inst.tables_info.len > 0) {
         vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
     }
+    vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
+    vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
 
     // Marshal args to raw 64-bit bit patterns. Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
@@ -1021,10 +1276,27 @@ pub fn callFuncScalar(
     // helper calls, so the VEH is effectively unused.
     if (comptime builtin.os.tag == .windows) {
         @atomicStore(bool, &g_trap_occurred, false, .seq_cst);
+        @atomicStore(u32, &g_last_trap_code, 0, .seq_cst);
+        // Reserve extra stack headroom so the VEH and trapLongjmp can
+        // run safely after a STATUS_STACK_OVERFLOW consumes the guard
+        // page. Without this, the OS leaves ~4KB of space below the
+        // former guard for user-mode dispatch — enough for the VEH to
+        // fire, but RtlRestoreContext and the subsequent return path
+        // may overflow. 16 KB is generous and idempotent across calls.
+        var guarantee: u32 = 16 * 1024;
+        _ = SetThreadStackGuarantee(&guarantee);
         @atomicStore(bool, &g_trap_catching, true, .seq_cst);
         RtlCaptureContext(&g_saved_ctx);
         if (@atomicLoad(bool, &g_trap_occurred, .seq_cst)) {
             @atomicStore(bool, &g_trap_catching, false, .seq_cst);
+            // If the trap was a stack overflow, the OS consumed the
+            // thread's guard page. Re-arm it here so a subsequent
+            // overflow in this process is also catchable rather than
+            // silently aborting. Runs on the post-longjmp stack, which
+            // is well clear of the former-guard region.
+            if (@atomicLoad(u32, &g_last_trap_code, .seq_cst) == 0xC00000FD) {
+                resetStackGuardPage();
+            }
             for (0..n_globals) |i| {
                 inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
             }
@@ -1391,6 +1663,8 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 120), @offsetOf(VmCtx, "funcptrs_ptr"));
     try std.testing.expectEqual(@as(usize, 128), @offsetOf(VmCtx, "table_grow_fn"));
     try std.testing.expectEqual(@as(usize, 136), @offsetOf(VmCtx, "tables_info_ptr"));
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(VmCtx, "table_init_fn"));
+    try std.testing.expectEqual(@as(usize, 152), @offsetOf(VmCtx, "elem_drop_fn"));
 }
 
 test "getFuncAddr: import indices return null" {
