@@ -37,6 +37,7 @@ const types = root.types;
 const instance_mod = root.instance;
 const wabt = @import("wabt");
 const aot_harness = @import("aot_harness.zig");
+const aot_runtime = root.aot_runtime;
 const Io = std.Io;
 const Dir = std.Io.Dir;
 
@@ -221,7 +222,8 @@ fn handleBareAction(
     defer allocator.free(args);
 
     const func_idx = h.findFuncExport(field) orelse return .{ .skipped = "invoke_missing" };
-    _ = h.callScalar(func_idx, args) catch |err| switch (err) {
+    var results_buf: [aot_runtime.MaxScalarResults]aot_runtime.ScalarResult = undefined;
+    _ = h.callScalar(func_idx, args, &results_buf) catch |err| switch (err) {
         error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => return .{ .skipped = "bad_sig" },
         else => return .{ .failed = @errorName(err) },
     };
@@ -1851,7 +1853,8 @@ fn runSpecTestFileAot(
                 continue;
             };
 
-            const call_res = h.callScalar(func_idx, args) catch |err| {
+            var results_buf: [aot_runtime.MaxScalarResults]aot_runtime.ScalarResult = undefined;
+            const call_res = h.callScalar(func_idx, args, &results_buf) catch |err| {
                 switch (err) {
                     error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => {
                         recordSkip("bad_sig");
@@ -1867,34 +1870,19 @@ fn runSpecTestFileAot(
 
             // Convert ScalarResult → []types.Value for comparison against
             // expected_json using the existing `valuesEqual` helper.
-            var actual_buf: [1]types.Value = undefined;
-            const actual: []const types.Value = switch (call_res) {
-                .void => &.{},
-                .i32 => |v| blk: {
-                    actual_buf[0] = .{ .i32 = v };
-                    break :blk actual_buf[0..1];
-                },
-                .i64 => |v| blk: {
-                    actual_buf[0] = .{ .i64 = v };
-                    break :blk actual_buf[0..1];
-                },
-                .f32 => |v| blk: {
-                    actual_buf[0] = .{ .f32 = v };
-                    break :blk actual_buf[0..1];
-                },
-                .f64 => |v| blk: {
-                    actual_buf[0] = .{ .f64 = v };
-                    break :blk actual_buf[0..1];
-                },
-                .funcref => |v| blk: {
-                    actual_buf[0] = .{ .funcref = if (v) |x| @as(u32, @truncate(x)) else null };
-                    break :blk actual_buf[0..1];
-                },
-                .externref => |v| blk: {
-                    actual_buf[0] = .{ .externref = if (v) |x| @as(u32, @truncate(x)) else null };
-                    break :blk actual_buf[0..1];
-                },
-            };
+            var actual_buf: [aot_runtime.MaxScalarResults]types.Value = undefined;
+            for (call_res, 0..) |sr, i| {
+                actual_buf[i] = switch (sr) {
+                    .void => .{ .i32 = 0 }, // unreachable for multi/single result types
+                    .i32 => |v| .{ .i32 = v },
+                    .i64 => |v| .{ .i64 = v },
+                    .f32 => |v| .{ .f32 = v },
+                    .f64 => |v| .{ .f64 = v },
+                    .funcref => |v| .{ .funcref = if (v) |x| @as(u32, @truncate(x)) else null },
+                    .externref => |v| .{ .externref = if (v) |x| @as(u32, @truncate(x)) else null },
+                };
+            }
+            const actual: []const types.Value = actual_buf[0..call_res.len];
 
             if (expected_json.len != actual.len) {
                 std.debug.print("  FAIL aot assert_return line {d}: {s} result count got={d} expected={d}\n", .{ cmd.line, field, actual.len, expected_json.len });
@@ -1906,24 +1894,45 @@ fn runSpecTestFileAot(
                 continue;
             }
 
-            const expected_val = parseValue(expected_json[0]) orelse {
+            // Parse expected values for all result slots.
+            var expected_buf: [aot_runtime.MaxScalarResults]types.Value = undefined;
+            var parse_failed = false;
+            for (expected_json, 0..) |ej, i| {
+                expected_buf[i] = parseValue(ej) orelse {
+                    parse_failed = true;
+                    break;
+                };
+            }
+            if (parse_failed) {
                 recordSkip("parse_expected");
                 result.skipped += 1;
                 continue;
-            };
-            if (valuesEqual(actual[0], expected_val)) {
+            }
+            const expected_vals: []const types.Value = expected_buf[0..expected_json.len];
+
+            var all_match = true;
+            for (actual, expected_vals) |a, e| {
+                if (!valuesEqual(a, e)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
                 result.passed += 1;
             } else {
-                // Honor `either` / `alternatives` for NaN et al.
+                // Honor `either` / `alternatives` for NaN et al. Each
+                // alternative is a full list of expected values; match if
+                // any alternative's count and values match the actuals.
                 var alt_match = false;
                 if (cmd.alternatives) |alts| {
-                    for (alts) |alt_args| {
-                        if (alt_args.len != 1) continue;
-                        const av = parseValue(alt_args[0]) orelse continue;
-                        if (valuesEqual(actual[0], av)) {
-                            alt_match = true;
-                            break;
+                    outer: for (alts) |alt_args| {
+                        if (alt_args.len != actual.len) continue;
+                        for (alt_args, actual) |aa, av| {
+                            const parsed_alt = parseValue(aa) orelse continue :outer;
+                            if (!valuesEqual(av, parsed_alt)) continue :outer;
                         }
+                        alt_match = true;
+                        break;
                     }
                 }
                 if (alt_match) {
@@ -1933,7 +1942,7 @@ fn runSpecTestFileAot(
                     var ebuf: [64]u8 = undefined;
                     std.debug.print(
                         "  FAIL aot assert_return line {d}: {s} value mismatch actual={s} expected={s} ",
-                        .{ cmd.line, field, formatValueBits(&abuf, actual[0]), formatValueBits(&ebuf, expected_val) },
+                        .{ cmd.line, field, formatValueBits(&abuf, actual[0]), formatValueBits(&ebuf, expected_vals[0]) },
                     );
                     printValuesBits("args", args);
                     std.debug.print("\n", .{});
@@ -2002,7 +2011,8 @@ fn runSpecTestFileAot(
                 result.skipped += 1;
                 continue;
             };
-            if (h.callScalar(func_idx, args)) |_| {
+            var trap_results_buf: [aot_runtime.MaxScalarResults]aot_runtime.ScalarResult = undefined;
+            if (h.callScalar(func_idx, args, &trap_results_buf)) |_| {
                 std.debug.print("  FAIL aot {s} line {d}: {s} returned normally (expected trap)\n", .{ cmd.type, cmd.line, field });
                 result.failed += 1;
             } else |err| switch (err) {

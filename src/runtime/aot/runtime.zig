@@ -756,6 +756,9 @@ const CallFn10 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64,
 const CallFn11 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
 const CallFn12 = *const fn (*VmCtx, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64) callconv(.c) u64;
 const MaxScalarArgs: usize = 12;
+/// Max number of results a multi-value return may produce via the
+/// `callFuncScalar` path. Bounded by the HRP stack buffer size below.
+pub const MaxScalarResults: usize = 16;
 
 fn isScalarValType(t: types.ValType) bool {
     return switch (t) {
@@ -876,16 +879,24 @@ fn funcPtrToIndex(inst: *const AotInstance, ptr: u64) ?u64 {
 
 /// Call an AOT-compiled function by index with runtime-typed scalar args.
 ///
-/// Supports up to 3 params of type i32/i64/f32/f64 and a result of
-/// void/i32/i64/f32/f64. Wider or non-scalar signatures return
-/// `error.UnsupportedSignature` and should be skipped by the caller.
+/// Supports up to 12 params and up to `MaxScalarResults` results of type
+/// i32/i64/f32/f64/funcref/externref. Multi-value returns use the hidden
+/// return pointer (HRP) ABI emitted by the x86_64 codegen: first result in
+/// RAX, remaining stored via a caller-supplied buffer passed as an implicit
+/// trailing arg after the wasm user params.
+///
+/// `results_out` must have capacity >= `result_types.len`. Returns a slice
+/// into `results_out` with the decoded results. Wider or non-scalar
+/// signatures return `error.UnsupportedSignature` and should be skipped by
+/// the caller.
 pub fn callFuncScalar(
     inst: *AotInstance,
     func_idx: u32,
     param_types: []const types.ValType,
-    result_type: ?types.ValType,
+    result_types: []const types.ValType,
     args: []const types.Value,
-) ScalarCallError!ScalarResult {
+    results_out: []ScalarResult,
+) ScalarCallError![]const ScalarResult {
     comptime if (!can_execute_native) @compileError("AOT execution not supported on this architecture");
 
     if (param_types.len != args.len) return error.ArgCountMismatch;
@@ -893,9 +904,16 @@ pub fn callFuncScalar(
     for (param_types) |pt| {
         if (!isScalarValType(pt)) return error.UnsupportedSignature;
     }
-    if (result_type) |rt| {
+    for (result_types) |rt| {
         if (!isScalarValType(rt)) return error.UnsupportedSignature;
     }
+    if (result_types.len > MaxScalarResults) return error.UnsupportedSignature;
+    if (results_out.len < result_types.len) return error.UnsupportedSignature;
+
+    // Multi-value returns require an extra HRP slot appended after user args.
+    const needs_hrp = result_types.len > 1;
+    const effective_args: usize = args.len + @as(usize, if (needs_hrp) 1 else 0);
+    if (effective_args > MaxScalarArgs) return error.UnsupportedSignature;
 
     if (inst.code_base == null) return error.CodeMappingFailed;
     const addr = getFuncAddr(inst, func_idx) orelse return error.FunctionNotFound;
@@ -939,10 +957,17 @@ pub fn callFuncScalar(
         vmctx.tables_info_ptr = @intFromPtr(inst.tables_info.ptr);
     }
 
-    // Marshal args to raw 64-bit bit patterns.
+    // Marshal args to raw 64-bit bit patterns. Multi-value calls append a
+    // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
+    // the callee stores results[1..] there (codegen writes RAX for results[0]
+    // and `[HRP + (i-1)*8]` for i in [1, result_count)).
     var raw: [MaxScalarArgs]u64 = [_]u64{0} ** MaxScalarArgs;
     for (args, param_types, 0..) |v, pt, i| {
         raw[i] = try valueToRawBits(inst, pt, v);
+    }
+    var hrp_buf: [MaxScalarResults - 1]u64 = [_]u64{0} ** (MaxScalarResults - 1);
+    if (needs_hrp) {
+        raw[args.len] = @intFromPtr(&hrp_buf);
     }
 
     if (comptime builtin.os.tag == .windows) {
@@ -981,7 +1006,7 @@ pub fn callFuncScalar(
         }
     }
 
-    const raw_result: u64 = switch (args.len) {
+    const raw_result: u64 = switch (effective_args) {
         0 => blk: {
             const f: CallFn0 = @ptrCast(@alignCast(addr));
             break :blk f(&vmctx);
@@ -1046,18 +1071,27 @@ pub fn callFuncScalar(
         inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
     }
 
-    if (result_type) |rt| {
-        return switch (rt) {
-            .i32 => ScalarResult{ .i32 = @bitCast(@as(u32, @truncate(raw_result))) },
-            .i64 => ScalarResult{ .i64 = @bitCast(raw_result) },
-            .f32 => ScalarResult{ .f32 = @bitCast(@as(u32, @truncate(raw_result))) },
-            .f64 => ScalarResult{ .f64 = @bitCast(raw_result) },
-            .funcref => ScalarResult{ .funcref = funcPtrToIndex(inst, raw_result) },
-            .externref => ScalarResult{ .externref = if (raw_result == 0) null else raw_result - 1 },
-            else => unreachable,
-        };
+    if (result_types.len == 0) return results_out[0..0];
+
+    results_out[0] = decodeScalarResult(inst, result_types[0], raw_result);
+    var i: usize = 1;
+    while (i < result_types.len) : (i += 1) {
+        results_out[i] = decodeScalarResult(inst, result_types[i], hrp_buf[i - 1]);
     }
-    return .void;
+    return results_out[0..result_types.len];
+}
+
+/// Decode a raw 64-bit result slot into a typed ScalarResult.
+fn decodeScalarResult(inst: *AotInstance, rt: types.ValType, raw_result: u64) ScalarResult {
+    return switch (rt) {
+        .i32 => ScalarResult{ .i32 = @bitCast(@as(u32, @truncate(raw_result))) },
+        .i64 => ScalarResult{ .i64 = @bitCast(raw_result) },
+        .f32 => ScalarResult{ .f32 = @bitCast(@as(u32, @truncate(raw_result))) },
+        .f64 => ScalarResult{ .f64 = @bitCast(raw_result) },
+        .funcref => ScalarResult{ .funcref = funcPtrToIndex(inst, raw_result) },
+        .externref => ScalarResult{ .externref = if (raw_result == 0) null else raw_result - 1 },
+        else => unreachable,
+    };
 }
 
 // ─── Host function resolution ───────────────────────────────────────────────

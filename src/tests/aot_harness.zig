@@ -310,12 +310,14 @@ pub const Harness = struct {
         if (h.aot_module.start_function) |start_idx| {
             const start_ft = h.wasm_module.getFuncType(start_idx);
             if (start_ft != null) {
+                var start_results: [1]aot_runtime.ScalarResult = undefined;
                 _ = aot_runtime.callFuncScalar(
                     h.inst,
                     start_idx,
                     start_ft.?.params,
-                    null,
                     &.{},
+                    &.{},
+                    &start_results,
                 ) catch {};
             }
         }
@@ -424,19 +426,15 @@ pub const Harness = struct {
 
     /// Invoke an AOT function by index with runtime-typed scalar args.
     /// See `aot_runtime.callFuncScalar` for the supported signature envelope.
+    /// Writes decoded results into `results_buf` and returns a slice into it.
     pub fn callScalar(
         self: *Harness,
         func_idx: u32,
         args: []const types.Value,
-    ) aot_runtime.ScalarCallError!aot_runtime.ScalarResult {
+        results_buf: []aot_runtime.ScalarResult,
+    ) aot_runtime.ScalarCallError![]const aot_runtime.ScalarResult {
         const ft = self.getFuncType(func_idx) orelse return error.FunctionNotFound;
-        const result_type: ?types.ValType = if (ft.results.len == 0)
-            null
-        else if (ft.results.len == 1)
-            ft.results[0]
-        else
-            return error.UnsupportedSignature;
-        return aot_runtime.callFuncScalar(self.inst, func_idx, ft.params, result_type, args);
+        return aot_runtime.callFuncScalar(self.inst, func_idx, ft.params, ft.results, args, results_buf);
     }
 };
 
