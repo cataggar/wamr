@@ -186,6 +186,8 @@ pub const Inst = struct {
         table_get: struct { table_idx: u32, idx: VReg },
         table_set: struct { table_idx: u32, idx: VReg, val: VReg },
         table_grow: struct { table_idx: u32, init: VReg, delta: VReg }, // -> i32 (prev size or -1)
+        table_init: struct { seg_idx: u32, table_idx: u32, dst: VReg, src: VReg, len: VReg },
+        elem_drop: u32, // element segment index
         ref_func: u32, // funcidx -> native pointer loaded from vmctx.func_table[idx]
     };
 

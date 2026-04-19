@@ -66,6 +66,10 @@ pub const ElemEntry = struct {
     table_idx: u32,
     offset: u32,
     func_indices: []const u32,
+    /// When true, the segment has no active initializer and is only usable
+    /// via `table.init`. Active segments (is_passive = false) are applied
+    /// at instantiation and appear as already-dropped to `table.init`.
+    is_passive: bool = false,
 };
 
 /// Emit an AOT binary to an owned byte buffer.
@@ -195,6 +199,7 @@ pub fn emit(
             defer tmp.deinit(allocator);
             try appendU32Le(&tmp, allocator, @intCast(elem_list.len));
             for (elem_list) |e| {
+                try tmp.append(allocator, if (e.is_passive) 1 else 0);
                 try appendU32Le(&tmp, allocator, e.table_idx);
                 try appendU32Le(&tmp, allocator, e.offset);
                 try appendU32Le(&tmp, allocator, @intCast(e.func_indices.len));

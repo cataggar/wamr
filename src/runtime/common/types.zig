@@ -690,6 +690,13 @@ pub const TableInstance = struct {
     table_type: TableType,
     elements: []TableElement,
     ref_count: u32 = 1,
+    /// AOT-only: native code-pointer backing used by call_indirect / call_ref
+    /// / table.init / table.set. Owned by this TableInstance and freed on
+    /// final release. When a table is imported by another module the
+    /// importer aliases this slice so that cross-module mutations (e.g.
+    /// active elem segments or table.init in a start function) are visible
+    /// to the exporter's compiled code.
+    native_backing: []usize = &.{},
 
     pub fn retain(self: *TableInstance) void {
         self.ref_count += 1;
@@ -699,6 +706,7 @@ pub const TableInstance = struct {
         self.ref_count -= 1;
         if (self.ref_count == 0) {
             if (self.elements.len > 0) allocator.free(self.elements);
+            if (self.native_backing.len > 0) allocator.free(self.native_backing);
             allocator.destroy(self);
         }
     }

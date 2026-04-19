@@ -201,20 +201,26 @@ pub fn main(init: std.process.Init) !void {
     var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
     defer elem_entries.deinit(allocator);
     for (module.elements) |seg| {
-        if (seg.is_passive or seg.is_declarative) continue;
-        const offset: u32 = if (seg.offset) |off| switch (off) {
-            .i32_const => |v| @bitCast(v),
-            else => continue,
-        } else continue;
-        // Extract function indices from the segment
+        if (seg.is_declarative) continue;
+        const offset: u32 = if (seg.is_passive) 0 else blk: {
+            const off = seg.offset orelse continue;
+            break :blk switch (off) {
+                .i32_const => |v| @as(u32, @bitCast(v)),
+                else => continue,
+            };
+        };
+        // Extract function indices from the segment. Use 0xFFFFFFFF as a
+        // null sentinel (wasm funcidx 0 is a valid function). The runtime
+        // writes 0 into the native backing for null entries.
         const indices = try allocator.alloc(u32, seg.func_indices.len);
         for (seg.func_indices, 0..) |fi, j| {
-            indices[j] = fi orelse 0;
+            indices[j] = fi orelse 0xFFFFFFFF;
         }
         try elem_entries.append(allocator, .{
             .table_idx = seg.table_idx,
             .offset = offset,
             .func_indices = indices,
+            .is_passive = seg.is_passive,
         });
     }
 

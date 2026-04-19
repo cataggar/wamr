@@ -73,6 +73,11 @@ pub const AotElemSegment = struct {
     table_idx: u32,
     offset: u32,
     func_indices: []const u32,
+    /// If true, segment is only referenced by `table.init` / `elem.drop`
+    /// (no active initializer at instantiation). For active segments,
+    /// `offset` is the static table offset; for passive segments
+    /// `offset` is 0 and unused.
+    is_passive: bool = false,
 };
 
 pub const AotModule = struct {
@@ -463,6 +468,7 @@ fn parseElemSection(reader: *BinaryReader, section_size: u32, module: *AotModule
     }
 
     for (0..count) |i| {
+        const flag = try reader.readByte();
         const table_idx = try reader.readU32Le();
         const offset = try reader.readU32Le();
         const n_funcs = try reader.readU32Le();
@@ -474,6 +480,7 @@ fn parseElemSection(reader: *BinaryReader, section_size: u32, module: *AotModule
             .table_idx = table_idx,
             .offset = offset,
             .func_indices = indices,
+            .is_passive = flag != 0,
         };
         initialized += 1;
     }

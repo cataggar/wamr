@@ -756,19 +756,30 @@ fn compileToAot(
     // bytecode segments are deferred.
     var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
     for (module.elements) |seg| {
-        if (seg.is_passive or seg.is_declarative) continue;
-        const offset_expr = seg.offset orelse continue;
-        const offset_val: u32 = resolveU32InitExpr(offset_expr, tmp_globals.items) orelse continue;
-        const indices = try a.alloc(u32, seg.func_indices.len);
-        for (seg.func_indices, 0..) |fi, k| {
-            if (fi) |v| {
-                indices[k] = v;
-                continue;
+        if (seg.is_declarative) continue;
+        const offset_val: u32 = if (seg.is_passive) 0 else blk: {
+            const offset_expr = seg.offset orelse continue;
+            break :blk resolveU32InitExpr(offset_expr, tmp_globals.items) orelse continue;
+        };
+        // Some elem segments (e.g. externref segments with `ref.null extern`
+        // or `ref.extern K` expressions) carry their values in `elem_exprs`
+        // rather than `func_indices`. Size the emitted index array to the
+        // larger of the two so expression-only entries still emit a slot
+        // (encoded as maxInt(u32) → null if unresolvable).
+        const entry_count = @max(seg.func_indices.len, seg.elem_exprs.len);
+        const indices = try a.alloc(u32, entry_count);
+        for (0..entry_count) |k| {
+            if (k < seg.func_indices.len) {
+                if (seg.func_indices[k]) |v| {
+                    indices[k] = v;
+                    continue;
+                }
             }
             // Fall back to resolving the init expression stored in
             // elem_exprs (e.g. `global.get K` where global K holds a
             // funcref produced by `ref.func N`). Unresolvable entries
-            // encode as maxInt(u32) → null slot at runtime.
+            // (including `ref.null extern`, `ref.extern K`) encode as
+            // maxInt(u32) → null slot at runtime.
             if (k < seg.elem_exprs.len) {
                 if (seg.elem_exprs[k]) |expr| {
                     if (resolveFuncIdxFromExpr(expr, tmp_globals.items, module.import_global_count)) |resolved| {
@@ -783,6 +794,7 @@ fn compileToAot(
             .table_idx = seg.table_idx,
             .offset = offset_val,
             .func_indices = indices,
+            .is_passive = seg.is_passive,
         });
     }
 
