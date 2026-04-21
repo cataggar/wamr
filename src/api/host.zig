@@ -58,6 +58,14 @@ pub const HostContext = struct {
             .mem_len = if (mem) |m| m.data.len else 0,
         };
     }
+
+    /// Build a HostContext from an AOT VmCtx pointer.
+    pub fn fromVmCtx(vmctx: anytype) HostContext {
+        return .{
+            .mem_base = if (vmctx.memory_base != 0) @ptrFromInt(vmctx.memory_base) else null,
+            .mem_len = vmctx.memory_size,
+        };
+    }
 };
 
 /// Valid wasm value types for host function parameters and returns.
@@ -70,6 +78,7 @@ pub const ImportEntry = struct {
     module_name: []const u8,
     field_name: []const u8,
     interp_fn: types.HostFn,
+    aot_fn: *const anyopaque,
 };
 
 /// Build a comptime host import table from a tuple of (module, name, function) descriptors.
@@ -122,6 +131,7 @@ pub fn HostImports(comptime descriptors: anytype) type {
                     .module_name = desc[0],
                     .field_name = desc[1],
                     .interp_fn = makeInterpAdapter(desc[2]),
+                    .aot_fn = makeAotAdapter(desc[2]),
                 };
             }
             break :blk e;
@@ -179,6 +189,38 @@ fn makeInterpAdapter(comptime func: anytype) types.HostFn {
         }
     };
     return S.adapter;
+}
+
+/// Generate an AOT adapter that bridges C-calling-convention dispatch to a
+/// typed Zig function. The AOT codegen calls imported functions with VmCtx
+/// as the hidden first parameter and wasm values in subsequent registers.
+fn makeAotAdapter(comptime func: anytype) *const anyopaque {
+    const VmCtx = @import("../runtime/aot/runtime.zig").VmCtx;
+    const FnType = @TypeOf(func);
+    const info = @typeInfo(FnType).@"fn";
+    const wasm_param_count = info.params.len - 1;
+    const RetT = info.return_type.?;
+    const AbiRet = if (RetT == void) void else if (RetT == i64 or RetT == u64) i64 else i32;
+
+    const S = struct {
+        fn adapter(vmctx: *VmCtx, p0: i64, p1: i64, p2: i64, p3: i64, p4: i64, p5: i64) callconv(.c) AbiRet {
+            const ctx = HostContext.fromVmCtx(vmctx);
+            const raw = [_]i64{ p0, p1, p2, p3, p4, p5 };
+            var args: std.meta.ArgsTuple(FnType) = undefined;
+            args[0] = ctx;
+            inline for (0..wasm_param_count) |i| {
+                const ParamT = info.params[i + 1].type.?;
+                args[i + 1] = if (ParamT == i64 or ParamT == u64)
+                    @bitCast(raw[i])
+                else
+                    @as(ParamT, @bitCast(@as(i32, @truncate(raw[i]))));
+            }
+            const result = @call(.auto, func, args);
+            if (RetT == void) return;
+            return @bitCast(result);
+        }
+    };
+    return @ptrCast(&S.adapter);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
