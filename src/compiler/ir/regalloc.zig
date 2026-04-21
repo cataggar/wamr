@@ -165,15 +165,50 @@ fn regSafeForRange(reg_idx: usize, start: u32, end: u32, clobbers: []const Clobb
     return true;
 }
 
-/// Find a free register that is not clobbered during [start, end].
+/// Whether a vreg's live range spans any clobber point (e.g., a call).
+/// If so, callee-saved registers are preferred to avoid save/restore.
+fn spansClobber(start: u32, end: u32, clobbers: []const ClobberPoint) bool {
+    for (clobbers) |cp| {
+        if (cp.pos >= start and cp.pos < end) return true;
+        if (cp.pos >= end) break; // clobbers are position-ordered
+    }
+    return false;
+}
+
+/// Indices of callee-saved registers within alloc_regs.
+/// On both Win64 and SysV: rbx(1), r12(6), r13(7), r14(8), r15(9).
+const callee_saved_indices = [_]usize{ 1, 6, 7, 8, 9 };
+/// Indices of caller-saved registers within alloc_regs.
+/// Win64: rdx(0), r8(4), r9(5). SysV adds: rsi(2), rdi(3).
+const caller_saved_indices = if (@import("builtin").os.tag == .windows)
+    [_]usize{ 0, 4, 5, 2, 3 } // rdx, r8, r9, then rsi/rdi (callee-saved on Win64 but treated as caller-saved for allocation preference since they need prologue save)
+else
+    [_]usize{ 0, 2, 3, 4, 5 }; // rdx, rsi, rdi, r8, r9
+
+/// Find a free register, preferring callee-saved for long-lived values
+/// (those spanning calls) and caller-saved for short-lived values.
 fn findSafeReg(
     reg_free: *const [alloc_regs.len]bool,
     start: u32,
     end: u32,
     clobbers: []const ClobberPoint,
 ) ?usize {
-    for (reg_free, 0..) |free, i| {
-        if (free and regSafeForRange(i, start, end, clobbers)) return i;
+    if (spansClobber(start, end, clobbers)) {
+        // Prefer callee-saved (survives calls without save/restore)
+        for (callee_saved_indices) |i| {
+            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
+        }
+        for (caller_saved_indices) |i| {
+            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
+        }
+    } else {
+        // Prefer caller-saved (avoids prologue push/pop cost)
+        for (caller_saved_indices) |i| {
+            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
+        }
+        for (callee_saved_indices) |i| {
+            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
+        }
     }
     return null;
 }
