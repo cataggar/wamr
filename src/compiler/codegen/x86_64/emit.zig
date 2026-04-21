@@ -538,6 +538,20 @@ pub const CodeBuffer = struct {
         }
     }
 
+    /// INC reg (64-bit). REX.W FF /0. 1 byte shorter than ADD reg, 1.
+    pub fn incReg(self: *CodeBuffer, dst: Reg) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 0, dst.low3());
+    }
+
+    /// DEC reg (64-bit). REX.W FF /1. 1 byte shorter than SUB reg, 1.
+    pub fn decReg(self: *CodeBuffer, dst: Reg) !void {
+        try self.rexW(.rax, dst);
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 1, dst.low3());
+    }
+
     /// AND reg, imm (64-bit, sign-extended). Uses imm8 form when possible.
     pub fn andRegImm32(self: *CodeBuffer, dst: Reg, imm: i32) !void {
         try self.rexW(.rax, dst);

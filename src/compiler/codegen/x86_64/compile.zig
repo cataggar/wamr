@@ -1872,8 +1872,20 @@ fn compileInstRA(
                     if (lhs_reg != dr) try code.movRegReg(dr, lhs_reg);
                     const imm32: i32 = @intCast(imm);
                     switch (inst.op) {
-                        .add => if (imm32 != 0) try code.addRegImm32(dr, imm32),
-                        .sub => if (imm32 != 0) try code.subRegImm32(dr, imm32),
+                        .add => if (imm32 == 1) {
+                            try code.incReg(dr);
+                        } else if (imm32 == -1) {
+                            try code.decReg(dr);
+                        } else if (imm32 != 0) {
+                            try code.addRegImm32(dr, imm32);
+                        },
+                        .sub => if (imm32 == 1) {
+                            try code.decReg(dr);
+                        } else if (imm32 == -1) {
+                            try code.incReg(dr);
+                        } else if (imm32 != 0) {
+                            try code.subRegImm32(dr, imm32);
+                        },
                         .@"and" => try code.andRegImm32(dr, imm32),
                         .@"or" => if (imm32 != 0) try code.orRegImm32(dr, imm32),
                         .xor => if (imm32 != 0) try code.xorRegImm32(dr, imm32),
