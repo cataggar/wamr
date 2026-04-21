@@ -76,8 +76,11 @@ pub const passes = @import("compiler/ir/passes.zig");
 /// Spec test runner infrastructure.
 pub const spec_runner = @import("tests/spec_runner.zig");
 
-/// Interp-vs-AOT differential test harness.
-pub const differential = @import("tests/differential.zig");
+// `differential.zig` is deliberately NOT exported here: it belongs to its
+// own test module in build.zig (which also brings `aot_harness.zig` with
+// it). Re-exporting would duplicate `aot_harness.zig` into both the `wamr`
+// module AND the standalone `aot_harness` module used by the fuzz targets,
+// which Zig rejects.
 
 /// WASI preview1 implementation.
 /// Note: Uses std.fs.File; tests require IO-aware runner.

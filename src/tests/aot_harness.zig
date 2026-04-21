@@ -14,6 +14,8 @@ const builtin = @import("builtin");
 const root = @import("wamr");
 const types = root.types;
 const loader_mod = root.loader;
+const instance_mod = root.instance;
+const sig_registry = root.sig_registry;
 const frontend = root.frontend;
 const passes = root.passes;
 const x86_64_compile = root.x86_64_compile;
@@ -412,7 +414,7 @@ pub const Harness = struct {
         // types as singletons. This patch adds the group context so
         // call_indirect distinguishes types in different rec groups.
         if (wasm_module.types.len > 0 and h.inst.sig_table.len > 0) {
-            const reg = root.sig_registry.global();
+            const reg = sig_registry.global();
             for (wasm_module.types, 0..) |ft, i| {
                 if (i >= h.inst.sig_table.len) break;
                 const rg = if (i < wasm_module.rec_groups.len)
@@ -1093,7 +1095,7 @@ fn compileToAot(
 
     // Locals: evaluate init expressions against the preceding globals.
     for (module.globals) |g| {
-        const val: types.Value = root.instance.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
+        const val: types.Value = instance_mod.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
         const gi = try a.create(types.GlobalInstance);
         gi.* = .{ .global_type = g.global_type, .value = val };
         try tmp_globals.append(a, gi);
@@ -1246,7 +1248,7 @@ fn resolveU32InitExpr(
     // bytecode. Delegate to the interpreter's `evalInitExpr` so that
     // extended constant expressions (the wasm 2.0 proposal) are
     // supported uniformly.
-    const val = root.instance.evalInitExpr(expr, tmp_globals, null) catch return null;
+    const val = instance_mod.evalInitExpr(expr, tmp_globals, null) catch return null;
     return switch (val) {
         .i32 => |x| @as(u32, @bitCast(x)),
         else => null,

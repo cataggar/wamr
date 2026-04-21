@@ -238,6 +238,24 @@ pub fn build(b: *std.Build) void {
     const run_regalloc_tests = b.addRunArtifact(regalloc_tests);
     test_step.dependOn(&run_regalloc_tests.step);
 
+    // Interp-vs-AOT differential tests. Own module (with its own `wamr`
+    // alias) so `aot_harness.zig` — which `differential.zig` imports — is
+    // reached through the `wamr` module and not duplicated into it. The
+    // standalone `aot_harness` module below (used by fuzz targets) must
+    // own the file exclusively; pulling it in via the main `wamr` lib
+    // module would trigger Zig's "file exists in modules X and Y" error.
+    const differential_test_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/differential.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    differential_test_module.addImport("wamr", lib_module);
+    const differential_tests = b.addTest(.{
+        .root_module = differential_test_module,
+    });
+    const run_differential_tests = b.addRunArtifact(differential_tests);
+    test_step.dependOn(&run_differential_tests.step);
+
     // ── Benchmark ─────────────────────────────────────────────────────
     const bench_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/bench_codegen.zig"),
