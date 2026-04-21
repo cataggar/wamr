@@ -14,6 +14,9 @@ pub const c_api = @import("api/c_api.zig");
 /// Idiomatic Zig embedding API.
 pub const wamr = @import("api/wamr.zig");
 
+/// Host function registration (comptime-typed native function imports).
+pub const host = @import("api/host.zig");
+
 /// Core WebAssembly types.
 pub const types = @import("runtime/common/types.zig");
 

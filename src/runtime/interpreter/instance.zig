@@ -46,6 +46,25 @@ pub fn instantiateWithImports(
     allocator: std.mem.Allocator,
     import_ctx: ?ImportContext,
 ) InstantiationError!*types.ModuleInstance {
+    return instantiateImpl(module, allocator, import_ctx, null);
+}
+
+/// Instantiate a module with host (native) functions from a comptime HostImports table.
+/// Custom host functions take priority; unmatched imports fall back to WASI.
+pub fn instantiateWithHosts(
+    module: *const types.WasmModule,
+    allocator: std.mem.Allocator,
+    comptime HostImportsT: type,
+) InstantiationError!*types.ModuleInstance {
+    return instantiateImpl(module, allocator, null, HostImportsT);
+}
+
+fn instantiateImpl(
+    module: *const types.WasmModule,
+    allocator: std.mem.Allocator,
+    import_ctx: ?ImportContext,
+    comptime HostImportsT: ?type,
+) InstantiationError!*types.ModuleInstance {
     const has_non_func_imports =
         module.import_global_count > 0 or
         module.import_memory_count > 0 or
@@ -93,10 +112,35 @@ pub fn instantiateWithImports(
         }
     }
 
-    // Resolve WASI host functions for function imports
+    // Resolve host functions for function imports.
+    // Priority: custom HostImports (if provided) > WASI auto-resolution.
     if (module.import_function_count > 0) {
+        const host_fns = allocator.alloc(?types.HostFn, module.import_function_count) catch return error.OutOfMemory;
+        @memset(host_fns, null);
+
+        // Layer 1: custom host functions from HostImports (comptime-resolved)
+        if (HostImportsT) |HI| {
+            var func_idx: u32 = 0;
+            for (module.imports) |imp| {
+                if (imp.kind == .function) {
+                    if (func_idx < module.import_function_count) {
+                        if (HI.resolve(imp.module_name, imp.field_name)) |entry| {
+                            host_fns[func_idx] = entry.interp_fn;
+                        }
+                    }
+                    func_idx += 1;
+                }
+            }
+        }
+
+        // Layer 2: WASI auto-resolution for any remaining nulls
         const wasi_host = @import("../../wasi/host_functions.zig");
-        const host_fns = wasi_host.resolveWasiHostFunctions(module, allocator) catch return error.OutOfMemory;
+        const wasi_fns = wasi_host.resolveWasiHostFunctions(module, allocator) catch return error.OutOfMemory;
+        defer allocator.free(wasi_fns);
+        for (wasi_fns, 0..) |wasi_fn, i| {
+            if (host_fns[i] == null) host_fns[i] = wasi_fn;
+        }
+
         inst.host_functions = host_fns;
         inst.owns_host_functions = true;
     }

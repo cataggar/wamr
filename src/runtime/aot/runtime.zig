@@ -1705,6 +1705,23 @@ fn resolveHostFunctions(
     module: *const aot_loader.AotModule,
     allocator: std.mem.Allocator,
 ) RuntimeError![]const ?*const anyopaque {
+    return resolveHostFunctionsImpl(module, allocator, null);
+}
+
+/// Resolve host functions with optional custom HostImports (comptime-typed).
+pub fn resolveHostFunctionsWithHosts(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+    comptime HostImportsT: ?type,
+) RuntimeError![]const ?*const anyopaque {
+    return resolveHostFunctionsImpl(module, allocator, HostImportsT);
+}
+
+fn resolveHostFunctionsImpl(
+    module: *const aot_loader.AotModule,
+    allocator: std.mem.Allocator,
+    comptime HostImportsT: ?type,
+) RuntimeError![]const ?*const anyopaque {
     if (module.import_function_count == 0) return &.{};
 
     const host_fns = allocator.alloc(?*const anyopaque, module.import_function_count) catch
@@ -1715,10 +1732,19 @@ fn resolveHostFunctions(
     for (module.imports) |imp| {
         if (imp.kind == .function) {
             if (func_idx < module.import_function_count) {
-                if (host_bridge.isWasiModule(imp.module_name)) {
-                    host_fns[func_idx] = host_bridge.resolveAotHostFunction(imp.field_name);
-                } else if (host_bridge.isSpectestModule(imp.module_name)) {
-                    host_fns[func_idx] = host_bridge.resolveAotSpectestFunction(imp.field_name);
+                // Layer 1: custom HostImports (comptime-resolved)
+                if (HostImportsT) |HI| {
+                    if (HI.resolve(imp.module_name, imp.field_name)) |entry| {
+                        host_fns[func_idx] = entry.aot_fn;
+                    }
+                }
+                // Layer 2: WASI / spectest (only if not already resolved)
+                if (host_fns[func_idx] == null) {
+                    if (host_bridge.isWasiModule(imp.module_name)) {
+                        host_fns[func_idx] = host_bridge.resolveAotHostFunction(imp.field_name);
+                    } else if (host_bridge.isSpectestModule(imp.module_name)) {
+                        host_fns[func_idx] = host_bridge.resolveAotSpectestFunction(imp.field_name);
+                    }
                 }
             }
             func_idx += 1;

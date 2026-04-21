@@ -20,6 +20,11 @@ const comp_types = @import("../component/types.zig");
 const comp_loader = @import("../component/loader.zig");
 const comp_instance = @import("../component/instance.zig");
 
+/// Host function registration types.
+pub const host = @import("host.zig");
+pub const HostContext = host.HostContext;
+pub const HostImports = host.HostImports;
+
 /// The WAMR runtime — manages the lifecycle of modules and instances.
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -70,6 +75,13 @@ pub const Module = struct {
     /// Instantiate with pre-resolved imports.
     pub fn instantiateWithImports(self: *Module, import_ctx: instance_mod.ImportContext) !Instance {
         const inst = try instance_mod.instantiateWithImports(&self.inner, self.allocator, import_ctx);
+        return .{ .inner = inst, .allocator = self.allocator };
+    }
+
+    /// Instantiate with comptime-typed host functions.
+    /// Custom host functions take priority; unmatched imports fall back to WASI.
+    pub fn instantiateWithHosts(self: *Module, comptime HostImportsT: type) !Instance {
+        const inst = try instance_mod.instantiateWithHosts(&self.inner, self.allocator, HostImportsT);
         return .{ .inner = inst, .allocator = self.allocator };
     }
 
@@ -277,4 +289,118 @@ test "wamr: loadModule rejects component binary" {
     defer runtime.deinit();
     const data = [_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x0d, 0x00, 0x01, 0x00 };
     try testing.expectError(error.IsComponent, runtime.loadModule(&data));
+}
+
+test "wamr: host function add via HostImports" {
+    // Wasm module that imports (env, add) and exports "call_add":
+    //   (import "env" "add" (func $add (param i32 i32) (result i32)))
+    //   (func (export "call_add") (result i32)
+    //     i32.const 3  i32.const 4  call $add)
+    const wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: 2 types
+        0x01, 0x0b, 0x02,
+        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // type 0: (i32,i32)->i32
+        0x60, 0x00, 0x01, 0x7f, // type 1: ()->i32
+        // import section: 1 import
+        0x02, 0x0b, 0x01,
+        0x03, 'e', 'n', 'v', // module "env"
+        0x03, 'a', 'd', 'd', // field "add"
+        0x00, 0x00, // func, type 0
+        // function section: 1 local function, type 1
+        0x03, 0x02, 0x01, 0x01,
+        // export section: "call_add" -> func 1
+        0x07, 0x0c, 0x01,
+        0x08, 'c', 'a', 'l', 'l', '_', 'a', 'd', 'd',
+        0x00, 0x01,
+        // code section
+        0x0a, 0x0a, 0x01,
+        0x08, 0x00, // body size, 0 locals
+        0x41, 0x03, // i32.const 3
+        0x41, 0x04, // i32.const 4
+        0x10, 0x00, // call func 0 (imported add)
+        0x0b, // end
+    };
+
+    const MyHosts = host.HostImports(.{
+        .{ "env", "add", struct {
+            fn f(_: host.HostContext, a: i32, b: i32) i32 {
+                return a + b;
+            }
+        }.f },
+    });
+
+    var runtime = Runtime.init(testing.allocator);
+    defer runtime.deinit();
+    var module = try runtime.loadModule(&wasm);
+    defer module.deinit();
+    var instance = try module.instantiateWithHosts(MyHosts);
+    defer instance.deinit();
+
+    const result = try instance.callI32("call_add", &.{});
+    try testing.expectEqual(@as(i32, 7), result);
+}
+
+test "wamr: host function reads memory" {
+    // Wasm module with memory that imports (env, sum_bytes):
+    //   (memory 1)
+    //   (import "env" "sum_bytes" (func $sum (param i32 i32) (result i32)))
+    //   (data (i32.const 0) "\x0a\x14\x1e")  ;; bytes 10, 20, 30 at offset 0
+    //   (func (export "test") (result i32)
+    //     i32.const 0  i32.const 3  call $sum)
+    const wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: 2 types
+        0x01, 0x0b, 0x02,
+        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // (i32,i32)->i32
+        0x60, 0x00, 0x01, 0x7f, // ()->i32
+        // import section
+        0x02, 0x11, 0x01,
+        0x03, 'e', 'n', 'v',
+        0x09, 's', 'u', 'm', '_', 'b', 'y', 't', 'e', 's',
+        0x00, 0x00,
+        // function section
+        0x03, 0x02, 0x01, 0x01,
+        // memory section
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // export section: "test" -> func 1
+        0x07, 0x08, 0x01,
+        0x04, 't', 'e', 's', 't',
+        0x00, 0x01,
+        // code section
+        0x0a, 0x0a, 0x01,
+        0x08, 0x00,
+        0x41, 0x00, // i32.const 0
+        0x41, 0x03, // i32.const 3
+        0x10, 0x00, // call $sum
+        0x0b,
+        // data section: 3 bytes at offset 0
+        0x0b, 0x09, 0x01,
+        0x00, 0x41, 0x00, 0x0b, // active, offset = i32.const 0
+        0x03, 0x0a, 0x14, 0x1e, // 3 bytes: 10, 20, 30
+    };
+
+    const MyHosts = host.HostImports(.{
+        .{ "env", "sum_bytes", struct {
+            fn f(ctx: host.HostContext, ptr: i32, len: i32) i32 {
+                const mem = ctx.memory() orelse return -1;
+                const start: u32 = @bitCast(ptr);
+                const end: u32 = start + @as(u32, @bitCast(len));
+                if (end > mem.len) return -1;
+                var sum: i32 = 0;
+                for (mem[start..end]) |b| sum += b;
+                return sum;
+            }
+        }.f },
+    });
+
+    var runtime = Runtime.init(testing.allocator);
+    defer runtime.deinit();
+    var module = try runtime.loadModule(&wasm);
+    defer module.deinit();
+    var instance = try module.instantiateWithHosts(MyHosts);
+    defer instance.deinit();
+
+    const result = try instance.callI32("test", &.{});
+    try testing.expectEqual(@as(i32, 60), result); // 10 + 20 + 30
 }
