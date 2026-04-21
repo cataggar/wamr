@@ -168,6 +168,10 @@ pub const FuncType = struct {
     supertype_idx: u32 = 0xFFFFFFFF,
     /// Whether this type is declared `final` (cannot be subtyped).
     is_final: bool = false,
+    /// Recursive group size (1 = singleton/implicit group).
+    rec_group_size: u16 = 1,
+    /// Position of this type within its recursive group (0-based).
+    rec_group_position: u16 = 0,
 
     pub const Kind = enum(u2) { func, struct_, array };
 };
@@ -275,7 +279,7 @@ pub const component_version: u32 = 0x0001_000d;
 pub const aot_magic: u32 = 0x746f6100; // "\0aot"
 
 /// AOT format version
-pub const aot_version: u32 = 6;
+pub const aot_version: u32 = 7;
 
 test "ValType: numeric classification" {
     try std.testing.expect(ValType.i32.isNumeric());
@@ -690,6 +694,19 @@ pub const TableInstance = struct {
     table_type: TableType,
     elements: []TableElement,
     ref_count: u32 = 1,
+    /// AOT-only: native code-pointer backing used by call_indirect / call_ref
+    /// / table.init / table.set. Owned by this TableInstance and freed on
+    /// final release. When a table is imported by another module the
+    /// importer aliases this slice so that cross-module mutations (e.g.
+    /// active elem segments or table.init in a start function) are visible
+    /// to the exporter's compiled code.
+    native_backing: []usize = &.{},
+    /// AOT-only: parallel to `native_backing`, one canonical sig_id per
+    /// slot. 0 = null/uninitialized. Written in lockstep with
+    /// `native_backing` by all table-mutation paths (elem copy, table.set,
+    /// table.init/copy/fill/grow) so that call_indirect can do a single
+    /// 4-byte equality check against the caller's expected sig_id.
+    type_backing: []u32 = &.{},
 
     pub fn retain(self: *TableInstance) void {
         self.ref_count += 1;
@@ -699,6 +716,8 @@ pub const TableInstance = struct {
         self.ref_count -= 1;
         if (self.ref_count == 0) {
             if (self.elements.len > 0) allocator.free(self.elements);
+            if (self.native_backing.len > 0) allocator.free(self.native_backing);
+            if (self.type_backing.len > 0) allocator.free(self.type_backing);
             allocator.destroy(self);
         }
     }

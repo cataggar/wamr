@@ -62,6 +62,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
@@ -72,7 +73,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |vreg| list.append(vreg),
 
@@ -86,8 +87,11 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .br_if => |bi| list.append(bi.cond),
         .br_table => |bt| list.append(bt.index),
         .ret => |maybe_vreg| if (maybe_vreg) |v| list.append(v),
+        .ret_multi => {}, // multi-return VRegs handled separately (unbounded)
         .call => {}, // call args handled separately in buildUseDef (unbounded)
         .call_indirect => {}, // same
+        .call_ref => {}, // same
+        .call_result => {},
         .select => |sel| {
             list.append(sel.cond);
             list.append(sel.if_true);
@@ -133,12 +137,29 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .memory_grow => |pages| {
             list.append(pages);
         },
+        .table_size => {},
+        .table_get => |tg| list.append(tg.idx),
+        .table_set => |ts| {
+            list.append(ts.idx);
+            list.append(ts.val);
+        },
+        .table_grow => |tg| {
+            list.append(tg.init);
+            list.append(tg.delta);
+        },
+        .ref_func => {},
         .memory_init => |mi| {
             list.append(mi.dst);
             list.append(mi.src);
             list.append(mi.len);
         },
         .data_drop => {},
+        .table_init => |ti| {
+            list.append(ti.dst);
+            list.append(ti.src);
+            list.append(ti.len);
+        },
+        .elem_drop => {},
     }
     return list;
 }
@@ -178,6 +199,7 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
@@ -187,7 +209,7 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |*vreg| if (vreg.* == old) { vreg.* = new; },
 
@@ -201,6 +223,12 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .br_if => |*bi| if (bi.cond == old) { bi.cond = new; },
         .br_table => |*bt| if (bt.index == old) { bt.index = new; },
         .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { if (v == old) maybe_vreg.* = new; },
+        .ret_multi => |vregs| {
+            for (@constCast(vregs)) |*v| {
+                if (v.* == old) v.* = new;
+            }
+        },
+        .call_result => {},
         .call => |cl| {
             for (@constCast(cl.args)) |*arg| {
                 if (arg.* == old) arg.* = new;
@@ -209,6 +237,12 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .call_indirect => |ci| {
             if (ci.elem_idx == old) @constCast(&ci.elem_idx).* = new;
             for (@constCast(ci.args)) |*arg| {
+                if (arg.* == old) arg.* = new;
+            }
+        },
+        .call_ref => |cr| {
+            if (cr.func_ref == old) @constCast(&cr.func_ref).* = new;
+            for (@constCast(cr.args)) |*arg| {
                 if (arg.* == old) arg.* = new;
             }
         },
@@ -257,12 +291,31 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .memory_grow => |*pages| {
             if (pages.* == old) pages.* = new;
         },
+        .table_size => {},
+        .table_get => |*tg| {
+            if (tg.idx == old) tg.idx = new;
+        },
+        .table_set => |*ts| {
+            if (ts.idx == old) ts.idx = new;
+            if (ts.val == old) ts.val = new;
+        },
+        .table_grow => |*tg| {
+            if (tg.init == old) tg.init = new;
+            if (tg.delta == old) tg.delta = new;
+        },
+        .ref_func => {},
         .memory_init => |*mi| {
             if (mi.dst == old) mi.dst = new;
             if (mi.src == old) mi.src = new;
             if (mi.len == old) mi.len = new;
         },
         .data_drop => {},
+        .table_init => |*ti| {
+            if (ti.dst == old) ti.dst = new;
+            if (ti.src == old) ti.src = new;
+            if (ti.len == old) ti.len = new;
+        },
+        .elem_drop => {},
     }
 }
 
@@ -368,10 +421,10 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
 
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .store, .local_set, .global_set, .call, .call_indirect, .ret, .br, .br_if, .br_table, .@"unreachable",
+        .store, .local_set, .global_set, .call, .call_indirect, .call_ref, .ret, .br, .br_if, .br_table, .@"unreachable",
         .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
         .atomic_notify, .atomic_wait, .memory_copy, .memory_fill, .memory_grow,
-        .memory_init, .data_drop,
+        .memory_init, .data_drop, .table_init, .elem_drop,
         => true,
         else => false,
     };
@@ -421,8 +474,9 @@ fn isPure(inst: ir.Inst) bool {
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => true,
         else => false,
@@ -469,6 +523,10 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .trunc_f64_u => |v| v == b.op.trunc_f64_u,
         .convert_s => |v| v == b.op.convert_s,
         .convert_u => |v| v == b.op.convert_u,
+        .convert_i32_s => |v| v == b.op.convert_i32_s,
+        .convert_i64_s => |v| v == b.op.convert_i64_s,
+        .convert_i32_u => |v| v == b.op.convert_i32_u,
+        .convert_i64_u => |v| v == b.op.convert_i64_u,
         .demote_f64 => |v| v == b.op.demote_f64,
         .promote_f32 => |v| v == b.op.promote_f32,
         .reinterpret => |v| v == b.op.reinterpret,

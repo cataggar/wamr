@@ -141,6 +141,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |bin| {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
@@ -150,7 +151,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |vreg| live.put(vreg, {}) catch {},
 
@@ -164,12 +165,20 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .br_if => |bi| live.put(bi.cond, {}) catch {},
         .br_table => |bt| live.put(bt.index, {}) catch {},
         .ret => |maybe_vreg| if (maybe_vreg) |v| live.put(v, {}) catch {},
+        .ret_multi => |vregs| {
+            for (vregs) |v| live.put(v, {}) catch {};
+        },
+        .call_result => {},
         .call => |cl| {
             for (cl.args) |arg| live.put(arg, {}) catch {};
         },
         .call_indirect => |ci| {
             live.put(ci.elem_idx, {}) catch {};
             for (ci.args) |arg| live.put(arg, {}) catch {};
+        },
+        .call_ref => |cr| {
+            live.put(cr.func_ref, {}) catch {};
+            for (cr.args) |arg| live.put(arg, {}) catch {};
         },
         .select => |sel| {
             live.put(sel.cond, {}) catch {};
@@ -214,12 +223,31 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .memory_grow => |pages| {
             live.put(pages, {}) catch {};
         },
+        .table_size => {},
+        .table_get => |tg| {
+            live.put(tg.idx, {}) catch {};
+        },
+        .table_set => |ts| {
+            live.put(ts.idx, {}) catch {};
+            live.put(ts.val, {}) catch {};
+        },
+        .table_grow => |tg| {
+            live.put(tg.init, {}) catch {};
+            live.put(tg.delta, {}) catch {};
+        },
+        .ref_func => {},
         .memory_init => |mi| {
             live.put(mi.dst, {}) catch {};
             live.put(mi.src, {}) catch {};
             live.put(mi.len, {}) catch {};
         },
         .data_drop => {},
+        .table_init => |ti| {
+            live.put(ti.dst, {}) catch {};
+            live.put(ti.src, {}) catch {};
+            live.put(ti.len, {}) catch {};
+        },
+        .elem_drop => {},
     }
 }
 
@@ -322,6 +350,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
         .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
         => |bin| {
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
@@ -331,7 +360,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .extend8_s, .extend16_s, .extend32_s,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32, .reinterpret,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         => |vreg| last_use.put(vreg, pos) catch {},
 
@@ -345,12 +374,20 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .br_if => |bi| last_use.put(bi.cond, pos) catch {},
         .br_table => |bt| last_use.put(bt.index, pos) catch {},
         .ret => |maybe_vreg| if (maybe_vreg) |v| last_use.put(v, pos) catch {},
+        .ret_multi => |vregs| {
+            for (vregs) |v| last_use.put(v, pos) catch {};
+        },
+        .call_result => {},
         .call => |cl| {
             for (cl.args) |arg| last_use.put(arg, pos) catch {};
         },
         .call_indirect => |ci| {
             last_use.put(ci.elem_idx, pos) catch {};
             for (ci.args) |arg| last_use.put(arg, pos) catch {};
+        },
+        .call_ref => |cr| {
+            last_use.put(cr.func_ref, pos) catch {};
+            for (cr.args) |arg| last_use.put(arg, pos) catch {};
         },
         .select => |sel| {
             last_use.put(sel.cond, pos) catch {};
@@ -395,12 +432,31 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .memory_grow => |pages| {
             last_use.put(pages, pos) catch {};
         },
+        .table_size => {},
+        .table_get => |tg| {
+            last_use.put(tg.idx, pos) catch {};
+        },
+        .table_set => |ts| {
+            last_use.put(ts.idx, pos) catch {};
+            last_use.put(ts.val, pos) catch {};
+        },
+        .table_grow => |tg| {
+            last_use.put(tg.init, pos) catch {};
+            last_use.put(tg.delta, pos) catch {};
+        },
+        .ref_func => {},
         .memory_init => |mi| {
             last_use.put(mi.dst, pos) catch {};
             last_use.put(mi.src, pos) catch {};
             last_use.put(mi.len, pos) catch {};
         },
         .data_drop => {},
+        .table_init => |ti| {
+            last_use.put(ti.dst, pos) catch {};
+            last_use.put(ti.src, pos) catch {};
+            last_use.put(ti.len, pos) catch {};
+        },
+        .elem_drop => {},
     }
 }
 

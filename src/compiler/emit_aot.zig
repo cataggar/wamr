@@ -4,7 +4,7 @@
 //! The output format matches what `runtime/aot/loader.zig` expects:
 //!
 //!   [4 bytes] magic (0x746f6100)
-//!   [4 bytes] version (6)
+//!   [4 bytes] version (7)
 //!   [sections...] each: [4 bytes type] [4 bytes size] [payload]
 
 const std = @import("std");
@@ -13,7 +13,7 @@ const std = @import("std");
 pub const aot_magic: u32 = 0x746f6100;
 
 /// AOT format version.
-pub const aot_version: u32 = 6;
+pub const aot_version: u32 = 7;
 
 /// Export kinds (matches WebAssembly spec §2.5 and runtime ExternalKind).
 pub const ExternalKind = enum(u8) {
@@ -66,6 +66,17 @@ pub const ElemEntry = struct {
     table_idx: u32,
     offset: u32,
     func_indices: []const u32,
+    /// When true, the segment has no active initializer and is only usable
+    /// via `table.init`. Active segments (is_passive = false) are applied
+    /// at instantiation and appear as already-dropped to `table.init`.
+    is_passive: bool = false,
+};
+
+/// Minimal `func`-kind FuncType descriptor for the AOT type section.
+/// `params` / `results` hold raw `ValType` byte tags.
+pub const FuncTypeEntry = struct {
+    params: []const u8,
+    results: []const u8,
 };
 
 /// Emit an AOT binary to an owned byte buffer.
@@ -80,6 +91,9 @@ pub fn emit(
     memories: ?[]const MemoryEntry,
     globals: ?[]const GlobalEntry,
     elems: ?[]const ElemEntry,
+    start_function: ?u32,
+    func_types: ?[]const FuncTypeEntry,
+    local_func_type_indices: ?[]const u32,
 ) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -94,13 +108,35 @@ pub fn emit(
     // Section 2: text (native code)
     try emitSection(allocator, &buf, 2, native_code);
 
-    // Section 3: function offsets
+    // Section 13: type descriptors (emitted before section 3 so the loader
+    // can resolve type indices referenced by the function section).
+    if (func_types) |ft_list| {
+        if (ft_list.len > 0) {
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(allocator);
+            try appendU32Le(&tmp, allocator, @intCast(ft_list.len));
+            for (ft_list) |ft| {
+                try appendU32Le(&tmp, allocator, @intCast(ft.params.len));
+                try tmp.appendSlice(allocator, ft.params);
+                try appendU32Le(&tmp, allocator, @intCast(ft.results.len));
+                try tmp.appendSlice(allocator, ft.results);
+            }
+            try emitSection(allocator, &buf, 13, tmp.items);
+        }
+    }
+
+    // Section 3: function offsets interleaved with type indices (v7).
     {
         var tmp: std.ArrayList(u8) = .empty;
         defer tmp.deinit(allocator);
         try appendU32Le(&tmp, allocator, @intCast(func_offsets.len));
-        for (func_offsets) |offset| {
+        for (func_offsets, 0..) |offset, i| {
             try appendU32Le(&tmp, allocator, offset);
+            const tidx: u32 = if (local_func_type_indices) |tidxs|
+                (if (i < tidxs.len) tidxs[i] else 0)
+            else
+                0;
+            try appendU32Le(&tmp, allocator, tidx);
         }
         try emitSection(allocator, &buf, 3, tmp.items);
     }
@@ -194,6 +230,7 @@ pub fn emit(
             defer tmp.deinit(allocator);
             try appendU32Le(&tmp, allocator, @intCast(elem_list.len));
             for (elem_list) |e| {
+                try tmp.append(allocator, if (e.is_passive) 1 else 0);
                 try appendU32Le(&tmp, allocator, e.table_idx);
                 try appendU32Le(&tmp, allocator, e.offset);
                 try appendU32Le(&tmp, allocator, @intCast(e.func_indices.len));
@@ -203,6 +240,14 @@ pub fn emit(
             }
             try emitSection(allocator, &buf, 11, tmp.items);
         }
+    }
+
+    // Section 12: start function (single u32 funcidx)
+    if (start_function) |start_idx| {
+        var tmp: std.ArrayList(u8) = .empty;
+        defer tmp.deinit(allocator);
+        try appendU32Le(&tmp, allocator, start_idx);
+        try emitSection(allocator, &buf, 12, tmp.items);
     }
 
     return buf.toOwnedSlice(allocator);
@@ -240,7 +285,7 @@ fn buildTargetInfo(options: AotEmitOptions) [40]u8 {
 
 test "emit: minimal (no functions, no exports) has correct magic and version" {
     const allocator = std.testing.allocator;
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // At least header (8) + target_info section (8+40) + text section (8+0) + func section (8+4) + export section (8+4)
@@ -255,7 +300,7 @@ test "emit: one function offset produces valid function section" {
     const allocator = std.testing.allocator;
     const code = [_]u8{ 0xCC, 0xC3 }; // int3; ret
     const offsets = [_]u32{0};
-    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null);
+    const data = try emit(allocator, &code, &offsets, &.{}, .{}, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 3 (function)
@@ -286,7 +331,7 @@ test "emit: export section encodes name, kind, and index" {
         .kind = .function,
         .index = 7,
     }};
-    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &exports, .{}, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Walk sections to find section type 4 (export)
@@ -333,7 +378,7 @@ test "roundtrip: emit then load with AOT loader" {
     const data = try emit(allocator, &code, &offsets, &exports, .{
         .arch = arch_name,
         .e_machine = 0x3E,
-    }, null, null, null, null, null);
+    }, null, null, null, null, null, null, null, null);
     defer allocator.free(data);
 
     // Parse back with the AOT loader
@@ -374,7 +419,7 @@ test "emit: import section round-trip" {
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "fd_write", .kind = .function, .func_type_idx = 0 },
         .{ .module_name = "wasi_snapshot_preview1", .field_name = "clock_time_get", .kind = .function, .func_type_idx = 1 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, &import_entries, null, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -395,7 +440,7 @@ test "emit: memory section round-trip" {
         .{ .min_pages = 2, .max_pages = null },
         .{ .min_pages = 1, .max_pages = 256 },
     };
-    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null);
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, &mem_entries, null, null, null, null, null);
     defer allocator.free(data);
 
     const module = try aot_loader.load(data, allocator);
@@ -406,4 +451,60 @@ test "emit: memory section round-trip" {
     try std.testing.expect(module.memories[0].limits.max == null);
     try std.testing.expectEqual(@as(u64, 1), module.memories[1].limits.min);
     try std.testing.expectEqual(@as(u64, 256), module.memories[1].limits.max.?);
+}
+
+test "emit: type section and function type indices round-trip" {
+    const allocator = std.testing.allocator;
+    const aot_loader = @import("../runtime/aot/loader.zig");
+    const types = @import("../runtime/common/types.zig");
+
+    // Two func types:
+    //   type 0: () -> ()
+    //   type 1: (i32, i32) -> i32
+    const params1 = [_]u8{ 0x7F, 0x7F };
+    const results1 = [_]u8{0x7F};
+    const ft_entries = [_]FuncTypeEntry{
+        .{ .params = &.{}, .results = &.{} },
+        .{ .params = &params1, .results = &results1 },
+    };
+
+    // Three local functions: bytes [0xC3, 0xC3, 0xC3] at offsets 0,1,2.
+    const code = [_]u8{ 0xC3, 0xC3, 0xC3 };
+    const offsets = [_]u32{ 0, 1, 2 };
+    const tidxs = [_]u32{ 1, 0, 1 };
+
+    const data = try emit(
+        allocator,
+        &code,
+        &offsets,
+        &.{},
+        .{},
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &ft_entries,
+        &tidxs,
+    );
+    defer allocator.free(data);
+
+    const module = try aot_loader.load(data, allocator);
+    defer aot_loader.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), module.func_types.len);
+    try std.testing.expectEqual(@as(usize, 0), module.func_types[0].params.len);
+    try std.testing.expectEqual(@as(usize, 0), module.func_types[0].results.len);
+    try std.testing.expectEqual(@as(usize, 2), module.func_types[1].params.len);
+    try std.testing.expectEqual(types.ValType.i32, module.func_types[1].params[0]);
+    try std.testing.expectEqual(types.ValType.i32, module.func_types[1].params[1]);
+    try std.testing.expectEqual(@as(usize, 1), module.func_types[1].results.len);
+    try std.testing.expectEqual(types.ValType.i32, module.func_types[1].results[0]);
+
+    try std.testing.expectEqual(@as(u32, 3), module.func_count);
+    try std.testing.expectEqual(@as(usize, 3), module.local_func_type_indices.len);
+    try std.testing.expectEqual(@as(u32, 1), module.local_func_type_indices[0]);
+    try std.testing.expectEqual(@as(u32, 0), module.local_func_type_indices[1]);
+    try std.testing.expectEqual(@as(u32, 1), module.local_func_type_indices[2]);
 }

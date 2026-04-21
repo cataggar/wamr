@@ -163,6 +163,15 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(spec_runner_exe);
 
+    // Run the spec suite through the AOT pipeline. Non-blocking convenience
+    // step; not wired into the default `test` aggregate while codegen gaps
+    // and the skiplist stabilize (see src/tests/aot_skiplist.zig).
+    const run_spec_aot = b.addRunArtifact(spec_runner_exe);
+    run_spec_aot.addArg("--mode=aot");
+    run_spec_aot.addArg("tests/spec-json");
+    const spec_aot_step = b.step("spec-tests-aot", "Run the spec-json suite through the AOT pipeline");
+    spec_aot_step.dependOn(&run_spec_aot.step);
+
     // ── Tests ──────────────────────────────────────────────────────────
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -248,15 +257,18 @@ pub fn build(b: *std.Build) void {
 
     // ── Fuzz harnesses ────────────────────────────────────────────────
     // CLI binaries that replay corpus inputs through a specific
-    // pipeline and leave a reproducer at <crashes>/in-flight.wasm if
-    // the process aborts. See src/tests/fuzz/common.zig and
-    // .github/workflows/fuzz.yml.
-    //
-    // Only loader + interp are wired here. fuzz-aot / fuzz-diff are
-    // deferred until a shared AOT compile-and-run harness module is
-    // available to both tests and fuzz targets (see plan_fuzz_security.md).
-    const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, interp)");
-    inline for (.{ "loader", "interp" }) |tgt| {
+    // pipeline (loader / interp / aot / interp-vs-aot diff) and leave
+    // a reproducer at <crashes>/in-flight.wasm if the process aborts.
+    // See src/tests/fuzz/common.zig and .github/workflows/fuzz.yml.
+    const aot_harness_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/aot_harness.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    aot_harness_module.addImport("wamr", lib_module);
+
+    const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, interp, aot, diff)");
+    inline for (.{ "loader", "interp", "aot", "diff" }) |tgt| {
         const fuzz_mod = b.createModule(.{
             .root_source_file = b.path("src/tests/fuzz/" ++ tgt ++ ".zig"),
             .target = target,
@@ -264,6 +276,9 @@ pub fn build(b: *std.Build) void {
         });
         fuzz_mod.addImport("config", config_module);
         fuzz_mod.addImport("wamr", lib_module);
+        if (std.mem.eql(u8, tgt, "aot") or std.mem.eql(u8, tgt, "diff")) {
+            fuzz_mod.addImport("aot_harness", aot_harness_module);
+        }
 
         const fuzz_exe = b.addExecutable(.{
             .name = "fuzz-" ++ tgt,

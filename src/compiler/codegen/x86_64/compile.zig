@@ -25,14 +25,14 @@ else
 const caller_saved_alloc = [_]emit.Reg{ .rdx, .rsi, .rdi, .r8, .r9 };
 
 /// Callee-saved allocatable registers preserved in prologue/epilogue.
-/// r12, r13 are callee-saved on both Win64 and SysV.
+/// rbx, r12-r15 are callee-saved on both Win64 and SysV.
 /// On Win64, rsi and rdi are also callee-saved per the ABI; compiled functions
 /// must save/restore them if used. On SysV they're caller-saved (handled
 /// at call sites via caller_saved_alloc), so no prologue work is needed for them.
 const callee_saved_alloc = if (builtin.os.tag == .windows)
-    [_]emit.Reg{ .rsi, .rdi, .r12, .r13 }
+    [_]emit.Reg{ .rbx, .rsi, .rdi, .r12, .r13, .r14, .r15 }
 else
-    [_]emit.Reg{ .r12, .r13 };
+    [_]emit.Reg{ .rbx, .r12, .r13, .r14, .r15 };
 
 /// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
@@ -45,9 +45,27 @@ const vmctx_host_functions_field: i32 = 24; // VmCtx.host_functions_ptr offset
 const vmctx_mem_max_size_field: i32 = 32; // VmCtx.memory_max_size offset
 const vmctx_func_table_field: i32 = 40; // VmCtx.func_table_ptr offset
 const vmctx_mem_pages_field: i32 = 56; // VmCtx.memory_pages offset (u32)
+const vmctx_func_table_len_field: i32 = 60; // VmCtx.func_table_len offset (u32)
 const vmctx_mem_grow_fn_field: i32 = 64; // VmCtx.mem_grow_fn offset (usize)
 const vmctx_instance_ptr_field: i32 = 72; // VmCtx.instance_ptr offset (usize)
 const vmctx_trap_oob_fn_field: i32 = 80; // VmCtx.trap_oob_fn offset (usize)
+const vmctx_trap_unreachable_fn_field: i32 = 88;
+const vmctx_trap_idivz_fn_field: i32 = 96;
+const vmctx_trap_iovf_fn_field: i32 = 104;
+const vmctx_trap_ivc_fn_field: i32 = 112;
+const vmctx_funcptrs_field: i32 = 120; // VmCtx.funcptrs_ptr offset (usize)
+const vmctx_table_grow_fn_field: i32 = 128; // VmCtx.table_grow_fn offset (usize)
+const vmctx_tables_info_field: i32 = 136; // VmCtx.tables_info_ptr offset (usize)
+const vmctx_table_init_fn_field: i32 = 144; // VmCtx.table_init_fn offset (usize)
+const vmctx_elem_drop_fn_field: i32 = 152; // VmCtx.elem_drop_fn offset (usize)
+const vmctx_sig_table_field: i32 = 160; // VmCtx.sig_table_ptr offset (usize)
+const vmctx_table_set_fn_field: i32 = 192; // VmCtx.table_set_fn offset (usize)
+// Per-table descriptor layout (TableInfo, 24 bytes):
+//   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
+const table_info_ptr_off: i32 = 0;
+const table_info_len_off: i32 = 8;
+const table_info_type_backing_off: i32 = 16;
+const table_info_stride: i32 = 24;
 
 /// Emit the compare-and-trap tail of a bounds check.
 ///
@@ -76,6 +94,168 @@ fn emitOobCmpAndTrap(code: *emit.CodeBuffer) !void {
     try code.movRegMem(.rax, param_regs[0], vmctx_trap_oob_fn_field);
     try code.callReg(.rax);
     // over_trap:
+}
+
+/// Emit an unconditional call to a non-returning trap helper at
+/// `[r10 + field_offset]` (where r10 holds vmctx*). Used for
+/// unreachable, divide-by-zero, integer overflow, and invalid
+/// float→int conversion traps.
+fn emitTrapHelperCall(code: *emit.CodeBuffer, field_offset: i32) !void {
+    try code.movRegReg(param_regs[0], .r10);
+    try code.movRegMem(.rax, param_regs[0], field_offset);
+    try code.callReg(.rax);
+}
+
+/// Emit the call_indirect signature check.
+///
+/// Preconditions: r10 = *VmCtx, r11 = tables_info_ptr, rax = elem_idx
+/// (zero-extended 32-bit). Clobbers rcx and r11 (both non-allocatable).
+/// Does NOT clobber rdx or any other allocatable register, so live arg
+/// vregs survive across this sequence. Traps via
+/// `vmctx.trap_unreachable_fn` on mismatch (also covers the null-slot
+/// case, since type_backing[idx]==0 will never equal a non-zero
+/// expected sig_id — a valid `(type $t)` always interns to sig_id >= 1).
+///
+/// Sequence (39 bytes total):
+///   mov rcx, [r11 + ti_type_backing_off]   ; 7 bytes
+///   mov r11, [r10 + sig_table_ptr]         ; 7 bytes
+///   mov r11d, [r11 + type_idx*4]           ; 7 bytes
+///   cmp r11d, [rcx + rax*4]               ; 4 bytes (REX.R, SIB)
+///   je  +12 (over_trap)                    ; 2 bytes
+///   mov param_regs[0], r10                 ; 3 bytes
+///   mov rax, [param_regs[0] + trap_unreachable_fn]  ; 7 bytes
+///   call rax                               ; 2 bytes
+///
+/// NOTE: r11 is clobbered (holds expected sig_id on exit). Callers
+/// that need tables_info_ptr afterward (non-table-0 paths) must
+/// reload it from vmctx.
+fn emitCallIndirectSigCheck(code: *emit.CodeBuffer, type_idx: u32, table_idx: u32) !void {
+    const ti_tb_off: i32 = @as(i32, @intCast(table_idx)) * table_info_stride + table_info_type_backing_off;
+    // mov rcx, [r11 + ti_tb_off]  — rcx = type_backing_ptr
+    //   REX.W|B = 0x49, opcode 0x8B, modrm=10_001_011 (mod=disp32, reg=rcx=1, rm=r11.low3=3) = 0x8B.
+    try code.emitSlice(&.{ 0x49, 0x8B, 0x8B });
+    try code.emitU32(@bitCast(ti_tb_off));
+    // mov r11, [r10 + sig_table_field]  — r11 = sig_table_ptr (clobbers tables_info_ptr)
+    //   REX.W|R|B = 0x4D, opcode 0x8B, modrm=10_011_010 (mod=disp32, reg=r11.low3=3, rm=r10.low3=2) = 0x9A.
+    try code.emitSlice(&.{ 0x4D, 0x8B, 0x9A });
+    try code.emitU32(@bitCast(@as(i32, vmctx_sig_table_field)));
+    // mov r11d, dword ptr [r11 + type_idx*4]  — r11d = expected sig_id
+    //   REX.R|B = 0x45, opcode 0x8B, modrm=10_011_011 (mod=disp32, reg=r11.low3=3, rm=r11.low3=3) = 0x9B.
+    try code.emitSlice(&.{ 0x45, 0x8B, 0x9B });
+    try code.emitU32(type_idx *% 4);
+    // cmp r11d, dword ptr [rcx + rax*4]  — compare with type_backing[elem_idx]
+    //   REX.R = 0x44, opcode 0x3B, modrm=00_011_100 (mod=0, reg=r11.low3=3, rm=100=SIB) = 0x1C.
+    //   SIB=10_000_001 (scale=10 ×4, index=rax=0, base=rcx=1) = 0x81.
+    try code.emitSlice(&.{ 0x44, 0x3B, 0x1C, 0x81 });
+    // je over_trap (rel8). Trap block: 3 + 7 + 2 = 12 bytes.
+    try code.emitByte(0x74);
+    try code.emitByte(12);
+    // Trap block: call trap_unreachable_fn(vmctx) — r10 holds vmctx.
+    try code.movRegReg(param_regs[0], .r10);
+    try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+    try code.callReg(.rax);
+    // over_trap:
+}
+
+/// Emit `cmp eax, [r10 + disp]`. Selects disp8 (4 bytes total) or disp32
+/// (7 bytes) based on the displacement. Used by table bounds checks and
+/// similar patterns that read a u32 length from an r10-based struct.
+fn emitCmpEaxMemR10Disp8(code: *emit.CodeBuffer, disp: i32) !void {
+    if (disp >= -128 and disp <= 127) {
+        try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @bitCast(@as(i8, @intCast(disp)))) });
+    } else {
+        // 41 3B 82 <disp32>: cmp eax, [r10 + disp32]
+        try code.emitSlice(&.{ 0x41, 0x3B, 0x82 });
+        try code.emitI32(disp);
+    }
+}
+
+/// Emit a conditional skip over a trap-invalid-conversion call.
+/// `skip_cond_byte` is the second byte of a 0x0F-prefixed rel32 Jcc that
+/// branches past the trap when it evaluates to true (i.e. the "safe"
+/// condition). When false, fall through into the noreturn trap call.
+fn emitSkipIvcOnCond(code: *emit.CodeBuffer, skip_cond_byte: u8) !void {
+    try code.emitSlice(&.{ 0x0F, skip_cond_byte });
+    const p = code.len();
+    try code.emitI32(0);
+    try emitTrapHelperCall(code, vmctx_trap_ivc_fn_field);
+    const after = code.len();
+    code.patchI32(p, @intCast(@as(i64, @intCast(after)) - @as(i64, @intCast(p + 4))));
+}
+
+/// Emit NaN + range checks for a non-saturating float→int trunc.
+/// Source float is in xmm0 (rax-aliased); uses xmm1 (rcx) and r11.
+/// On any failing check, calls trap_ivc_fn (noreturn). Otherwise falls
+/// through with xmm0 preserved.
+fn emitTruncRangeCheck(
+    code: *emit.CodeBuffer,
+    dst_is_i32: bool,
+    is_signed: bool,
+    is_f32: bool,
+) !void {
+    // NaN check: ucomi* xmm0, xmm0 sets PF=1 iff unordered. JNP skips trap.
+    if (is_f32) try code.ucomiss(.rax, .rax) else try code.ucomisd(.rax, .rax);
+    try emitSkipIvcOnCond(code, 0x8B); // JNP rel32
+
+    // Lower bound
+    const MinInfo = struct { bits: u64, inclusive_trap: bool };
+    const min_info: MinInfo = if (is_signed) blk: {
+        if (dst_is_i32) {
+            if (is_f32) {
+                break :blk .{ .bits = 0xCF000000, .inclusive_trap = false };
+            } else {
+                // f64 can represent -2^31 - 1 exactly; use inclusive trap.
+                break :blk .{ .bits = 0xC1E0000000200000, .inclusive_trap = true };
+            }
+        } else {
+            break :blk if (is_f32)
+                .{ .bits = 0xDF000000, .inclusive_trap = false }
+            else
+                .{ .bits = 0xC3E0000000000000, .inclusive_trap = false };
+        }
+    } else blk: {
+        // Unsigned: -1.0 inclusive
+        break :blk if (is_f32)
+            .{ .bits = 0xBF800000, .inclusive_trap = true }
+        else
+            .{ .bits = 0xBFF0000000000000, .inclusive_trap = true };
+    };
+    if (is_f32) {
+        try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(min_info.bits))));
+        try code.movdToXmm(.rcx, .r11);
+        try code.ucomiss(.rax, .rcx);
+    } else {
+        try code.movRegImm64(.r11, min_info.bits);
+        try code.movqToXmm(.rcx, .r11);
+        try code.ucomisd(.rax, .rcx);
+    }
+    // Strict (JB traps) -> skip with JNB (0x83). Inclusive (JBE traps) -> skip with JA (0x87).
+    try emitSkipIvcOnCond(code, if (min_info.inclusive_trap) @as(u8, 0x87) else @as(u8, 0x83));
+
+    // Upper bound: always JAE traps -> skip with JB (0x82).
+    const max_bits: u64 = if (is_signed) blk: {
+        if (dst_is_i32) {
+            break :blk if (is_f32) @as(u64, 0x4F000000) else @as(u64, 0x41E0000000000000);
+        } else {
+            break :blk if (is_f32) @as(u64, 0x5F000000) else @as(u64, 0x43E0000000000000);
+        }
+    } else blk: {
+        if (dst_is_i32) {
+            break :blk if (is_f32) @as(u64, 0x4F800000) else @as(u64, 0x41F0000000000000);
+        } else {
+            break :blk if (is_f32) @as(u64, 0x5F800000) else @as(u64, 0x43F0000000000000);
+        }
+    };
+    if (is_f32) {
+        try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(max_bits))));
+        try code.movdToXmm(.rcx, .r11);
+        try code.ucomiss(.rax, .rcx);
+    } else {
+        try code.movRegImm64(.r11, max_bits);
+        try code.movqToXmm(.rcx, .r11);
+        try code.ucomisd(.rax, .rcx);
+    }
+    try emitSkipIvcOnCond(code, 0x82); // JB rel32
 }
 
 /// Emit an inline wasm-memory bounds check.
@@ -381,7 +561,7 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
 
 fn isRet(op: ir.Inst.Op) bool {
     return switch (op) {
-        .ret => true,
+        .ret, .ret_multi => true,
         else => false,
     };
 }
@@ -647,7 +827,7 @@ fn compileInst(
             try code.emitEpilogue();
         },
 
-        .@"unreachable" => try code.int3(),
+        .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field),
 
         // ── Select (conditional move) ─────────────────────────────────
         .select => {
@@ -790,7 +970,7 @@ fn compileInst(
 
         // ── Float/conversion stubs (pop input, push placeholder) ──────
         .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .demote_f64, .promote_f32,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32,
         .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
         .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
         => {
@@ -799,7 +979,9 @@ fn compileInst(
         },
 
         // ── Float binary stubs ────────────────────────────────────────
-        .f_min, .f_max, .f_copysign => {
+        .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        => {
             try stack.pop(code, .rcx);
             try stack.pop(code, .rax);
             try stack.push(code, .rax);
@@ -934,12 +1116,59 @@ fn compileInst(
             try code.movRegImm32(.rax, 0);
             try stack.push(code, .rax);
         },
+        .call_ref => {
+            // Stub in non-RA path: pop funcref, push 0
+            try stack.pop(code, .rax); // func_ref (discard)
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .call_result => {
+            // Stub in non-RA path: push 0 as placeholder.
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .ret_multi => {
+            // Stub in non-RA path: emit plain epilogue.
+            try code.emitEpilogue();
+        },
         .memory_init => {
             try stack.pop(code, .rax); // len
             try stack.pop(code, .rax); // src
             try stack.pop(code, .rax); // dst
         },
         .data_drop => {},
+        .table_init => {
+            try stack.pop(code, .rax); // len
+            try stack.pop(code, .rax); // src
+            try stack.pop(code, .rax); // dst
+        },
+        .elem_drop => {},
+        .table_size => {
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMemNoRex(.rax, .r10, vmctx_func_table_len_field);
+            try stack.push(code, .rax);
+        },
+        .table_get => {
+            try stack.pop(code, .rax); // idx (discard in non-RA path)
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .table_set => {
+            try stack.pop(code, .rax); // val
+            try stack.pop(code, .rax); // idx
+        },
+        .table_grow => {
+            try stack.pop(code, .rax); // delta
+            try stack.pop(code, .rax); // init
+            try code.movRegImm32(.rax, 0);
+            try stack.push(code, .rax);
+        },
+        .ref_func => |fidx| {
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
+            try code.movRegMem(.rax, .r10, @as(i32, @intCast(fidx * 8)));
+            try stack.push(code, .rax);
+        },
     }
 }
 
@@ -966,15 +1195,15 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
             switch (ci.op) {
-                .call, .call_indirect, .memory_grow => {
+                .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
                     const mask = if (comptime builtin.os.tag == .windows)
-                        [_]bool{ true, false, false, true, true, false, false }
+                        [_]bool{ true, false, false, false, true, true, false, false, false, false }
                     else
-                        [_]bool{ true, true, true, true, true, false, false };
+                        [_]bool{ true, false, true, true, true, true, false, false, false, false };
                     try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = mask });
                 },
-                .memory_copy => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, true, true, false, false, false, false } }),
-                .memory_fill => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, false, true, false, false, false, false } }),
+                .memory_copy => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, false, true, true, false, false, false, false, false, false } }),
+                .memory_fill => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, false, false, true, false, false, false, false, false, false } }),
                 else => {},
             }
             cp_pos += 1;
@@ -1033,6 +1262,7 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
                     p("    {d:4}: call {s}[{d}] nargs={d}  {s}\n", .{ pos, kind, cl.func_idx, cl.args.len, dest_alloc });
                 },
                 .call_indirect => |ci| p("    {d:4}: call_indirect type={d} v{d} nargs={d}  {s}\n", .{ pos, ci.type_idx, ci.elem_idx, ci.args.len, dest_alloc }),
+                .call_ref => |cr| p("    {d:4}: call_ref type={d} v{d} nargs={d}  {s}\n", .{ pos, cr.type_idx, cr.func_ref, cr.args.len, dest_alloc }),
                 .select => |sel| p("    {d:4}: select cond=v{d} t=v{d} f=v{d}  {s}\n", .{ pos, sel.cond, sel.if_true, sel.if_false, dest_alloc }),
                 .global_get => |idx| p("    {d:4}: global_get {d}  {s}\n", .{ pos, idx, dest_alloc }),
                 .global_set => |gs| p("    {d:4}: global_set {d}, v{d}\n", .{ pos, gs.idx, gs.val }),
@@ -1067,7 +1297,8 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
 
         // Debug: dump IR+alloc for selected function index (-1 disables).
         const dump_func_idx: i32 = -1;
-        if (@as(i32, @intCast(fi)) == dump_func_idx) {
+        const dump_all: bool = false;
+        if (dump_all or @as(i32, @intCast(fi)) == dump_func_idx) {
             dumpFuncIRAlloc(&func, @intCast(fi), ir_module.import_count, allocator) catch {};
         }
 
@@ -1119,31 +1350,31 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (func.blocks.items) |block| {
             for (block.instructions.items) |ci| {
                 switch (ci.op) {
-                    .call, .call_indirect, .memory_grow => {
+                    .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
                         // Calls clobber caller-saved allocatable regs.
                         // memory.grow is compiled as a host call, same ABI, so it
                         // clobbers the same set of caller-saved registers.
-                        // alloc_regs = [rdx(2), rsi(6), rdi(7), r8(8), r9(9), r12(12), r13(13)]
-                        // On Win64: rdx, r8, r9 are volatile (indices 0, 3, 4); rsi/rdi/r12/r13 callee-saved.
-                        // On SysV: rdx, rsi, rdi, r8, r9 are volatile; r12, r13 callee-saved.
+                        // alloc_regs = [rdx(0), rbx(1), rsi(2), rdi(3), r8(4), r9(5), r12(6), r13(7), r14(8), r15(9)]
+                        // On Win64: rdx, r8, r9 are volatile; rbx/rsi/rdi/r12-r15 callee-saved.
+                        // On SysV: rdx, rsi, rdi, r8, r9 are volatile; rbx/r12-r15 callee-saved.
                         const mask = if (comptime builtin.os.tag == .windows)
-                            [_]bool{ true, false, false, true, true, false, false }
+                            [_]bool{ true, false, false, false, true, true, false, false, false, false }
                         else
-                            [_]bool{ true, true, true, true, true, false, false };
+                            [_]bool{ true, false, true, true, true, true, false, false, false, false };
                         try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = mask });
                     },
                     .memory_copy => {
-                        // REP MOVSB clobbers rsi(6) and rdi(7) → indices 1, 2
+                        // REP MOVSB clobbers rsi(6) and rdi(7) → indices 2, 3
                         try clobber_points.append(allocator, .{
                             .pos = pos,
-                            .regs_clobbered = .{ false, true, true, false, false, false, false },
+                            .regs_clobbered = .{ false, false, true, true, false, false, false, false, false, false },
                         });
                     },
                     .memory_fill => {
-                        // REP STOSB clobbers rdi(7) → index 2
+                        // REP STOSB clobbers rdi(7) → index 3
                         try clobber_points.append(allocator, .{
                             .pos = pos,
-                            .regs_clobbered = .{ false, false, true, false, false, false, false },
+                            .regs_clobbered = .{ false, false, false, true, false, false, false, false, false, false },
                         });
                     },
                     else => {},
@@ -1258,6 +1489,24 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         }
     }
 
+    // Multi-value returns: callee receives a hidden return pointer (HRP)
+    // as an implicit trailing user-arg. Save it to a fixed frame slot so
+    // `.ret_multi` can load it at function exit. HRP lives in
+    // param_regs[1 + func.param_count] if that fits, else on the caller's
+    // stack at the usual extra-arg location.
+    if (func.result_count > 1) {
+        const hrp_save_off: i32 = -@as(i32, @intCast((func.local_count + 2) * 8));
+        const max_reg_params_local: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+        if (func.param_count < max_reg_params_local) {
+            try code.movMemReg(.rbp, hrp_save_off, param_regs[1 + func.param_count]);
+        } else {
+            const stack_arg_base: i32 = if (comptime builtin.os.tag == .windows) 48 else 16;
+            const src_off: i32 = stack_arg_base + @as(i32, @intCast((func.param_count - max_reg_params_local) * 8));
+            try code.movRegMem(.rax, .rbp, src_off);
+            try code.movMemReg(.rbp, hrp_save_off, .rax);
+        }
+    }
+
     // Save callee-saved registers used by this function.
     // Win64: rsi, rdi, r12, r13. SysV: r12, r13.
     for (callee_saved_alloc, 0..) |reg, i| {
@@ -1294,7 +1543,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         const next_block_id: ?ir.BlockId = if (idx + 1 < func.blocks.items.len) @intCast(idx + 1) else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count);
         }
         // C3 fall-through peephole: if the block's terminator emitted a
         // trailing `E9 disp32` (br, or br_if's unconditional else) whose
@@ -1529,6 +1778,7 @@ fn compileInstRA(
     import_count: u32,
     used_caller_saved: *const [caller_saved_alloc.len]bool,
     used_callee_saved: *const [callee_saved_alloc.len]bool,
+    local_count: u32,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -1540,8 +1790,9 @@ fn compileInstRA(
             } else {
                 try code.movRegImm32(dr, val);
             }
-            // 32-bit write already zero-extends upper bits — skip zeroExtend32
-            try writeDef(code, alloc_result, dest, dr);
+            // movRegImm32 uses MOV r64,imm32 which sign-extends negative
+            // values to 64 bits. Zero-extend to clear upper bits.
+            try writeDefTyped(code, alloc_result, dest, dr, .i32);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
@@ -1572,6 +1823,44 @@ fn compileInstRA(
                 .@"and" => |b| b, .@"or" => |b| b, .xor => |b| b,
                 else => unreachable,
             };
+
+            // Float path: wasm f32/f64 add/sub/mul are lowered by the frontend
+            // into these integer ops with `inst.type == .f32/.f64`. Dispatch
+            // to SSE scalar ops through the GPR↔XMM bounce pattern used by
+            // f_min/f_max/f_sqrt. Logical ops (and/or/xor) don't have float
+            // variants; they'll fall through to the integer path below
+            // because the frontend never produces them with float type.
+            if (inst.type == .f32 or inst.type == .f64) {
+                const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+                if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+                const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+                if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+                if (inst.type == .f32) {
+                    try code.movdToXmm(.rax, .rax);
+                    try code.movdToXmm(.rcx, .rcx);
+                    switch (inst.op) {
+                        .add => try code.addss(.rax, .rcx),
+                        .sub => try code.subss(.rax, .rcx),
+                        .mul => try code.mulss(.rax, .rcx),
+                        else => unreachable,
+                    }
+                    try code.movdFromXmm(.rax, .rax);
+                } else {
+                    try code.movqToXmm(.rax, .rax);
+                    try code.movqToXmm(.rcx, .rcx);
+                    switch (inst.op) {
+                        .add => try code.addsd(.rax, .rcx),
+                        .sub => try code.subsd(.rax, .rcx),
+                        .mul => try code.mulsd(.rax, .rcx),
+                        else => unreachable,
+                    }
+                    try code.movqFromXmm(.rax, .rax);
+                }
+                if (dr != .rax) try code.movRegReg(dr, .rax);
+                try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+                return;
+            }
+
             const scratch: emit.Reg = if (dr == .rax) .rcx else .rax;
             // Check if RHS is a constant for immediate form
             if (const_vals.get(bin.rhs)) |imm| {
@@ -1656,7 +1945,14 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
-            try code.testRegReg(src_reg, src_reg);
+            // Use 32-bit TEST for i32 so upper-32-bit garbage doesn't
+            // affect the zero check (same reasoning as cmpRegReg32 for
+            // comparisons).
+            if (inst.type == .i32) {
+                try code.testRegReg32(src_reg, src_reg);
+            } else {
+                try code.testRegReg(src_reg, src_reg);
+            }
             try code.setcc(0x4, dr);
             try code.movzxByte(dr, dr);
             // setcc+movzx produces clean 0/1 — skip zeroExtend32
@@ -1689,6 +1985,35 @@ fn compileInstRA(
             }
             try code.emitEpilogue();
         },
+        .ret_multi => |vregs| {
+            // First result → RAX; remaining → [HRP + (i-1)*8] where HRP is
+            // loaded from the saved-slot in the prologue. We stash HRP in
+            // r11 (non-allocatable scratch) to avoid conflicts with value
+            // regs. Load result vregs into rcx (also non-allocatable).
+            if (vregs.len == 0) {
+                // Degenerate; treat as plain ret.
+            } else {
+                // Move first result to rax.
+                const first_reg = try useVReg(code, alloc_result, vregs[0], .rax);
+                if (first_reg != .rax) try code.movRegReg(.rax, first_reg);
+            }
+            if (vregs.len > 1) {
+                const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                try code.movRegMem(.r11, .rbp, hrp_save_off); // load HRP
+                var i: u32 = 1;
+                while (i < vregs.len) : (i += 1) {
+                    const vr = try useVReg(code, alloc_result, vregs[i], .rcx);
+                    const off: i32 = @intCast((i - 1) * 8);
+                    try code.movMemReg(.r11, off, vr);
+                }
+            }
+            var ci: usize = callee_saved_alloc.len;
+            while (ci > 0) {
+                ci -= 1;
+                if (used_callee_saved[ci]) try code.popReg(callee_saved_alloc[ci]);
+            }
+            try code.emitEpilogue();
+        },
 
         // ── Branches ──────────────────────────────────────────────────
         .br => |target| {
@@ -1699,7 +2024,10 @@ fn compileInstRA(
         },
         .br_if => |br| {
             const cond_reg = try useVReg(code, alloc_result, br.cond, .rax);
-            try code.testRegReg(cond_reg, cond_reg);
+            // Wasm br_if condition is always i32; use 32-bit TEST so that
+            // upper-32 garbage (possible after our local_get preserves full
+            // 64 bits) doesn't spuriously flip the branch.
+            try code.testRegReg32(cond_reg, cond_reg);
             try code.emitByte(0x0F);
             try code.emitByte(0x85);
             const then_patch = code.len();
@@ -1767,17 +2095,50 @@ fn compileInstRA(
             // No push/pop: the allocator ensures no live vreg in a
             // caller-saved register spans this call instruction.
             const n_args: u32 = @intCast(cl.args.len);
-            const max_reg_args: u32 = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+            const has_hrp: bool = cl.extra_results > 0;
+            const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+            const hrp_in_reg: bool = has_hrp and (n_args < max_reg_slots);
+            const max_reg_args: u32 = @min(n_args, max_reg_slots);
             const extra: u32 = n_args - max_reg_args;
+            const hrp_on_stack: bool = has_hrp and !hrp_in_reg;
+            const hrp_stack_k: u32 = if (hrp_on_stack) n_args - max_reg_slots else 0;
+            const total_stack_args: u32 = extra + (if (hrp_on_stack) @as(u32, 1) else 0);
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
-            const stack_need: u32 = shadow + extra * 8;
-            // Keep rsp 16-aligned across the CALL (prologue established 16-alignment at rbp+8).
+            const stack_need: u32 = shadow + total_stack_args * 8;
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
+            const is_import: bool = cl.func_idx < import_count;
 
-            if (cl.func_idx < import_count) {
-                // Import call: indirect via host_functions_ptr table in VmCtx.
-                // Load vmctx, then fetch the host fn pointer into rax BEFORE adjusting
-                // rsp (so base-register moves don't race with stack-arg writes).
+            // Real tail-call is feasible when outgoing stack args are empty,
+            // HRP (if any) goes in a register (so we pass our caller's HRP through),
+            // and the target is a local function (rel32 JMP).
+            const can_real_tail: bool = cl.tail and total_stack_args == 0 and !hrp_on_stack and !is_import;
+            if (can_real_tail) {
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                if (has_hrp) {
+                    const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                    const hrp_dst = param_regs[1 + n_args];
+                    try code.movRegMem(hrp_dst, .rbp, hrp_save_off);
+                }
+                var ci_t: usize = callee_saved_alloc.len;
+                while (ci_t > 0) {
+                    ci_t -= 1;
+                    if (used_callee_saved[ci_t]) try code.popReg(callee_saved_alloc[ci_t]);
+                }
+                try code.movRegReg(.rsp, .rbp);
+                try code.popReg(.rbp);
+                try code.emitByte(0xE9); // JMP rel32
+                const patch_off = code.len();
+                try code.emitI32(0);
+                try call_patches.append(code.allocator, .{
+                    .patch_offset = patch_off,
+                    .target_func_idx = cl.func_idx - import_count,
+                });
+                return;
+            }
+
+            if (is_import) {
                 try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
                 try code.movRegMem(.r10, param_regs[0], vmctx_host_functions_field);
                 if (cl.func_idx > 0) {
@@ -1786,17 +2147,26 @@ fn compileInstRA(
                 try code.movRegMem(.rax, .r10, 0);
 
                 if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
-                // Stack args first — their sources may live in regs we're about to overwrite.
                 var j: u32 = 0;
                 while (j < extra) : (j += 1) {
                     const arg_reg = try useVReg(code, alloc_result, cl.args[max_reg_args + j], .r10);
                     try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
                 }
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                if (has_hrp) {
+                    if (hrp_in_reg) {
+                        const hrp_dst = param_regs[1 + n_args];
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    } else {
+                        try code.movRegReg(.r10, .rbp);
+                        try code.addRegImm32(.r10, scratch_base_off);
+                        try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                    }
+                }
                 try code.callReg(.rax);
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
             } else {
-                // Local function call: direct CALL rel32.
                 try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
 
                 if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
@@ -1806,6 +2176,17 @@ fn compileInstRA(
                     try code.movMemReg(.rsp, @intCast(shadow + j2 * 8), arg_reg);
                 }
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                if (has_hrp) {
+                    if (hrp_in_reg) {
+                        const hrp_dst = param_regs[1 + n_args];
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    } else {
+                        try code.movRegReg(.r10, .rbp);
+                        try code.addRegImm32(.r10, scratch_base_off);
+                        try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                    }
+                }
                 try code.emitByte(0xE8);
                 const patch_off = code.len();
                 try code.emitI32(0);
@@ -1814,6 +2195,19 @@ fn compileInstRA(
                     .target_func_idx = cl.func_idx - import_count,
                 });
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+            }
+
+            if (cl.tail) {
+                // Fallback tail: result already in rax; multi-result values
+                // already written through our HRP pass-through. Emit inline
+                // epilogue + ret; skip writeDefTyped (dest is dead).
+                var ci_f: usize = callee_saved_alloc.len;
+                while (ci_f > 0) {
+                    ci_f -= 1;
+                    if (used_callee_saved[ci_f]) try code.popReg(callee_saved_alloc[ci_f]);
+                }
+                try code.emitEpilogue();
+                return;
             }
 
             if (inst.dest) |dest| {
@@ -1831,9 +2225,63 @@ fn compileInstRA(
             if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
             try code.zeroExtend32(.rax);
 
-            // Load func_table_ptr from VmCtx
+            // Load vmctx into r10. For table 0 we use the fast path that
+            // reads vmctx.func_table_ptr/len directly. For higher-numbered
+            // tables we go through vmctx.tables_info_ptr[table_idx].
             try code.movRegMem(.r10, .rbp, vmctx_offset);
-            try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+
+            if (ci.table_idx == 0) {
+                // cmp eax, dword ptr [r10 + func_table_len]
+                //   REX.B=0x41, opcode 0x3B, modrm=01_000_010 (mod=disp8, reg=eax=0,
+                //   rm=r10 low=2), disp8=60.
+                try code.emitSlice(&.{ 0x41, 0x3B, 0x42, @as(u8, @intCast(vmctx_func_table_len_field)) });
+                // jb over_trap (rel8). Trap block size is 3 + 7 + 2 = 12 bytes below.
+                try code.emitByte(0x72);
+                try code.emitByte(12);
+                // Trap block: call trap_unreachable_fn(vmctx)
+                try code.movRegReg(param_regs[0], .r10);
+                try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+                try code.callReg(.rax);
+                // over_trap:
+
+                // Signature check. Load tables_info_ptr into r11
+                // so the sig-check sequence can read type_backing_ptr.
+                // r11 is clobbered by the sig check, but not needed after
+                // here (table-0 path reads func_table_ptr from vmctx).
+                try code.movRegMem(.r11, .r10, vmctx_tables_info_field);
+                try emitCallIndirectSigCheck(code, ci.type_idx, ci.table_idx);
+
+                // Load func_table_ptr from VmCtx (r10 still holds vmctx)
+                try code.movRegMem(.r10, .r10, vmctx_func_table_field);
+            } else {
+                // r11 = vmctx.tables_info_ptr (kept in r11 so r10/vmctx
+                // survives for the trap path below).
+                try code.movRegMem(.r11, .r10, vmctx_tables_info_field);
+
+                const len_off: i32 = @as(i32, @intCast(ci.table_idx)) * table_info_stride + table_info_len_off;
+                // cmp eax, [r11 + len_off]
+                //   REX.B=0x41, opcode 0x3B, modrm=10_000_011 (mod=disp32,
+                //   reg=eax=0, rm=r11 low=3), disp32=len_off.
+                try code.emitSlice(&.{ 0x41, 0x3B, 0x83 });
+                try code.emitU32(@bitCast(len_off));
+                // jb over_trap (rel8). Trap block: 3 + 7 + 2 = 12 bytes.
+                try code.emitByte(0x72);
+                try code.emitByte(12);
+                // Trap block: call trap_unreachable_fn(vmctx) — r10 holds vmctx.
+                try code.movRegReg(param_regs[0], .r10);
+                try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+                try code.callReg(.rax);
+                // over_trap:
+
+                // Signature check (r11 already = tables_info_ptr).
+                // NOTE: sig check clobbers r11; reload tables_info_ptr afterward.
+                try emitCallIndirectSigCheck(code, ci.type_idx, ci.table_idx);
+                try code.movRegMem(.r11, .r10, vmctx_tables_info_field);
+
+                // r10 = tables_info[table_idx].ptr
+                const ptr_off: i32 = @as(i32, @intCast(ci.table_idx)) * table_info_stride + table_info_ptr_off;
+                try code.movRegMem(.r10, .r11, ptr_off);
+            }
 
             // func_ptr = func_table[elem_idx * 8]; stash in r11 across arg setup
             // because useVReg below only touches its scratch (.r10) and the
@@ -1846,13 +2294,24 @@ fn compileInstRA(
             try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
 
             const n_args: u32 = @intCast(ci.args.len);
-            const max_reg_args: u32 = @min(n_args, @as(u32, @intCast(param_regs.len)) - 1);
+            const has_hrp: bool = ci.extra_results > 0;
+            const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+            const hrp_in_reg: bool = has_hrp and (n_args < max_reg_slots);
+            const max_reg_args: u32 = @min(n_args, max_reg_slots);
             const extra: u32 = n_args - max_reg_args;
+            const hrp_on_stack: bool = has_hrp and !hrp_in_reg;
+            const hrp_stack_k: u32 = if (hrp_on_stack) n_args - max_reg_slots else 0;
+            const total_stack_args: u32 = extra + (if (hrp_on_stack) @as(u32, 1) else 0);
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
-            const stack_need: u32 = shadow + extra * 8;
+            const stack_need: u32 = shadow + total_stack_args * 8;
             const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
 
-            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            // For real tail we jmp (no return address pushed) so shadow space
+            // isn't needed; skip the rsp adjust entirely to match the working
+            // direct-call tail path.
+            const ci_can_real_tail: bool = ci.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (!ci_can_real_tail and stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
             // Stack args first; sources may live in regs we're about to overwrite.
             var j: u32 = 0;
             while (j < extra) : (j += 1) {
@@ -1860,12 +2319,155 @@ fn compileInstRA(
                 try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
             }
             try emitCallRegArgMoves(code, alloc_result, ci.args, max_reg_args);
+            if (has_hrp) {
+                if (hrp_in_reg) {
+                    const hrp_dst = param_regs[1 + n_args];
+                    if (ci.tail and total_stack_args == 0 and !hrp_on_stack) {
+                        // Real tail: pass-through our caller's HRP.
+                        const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                        try code.movRegMem(hrp_dst, .rbp, hrp_save_off);
+                    } else {
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    }
+                } else {
+                    try code.movRegReg(.r10, .rbp);
+                    try code.addRegImm32(.r10, scratch_base_off);
+                    try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                }
+            }
+
+            const ci_real_tail: bool = ci.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (ci_real_tail) {
+                var ci_t: usize = callee_saved_alloc.len;
+                while (ci_t > 0) {
+                    ci_t -= 1;
+                    if (used_callee_saved[ci_t]) try code.popReg(callee_saved_alloc[ci_t]);
+                }
+                try code.movRegReg(.rsp, .rbp);
+                try code.popReg(.rbp);
+                try code.jmpReg(.r11);
+                return;
+            }
+
             try code.callReg(.r11);
             if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            if (ci.tail) {
+                var ci_f: usize = callee_saved_alloc.len;
+                while (ci_f > 0) {
+                    ci_f -= 1;
+                    if (used_callee_saved[ci_f]) try code.popReg(callee_saved_alloc[ci_f]);
+                }
+                try code.emitEpilogue();
+                return;
+            }
 
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
+        },
+
+        .call_ref => |cr| {
+            // Load funcref (native pointer) into r11.
+            const ref_reg = try useVReg(code, alloc_result, cr.func_ref, .rax);
+            if (ref_reg != .r11) try code.movRegReg(.r11, ref_reg);
+
+            // Null check: if r11 == 0, trap via trap_unreachable_fn.
+            // Load vmctx into r10 first so the trap call has it handy.
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            // test r11, r11  → 0x4D 0x85 0xDB
+            try code.emitSlice(&.{ 0x4D, 0x85, 0xDB });
+            // jne over_trap (rel8). Trap block is 3 + 7 + 2 = 12 bytes.
+            try code.emitByte(0x75);
+            try code.emitByte(12);
+            // Trap block: call trap_unreachable_fn(vmctx)
+            try code.movRegReg(param_regs[0], .r10);
+            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+            try code.callReg(.rax);
+            // over_trap:
+
+            // Load vmctx into param_regs[0] for the callee.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+
+            const n_args: u32 = @intCast(cr.args.len);
+            const has_hrp: bool = cr.extra_results > 0;
+            const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+            const hrp_in_reg: bool = has_hrp and (n_args < max_reg_slots);
+            const max_reg_args: u32 = @min(n_args, max_reg_slots);
+            const extra: u32 = n_args - max_reg_args;
+            const hrp_on_stack: bool = has_hrp and !hrp_in_reg;
+            const hrp_stack_k: u32 = if (hrp_on_stack) n_args - max_reg_slots else 0;
+            const total_stack_args: u32 = extra + (if (hrp_on_stack) @as(u32, 1) else 0);
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_need: u32 = shadow + total_stack_args * 8;
+            const stack_adjust: u32 = (stack_need + 15) & ~@as(u32, 15);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
+
+            const cr_can_real_tail: bool = cr.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (!cr_can_real_tail and stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            var j: u32 = 0;
+            while (j < extra) : (j += 1) {
+                const arg_reg = try useVReg(code, alloc_result, cr.args[max_reg_args + j], .r10);
+                try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
+            }
+            try emitCallRegArgMoves(code, alloc_result, cr.args, max_reg_args);
+            if (has_hrp) {
+                if (hrp_in_reg) {
+                    const hrp_dst = param_regs[1 + n_args];
+                    if (cr.tail and total_stack_args == 0 and !hrp_on_stack) {
+                        const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
+                        try code.movRegMem(hrp_dst, .rbp, hrp_save_off);
+                    } else {
+                        try code.movRegReg(hrp_dst, .rbp);
+                        try code.addRegImm32(hrp_dst, scratch_base_off);
+                    }
+                } else {
+                    try code.movRegReg(.r10, .rbp);
+                    try code.addRegImm32(.r10, scratch_base_off);
+                    try code.movMemReg(.rsp, @intCast(shadow + hrp_stack_k * 8), .r10);
+                }
+            }
+
+            const cr_real_tail: bool = cr.tail and total_stack_args == 0 and !hrp_on_stack;
+            if (cr_real_tail) {
+                var ci_t: usize = callee_saved_alloc.len;
+                while (ci_t > 0) {
+                    ci_t -= 1;
+                    if (used_callee_saved[ci_t]) try code.popReg(callee_saved_alloc[ci_t]);
+                }
+                try code.movRegReg(.rsp, .rbp);
+                try code.popReg(.rbp);
+                try code.jmpReg(.r11);
+                return;
+            }
+
+            try code.callReg(.r11);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            if (cr.tail) {
+                var ci_f: usize = callee_saved_alloc.len;
+                while (ci_f > 0) {
+                    ci_f -= 1;
+                    if (used_callee_saved[ci_f]) try code.popReg(callee_saved_alloc[ci_f]);
+                }
+                try code.emitEpilogue();
+                return;
+            }
+
+            if (inst.dest) |dest| {
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+            }
+        },
+
+        // ── Extra result of a preceding multi-value call ──────────────
+        .call_result => |idx| {
+            const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
+            const scratch_base_off: i32 = -@as(i32, @intCast((local_count + 18) * 8));
+            const slot_off: i32 = scratch_base_off + @as(i32, @intCast(@as(u32, idx) * 8));
+            try code.movRegMem(dr, .rbp, slot_off);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
 
         // ── Memory ────────────────────────────────────────────────────
@@ -1882,9 +2484,19 @@ fn compileInstRA(
             try emitMemBoundsCheck(code, @as(u64, ld.offset) + @as(u64, ld.size));
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
-            // Load value into dest register (address is in rax); fold offset into disp.
+            // Fold wasm offset into mov displacement when it fits in i32.
+            // For out-of-range offsets (address.wast uses 0xFFFFFFFF), first
+            // add the offset to rax via a 64-bit imm.
+            var ld_disp: i32 = 0;
+            if (ld.offset <= 0x7FFFFFFF) {
+                ld_disp = @intCast(ld.offset);
+            } else {
+                try code.movRegImm64(.r10, @as(u64, ld.offset));
+                try code.addRegReg(.rax, .r10);
+            }
+            // Load value into dest register (address is in rax).
             const dr = destReg(alloc_result, dest);
-            try code.movRegMemSized(dr, .rax, @intCast(ld.offset), ld.size);
+            try code.movRegMemSized(dr, .rax, ld_disp, ld.size);
             if (ld.sign_extend and ld.size < 8) {
                 switch (ld.size) {
                     1 => try code.movsxByteToReg(dr, dr),
@@ -1919,8 +2531,15 @@ fn compileInstRA(
             // useVReg writes spill loads into scratch=.rcx, so rax is preserved.
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
             if (val_reg != .rcx) try code.movRegReg(.rcx, val_reg);
-            // Fold wasm offset into the mov displacement.
-            try code.movMemRegSized(.rax, @intCast(st.offset), .rcx, st.size);
+            // Fold wasm offset into the mov displacement when it fits in i32.
+            var st_disp: i32 = 0;
+            if (st.offset <= 0x7FFFFFFF) {
+                st_disp = @intCast(st.offset);
+            } else {
+                try code.movRegImm64(.r10, @as(u64, st.offset));
+                try code.addRegReg(.rax, .r10);
+            }
+            try code.movMemRegSized(.rax, st_disp, .rcx, st.size);
         },
         .memory_copy => |mc| {
             // REP MOVSB: rdi=dst, rsi=src, rcx=len
@@ -1961,17 +2580,16 @@ fn compileInstRA(
             const len_reg = try useVReg(code, alloc_result, mf.len, .rcx);
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
             try code.zeroExtend32(.rcx); // wasm lengths are u32
-            const val_reg = try useVReg(code, alloc_result, mf.val, .rax);
-            if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
             const dst_reg = try useVReg(code, alloc_result, mf.dst, .rdi);
             if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
             try code.zeroExtend32(.rdi); // wasm addresses are i32
-            // Bounds-check dst: stash val in r11 while we clobber rax for
-            // the check, then restore it.
-            try code.movRegReg(.r11, .rax); // save fill byte
+            // Bounds-check dst+len: uses rax for address and clobbers r11.
             try code.movRegReg(.rax, .rdi);
             try emitMemBoundsCheckDynamic(code);
-            try code.movRegReg(.rax, .r11); // restore fill byte into rax
+            // Load fill value AFTER bounds check (emitMemBoundsCheckDynamic
+            // clobbers r11, so we can't stash the value there).
+            const val_reg = try useVReg(code, alloc_result, mf.val, .rax);
+            if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
             try code.emitSlice(&.{ 0xF3, 0xAA }); // REP STOSB
@@ -2024,9 +2642,217 @@ fn compileInstRA(
         },
         .data_drop => {},
 
+        .table_init => |ti| {
+            // Helper signature (4 args to fit Win64 regs):
+            //   tableInitHelper(vmctx, packed_seg_table, packed_dst_src, len)
+            //   packed_seg_table = seg_idx | (table_idx << 32)
+            //   packed_dst_src   = dst | (src << 32)
+            //
+            // Win64: rcx=vmctx, rdx=packed_seg_table, r8=packed_dst_src, r9=len
+            // SysV:  rdi=vmctx, rsi=packed_seg_table, rdx=packed_dst_src, rcx=len
+            const arg_len_reg = param_regs[3];
+            const arg_packed_ds_reg = param_regs[2];
+            const arg_packed_st_reg = param_regs[1];
+
+            // Stage len into arg_len_reg (zero-extended i32).
+            const len_reg = try useVReg(code, alloc_result, ti.len, arg_len_reg);
+            if (len_reg != arg_len_reg) try code.movRegReg(arg_len_reg, len_reg);
+            try code.zeroExtend32(arg_len_reg);
+
+            // Build packed_dst_src in arg_packed_ds_reg.
+            // 1. src -> r11, zero-extend, shl 32.
+            const src_reg = try useVReg(code, alloc_result, ti.src, .r11);
+            if (src_reg != .r11) try code.movRegReg(.r11, src_reg);
+            try code.zeroExtend32(.r11);
+            try code.emitSlice(&.{ 0x49, 0xC1, 0xE3, 0x20 }); // shl r11, 32
+
+            // 2. dst -> arg_packed_ds_reg, zero-extend.
+            const dst_reg = try useVReg(code, alloc_result, ti.dst, arg_packed_ds_reg);
+            if (dst_reg != arg_packed_ds_reg) try code.movRegReg(arg_packed_ds_reg, dst_reg);
+            try code.zeroExtend32(arg_packed_ds_reg);
+
+            // 3. or arg_packed_ds_reg, r11.
+            try code.orRegReg(arg_packed_ds_reg, .r11);
+
+            // packed_seg_table is compile-time constant.
+            const packed_st: u64 =
+                @as(u64, ti.seg_idx) | (@as(u64, ti.table_idx) << 32);
+            try code.movRegImm64(arg_packed_st_reg, packed_st);
+
+            // vmctx into param_regs[0]; helper ptr into rax.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_table_init_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+        },
+        .elem_drop => |seg_idx| {
+            // Helper: elemDropHelper(vmctx, seg_idx)
+            //   Win64: rcx=vmctx, rdx=seg_idx
+            //   SysV:  rdi=vmctx, rsi=seg_idx
+            try code.movRegImm32(param_regs[1], @bitCast(seg_idx));
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_elem_drop_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+        },
+
+        // ── Table management ─────────────────────────────────────────
+        .table_size => |table_idx| {
+            const dest = inst.dest orelse return;
+            const dr = destReg(alloc_result, dest);
+            // r10 = vmctx.tables_info_ptr; read len (u32) from slot [table_idx].
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .r10, vmctx_tables_info_field);
+            const len_off: i32 = @as(i32, @intCast(table_idx)) * table_info_stride + table_info_len_off;
+            try code.movRegMemNoRex(dr, .r10, len_off);
+            try writeDef(code, alloc_result, dest, dr);
+        },
+        .table_get => |tg| {
+            const dest = inst.dest orelse return;
+
+            // Bring idx into rax, zero-extend to 64 bits.
+            const idx_reg = try useVReg(code, alloc_result, tg.idx, .rax);
+            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
+            try code.zeroExtend32(.rax);
+
+            // r10 = vmctx.tables_info_ptr.
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .r10, vmctx_tables_info_field);
+
+            // cmp eax, [r10 + table_idx*16 + 8]   (table len, u32)
+            const len_off: i32 = @as(i32, @intCast(tg.table_idx)) * table_info_stride + table_info_len_off;
+            try emitCmpEaxMemR10Disp8(code, len_off);
+            try code.emitByte(0x72); // jb over_trap (rel8)
+            try code.emitByte(12);
+            try code.movRegReg(param_regs[0], .r10);
+            try code.movRegMem(.rax, param_regs[0], vmctx_trap_unreachable_fn_field);
+            try code.callReg(.rax);
+            // over_trap: rax still holds idx on the fall-through.
+
+            // r10 = table_info[table_idx].ptr.
+            const ptr_off: i32 = @as(i32, @intCast(tg.table_idx)) * table_info_stride + table_info_ptr_off;
+            try code.movRegMem(.r10, .r10, ptr_off);
+            try code.emitSlice(&.{ 0x48, 0xC1, 0xE0, 0x03 }); // shl rax, 3
+            try code.addRegReg(.r10, .rax);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegMem(dr, .r10, 0);
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+        },
+        .table_set => |ts| {
+            // Call tableSetHelper(vmctx, table_idx, elem_idx, value).
+            // The helper updates both native_backing and type_backing
+            // (via ptr_to_sig binary search) so subsequent call_indirect
+            // sees the correct sig_id.
+            //
+            // Stage operands through non-allocatable scratch registers
+            // (r11, rax) first to avoid clobbering live vregs in param regs.
+            const val_reg = try useVReg(code, alloc_result, ts.val, .r11);
+            if (val_reg != .r11) try code.movRegReg(.r11, val_reg);
+            const idx_reg = try useVReg(code, alloc_result, ts.idx, .rax);
+            if (idx_reg != .rax) try code.movRegReg(.rax, idx_reg);
+            try code.zeroExtend32(.rax);
+
+            if (comptime builtin.os.tag == .windows) {
+                // Win64: rcx=vmctx, rdx=table_idx, r8=elem_idx, r9=value
+                try code.movRegReg(.r9, .r11);
+                try code.movRegReg(.r8, .rax);
+                try code.movRegImm32(.rdx, @bitCast(ts.table_idx));
+            } else {
+                // SysV: rdi=vmctx, rsi=table_idx, rdx=elem_idx, rcx=value
+                try code.movRegReg(.rcx, .r11);
+                try code.movRegReg(.rdx, .rax);
+                try code.movRegImm32(.rsi, @bitCast(ts.table_idx));
+            }
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_table_set_fn_field);
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+        },
+        .ref_func => |fidx| {
+            const dest = inst.dest orelse return;
+            // Load funcptrs array, then [funcptrs + fidx*8].
+            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
+            const dr = destReg(alloc_result, dest);
+            try code.movRegMem(dr, .r10, @as(i32, @intCast(fidx * 8)));
+            try writeDefTyped(code, alloc_result, dest, dr, inst.type);
+        },
+        .table_grow => |tg| {
+            const dest = inst.dest orelse return;
+            // Host helper signature (Win64): RCX=vmctx, RDX=init_val (i64),
+            // R8=delta (i32). Returns i32 old_size in eax or -1.
+            // Like memory_grow, regalloc treats this as a call: no caller-saved
+            // vregs live across.
+
+            // Move init into rdx (Win64 arg1 / SysV arg1 rsi — adjust per ABI).
+            if (comptime builtin.os.tag == .windows) {
+                const init_reg = try useVReg(code, alloc_result, tg.init, .rdx);
+                if (init_reg != .rdx) try code.movRegReg(.rdx, init_reg);
+                const delta_reg = try useVReg(code, alloc_result, tg.delta, .r8);
+                if (delta_reg != .r8) try code.movRegReg(.r8, delta_reg);
+                try code.zeroExtend32(.r8);
+                try code.movRegImm32(.r9, @bitCast(tg.table_idx));
+            } else {
+                // SysV: rdi=vmctx, rsi=init, rdx=delta, rcx=table_idx.
+                const init_reg = try useVReg(code, alloc_result, tg.init, .rsi);
+                if (init_reg != .rsi) try code.movRegReg(.rsi, init_reg);
+                const delta_reg = try useVReg(code, alloc_result, tg.delta, .rdx);
+                if (delta_reg != .rdx) try code.movRegReg(.rdx, delta_reg);
+                try code.zeroExtend32(.rdx);
+                try code.movRegImm32(.rcx, @bitCast(tg.table_idx));
+            }
+
+            // Load vmctx into param_regs[0] and grow fn ptr into rax.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_table_grow_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+
         // ── Division ──────────────────────────────────────────────────
         .div_s, .div_u, .rem_s, .rem_u => |bin| {
             const dest = inst.dest orelse return;
+
+            // Float div: frontend lowers f32/f64 `div` into `.div_s` with
+            // inst.type == .f32/.f64. Dispatch to SSE divss/divsd. `.div_u`,
+            // `.rem_s`, `.rem_u` are never produced with float type.
+            if (inst.type == .f32 or inst.type == .f64) {
+                const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+                if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+                const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+                if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+                if (inst.type == .f32) {
+                    try code.movdToXmm(.rax, .rax);
+                    try code.movdToXmm(.rcx, .rcx);
+                    try code.divss(.rax, .rcx);
+                    try code.movdFromXmm(.rax, .rax);
+                } else {
+                    try code.movqToXmm(.rax, .rax);
+                    try code.movqToXmm(.rcx, .rcx);
+                    try code.divsd(.rax, .rcx);
+                    try code.movqFromXmm(.rax, .rax);
+                }
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+                return;
+            }
+
             // idiv clobbers rax+rdx. rax is not allocatable, so only rdx
             // (which IS allocatable) needs saving if it holds a live value.
             const rdx_in_use = for (caller_saved_alloc, 0..) |reg, i| {
@@ -2041,34 +2867,103 @@ fn compileInstRA(
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
 
-            // Zero divisor check
+            // Zero divisor check: if rcx == 0, call the trap helper.
+            //   test rcx, rcx
+            //   jne not_zero  (rel32)
+            //   call trap_idivz
+            // not_zero:
             try code.testRegReg(.rcx, .rcx);
-            try code.emitSlice(&.{ 0x0F, 0x84 }); // JZ rel32
-            const skip_patch = code.len();
+            try code.emitSlice(&.{ 0x0F, 0x85 }); // JNE rel32
+            const notzero_patch = code.len();
             try code.emitI32(0);
+            try emitTrapHelperCall(code, vmctx_trap_idivz_fn_field);
+            const notzero_off = code.len();
+            code.patchI32(notzero_patch, @intCast(@as(i64, @intCast(notzero_off)) - @as(i64, @intCast(notzero_patch + 4))));
+
+            const is_rem = (inst.op == .rem_s or inst.op == .rem_u);
 
             switch (inst.op) {
                 .div_s, .rem_s => {
-                    try code.cqo();
-                    try code.idivReg(.rcx);
+                    if (inst.type == .i32) {
+                        // Guard against INT_MIN / -1: div_s traps, rem_s returns 0.
+                        //   cmp ecx, -1
+                        //   jne do_div
+                        //   cmp eax, 0x80000000
+                        //   jne do_div
+                        //   (INT_MIN/-1 case:)
+                        //     rem_s: xor edx, edx; jmp after
+                        //     div_s: call trap_iovf
+                        // do_div:
+                        //   cdq
+                        //   idiv ecx
+                        // after:
+                        try code.emitSlice(&.{ 0x83, 0xF9, 0xFF }); // cmp ecx, -1
+                        try code.emitSlice(&.{ 0x0F, 0x85 }); // jne rel32
+                        const dodiv_patch = code.len();
+                        try code.emitI32(0);
+                        try code.emitSlice(&.{ 0x3D, 0x00, 0x00, 0x00, 0x80 }); // cmp eax, INT_MIN
+                        try code.emitSlice(&.{ 0x0F, 0x85 }); // jne rel32
+                        const dodiv_patch2 = code.len();
+                        try code.emitI32(0);
+                        var after_patch: usize = 0;
+                        if (is_rem) {
+                            try code.emitSlice(&.{ 0x31, 0xD2 }); // xor edx, edx
+                            try code.emitSlice(&.{ 0xE9 }); // jmp rel32
+                            after_patch = code.len();
+                            try code.emitI32(0);
+                        } else {
+                            try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
+                        }
+                        const dodiv_off = code.len();
+                        code.patchI32(dodiv_patch, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch + 4))));
+                        code.patchI32(dodiv_patch2, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch2 + 4))));
+                        try code.emitSlice(&.{ 0x99 }); // cdq
+                        try code.emitSlice(&.{ 0xF7, 0xF9 }); // idiv ecx
+                        if (is_rem) {
+                            const after_off = code.len();
+                            code.patchI32(after_patch, @intCast(@as(i64, @intCast(after_off)) - @as(i64, @intCast(after_patch + 4))));
+                        }
+                    } else {
+                        try code.emitSlice(&.{ 0x48, 0x83, 0xF9, 0xFF }); // cmp rcx, -1
+                        try code.emitSlice(&.{ 0x0F, 0x85 });
+                        const dodiv_patch = code.len();
+                        try code.emitI32(0);
+                        // movabs r11, INT64_MIN
+                        try code.emitSlice(&.{ 0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 });
+                        try code.emitSlice(&.{ 0x4C, 0x39, 0xD8 }); // cmp rax, r11
+                        try code.emitSlice(&.{ 0x0F, 0x85 });
+                        const dodiv_patch2 = code.len();
+                        try code.emitI32(0);
+                        var after_patch: usize = 0;
+                        if (is_rem) {
+                            try code.emitSlice(&.{ 0x31, 0xD2 });
+                            try code.emitSlice(&.{ 0xE9 });
+                            after_patch = code.len();
+                            try code.emitI32(0);
+                        } else {
+                            try emitTrapHelperCall(code, vmctx_trap_iovf_fn_field);
+                        }
+                        const dodiv_off = code.len();
+                        code.patchI32(dodiv_patch, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch + 4))));
+                        code.patchI32(dodiv_patch2, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch2 + 4))));
+                        try code.emitSlice(&.{ 0x48, 0x99 }); // cqo
+                        try code.emitSlice(&.{ 0x48, 0xF7, 0xF9 }); // idiv rcx
+                        if (is_rem) {
+                            const after_off = code.len();
+                            code.patchI32(after_patch, @intCast(@as(i64, @intCast(after_off)) - @as(i64, @intCast(after_patch + 4))));
+                        }
+                    }
                 },
                 .div_u, .rem_u => {
                     try code.movRegImm32(.rdx, 0);
-                    try code.divReg(.rcx);
+                    if (inst.type == .i32) {
+                        try code.emitSlice(&.{ 0xF7, 0xF1 }); // div ecx
+                    } else {
+                        try code.divReg(.rcx);
+                    }
                 },
                 else => unreachable,
             }
-            try code.emitSlice(&.{ 0xE9 }); // JMP done
-            const done_patch = code.len();
-            try code.emitI32(0);
-
-            const zero_off = code.len();
-            try code.xorReg32(.rax);
-            try code.movRegImm32(.rdx, 0);
-            const done_off = code.len();
-
-            code.patchI32(skip_patch, @intCast(@as(i64, @intCast(zero_off)) - @as(i64, @intCast(skip_patch + 4))));
-            code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
 
             const result_reg: emit.Reg = switch (inst.op) {
                 .div_s, .div_u => .rax,
@@ -2079,7 +2974,6 @@ fn compileInstRA(
             // Restore rdx if it was saved
             if (rdx_in_use) {
                 if (result_reg == .rdx) {
-                    // Remainder result is in rdx — save before restoring
                     try code.movRegReg(.r11, .rdx);
                     try code.popReg(.rdx);
                     try code.movRegReg(.rax, .r11);
@@ -2103,25 +2997,30 @@ fn compileInstRA(
             // clobber rax; no need to stash val in r11.
             const cnt_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (cnt_reg != .rcx) try code.movRegReg(.rcx, cnt_reg);
+            // i32 shifts/rotates must use the 32-bit opcode form (no REX.W).
+            // In 64-bit REX.W form x86 masks CL to 6 bits, so shift-by-32
+            // produces wrong results; wasm i32 shifts mask by 5 bits, which
+            // matches the 32-bit x86 form natively.
+            const is64 = inst.type == .i64;
             switch (inst.op) {
                 .shl => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xE0 });
                 },
                 .shr_u => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xE8 });
                 },
                 .shr_s => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xF8 });
                 },
                 .rotl => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xC0 });
                 },
                 .rotr => {
-                    try code.rexW(.rax, .rax);
+                    if (is64) try code.rexW(.rax, .rax);
                     try code.emitSlice(&.{ 0xD3, 0xC8 });
                 },
                 else => unreachable,
@@ -2167,15 +3066,24 @@ fn compileInstRA(
         // ── Select ────────────────────────────────────────────────────
         .select => |sel| {
             const dest = inst.dest orelse return;
+            // Stage operands through non-allocatable scratch registers
+            // (.r10, .r11) so no allocated VReg can collide with our
+            // intermediate storage. The previous implementation loaded
+            // cond into .rax then operands into .rcx/.rdx, which
+            // clobbered the if_true/if_false values whenever the
+            // allocator had placed them in .rax/.rcx/.rdx (seen as
+            // the float-select LSB-ORed-with-cond pattern in
+            // float_exprs.wast).
+            const true_reg = try useVReg(code, alloc_result, sel.if_true, .r10);
+            if (true_reg != .r10) try code.movRegReg(.r10, true_reg);
+            const false_reg = try useVReg(code, alloc_result, sel.if_false, .r11);
+            if (false_reg != .r11) try code.movRegReg(.r11, false_reg);
             const cond_reg = try useVReg(code, alloc_result, sel.cond, .rax);
-            if (cond_reg != .rax) try code.movRegReg(.rax, cond_reg);
-            const false_reg = try useVReg(code, alloc_result, sel.if_false, .rcx);
-            if (false_reg != .rcx) try code.movRegReg(.rcx, false_reg);
-            const true_reg = try useVReg(code, alloc_result, sel.if_true, .rdx);
-            if (true_reg != .rdx) try code.movRegReg(.rdx, true_reg);
-            try code.testRegReg(.rax, .rax);
-            try code.cmovnz(.rcx, .rdx);
-            try writeDefTyped(code, alloc_result, dest, .rcx, inst.type);
+            // Condition is always i32 in wasm; use 32-bit test so
+            // upper-bit garbage doesn't affect the branch.
+            try code.testRegReg32(cond_reg, cond_reg);
+            try code.cmovnz(.r11, .r10); // if cond != 0, r11 = r10 (if_true)
+            try writeDefTyped(code, alloc_result, dest, .r11, inst.type);
         },
 
         .global_get => |idx| {
@@ -2195,7 +3103,7 @@ fn compileInstRA(
         },
 
         .@"unreachable" => {
-            try code.int3();
+            try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_field);
         },
 
         // ── Type conversions ──────────────────────────────────────────
@@ -2324,41 +3232,115 @@ fn compileInstRA(
         },
 
         // ── Float binary operations ───────────────────────────────────
-        .f_min => |bin| {
+        .f_min, .f_max => |bin| {
             const dest = inst.dest orelse return;
             const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
             if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
             const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            // Wasm f32/f64 min/max:
+            //   1. If either operand is NaN → canonical qNaN.
+            //   2. If operands are bit-equal → bitwise OR (min) / AND (max)
+            //      so that min(-0,+0) = -0 and max(-0,+0) = +0.
+            //   3. Otherwise → MINSS/MINSD (MAXSS/MAXSD).
+            // MINSx/MAXSx alone fail both (1) (returns 2nd op on NaN) and
+            // (2) (returns 2nd op when equal) — hence the explicit checks.
+            const is_min = inst.op == .f_min;
             if (inst.type == .f32) {
-                try code.movdToXmm(.rax, .rax);
-                try code.movdToXmm(.rcx, .rcx);
-                try code.minss(.rax, .rcx);
-                try code.movdFromXmm(.rax, .rax);
+                // Offsets (f32, with UCOMISS for IEEE equality — handles ±0):
+                //  0   mov edx, eax                          2
+                //  2   and edx, 0x7FFFFFFF                   6
+                //  8   cmp edx, 0x7F800000                   6
+                // 14   ja  nan  (rel8 = 59-16 = 43)          2
+                // 16   mov edx, ecx                          2
+                // 18   and edx, 0x7FFFFFFF                   6
+                // 24   cmp edx, 0x7F800000                   6
+                // 30   ja  nan  (rel8 = 59-32 = 27)          2
+                // 32   movd xmm0, eax                        4
+                // 36   movd xmm1, ecx                        4
+                // 40   ucomiss xmm0, xmm1                    3
+                // 43   je  equal (rel8 = 55-45 = 10)         2
+                // 45   minss/maxss xmm0, xmm1                4
+                // 49   movd eax, xmm0                        4
+                // 53   jmp done (rel8 = 64-55 = 9)           2
+                // 55   or/and eax, ecx                       2
+                // 57   jmp done (rel8 = 64-59 = 5)           2
+                // 59   mov eax, 0x7FC00000                   5
+                // 64   <done>
+                const minmax_byte: u8 = if (is_min) 0x5D else 0x5F; // MINSS=5D, MAXSS=5F
+                const or_and_byte: u8 = if (is_min) 0x09 else 0x21; // OR=09, AND=21
+                try code.emitSlice(&.{
+                    0x89, 0xC2,                               // mov edx, eax
+                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F,       // and edx, 0x7FFFFFFF
+                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F,       // cmp edx, 0x7F800000
+                    0x77, 0x2B,                               // ja nan (+43)
+                    0x89, 0xCA,                               // mov edx, ecx
+                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F,       // and edx, 0x7FFFFFFF
+                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F,       // cmp edx, 0x7F800000
+                    0x77, 0x1B,                               // ja nan (+27)
+                    0x66, 0x0F, 0x6E, 0xC0,                   // movd xmm0, eax
+                    0x66, 0x0F, 0x6E, 0xC9,                   // movd xmm1, ecx
+                    0x0F, 0x2E, 0xC1,                         // ucomiss xmm0, xmm1
+                    0x74, 0x0A,                               // je equal (+10)
+                    0xF3, 0x0F, minmax_byte, 0xC1,            // min/maxss xmm0, xmm1
+                    0x66, 0x0F, 0x7E, 0xC0,                   // movd eax, xmm0
+                    0xEB, 0x09,                               // jmp done (+9)
+                    or_and_byte, 0xC8,                        // or/and eax, ecx
+                    0xEB, 0x05,                               // jmp done (+5)
+                    0xB8, 0x00, 0x00, 0xC0, 0x7F,             // mov eax, 0x7FC00000
+                });
             } else {
-                try code.movqToXmm(.rax, .rax);
-                try code.movqToXmm(.rcx, .rcx);
-                try code.minsd(.rax, .rcx);
-                try code.movqFromXmm(.rax, .rax);
-            }
-            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
-        },
-        .f_max => |bin| {
-            const dest = inst.dest orelse return;
-            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
-            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
-            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
-            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
-            if (inst.type == .f32) {
-                try code.movdToXmm(.rax, .rax);
-                try code.movdToXmm(.rcx, .rcx);
-                try code.maxss(.rax, .rcx);
-                try code.movdFromXmm(.rax, .rax);
-            } else {
-                try code.movqToXmm(.rax, .rax);
-                try code.movqToXmm(.rcx, .rcx);
-                try code.maxsd(.rax, .rcx);
-                try code.movqFromXmm(.rax, .rax);
+                // f64: same shape with UCOMISD for IEEE equality.
+                // Offsets:
+                //   0  mov rdx, rax                          3
+                //   3  movabs r11, 0x7FFFFFFFFFFFFFFF       10
+                //  13  and rdx, r11                          3
+                //  16  movabs r11, 0x7FF0000000000000       10
+                //  26  cmp rdx, r11                          3
+                //  29  ja nan (rel8 = 94-31 = 63)            2
+                //  31  mov rdx, rcx                          3
+                //  34  movabs r11, 0x7FFFFFFFFFFFFFFF       10
+                //  44  and rdx, r11                          3
+                //  47  movabs r11, 0x7FF0000000000000       10
+                //  57  cmp rdx, r11                          3
+                //  60  ja nan (rel8 = 94-62 = 32)            2
+                //  62  movq xmm0, rax                        5
+                //  67  movq xmm1, rcx                        5
+                //  72  ucomisd xmm0, xmm1                    4
+                //  76  je equal (rel8 = 89-78 = 11)          2
+                //  78  minsd/maxsd xmm0, xmm1                4
+                //  82  movq rax, xmm0                        5
+                //  87  jmp done (rel8 = 104-89 = 15)         2
+                //  89  or/and rax, rcx                       3
+                //  92  jmp done (rel8 = 104-94 = 10)         2
+                //  94  movabs rax, 0x7FF8000000000000       10
+                // 104  <done>
+                const minmax_byte: u8 = if (is_min) 0x5D else 0x5F;
+                const or_and_byte: u8 = if (is_min) 0x09 else 0x21;
+                try code.emitSlice(&.{
+                    0x48, 0x89, 0xC2,                                                   // mov rdx, rax
+                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,         // movabs r11, 0x7FFF...FF
+                    0x4C, 0x21, 0xDA,                                                   // and rdx, r11
+                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F,         // movabs r11, 0x7FF0...00
+                    0x4C, 0x39, 0xDA,                                                   // cmp rdx, r11
+                    0x77, 0x3F,                                                         // ja nan (+63)
+                    0x48, 0x89, 0xCA,                                                   // mov rdx, rcx
+                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,         // movabs r11, 0x7FFF...FF
+                    0x4C, 0x21, 0xDA,                                                   // and rdx, r11
+                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F,         // movabs r11, 0x7FF0...00
+                    0x4C, 0x39, 0xDA,                                                   // cmp rdx, r11
+                    0x77, 0x20,                                                         // ja nan (+32)
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                                       // movq xmm0, rax
+                    0x66, 0x48, 0x0F, 0x6E, 0xC9,                                       // movq xmm1, rcx
+                    0x66, 0x0F, 0x2E, 0xC1,                                             // ucomisd xmm0, xmm1
+                    0x74, 0x0B,                                                         // je equal (+11)
+                    0xF2, 0x0F, minmax_byte, 0xC1,                                      // min/maxsd xmm0, xmm1
+                    0x66, 0x48, 0x0F, 0x7E, 0xC0,                                       // movq rax, xmm0
+                    0xEB, 0x0F,                                                         // jmp done (+15)
+                    0x48, or_and_byte, 0xC8,                                            // or/and rax, rcx
+                    0xEB, 0x0A,                                                         // jmp done (+10)
+                    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x7F,         // movabs rax, 0x7FF8...00
+                });
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
@@ -2388,17 +3370,91 @@ fn compileInstRA(
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
 
+        // ── Float comparisons ─────────────────────────────────────────
+        // Operands are f32/f64 (via inst.type); result is i32 (0 or 1).
+        // Uses UCOMIS[SD] xmm0, xmm1, then SETcc. IEEE-754 unordered
+        // (NaN) rules: eq=0/ne=1 when unordered; lt/gt/le/ge all=0.
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge => |bin| {
+            const dest = inst.dest orelse return;
+            const rhs_reg = try useVReg(code, alloc_result, bin.rhs, .rcx);
+            if (rhs_reg != .rcx) try code.movRegReg(.rcx, rhs_reg);
+            const lhs_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+            if (lhs_reg != .rax) try code.movRegReg(.rax, lhs_reg);
+            if (inst.type == .f32) {
+                try code.movdToXmm(.rax, .rax); // xmm0 = lhs
+                try code.movdToXmm(.rcx, .rcx); // xmm1 = rhs
+                try code.ucomiss(.rax, .rcx);
+            } else {
+                try code.movqToXmm(.rax, .rax);
+                try code.movqToXmm(.rcx, .rcx);
+                try code.ucomisd(.rax, .rcx);
+            }
+            // UCOMIS flags:
+            //   equal     : ZF=1, PF=0, CF=0
+            //   a > b     : ZF=0, PF=0, CF=0
+            //   a < b     : ZF=0, PF=0, CF=1
+            //   unordered : ZF=1, PF=1, CF=1
+            //
+            // SETcc codes: B=2, AE=3, E=4, NE=5, BE=6, A=7, P=A, NP=B
+            switch (inst.op) {
+                .f_eq => {
+                    // ordered AND equal: SETE AND SETNP
+                    try code.setcc(0x4, .rax); // sete al
+                    try code.setcc(0xB, .r11); // setnp r11b
+                    try code.andRegReg(.rax, .r11);
+                },
+                .f_ne => {
+                    // unordered OR not-equal: SETNE OR SETP
+                    try code.setcc(0x5, .rax); // setne al
+                    try code.setcc(0xA, .r11); // setp r11b
+                    try code.orRegReg(.rax, .r11);
+                },
+                .f_lt => {
+                    // ordered AND below: SETB AND SETNP
+                    try code.setcc(0x2, .rax); // setb al
+                    try code.setcc(0xB, .r11); // setnp r11b
+                    try code.andRegReg(.rax, .r11);
+                },
+                .f_gt => {
+                    // above (already excludes unordered): SETA
+                    try code.setcc(0x7, .rax); // seta al
+                },
+                .f_le => {
+                    // ordered AND below-or-equal: SETBE AND SETNP
+                    try code.setcc(0x6, .rax); // setbe al
+                    try code.setcc(0xB, .r11); // setnp r11b
+                    try code.andRegReg(.rax, .r11);
+                },
+                .f_ge => {
+                    // above-or-equal (excludes unordered): SETAE
+                    try code.setcc(0x3, .rax); // setae al
+                },
+                else => unreachable,
+            }
+            try code.movzxByte(.rax, .rax);
+            // Result is i32; explicitly force i32 write (inst.type is the
+            // operand float type, not the result type).
+            try writeDefTyped(code, alloc_result, dest, .rax, .i32);
+        },
+
         // ── Int/Float conversions ─────────────────────────────────────
         .trunc_f32_s, .trunc_f64_s => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            if (inst.op == .trunc_f32_s) {
+            const is_f32 = (inst.op == .trunc_f32_s);
+            if (is_f32) {
                 try code.movdToXmm(.rax, .rax);
-                try code.cvttss2si(.rax, .rax);
             } else {
                 try code.movqToXmm(.rax, .rax);
-                try code.cvttsd2si(.rax, .rax);
+            }
+            try emitTruncRangeCheck(code, inst.type == .i32, true, is_f32);
+            // Use the dest-width form so 32-bit trunc fills only EAX (and the
+            // upper 32 bits don't carry stale signed bits across writeDefTyped).
+            if (inst.type == .i32) {
+                if (is_f32) try code.cvttss2si32(.rax, .rax) else try code.cvttsd2si32(.rax, .rax);
+            } else {
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
@@ -2406,12 +3462,51 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
-            if (inst.op == .trunc_f32_u) {
+            const is_f32 = (inst.op == .trunc_f32_u);
+            if (is_f32) {
                 try code.movdToXmm(.rax, .rax);
-                try code.cvttss2si(.rax, .rax);
             } else {
                 try code.movqToXmm(.rax, .rax);
-                try code.cvttsd2si(.rax, .rax);
+            }
+            try emitTruncRangeCheck(code, inst.type == .i32, false, is_f32);
+            if (inst.type == .i32) {
+                // Unsigned i32 fits in signed i64; use 64-bit cvtt then truncate.
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+            } else {
+                // Unsigned i64: split at 2^63. If src < 2^63 direct; else subtract
+                // 2^63, convert, then add back.
+                const split_bits: u64 = if (is_f32) 0x5F000000 else 0x43E0000000000000;
+                if (is_f32) {
+                    try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(split_bits))));
+                    try code.movdToXmm(.rcx, .r11);
+                    try code.ucomiss(.rax, .rcx);
+                } else {
+                    try code.movRegImm64(.r11, split_bits);
+                    try code.movqToXmm(.rcx, .r11);
+                    try code.ucomisd(.rax, .rcx);
+                }
+                // JB = src < 2^63 -> direct convert
+                try code.emitSlice(&.{ 0x0F, 0x82 });
+                const direct_patch = code.len();
+                try code.emitI32(0);
+                // High range: subtract 2^63, convert, add back
+                if (is_f32) {
+                    try code.subss(.rax, .rcx);
+                    try code.cvttss2si(.rax, .rax);
+                } else {
+                    try code.subsd(.rax, .rcx);
+                    try code.cvttsd2si(.rax, .rax);
+                }
+                try code.movRegImm64(.r11, 0x8000000000000000);
+                try code.addRegReg(.rax, .r11);
+                try code.emitSlice(&.{0xE9}); // JMP done
+                const done_patch = code.len();
+                try code.emitI32(0);
+                const direct_off = code.len();
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+                code.patchI32(direct_patch, @intCast(@as(i64, @intCast(direct_off)) - @as(i64, @intCast(direct_patch + 4))));
+                const done_off = code.len();
+                code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
@@ -2420,41 +3515,201 @@ fn compileInstRA(
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
 
-            // NaN check: compare value with itself (NaN != NaN)
             const is_f32 = (inst.op == .trunc_sat_f32_s or inst.op == .trunc_sat_f32_u);
-            if (is_f32) {
-                try code.movdToXmm(.rax, .rax);
-                try code.ucomiss(.rax, .rax);
-            } else {
-                try code.movqToXmm(.rax, .rax);
-                try code.ucomisd(.rax, .rax);
-            }
-            // JP = parity flag set = NaN → result is 0
+            const is_signed = (inst.op == .trunc_sat_f32_s or inst.op == .trunc_sat_f64_s);
+            const dst_is_i32 = (inst.type == .i32);
+
+            // Move source to xmm0
+            if (is_f32) try code.movdToXmm(.rax, .rax) else try code.movqToXmm(.rax, .rax);
+
+            // ── NaN check ──
+            // ucomis* sets PF=1 if unordered (NaN). NaN -> result = 0.
+            if (is_f32) try code.ucomiss(.rax, .rax) else try code.ucomisd(.rax, .rax);
             try code.emitSlice(&.{ 0x0F, 0x8A }); // JP rel32
             const nan_patch = code.len();
             try code.emitI32(0);
 
-            // Normal conversion
+            // ── Lower bound check: if src < MIN_F  -> saturate to MIN_INT ──
+            // Compute MIN_F bits depending on (dst_is_i32, is_signed, is_f32).
+            // For unsigned: MIN_F = 0.0 (any 0-or-negative -> 0).
+            const min_f_bits: u64 = if (is_signed) blk: {
+                if (dst_is_i32) {
+                    // INT32_MIN = -2147483648.0
+                    break :blk if (is_f32) @as(u64, 0xCF000000) else @as(u64, 0xC1E0000000000000);
+                } else {
+                    // INT64_MIN = -9223372036854775808.0
+                    break :blk if (is_f32) @as(u64, 0xDF000000) else @as(u64, 0xC3E0000000000000);
+                }
+            } else 0; // 0.0 for unsigned
+
+            // Load MIN_F into xmm1 via R11
             if (is_f32) {
-                try code.cvttss2si(.rax, .rax);
+                try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(min_f_bits))));
+                try code.movdToXmm(.rcx, .r11);
             } else {
-                try code.cvttsd2si(.rax, .rax);
+                try code.movRegImm64(.r11, min_f_bits);
+                try code.movqToXmm(.rcx, .r11);
+            }
+            // For signed, use UCOMIS; src < MIN_F if CF=1 -> JB
+            // For unsigned, src <= 0 -> JBE saturates to 0.
+            if (is_f32) try code.ucomiss(.rax, .rcx) else try code.ucomisd(.rax, .rcx);
+            try code.emitSlice(&.{ 0x0F, if (is_signed) @as(u8, 0x82) else @as(u8, 0x86) }); // JB / JBE rel32
+            const min_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Upper bound check: if src >= MAX_BOUND_F -> saturate to MAX_INT ──
+            // MAX_BOUND_F is the smallest float >= the *exclusive* upper bound,
+            // i.e. (MAX_INT + 1) as a float, since MAX_INT itself isn't usually
+            // exactly representable.
+            const max_bound_bits: u64 = if (is_signed) blk: {
+                if (dst_is_i32) {
+                    // 2^31 = 2147483648.0
+                    break :blk if (is_f32) @as(u64, 0x4F000000) else @as(u64, 0x41E0000000000000);
+                } else {
+                    // 2^63 = 9223372036854775808.0
+                    break :blk if (is_f32) @as(u64, 0x5F000000) else @as(u64, 0x43E0000000000000);
+                }
+            } else blk: {
+                if (dst_is_i32) {
+                    // 2^32 = 4294967296.0
+                    break :blk if (is_f32) @as(u64, 0x4F800000) else @as(u64, 0x41F0000000000000);
+                } else {
+                    // 2^64 = 18446744073709551616.0
+                    break :blk if (is_f32) @as(u64, 0x5F800000) else @as(u64, 0x43F0000000000000);
+                }
+            };
+            if (is_f32) {
+                try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(max_bound_bits))));
+                try code.movdToXmm(.rcx, .r11);
+            } else {
+                try code.movRegImm64(.r11, max_bound_bits);
+                try code.movqToXmm(.rcx, .r11);
+            }
+            if (is_f32) try code.ucomiss(.rax, .rcx) else try code.ucomisd(.rax, .rcx);
+            // JAE = src >= MAX_BOUND -> saturate to MAX
+            try code.emitSlice(&.{ 0x0F, 0x83 });
+            const max_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Normal conversion ──
+            if (!is_signed and !dst_is_i32) {
+                // Unsigned 64-bit trunc: cvttsx2si is signed, so split at 2^63.
+                // We've already verified 0 <= src < 2^64.
+                // If src >= 2^63: subtract 2^63, cvttsx2si, add back 2^63.
+                const split_bits: u64 = if (is_f32) 0x5F000000 else 0x43E0000000000000;
+                if (is_f32) {
+                    try code.movRegImm32(.r11, @bitCast(@as(u32, @truncate(split_bits))));
+                    try code.movdToXmm(.rcx, .r11);
+                    try code.ucomiss(.rax, .rcx);
+                } else {
+                    try code.movRegImm64(.r11, split_bits);
+                    try code.movqToXmm(.rcx, .r11);
+                    try code.ucomisd(.rax, .rcx);
+                }
+                // JB = src < 2^63 -> direct convert
+                try code.emitSlice(&.{ 0x0F, 0x82 });
+                const direct_patch = code.len();
+                try code.emitI32(0);
+                // High range: subtract 2^63, convert, add back
+                if (is_f32) {
+                    try code.subss(.rax, .rcx);
+                    try code.cvttss2si(.rax, .rax);
+                } else {
+                    try code.subsd(.rax, .rcx);
+                    try code.cvttsd2si(.rax, .rax);
+                }
+                try code.movRegImm64(.r11, 0x8000000000000000);
+                try code.addRegReg(.rax, .r11);
+                try code.emitSlice(&.{0xE9}); // JMP done
+                const u64_done_patch = code.len();
+                try code.emitI32(0);
+                // Direct path
+                const direct_off = code.len();
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+                code.patchI32(direct_patch, @intCast(@as(i64, @intCast(direct_off)) - @as(i64, @intCast(direct_patch + 4))));
+                const u64_done_off = code.len();
+                code.patchI32(u64_done_patch, @intCast(@as(i64, @intCast(u64_done_off)) - @as(i64, @intCast(u64_done_patch + 4))));
+            } else if (dst_is_i32) {
+                if (is_signed) {
+                    // Signed i32: 32-bit cvtt; bound-check already ensured in-range.
+                    if (is_f32) try code.cvttss2si32(.rax, .rax) else try code.cvttsd2si32(.rax, .rax);
+                } else {
+                    // Unsigned i32 in [0, 2^32): use 64-bit signed cvt (fits in
+                    // positive i63), then low 32 bits are the unsigned result.
+                    if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
+                }
+            } else {
+                // Signed i64
+                if (is_f32) try code.cvttss2si(.rax, .rax) else try code.cvttsd2si(.rax, .rax);
             }
             try code.emitSlice(&.{0xE9}); // JMP done
             const done_patch = code.len();
             try code.emitI32(0);
 
-            // NaN path: result = 0
+            // ── NaN landing: result = 0 ──
             const nan_off = code.len();
             try code.xorReg32(.rax);
+            try code.emitSlice(&.{0xE9});
+            const nan_done_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Underflow landing: result = MIN_INT ──
+            const min_off = code.len();
+            if (!is_signed) {
+                // unsigned -> 0
+                try code.xorReg32(.rax);
+            } else if (dst_is_i32) {
+                try code.movRegImm32(.rax, @bitCast(@as(u32, 0x80000000)));
+            } else {
+                try code.movRegImm64(.rax, 0x8000000000000000);
+            }
+            try code.emitSlice(&.{0xE9});
+            const min_done_patch = code.len();
+            try code.emitI32(0);
+
+            // ── Overflow landing: result = MAX_INT ──
+            const max_off = code.len();
+            if (!is_signed) {
+                if (dst_is_i32) try code.movRegImm32(.rax, @bitCast(@as(u32, 0xFFFFFFFF)))
+                else try code.movRegImm64(.rax, 0xFFFFFFFFFFFFFFFF);
+            } else if (dst_is_i32) {
+                try code.movRegImm32(.rax, 0x7FFFFFFF);
+            } else {
+                try code.movRegImm64(.rax, 0x7FFFFFFFFFFFFFFF);
+            }
+
+            // ── done ──
             const done_off = code.len();
 
             code.patchI32(nan_patch, @intCast(@as(i64, @intCast(nan_off)) - @as(i64, @intCast(nan_patch + 4))));
+            code.patchI32(min_patch, @intCast(@as(i64, @intCast(min_off)) - @as(i64, @intCast(min_patch + 4))));
+            code.patchI32(max_patch, @intCast(@as(i64, @intCast(max_off)) - @as(i64, @intCast(max_patch + 4))));
             code.patchI32(done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(done_patch + 4))));
+            code.patchI32(nan_done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(nan_done_patch + 4))));
+            code.patchI32(min_done_patch, @intCast(@as(i64, @intCast(done_off)) - @as(i64, @intCast(min_done_patch + 4))));
 
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
-        .convert_s => |vreg| {
+        .convert_s, .convert_u => {
+            // Legacy ops, no longer emitted by the frontend (replaced by
+            // .convert_i32_s/.convert_i64_s/.convert_i32_u/.convert_i64_u).
+        },
+        .convert_i32_s => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // Use 32-bit CVTSI2S{S,D} so the source register is interpreted as a
+            // signed dword (so e.g. 0xFFFFFFFF -> -1.0, not 4294967295.0).
+            if (inst.type == .f32) {
+                try code.cvtsi2ss32(.rax, .rax);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd32(.rax, .rax);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+        .convert_i64_s => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
@@ -2467,7 +3722,24 @@ fn compileInstRA(
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
         },
-        .convert_u => |vreg| {
+        .convert_i32_u => |vreg| {
+            const dest = inst.dest orelse return;
+            const src_reg = try useVReg(code, alloc_result, vreg, .rax);
+            if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
+            // Zero-extend low 32 bits to 64 bits, then use signed 64-bit conversion.
+            // (mov r32,r32 zero-extends to 64; the eax->rax extension already
+            // happened from any preceding 32-bit op, but be explicit.)
+            try code.emitSlice(&.{ 0x89, 0xC0 }); // mov eax, eax — zero-extends to RAX
+            if (inst.type == .f32) {
+                try code.cvtsi2ss(.rax, .rax);
+                try code.movdFromXmm(.rax, .rax);
+            } else {
+                try code.cvtsi2sd(.rax, .rax);
+                try code.movqFromXmm(.rax, .rax);
+            }
+            try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+        },
+        .convert_i64_u => |vreg| {
             const dest = inst.dest orelse return;
             const src_reg = try useVReg(code, alloc_result, vreg, .rax);
             if (src_reg != .rax) try code.movRegReg(.rax, src_reg);
@@ -3026,10 +4298,10 @@ test "compileFunctionRA: wrap_i64 emits mov eax,eax" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // Allocator keeps v0 in rdx and puts v1 in rsi (v0's range doesn't end
-    // strictly before v1 begins). wrap_i64 emits `mov esi, edx` = 89 D6
-    // (ModR/M 11_010_110, reg=rdx=2, rm=rsi=6), which zero-extends to rsi.
-    try std.testing.expect(containsBytes(code, &.{ 0x89, 0xD6 }));
+    // Allocator keeps v0 in rdx and puts v1 in rbx (v0's range doesn't end
+    // strictly before v1 begins). wrap_i64 emits `mov ebx, edx` = 89 D3
+    // (ModR/M 11_010_011, reg=rdx=2, rm=rbx=3), which zero-extends to rbx.
+    try std.testing.expect(containsBytes(code, &.{ 0x89, 0xD3 }));
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
 
@@ -3051,8 +4323,8 @@ test "compileFunctionRA: extend_i32_s emits MOVSXD" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // MOVSXD rsi, edx (sign-extend v0→v1; v0 in rdx, v1 in rsi): 48 63 F2
-    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x63, 0xF2 }));
+    // MOVSXD rbx, edx (sign-extend v0→v1; v0 in rdx, v1 in rbx): 48 63 DA
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x63, 0xDA }));
 }
 
 test "compileFunctionRA: memory_copy emits REP MOVSB" {
@@ -3225,12 +4497,12 @@ test "compileFunctionRA: eqz targets allocated dest register (rdx)" {
     defer allocator.free(code);
 
     // Allocator expires v0 after v1 starts (live-range end==start), so v0 gets
-    // rdx and v1 gets rsi. The setcc result therefore lands in sil, which
-    // requires the mandatory REX prefix to distinguish it from DH.
-    // setcc sil: 40 0F 94 C6  (REX=0x40, opcode 0F 94, ModR/M 11_000_110)
-    try std.testing.expect(containsBytes(code, &.{ 0x40, 0x0F, 0x94, 0xC6 }));
-    // movzx rsi, sil: 48 0F B6 F6  (REX.W, ModR/M 11_110_110)
-    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x0F, 0xB6, 0xF6 }));
+    // rdx and v1 gets rbx. The setcc result therefore lands in bl.
+    // bl is a legacy low-byte register — no REX prefix needed.
+    // setcc bl: 0F 94 C3  (opcode 0F 94, ModR/M 11_000_011)
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x94, 0xC3 }));
+    // movzx rbx, bl: 48 0F B6 DB  (REX.W, ModR/M 11_011_011)
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x0F, 0xB6, 0xDB }));
     // Must NOT emit the old rax-centric `setcc al` (0F 94 C0).
     try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x94, 0xC0 }));
 }
@@ -3257,12 +4529,12 @@ test "compileFunctionRA: comparison targets allocated dest register" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // Two constants are live simultaneously at the eq, so v0→rdx, v1→rsi,
-    // v2→rdi. The setcc writes dil with mandatory REX.
-    // setcc dil: 40 0F 94 C7  (REX=0x40, opcode 0F 94, ModR/M 11_000_111)
-    try std.testing.expect(containsBytes(code, &.{ 0x40, 0x0F, 0x94, 0xC7 }));
-    // movzx rdi, dil: 48 0F B6 FF  (REX.W, ModR/M 11_111_111)
-    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x0F, 0xB6, 0xFF }));
+    // Two constants are live simultaneously at the eq, so v0→rdx, v1→rbx,
+    // v2→rsi. The setcc writes sil with mandatory REX.
+    // setcc sil: 40 0F 94 C6  (REX=0x40, opcode 0F 94, ModR/M 11_000_110)
+    try std.testing.expect(containsBytes(code, &.{ 0x40, 0x0F, 0x94, 0xC6 }));
+    // movzx rsi, sil: 48 0F B6 F6  (REX.W, ModR/M 11_110_110)
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0x0F, 0xB6, 0xF6 }));
     // No legacy `setcc al`.
     try std.testing.expect(!containsBytes(code, &.{ 0x0F, 0x94, 0xC0 }));
 }

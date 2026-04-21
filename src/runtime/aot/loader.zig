@@ -27,6 +27,8 @@ pub const AotSectionType = enum(u32) {
     memory = 9,
     global = 10,
     elem = 11,
+    start = 12,
+    type = 13,
     _,
 };
 
@@ -72,13 +74,31 @@ pub const AotElemSegment = struct {
     table_idx: u32,
     offset: u32,
     func_indices: []const u32,
+    /// If true, segment is only referenced by `table.init` / `elem.drop`
+    /// (no active initializer at instantiation). For active segments,
+    /// `offset` is the static table offset; for passive segments
+    /// `offset` is 0 and unused.
+    is_passive: bool = false,
+};
+
+/// A function type parsed from the AOT type section.
+///
+/// Minimal shape for Workstream C: only MVP `func` kind is serialized (no
+/// GC subtyping or struct/array variants). Fields are allocator-owned.
+pub const AotFuncType = struct {
+    params: []const types.ValType,
+    results: []const types.ValType,
 };
 
 pub const AotModule = struct {
     target_info: ?TargetInfo = null,
     text_section: ?[]const u8 = null,
     func_offsets: []const u32 = &.{},
+    /// Parallel to `func_offsets`: index into `func_types` for each local
+    /// function (or 0 if the module didn't supply type info).
+    local_func_type_indices: []const u32 = &.{},
     func_count: u32 = 0,
+    func_types: []const AotFuncType = &.{},
     exports: []const types.ExportDesc = &.{},
     import_function_count: u32 = 0,
     imports: []const AotImportDesc = &.{},
@@ -87,6 +107,7 @@ pub const AotModule = struct {
     data_segments: []const AotDataSegment = &.{},
     global_inits: []const AotGlobalInit = &.{},
     elem_segments: []const AotElemSegment = &.{},
+    start_function: ?u32 = null,
 
     /// Find an export by name and kind.
     pub fn findExport(self: *const AotModule, name: []const u8, kind: types.ExternalKind) ?types.ExportDesc {
@@ -202,6 +223,14 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .elem => {
                 try parseElemSection(&reader, section_size, &module, allocator);
             },
+            .start => {
+                if (section_size >= 4) {
+                    module.start_function = try reader.readU32Le();
+                }
+            },
+            .type => {
+                try parseTypeSection(&reader, section_size, &module, allocator);
+            },
             else => {
                 // Skip unknown/unhandled sections
                 reader.pos += section_size;
@@ -219,6 +248,16 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
 pub fn unload(module: *const AotModule, allocator: std.mem.Allocator) void {
     if (module.func_offsets.len > 0) {
         allocator.free(module.func_offsets);
+    }
+    if (module.local_func_type_indices.len > 0) {
+        allocator.free(module.local_func_type_indices);
+    }
+    for (module.func_types) |ft| {
+        if (ft.params.len > 0) allocator.free(ft.params);
+        if (ft.results.len > 0) allocator.free(ft.results);
+    }
+    if (module.func_types.len > 0) {
+        allocator.free(module.func_types);
     }
     for (module.exports) |exp| {
         if (exp.name.len > 0) {
@@ -283,15 +322,54 @@ fn parseFunctionSection(reader: *BinaryReader, section_size: u32, module: *AotMo
         module.func_count = 0;
         return;
     }
-    const needed = @as(usize, count) * 4;
+    // v7 layout: interleaved (offset:u32, type_idx:u32) pairs.
+    const needed = @as(usize, count) * 8;
     if (reader.remaining() < needed) return error.UnexpectedEnd;
 
     const offsets = allocator.alloc(u32, count) catch return error.OutOfMemory;
+    errdefer allocator.free(offsets);
+    const tidxs = allocator.alloc(u32, count) catch return error.OutOfMemory;
+    errdefer allocator.free(tidxs);
     for (0..count) |i| {
         offsets[i] = try reader.readU32Le();
+        tidxs[i] = try reader.readU32Le();
     }
     module.func_offsets = offsets;
+    module.local_func_type_indices = tidxs;
     module.func_count = count;
+}
+
+fn parseTypeSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
+    if (section_size < 4) return error.InvalidSection;
+    const count = try reader.readU32Le();
+    if (count == 0) return;
+
+    const entries = allocator.alloc(AotFuncType, count) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (0..initialized) |i| {
+            if (entries[i].params.len > 0) allocator.free(entries[i].params);
+            if (entries[i].results.len > 0) allocator.free(entries[i].results);
+        }
+        allocator.free(entries);
+    }
+
+    for (0..count) |i| {
+        const params_len = try reader.readU32Le();
+        const params_bytes = try reader.readBytes(params_len);
+        const params = allocator.alloc(types.ValType, params_len) catch return error.OutOfMemory;
+        for (0..params_len) |j| params[j] = @enumFromInt(params_bytes[j]);
+
+        const results_len = try reader.readU32Le();
+        const results_bytes = try reader.readBytes(results_len);
+        const results = allocator.alloc(types.ValType, results_len) catch return error.OutOfMemory;
+        for (0..results_len) |j| results[j] = @enumFromInt(results_bytes[j]);
+
+        entries[i] = .{ .params = params, .results = results };
+        initialized += 1;
+    }
+
+    module.func_types = entries;
 }
 
 fn parseExportSection(reader: *BinaryReader, section_size: u32, module: *AotModule, allocator: std.mem.Allocator) LoadError!void {
@@ -456,6 +534,7 @@ fn parseElemSection(reader: *BinaryReader, section_size: u32, module: *AotModule
     }
 
     for (0..count) |i| {
+        const flag = try reader.readByte();
         const table_idx = try reader.readU32Le();
         const offset = try reader.readU32Le();
         const n_funcs = try reader.readU32Le();
@@ -467,6 +546,7 @@ fn parseElemSection(reader: *BinaryReader, section_size: u32, module: *AotModule
             .table_idx = table_idx,
             .offset = offset,
             .func_indices = indices,
+            .is_passive = flag != 0,
         };
         initialized += 1;
     }
@@ -551,16 +631,19 @@ test "unload: frees without leaks on empty module" {
 }
 
 test "load: function section with offsets" {
-    // Header(8) + section header(8) + count(4) + 3 offsets(12) = 32
-    var data = [_]u8{0} ** 32;
+    // v7 layout: header(8) + section header(8) + count(4) + 3 pairs (3*8=24) = 44
+    var data = [_]u8{0} ** 44;
     writeU32Le(&data, 0, types.aot_magic);
     writeU32Le(&data, 4, types.aot_version);
     writeU32Le(&data, 8, 3); // section type = function
-    writeU32Le(&data, 12, 16); // section size: count(4) + 3*offset(12) = 16
+    writeU32Le(&data, 12, 28); // section size: count(4) + 3*pair(24) = 28
     writeU32Le(&data, 16, 3); // count
     writeU32Le(&data, 20, 0); // offset 0
-    writeU32Le(&data, 24, 64); // offset 1
-    writeU32Le(&data, 28, 128); // offset 2
+    writeU32Le(&data, 24, 0); // type_idx 0
+    writeU32Le(&data, 28, 64); // offset 1
+    writeU32Le(&data, 32, 0); // type_idx 1
+    writeU32Le(&data, 36, 128); // offset 2
+    writeU32Le(&data, 40, 0); // type_idx 2
 
     const allocator = std.testing.allocator;
     const module = try load(&data, allocator);
