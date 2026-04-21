@@ -201,21 +201,59 @@ pub fn main(init: std.process.Init) !void {
     var elem_entries: std.ArrayList(emit_aot.ElemEntry) = .empty;
     defer elem_entries.deinit(allocator);
     for (module.elements) |seg| {
-        if (seg.is_passive or seg.is_declarative) continue;
-        const offset: u32 = if (seg.offset) |off| switch (off) {
-            .i32_const => |v| @bitCast(v),
-            else => continue,
-        } else continue;
-        // Extract function indices from the segment
+        if (seg.is_declarative) continue;
+        const offset: u32 = if (seg.is_passive) 0 else blk: {
+            const off = seg.offset orelse continue;
+            break :blk switch (off) {
+                .i32_const => |v| @as(u32, @bitCast(v)),
+                else => continue,
+            };
+        };
+        // Extract function indices from the segment. Use 0xFFFFFFFF as a
+        // null sentinel (wasm funcidx 0 is a valid function). The runtime
+        // writes 0 into the native backing for null entries.
         const indices = try allocator.alloc(u32, seg.func_indices.len);
         for (seg.func_indices, 0..) |fi, j| {
-            indices[j] = fi orelse 0;
+            indices[j] = fi orelse 0xFFFFFFFF;
         }
         try elem_entries.append(allocator, .{
             .table_idx = seg.table_idx,
             .offset = offset,
             .func_indices = indices,
+            .is_passive = seg.is_passive,
         });
+    }
+
+    // Build func-type entries from the parsed wasm module. One entry per
+    // module.types index; non-func (struct/array) kinds serialize as empty
+    // params/results placeholders so that all `type_idx` references remain
+    // valid. Slices are allocator-owned for the lifetime of this function.
+    var func_type_entries: std.ArrayList(emit_aot.FuncTypeEntry) = .empty;
+    defer {
+        for (func_type_entries.items) |fte| {
+            if (fte.params.len > 0) allocator.free(fte.params);
+            if (fte.results.len > 0) allocator.free(fte.results);
+        }
+        func_type_entries.deinit(allocator);
+    }
+    for (module.types) |ft| {
+        if (ft.kind != .func) {
+            try func_type_entries.append(allocator, .{ .params = &.{}, .results = &.{} });
+            continue;
+        }
+        const params_bytes = try allocator.alloc(u8, ft.params.len);
+        for (ft.params, 0..) |p, j| params_bytes[j] = @intFromEnum(p);
+        const results_bytes = try allocator.alloc(u8, ft.results.len);
+        for (ft.results, 0..) |r, j| results_bytes[j] = @intFromEnum(r);
+        try func_type_entries.append(allocator, .{ .params = params_bytes, .results = results_bytes });
+    }
+
+    // Build local function → type_idx map (one entry per local function,
+    // in the order they were compiled).
+    var local_func_tidx_list: std.ArrayList(u32) = .empty;
+    defer local_func_tidx_list.deinit(allocator);
+    for (module.functions) |f| {
+        try local_func_tidx_list.append(allocator, f.type_idx);
     }
 
     const aot_binary = try emit_aot.emit(
@@ -229,6 +267,9 @@ pub fn main(init: std.process.Init) !void {
         if (mem_entries.items.len > 0) mem_entries.items else null,
         if (global_entries.items.len > 0) global_entries.items else null,
         if (elem_entries.items.len > 0) elem_entries.items else null,
+        module.start_function,
+        if (func_type_entries.items.len > 0) func_type_entries.items else null,
+        if (local_func_tidx_list.items.len > 0) local_func_tidx_list.items else null,
     );
     defer allocator.free(aot_binary);
 

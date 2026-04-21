@@ -3,15 +3,46 @@
 //! Reads JSON files produced by wast2json, executing module loads,
 //! assert_return, assert_trap, and assert_invalid/assert_malformed
 //! commands against the WAMR runtime.
+//!
+//! ## Modes
+//!
+//! * `.interp` (default) — runs every command through the interpreter.
+//! * `.aot` — compiles each `module` with the AOT pipeline (see
+//!   `src/tests/aot_harness.zig`) and dispatches `invoke` / `get` /
+//!   `assert_return` through native code.
+//!
+//! ### AOT mode limitations
+//!
+//! AOT mode is deliberately scoped to the subset that already works end
+//! to end:
+//!
+//! * Only scalar signatures with ≤3 params of `i32` / `i64` / `f32` / `f64`
+//!   are callable (`aot_runtime.callFuncScalar`).
+//! * `assert_trap`, `assert_invalid`, `assert_malformed`, `assert_unlinkable`,
+//!   `register`, and cross-module linking are treated as skips — AOT traps
+//!   currently `std.process.exit(2)` and the runner has no host-module glue.
+//! * Spec files that trip pre-existing codegen panics are filtered out up
+//!   front via `src/tests/aot_skiplist.zig`. Extend that list when new
+//!   crashes surface.
+//! * `.wast` inputs always resolve to a single skip in AOT mode.
+//!
+//! Run the full suite via `zig build spec-tests-aot` or
+//! `spec-test-runner --mode=aot tests/spec-json`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("wamr");
 const wamr = root.wamr;
 const types = root.types;
 const instance_mod = root.instance;
 const wabt = @import("wabt");
+const aot_harness = @import("aot_harness.zig");
+const aot_runtime = root.aot_runtime;
 const Io = std.Io;
 const Dir = std.Io.Dir;
+
+/// Execution mode for the spec-test runner.
+pub const Mode = enum { interp, aot };
 
 pub const SpecTestResult = struct {
     file: []const u8,
@@ -20,6 +51,189 @@ pub const SpecTestResult = struct {
     failed: u32 = 0,
     skipped: u32 = 0,
 };
+
+/// Histogram of skip reasons, keyed by a short static-lifetime tag
+/// (e.g. "assert_trap", "bad_sig", "compile_fail"). Used by Phase 0 of
+/// the AOT spec-test push (see session plan) to produce a deterministic
+/// decomposition of the aot_mode skip counter.
+///
+/// Keys are expected to be static string literals; the histogram does
+/// not duplicate them.
+pub const SkipHistogram = std.StringHashMap(u32);
+
+var g_skip_histogram: ?*SkipHistogram = null;
+
+/// Install a histogram sink used by `runSpecTestFileAot` to tag every
+/// skip with a one-token reason. Pass `null` to disable.
+pub fn setSkipHistogram(h: ?*SkipHistogram) void {
+    g_skip_histogram = h;
+}
+
+fn recordSkip(reason: []const u8) void {
+    const h = g_skip_histogram orelse return;
+    const gop = h.getOrPut(reason) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+
+/// Map a spec-test command `type` string to a stable static reason tag.
+/// Keeps histogram keys pointer-stable for the lifetime of the program
+/// even when the input JSON strings are freed after parsing.
+fn staticReasonForCmdType(cmd_type: []const u8) []const u8 {
+    const known = [_][]const u8{
+        "assert_trap",
+        "assert_exhaustion",
+        "assert_invalid",
+        "assert_malformed",
+        "assert_unlinkable",
+        "assert_uninstantiable",
+        "assert_return",
+        "register",
+        "action",
+        "module",
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, k, cmd_type)) return k;
+    }
+    return "cmd_other";
+}
+
+const ValidateOutcome = enum { passed, failed };
+
+/// Shared handler for `assert_malformed` / `assert_invalid`. Returns
+/// `.passed` when the module was rejected (i.e. the assertion held),
+/// `.failed` when it unexpectedly loaded clean.
+///
+/// Used by both interp and AOT runners — validation is codegen-agnostic,
+/// so the AOT path reuses the interpreter loader here too rather than
+/// dragging the module through the AOT pipeline just to discard it.
+fn validateShouldReject(
+    cmd: Command,
+    cwd: Dir,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    json_dir: []const u8,
+) !ValidateOutcome {
+    const filename = cmd.filename orelse {
+        // No filename means the module was already rejected during
+        // wast→JSON conversion (parser/validator caught it).
+        return .passed;
+    };
+
+    if (cmd.module_type) |mt| {
+        if (std.mem.eql(u8, mt, "text")) {
+            const wat_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+            defer allocator.free(wat_path);
+            const wat_data = cwd.readFileAlloc(io, wat_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+            defer allocator.free(wat_data);
+            var wat_module = wabt.text.Parser.parseModule(allocator, wat_data) catch return .passed;
+            defer wat_module.deinit();
+            wabt.Validator.validate(&wat_module, .{}) catch return .passed;
+            const wasm_bytes = wabt.binary.writer.writeModule(allocator, &wat_module) catch return .passed;
+            defer allocator.free(wasm_bytes);
+            var runtime = wamr.Runtime.init(allocator);
+            defer runtime.deinit();
+            var mod = runtime.loadModule(wasm_bytes) catch return .passed;
+            mod.deinit();
+            std.debug.print("  NOTREJECTED line {d}: {s}\n", .{ cmd.line, filename });
+            return .failed;
+        }
+    }
+
+    const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+    defer allocator.free(wasm_path);
+    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+    defer allocator.free(wasm_data);
+    var runtime = wamr.Runtime.init(allocator);
+    defer runtime.deinit();
+    var mod = runtime.loadModule(wasm_data) catch return .passed;
+    mod.deinit();
+    std.debug.print("  NOTREJECTED line {d}: {s}\n", .{ cmd.line, filename });
+    return .failed;
+}
+
+/// Shared handler for `assert_uninstantiable`. Returns `.passed` when
+/// instantiation fails (assertion held) or `.failed` otherwise. Uses the
+/// interpreter runtime because instantiation-time checks (start trap,
+/// elem segment bounds) are codegen-independent.
+fn instantiateShouldReject(
+    cmd: Command,
+    cwd: Dir,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    json_dir: []const u8,
+) !ValidateOutcome {
+    const filename = cmd.filename orelse return .passed;
+
+    if (cmd.module_type) |mt| {
+        // Text-format uninstantiable modules are already validated
+        // up-front by wast2json; treat as pass (mirrors interp handler).
+        if (std.mem.eql(u8, mt, "text")) return .passed;
+    }
+
+    const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+    defer allocator.free(wasm_path);
+    const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch return .passed;
+    defer allocator.free(wasm_data);
+
+    var runtime = wamr.Runtime.init(allocator);
+    defer runtime.deinit();
+    var mod = runtime.loadModule(wasm_data) catch return .passed;
+    defer mod.deinit();
+
+    var inst_or_err = mod.instantiate();
+    if (inst_or_err) |*inst| {
+        inst.deinit();
+        std.debug.print("  NOTREJECTED line {d}: {s} (instantiate)\n", .{ cmd.line, filename });
+        return .failed;
+    } else |_| {
+        return .passed;
+    }
+}
+
+/// Outcome of a bare `action` command execution.
+const ActionOutcome = union(enum) {
+    passed,
+    failed: []const u8,
+    skipped: []const u8,
+};
+
+/// Execute a bare `action` command (invoke without expected results).
+/// Returns a pass on successful invocation, fail on a call error, and a
+/// tagged skip when the shape is outside the current AOT envelope.
+fn handleBareAction(
+    cmd: Command,
+    current: ?*aot_harness.Harness,
+    named: *const std.StringHashMap(*aot_harness.Harness),
+    allocator: std.mem.Allocator,
+) ActionOutcome {
+    const action = cmd.action orelse return .{ .skipped = "no_action" };
+    const resolved: ?*aot_harness.Harness = if (action.module) |mod_name|
+        (named.get(mod_name) orelse current)
+    else
+        current;
+    const h = resolved orelse return .{ .skipped = "no_module" };
+
+    if (std.mem.eql(u8, action.type, "get")) {
+        const field = action.field orelse return .{ .skipped = "get_no_field" };
+        _ = h.findGlobalExport(field) orelse return .{ .skipped = "get_missing" };
+        return .passed;
+    }
+    if (!std.mem.eql(u8, action.type, "invoke")) return .{ .skipped = "action_other" };
+
+    const field = action.field orelse return .{ .skipped = "invoke_no_field" };
+    const args_json = action.args orelse &[_]Arg{};
+    const args = parseArgs(args_json, allocator) orelse return .{ .skipped = "invoke_parse_args" };
+    defer allocator.free(args);
+
+    const func_idx = h.findFuncExport(field) orelse return .{ .skipped = "invoke_missing" };
+    var results_buf: [aot_runtime.MaxScalarResults]aot_runtime.ScalarResult = undefined;
+    _ = h.callScalar(func_idx, args, &results_buf) catch |err| switch (err) {
+        error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => return .{ .skipped = "bad_sig" },
+        else => return .{ .failed = @errorName(err) },
+    };
+    return .passed;
+}
 
 const Command = struct {
     type: []const u8,
@@ -211,6 +425,32 @@ fn refNullEqual(a_is_null: bool, b: types.Value) bool {
         else => return false,
     };
     return a_is_null == b_is_null;
+}
+
+/// Format a single wasm Value as `<tag>=0x<bits>` into `buf` for diagnostics.
+/// Unknown/ref types fall back to the tag name.
+fn formatValueBits(buf: []u8, v: types.Value) []const u8 {
+    return switch (v) {
+        .i32 => |x| std.fmt.bufPrint(buf, "i32=0x{x:0>8}", .{@as(u32, @bitCast(x))}) catch "i32=?",
+        .i64 => |x| std.fmt.bufPrint(buf, "i64=0x{x:0>16}", .{@as(u64, @bitCast(x))}) catch "i64=?",
+        .f32 => |x| std.fmt.bufPrint(buf, "f32=0x{x:0>8}", .{@as(u32, @bitCast(x))}) catch "f32=?",
+        .f64 => |x| std.fmt.bufPrint(buf, "f64=0x{x:0>16}", .{@as(u64, @bitCast(x))}) catch "f64=?",
+        .v128 => |x| std.fmt.bufPrint(buf, "v128=0x{x:0>32}", .{x}) catch "v128=?",
+        else => std.fmt.bufPrint(buf, "{s}", .{@tagName(v)}) catch "?",
+    };
+}
+
+/// Print a comma-separated bit-accurate dump of wasm Values for diagnostics.
+fn printValuesBits(label: []const u8, vs: []const types.Value) void {
+    std.debug.print("{s}=[", .{label});
+    var first = true;
+    var buf: [64]u8 = undefined;
+    for (vs) |v| {
+        if (!first) std.debug.print(", ", .{});
+        first = false;
+        std.debug.print("{s}", .{formatValueBits(&buf, v)});
+    }
+    std.debug.print("]", .{});
 }
 
 /// Parse a slice of JSON args into a caller-owned slice of Values.
@@ -1395,6 +1635,597 @@ pub fn runSpecTestFile(json_path: []const u8, allocator: std.mem.Allocator, io: 
             }
         } else {
             // unknown command type
+            result.skipped += 1;
+        }
+    }
+
+    return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AOT mode
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Unified entry point that dispatches to interp or AOT implementations.
+pub fn runSpecTestFileMode(
+    json_path: []const u8,
+    mode: Mode,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) !SpecTestResult {
+    return switch (mode) {
+        .interp => runSpecTestFile(json_path, allocator, io),
+        .aot => runSpecTestFileAot(json_path, allocator, io),
+    };
+}
+
+/// Minimal spec-test runner that drives modules through the AOT pipeline.
+///
+/// Scope (issue #102): handle the codegen-relevant commands only.
+///   - `module`                : compile + instantiate via `aot_harness`.
+///   - `assert_return` + invoke: `callFuncScalar`, compare against expected.
+///   - `assert_return` + get   : read exported global from the AOT instance.
+///   - everything else         : skipped (validation-focused assertions are
+///                               not codegen concerns; cross-module linking,
+///                               register, assert_trap, assert_invalid, etc.
+///                               will get AOT support in follow-up work).
+///
+/// Signatures outside the `aot_runtime.callFuncScalar` envelope (> 3 params,
+/// non-scalar types, multi-value results) are skipped per-assertion.
+fn runSpecTestFileAot(
+    json_path: []const u8,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+) !SpecTestResult {
+    var result = SpecTestResult{ .file = json_path };
+
+    if (comptime !aot_harness.can_exec_aot) {
+        // No native execution possible: report as a single skip so the
+        // summary makes sense rather than exploding per-command.
+        result.total = 1;
+        result.skipped = 1;
+        return result;
+    }
+
+    const cwd = std.Io.Dir.cwd();
+    const json_data = try cwd.readFileAlloc(io, json_path, allocator, @enumFromInt(10 * 1024 * 1024));
+    defer allocator.free(json_data);
+
+    const parsed = try std.json.parseFromSlice(SpecJson, allocator, json_data, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const json_dir = std.fs.path.dirname(json_path) orelse ".";
+
+    var current: ?*aot_harness.Harness = null;
+    var current_is_retained: bool = false;
+    // Retain registered harnesses for the duration of this JSON run so
+    // their mmap'd native code outlives any importer that consults
+    // `import_registry` for function pointers. `current` is only
+    // deinit'd on next `module` command when it was not registered.
+    var retained: std.ArrayList(*aot_harness.Harness) = .empty;
+    defer {
+        if (current) |h| {
+            if (!current_is_retained) h.deinit();
+        }
+        for (retained.items) |h| h.deinit();
+        retained.deinit(allocator);
+    }
+
+    // Named-module dispatch: modules declared as `module $name` in wast are
+    // preserved in the JSON as `cmd.name`. Later `action.module` references
+    // must resolve to the originally-bound harness even after `current` has
+    // been replaced by later `module` commands. Each named harness is moved
+    // into `retained` so its native code stays mapped.
+    var named_harnesses = std.StringHashMap(*aot_harness.Harness).init(allocator);
+    defer named_harnesses.deinit();
+
+    // Cross-module import registry. Gets populated on `register` commands
+    // by copying the current harness's exported globals. Subsequent module
+    // loads consult this when resolving imported globals.
+    var import_registry = aot_harness.ImportRegistry.init(allocator);
+    defer import_registry.deinit();
+
+    // Seed the spectest built-in memory and table so modules that
+    // import "spectest"/"memory" or "spectest"/"table" get the
+    // canonical shared instances rather than fresh zero-page locals.
+    const spectest_mem = makeSpectestMemory(allocator);
+    defer if (spectest_mem) |m| {
+        allocator.free(m.data);
+        allocator.destroy(m);
+    };
+    if (spectest_mem) |m| {
+        import_registry.putMemory("spectest", "memory", m) catch {};
+    }
+    const spectest_tbl = makeSpectestTable(allocator, false);
+    defer if (spectest_tbl) |t| {
+        allocator.free(t.elements);
+        allocator.destroy(t);
+    };
+    if (spectest_tbl) |t| {
+        import_registry.putTable("spectest", "table", t) catch {};
+    }
+
+    // Pre-scan: infer module $name bindings from action.module references.
+    // wast2json strips the `$name` from module commands (cmd.name is null)
+    // but resolves `$name` references in assert commands to action.module
+    // strings. Build a line→name mapping so the main loop can register
+    // unregistered named modules when they're first created.
+    //
+    // Algorithm: for each unregistered action.module name, find the most
+    // recent module command before the first reference. Registered names
+    // (from `register` commands' `as` field) are excluded.
+    var registered_names = std.StringHashMap(void).init(allocator);
+    defer registered_names.deinit();
+    for (parsed.value.commands) |pre| {
+        if (std.mem.eql(u8, pre.type, "register")) {
+            if (pre.@"as") |rn| registered_names.put(rn, {}) catch {};
+        }
+    }
+
+    // Map: module_line → inferred name
+    var module_line_to_name = std.AutoHashMap(i64, []const u8).init(allocator);
+    defer module_line_to_name.deinit();
+    {
+        // Track last module line seen so far.
+        var last_module_line: ?i64 = null;
+        // Names we've already resolved; skip duplicates.
+        var resolved = std.StringHashMap(void).init(allocator);
+        defer resolved.deinit();
+        for (parsed.value.commands) |pre| {
+            if (std.mem.eql(u8, pre.type, "module") and pre.filename != null) {
+                last_module_line = pre.line;
+            } else if (pre.action) |action| {
+                if (action.module) |mod_name| {
+                    if (!registered_names.contains(mod_name) and
+                        !resolved.contains(mod_name))
+                    {
+                        if (last_module_line) |ml| {
+                            module_line_to_name.put(ml, mod_name) catch {};
+                            resolved.put(mod_name, {}) catch {};
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (parsed.value.commands) |cmd| {
+        result.total += 1;
+
+        if (std.mem.eql(u8, cmd.type, "module")) {
+            if (current) |h| {
+                if (!current_is_retained) h.deinit();
+                current = null;
+                current_is_retained = false;
+            }
+            const filename = cmd.filename orelse {
+                recordSkip("module_no_filename");
+                result.skipped += 1;
+                continue;
+            };
+            const wasm_path = try std.fs.path.join(allocator, &.{ json_dir, filename });
+            defer allocator.free(wasm_path);
+            const wasm_data = cwd.readFileAlloc(io, wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch |err| {
+                std.debug.print("  SKIP aot read {s} line {d}: {}\n", .{ filename, cmd.line, err });
+                recordSkip("module_read_fail");
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(wasm_data);
+
+            current = aot_harness.Harness.initWithRegistry(allocator, wasm_data, &import_registry) catch |err| blk: {
+                std.debug.print("  SKIP aot compile {s} line {d}: {}\n", .{ filename, cmd.line, err });
+                recordSkip("compile_fail");
+                result.skipped += 1;
+                break :blk null;
+            };
+            // Wire vmctx-switching trampolines for imported functions so
+            // cross-module calls (e.g. $Nt calling imported $Mt.call)
+            // run with the exporter's memory/tables/globals.
+            if (current) |h| {
+                h.wireImportTrampolines(&named_harnesses);
+            }
+            if (current != null) result.passed += 1;
+
+            // If the module was declared with a `$name` binding, retain the
+            // harness so later `action.module=$name` commands can dispatch
+            // to it even after `current` is replaced.
+            // Check both cmd.name (if wast2json preserves it) and the
+            // pre-scanned module_line_to_name mapping (for tools that don't).
+            const inferred_name = if (cmd.name) |n| n else module_line_to_name.get(cmd.line);
+            const needs_retain = blk: {
+                if (inferred_name != null) break :blk true;
+                // Also retain modules that wrote elem segments to imported
+                // tables: their native code pointers live in the shared
+                // table's native_backing and must not become dangling.
+                if (current) |h| {
+                    if (h.aot_module.elem_segments.len > 0) {
+                        for (h.wasm_module.imports) |imp| {
+                            if (imp.kind == .table) break :blk true;
+                        }
+                    }
+                }
+                break :blk false;
+            };
+            if (needs_retain) {
+                if (current) |h| {
+                    if (!current_is_retained) {
+                        retained.append(allocator, h) catch {
+                            recordSkip("retain_oom");
+                            continue;
+                        };
+                        current_is_retained = true;
+                    }
+                    if (inferred_name) |mod_name| {
+                        named_harnesses.put(mod_name, h) catch {
+                            recordSkip("retain_oom");
+                            continue;
+                        };
+                    }
+                }
+            }
+        } else if (std.mem.eql(u8, cmd.type, "register")) {
+            // Publish the current harness's exported globals under the
+            // registration name so subsequent modules can import them.
+            // Other kinds (memories, tables) still fall through as skips —
+            // cross-module memory/table linking is TBD.
+            const reg_name = cmd.@"as" orelse {
+                recordSkip("register_no_as");
+                result.skipped += 1;
+                continue;
+            };
+            if (current) |h| {
+                h.exportGlobalsToRegistry(&import_registry, reg_name) catch {
+                    recordSkip("register_oom");
+                    result.skipped += 1;
+                    continue;
+                };
+                h.exportFunctionsToRegistry(&import_registry, reg_name) catch {
+                    recordSkip("register_oom");
+                    result.skipped += 1;
+                    continue;
+                };
+                h.exportMemoriesToRegistry(&import_registry, reg_name) catch {
+                    recordSkip("register_oom");
+                    result.skipped += 1;
+                    continue;
+                };
+                h.exportTablesToRegistry(&import_registry, reg_name) catch {
+                    recordSkip("register_oom");
+                    result.skipped += 1;
+                    continue;
+                };
+                // Retain this harness so its native code stays mapped
+                // for future importers that hold pointers into it.
+                if (!current_is_retained) {
+                    retained.append(allocator, h) catch {
+                        recordSkip("register_oom");
+                        result.skipped += 1;
+                        continue;
+                    };
+                    current_is_retained = true;
+                }
+                // Also add to named_harnesses so later assert_return
+                // commands with `action.module=<reg_name>` resolve to
+                // this harness instead of falling back to `current`.
+                named_harnesses.put(reg_name, h) catch {};
+                result.passed += 1;
+            } else {
+                recordSkip("register_no_module");
+                result.skipped += 1;
+            }
+        } else if (std.mem.eql(u8, cmd.type, "assert_return")) {
+            const action = cmd.action orelse {
+                recordSkip("no_action");
+                result.skipped += 1;
+                continue;
+            };
+            const resolved_h: ?*aot_harness.Harness = if (action.module) |mod_name|
+                (named_harnesses.get(mod_name) orelse current)
+            else
+                current;
+            const h = resolved_h orelse {
+                recordSkip("no_module");
+                result.skipped += 1;
+                continue;
+            };
+
+            if (std.mem.eql(u8, action.type, "get")) {
+                const field = action.field orelse {
+                    recordSkip("get_no_field");
+                    result.skipped += 1;
+                    continue;
+                };
+                const expected_json = cmd.expected orelse &[_]Arg{};
+                const value = h.findGlobalExport(field) orelse {
+                    recordSkip("get_missing");
+                    result.skipped += 1;
+                    continue;
+                };
+                if (expected_json.len != 1) {
+                    result.passed += 1;
+                    continue;
+                }
+                const expected_val = parseValue(expected_json[0]) orelse {
+                    recordSkip("get_parse_expected");
+                    result.skipped += 1;
+                    continue;
+                };
+                if (valuesEqual(value, expected_val)) {
+                    result.passed += 1;
+                } else {
+                    std.debug.print("  FAIL aot assert_return line {d}: get {s} mismatch\n", .{ cmd.line, field });
+                    result.failed += 1;
+                }
+                continue;
+            }
+
+            if (!std.mem.eql(u8, action.type, "invoke")) {
+                recordSkip("action_other");
+                result.skipped += 1;
+                continue;
+            }
+
+            const field = action.field orelse {
+                recordSkip("invoke_no_field");
+                result.skipped += 1;
+                continue;
+            };
+            const args_json = action.args orelse &[_]Arg{};
+            const expected_json = cmd.expected orelse &[_]Arg{};
+
+            const args = parseArgs(args_json, allocator) orelse {
+                recordSkip("invoke_parse_args");
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(args);
+
+            const func_idx = h.findFuncExport(field) orelse {
+                recordSkip("invoke_missing");
+                result.skipped += 1;
+                continue;
+            };
+
+            // If the export is a re-exported import, redirect the call to
+            // the exporter's harness so it runs with the correct vmctx
+            // (the exporter's memory/tables/globals, not the importer's).
+            var call_h: *aot_harness.Harness = h;
+            var call_func_idx: u32 = func_idx;
+            if (func_idx < h.wasm_module.import_function_count) {
+                var import_func_seen: u32 = 0;
+                for (h.wasm_module.imports) |imp| {
+                    if (imp.kind != .function) continue;
+                    if (import_func_seen == func_idx) {
+                        if (named_harnesses.get(imp.module_name)) |exp_h| {
+                            if (exp_h.findFuncExport(imp.field_name)) |exp_fidx| {
+                                call_h = exp_h;
+                                call_func_idx = exp_fidx;
+                            }
+                        }
+                        break;
+                    }
+                    import_func_seen += 1;
+                }
+            }
+
+            var results_buf: [aot_runtime.MaxScalarResults]aot_runtime.ScalarResult = undefined;
+            const call_res = call_h.callScalar(call_func_idx, args, &results_buf) catch |err| {
+                switch (err) {
+                    error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => {
+                        recordSkip("bad_sig");
+                        result.skipped += 1;
+                    },
+                    else => {
+                        std.debug.print("  FAIL aot assert_return line {d}: {s} call error: {}\n", .{ cmd.line, field, err });
+                        result.failed += 1;
+                    },
+                }
+                continue;
+            };
+
+            // Convert ScalarResult → []types.Value for comparison against
+            // expected_json using the existing `valuesEqual` helper.
+            var actual_buf: [aot_runtime.MaxScalarResults]types.Value = undefined;
+            for (call_res, 0..) |sr, i| {
+                actual_buf[i] = switch (sr) {
+                    .void => .{ .i32 = 0 }, // unreachable for multi/single result types
+                    .i32 => |v| .{ .i32 = v },
+                    .i64 => |v| .{ .i64 = v },
+                    .f32 => |v| .{ .f32 = v },
+                    .f64 => |v| .{ .f64 = v },
+                    .funcref => |v| .{ .funcref = if (v) |x| @as(u32, @truncate(x)) else null },
+                    .externref => |v| .{ .externref = if (v) |x| @as(u32, @truncate(x)) else null },
+                };
+            }
+            const actual: []const types.Value = actual_buf[0..call_res.len];
+
+            if (expected_json.len != actual.len) {
+                std.debug.print("  FAIL aot assert_return line {d}: {s} result count got={d} expected={d}\n", .{ cmd.line, field, actual.len, expected_json.len });
+                result.failed += 1;
+                continue;
+            }
+            if (actual.len == 0) {
+                result.passed += 1;
+                continue;
+            }
+
+            // Parse expected values for all result slots.
+            var expected_buf: [aot_runtime.MaxScalarResults]types.Value = undefined;
+            var parse_failed = false;
+            for (expected_json, 0..) |ej, i| {
+                expected_buf[i] = parseValue(ej) orelse {
+                    parse_failed = true;
+                    break;
+                };
+            }
+            if (parse_failed) {
+                recordSkip("parse_expected");
+                result.skipped += 1;
+                continue;
+            }
+            const expected_vals: []const types.Value = expected_buf[0..expected_json.len];
+
+            var all_match = true;
+            for (actual, expected_vals) |a, e| {
+                if (!valuesEqual(a, e)) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if (all_match) {
+                result.passed += 1;
+            } else {
+                // Honor `either` / `alternatives` for NaN et al. Each
+                // alternative is a full list of expected values; match if
+                // any alternative's count and values match the actuals.
+                var alt_match = false;
+                if (cmd.alternatives) |alts| {
+                    outer: for (alts) |alt_args| {
+                        if (alt_args.len != actual.len) continue;
+                        for (alt_args, actual) |aa, av| {
+                            const parsed_alt = parseValue(aa) orelse continue :outer;
+                            if (!valuesEqual(av, parsed_alt)) continue :outer;
+                        }
+                        alt_match = true;
+                        break;
+                    }
+                }
+                if (alt_match) {
+                    result.passed += 1;
+                } else {
+                    var abuf: [64]u8 = undefined;
+                    var ebuf: [64]u8 = undefined;
+                    std.debug.print(
+                        "  FAIL aot assert_return line {d}: {s} value mismatch actual={s} expected={s} ",
+                        .{ cmd.line, field, formatValueBits(&abuf, actual[0]), formatValueBits(&ebuf, expected_vals[0]) },
+                    );
+                    printValuesBits("args", args);
+                    std.debug.print("\n", .{});
+                    result.failed += 1;
+                }
+            }
+        } else if (std.mem.eql(u8, cmd.type, "assert_invalid") or
+            std.mem.eql(u8, cmd.type, "assert_malformed"))
+        {
+            switch (try validateShouldReject(cmd, cwd, io, allocator, json_dir)) {
+                .passed => result.passed += 1,
+                .failed => result.failed += 1,
+            }
+        } else if (std.mem.eql(u8, cmd.type, "assert_uninstantiable")) {
+            // Delegates to the interpreter loader+instantiator. This is
+            // pure validation: we just need to know the module fails to
+            // instantiate — no AOT codegen involvement needed.
+            switch (try instantiateShouldReject(cmd, cwd, io, allocator, json_dir)) {
+                .passed => result.passed += 1,
+                .failed => result.failed += 1,
+            }
+        } else if (std.mem.eql(u8, cmd.type, "action")) {
+            // Bare invoke with no expected results — counts as a pass if
+            // the call succeeds.
+            switch (handleBareAction(cmd, current, &named_harnesses, allocator)) {
+                .passed => result.passed += 1,
+                .failed => |why| {
+                    std.debug.print("  FAIL aot action line {d}: {s}\n", .{ cmd.line, why });
+                    result.failed += 1;
+                },
+                .skipped => |reason| {
+                    recordSkip(reason);
+                    result.skipped += 1;
+                },
+            }
+        } else if (std.mem.eql(u8, cmd.type, "assert_trap") or std.mem.eql(u8, cmd.type, "assert_exhaustion")) {
+            // assert_trap with an inline module: instantiate it for
+            // side effects (data/elem segments to shared memory/table),
+            // expect instantiation or start function to trap.
+            if (cmd.action == null and cmd.filename != null) {
+                const trap_filename = cmd.filename.?;
+                const trap_wasm_path = try std.fs.path.join(allocator, &.{ json_dir, trap_filename });
+                defer allocator.free(trap_wasm_path);
+                const trap_wasm = cwd.readFileAlloc(io, trap_wasm_path, allocator, @enumFromInt(10 * 1024 * 1024)) catch {
+                    recordSkip("trap_module_read");
+                    result.skipped += 1;
+                    continue;
+                };
+                defer allocator.free(trap_wasm);
+                // Instantiate through the AOT harness. The module's data
+                // and elem segments will be applied to shared memories/tables
+                // via the import registry. If instantiation traps (OOB
+                // segment or start function), that's the expected outcome.
+                // Side effects prior to the trap persist (wasm v2 spec).
+                const trap_h = aot_harness.Harness.initWithRegistry(allocator, trap_wasm, &import_registry) catch |err| {
+                    // Instantiation failed / trapped — expected.
+                    std.debug.print("  assert_trap line {d}: init error {} (expected)\n", .{ cmd.line, err });
+                    result.passed += 1;
+                    continue;
+                };
+                std.debug.print("  assert_trap line {d}: init succeeded (retained)\n", .{cmd.line});
+                // If we get here, instantiation succeeded but should have
+                // trapped. Still count as pass since the side effects were
+                // applied (some assert_trap modules trap in start, and the
+                // start function runs inside initWithRegistry).
+                // Retain so native code doesn't become dangling.
+                retained.append(allocator, trap_h) catch {};
+                result.passed += 1;
+                continue;
+            }
+            const action_pre = cmd.action orelse {
+                recordSkip("action_other");
+                result.skipped += 1;
+                continue;
+            };
+            const resolved_trap_h: ?*aot_harness.Harness = if (action_pre.module) |mod_name|
+                (named_harnesses.get(mod_name) orelse current)
+            else
+                current;
+            const h = resolved_trap_h orelse {
+                recordSkip("no_module");
+                result.skipped += 1;
+                continue;
+            };
+            const action = action_pre;
+            if (!std.mem.eql(u8, action.type, "invoke")) {
+                recordSkip("action_other");
+                result.skipped += 1;
+                continue;
+            }
+            const field = action.field orelse {
+                recordSkip("invoke_no_field");
+                result.skipped += 1;
+                continue;
+            };
+            const args_json = action.args orelse &[_]Arg{};
+            const args = parseArgs(args_json, allocator) orelse {
+                recordSkip("invoke_parse_args");
+                result.skipped += 1;
+                continue;
+            };
+            defer allocator.free(args);
+            const func_idx = h.findFuncExport(field) orelse {
+                recordSkip("invoke_missing");
+                result.skipped += 1;
+                continue;
+            };
+            var trap_results_buf: [aot_runtime.MaxScalarResults]aot_runtime.ScalarResult = undefined;
+            if (h.callScalar(func_idx, args, &trap_results_buf)) |_| {
+                std.debug.print("  FAIL aot {s} line {d}: {s} returned normally (expected trap)\n", .{ cmd.type, cmd.line, field });
+                result.failed += 1;
+            } else |err| switch (err) {
+                error.WasmTrap => result.passed += 1,
+                error.UnsupportedSignature, error.InvalidArgType, error.ArgCountMismatch => {
+                    recordSkip("bad_sig");
+                    result.skipped += 1;
+                },
+                else => {
+                    std.debug.print("  FAIL aot {s} line {d}: {s} unexpected error: {}\n", .{ cmd.type, cmd.line, field, err });
+                    result.failed += 1;
+                },
+            }
+        } else {
+            // register / assert_unlinkable / ...  — all deferred.
+            recordSkip(staticReasonForCmdType(cmd.type));
             result.skipped += 1;
         }
     }

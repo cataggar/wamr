@@ -115,6 +115,41 @@ pub fn isWasiModule(module_name: []const u8) bool {
         std.mem.eql(u8, module_name, "wasi");
 }
 
+// ── Spectest stubs ────────────────────────────────────────────────────
+//
+// The WebAssembly reference-test suite imports a small set of `spectest.*`
+// functions (see tests/spec-json/*.wasm). The test runner treats these as
+// no-ops: the spec only asserts that calls don't trap. A single `ret` is
+// sufficient for every print_* signature because x86-64 callers own their
+// stack args (no callee cleanup) and unused arg registers can be left alone.
+
+pub fn aotSpectestNoop(_: *VmCtx) callconv(.c) void {}
+
+/// True if `module_name` is the `spectest` module used by the WebAssembly
+/// reference test suite.
+pub fn isSpectestModule(module_name: []const u8) bool {
+    return std.mem.eql(u8, module_name, "spectest");
+}
+
+/// Resolve a `spectest.*` function name to a no-op AOT adapter. Returns null
+/// for names outside the spec's standard surface (print/print_i32/... etc).
+pub fn resolveAotSpectestFunction(name: []const u8) ?*const anyopaque {
+    const known = [_][]const u8{
+        "print",
+        "print_i32",
+        "print_i64",
+        "print_f32",
+        "print_f64",
+        "print_i32_f32",
+        "print_f64_f64",
+    };
+    for (known) |k| {
+        if (std.mem.eql(u8, name, k))
+            return @as(*const anyopaque, @ptrCast(&aotSpectestNoop));
+    }
+    return null;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 test "resolveAotHostFunction: all known functions resolve" {

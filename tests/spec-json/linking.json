@@ -1,0 +1,2056 @@
+{
+  "commands": [
+    {
+      "type": "module",
+      "line": 3,
+      "filename": "linking.0.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 7,
+      "as": "Mf"
+    },
+    {
+      "type": "module",
+      "line": 9,
+      "filename": "linking.1.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 17,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mf",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "2"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 18,
+      "action": {
+        "type": "invoke",
+        "field": "Mf.call",
+        "module": "Nf",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "2"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 19,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nf",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "3"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 20,
+      "action": {
+        "type": "invoke",
+        "field": "call Mf.call",
+        "module": "Nf",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "2"
+        }
+      ]
+    },
+    {
+      "type": "module",
+      "line": 22,
+      "filename": "linking.2.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 26,
+      "as": "reexport_f"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 27,
+      "filename": "linking.3.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 31,
+      "filename": "linking.4.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 39,
+      "filename": "linking.5.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 48,
+      "as": "Mg"
+    },
+    {
+      "type": "module",
+      "line": 50,
+      "filename": "linking.6.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 67,
+      "action": {
+        "type": "get",
+        "field": "glob",
+        "module": "Mg"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "42"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 68,
+      "action": {
+        "type": "get",
+        "field": "Mg.glob",
+        "module": "Ng"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "42"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 69,
+      "action": {
+        "type": "get",
+        "field": "glob",
+        "module": "Ng"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "43"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 70,
+      "action": {
+        "type": "invoke",
+        "field": "get",
+        "module": "Mg",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "42"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 71,
+      "action": {
+        "type": "invoke",
+        "field": "Mg.get",
+        "module": "Ng",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "42"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 72,
+      "action": {
+        "type": "invoke",
+        "field": "get",
+        "module": "Ng",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "43"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 74,
+      "action": {
+        "type": "get",
+        "field": "mut_glob",
+        "module": "Mg"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "142"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 75,
+      "action": {
+        "type": "get",
+        "field": "Mg.mut_glob",
+        "module": "Ng"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "142"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 76,
+      "action": {
+        "type": "invoke",
+        "field": "get_mut",
+        "module": "Mg",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "142"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 77,
+      "action": {
+        "type": "invoke",
+        "field": "Mg.get_mut",
+        "module": "Ng",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "142"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 79,
+      "action": {
+        "type": "invoke",
+        "field": "set_mut",
+        "module": "Mg",
+        "args": [
+          {
+            "type": "i32",
+            "value": "241"
+          }
+        ]
+      },
+      "expected": []
+    },
+    {
+      "type": "assert_return",
+      "line": 80,
+      "action": {
+        "type": "get",
+        "field": "mut_glob",
+        "module": "Mg"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "241"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 81,
+      "action": {
+        "type": "get",
+        "field": "Mg.mut_glob",
+        "module": "Ng"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "241"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 82,
+      "action": {
+        "type": "invoke",
+        "field": "get_mut",
+        "module": "Mg",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "241"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 83,
+      "action": {
+        "type": "invoke",
+        "field": "Mg.get_mut",
+        "module": "Ng",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "241"
+        }
+      ]
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 86,
+      "filename": "linking.7.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 90,
+      "filename": "linking.8.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 96,
+      "filename": "linking.9.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 110,
+      "as": "Mref_ex"
+    },
+    {
+      "type": "module",
+      "line": 112,
+      "filename": "linking.10.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 132,
+      "filename": "linking.11.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 137,
+      "filename": "linking.12.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 141,
+      "filename": "linking.13.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 145,
+      "filename": "linking.14.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 150,
+      "filename": "linking.15.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 154,
+      "filename": "linking.16.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 158,
+      "filename": "linking.17.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 163,
+      "filename": "linking.18.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 167,
+      "filename": "linking.19.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 171,
+      "filename": "linking.20.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 175,
+      "filename": "linking.21.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 181,
+      "filename": "linking.22.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 185,
+      "filename": "linking.23.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 189,
+      "filename": "linking.24.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 193,
+      "filename": "linking.25.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 198,
+      "filename": "linking.26.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 202,
+      "filename": "linking.27.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 206,
+      "filename": "linking.28.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 210,
+      "filename": "linking.29.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 215,
+      "filename": "linking.30.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 219,
+      "filename": "linking.31.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 223,
+      "filename": "linking.32.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 227,
+      "filename": "linking.33.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 232,
+      "filename": "linking.34.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 236,
+      "filename": "linking.35.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 240,
+      "filename": "linking.36.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 244,
+      "filename": "linking.37.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 249,
+      "filename": "linking.38.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 253,
+      "filename": "linking.39.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 257,
+      "filename": "linking.40.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 261,
+      "filename": "linking.41.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 269,
+      "filename": "linking.42.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 282,
+      "as": "Mt"
+    },
+    {
+      "type": "module",
+      "line": 284,
+      "filename": "linking.43.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 303,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 304,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 305,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 306,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 308,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 309,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_return",
+      "line": 310,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 311,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 313,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 314,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_return",
+      "line": 315,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 316,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 318,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "20"
+          }
+        ]
+      },
+      "text": "undefined element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 319,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "20"
+          }
+        ]
+      },
+      "text": "undefined element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 320,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "7"
+          }
+        ]
+      },
+      "text": "undefined element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 321,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "20"
+          }
+        ]
+      },
+      "text": "undefined element"
+    },
+    {
+      "type": "assert_return",
+      "line": 323,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "3"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4294967292"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 324,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "4"
+          }
+        ]
+      },
+      "text": "indirect call type mismatch"
+    },
+    {
+      "type": "module",
+      "line": 326,
+      "filename": "linking.44.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 339,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "3"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 340,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "3"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 341,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "3"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 342,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Ot",
+        "args": [
+          {
+            "type": "i32",
+            "value": "3"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 344,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4294967292"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 345,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4294967292"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 346,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 347,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4294967292"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 348,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Ot",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4294967292"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 350,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "6"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 351,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "6"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 352,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 353,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "6"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 354,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Ot",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "6"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 356,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 357,
+      "action": {
+        "type": "invoke",
+        "field": "Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_return",
+      "line": 358,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 359,
+      "action": {
+        "type": "invoke",
+        "field": "call Mt.call",
+        "module": "Nt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 360,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Ot",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 362,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Ot",
+        "args": [
+          {
+            "type": "i32",
+            "value": "20"
+          }
+        ]
+      },
+      "text": "undefined element"
+    },
+    {
+      "type": "module",
+      "line": 364,
+      "filename": "linking.45.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 370,
+      "filename": "linking.46.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 371,
+      "as": "G1"
+    },
+    {
+      "type": "module",
+      "line": 372,
+      "filename": "linking.47.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 376,
+      "action": {
+        "type": "get",
+        "field": "g",
+        "module": "G2"
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 378,
+      "text": "out of bounds table access"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 387,
+      "filename": "linking.48.wasm",
+      "text": "unknown import",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_trap",
+      "line": 397,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "7"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 401,
+      "text": "out of bounds table access",
+      "filename": "linking.trap401.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 410,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "7"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 411,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "8"
+          }
+        ]
+      },
+      "text": "uninitialized element"
+    },
+    {
+      "type": "assert_trap",
+      "line": 413,
+      "text": "out of bounds memory access",
+      "filename": "linking.trap413.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 423,
+      "action": {
+        "type": "invoke",
+        "field": "call",
+        "module": "Mt",
+        "args": [
+          {
+            "type": "i32",
+            "value": "7"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "type": "module",
+      "line": 426,
+      "filename": "linking.49.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 432,
+      "as": "Mtable_ex"
+    },
+    {
+      "type": "module",
+      "line": 434,
+      "filename": "linking.50.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 441,
+      "filename": "linking.51.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 445,
+      "filename": "linking.52.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 450,
+      "filename": "linking.53.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 454,
+      "filename": "linking.54.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 459,
+      "filename": "linking.55.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 463,
+      "filename": "linking.56.wasm",
+      "text": "incompatible import type",
+      "module_type": "binary"
+    },
+    {
+      "type": "module",
+      "line": 471,
+      "filename": "linking.57.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 479,
+      "as": "Mm"
+    },
+    {
+      "type": "module",
+      "line": 481,
+      "filename": "linking.58.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 493,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Mm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "12"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "2"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 494,
+      "action": {
+        "type": "invoke",
+        "field": "Mm.load",
+        "module": "Nm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "12"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "2"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 495,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Nm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "12"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "242"
+        }
+      ]
+    },
+    {
+      "type": "module",
+      "line": 497,
+      "filename": "linking.59.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 506,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Mm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "12"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "167"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 507,
+      "action": {
+        "type": "invoke",
+        "field": "Mm.load",
+        "module": "Nm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "12"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "167"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 508,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Nm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "12"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "242"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 509,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Om",
+        "args": [
+          {
+            "type": "i32",
+            "value": "12"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "167"
+        }
+      ]
+    },
+    {
+      "type": "module",
+      "line": 511,
+      "filename": "linking.60.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_trap",
+      "line": 516,
+      "text": "out of bounds memory access"
+    },
+    {
+      "type": "module",
+      "line": 524,
+      "filename": "linking.61.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 532,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 533,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "2"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "1"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 534,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "3"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 535,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "3"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 536,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 537,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 538,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "1"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "4294967295"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 539,
+      "action": {
+        "type": "invoke",
+        "field": "grow",
+        "module": "Pm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "5"
+        }
+      ]
+    },
+    {
+      "type": "assert_unlinkable",
+      "line": 541,
+      "filename": "linking.62.wasm",
+      "text": "unknown import",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 550,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Mm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 554,
+      "text": "out of bounds memory access",
+      "filename": "linking.trap554.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 563,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Mm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "97"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 564,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Mm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "327670"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "0"
+        }
+      ]
+    },
+    {
+      "type": "assert_trap",
+      "line": 566,
+      "text": "out of bounds table access",
+      "filename": "linking.trap566.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 576,
+      "action": {
+        "type": "invoke",
+        "field": "load",
+        "module": "Mm",
+        "args": [
+          {
+            "type": "i32",
+            "value": "0"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "97"
+        }
+      ]
+    },
+    {
+      "type": "module",
+      "line": 579,
+      "filename": "linking.63.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "register",
+      "line": 590,
+      "as": "Ms"
+    },
+    {
+      "type": "assert_trap",
+      "line": 592,
+      "text": "unreachable",
+      "filename": "linking.trap592.wasm",
+      "module_type": "binary"
+    },
+    {
+      "type": "assert_return",
+      "line": 609,
+      "action": {
+        "type": "invoke",
+        "field": "get memory[0]",
+        "module": "Ms",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "104"
+        }
+      ]
+    },
+    {
+      "type": "assert_return",
+      "line": 610,
+      "action": {
+        "type": "invoke",
+        "field": "get table[0]",
+        "module": "Ms",
+        "args": []
+      },
+      "expected": [
+        {
+          "type": "i32",
+          "value": "57005"
+        }
+      ]
+    }
+  ]
+}

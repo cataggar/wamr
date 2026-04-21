@@ -239,6 +239,13 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, 2, reg.low3());
     }
 
+    /// JMP reg — emits an indirect jump through a register (FF /4).
+    pub fn jmpReg(self: *CodeBuffer, reg: Reg) !void {
+        if (reg.isExtended()) try self.emitByte(0x41); // REX.B
+        try self.emitByte(0xFF);
+        try self.modrm(0b11, 4, reg.low3());
+    }
+
     /// JMP rel32 — emits a 5-byte near jump with a 32-bit relative offset.
     pub fn jmpRel32(self: *CodeBuffer, rel: i32) !void {
         try self.emitByte(0xE9);
@@ -334,9 +341,26 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, b.low3(), a.low3());
     }
 
+    /// TEST reg, reg (32-bit). Emits REX only if either reg is extended.
+    pub fn testRegReg32(self: *CodeBuffer, a: Reg, b: Reg) !void {
+        if (a.isExtended() or b.isExtended()) {
+            var rex_byte: u8 = 0x40;
+            if (b.isExtended()) rex_byte |= 0x04; // REX.R
+            if (a.isExtended()) rex_byte |= 0x01; // REX.B
+            try self.emitByte(rex_byte);
+        }
+        try self.emitByte(0x85);
+        try self.modrm(0b11, b.low3(), a.low3());
+    }
+
     /// CQO — sign-extend RAX into RDX:RAX (REX.W + 99).
     pub fn cqo(self: *CodeBuffer) !void {
         try self.emitByte(0x48); // REX.W
+        try self.emitByte(0x99);
+    }
+
+    /// CDQ — sign-extend EAX into EDX:EAX (0x99, no REX.W).
+    pub fn cdq(self: *CodeBuffer) !void {
         try self.emitByte(0x99);
     }
 
@@ -347,9 +371,23 @@ pub const CodeBuffer = struct {
         try self.modrm(0b11, 7, src.low3());
     }
 
+    /// IDIV r/m32 — signed divide EDX:EAX by reg32.
+    pub fn idivReg32(self: *CodeBuffer, src: Reg) !void {
+        if (src.isExtended()) try self.emitByte(0x41); // REX.B for r8-r15
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 7, src.low3());
+    }
+
     /// DIV r/m64 — unsigned divide RDX:RAX by reg.
     pub fn divReg(self: *CodeBuffer, src: Reg) !void {
         try self.rexW(.rax, src);
+        try self.emitByte(0xF7);
+        try self.modrm(0b11, 6, src.low3());
+    }
+
+    /// DIV r/m32 — unsigned divide EDX:EAX by reg32.
+    pub fn divReg32(self: *CodeBuffer, src: Reg) !void {
+        if (src.isExtended()) try self.emitByte(0x41); // REX.B for r8-r15
         try self.emitByte(0xF7);
         try self.modrm(0b11, 6, src.low3());
     }
@@ -872,6 +910,38 @@ pub const CodeBuffer = struct {
     pub fn cvttss2si(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
         try self.emitByte(0xF3);
         try self.rexW(gpr, xmm);
+        try self.emitSlice(&.{ 0x0F, 0x2C });
+        try self.modrm(0b11, gpr.low3(), xmm.low3());
+    }
+
+    /// CVTSI2SD xmm, r32 — convert signed i32 to f64
+    pub fn cvtsi2sd32(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0xF2);
+        try self.rex(false, xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x2A });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// CVTSI2SS xmm, r32 — convert signed i32 to f32
+    pub fn cvtsi2ss32(self: *CodeBuffer, xmm: Reg, gpr: Reg) !void {
+        try self.emitByte(0xF3);
+        try self.rex(false, xmm, gpr);
+        try self.emitSlice(&.{ 0x0F, 0x2A });
+        try self.modrm(0b11, xmm.low3(), gpr.low3());
+    }
+
+    /// CVTTSD2SI r32, xmm — truncate f64 to signed i32
+    pub fn cvttsd2si32(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0xF2);
+        try self.rex(false, gpr, xmm);
+        try self.emitSlice(&.{ 0x0F, 0x2C });
+        try self.modrm(0b11, gpr.low3(), xmm.low3());
+    }
+
+    /// CVTTSS2SI r32, xmm — truncate f32 to signed i32
+    pub fn cvttss2si32(self: *CodeBuffer, gpr: Reg, xmm: Reg) !void {
+        try self.emitByte(0xF3);
+        try self.rex(false, gpr, xmm);
         try self.emitSlice(&.{ 0x0F, 0x2C });
         try self.modrm(0b11, gpr.low3(), xmm.low3());
     }

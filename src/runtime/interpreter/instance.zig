@@ -357,7 +357,7 @@ fn initializeGlobals(module: *const types.WasmModule, allocator: std.mem.Allocat
 }
 
 /// Evaluate a constant init expression.
-fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalInstance, inst: ?*types.ModuleInstance) InstantiationError!types.Value {
+pub fn evalInitExpr(expr: types.InitExpr, preceding_globals: []const *types.GlobalInstance, inst: ?*types.ModuleInstance) InstantiationError!types.Value {
     return switch (expr) {
         .i32_const => |v| .{ .i32 = v },
         .i64_const => |v| .{ .i64 = v },

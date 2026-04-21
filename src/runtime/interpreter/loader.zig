@@ -500,6 +500,19 @@ fn readTableType(reader: *BinaryReader, type_count: u32, _: u32) LoadError!types
         const info = try readValTypeWithTidx(reader, type_count);
         const lr = try readLimitsEx(reader);
         const init_expr = try parseInitExprChecked(reader, type_count, null);
+        // Validate init_expr type against elem_type nullability.
+        // Non-null elem types (e.g., (ref func), (ref $t)) require a non-null init.
+        // ref.null produces a nullable ref and is invalid here.
+        const elem_is_non_null = switch (info.vt) {
+            .nonfuncref, .nonexternref => true,
+            else => false,
+        };
+        if (elem_is_non_null) {
+            switch (init_expr) {
+                .ref_null => return error.TypeMismatch,
+                else => {},
+            }
+        }
         return .{ .elem_type = info.vt, .limits = lr.limits, .elem_tidx = info.tidx, .init_expr = init_expr, .is_table64 = lr.is_64 };
     }
 
