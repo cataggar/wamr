@@ -4964,18 +4964,35 @@ fn makeAllocResult(allocator: std.mem.Allocator, mapping: []const struct { vreg:
     return .{ .assignments = map, .spill_count = 0 };
 }
 
-test "emitCallRegArgMoves: resolves arg[0]→rdx / arg[1]→r8 when arg[1] source is rdx" {
-    // Scenario from coremark malloc→alloc: RA placed arg[1] in rdx
-    // (param_regs[1], = arg[0]'s target). Naive sequential copy would
-    // `mov rdx, rdi` (arg0) first, clobbering the 4 in rdx, then `mov r8, rdx`
-    // would pick up the clobbered value. The fixed emitter must move arg[1]
-    // (src=rdx → r8) BEFORE arg[0] (src=rdi → rdx).
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+/// Encode `mov dst, src` through the same emitter the production code uses,
+/// so assertions compare against the byte sequence the emitter would actually
+/// produce on the current architecture/ABI. Returned buffer is owned by
+/// `out_buf` and freed on `deinit`.
+fn encodeMov(allocator: std.mem.Allocator, dst: emit.Reg, src: emit.Reg) !emit.CodeBuffer {
+    var buf = emit.CodeBuffer.init(allocator);
+    errdefer buf.deinit();
+    try buf.movRegReg(dst, src);
+    return buf;
+}
 
+test "emitCallRegArgMoves: resolves arg[0]→p1 / arg[1]→p2 when arg[1] source is p1" {
+    // Scenario from coremark malloc→alloc (generalized across ABIs): RA
+    // placed arg[1] in `param_regs[1]` — which is also arg[0]'s target.
+    // A naive sequential copy would `mov p1, src(arg0)` first, clobbering
+    // arg[1]'s value in p1, then `mov p2, p1` would pick up the clobbered
+    // value. The fixed emitter must move arg[1] (src=p1 → p2) BEFORE
+    // arg[0] (src=X → p1).
     const allocator = std.testing.allocator;
+    // arg[0]'s source: any reg that is NOT a parameter register on either
+    // ABI so it can't conflict. `.rbx` is callee-saved on both Win64 and
+    // SysV, and is never in `param_regs`.
+    const arg0_src: emit.Reg = .rbx;
+    const p1 = param_regs[1];
+    const p2 = param_regs[2];
+
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = 7 }, // arg[0] in rdi
-        .{ .vreg = 1, .reg = 2 }, // arg[1] in rdx
+        .{ .vreg = 0, .reg = @intFromEnum(arg0_src) },
+        .{ .vreg = 1, .reg = @intFromEnum(p1) },
     });
     defer alloc_result.deinit();
 
@@ -4986,25 +5003,26 @@ test "emitCallRegArgMoves: resolves arg[0]→rdx / arg[1]→r8 when arg[1] sourc
     try emitCallRegArgMoves(&code, &alloc_result, &args, 2);
     const bytes = code.bytes.items;
 
-    // Correct emission: `mov r8, rdx` (49 89 D0) must precede `mov rdx, rdi`
-    // (48 89 FA) so that arg[1]'s value is saved before arg[0]'s move
-    // overwrites rdx.
-    const mov_r8_rdx = [_]u8{ 0x49, 0x89, 0xD0 };
-    const mov_rdx_rdi = [_]u8{ 0x48, 0x89, 0xFA };
-    const idx_r8 = std.mem.indexOf(u8, bytes, &mov_r8_rdx) orelse return error.TestExpectedMovR8RdxEmitted;
-    const idx_rdx = std.mem.indexOf(u8, bytes, &mov_rdx_rdi) orelse return error.TestExpectedMovRdxRdiEmitted;
-    try std.testing.expect(idx_r8 < idx_rdx);
+    // Expected encodings for `mov p2, p1` and `mov p1, arg0_src`. The
+    // former must precede the latter to avoid clobbering p1 before it is
+    // read.
+    var save_arg1 = try encodeMov(allocator, p2, p1);
+    defer save_arg1.deinit();
+    var move_arg0 = try encodeMov(allocator, p1, arg0_src);
+    defer move_arg0.deinit();
+
+    const idx_save = std.mem.indexOf(u8, bytes, save_arg1.bytes.items) orelse return error.TestExpectedArg1SaveEmitted;
+    const idx_move = std.mem.indexOf(u8, bytes, move_arg0.bytes.items) orelse return error.TestExpectedArg0MoveEmitted;
+    try std.testing.expect(idx_save < idx_move);
 }
 
 test "emitCallRegArgMoves: identity moves are elided" {
     // When every arg[i] is already in param_regs[i+1], no moves should be emitted.
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = 2 }, // arg[0] already in rdx = param_regs[1]
-        .{ .vreg = 1, .reg = 8 }, // arg[1] already in r8  = param_regs[2]
-        .{ .vreg = 2, .reg = 9 }, // arg[2] already in r9  = param_regs[3]
+        .{ .vreg = 0, .reg = @intFromEnum(param_regs[1]) },
+        .{ .vreg = 1, .reg = @intFromEnum(param_regs[2]) },
+        .{ .vreg = 2, .reg = @intFromEnum(param_regs[3]) },
     });
     defer alloc_result.deinit();
 
@@ -5017,14 +5035,15 @@ test "emitCallRegArgMoves: identity moves are elided" {
 }
 
 test "emitCallRegArgMoves: breaks 2-cycle via r10 scratch" {
-    // Cycle: arg[0] src=r8 → rdx; arg[1] src=rdx → r8. No topological order
+    // Cycle: arg[0] src=p2 → p1; arg[1] src=p1 → p2. No topological order
     // exists; the fix must save one source into r10, then finish the copy.
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-
     const allocator = std.testing.allocator;
+    const p1 = param_regs[1];
+    const p2 = param_regs[2];
+
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = 8 }, // arg[0] in r8  (= arg[1]'s target)
-        .{ .vreg = 1, .reg = 2 }, // arg[1] in rdx (= arg[0]'s target)
+        .{ .vreg = 0, .reg = @intFromEnum(p2) }, // arg[0] in p2 (= arg[1]'s target)
+        .{ .vreg = 1, .reg = @intFromEnum(p1) }, // arg[1] in p1 (= arg[0]'s target)
     });
     defer alloc_result.deinit();
 
@@ -5035,44 +5054,44 @@ test "emitCallRegArgMoves: breaks 2-cycle via r10 scratch" {
     try emitCallRegArgMoves(&code, &alloc_result, &args, 2);
     const bytes = code.bytes.items;
 
-    // Must emit three moves: save one source to r10, then two final moves.
-    // Our algorithm picks the first pending (arg[0], src=r8) as the breaker:
-    //   mov r10, r8   (4D 89 C2)
-    //   mov r8, rdx   (49 89 D0)   ← arg[1]: src=rdx, dst=r8
-    //   mov rdx, r10  (4C 89 D2)   ← arg[0]: src=r10 (was r8), dst=rdx
-    // Whatever the chosen breaker, *some* move into r10 must appear, and the
-    // final register state (rdx := old_r8, r8 := old_rdx) must be achievable.
-    const mov_r10_r8 = [_]u8{ 0x4D, 0x89, 0xC2 }; // r10 <- r8
-    const mov_r10_rdx = [_]u8{ 0x49, 0x89, 0xD2 }; // r10 <- rdx
+    // Whichever source gets chosen as the cycle-breaker, *some* `mov r10, X`
+    // with X ∈ {p1, p2} must appear. The algorithm picks the first pending
+    // arg (arg[0], src=p2) so we expect `mov r10, p2`, but accept either.
+    var break_from_p1 = try encodeMov(allocator, .r10, p1);
+    defer break_from_p1.deinit();
+    var break_from_p2 = try encodeMov(allocator, .r10, p2);
+    defer break_from_p2.deinit();
     const has_breaker =
-        std.mem.indexOf(u8, bytes, &mov_r10_r8) != null or
-        std.mem.indexOf(u8, bytes, &mov_r10_rdx) != null;
+        std.mem.indexOf(u8, bytes, break_from_p1.bytes.items) != null or
+        std.mem.indexOf(u8, bytes, break_from_p2.bytes.items) != null;
     try std.testing.expect(has_breaker);
-    // And the buggy naive sequence `mov rdx, r8; mov r8, rdx` must NOT appear
-    // back-to-back (that would clobber r8 before reading it).
-    const mov_rdx_r8 = [_]u8{ 0x4C, 0x89, 0xC2 }; // rdx <- r8
-    const mov_r8_rdx = [_]u8{ 0x49, 0x89, 0xD0 }; // r8  <- rdx
-    const idx_rdx_r8 = std.mem.indexOf(u8, bytes, &mov_rdx_r8);
-    const idx_r8_rdx = std.mem.indexOf(u8, bytes, &mov_r8_rdx);
-    if (idx_rdx_r8) |a| if (idx_r8_rdx) |b| {
-        // If both appear, `mov rdx, r8` must NOT be immediately before
-        // `mov r8, rdx` (which would be the buggy clobbering sequence).
-        try std.testing.expect(!(a + 3 == b));
+
+    // The buggy naive sequence `mov p1, p2` immediately followed by
+    // `mov p2, p1` must NOT appear — it would clobber p2 before reading.
+    var buggy_a = try encodeMov(allocator, p1, p2);
+    defer buggy_a.deinit();
+    var buggy_b = try encodeMov(allocator, p2, p1);
+    defer buggy_b.deinit();
+    const idx_a = std.mem.indexOf(u8, bytes, buggy_a.bytes.items);
+    const idx_b = std.mem.indexOf(u8, bytes, buggy_b.bytes.items);
+    if (idx_a) |a| if (idx_b) |b| {
+        try std.testing.expect(!(a + buggy_a.bytes.items.len == b));
     };
 }
 
-test "emitCallRegArgMoves: regression — arg[0]=rdi, arg[1]=rdx, arg[2]=rcx (coremark malloc→alloc)" {
-    // Exact shape observed in the bug: caller emits arg[0] from rdi,
-    // arg[1] from rdx, and vmctx is already in rcx (we don't include vmctx
-    // in the reg-arg move set — the call emitter handles vmctx separately).
-    // This regression test asserts the fix does not re-introduce the
-    // clobber pattern `mov rdx, rdi` followed by `mov r8, rdx`.
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-
+test "emitCallRegArgMoves: regression — arg[1] source equals arg[0] target (coremark malloc→alloc)" {
+    // Exact shape observed in the bug (generalized across ABIs): arg[0] is
+    // in some non-param reg, arg[1] is in `param_regs[1]` (which is also
+    // arg[0]'s destination). The fix must not re-introduce the clobber
+    // pattern `mov p1, src(arg0)` followed by `mov p2, p1`.
     const allocator = std.testing.allocator;
+    const arg0_src: emit.Reg = .rbx; // callee-saved on both ABIs; not a param reg.
+    const p1 = param_regs[1];
+    const p2 = param_regs[2];
+
     var alloc_result = try makeAllocResult(allocator, &.{
-        .{ .vreg = 0, .reg = 7 }, // arg[0] in rdi
-        .{ .vreg = 1, .reg = 2 }, // arg[1] in rdx (the bug case)
+        .{ .vreg = 0, .reg = @intFromEnum(arg0_src) },
+        .{ .vreg = 1, .reg = @intFromEnum(p1) }, // the bug trigger
     });
     defer alloc_result.deinit();
 
@@ -5083,13 +5102,14 @@ test "emitCallRegArgMoves: regression — arg[0]=rdi, arg[1]=rdx, arg[2]=rcx (co
     try emitCallRegArgMoves(&code, &alloc_result, &args, 2);
     const bytes = code.bytes.items;
 
-    // Assert the buggy adjacency (`48 89 FA` then `49 89 D0`) is absent.
-    const mov_rdx_rdi = [_]u8{ 0x48, 0x89, 0xFA };
-    if (std.mem.indexOf(u8, bytes, &mov_rdx_rdi)) |a| {
-        const mov_r8_rdx = [_]u8{ 0x49, 0x89, 0xD0 };
-        if (std.mem.indexOf(u8, bytes, &mov_r8_rdx)) |b| {
-            // The buggy pre-fix emitter produced `mov rdx, rdi; mov r8, rdx`
-            // (clobbering). The fixed emitter produces `mov r8, rdx; mov rdx, rdi`.
+    // Assert that if the buggy pattern `mov p1, arg0_src` appears at all,
+    // it is preceded by the save `mov p2, p1` (fixed order).
+    var move_arg0 = try encodeMov(allocator, p1, arg0_src);
+    defer move_arg0.deinit();
+    if (std.mem.indexOf(u8, bytes, move_arg0.bytes.items)) |a| {
+        var save_arg1 = try encodeMov(allocator, p2, p1);
+        defer save_arg1.deinit();
+        if (std.mem.indexOf(u8, bytes, save_arg1.bytes.items)) |b| {
             try std.testing.expect(b < a);
         }
     }

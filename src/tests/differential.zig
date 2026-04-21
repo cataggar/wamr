@@ -16,24 +16,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 
-const loader_mod = @import("../runtime/interpreter/loader.zig");
-const instance_mod = @import("../runtime/interpreter/instance.zig");
-const interp = @import("../runtime/interpreter/interp.zig");
-const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+const wamr = @import("wamr");
+const loader_mod = wamr.loader;
+const instance_mod = wamr.instance;
+const interp = wamr.interp;
+const ExecEnv = wamr.exec_env.ExecEnv;
 
-const frontend = @import("../compiler/frontend.zig");
-const passes = @import("../compiler/ir/passes.zig");
-const x86_64_compile = @import("../compiler/codegen/x86_64/compile.zig");
-const aarch64_compile = @import("../compiler/codegen/aarch64/compile.zig");
-const emit_aot = @import("../compiler/emit_aot.zig");
-const aot_loader = @import("../runtime/aot/loader.zig");
-const aot_runtime = @import("../runtime/aot/runtime.zig");
+const aot_harness = @import("aot_harness.zig");
+const aot_runtime = wamr.aot_runtime;
 
-/// True on targets where the AOT runtime can execute generated code.
-const can_exec_aot = switch (builtin.cpu.arch) {
-    .x86_64 => true,
-    else => false,
-};
+/// Runtime-arch gate for the AOT half of these tests. We deliberately keep
+/// this narrower than `aot_harness.can_exec_aot` (which also lists aarch64):
+/// the specific i32 AOT results asserted below have only ever been validated
+/// on x86_64, and the aarch64 codegen still has known spill-path gaps that
+/// would surface as false failures in this suite. Re-widening is tracked
+/// separately — do not flip this back to the harness's constant without
+/// first fixing the aarch64 AOT codegen.
+const can_exec_aot = builtin.cpu.arch == .x86_64;
 
 /// Run `name` (a `() -> i32` export) through the interpreter.
 fn runInterpI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !i32 {
@@ -52,89 +51,22 @@ fn runInterpI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8
     return env.popI32();
 }
 
-/// Compile `wasm` through the full AOT pipeline, returning the AOT binary.
-/// Caller owns the returned slice.
-fn compileToAot(allocator: std.mem.Allocator, wasm: []const u8) ![]u8 {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    const module = try loader_mod.load(wasm, a);
-
-    var ir_module = try frontend.lowerModule(&module, a);
-    defer ir_module.deinit();
-
-    _ = try passes.runPasses(&ir_module, passes.default_passes, a);
-
-    const code: []const u8, const offsets: []const u32 = switch (builtin.cpu.arch) {
-        .aarch64 => blk: {
-            const r = try aarch64_compile.compileModule(&ir_module, a);
-            break :blk .{ r.code, r.offsets };
-        },
-        else => blk: {
-            const r = try x86_64_compile.compileModule(&ir_module, a);
-            break :blk .{ r.code, r.offsets };
-        },
-    };
-
-    var exports: std.ArrayList(emit_aot.ExportEntry) = .empty;
-    for (module.exports) |exp| {
-        try exports.append(a, .{
-            .name = exp.name,
-            .kind = @enumFromInt(@intFromEnum(exp.kind)),
-            .index = exp.index,
-        });
-    }
-
-    var arch_name = std.mem.zeroes([16]u8);
-    switch (builtin.cpu.arch) {
-        .aarch64 => @memcpy(arch_name[0..7], "aarch64"),
-        else => @memcpy(arch_name[0..6], "x86-64"),
-    }
-
-    // Include memory section if the module declares memory.
-    var mem_entries: std.ArrayList(emit_aot.MemoryEntry) = .empty;
-    for (module.memories) |mem| {
-        try mem_entries.append(a, .{
-            .min_pages = @intCast(mem.limits.min),
-            .max_pages = if (mem.limits.max) |m| @as(?u32, @intCast(m)) else null,
-        });
-    }
-
-    // emit_aot copies `code` / names into its own buffer, so we can return
-    // it even though the arena is torn down on scope exit.
-    return try emit_aot.emit(
-        allocator,
-        code,
-        offsets,
-        exports.items,
-        .{ .arch = arch_name },
-        null,
-        null,
-        if (mem_entries.items.len > 0) mem_entries.items else null,
-        null,
-        null,
-        null,
-        null,
-        null,
-    );
-}
-
-/// Run `name` (a `() -> i32` export) through the AOT pipeline.
+/// Run `name` (a `() -> i32` export) through the AOT pipeline via the shared
+/// `aot_harness.Harness`. Kept as a thin wrapper so `expectDiffI32` reads
+/// symmetrically against `runInterpI32`.
 fn runAotI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !i32 {
-    const aot_bin = try compileToAot(allocator, wasm);
-    defer allocator.free(aot_bin);
+    const h = try aot_harness.Harness.init(allocator, wasm);
+    defer h.deinit();
 
-    const module = try aot_loader.load(aot_bin, allocator);
-    defer aot_loader.unload(&module, allocator);
+    const func_idx = h.findFuncExport(name) orelse return error.FunctionNotFound;
 
-    const inst = try aot_runtime.instantiate(&module, allocator);
-    defer aot_runtime.destroy(inst);
-
-    try aot_runtime.mapCodeExecutable(inst);
-
-    const func_idx = aot_runtime.findExportFunc(inst, name) orelse return error.FunctionNotFound;
-    return aot_runtime.callFunc(inst, func_idx, i32);
+    var results_buf: [1]aot_runtime.ScalarResult = undefined;
+    const results = try h.callScalar(func_idx, &.{}, &results_buf);
+    if (results.len != 1) return error.UnsupportedSignature;
+    return switch (results[0]) {
+        .i32 => |v| v,
+        else => error.InvalidArgType,
+    };
 }
 
 /// Run `wasm` through both pipelines and assert they agree, and match `expected`.

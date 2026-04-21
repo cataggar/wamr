@@ -14,6 +14,8 @@ const builtin = @import("builtin");
 const root = @import("wamr");
 const types = root.types;
 const loader_mod = root.loader;
+const instance_mod = root.instance;
+const sig_registry = root.sig_registry;
 const frontend = root.frontend;
 const passes = root.passes;
 const x86_64_compile = root.x86_64_compile;
@@ -234,11 +236,21 @@ pub const Harness = struct {
     trampoline_pages: ?[*]u8 = null,
     trampoline_size: usize = 0,
 
+    /// Options controlling side-effects performed during instantiation.
+    /// Public so fuzz targets can opt out of executing the module's start
+    /// function (which can SEGV on arbitrary attacker-supplied bytecode).
+    pub const InitOptions = struct {
+        /// If true, invoke the module's `start` function (if declared)
+        /// after wiring imports. The spec runner and the differential
+        /// tests need this. Fuzz targets should pass `false`.
+        invoke_start: bool = true,
+    };
+
     /// Compile `wasm_bytes` through the full AOT pipeline and instantiate it.
     /// On success the caller owns the harness and must call `deinit` then
     /// free the pointer with the same allocator.
     pub fn init(allocator: std.mem.Allocator, wasm_bytes: []const u8) Error!*Harness {
-        return initWithRegistry(allocator, wasm_bytes, null);
+        return initWithOptions(allocator, wasm_bytes, null, .{});
     }
 
     /// Like `init` but consults `registry` when resolving imports that the
@@ -249,6 +261,18 @@ pub const Harness = struct {
         allocator: std.mem.Allocator,
         wasm_bytes: []const u8,
         registry: ?*const ImportRegistry,
+    ) Error!*Harness {
+        return initWithOptions(allocator, wasm_bytes, registry, .{});
+    }
+
+    /// Full-featured init: accepts both an import registry and explicit
+    /// `InitOptions`. Fuzz targets call this with `invoke_start=false` so
+    /// that a malicious start function cannot SEGV the harness.
+    pub fn initWithOptions(
+        allocator: std.mem.Allocator,
+        wasm_bytes: []const u8,
+        registry: ?*const ImportRegistry,
+        options: InitOptions,
     ) Error!*Harness {
         if (comptime !can_exec_aot) return error.AotUnsupportedArch;
 
@@ -412,7 +436,7 @@ pub const Harness = struct {
         // types as singletons. This patch adds the group context so
         // call_indirect distinguishes types in different rec groups.
         if (wasm_module.types.len > 0 and h.inst.sig_table.len > 0) {
-            const reg = root.sig_registry.global();
+            const reg = sig_registry.global();
             for (wasm_module.types, 0..) |ft, i| {
                 if (i >= h.inst.sig_table.len) break;
                 const rg = if (i < wasm_module.rec_groups.len)
@@ -550,20 +574,24 @@ pub const Harness = struct {
         // Must happen after all wiring (funcptrs, tables_info, sig_table).
         h.buildPersistentVmCtx();
 
-        // Invoke the start function, if any. The start function has type
-        // `() -> ()` per the wasm spec, so we pass no params/results.
-        if (h.aot_module.start_function) |start_idx| {
-            const start_ft = h.wasm_module.getFuncType(start_idx);
-            if (start_ft != null) {
-                var start_results: [1]aot_runtime.ScalarResult = undefined;
-                _ = aot_runtime.callFuncScalar(
-                    h.inst,
-                    start_idx,
-                    start_ft.?.params,
-                    &.{},
-                    &.{},
-                    &start_results,
-                ) catch {};
+        // Invoke the start function, if any and if callers opted in. The
+        // start function has type `() -> ()` per the wasm spec, so we pass
+        // no params/results. Fuzz targets pass `invoke_start=false` to
+        // avoid executing attacker-supplied code.
+        if (options.invoke_start) {
+            if (h.aot_module.start_function) |start_idx| {
+                const start_ft = h.wasm_module.getFuncType(start_idx);
+                if (start_ft != null) {
+                    var start_results: [1]aot_runtime.ScalarResult = undefined;
+                    _ = aot_runtime.callFuncScalar(
+                        h.inst,
+                        start_idx,
+                        start_ft.?.params,
+                        &.{},
+                        &.{},
+                        &start_results,
+                    ) catch {};
+                }
             }
         }
 
@@ -1093,7 +1121,7 @@ fn compileToAot(
 
     // Locals: evaluate init expressions against the preceding globals.
     for (module.globals) |g| {
-        const val: types.Value = root.instance.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
+        const val: types.Value = instance_mod.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
         const gi = try a.create(types.GlobalInstance);
         gi.* = .{ .global_type = g.global_type, .value = val };
         try tmp_globals.append(a, gi);
@@ -1246,7 +1274,7 @@ fn resolveU32InitExpr(
     // bytecode. Delegate to the interpreter's `evalInitExpr` so that
     // extended constant expressions (the wasm 2.0 proposal) are
     // supported uniformly.
-    const val = root.instance.evalInitExpr(expr, tmp_globals, null) catch return null;
+    const val = instance_mod.evalInitExpr(expr, tmp_globals, null) catch return null;
     return switch (val) {
         .i32 => |x| @as(u32, @bitCast(x)),
         else => null,
