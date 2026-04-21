@@ -1,0 +1,127 @@
+name: Perf Investigate
+
+# Daily automated performance investigation.
+#
+# Picks an optimization idea inspired by wasmtime/Cranelift, LLVM, and
+# other runtimes, collects the current benchmark baseline, and opens a
+# GitHub issue for the Copilot coding agent to attempt.  The existing
+# bench.yml workflow runs automatically on any resulting PR, providing
+# a before/after comparison.
+#
+# Back-pressure: at most one perf-investigation issue is open at a time.
+# If a previous investigation is still in progress, this run is skipped.
+#
+# To assign the created issue to Copilot automatically, enable Copilot
+# coding agent for this repository and configure it to watch the
+# "perf-investigation" label.
+on:
+  schedule:
+    # 05:42 UTC daily — offset from fuzz (03:17) and off-peak.
+    - cron: "42 5 * * *"
+  workflow_dispatch:
+    inputs:
+      idea_index:
+        description: "Idea index to investigate (0-based), or 'auto'"
+        required: false
+        default: "auto"
+
+concurrency:
+  group: perf-investigate
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  investigate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # ── Back-pressure: skip when an investigation is already open ──
+      - name: Check for active investigation
+        id: guard
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'perf-investigation',
+              state: 'open',
+              per_page: 1,
+            });
+            const skip = issues.length > 0;
+            if (skip) {
+              core.info(
+                `Skipping: open investigation exists — #${issues[0].number}: ${issues[0].title}`
+              );
+            }
+            core.setOutput('skip', skip ? 'true' : 'false');
+
+      - name: Install Zig 0.16.0
+        if: steps.guard.outputs.skip != 'true'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Build and benchmark baseline
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          zig build -Doptimize=ReleaseFast
+          zig build bench 2>&1 | tee bench-baseline.txt
+          zig build spec-tests-aot 2>&1 | tail -6 | tee spec-baseline.txt || true
+
+      - name: Select optimization idea
+        if: steps.guard.outputs.skip != 'true'
+        id: idea
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IDEA_INDEX: ${{ github.event.inputs.idea_index || 'auto' }}
+        run: python3 scripts/perf_investigate.py
+
+      - name: Upload baseline artifacts
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: perf-baseline-${{ github.run_id }}
+          path: |
+            bench-baseline.txt
+            spec-baseline.txt
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Create investigation issue
+        if: steps.guard.outputs.skip != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('issue-body.md', 'utf8');
+            const title = `${{ steps.idea.outputs.title }}`;
+
+            // Ensure the label exists.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'perf-investigation',
+                color: 'e6b800',
+                description: 'Automated daily performance investigation',
+              });
+            } catch {
+              // Label already exists — fine.
+            }
+
+            const { data: issue } = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['perf-investigation'],
+            });
+
+            core.info(`Created issue #${issue.number}: ${title}`);
+            core.notice(`Investigation issue: ${issue.html_url}`);
