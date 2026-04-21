@@ -53,7 +53,8 @@ fn runOnce(allocator: std.mem.Allocator, bytes: []const u8) !void {
     defer iarena.deinit();
     _ = wamr.loader.load(bytes, iarena.allocator()) catch return;
 
-    // AOT side — full compile + instantiate.
-    const h = aot_harness.Harness.init(allocator, bytes) catch return;
+    // AOT side — full compile + instantiate, but do NOT invoke start:
+    // attacker-supplied start functions can SEGV on OOB access.
+    const h = aot_harness.Harness.initWithOptions(allocator, bytes, null, .{ .invoke_start = false }) catch return;
     defer h.deinit();
 }
