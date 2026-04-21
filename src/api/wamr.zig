@@ -340,3 +340,67 @@ test "wamr: host function add via HostImports" {
     const result = try instance.callI32("call_add", &.{});
     try testing.expectEqual(@as(i32, 7), result);
 }
+
+test "wamr: host function reads memory" {
+    // Wasm module with memory that imports (env, sum_bytes):
+    //   (memory 1)
+    //   (import "env" "sum_bytes" (func $sum (param i32 i32) (result i32)))
+    //   (data (i32.const 0) "\x0a\x14\x1e")  ;; bytes 10, 20, 30 at offset 0
+    //   (func (export "test") (result i32)
+    //     i32.const 0  i32.const 3  call $sum)
+    const wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: 2 types
+        0x01, 0x0b, 0x02,
+        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // (i32,i32)->i32
+        0x60, 0x00, 0x01, 0x7f, // ()->i32
+        // import section
+        0x02, 0x11, 0x01,
+        0x03, 'e', 'n', 'v',
+        0x09, 's', 'u', 'm', '_', 'b', 'y', 't', 'e', 's',
+        0x00, 0x00,
+        // function section
+        0x03, 0x02, 0x01, 0x01,
+        // memory section
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // export section: "test" -> func 1
+        0x07, 0x08, 0x01,
+        0x04, 't', 'e', 's', 't',
+        0x00, 0x01,
+        // code section
+        0x0a, 0x0a, 0x01,
+        0x08, 0x00,
+        0x41, 0x00, // i32.const 0
+        0x41, 0x03, // i32.const 3
+        0x10, 0x00, // call $sum
+        0x0b,
+        // data section: 3 bytes at offset 0
+        0x0b, 0x09, 0x01,
+        0x00, 0x41, 0x00, 0x0b, // active, offset = i32.const 0
+        0x03, 0x0a, 0x14, 0x1e, // 3 bytes: 10, 20, 30
+    };
+
+    const MyHosts = host.HostImports(.{
+        .{ "env", "sum_bytes", struct {
+            fn f(ctx: host.HostContext, ptr: i32, len: i32) i32 {
+                const mem = ctx.memory() orelse return -1;
+                const start: u32 = @bitCast(ptr);
+                const end: u32 = start + @as(u32, @bitCast(len));
+                if (end > mem.len) return -1;
+                var sum: i32 = 0;
+                for (mem[start..end]) |b| sum += b;
+                return sum;
+            }
+        }.f },
+    });
+
+    var runtime = Runtime.init(testing.allocator);
+    defer runtime.deinit();
+    var module = try runtime.loadModule(&wasm);
+    defer module.deinit();
+    var instance = try module.instantiateWithHosts(MyHosts);
+    defer instance.deinit();
+
+    const result = try instance.callI32("test", &.{});
+    try testing.expectEqual(@as(i32, 60), result); // 10 + 20 + 30
+}
