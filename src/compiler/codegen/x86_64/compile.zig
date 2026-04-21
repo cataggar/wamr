@@ -60,6 +60,9 @@ const vmctx_table_init_fn_field: i32 = 144; // VmCtx.table_init_fn offset (usize
 const vmctx_elem_drop_fn_field: i32 = 152; // VmCtx.elem_drop_fn offset (usize)
 const vmctx_sig_table_field: i32 = 160; // VmCtx.sig_table_ptr offset (usize)
 const vmctx_table_set_fn_field: i32 = 192; // VmCtx.table_set_fn offset (usize)
+const vmctx_futex_wait32_fn_field: i32 = 200; // VmCtx.futex_wait32_fn offset (usize)
+const vmctx_futex_wait64_fn_field: i32 = 208; // VmCtx.futex_wait64_fn offset (usize)
+const vmctx_futex_notify_fn_field: i32 = 216; // VmCtx.futex_notify_fn offset (usize)
 // Per-table descriptor layout (TableInfo, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
 const table_info_ptr_off: i32 = 0;
