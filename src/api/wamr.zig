@@ -20,6 +20,11 @@ const comp_types = @import("../component/types.zig");
 const comp_loader = @import("../component/loader.zig");
 const comp_instance = @import("../component/instance.zig");
 
+/// Host function registration types.
+pub const host = @import("host.zig");
+pub const HostContext = host.HostContext;
+pub const HostImports = host.HostImports;
+
 /// The WAMR runtime — manages the lifecycle of modules and instances.
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
