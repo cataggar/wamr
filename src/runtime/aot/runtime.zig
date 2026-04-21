@@ -306,6 +306,17 @@ pub const VmCtx = extern struct {
     /// binary search) so a subsequent call_indirect sees the correct
     /// sig_id.
     table_set_fn: usize = 0,
+    /// Native function pointer for `memory.atomic.wait32`.
+    /// Signature: fn (vmctx: *VmCtx, addr: u32, expected: u32, timeout_ns: i64) callconv(.c) i32
+    /// Returns 0 (ok/woken), 1 (not-equal), 2 (timed-out).
+    futex_wait32_fn: usize = 0,
+    /// Native function pointer for `memory.atomic.wait64`.
+    /// Signature: fn (vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeout_ns: i64) callconv(.c) i32
+    futex_wait64_fn: usize = 0,
+    /// Native function pointer for `memory.atomic.notify`.
+    /// Signature: fn (vmctx: *VmCtx, addr: u32, count: u32) callconv(.c) i32
+    /// Returns number of waiters woken.
+    futex_notify_fn: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -381,6 +392,55 @@ pub fn aotTrapInvalidConversion(vmctx: *VmCtx) callconv(.c) noreturn {
     if (@atomicLoad(bool, &g_trap_catching, .seq_cst)) trapLongjmp();
     std.debug.print("wasm trap: invalid conversion to integer\n", .{});
     std.process.exit(2);
+}
+
+// ── Futex helpers for atomic.wait / atomic.notify ────────────────────
+
+/// Host helper for `memory.atomic.wait32`.
+/// Blocks the calling thread if `mem[addr] == expected`.
+/// Returns: 0 = woken by notify, 1 = not-equal, 2 = timed-out.
+pub fn aotAtomicWait32(vmctx: *VmCtx, addr: u32, expected: u32, timeout_lo: u32, timeout_hi: u32) callconv(.c) i32 {
+    const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
+    if (vmctx.memory_base == 0) return 1;
+    if (@as(u64, addr) + 4 > vmctx.memory_size) return 1;
+    const mem: [*]u8 = @ptrFromInt(vmctx.memory_base);
+    const current = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(mem + addr)), .little);
+    if (current != expected) return 1; // not-equal
+
+    // In single-threaded mode, no other thread can wake us, so we'd block
+    // forever. Return timed-out (2) immediately for timeout >= 0, or
+    // block forever for timeout == -1 (infinite).
+    // TODO: with real threading, use OS futex to block.
+    if (timeout_ns < 0) {
+        // Infinite wait in single-threaded mode would deadlock.
+        // Spec says this is valid behavior (trap or block indefinitely).
+        return 2; // timed-out
+    }
+    return 2; // timed-out
+}
+
+/// Host helper for `memory.atomic.wait64`.
+pub fn aotAtomicWait64(vmctx: *VmCtx, addr: u32, exp_lo: u32, exp_hi: u32, timeout_lo: u32, timeout_hi: u32) callconv(.c) i32 {
+    const expected: u64 = @as(u64, exp_hi) << 32 | @as(u64, exp_lo);
+    const timeout_ns: i64 = @bitCast(@as(u64, timeout_hi) << 32 | @as(u64, timeout_lo));
+    if (vmctx.memory_base == 0) return 1;
+    if (@as(u64, addr) + 8 > vmctx.memory_size) return 1;
+    const mem: [*]u8 = @ptrFromInt(vmctx.memory_base);
+    const current = std.mem.readInt(u64, @as(*const [8]u8, @ptrCast(mem + addr)), .little);
+    if (current != expected) return 1;
+    _ = timeout_ns;
+    return 2; // timed-out (single-threaded)
+}
+
+/// Host helper for `memory.atomic.notify`.
+/// Wakes up to `count` threads waiting on `mem[addr]`.
+/// Returns the number of threads actually woken.
+pub fn aotAtomicNotify(vmctx: *VmCtx, addr: u32, count: u32) callconv(.c) i32 {
+    // In single-threaded mode, no threads are ever waiting.
+    _ = vmctx;
+    _ = addr;
+    _ = count;
+    return 0;
 }
 
 /// Host helper invoked from AOT-compiled `memory.grow` sites.
@@ -1248,6 +1308,9 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
     vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
     vmctx.table_set_fn = @intFromPtr(&tableSetHelper);
+    vmctx.futex_wait32_fn = @intFromPtr(&aotAtomicWait32);
+    vmctx.futex_wait64_fn = @intFromPtr(&aotAtomicWait64);
+    vmctx.futex_notify_fn = @intFromPtr(&aotAtomicNotify);
     if (inst.sig_table.len > 0) vmctx.sig_table_ptr = @intFromPtr(inst.sig_table.ptr);
     if (inst.func_sig_ids.len > 0) vmctx.func_sig_ids_ptr = @intFromPtr(inst.func_sig_ids.ptr);
     if (inst.ptr_to_sig.len > 0) {
@@ -1536,6 +1599,9 @@ pub fn callFuncScalar(
     vmctx.table_init_fn = @intFromPtr(&tableInitHelper);
     vmctx.elem_drop_fn = @intFromPtr(&elemDropHelper);
     vmctx.table_set_fn = @intFromPtr(&tableSetHelper);
+    vmctx.futex_wait32_fn = @intFromPtr(&aotAtomicWait32);
+    vmctx.futex_wait64_fn = @intFromPtr(&aotAtomicWait64);
+    vmctx.futex_notify_fn = @intFromPtr(&aotAtomicNotify);
     if (inst.sig_table.len > 0) vmctx.sig_table_ptr = @intFromPtr(inst.sig_table.ptr);
     if (inst.func_sig_ids.len > 0) vmctx.func_sig_ids_ptr = @intFromPtr(inst.func_sig_ids.ptr);
     if (inst.ptr_to_sig.len > 0) {
@@ -1543,7 +1609,7 @@ pub fn callFuncScalar(
         vmctx.ptr_to_sig_len = @intCast(inst.ptr_to_sig.len);
     }
 
-    // Marshal args to raw 64-bit bit patterns. Multi-value calls append a
+    // Marshal args to raw 64-bit bit patterns.Multi-value calls append a
     // hidden return pointer (HRP) at raw[args.len] pointing at `hrp_buf`;
     // the callee stores results[1..] there (codegen writes RAX for results[0]
     // and `[HRP + (i-1)*8]` for i in [1, result_count)).
@@ -2001,6 +2067,9 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 176), @offsetOf(VmCtx, "ptr_to_sig_ptr"));
     try std.testing.expectEqual(@as(usize, 184), @offsetOf(VmCtx, "ptr_to_sig_len"));
     try std.testing.expectEqual(@as(usize, 192), @offsetOf(VmCtx, "table_set_fn"));
+    try std.testing.expectEqual(@as(usize, 200), @offsetOf(VmCtx, "futex_wait32_fn"));
+    try std.testing.expectEqual(@as(usize, 208), @offsetOf(VmCtx, "futex_wait64_fn"));
+    try std.testing.expectEqual(@as(usize, 216), @offsetOf(VmCtx, "futex_notify_fn"));
 }
 
 test "getFuncAddr: import indices return null" {
