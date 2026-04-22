@@ -131,10 +131,23 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// ADD Xd, Xn, #imm12, LSL #12 (imm scaled by 4096).
+    pub fn addImmShift12(self: *CodeBuffer, rd: Reg, rn: Reg, imm12: u12) !void {
+        // sh=1 (bit 22) shifts the imm12 left by 12.
+        try self.emit32(0x91400000 | (@as(u32, imm12) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// SUB Xd, Xn, #imm12 (64-bit immediate sub). Rn may be SP.
     pub fn subImm(self: *CodeBuffer, rd: Reg, rn: Reg, imm12: u12) !void {
         // 1|10|100010|0|imm12|Rn|Rd
         try self.emit32(0xD1000000 | (@as(u32, imm12) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// SUB Xd, Xn, #imm12, LSL #12 (imm scaled by 4096).
+    pub fn subImmShift12(self: *CodeBuffer, rd: Reg, rn: Reg, imm12: u12) !void {
+        try self.emit32(0xD1400000 | (@as(u32, imm12) << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 

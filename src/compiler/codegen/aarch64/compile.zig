@@ -118,6 +118,11 @@ const FuncCompileCtx = struct {
     /// FP-relative byte offset of the call-save region where caller-save
     /// physregs (x0..x15) are spilled around BL instructions.
     call_save_base: u32 = 0,
+    /// VReg → signed i64 value for `iconst_*` definitions in this function.
+    /// Used to fold constants into immediate-form instructions (e.g.
+    /// ADD/SUB imm). The iconst itself is still materialized into its home
+    /// register, so downstream uses that don't fold still work.
+    const_vals: ?*const std.AutoHashMap(ir.VReg, i64) = null,
     allocator: std.mem.Allocator,
 };
 
@@ -174,6 +179,22 @@ pub fn compileFunctionImpl(
 
     var fctx = ctx;
     fctx.call_save_base = call_save_base;
+
+    // Collect iconst_* values so emitBinOp etc can fold small constants
+    // into immediate-form instructions. Scan is cheap — one pass over IR.
+    var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer const_vals.deinit();
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const dest = inst.dest orelse continue;
+            switch (inst.op) {
+                .iconst_32 => |v| try const_vals.put(dest, v),
+                .iconst_64 => |v| try const_vals.put(dest, v),
+                else => {},
+            }
+        }
+    }
+    fctx.const_vals = &const_vals;
 
     try code.emitPrologue(frame_size);
 
@@ -319,18 +340,18 @@ fn compileInst(
         .add => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .add)
         else
-            try emitBinOp(code, inst, bin, reg_map, .add),
+            try emitBinOp(code, inst, bin, reg_map, .add, fctx),
         .sub => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .sub)
         else
-            try emitBinOp(code, inst, bin, reg_map, .sub),
+            try emitBinOp(code, inst, bin, reg_map, .sub, fctx),
         .mul => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .mul)
         else
-            try emitBinOp(code, inst, bin, reg_map, .mul),
-        .@"and" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"and"),
-        .@"or" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"or"),
-        .xor => |bin| try emitBinOp(code, inst, bin, reg_map, .xor),
+            try emitBinOp(code, inst, bin, reg_map, .mul, fctx),
+        .@"and" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"and", fctx),
+        .@"or" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"or", fctx),
+        .xor => |bin| try emitBinOp(code, inst, bin, reg_map, .xor, fctx),
 
         .div_s => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .div)
@@ -1748,18 +1769,86 @@ fn emitBrIf(
 
 const BinOpKind = enum { add, sub, mul, @"and", @"or", xor };
 
+/// Encode an integer as an AArch64 ADD/SUB immediate, if possible.
+/// Returns null if the value can't be encoded as a 12-bit imm
+/// (optionally LSL 12). Negative values are encoded as the opposite op
+/// (add↔sub), signaled by `flip_op`.
+const AddSubImmEnc = struct { imm12: u12, shift12: bool, flip_op: bool };
+
+fn encodeAddSubImm(value: i64) ?AddSubImmEnc {
+    const flip = value < 0;
+    const abs_val: u64 = if (flip) @intCast(-value) else @intCast(value);
+    if (abs_val <= 0xFFF) {
+        return .{ .imm12 = @intCast(abs_val), .shift12 = false, .flip_op = flip };
+    }
+    if ((abs_val & 0xFFF) == 0 and (abs_val >> 12) <= 0xFFF) {
+        return .{ .imm12 = @intCast(abs_val >> 12), .shift12 = true, .flip_op = flip };
+    }
+    return null;
+}
+
+fn emitAddSubImm(
+    code: *emit.CodeBuffer,
+    dst: emit.Reg,
+    src: emit.Reg,
+    enc: AddSubImmEnc,
+    base_kind: BinOpKind, // .add or .sub (pre-flip)
+) !void {
+    const is_sub = switch (base_kind) {
+        .add => enc.flip_op,
+        .sub => !enc.flip_op,
+        else => unreachable,
+    };
+    if (is_sub) {
+        if (enc.shift12) try code.subImmShift12(dst, src, enc.imm12)
+        else try code.subImm(dst, src, enc.imm12);
+    } else {
+        if (enc.shift12) try code.addImmShift12(dst, src, enc.imm12)
+        else try code.addImm(dst, src, enc.imm12);
+    }
+}
+
 fn emitBinOp(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     bin: ir.Inst.BinOp,
     reg_map: *RegMap,
     kind: BinOpKind,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
     // Allocate dest first; if spilled, dst_info.reg is tmp0 and we STR on commit.
     const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
-    // Load sources. lhs may share tmp0 with dst when dst is spilled — that's
-    // fine, because the final op writes dst_info.reg last.
+
+    // Try to fold an ADD/SUB immediate. For ADD, either operand may be the
+    // constant (commutative). For SUB, only rhs may be (non-commutative).
+    if ((kind == .add or kind == .sub) and fctx.const_vals != null) {
+        const cmap = fctx.const_vals.?;
+        const rhs_const = cmap.get(bin.rhs);
+        const lhs_const = if (kind == .add) cmap.get(bin.lhs) else null;
+        const pick: ?struct { imm: i64, other: ir.VReg } = blk: {
+            if (rhs_const) |v| {
+                if (encodeAddSubImm(v) != null) break :blk .{ .imm = v, .other = bin.lhs };
+            }
+            if (lhs_const) |v| {
+                if (encodeAddSubImm(v) != null) break :blk .{ .imm = v, .other = bin.rhs };
+            }
+            break :blk null;
+        };
+        if (pick) |p| {
+            const enc = encodeAddSubImm(p.imm).?;
+            const other_scratch: emit.Reg = if (dst_info.spill_slot == null)
+                RegMap.tmp0
+            else
+                dst_info.reg;
+            const other_reg = try useInto(code, reg_map, p.other, other_scratch);
+            try emitAddSubImm(code, dst_info.reg, other_reg, enc, kind);
+            try destCommit(code, reg_map, dst_info);
+            return;
+        }
+    }
+
+    // General reg/reg path.
     const lhs_scratch: emit.Reg = if (dst_info.spill_slot == null) RegMap.tmp0 else dst_info.reg;
     const lhs_reg = try useInto(code, reg_map, bin.lhs, lhs_scratch);
     const rhs_reg = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);

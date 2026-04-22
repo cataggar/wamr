@@ -1126,3 +1126,65 @@ test "differential: br_table idx=100 (out-of-range) → default → returns 20" 
     defer testing.allocator.free(wasm);
     try expectDiffI32(wasm, "f", 20);
 }
+
+// ── AArch64 add/sub immediate-fold coverage ─────────────────────────
+// These exercise the ADD/SUB imm12 (with and without LSL #12) encodings
+// and the negative-const → flipped-op path added by p2-add-sub-mul-imm.
+// Values chosen so encodeAddSubImm hits each branch:
+//   100         → imm12, no shift.
+//   4095        → imm12 max (unshifted).
+//   4096        → imm12=1, shift12=true (LSL #12).
+//   1000*4096=4096000 → imm12=1000, shift12=true.
+//   -200        → ADD flips to SUB imm12=200; or SUB flips to ADD.
+//   99999       → does not fit (low bits nonzero), falls back to reg-reg.
+test "differential: i32.add 10 + 100 == 110 (imm12 fold)" {
+    const wasm = try buildBinI32Module(testing.allocator, 10, 100, 0x6A);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 110);
+}
+
+test "differential: i32.add 1 + 4095 == 4096 (imm12 max)" {
+    const wasm = try buildBinI32Module(testing.allocator, 1, 4095, 0x6A);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 4096);
+}
+
+test "differential: i32.add 1 + 4096 == 4097 (imm12 LSL #12)" {
+    const wasm = try buildBinI32Module(testing.allocator, 1, 4096, 0x6A);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 4097);
+}
+
+test "differential: i32.add 1 + 4096000 == 4096001 (large LSL #12)" {
+    const wasm = try buildBinI32Module(testing.allocator, 1, 4096000, 0x6A);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 4096001);
+}
+
+test "differential: i32.add 500 + (-200) == 300 (add flips to sub-imm)" {
+    const wasm = try buildBinI32Module(testing.allocator, 500, -200, 0x6A);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 300);
+}
+
+test "differential: i32.sub 1000 - 250 == 750 (sub-imm fold)" {
+    // 0x6B = i32.sub
+    const wasm = try buildBinI32Module(testing.allocator, 1000, 250, 0x6B);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 750);
+}
+
+test "differential: i32.sub 100 - (-50) == 150 (sub flips to add-imm)" {
+    const wasm = try buildBinI32Module(testing.allocator, 100, -50, 0x6B);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 150);
+}
+
+test "differential: i32.add 1 + 99999 == 100000 (unencodable → reg-reg fallback)" {
+    // 99999 = 0x1869F. Low 12 bits are nonzero AND value > 0xFFF, so neither
+    // imm12 nor imm12<<12 fits; encodeAddSubImm returns null and we fall
+    // back to the reg-reg path.
+    const wasm = try buildBinI32Module(testing.allocator, 1, 99999, 0x6A);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 100000);
+}
