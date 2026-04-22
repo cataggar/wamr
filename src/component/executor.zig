@@ -384,7 +384,7 @@ fn loadInterfaceValue(
             // Use registry-aware compound loading
             return abi.loadValReg(mem, ptr, t, registry, allocator);
         },
-        else => return error.LiftError,
+        inline else => |e| return e,
     };
     return prim;
 }
@@ -475,6 +475,95 @@ pub fn dispatchCanonBuiltin(
         },
         .lift, .lower => {}, // Handled by callComponentFunc
     }
+}
+
+// ── Async execution ─────────────────────────────────────────────────────────
+
+const async_mod = @import("async.zig");
+const async_canon = @import("async_canon.zig");
+
+/// Start an async component function call. Returns a subtask handle
+/// that the caller can poll via the waitable set.
+///
+/// Unlike `callComponentFunc`, this does NOT block — it creates a task,
+/// starts it, and returns immediately. The caller polls the waitable set
+/// to discover when results are available.
+///
+/// Note: In the current single-threaded implementation, the core function
+/// is still executed synchronously and results are stored in the task.
+/// True cooperative scheduling will require runtime loop integration.
+pub fn callComponentFuncAsync(
+    comp_inst: *const ComponentInstance,
+    func_name: []const u8,
+    args: []const InterfaceValue,
+    task_manager: *async_mod.TaskManager,
+    waitable_set: ?*async_mod.WaitableSet,
+    allocator: Allocator,
+) ExecutionError!u32 {
+    // Create the subtask
+    const lift_result = async_canon.asyncLift(.{
+        .waitable_set = waitable_set,
+        .task_manager = task_manager,
+        .allocator = allocator,
+    }) catch return error.OutOfMemory;
+    const handle = lift_result.subtask_handle;
+
+    // Look up the exported function to determine result count
+    const exported = comp_inst.getExport(func_name) orelse {
+        task_manager.cancelTask(handle);
+        return error.FunctionNotFound;
+    };
+
+    // Get function type for result count
+    const result_count: usize = blk: {
+        if (exported.func_type_idx < comp_inst.component.types.len) {
+            const td = comp_inst.component.types[exported.func_type_idx];
+            switch (td) {
+                .func => |ft| {
+                    switch (ft.results) {
+                        .unnamed => break :blk 1,
+                        .named => |named| break :blk named.len,
+                    }
+                },
+                else => break :blk 0,
+            }
+        }
+        break :blk 0;
+    };
+
+    // Execute synchronously (current impl — no real cooperative scheduling)
+    const results = allocator.alloc(InterfaceValue, result_count) catch {
+        task_manager.cancelTask(handle);
+        return error.OutOfMemory;
+    };
+
+    callComponentFunc(comp_inst, func_name, args, results, allocator) catch |e| {
+        allocator.free(results);
+        task_manager.cancelTask(handle);
+        return e;
+    };
+
+    // Store flat results in the task (as u32 representation)
+    const flat_results = allocator.alloc(u32, result_count) catch {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+        task_manager.cancelTask(handle);
+        return error.OutOfMemory;
+    };
+    for (results, 0..) |r, i| {
+        flat_results[i] = switch (r) {
+            .s32 => |v| @bitCast(v),
+            .u32 => |v| v,
+            .bool => |v| @intFromBool(v),
+            else => 0,
+        };
+        r.deinit(allocator);
+    }
+    allocator.free(results);
+
+    async_canon.asyncReturn(task_manager, handle, flat_results);
+
+    return handle;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -601,4 +690,44 @@ test "canonResourceDrop: double drop returns null" {
     _ = canonResourceDrop(&table, handle, allocator);
     // Second drop should return null
     try std.testing.expectEqual(@as(?u32, null), canonResourceDrop(&table, handle, allocator));
+}
+
+// ── Async tests ─────────────────────────────────────────────────────────────
+
+test "callComponentFuncAsync: function not found cancels task" {
+    const allocator = std.testing.allocator;
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(allocator);
+    var ws = async_mod.WaitableSet{};
+    defer ws.deinit(allocator);
+
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+
+    var inst = try instance_mod.instantiate(&comp, allocator);
+    defer inst.deinit();
+
+    const result = callComponentFuncAsync(
+        inst,
+        "nonexistent",
+        &.{},
+        &tm,
+        &ws,
+        allocator,
+    );
+    try std.testing.expectError(error.FunctionNotFound, result);
+
+    // Task should have been created and then cancelled
+    try std.testing.expectEqual(@as(usize, 1), tm.tasks.items.len);
+    try std.testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(0).?);
 }
