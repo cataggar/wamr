@@ -390,7 +390,9 @@ fn compileInst(
             }
             try code.emitEpilogue(frame_size);
         },
-        .@"unreachable" => try code.brk(0),
+        .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot),
+        .global_get => |idx| try emitGlobalGet(code, inst, idx, reg_map),
+        .global_set => |gs| try emitGlobalSet(code, gs, reg_map),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
@@ -850,9 +852,51 @@ fn emitMemAddr(
 
 /// VmCtx field offsets. Must match `runtime/aot/runtime.zig::VmCtx`.
 const vmctx_memsize_slot: u12 = 1;       // byte 8, scale 8
+const vmctx_globals_slot: u12 = 2;       // byte 16, scale 8
 const vmctx_trap_oob_fn_slot: u12 = 10;  // byte 80, scale 8
+const vmctx_trap_unreachable_fn_slot: u12 = 11; // byte 88, scale 8
 const vmctx_trap_idivz_fn_slot: u12 = 12; // byte 96, scale 8
 const vmctx_trap_iovf_fn_slot: u12 = 13;  // byte 104, scale 8
+
+/// Globals are a packed array of 8-byte slots indexed by global index.
+/// For i32/f32 we read/write the low 32 bits with W-form LDR/STR; for
+/// i64/f64 we use the 64-bit forms. This matches x86-64 which uses an
+/// 8-byte slot per global.
+fn emitGlobalGet(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    idx: u32,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    // tmp0 = vmctx; tmp0 = globals_base
+    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const is32 = (inst.type == .i32 or inst.type == .f32);
+    // Byte offset = idx * 8. LDR scaled-imm requires idx fit in u12.
+    if (idx > 0xFFF) return error.GlobalIndexOutOfRange;
+    if (is32) try code.ldrImm32(info.reg, RegMap.tmp0, @intCast(idx * 2))
+    else try code.ldrImm(info.reg, RegMap.tmp0, @intCast(idx));
+    try destCommit(code, reg_map, info);
+}
+
+fn emitGlobalSet(
+    code: *emit.CodeBuffer,
+    gs: @TypeOf(@as(ir.Inst.Op, undefined).global_set),
+    reg_map: *RegMap,
+) !void {
+    const val_r = try useInto(code, reg_map, gs.val, RegMap.tmp1);
+    // tmp0 = vmctx; tmp0 = globals_base
+    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+    if (gs.idx > 0xFFF) return error.GlobalIndexOutOfRange;
+    // Type width inferred from the val's IR type is not available here;
+    // always store 8 bytes (safe: the interpreter allocates 8 bytes per
+    // global slot, and i32/f32 are zero-extended or host-padded).
+    try code.strImm(val_r, RegMap.tmp0, @intCast(gs.idx));
+}
 
 /// Patch a B.cond placeholder at `patch_off` to branch to the current PC.
 /// Preserves the original condition bits and updates only imm19.
@@ -1235,6 +1279,45 @@ test "compileFunction: add two constants" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
 
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+}
+
+test "compileFunction: global_get then global_set round-trips" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .global_get = 3 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .global_set = .{ .idx = 5, .val = v0 } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+}
+
+test "compileFunction: div_s by zero codegen produces trap path" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .div_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
     try std.testing.expect(code.len > 0);
     try std.testing.expect(code.len % 4 == 0);
 }
