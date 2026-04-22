@@ -1,10 +1,12 @@
-//! x86-64 Atomic Codegen Microbenchmark
+//! x86-64 Atomic + DCE Codegen Microbenchmark
 //!
 //! Measures compilation throughput and generated code size for each
-//! atomic instruction type. Run with: zig build bench
+//! atomic instruction type and demonstrates dead code elimination.
+//! Run with: zig build bench
 
 const std = @import("std");
 const ir = @import("ir/ir.zig");
+const passes = @import("ir/passes.zig");
 const compile = @import("codegen/x86_64/compile.zig");
 
 /// Read the CPU timestamp counter (RDTSC) for cycle-accurate timing.
@@ -32,7 +34,7 @@ const BenchResult = struct {
 
 const BuildBodyFn = *const fn (*ir.IrFunction, *ir.BasicBlock) void;
 
-fn buildAtomicFunc(
+fn buildTestFunc(
     allocator: std.mem.Allocator,
     buildBody: BuildBodyFn,
 ) !ir.IrFunction {
@@ -48,7 +50,7 @@ fn runBench(
     name: []const u8,
     buildBody: BuildBodyFn,
 ) !BenchResult {
-    var func = try buildAtomicFunc(allocator, buildBody);
+    var func = try buildTestFunc(allocator, buildBody);
     defer func.deinit();
 
     const sample_code = try compile.compileFunction(&func, allocator);
@@ -173,6 +175,66 @@ fn bodyRmwAdd8(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = result } }) catch unreachable;
 }
 
+/// Body with several dead intermediate values — used to demonstrate DCE effect.
+fn bodyDeadIntermediates(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const dead1 = func.newVReg();
+    const dead2 = func.newVReg();
+    const dead3 = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = a }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = b }) catch unreachable;
+    // These three are never used — DCE should remove them.
+    block.append(.{ .op = .{ .iconst_32 = 999 }, .dest = dead1 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = a, .rhs = b } }, .dest = dead2 }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = a, .rhs = b } }, .dest = dead3 }) catch unreachable;
+    // Only this result is returned.
+    block.append(.{ .op = .{ .add = .{ .lhs = a, .rhs = b } }, .dest = result }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
+fn runBenchWithPasses(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    buildBody: BuildBodyFn,
+) !BenchResult {
+    // Build function, run passes once, then time repeated codegen.
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+    const func = try buildTestFunc(allocator, buildBody);
+    _ = try module.addFunction(func);
+    _ = try passes.runPasses(&module, passes.default_passes, allocator);
+
+    const sample_code = try compile.compileFunction(&module.functions.items[0], allocator);
+    const code_size = sample_code.len;
+    defer allocator.free(sample_code);
+
+    // Warmup
+    for (0..200) |_| {
+        const c = try compile.compileFunction(&module.functions.items[0], allocator);
+        allocator.free(c);
+    }
+
+    // Timed iterations
+    const iterations: u64 = 10_000;
+    const start = rdtsc();
+
+    for (0..iterations) |_| {
+        const c = try compile.compileFunction(&module.functions.items[0], allocator);
+        allocator.free(c);
+    }
+
+    const end = rdtsc();
+
+    return .{
+        .name = name,
+        .iterations = iterations,
+        .total_cycles = end - start,
+        .code_size = code_size,
+    };
+}
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
@@ -203,6 +265,19 @@ pub fn main() !void {
             result.code_size,
         });
     }
+
+    std.debug.print("\n", .{});
+    std.debug.print("  DCE benchmark: codegen after default passes (10,000 iterations each)\n", .{});
+    std.debug.print("  -----------------------------------------------------------------------\n\n", .{});
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
+
+    const dce_result = try runBenchWithPasses(allocator, "dead intermediates (DCE)", &bodyDeadIntermediates);
+    std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{
+        dce_result.name,
+        dce_result.cyclesPerOp(),
+        dce_result.code_size,
+    });
 
     std.debug.print("\n", .{});
 }
