@@ -405,6 +405,49 @@ pub const CodeBuffer = struct {
 
     pub const ShiftOp = enum { lsl, lsr, asr, ror };
 
+    /// SDIV Xd, Xn, Xm (signed divide, 64-bit). Rounds toward zero. Divide
+    /// by zero yields 0 (no trap); INT_MIN/-1 yields INT_MIN (no trap) —
+    /// caller must emit wasm traps.
+    pub fn sdivRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        // 1|0|0|11010110|Rm|000011|Rn|Rd
+        try self.emit32(0x9AC00C00 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// SDIV Wd, Wn, Wm (signed divide, 32-bit).
+    pub fn sdivRegReg32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        try self.emit32(0x1AC00C00 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// UDIV Xd, Xn, Xm (unsigned divide, 64-bit).
+    pub fn udivRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        // 1|0|0|11010110|Rm|000010|Rn|Rd
+        try self.emit32(0x9AC00800 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// UDIV Wd, Wn, Wm (unsigned divide, 32-bit).
+    pub fn udivRegReg32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        try self.emit32(0x1AC00800 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// MSUB Xd, Xn, Xm, Xa — Xd = Xa - Xn*Xm (64-bit).
+    pub fn msubRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, ra: Reg) !void {
+        // 1|00|11011|000|Rm|1|Ra|Rn|Rd
+        try self.emit32(0x9B008000 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, ra.encoding()) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// MSUB Wd, Wn, Wm, Wa (32-bit).
+    pub fn msubRegReg32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, ra: Reg) !void {
+        try self.emit32(0x1B008000 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, ra.encoding()) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// NEG Xd, Xn (alias SUB Xd, XZR, Xn)
     pub fn negReg(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
         // SUB Xd, XZR, Xn: 1|10|01011|00|0|Rm(Rn)|000000|Rn(11111)|Rd
@@ -571,6 +614,48 @@ test "emit: MUL x0, x1, x2" {
     const word = std.mem.readInt(u32, code.getCode()[0..4], .little);
     // MADD x0, x1, x2, xzr = 0x9B027C20
     try std.testing.expectEqual(@as(u32, 0x9B027C20), word);
+}
+
+test "emit: SDIV x0, x1, x2" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.sdivRegReg(.x0, .x1, .x2);
+    try expectWord(0x9AC20C20, &code);
+}
+
+test "emit: SDIV w0, w1, w2" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.sdivRegReg32(.x0, .x1, .x2);
+    try expectWord(0x1AC20C20, &code);
+}
+
+test "emit: UDIV x3, x4, x5" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.udivRegReg(.x3, .x4, .x5);
+    try expectWord(0x9AC50883, &code);
+}
+
+test "emit: UDIV w3, w4, w5" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.udivRegReg32(.x3, .x4, .x5);
+    try expectWord(0x1AC50883, &code);
+}
+
+test "emit: MSUB x0, x1, x2, x3" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.msubRegReg(.x0, .x1, .x2, .x3);
+    try expectWord(0x9B028C20, &code);
+}
+
+test "emit: MSUB w0, w1, w2, w3" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.msubRegReg32(.x0, .x1, .x2, .x3);
+    try expectWord(0x1B028C20, &code);
 }
 
 fn expectWord(expected: u32, code: *const CodeBuffer) !void {

@@ -323,6 +323,11 @@ fn compileInst(
         .@"or" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"or"),
         .xor => |bin| try emitBinOp(code, inst, bin, reg_map, .xor),
 
+        .div_s => |bin| try emitDivRem(code, inst, bin, reg_map, .div_s),
+        .div_u => |bin| try emitDivRem(code, inst, bin, reg_map, .div_u),
+        .rem_s => |bin| try emitDivRem(code, inst, bin, reg_map, .rem_s),
+        .rem_u => |bin| try emitDivRem(code, inst, bin, reg_map, .rem_u),
+
         // ── Shifts / rotates ─────────────────────────────────────────
         .shl => |bin| try emitShift(code, inst, bin, reg_map, .lsl),
         .shr_u => |bin| try emitShift(code, inst, bin, reg_map, .lsr),
@@ -846,6 +851,137 @@ fn emitMemAddr(
 /// VmCtx field offsets. Must match `runtime/aot/runtime.zig::VmCtx`.
 const vmctx_memsize_slot: u12 = 1;       // byte 8, scale 8
 const vmctx_trap_oob_fn_slot: u12 = 10;  // byte 80, scale 8
+const vmctx_trap_idivz_fn_slot: u12 = 12; // byte 96, scale 8
+const vmctx_trap_iovf_fn_slot: u12 = 13;  // byte 104, scale 8
+
+/// Patch a B.cond placeholder at `patch_off` to branch to the current PC.
+/// Preserves the original condition bits and updates only imm19.
+fn patchBCondHere(code: *emit.CodeBuffer, patch_off: usize) void {
+    const target = code.len();
+    const delta_words: i19 = @intCast(@divExact(
+        @as(i64, @intCast(target)) - @as(i64, @intCast(patch_off)),
+        4,
+    ));
+    const existing = std.mem.readInt(u32, code.bytes.items[patch_off..][0..4], .little);
+    const imm19: u19 = @bitCast(delta_words);
+    const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
+    code.patch32(patch_off, new_word);
+}
+
+/// Emit a noreturn call to a VmCtx trap helper at scaled slot `slot`.
+/// Sequence: load x0 = vmctx, tmp0 = [x0 + slot*8], BLR tmp0, BRK 0.
+/// Clobbers x0, tmp0, LR — but this path is noreturn, so callers do not
+/// care what survives it.
+fn emitTrapHelperCall(code: *emit.CodeBuffer, slot: u12) !void {
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, .x0, slot);
+    try code.blr(RegMap.tmp0);
+    try code.brk(0);
+}
+
+const DivRemKind = enum { div_s, div_u, rem_s, rem_u };
+
+/// Emit div_s / div_u / rem_s / rem_u. Semantics per wasm:
+///   * rhs == 0 traps (idivz helper).
+///   * div_s with INT_MIN / -1 traps (iovf helper).
+///   * rem_s with INT_MIN / -1 yields 0 — handled naturally by MSUB with
+///     two's complement wrap (INT_MIN - INT_MIN*(-1) == 0).
+///
+/// Uses tmp0=lhs, tmp1=rhs, tmp2=scratch/quotient/INT_MIN constant.
+fn emitDivRem(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+    kind: DivRemKind,
+) !void {
+    const dest = inst.dest orelse return;
+    const is64 = inst.type == .i64;
+
+    // Copy sources into the fixed scratch registers (tmp0, tmp1). useInto
+    // may already place them there, but if the vreg lives in an allocated
+    // physreg we need an explicit move because later code clobbers tmp0
+    // and tmp1 across the trap-helper calls.
+    const lhs_loaded = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    if (lhs_loaded != RegMap.tmp0) {
+        if (is64) try code.movRegReg(RegMap.tmp0, lhs_loaded)
+        else try code.movRegReg32(RegMap.tmp0, lhs_loaded);
+    }
+    const rhs_loaded = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    if (rhs_loaded != RegMap.tmp1) {
+        if (is64) try code.movRegReg(RegMap.tmp1, rhs_loaded)
+        else try code.movRegReg32(RegMap.tmp1, rhs_loaded);
+    }
+
+    // Zero-divisor check: cmp rhs, #0; b.ne skip; call trap_idivz; skip:
+    if (is64) try code.cmpImm(RegMap.tmp1, 0)
+    else try code.cmpImm32(RegMap.tmp1, 0);
+    const skip_idivz = code.len();
+    try code.bCond(.ne, 0);
+    try emitTrapHelperCall(code, vmctx_trap_idivz_fn_slot);
+    patchBCondHere(code, skip_idivz);
+
+    // div_s INT_MIN/-1 overflow check. Sequence:
+    //   tmp2 = -1; cmp rhs, tmp2; b.ne skip_ovf
+    //   tmp2 = INT_MIN; cmp lhs, tmp2; b.ne skip_ovf
+    //   call trap_iovf
+    // skip_ovf:
+    if (kind == .div_s) {
+        if (is64) {
+            try code.movImm64(RegMap.tmp2, 0xFFFF_FFFF_FFFF_FFFF);
+            try code.cmpRegReg(RegMap.tmp1, RegMap.tmp2);
+        } else {
+            try code.movImm32(RegMap.tmp2, -1);
+            try code.cmpRegReg32(RegMap.tmp1, RegMap.tmp2);
+        }
+        const skip_a = code.len();
+        try code.bCond(.ne, 0);
+        if (is64) {
+            try code.movImm64(RegMap.tmp2, 0x8000_0000_0000_0000);
+            try code.cmpRegReg(RegMap.tmp0, RegMap.tmp2);
+        } else {
+            try code.movImm32(RegMap.tmp2, @as(i32, -2147483648));
+            try code.cmpRegReg32(RegMap.tmp0, RegMap.tmp2);
+        }
+        const skip_b = code.len();
+        try code.bCond(.ne, 0);
+        try emitTrapHelperCall(code, vmctx_trap_iovf_fn_slot);
+        patchBCondHere(code, skip_a);
+        patchBCondHere(code, skip_b);
+    }
+
+    // After checks: tmp0=lhs, tmp1=rhs are still live. Now allocate dest
+    // (destBegin's scratch is tmp2 — safe because tmp2 is dead here).
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+
+    switch (kind) {
+        .div_s => if (is64)
+            try code.sdivRegReg(info.reg, RegMap.tmp0, RegMap.tmp1)
+        else
+            try code.sdivRegReg32(info.reg, RegMap.tmp0, RegMap.tmp1),
+        .div_u => if (is64)
+            try code.udivRegReg(info.reg, RegMap.tmp0, RegMap.tmp1)
+        else
+            try code.udivRegReg32(info.reg, RegMap.tmp0, RegMap.tmp1),
+        .rem_s, .rem_u => {
+            // q = lhs DIV rhs into tmp2; dest = lhs - q*rhs via MSUB.
+            // If info.reg happens to equal tmp2 (dest is spilled), SDIV/UDIV
+            // still writes tmp2=q, then MSUB reads q (tmp2) before writing
+            // dest (tmp2) — single-instruction read-before-write, safe.
+            if (kind == .rem_s) {
+                if (is64) try code.sdivRegReg(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1)
+                else try code.sdivRegReg32(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1);
+            } else {
+                if (is64) try code.udivRegReg(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1)
+                else try code.udivRegReg32(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1);
+            }
+            // MSUB dest, q, rhs, lhs  →  dest = lhs - q*rhs
+            if (is64) try code.msubRegReg(info.reg, RegMap.tmp2, RegMap.tmp1, RegMap.tmp0)
+            else try code.msubRegReg32(info.reg, RegMap.tmp2, RegMap.tmp1, RegMap.tmp0);
+        },
+    }
+    try destCommit(code, reg_map, info);
+}
 
 
 /// Scaled-immediate offset suitable for LDR/STR with given scale.

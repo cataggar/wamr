@@ -424,3 +424,57 @@ test "differential: 10 locals no memory (pure spill test)" {
     };
     try expectDiffI32(wasm, "f", 55);
 }
+
+// ── i32 div / rem ────────────────────────────────────────────────────────────
+
+test "differential: 20 / 6 == 3 (i32.div_s)" {
+    // 0x6D = i32.div_s
+    const wasm = try buildBinI32Module(testing.allocator, 20, 6, 0x6D);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 3);
+}
+
+test "differential: -20 / 6 == -3 (i32.div_s rounds toward zero)" {
+    const wasm = try buildBinI32Module(testing.allocator, -20, 6, 0x6D);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", -3);
+}
+
+test "differential: 20 / 6 == 3 (i32.div_u)" {
+    // 0x6E = i32.div_u
+    const wasm = try buildBinI32Module(testing.allocator, 20, 6, 0x6E);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 3);
+}
+
+test "differential: -1 /u 2 == 0x7FFFFFFF (i32.div_u treats lhs as unsigned)" {
+    const wasm = try buildBinI32Module(testing.allocator, -1, 2, 0x6E);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 0x7FFFFFFF);
+}
+
+test "differential: 20 % 6 == 2 (i32.rem_s)" {
+    // 0x6F = i32.rem_s
+    const wasm = try buildBinI32Module(testing.allocator, 20, 6, 0x6F);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 2);
+}
+
+test "differential: -20 % 6 == -2 (i32.rem_s takes lhs sign)" {
+    const wasm = try buildBinI32Module(testing.allocator, -20, 6, 0x6F);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", -2);
+}
+
+test "differential: INT_MIN % -1 == 0 (i32.rem_s overflow is defined as 0)" {
+    const wasm = try buildBinI32Module(testing.allocator, -2147483648, -1, 0x6F);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 0);
+}
+
+test "differential: 20 %u 6 == 2 (i32.rem_u)" {
+    // 0x70 = i32.rem_u
+    const wasm = try buildBinI32Module(testing.allocator, 20, 6, 0x70);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 2);
+}
