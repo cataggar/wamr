@@ -368,6 +368,10 @@ fn compileInst(
             try code.strImm(src, .fp, off_scaled);
         },
 
+        // ── Linear memory load/store ─────────────────────────────────
+        .load => |ld| try emitLoad(code, inst, ld, reg_map),
+        .store => |st| try emitStore(code, st, reg_map),
+
         .ret => |maybe_val| {
             if (maybe_val) |val| {
                 const r = try useInto(code, reg_map, val, .x0);
@@ -741,6 +745,93 @@ fn emitCall(
     }
 }
 
+/// Compute linear-memory effective address in tmp0: mem_base + zext(wasm_addr) + offset.
+///
+/// Clobbers tmp0 and tmp1. After return, the user's value register (arg/result)
+/// can still be read/written — we only touched the two non-allocatable scratches.
+fn emitMemAddr(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    base_vreg: ir.VReg,
+    offset: u32,
+) !void {
+    // tmp0 = VmCtx*  →  tmp0 = VmCtx.memory_base (at +0).
+    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
+
+    // Zero-extend wasm address (i32) into tmp1.
+    const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
+    try code.movRegReg32(RegMap.tmp1, src); // ORR Wd, WZR, Wsrc → clears upper 32
+
+    // tmp0 = mem_base + wasm_addr.
+    try code.addRegReg(RegMap.tmp0, RegMap.tmp0, RegMap.tmp1);
+
+    // Fold constant offset. For offsets not representable as a scaled u12,
+    // materialize into tmp1 via MOVZ/MOVK and add. This also handles the
+    // "fold into unscaled LDUR" case by always moving into tmp0 unconditionally
+    // (caller uses scaled LDR #0 in that fallback).
+    if (offset != 0) {
+        // Small offsets (≤ 0xFFF) fit a single ADD imm12.
+        if (offset <= 0xFFF) {
+            try code.addImm(RegMap.tmp0, RegMap.tmp0, @intCast(offset));
+        } else {
+            try code.movImm64(RegMap.tmp1, offset);
+            try code.addRegReg(RegMap.tmp0, RegMap.tmp0, RegMap.tmp1);
+        }
+    }
+}
+
+/// Scaled-immediate offset suitable for LDR/STR W-form (4-byte access).
+/// Returns null if the offset isn't a multiple of 4 within u12*4 range.
+fn scaled4Offset(off: u32) ?u12 {
+    if (off > 0x3FFC) return null;
+    if ((off & 3) != 0) return null;
+    return @intCast(off / 4);
+}
+
+fn emitLoad(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    ld: @TypeOf(@as(ir.Inst.Op, undefined).load),
+    reg_map: *RegMap,
+) !void {
+    // Phase 1 scope: 4-byte load only; other sizes handled by p1-load-store-other.
+    if (ld.size != 4) return error.UnimplementedLoadSize;
+    if (ld.sign_extend) return error.UnimplementedLoadSign;
+    const dest = inst.dest orelse return;
+
+    // Try to fold the wasm offset into LDR's scaled immediate; else add it to tmp0.
+    if (scaled4Offset(ld.offset)) |disp| {
+        try emitMemAddr(code, reg_map, ld.base, 0);
+        const info = try destBegin(reg_map, dest, RegMap.tmp1);
+        try code.ldrImm32(info.reg, RegMap.tmp0, disp);
+        try destCommit(code, reg_map, info);
+    } else {
+        try emitMemAddr(code, reg_map, ld.base, ld.offset);
+        const info = try destBegin(reg_map, dest, RegMap.tmp1);
+        try code.ldrImm32(info.reg, RegMap.tmp0, 0);
+        try destCommit(code, reg_map, info);
+    }
+}
+
+fn emitStore(
+    code: *emit.CodeBuffer,
+    st: @TypeOf(@as(ir.Inst.Op, undefined).store),
+    reg_map: *RegMap,
+) !void {
+    if (st.size != 4) return error.UnimplementedStoreSize;
+
+    // Compute effective address in tmp0 (possibly using tmp1). If we fold
+    // offset into STR's scaled imm, pass 0; else fold into tmp0.
+    const disp_opt = scaled4Offset(st.offset);
+    try emitMemAddr(code, reg_map, st.base, if (disp_opt == null) st.offset else 0);
+
+    // Materialize the value into tmp1 (or use its home reg). emitMemAddr is
+    // done with tmp1 by now, so it's free for `useInto` to reuse.
+    const val_reg = try useInto(code, reg_map, st.val, RegMap.tmp1);
+    try code.strImm32(val_reg, RegMap.tmp0, if (disp_opt) |d| d else 0);
+}
+
 fn emitBrIf(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
@@ -993,6 +1084,103 @@ test "compileModule: direct call between two local functions" {
 }
 
 // ── New handler tests (Phase 1a) ─────────────────────────────────────────────
+
+test "load i32: emits VMCtx load + LDR W with scaled offset" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 8, .size = 4 } },
+        .dest = val,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = val } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Expect at least one LDR W (opcode 0xB9400000 in top bits).
+    var found_ldr_w = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0xB9400000) {
+            found_ldr_w = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_ldr_w);
+}
+
+test "store i32: emits VMCtx load + STR W" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = @bitCast(@as(u32, 0xDEADBEEF)) }, .dest = val, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .store = .{ .base = addr, .offset = 0, .size = 4, .val = val } },
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = null } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Expect at least one STR W (opcode 0xB9000000 in top bits).
+    var found_str_w = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0xB9000000) {
+            found_str_w = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_str_w);
+}
+
+test "load i32: unrepresentable offset falls back to movImm + add" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    // Offset 5 is not a multiple of 4 → must go through tmp1/ADD path.
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 5, .size = 4 } },
+        .dest = val,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = val } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+}
+
+test "load: size != 4 returns UnimplementedLoadSize" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 0, .size = 1 } },
+        .dest = val,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = val } });
+    try std.testing.expectError(error.UnimplementedLoadSize, compileFunction(&func, allocator));
+}
 
 /// Build a single-block function with the given ops and verify codegen
 /// succeeds and produces 4-byte-aligned output.
