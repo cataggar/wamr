@@ -99,6 +99,45 @@ pub const InterfaceValue = union(enum) {
         is_ok: bool,
         payload: ?*const InterfaceValue,
     };
+
+    /// Recursively free all allocator-owned memory in this value.
+    pub fn deinit(self: InterfaceValue, allocator: Allocator) void {
+        switch (self) {
+            .record_val => |fields| {
+                for (fields) |f| f.deinit(allocator);
+                allocator.free(fields);
+            },
+            .variant_val => |v| {
+                if (v.payload) |p| {
+                    p.*.deinit(allocator);
+                    allocator.destroy(p);
+                }
+            },
+            .list_val => |elems| {
+                for (elems) |e| e.deinit(allocator);
+                allocator.free(elems);
+            },
+            .tuple_val => |fields| {
+                for (fields) |f| f.deinit(allocator);
+                allocator.free(fields);
+            },
+            .flags_val => |words| allocator.free(words),
+            .option_val => |o| {
+                if (o.payload) |p| {
+                    p.*.deinit(allocator);
+                    allocator.destroy(p);
+                }
+            },
+            .result_val => |r| {
+                if (r.payload) |p| {
+                    p.*.deinit(allocator);
+                    allocator.destroy(p);
+                }
+            },
+            // Primitives and PtrLen refs own no heap memory.
+            else => {},
+        }
+    }
 };
 
 /// Typed flat core value for lift/lower (not just u32 — handles i64/f32/f64).

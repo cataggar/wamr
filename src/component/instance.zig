@@ -107,6 +107,10 @@ pub const ComponentInstance = struct {
     pub const ExportedFunc = struct {
         core_instance_idx: u32,
         core_func_idx: u32,
+        /// Component-level function type index (into component.types).
+        func_type_idx: u32 = 0,
+        /// Canonical options from the canon lift definition.
+        opts: []const ctypes.CanonOpt = &.{},
     };
 
     /// Look up an exported function by name.
@@ -197,6 +201,8 @@ pub fn instantiate(
                             exported_funcs.put(allocator, exp.name, .{
                                 .core_instance_idx = 0,
                                 .core_func_idx = lift.core_func_idx,
+                                .func_type_idx = lift.type_idx,
+                                .opts = lift.opts,
                             }) catch {};
                         },
                         else => {},
