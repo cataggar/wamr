@@ -481,15 +481,16 @@ fn emitEqz(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    const src = useReg(reg_map, vreg) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
     if (inst.type == .i32) {
         try code.cmpImm32(src, 0);
-        try code.cset32(dr, .eq);
+        try code.cset32(info.reg, .eq);
     } else {
         try code.cmpImm(src, 0);
-        try code.cset(dr, .eq);
+        try code.cset(info.reg, .eq);
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitCmp(
@@ -500,16 +501,17 @@ fn emitCmp(
     cond: emit.Cond,
 ) !void {
     const dest = inst.dest orelse return;
-    const lhs = useReg(reg_map, bin.lhs) orelse return;
-    const rhs = useReg(reg_map, bin.rhs) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
+    const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
     if (inst.type == .i32) {
         try code.cmpRegReg32(lhs, rhs);
-        try code.cset32(dr, cond);
+        try code.cset32(info.reg, cond);
     } else {
         try code.cmpRegReg(lhs, rhs);
-        try code.cset(dr, cond);
+        try code.cset(info.reg, cond);
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitClz(
@@ -519,13 +521,14 @@ fn emitClz(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    const src = useReg(reg_map, vreg) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
     if (inst.type == .i32) {
-        try code.clzReg32(dr, src);
+        try code.clzReg32(info.reg, src);
     } else {
-        try code.clzReg(dr, src);
+        try code.clzReg(info.reg, src);
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitCtz(
@@ -535,17 +538,18 @@ fn emitCtz(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    const src = useReg(reg_map, vreg) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
-    // CTZ(x) = CLZ(RBIT(x)). Width matters: RBIT W/CLZ W gives 32 for zero;
-    // RBIT X/CLZ X gives 64 — matching wasm semantics.
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    // CTZ(x) = CLZ(RBIT(x)). RBIT reads src then writes info.reg; CLZ reads
+    // info.reg then writes info.reg — safe even if info.reg aliases src.
     if (inst.type == .i32) {
-        try code.rbitReg32(dr, src);
-        try code.clzReg32(dr, dr);
+        try code.rbitReg32(info.reg, src);
+        try code.clzReg32(info.reg, info.reg);
     } else {
-        try code.rbitReg(dr, src);
-        try code.clzReg(dr, dr);
+        try code.rbitReg(info.reg, src);
+        try code.clzReg(info.reg, info.reg);
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitExtendImpl(
@@ -556,13 +560,14 @@ fn emitExtendImpl(
     width: ExtendWidth,
 ) !void {
     const dest = inst.dest orelse return;
-    const src = useReg(reg_map, vreg) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
     switch (width) {
-        .b => try code.sxtb(dr, src),
-        .h => try code.sxth(dr, src),
-        .w => try code.sxtw(dr, src),
+        .b => try code.sxtb(info.reg, src),
+        .h => try code.sxth(info.reg, src),
+        .w => try code.sxtw(info.reg, src),
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitWrap(
@@ -572,10 +577,11 @@ fn emitWrap(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    const src = useReg(reg_map, vreg) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
-    // wasm i32.wrap_i64: take low 32 bits of i64. MOV Wd, Wn zero-extends.
-    try code.uxtw(dr, src);
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    // wasm i32.wrap_i64: take low 32 bits of i64. UXTW zero-extends.
+    try code.uxtw(info.reg, src);
+    try destCommit(code, reg_map, info);
 }
 
 fn emitSelect(
@@ -585,18 +591,21 @@ fn emitSelect(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    const cond_r = useReg(reg_map, sel.cond) orelse return;
-    const t_r = useReg(reg_map, sel.if_true) orelse return;
-    const f_r = useReg(reg_map, sel.if_false) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
-    // wasm: select picks if_true when cond != 0. Use W-form test since
-    // cond is always i32.
+    // Load cond first; after CMP we don't need the cond register anymore,
+    // so we can reuse tmp0 for subsequent uses if desired. We keep t/f in
+    // distinct scratches (tmp1/tmp2) so CSEL can read them simultaneously.
+    const cond_r = try useInto(code, reg_map, sel.cond, RegMap.tmp0);
     try code.cmpImm32(cond_r, 0);
+    const t_r = try useInto(code, reg_map, sel.if_true, RegMap.tmp1);
+    const f_r = try useInto(code, reg_map, sel.if_false, RegMap.tmp2);
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+    // wasm: select picks if_true when cond != 0.
     if (inst.type == .i32) {
-        try code.csel32(dr, t_r, f_r, .ne);
+        try code.csel32(info.reg, t_r, f_r, .ne);
     } else {
-        try code.csel(dr, t_r, f_r, .ne);
+        try code.csel(info.reg, t_r, f_r, .ne);
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitShift(
@@ -607,14 +616,15 @@ fn emitShift(
     op: emit.CodeBuffer.ShiftOp,
 ) !void {
     const dest = inst.dest orelse return;
-    const lhs = useReg(reg_map, bin.lhs) orelse return;
-    const rhs = useReg(reg_map, bin.rhs) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
+    const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
     if (inst.type == .i32) {
-        try code.shiftRegReg32(dr, lhs, rhs, op);
+        try code.shiftRegReg32(info.reg, lhs, rhs, op);
     } else {
-        try code.shiftRegReg(dr, lhs, rhs, op);
+        try code.shiftRegReg(info.reg, lhs, rhs, op);
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitRotl(
@@ -624,18 +634,22 @@ fn emitRotl(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    const lhs = useReg(reg_map, bin.lhs) orelse return;
-    const rhs = useReg(reg_map, bin.rhs) orelse return;
-    const dr = (try destReg(code, reg_map, dest)) orelse return;
-    // rotl(x, n) = ror(x, -n). AArch64 has no ROL, so negate count
-    // into scratch, then RORV. Width-correct: W-form masks by 5, X by 6.
+    const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    // NEG output must not clobber lhs or rhs. Use tmp2 as the dedicated
+    // scratch for -rhs. destBegin takes tmp0 as its fallback, so in the
+    // worst case info.reg == tmp0 == lhs (aliased read-before-write — OK).
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+    // rotl(x, n) = ror(x, -n). AArch64 has no ROL, so negate count into
+    // tmp2, then RORV. Width-correct: W-form masks by 5, X by 6.
     if (inst.type == .i32) {
-        try code.negReg32(RegMap.tmp0, rhs);
-        try code.shiftRegReg32(dr, lhs, RegMap.tmp0, .ror);
+        try code.negReg32(RegMap.tmp2, rhs);
+        try code.shiftRegReg32(info.reg, lhs, RegMap.tmp2, .ror);
     } else {
-        try code.negReg(RegMap.tmp0, rhs);
-        try code.shiftRegReg(dr, lhs, RegMap.tmp0, .ror);
+        try code.negReg(RegMap.tmp2, rhs);
+        try code.shiftRegReg(info.reg, lhs, RegMap.tmp2, .ror);
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitBr(
@@ -929,7 +943,7 @@ fn emitBrIf(
     br: @TypeOf(@as(ir.Inst.Op, undefined).br_if),
     allocator: std.mem.Allocator,
 ) !void {
-    const cond_r = useReg(reg_map, br.cond) orelse return;
+    const cond_r = try useInto(code, reg_map, br.cond, RegMap.tmp0);
     // wasm br_if: branch to then_block if cond != 0 (i32).
     try code.cmpImm32(cond_r, 0);
     const cond_patch = code.len();

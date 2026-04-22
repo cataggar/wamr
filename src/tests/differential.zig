@@ -32,7 +32,7 @@ const aot_runtime = wamr.aot_runtime;
 /// would surface as false failures in this suite. Re-widening is tracked
 /// separately — do not flip this back to the harness's constant without
 /// first fixing the aarch64 AOT codegen.
-const can_exec_aot = builtin.cpu.arch == .x86_64;
+const can_exec_aot = builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64;
 
 /// Run `name` (a `() -> i32` export) through the interpreter.
 fn runInterpI32(allocator: std.mem.Allocator, wasm: []const u8, name: []const u8) !i32 {
