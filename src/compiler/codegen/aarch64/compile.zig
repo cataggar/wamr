@@ -394,6 +394,8 @@ fn compileInst(
         .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot),
         .global_get => |idx| try emitGlobalGet(code, inst, idx, reg_map),
         .global_set => |gs| try emitGlobalSet(code, gs, reg_map),
+        .memory_size => try emitMemorySize(code, inst, reg_map),
+        .memory_grow => |pages_vreg| try emitMemoryGrow(code, inst, pages_vreg, reg_map, fctx),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
@@ -854,6 +856,8 @@ fn emitMemAddr(
 /// VmCtx field offsets. Must match `runtime/aot/runtime.zig::VmCtx`.
 const vmctx_memsize_slot: u12 = 1;       // byte 8, scale 8
 const vmctx_globals_slot: u12 = 2;       // byte 16, scale 8
+const vmctx_mem_pages_slot_w: u12 = 14;  // byte 56 (u32), scale 4
+const vmctx_mem_grow_fn_slot: u12 = 8;   // byte 64, scale 8
 const vmctx_trap_oob_fn_slot: u12 = 10;  // byte 80, scale 8
 const vmctx_trap_unreachable_fn_slot: u12 = 11; // byte 88, scale 8
 const vmctx_trap_idivz_fn_slot: u12 = 12; // byte 96, scale 8
@@ -897,6 +901,87 @@ fn emitGlobalSet(
     // always store 8 bytes (safe: the interpreter allocates 8 bytes per
     // global slot, and i32/f32 are zero-extended or host-padded).
     try code.strImm(val_r, RegMap.tmp0, @intCast(gs.idx));
+}
+
+/// `memory.size` — 32-bit load of VmCtx.memory_pages.
+fn emitMemorySize(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    // Load vmctx into tmp0 first, then allocate dest (dest's scratch is
+    // tmp1, so even if dest spills we don't alias tmp0 until after the
+    // vmctx load).
+    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    try code.ldrImm32(info.reg, RegMap.tmp0, vmctx_mem_pages_slot_w);
+    try destCommit(code, reg_map, info);
+}
+
+/// `memory.grow` — calls host helper `VmCtx.mem_grow_fn(vmctx, delta)`.
+/// Returns previous page count (or -1 on failure) in x0.
+///
+/// Follows the same save-all-live-caller-save pattern as `emitCall`: we
+/// snapshot `reg_map.reg_used`, STR each live physreg to its fixed
+/// per-reg call-save slot, stage `delta_pages` into x1 by reading from
+/// either the save slot (for physreg sources) or the spill slot (for
+/// stack sources), load vmctx into x0, indirect-call through
+/// VmCtx.mem_grow_fn (scaled slot 8), commit x0 to `dest` BEFORE
+/// restoring saved regs (so the reg allocator's choice for dest — which
+/// was made after the snapshot — cannot collide with a reg being
+/// restored), then restore each saved reg.
+fn emitMemoryGrow(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    pages_vreg: ir.VReg,
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // Stage delta_pages into x1 from its spilled location.
+    const loc = reg_map.get(pages_vreg) orelse return error.UnboundVReg;
+    switch (loc) {
+        .reg => |r| {
+            const reg_idx: u32 = @intFromEnum(r);
+            const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+            try code.ldrImm(.x1, .fp, slot_scaled);
+        },
+        .stack => |off| {
+            try code.ldrImm(.x1, .fp, reg_map.spillOffsetScaled(off));
+        },
+    }
+
+    // x0 = vmctx; tmp0 = vmctx.mem_grow_fn; BLR tmp0.
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_mem_grow_fn_slot);
+    try code.blr(RegMap.tmp0);
+
+    // Commit helper result (x0) to dest BEFORE restoring saved regs.
+    // dest.reg is guaranteed not to be in used_snapshot because destBegin
+    // calls assign() which only picks currently-free regs.
+    if (inst.dest) |dest| {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
+
+    // Restore saved regs.
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
 }
 
 /// Patch a B.cond placeholder at `patch_off` to branch to the current PC.
@@ -1405,6 +1490,34 @@ test "compileFunction: br_table with 2 targets + default compiles" {
 
     try std.testing.expect(code.len > 0);
     try std.testing.expect(code.len % 4 == 0);
+}
+
+test "compileFunction: memory.size compiles" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .memory_size = {} }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v0 } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+}
+
+test "compileFunction: memory.grow compiles" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .memory_grow = v0 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v1 } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
 }
 
 test "compileModule: records offsets" {
