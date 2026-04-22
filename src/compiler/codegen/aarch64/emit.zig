@@ -369,6 +369,20 @@ pub const CodeBuffer = struct {
             (@as(u32, rt2.encoding()) << 10) | (@as(u32, rn.encoding()) << 5) | rt1.encoding());
     }
 
+    /// STP Xt1, Xt2, [Xn, #imm7*8] (signed-offset, no writeback)
+    pub fn stpImm(self: *CodeBuffer, rt1: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
+        const imm: u32 = @as(u32, @as(u7, @bitCast(imm7)));
+        try self.emit32(0xA9000000 | (imm << 15) |
+            (@as(u32, rt2.encoding()) << 10) | (@as(u32, rn.encoding()) << 5) | rt1.encoding());
+    }
+
+    /// LDP Xt1, Xt2, [Xn, #imm7*8] (signed-offset, no writeback)
+    pub fn ldpImm(self: *CodeBuffer, rt1: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
+        const imm: u32 = @as(u32, @as(u7, @bitCast(imm7)));
+        try self.emit32(0xA9400000 | (imm << 15) |
+            (@as(u32, rt2.encoding()) << 10) | (@as(u32, rn.encoding()) << 5) | rt1.encoding());
+    }
+
     // ── Conditional / Shift / Bit Ops ───────────────────────────────
 
     /// CSET Xd, cond — set Xd = 1 if cond else 0 (alias CSINC Xd, XZR, XZR, !cond).
@@ -695,18 +709,46 @@ pub const CodeBuffer = struct {
     // ── Prologue / Epilogue ─────────────────────────────────────────
 
     /// Emit function prologue: STP FP, LR, [SP, #-frame_size]!; MOV FP, SP
+    /// For frames that exceed the STP pre-index immediate range (±512), a
+    /// two-step sequence is used: SUB SP, SP, #frame_size; STP FP, LR, [SP].
     pub fn emitPrologue(self: *CodeBuffer, frame_size: u32) !void {
-        // STP x29, x30, [sp, #-frame_size]!
-        const scaled: i7 = @intCast(-@as(i8, @intCast(frame_size / 8)));
-        try self.stpPre(.fp, .lr, .sp, scaled);
+        if (frame_size / 8 <= 63) {
+            // STP x29, x30, [sp, #-frame_size]!
+            const scaled: i7 = @intCast(-@as(i8, @intCast(frame_size / 8)));
+            try self.stpPre(.fp, .lr, .sp, scaled);
+        } else {
+            // SUB SP, SP, #frame_size (12-bit imm, optionally LSL #12 for
+            // frames up to ~16MB — well beyond what we'd ever need).
+            if (frame_size <= 0xFFF) {
+                try self.subImm(.sp, .sp, @intCast(frame_size));
+            } else if ((frame_size & 0xFFF) == 0 and (frame_size >> 12) <= 0xFFF) {
+                try self.subImmShift12(.sp, .sp, @intCast(frame_size >> 12));
+            } else {
+                return error.FrameTooLarge;
+            }
+            // STP x29, x30, [sp, #0]
+            try self.stpImm(.fp, .lr, .sp, 0);
+        }
         // MOV x29, sp  (ADD x29, sp, #0 — NOT ORR, which would use XZR)
         try self.movFromSp(.fp);
     }
 
     /// Emit function epilogue: LDP FP, LR, [SP], #frame_size; RET
+    /// Matching large-frame fallback for emitPrologue.
     pub fn emitEpilogue(self: *CodeBuffer, frame_size: u32) !void {
-        const scaled: i7 = @intCast(@as(i8, @intCast(frame_size / 8)));
-        try self.ldpPost(.fp, .lr, .sp, scaled);
+        if (frame_size / 8 <= 63) {
+            const scaled: i7 = @intCast(@as(i8, @intCast(frame_size / 8)));
+            try self.ldpPost(.fp, .lr, .sp, scaled);
+        } else {
+            try self.ldpImm(.fp, .lr, .sp, 0);
+            if (frame_size <= 0xFFF) {
+                try self.addImm(.sp, .sp, @intCast(frame_size));
+            } else if ((frame_size & 0xFFF) == 0 and (frame_size >> 12) <= 0xFFF) {
+                try self.addImmShift12(.sp, .sp, @intCast(frame_size >> 12));
+            } else {
+                return error.FrameTooLarge;
+            }
+        }
         try self.ret();
     }
 

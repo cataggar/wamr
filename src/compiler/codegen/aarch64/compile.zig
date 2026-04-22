@@ -16,14 +16,6 @@ const emit = @import("emit.zig");
 /// locals area so spill slots don't collide with saved FP/LR, VMContext,
 /// or wasm locals.
 const RegMap = struct {
-    entries: std.AutoHashMap(ir.VReg, Location),
-    reg_used: [scratch_regs.len]bool = [_]bool{false} ** scratch_regs.len,
-    next_stack_offset: u32 = 0,
-    /// Byte offset from FP where the first spill slot lives.
-    spill_base: u32 = 0,
-    /// Maximum bytes reserved for spills (beyond which `assign` errors).
-    spill_capacity: u32 = 0,
-
     const Location = union(enum) {
         reg: emit.Reg,
         /// Byte offset from `spill_base` for the spill slot.
@@ -33,16 +25,20 @@ const RegMap = struct {
     // Caller-saved scratch registers (AAPCS64: X0–X15 are caller-saved).
     // We reserve X16 (IP0) and X17 (IP1) as non-allocatable scratch for
     // codegen use (shift-count negation, rem via MSUB, spill reload, etc.);
-    // X18 is reserved platform register. Once calls land, caller-saved
-    // across call boundaries will need spill/reload handling.
+    // X18 is reserved platform register.
     //
     // X15 is reserved as `tmp2` for multi-operand sequences (e.g., bounds
-    // check needs vmctx + zext_addr + mem_size live simultaneously). The
-    // tradeoff: one less allocatable reg in exchange for simpler helper
-    // sequences that don't have to spill/reload through the frame.
-    const scratch_regs = [_]emit.Reg{
-        .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7,
-        .x8, .x9, .x10, .x11, .x12, .x13, .x14,
+    // check needs vmctx + zext_addr + mem_size live simultaneously).
+    //
+    // X19–X28 are AAPCS64 callee-saved and appended after the caller-saved
+    // block. They survive calls (no save around BL), trading one extra
+    // STR/LDR pair per function per reg that the body allocates.
+    pub const caller_saved_count: usize = 15;
+    pub const scratch_regs = [_]emit.Reg{
+        .x0,  .x1,  .x2,  .x3,  .x4,  .x5,  .x6,  .x7,
+        .x8,  .x9,  .x10, .x11, .x12, .x13, .x14,
+        // Callee-saved:
+        .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28,
     };
 
     /// Non-allocatable scratch registers usable by any handler.
@@ -50,6 +46,14 @@ const RegMap = struct {
     pub const tmp0: emit.Reg = .x16;
     pub const tmp1: emit.Reg = .x17;
     pub const tmp2: emit.Reg = .x15;
+
+    entries: std.AutoHashMap(ir.VReg, Location),
+    reg_used: [scratch_regs.len]bool = [_]bool{false} ** scratch_regs.len,
+    next_stack_offset: u32 = 0,
+    /// Byte offset from FP where the first spill slot lives.
+    spill_base: u32 = 0,
+    /// Maximum bytes reserved for spills (beyond which `assign` errors).
+    spill_capacity: u32 = 0,
 
     fn init(allocator: std.mem.Allocator, spill_base: u32, spill_capacity: u32) RegMap {
         return .{
@@ -118,6 +122,9 @@ const FuncCompileCtx = struct {
     /// FP-relative byte offset of the call-save region where caller-save
     /// physregs (x0..x15) are spilled around BL instructions.
     call_save_base: u32 = 0,
+    /// FP-relative byte offset of the callee-save region where x19..x28
+    /// are saved in the prologue and restored in each epilogue.
+    callee_save_base: u32 = 0,
     /// VReg → signed i64 value for `iconst_*` definitions in this function.
     /// Used to fold constants into immediate-form instructions (e.g.
     /// ADD/SUB imm). The iconst itself is still materialized into its home
@@ -166,12 +173,16 @@ pub fn compileFunctionImpl(
 
     // Frame size: (local_count + 3) × 8 for saved FP/LR + vmctx + locals,
     // plus 256 bytes of spill headroom (32 slots), plus 128 bytes for
-    // call-save (16 physregs × 8), aligned to 16 (AArch64 SP alignment).
+    // call-save (16 physregs × 8), plus 80 bytes for 10 callee-saved regs
+    // (x19..x28), aligned to 16 (AArch64 SP alignment).
     const spill_base: u32 = (func.local_count + 3) * 8;
     const spill_capacity: u32 = 256;
     const call_save_base: u32 = spill_base + spill_capacity;
     const call_save_size: u32 = 128;
-    const raw_frame = call_save_base + call_save_size;
+    const callee_save_base: u32 = call_save_base + call_save_size;
+    const callee_save_count: u32 = 10; // x19..x28
+    const callee_save_size: u32 = callee_save_count * 8;
+    const raw_frame = callee_save_base + callee_save_size;
     const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
 
     var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
@@ -179,6 +190,7 @@ pub fn compileFunctionImpl(
 
     var fctx = ctx;
     fctx.call_save_base = call_save_base;
+    fctx.callee_save_base = callee_save_base;
 
     // Collect iconst_* values so emitBinOp etc can fold small constants
     // into immediate-form instructions. Scan is cheap — one pass over IR.
@@ -197,6 +209,7 @@ pub fn compileFunctionImpl(
     fctx.const_vals = &const_vals;
 
     try code.emitPrologue(frame_size);
+    try emitCalleeSaveStore(&code, callee_save_base);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
     try emitEntrySpill(&code, func.*);
@@ -218,6 +231,7 @@ pub fn compileFunctionImpl(
     }
 
     if (!last_was_ret) {
+        try emitCalleeSaveRestore(&code, callee_save_base);
         try code.emitEpilogue(frame_size);
     }
 
@@ -300,6 +314,34 @@ fn isRet(op: ir.Inst.Op) bool {
         .ret => true,
         else => false,
     };
+}
+
+/// The 10 callee-saved allocatable registers (x19..x28). Must match the
+/// tail of `RegMap.scratch_regs`.
+const callee_saved_regs = [_]emit.Reg{
+    .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28,
+};
+
+/// Save all callee-saved allocatable registers to `[fp + callee_save_base
+/// + i*8]`. Called once from the prologue, unconditionally — the simple
+/// linear-scan allocator doesn't track per-reg usage precisely enough to
+/// emit targeted saves, and the overhead (10 STRs per function) is small
+/// relative to typical wasm function bodies.
+fn emitCalleeSaveStore(code: *emit.CodeBuffer, callee_save_base: u32) !void {
+    for (callee_saved_regs, 0..) |r, i| {
+        const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(r, .fp, off_scaled);
+    }
+}
+
+/// Restore all callee-saved allocatable registers. Emitted before each
+/// epilogue so every return path leaves the registers in the state the
+/// caller expects.
+fn emitCalleeSaveRestore(code: *emit.CodeBuffer, callee_save_base: u32) !void {
+    for (callee_saved_regs, 0..) |r, i| {
+        const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(r, .fp, off_scaled);
+    }
 }
 
 fn compileInst(
@@ -422,6 +464,7 @@ fn compileInst(
                 const r = try useInto(code, reg_map, val, .x0);
                 if (r != .x0) try code.movRegReg(.x0, r);
             }
+            try emitCalleeSaveRestore(code, fctx.callee_save_base);
             try code.emitEpilogue(frame_size);
         },
         .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot),
@@ -1167,13 +1210,16 @@ fn emitCall(
     if (cl.func_idx < fctx.import_count) return error.UnimplementedImportCall;
     const call_patches = fctx.call_patches orelse return error.CallLinkageUnavailable;
 
-    // Snapshot live caller-save physregs (x0..x15).
+    // Snapshot live caller-save physregs (x0..x15). Callee-saved
+    // allocatable regs (x19..x28) at indices >= caller_saved_count survive
+    // BL automatically, so we never spill them around calls.
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
 
     // Spill each used caller-save reg to [fp + call_save_base + i*8].
     for (used_snapshot, 0..) |used, i| {
         if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
         const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.strImm(reg, .fp, slot_scaled);
@@ -1189,8 +1235,14 @@ fn emitCall(
         switch (loc) {
             .reg => |r| {
                 const reg_idx: u32 = @intFromEnum(r);
-                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-                try code.ldrImm(target, .fp, slot_scaled);
+                if (reg_idx >= 19) {
+                    // Callee-saved source reg was not spilled across BL — just
+                    // MOV it into the target arg reg directly.
+                    try code.movRegReg(target, r);
+                } else {
+                    const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                    try code.ldrImm(target, .fp, slot_scaled);
+                }
             },
             .stack => |off| {
                 try code.ldrImm(target, .fp, reg_map.spillOffsetScaled(off));
@@ -1221,6 +1273,7 @@ fn emitCall(
     // Restore previously-saved caller-save regs.
     for (used_snapshot, 0..) |used, i| {
         if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
         const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.ldrImm(reg, .fp, slot_scaled);
@@ -2578,11 +2631,11 @@ test "compile: entry spills vmctx to [fp+16]" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
-    // First 2 words: prologue (STP + ADD fp, sp, #0)
-    // Third word: STR x0, [fp, #16]
+    // Layout: prologue (STP + ADD fp,sp,0), then 10 callee-save STRs for
+    // x19..x28 (40 bytes), then STR x0 → [fp+16].
     //   opcode 0xF9000000 | (imm12=2 << 10) | (rn=29 << 5) | rt=0
     //   = 0xF9000000 | 0x800 | 0x3A0 | 0 = 0xF9000BA0
-    const str_word = std.mem.readInt(u32, code[8..][0..4], .little);
+    const str_word = std.mem.readInt(u32, code[48..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xF9000BA0), str_word);
 }
 
@@ -2597,10 +2650,11 @@ test "compile: param spill — STR x1 into first local slot" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
-    // words: [0]=STP, [1]=ADD fp,sp,0, [2]=STR x0 vmctx, [3]=STR x1 local0
+    // Layout: STP, ADD fp,sp,0, 10× callee-save STRs (40 bytes), STR x0
+    // vmctx, STR x1 local0.
     //   STR x1, [fp, #24]: rt=1, rn=29, imm12=3
     //   = 0xF9000000 | (3<<10) | (29<<5) | 1 = 0xF9000FA1
-    const str_param = std.mem.readInt(u32, code[12..][0..4], .little);
+    const str_param = std.mem.readInt(u32, code[52..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xF9000FA1), str_param);
 }
 
@@ -2616,14 +2670,19 @@ test "compile: zero-init of declared local (beyond params)" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
-    // words: STP, ADD fp, STR x0 vmctx, MOVZ x16 #0, STR x16→local0, STR x16→local1
-    const movz_word = std.mem.readInt(u32, code[12..][0..4], .little);
+    // Layout (large-frame prologue, 3 words):
+    //   [0]   SUB SP, SP, #frame_size
+    //   [4]   STP FP, LR, [SP]
+    //   [8]   MOV FP, SP
+    //   [12]..[48] 10× callee-save STR (40 bytes)
+    //   [52]  STR x0 vmctx, [56] MOVZ x16, [60]/[64] STR x16 → locals.
+    const movz_word = std.mem.readInt(u32, code[56..][0..4], .little);
     // MOVZ X16, #0, LSL #0 = 0xD2800000 | (0<<5) | 16 = 0xD2800010
     try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
-    const str0 = std.mem.readInt(u32, code[16..][0..4], .little);
+    const str0 = std.mem.readInt(u32, code[60..][0..4], .little);
     // STR x16, [fp, #24]: rt=16, rn=29, imm12=3 → 0xF9000000|(3<<10)|(29<<5)|16
     try std.testing.expectEqual(@as(u32, 0xF9000FB0), str0);
-    const str1 = std.mem.readInt(u32, code[20..][0..4], .little);
+    const str1 = std.mem.readInt(u32, code[64..][0..4], .little);
     // STR x16, [fp, #32]: imm12=4 → 0xF9000000|(4<<10)|(29<<5)|16
     try std.testing.expectEqual(@as(u32, 0xF90013B0), str1);
 }
