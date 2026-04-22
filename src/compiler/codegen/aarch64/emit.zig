@@ -533,6 +533,16 @@ pub const CodeBuffer = struct {
         try self.emit32(0x1E21C000 | (ty << 22) | (@as(u32, vn) << 5) | vd);
     }
 
+    /// FCMP Sn, Sm / FCMP Dn, Dm — set NZCV from float compare.
+    /// Unordered (NaN involved) sets NZCV = 0011 (N=0, Z=0, C=1, V=1).
+    pub fn fcmpScalar(self: *CodeBuffer, is_f64: bool, vn: u5, vm: u5) !void {
+        // 0001 1110 0 ty 1 Rm 00 1000 Rn 0 0000
+        const ty: u32 = if (is_f64) 1 else 0;
+        try self.emit32(0x1E202000 | (ty << 22) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5));
+    }
+
     /// NEG Xd, Xn (alias SUB Xd, XZR, Xn)
     pub fn negReg(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
         // SUB Xd, XZR, Xn: 1|10|01011|00|0|Rm(Rn)|000000|Rn(11111)|Rd

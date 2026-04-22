@@ -418,6 +418,13 @@ fn compileInst(
         .f_neg => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .neg),
         .f_abs => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .abs),
         .f_sqrt => |vreg| try emitFSqrt(code, inst, vreg, reg_map),
+
+        .f_eq => |bin| try emitFCmp(code, inst, bin, reg_map, .eq),
+        .f_ne => |bin| try emitFCmp(code, inst, bin, reg_map, .ne),
+        .f_lt => |bin| try emitFCmp(code, inst, bin, reg_map, .mi),
+        .f_gt => |bin| try emitFCmp(code, inst, bin, reg_map, .gt),
+        .f_le => |bin| try emitFCmp(code, inst, bin, reg_map, .ls),
+        .f_ge => |bin| try emitFCmp(code, inst, bin, reg_map, .ge),
         .reinterpret => |vreg| try emitReinterpret(code, inst, vreg, reg_map),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
@@ -728,6 +735,47 @@ fn emitFSqrt(
     try code.fsqrtScalar(is64, 0, 0);
     if (is64) try code.fmovGpFromD64(info.reg, 0)
     else try code.fmovGpFromS32(info.reg, 0);
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit a float comparison (f_eq/f_ne/f_lt/f_gt/f_le/f_ge). Operand
+/// type is carried in `inst.type` (.f32 or .f64); the result is an
+/// i32 boolean placed in `inst.dest`.
+///
+/// NaN semantics: WebAssembly requires every comparison to return 0
+/// when either operand is NaN, except `ne` which must return 1.
+/// FCMP on AArch64 sets NZCV = 0b0011 (N=0, Z=0, C=1, V=1) when
+/// unordered. The chosen conditions satisfy wasm semantics for NaN:
+///   eq → EQ  (Z=1)           : unordered Z=0 → 0 ✓
+///   ne → NE  (Z=0)           : unordered Z=0 → 1 ✓
+///   lt → MI  (N=1)           : unordered N=0 → 0 ✓
+///   le → LS  (C=0 | Z=1)     : unordered C=1,Z=0 → 0 ✓
+///   gt → GT  (Z=0 & N=V)     : unordered N=0,V=1 → 0 ✓
+///   ge → GE  (N=V)           : unordered N=0,V=1 → 0 ✓
+fn emitFCmp(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+    cond: emit.Cond,
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+
+    const is64 = (inst.type == .f64);
+    if (is64) {
+        try code.fmovDFromGp64(0, lhs);
+        try code.fmovDFromGp64(1, rhs);
+    } else {
+        try code.fmovSFromGp32(0, lhs);
+        try code.fmovSFromGp32(1, rhs);
+    }
+    try code.fcmpScalar(is64, 0, 1);
+    // Result is i32; CSET Wd, cond — upper 32 bits are zeroed by the
+    // CSINC-W alias, matching x86_64 SETcc+MOVZX convention.
+    try code.cset32(info.reg, cond);
     try destCommit(code, reg_map, info);
 }
 

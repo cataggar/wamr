@@ -590,6 +590,107 @@ test "differential: f32.sqrt" {
     try expectDiffI32(wasm, "f", 0x40000000);
 }
 
+// ── f32 comparisons ─────────────────────────────────────────────────
+// Each test uses a body of:
+//   f32.const A, f32.const B, f32.<cmp> → i32 on stack, end
+// Body size = 1 + 4 + 1 + 4 + 1 + 1 = 12, locals byte = 1 → 13 → 0x0d
+// Code section size = 1 (func count) + 1 (body size LEB) + 13 = 15 → 0x0f
+
+fn buildF32CmpModule(comptime opcode: u8, comptime a_bytes: [4]u8, comptime b_bytes: [4]u8) [43]u8 {
+    return [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00,
+        0x0a, 0x0f, 0x01, 0x0d, 0x00,
+        0x43, a_bytes[0], a_bytes[1], a_bytes[2], a_bytes[3], // f32.const A
+        0x43, b_bytes[0], b_bytes[1], b_bytes[2], b_bytes[3], // f32.const B
+        opcode,                                                // f32.<cmp>
+        0x0b,
+    };
+}
+
+test "differential: f32.eq true" {
+    // 1.5 == 1.5 → 1
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const wasm = buildF32CmpModule(0x5b, one_five, one_five);
+    try expectDiffI32(&wasm, "f", 1);
+}
+
+test "differential: f32.eq false" {
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const two_five = [4]u8{ 0x00, 0x00, 0x20, 0x40 };
+    const wasm = buildF32CmpModule(0x5b, one_five, two_five);
+    try expectDiffI32(&wasm, "f", 0);
+}
+
+test "differential: f32.ne true" {
+    // 1.5 != 2.5 → 1
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const two_five = [4]u8{ 0x00, 0x00, 0x20, 0x40 };
+    const wasm = buildF32CmpModule(0x5c, one_five, two_five);
+    try expectDiffI32(&wasm, "f", 1);
+}
+
+test "differential: f32.lt" {
+    // 1.5 < 2.5 → 1; 2.5 < 1.5 → 0
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const two_five = [4]u8{ 0x00, 0x00, 0x20, 0x40 };
+    {
+        const wasm = buildF32CmpModule(0x5d, one_five, two_five);
+        try expectDiffI32(&wasm, "f", 1);
+    }
+    {
+        const wasm = buildF32CmpModule(0x5d, two_five, one_five);
+        try expectDiffI32(&wasm, "f", 0);
+    }
+}
+
+test "differential: f32.gt" {
+    // 2.5 > 1.5 → 1
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const two_five = [4]u8{ 0x00, 0x00, 0x20, 0x40 };
+    const wasm = buildF32CmpModule(0x5e, two_five, one_five);
+    try expectDiffI32(&wasm, "f", 1);
+}
+
+test "differential: f32.le equal" {
+    // 1.5 <= 1.5 → 1
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const wasm = buildF32CmpModule(0x5f, one_five, one_five);
+    try expectDiffI32(&wasm, "f", 1);
+}
+
+test "differential: f32.ge equal" {
+    // 1.5 >= 1.5 → 1
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const wasm = buildF32CmpModule(0x60, one_five, one_five);
+    try expectDiffI32(&wasm, "f", 1);
+}
+
+test "differential: f32.eq NaN returns 0" {
+    // NaN == 1.5 → 0 (wasm NaN semantics)
+    const nan = [4]u8{ 0x00, 0x00, 0xc0, 0x7f }; // quiet NaN 0x7FC00000
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const wasm = buildF32CmpModule(0x5b, nan, one_five);
+    try expectDiffI32(&wasm, "f", 0);
+}
+
+test "differential: f32.ne NaN returns 1" {
+    // NaN != 1.5 → 1 (only cmp that returns 1 for NaN)
+    const nan = [4]u8{ 0x00, 0x00, 0xc0, 0x7f };
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const wasm = buildF32CmpModule(0x5c, nan, one_five);
+    try expectDiffI32(&wasm, "f", 1);
+}
+
+test "differential: f32.lt NaN returns 0" {
+    const nan = [4]u8{ 0x00, 0x00, 0xc0, 0x7f };
+    const one_five = [4]u8{ 0x00, 0x00, 0xc0, 0x3f };
+    const wasm = buildF32CmpModule(0x5d, nan, one_five);
+    try expectDiffI32(&wasm, "f", 0);
+}
+
 test "differential: memory.size returns min pages" {
     // (module (memory 3) (func (export "f") (result i32) memory.size))
     // Expected: 3 (initial page count).
