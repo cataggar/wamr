@@ -451,10 +451,10 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
 
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .store, .local_set, .global_set, .call, .call_indirect, .call_ref, .ret, .br, .br_if, .br_table, .@"unreachable",
+        .store, .local_set, .global_set, .call, .call_indirect, .call_ref, .ret, .ret_multi, .br, .br_if, .br_table, .@"unreachable",
         .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
         .atomic_notify, .atomic_wait, .memory_copy, .memory_fill, .memory_grow,
-        .memory_init, .data_drop, .table_init, .elem_drop,
+        .memory_init, .data_drop, .table_init, .elem_drop, .table_set, .table_grow,
         => true,
         else => false,
     };
@@ -709,6 +709,27 @@ test "DCE: preserves call_indirect elem_idx and arg VRegs" {
 
     const changed = try deadCodeElimination(&func, allocator);
     try std.testing.expect(!changed); // elem and arg are both used
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+}
+
+test "DCE: preserves call_ref func_ref and arg VRegs" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const fref = func.newVReg();
+    const arg = func.newVReg();
+    const call_args = try allocator.dupe(ir.VReg, &[_]ir.VReg{arg});
+    defer allocator.free(call_args);
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = fref });
+    try block.append(.{ .op = .{ .iconst_32 = 9 }, .dest = arg });
+    try block.append(.{ .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = fref, .args = call_args } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const changed = try deadCodeElimination(&func, allocator);
+    try std.testing.expect(!changed); // fref and arg are both used
     try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
 }
 
