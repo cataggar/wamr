@@ -396,6 +396,8 @@ fn compileInst(
         .global_set => |gs| try emitGlobalSet(code, gs, reg_map),
         .memory_size => try emitMemorySize(code, inst, reg_map),
         .memory_grow => |pages_vreg| try emitMemoryGrow(code, inst, pages_vreg, reg_map, fctx),
+        .memory_fill => |mf| try emitMemoryFill(code, mf, reg_map, fctx),
+        .memory_copy => |mc| try emitMemoryCopy(code, mc, reg_map, fctx),
 
         // ── Float bit-level unary ────────────────────────────────────
         // f_neg and f_abs are sign-bit manipulations; they can be done
@@ -912,6 +914,8 @@ const vmctx_memsize_slot: u12 = 1;       // byte 8, scale 8
 const vmctx_globals_slot: u12 = 2;       // byte 16, scale 8
 const vmctx_mem_pages_slot_w: u12 = 14;  // byte 56 (u32), scale 4
 const vmctx_mem_grow_fn_slot: u12 = 8;   // byte 64, scale 8
+const vmctx_mem_fill_fn_slot: u12 = 28;  // byte 224, scale 8
+const vmctx_mem_copy_fn_slot: u12 = 29;  // byte 232, scale 8
 const vmctx_trap_oob_fn_slot: u12 = 10;  // byte 80, scale 8
 const vmctx_trap_unreachable_fn_slot: u12 = 11; // byte 88, scale 8
 const vmctx_trap_idivz_fn_slot: u12 = 12; // byte 96, scale 8
@@ -992,6 +996,47 @@ fn emitMemoryGrow(
     reg_map: *RegMap,
     fctx: *FuncCompileCtx,
 ) !void {
+    const args = [_]ir.VReg{pages_vreg};
+    try emitVmctxHelperCall(code, &args, vmctx_mem_grow_fn_slot, reg_map, fctx, inst.dest);
+}
+
+fn emitMemoryFill(
+    code: *emit.CodeBuffer,
+    mf: @TypeOf(@as(ir.Inst.Op, undefined).memory_fill),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    const args = [_]ir.VReg{ mf.dst, mf.val, mf.len };
+    try emitVmctxHelperCall(code, &args, vmctx_mem_fill_fn_slot, reg_map, fctx, null);
+}
+
+fn emitMemoryCopy(
+    code: *emit.CodeBuffer,
+    mc: @TypeOf(@as(ir.Inst.Op, undefined).memory_copy),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    const args = [_]ir.VReg{ mc.dst, mc.src, mc.len };
+    try emitVmctxHelperCall(code, &args, vmctx_mem_copy_fn_slot, reg_map, fctx, null);
+}
+
+/// Emit an indirect call to a host helper via a VmCtx slot, passing
+/// `vmctx` as the first arg and `args` as x1..xN (up to 7). Uses the
+/// same caller-save snapshot pattern as `emitCall`: all currently-used
+/// scratch regs are spilled to the function's `call_save` region before
+/// arg staging, so the arg moves can read from stable stack slots
+/// without parallel-move hazards. If `maybe_dest` is non-null, x0 is
+/// committed to it before restoring saved regs.
+fn emitVmctxHelperCall(
+    code: *emit.CodeBuffer,
+    args: []const ir.VReg,
+    fn_slot: u12,
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+    maybe_dest: ?ir.VReg,
+) !void {
+    if (args.len > 7) return error.UnimplementedOp;
+
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
 
@@ -1002,34 +1047,34 @@ fn emitMemoryGrow(
         try code.strImm(reg, .fp, slot_scaled);
     }
 
-    // Stage delta_pages into x1 from its spilled location.
-    const loc = reg_map.get(pages_vreg) orelse return error.UnboundVReg;
-    switch (loc) {
-        .reg => |r| {
-            const reg_idx: u32 = @intFromEnum(r);
-            const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-            try code.ldrImm(.x1, .fp, slot_scaled);
-        },
-        .stack => |off| {
-            try code.ldrImm(.x1, .fp, reg_map.spillOffsetScaled(off));
-        },
+    // Stage args into x1..xN from stable post-snapshot storage.
+    const arg_regs = [_]emit.Reg{ .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
+    for (args, 0..) |vreg, i| {
+        const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
+        switch (loc) {
+            .reg => |r| {
+                const reg_idx: u32 = @intFromEnum(r);
+                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                try code.ldrImm(arg_regs[i], .fp, slot_scaled);
+            },
+            .stack => |off| {
+                try code.ldrImm(arg_regs[i], .fp, reg_map.spillOffsetScaled(off));
+            },
+        }
     }
 
-    // x0 = vmctx; tmp0 = vmctx.mem_grow_fn; BLR tmp0.
+    // x0 = vmctx; tmp0 = vmctx.<fn_slot>; BLR tmp0.
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
-    try code.ldrImm(RegMap.tmp0, .x0, vmctx_mem_grow_fn_slot);
+    try code.ldrImm(RegMap.tmp0, .x0, fn_slot);
     try code.blr(RegMap.tmp0);
 
-    // Commit helper result (x0) to dest BEFORE restoring saved regs.
-    // dest.reg is guaranteed not to be in used_snapshot because destBegin
-    // calls assign() which only picks currently-free regs.
-    if (inst.dest) |dest| {
+    // Commit result (x0) to dest BEFORE restoring saved regs.
+    if (maybe_dest) |dest| {
         const info = try destBegin(reg_map, dest, RegMap.tmp0);
         if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
         try destCommit(code, reg_map, info);
     }
 
-    // Restore saved regs.
     for (used_snapshot, 0..) |used, i| {
         if (!used) continue;
         const reg = RegMap.scratch_regs[i];
