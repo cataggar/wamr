@@ -460,6 +460,21 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// MADD Xd, Xn, Xm, Xa — Xd = Xa + Xn*Xm (64-bit).
+    pub fn maddRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, ra: Reg) !void {
+        // 1|00|11011|000|Rm|0|Ra|Rn|Rd
+        try self.emit32(0x9B000000 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, ra.encoding()) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// MADD Wd, Wn, Wm, Wa (32-bit).
+    pub fn maddRegReg32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, ra: Reg) !void {
+        try self.emit32(0x1B000000 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, ra.encoding()) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// MSUB Xd, Xn, Xm, Xa — Xd = Xa - Xn*Xm (64-bit).
     pub fn msubRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, ra: Reg) !void {
         // 1|00|11011|000|Rm|1|Ra|Rn|Rd
@@ -885,6 +900,20 @@ test "emit: MSUB w0, w1, w2, w3" {
     defer code.deinit();
     try code.msubRegReg32(.x0, .x1, .x2, .x3);
     try expectWord(0x1B028C20, &code);
+}
+
+test "emit: MADD x0, x1, x2, x3" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.maddRegReg(.x0, .x1, .x2, .x3);
+    try expectWord(0x9B020C20, &code);
+}
+
+test "emit: MADD w0, w1, w2, w3" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.maddRegReg32(.x0, .x1, .x2, .x3);
+    try expectWord(0x1B020C20, &code);
 }
 
 fn expectWord(expected: u32, code: *const CodeBuffer) !void {

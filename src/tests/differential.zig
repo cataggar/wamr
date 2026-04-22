@@ -1188,3 +1188,86 @@ test "differential: i32.add 1 + 99999 == 100000 (unencodable → reg-reg fallbac
     defer testing.allocator.free(wasm);
     try expectDiffI32(wasm, "f", 100000);
 }
+
+test "differential: i32 FMA — (3 * 4) + 10 == 22 (MADD fusion)" {
+    // Build a module exporting `f : () -> i32` with body
+    //   i32.const 3; i32.const 4; i32.mul;  -- mul (single-use)
+    //   i32.const 10; i32.add;              -- consumed by add → MADD
+    // end
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00); // no locals
+    const push = struct {
+        fn f(b: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) !void {
+            try b.append(a, 0x41);
+            try encodeSLEB128(b, a, v);
+        }
+    }.f;
+    try push(&body, testing.allocator, 3);
+    try push(&body, testing.allocator, 4);
+    try body.append(testing.allocator, 0x6C); // i32.mul
+    try push(&body, testing.allocator, 10);
+    try body.append(testing.allocator, 0x6A); // i32.add
+    try body.append(testing.allocator, 0x0B);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F });
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x03, 0x02, 0x01, 0x00 });
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 });
+
+    var code_section: std.ArrayList(u8) = .empty;
+    defer code_section.deinit(testing.allocator);
+    try code_section.append(testing.allocator, 0x01);
+    try encodeULEB128(&code_section, testing.allocator, @intCast(body.items.len));
+    try code_section.appendSlice(testing.allocator, body.items);
+
+    try out.append(testing.allocator, 0x0A);
+    try encodeULEB128(&out, testing.allocator, @intCast(code_section.items.len));
+    try out.appendSlice(testing.allocator, code_section.items);
+
+    const wasm = try out.toOwnedSlice(testing.allocator);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 22);
+}
+
+test "differential: i32 FMA — 100 - (5 * 7) == 65 (MSUB fusion)" {
+    // body: const 100; const 5; const 7; i32.mul; i32.sub  (100 - 5*7)
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    const push = struct {
+        fn f(b: *std.ArrayList(u8), a: std.mem.Allocator, v: i32) !void {
+            try b.append(a, 0x41);
+            try encodeSLEB128(b, a, v);
+        }
+    }.f;
+    try push(&body, testing.allocator, 100);
+    try push(&body, testing.allocator, 5);
+    try push(&body, testing.allocator, 7);
+    try body.append(testing.allocator, 0x6C); // i32.mul
+    try body.append(testing.allocator, 0x6B); // i32.sub
+    try body.append(testing.allocator, 0x0B);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F });
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x03, 0x02, 0x01, 0x00 });
+    try out.appendSlice(testing.allocator, &[_]u8{ 0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00 });
+
+    var code_section: std.ArrayList(u8) = .empty;
+    defer code_section.deinit(testing.allocator);
+    try code_section.append(testing.allocator, 0x01);
+    try encodeULEB128(&code_section, testing.allocator, @intCast(body.items.len));
+    try code_section.appendSlice(testing.allocator, body.items);
+
+    try out.append(testing.allocator, 0x0A);
+    try encodeULEB128(&out, testing.allocator, @intCast(code_section.items.len));
+    try out.appendSlice(testing.allocator, code_section.items);
+
+    const wasm = try out.toOwnedSlice(testing.allocator);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 65);
+}

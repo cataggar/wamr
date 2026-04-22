@@ -130,7 +130,24 @@ const FuncCompileCtx = struct {
     /// ADD/SUB imm). The iconst itself is still materialized into its home
     /// register, so downstream uses that don't fold still work.
     const_vals: ?*const std.AutoHashMap(ir.VReg, i64) = null,
+    /// Set of mul dest vregs whose computation should be skipped because
+    /// the single consumer is an add/sub that will be emitted as a fused
+    /// MADD/MSUB (Phase 4 FMA fusion). When the mul handler sees a dest
+    /// in this set, it bypasses codegen and leaves the sources live for
+    /// the fused op.
+    mul_fused: ?*const std.AutoHashMap(ir.VReg, void) = null,
+    /// Map from add/sub dest vreg → (mul_lhs, mul_rhs, addend) source
+    /// triple. Populated by the FMA pre-pass in lockstep with `mul_fused`.
+    fma_info: ?*const std.AutoHashMap(ir.VReg, FmaInfo) = null,
     allocator: std.mem.Allocator,
+};
+
+/// Pre-computed info for a fused MADD/MSUB: `dest = addend ± mul_lhs * mul_rhs`.
+const FmaInfo = struct {
+    mul_lhs: ir.VReg,
+    mul_rhs: ir.VReg,
+    addend: ir.VReg,
+    is_sub: bool,
 };
 
 /// Compile an IR function to AArch64 machine code.
@@ -207,6 +224,92 @@ pub fn compileFunctionImpl(
         }
     }
     fctx.const_vals = &const_vals;
+
+    // FMA fusion pre-pass: find `mul → single-use add/sub` pairs within the
+    // same block. The mul's dest must be consumed by the very next use (an
+    // integer add/sub of matching type) and used nowhere else. IR vregs are
+    // single-assignment so the mul's sources remain valid for MADD/MSUB.
+    var use_counts = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer use_counts.deinit();
+    const bumpUse = struct {
+        fn f(uc: *std.AutoHashMap(ir.VReg, u32), v: ir.VReg) !void {
+            const e = try uc.getOrPut(v);
+            if (!e.found_existing) e.value_ptr.* = 0;
+            e.value_ptr.* += 1;
+        }
+    }.f;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const maybe_bin: ?ir.Inst.BinOp = switch (inst.op) {
+                .add, .sub, .mul, .@"and", .@"or", .xor,
+                .div_s, .div_u, .rem_s, .rem_u,
+                .shl, .shr_s, .shr_u, .rotl, .rotr,
+                .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u,
+                .le_s, .le_u, .ge_s, .ge_u => |b| b,
+                else => null,
+            };
+            if (maybe_bin) |b| {
+                try bumpUse(&use_counts, b.lhs);
+                try bumpUse(&use_counts, b.rhs);
+            }
+        }
+    }
+
+    var mul_fused = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer mul_fused.deinit();
+    var fma_info = std.AutoHashMap(ir.VReg, FmaInfo).init(allocator);
+    defer fma_info.deinit();
+    for (func.blocks.items) |block| {
+        const insts = block.instructions.items;
+        var i: usize = 0;
+        while (i < insts.len) : (i += 1) {
+            const add_inst = insts[i];
+            const is_add = add_inst.op == .add;
+            const is_sub = add_inst.op == .sub;
+            if (!is_add and !is_sub) continue;
+            if (add_inst.type != .i32 and add_inst.type != .i64) continue;
+            const bin: ir.Inst.BinOp = switch (add_inst.op) {
+                .add => |b| b, .sub => |b| b, else => continue,
+            };
+            const candidates: [2]?ir.VReg = if (is_add)
+                .{ bin.rhs, bin.lhs }
+            else
+                .{ bin.rhs, null };
+            for (candidates) |maybe_mul_dest| {
+                const mul_dest = maybe_mul_dest orelse continue;
+                const uc = use_counts.get(mul_dest) orelse continue;
+                if (uc != 1) continue;
+                var found_bin: ?ir.Inst.BinOp = null;
+                var j: usize = i;
+                while (j > 0) : (j -= 1) {
+                    const prev = insts[j - 1];
+                    if (prev.dest) |d| {
+                        if (d != mul_dest) continue;
+                        if (prev.op == .mul and prev.type == add_inst.type) {
+                            found_bin = prev.op.mul;
+                        }
+                        break;
+                    }
+                }
+                const mul_bin = found_bin orelse continue;
+                const addend = if (is_add and maybe_mul_dest.? == bin.lhs)
+                    bin.rhs
+                else
+                    bin.lhs;
+                try mul_fused.put(mul_dest, {});
+                const dest = add_inst.dest orelse continue;
+                try fma_info.put(dest, .{
+                    .mul_lhs = mul_bin.lhs,
+                    .mul_rhs = mul_bin.rhs,
+                    .addend = addend,
+                    .is_sub = is_sub,
+                });
+                break;
+            }
+        }
+    }
+    fctx.mul_fused = &mul_fused;
+    fctx.fma_info = &fma_info;
 
     try code.emitPrologue(frame_size);
     try emitCalleeSaveStore(&code, callee_save_base);
@@ -1870,6 +1973,42 @@ fn emitBinOp(
     fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
+
+    // FMA fusion: if this is an add/sub whose dest is in fma_info, skip the
+    // mul (already marked for skip) and emit MADD/MSUB in one shot.
+    if ((kind == .add or kind == .sub) and fctx.fma_info != null) {
+        if (fctx.fma_info.?.get(dest)) |info| {
+            const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
+            // Load three sources into fresh scratch regs. When dst is
+            // spilled, dst_info.reg == tmp0; reserve tmp1/tmp2 plus a
+            // secondary landing pad via the reg_map for the addend.
+            const lhs_scratch: emit.Reg = if (dst_info.spill_slot == null) RegMap.tmp0 else dst_info.reg;
+            const lhs_reg = try useInto(code, reg_map, info.mul_lhs, lhs_scratch);
+            const rhs_reg = try useInto(code, reg_map, info.mul_rhs, RegMap.tmp1);
+            const add_reg = try useInto(code, reg_map, info.addend, RegMap.tmp2);
+            const is64 = (inst.type == .i64);
+            if (info.is_sub) {
+                if (is64)
+                    try code.msubRegReg(dst_info.reg, lhs_reg, rhs_reg, add_reg)
+                else
+                    try code.msubRegReg32(dst_info.reg, lhs_reg, rhs_reg, add_reg);
+            } else {
+                if (is64)
+                    try code.maddRegReg(dst_info.reg, lhs_reg, rhs_reg, add_reg)
+                else
+                    try code.maddRegReg32(dst_info.reg, lhs_reg, rhs_reg, add_reg);
+            }
+            try destCommit(code, reg_map, dst_info);
+            return;
+        }
+    }
+
+    // Mul skip: if this mul's dest was absorbed into a later MADD/MSUB, emit
+    // nothing. The dest vreg is never read, so no allocation is needed.
+    if (kind == .mul and fctx.mul_fused != null and fctx.mul_fused.?.contains(dest)) {
+        return;
+    }
+
     // Allocate dest first; if spilled, dst_info.reg is tmp0 and we STR on commit.
     const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
 
