@@ -49,6 +49,7 @@ extern "kernel32" fn RtlRestoreContext(ContextRecord: *windows.CONTEXT, Exceptio
 const PAGE_READWRITE: u32 = 0x04;
 const PAGE_GUARD: u32 = 0x100;
 const MEM_COMMIT: u32 = 0x1000;
+const MEM_DECOMMIT: u32 = 0x4000;
 
 const MEMORY_BASIC_INFORMATION = extern struct {
     BaseAddress: ?*anyopaque,
@@ -74,6 +75,12 @@ extern "kernel32" fn VirtualQuery(
     lpBuffer: *MEMORY_BASIC_INFORMATION,
     dwLength: usize,
 ) callconv(.winapi) usize;
+
+extern "kernel32" fn VirtualFree(
+    lpAddress: ?*anyopaque,
+    dwSize: usize,
+    dwFreeType: u32,
+) callconv(.winapi) windows.BOOL;
 
 extern "kernel32" fn SetThreadStackGuarantee(
     StackSizeInBytes: *u32,
@@ -108,15 +115,38 @@ fn resetStackGuardPage() void {
     var cursor: usize = @intFromPtr(alloc_base);
     while (true) {
         if (VirtualQuery(@ptrFromInt(cursor), &mbi, @sizeOf(MEMORY_BASIC_INFORMATION)) == 0) return;
-        if (mbi.AllocationBase != alloc_base) return; // walked past the stack
+        if (mbi.AllocationBase != alloc_base) return;
         if (mbi.State == MEM_COMMIT) break;
         cursor +%= mbi.RegionSize;
         if (mbi.RegionSize == 0) return;
     }
 
     const page_size: usize = std.heap.page_size_min;
-    var old_protect: u32 = 0;
-    _ = VirtualProtect(@ptrFromInt(cursor), page_size, PAGE_READWRITE | PAGE_GUARD, &old_protect);
+
+    // After a stack overflow the OS committed the former guard page and
+    // additional pages below it for SetThreadStackGuarantee.  These extra
+    // committed pages reduce the reservoir of reserved pages needed by
+    // the next overflow's exception dispatch.  Decommit a few pages back
+    // to MEM_RESERVE so the OS can reuse them for the next guarantee.
+    const reserve_pages = 8; // 32 KB — comfortably covers a 16 KB guarantee
+    const pages_in_region = mbi.RegionSize / page_size;
+    if (pages_in_region >= 2) {
+        const decommit_pages = @min(reserve_pages, pages_in_region - 1);
+        const decommit_bytes = decommit_pages * page_size;
+        _ = VirtualFree(@ptrFromInt(cursor), decommit_bytes, MEM_DECOMMIT);
+        var old_protect: u32 = 0;
+        _ = VirtualProtect(
+            @ptrFromInt(cursor + decommit_bytes),
+            page_size,
+            PAGE_READWRITE | PAGE_GUARD,
+            &old_protect,
+        );
+    } else {
+        // Single committed page: just re-arm as guard (pre-existing
+        // behaviour; may not survive a second overflow).
+        var old_protect: u32 = 0;
+        _ = VirtualProtect(@ptrFromInt(cursor), page_size, PAGE_READWRITE | PAGE_GUARD, &old_protect);
+    }
 }
 
 fn trapLongjmp() noreturn {
@@ -156,7 +186,15 @@ fn vehHandler(info: *windows.EXCEPTION_POINTERS) callconv(.winapi) c_long {
         _ = in_code;
         @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
         @atomicStore(u32, &g_last_trap_code, code, .seq_cst);
-        ctx.Rip = @intFromPtr(&trapLongjmp);
+        if (code == 0xC00000FD) {
+            // Stack overflow: restore the full saved context so we
+            // resume at the RtlCaptureContext site on a healthy stack.
+            // Using trapLongjmp here is fragile because it would run
+            // on the nearly-exhausted overflowed stack.
+            ctx.* = g_saved_ctx;
+        } else {
+            ctx.Rip = @intFromPtr(&trapLongjmp);
+        }
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     if (rec.ExceptionCode == 0xC0000005) { // STATUS_ACCESS_VIOLATION

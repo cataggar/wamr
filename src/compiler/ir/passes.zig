@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const ir = @import("ir.zig");
+const analysis = @import("analysis.zig");
 
 // ── Use-Def Analysis ────────────────────────────────────────────────────────
 
@@ -562,6 +563,114 @@ pub const default_passes: []const PassFn = &.{
     &commonSubexprElimination,
 };
 
+// ── Block Reordering ────────────────────────────────────────────────────────
+
+const DfsEntry = struct { block: ir.BlockId, child_idx: usize };
+
+/// Compute a block emission order using Reverse Postorder (RPO) with
+/// cold-block sinking. Places hot blocks contiguously for i-cache locality
+/// and maximises fall-through opportunities for the C3 peephole.
+///
+/// Returns a permutation of all BlockIds (caller owns the slice).
+/// Block 0 (entry) is always first. Unreachable blocks are appended at the
+/// end. Blocks containing `.unreachable` instructions are sunk after all
+/// hot blocks.
+pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]ir.BlockId {
+    const n: u32 = @intCast(func.blocks.items.len);
+    if (n <= 1) {
+        const order = try allocator.alloc(ir.BlockId, n);
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        return order;
+    }
+
+    // Build CFG
+    var successors = try analysis.buildSuccessors(func, allocator);
+    defer {
+        var it = successors.valueIterator();
+        while (it.next()) |v| allocator.free(v.*);
+        successors.deinit();
+    }
+
+    // Iterative DFS → post-order
+    const visited = try allocator.alloc(bool, n);
+    defer allocator.free(visited);
+    @memset(visited, false);
+
+    var post_order: std.ArrayList(ir.BlockId) = .empty;
+    defer post_order.deinit(allocator);
+
+    var stack: std.ArrayList(DfsEntry) = .empty;
+    defer stack.deinit(allocator);
+
+    visited[0] = true;
+    try stack.append(allocator, .{ .block = 0, .child_idx = 0 });
+
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        const succs = successors.get(top.block) orelse &[_]ir.BlockId{};
+        if (top.child_idx < succs.len) {
+            const child = succs[top.child_idx];
+            top.child_idx += 1;
+            if (child < n and !visited[child]) {
+                visited[child] = true;
+                try stack.append(allocator, .{ .block = child, .child_idx = 0 });
+            }
+        } else {
+            try post_order.append(allocator, top.block);
+            _ = stack.pop();
+        }
+    }
+
+    // Reverse → RPO
+    std.mem.reverse(ir.BlockId, post_order.items);
+
+    // Detect cold blocks (those containing .@"unreachable")
+    const is_cold = try allocator.alloc(bool, n);
+    defer allocator.free(is_cold);
+    @memset(is_cold, false);
+
+    for (func.blocks.items, 0..) |block, idx| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .@"unreachable") {
+                is_cold[idx] = true;
+                break;
+            }
+        }
+    }
+    // Entry block is never treated as cold.
+    is_cold[0] = false;
+
+    // Partition RPO: hot first, cold second (preserving RPO within each group)
+    var order = try allocator.alloc(ir.BlockId, n);
+    var hot_i: usize = 0;
+
+    for (post_order.items) |bid| {
+        if (!is_cold[bid]) {
+            order[hot_i] = bid;
+            hot_i += 1;
+        }
+    }
+    var cold_i: usize = hot_i;
+    for (post_order.items) |bid| {
+        if (is_cold[bid]) {
+            order[cold_i] = bid;
+            cold_i += 1;
+        }
+    }
+
+    // Append any unreachable blocks (not visited by DFS)
+    for (0..n) |idx| {
+        if (!visited[idx]) {
+            order[cold_i] = @intCast(idx);
+            cold_i += 1;
+        }
+    }
+
+    std.debug.assert(cold_i == n);
+    std.debug.assert(order[0] == 0); // Entry block must be first
+    return order;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "constantFold: iconst + iconst + add → iconst" {
@@ -731,4 +840,98 @@ test "replaceVReg: updates all uses" {
     const add = block.instructions.items[2].op.add;
     try std.testing.expectEqual(v1, add.lhs); // was v0, now v1
     try std.testing.expectEqual(v1, add.rhs); // was already v1
+}
+
+// ── Block Reordering Tests ─────────────────────────────────────────────────
+
+test "reorderBlocks: single block → identity" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    _ = try func.newBlock(); // block 0
+
+    const order = try reorderBlocks(&func, allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 1), order.len);
+    try std.testing.expectEqual(@as(ir.BlockId, 0), order[0]);
+}
+
+test "reorderBlocks: diamond CFG preserves RPO" {
+    // CFG: 0 → {1,2}, 1 → 3, 2 → 3
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    const order = try reorderBlocks(&func, allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 4), order.len);
+    // Block 0 must be first (entry)
+    try std.testing.expectEqual(@as(ir.BlockId, 0), order[0]);
+    // All 4 blocks present
+    var seen = [_]bool{false} ** 4;
+    for (order) |bid| seen[bid] = true;
+    for (seen) |s| try std.testing.expect(s);
+    // Block 3 (merge) must come after both 1 and 2
+    var pos: [4]usize = undefined;
+    for (order, 0..) |bid, i| pos[bid] = i;
+    try std.testing.expect(pos[3] > pos[1]);
+    try std.testing.expect(pos[3] > pos[2]);
+}
+
+test "reorderBlocks: cold block sunk to end" {
+    // CFG: 0 → {1(cold), 2}, 2 → ret
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock(); // cold (unreachable)
+    const b2 = try func.newBlock(); // hot
+
+    const cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .@"unreachable" = {} } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const order = try reorderBlocks(&func, allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 3), order.len);
+    // Block 0 first
+    try std.testing.expectEqual(@as(ir.BlockId, 0), order[0]);
+    // Cold block 1 should be last
+    try std.testing.expectEqual(@as(ir.BlockId, 1), order[order.len - 1]);
+    // Hot block 2 should be second (right after entry)
+    try std.testing.expectEqual(@as(ir.BlockId, 2), order[1]);
+}
+
+test "reorderBlocks: unreachable block appended at end" {
+    // CFG: 0 → 1, block 2 is unreachable
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    _ = try func.newBlock(); // b2: unreachable, no edges to it
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+
+    const order = try reorderBlocks(&func, allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 3), order.len);
+    try std.testing.expectEqual(@as(ir.BlockId, 0), order[0]);
+    try std.testing.expectEqual(@as(ir.BlockId, 1), order[1]);
+    // Unreachable block 2 at end
+    try std.testing.expectEqual(@as(ir.BlockId, 2), order[2]);
 }

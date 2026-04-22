@@ -8,6 +8,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ir = @import("../../ir/ir.zig");
+const passes = @import("../../ir/passes.zig");
 const emit = @import("emit.zig");
 
 /// Platform-specific ABI parameter registers, resolved at comptime.
@@ -1540,10 +1541,15 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     var table_patches: std.ArrayList(TablePatch) = .empty;
     defer table_patches.deinit(allocator);
 
+    // Compute block emission order: RPO with cold-block sinking.
+    const block_order = try passes.reorderBlocks(func, allocator);
+    defer allocator.free(block_order);
+
     var last_was_ret = false;
-    for (func.blocks.items, 0..) |block, idx| {
-        try block_offsets.put(@intCast(idx), code.len());
-        const next_block_id: ?ir.BlockId = if (idx + 1 < func.blocks.items.len) @intCast(idx + 1) else null;
+    for (block_order, 0..) |block_id, order_idx| {
+        const block = func.blocks.items[block_id];
+        try block_offsets.put(block_id, code.len());
+        const next_block_id: ?ir.BlockId = if (order_idx + 1 < block_order.len) block_order[order_idx + 1] else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
             try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count);
