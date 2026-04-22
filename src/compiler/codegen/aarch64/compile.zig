@@ -35,15 +35,21 @@ const RegMap = struct {
     // codegen use (shift-count negation, rem via MSUB, spill reload, etc.);
     // X18 is reserved platform register. Once calls land, caller-saved
     // across call boundaries will need spill/reload handling.
+    //
+    // X15 is reserved as `tmp2` for multi-operand sequences (e.g., bounds
+    // check needs vmctx + zext_addr + mem_size live simultaneously). The
+    // tradeoff: one less allocatable reg in exchange for simpler helper
+    // sequences that don't have to spill/reload through the frame.
     const scratch_regs = [_]emit.Reg{
         .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7,
-        .x8, .x9, .x10, .x11, .x12, .x13, .x14, .x15,
+        .x8, .x9, .x10, .x11, .x12, .x13, .x14,
     };
 
     /// Non-allocatable scratch registers usable by any handler.
     /// Must never appear in `scratch_regs`.
     pub const tmp0: emit.Reg = .x16;
     pub const tmp1: emit.Reg = .x17;
+    pub const tmp2: emit.Reg = .x15;
 
     fn init(allocator: std.mem.Allocator, spill_base: u32, spill_capacity: u32) RegMap {
         return .{
@@ -747,31 +753,73 @@ fn emitCall(
 
 /// Compute linear-memory effective address in tmp0: mem_base + zext(wasm_addr) + offset.
 ///
-/// Clobbers tmp0 and tmp1. After return, the user's value register (arg/result)
-/// can still be read/written — we only touched the two non-allocatable scratches.
+/// Emits an inline bounds check: if `zext(wasm_addr) + end_offset > memory_size`,
+/// calls `VmCtx.trap_oob_fn(vmctx)` which is noreturn. `end_offset` is
+/// `static_offset + access_size` as supplied by the caller.
+///
+/// Clobbers tmp0, tmp1, tmp2. On the trap path additionally clobbers x0
+/// (as the call arg) and LR — but that path is noreturn, so callers need
+/// not care. After the fallthrough, only tmp0 carries meaningful data.
 fn emitMemAddr(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
     base_vreg: ir.VReg,
     offset: u32,
+    end_offset: u64,
 ) !void {
-    // tmp0 = VmCtx*  →  tmp0 = VmCtx.memory_base (at +0).
+    // Step 1: zero-extend wasm address into tmp2 (kept alive across check).
+    const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
+    try code.movRegReg32(RegMap.tmp2, src);
+
+    // Step 2: compute end = tmp2 + end_offset in tmp1.
+    if (end_offset == 0) {
+        try code.movRegReg(RegMap.tmp1, RegMap.tmp2);
+    } else if (end_offset <= 0xFFF) {
+        try code.addImm(RegMap.tmp1, RegMap.tmp2, @intCast(end_offset));
+    } else {
+        try code.movImm64(RegMap.tmp1, end_offset);
+        try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
+    }
+
+    // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1).
+    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 1);
+
+    // Step 4: cmp end, mem_size; B.LS over_trap (≤ is in-bounds since
+    // accesses of size s are valid when end = addr+s ≤ memory_size).
+    try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
+    const over_patch = code.len();
+    try code.bCond(.ls, 0); // placeholder
+
+    // Trap path: arg0=vmctx, call vmctx.trap_oob_fn (noreturn). We read
+    // vmctx again because tmp0 now holds mem_size. BRK after BLR is
+    // defensive — the helper is declared noreturn.
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    // trap_oob_fn is at VmCtx offset 80 = scale-8 slot 10.
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
+    try code.blr(RegMap.tmp0);
+    try code.brk(0);
+
+    // Patch B.LS to land here.
+    const over_target = code.len();
+    const delta_words: i19 = @intCast(@divExact(
+        @as(i64, @intCast(over_target)) - @as(i64, @intCast(over_patch)),
+        4,
+    ));
+    const existing = std.mem.readInt(u32, code.bytes.items[over_patch..][0..4], .little);
+    const imm19: u19 = @bitCast(delta_words);
+    const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
+    code.patch32(over_patch, new_word);
+
+    // Step 5: reload vmctx, then load memory_base (at +0).
     try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
 
-    // Zero-extend wasm address (i32) into tmp1.
-    const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
-    try code.movRegReg32(RegMap.tmp1, src); // ORR Wd, WZR, Wsrc → clears upper 32
+    // Step 6: tmp0 = mem_base + zext(wasm_addr).
+    try code.addRegReg(RegMap.tmp0, RegMap.tmp0, RegMap.tmp2);
 
-    // tmp0 = mem_base + wasm_addr.
-    try code.addRegReg(RegMap.tmp0, RegMap.tmp0, RegMap.tmp1);
-
-    // Fold constant offset. For offsets not representable as a scaled u12,
-    // materialize into tmp1 via MOVZ/MOVK and add. This also handles the
-    // "fold into unscaled LDUR" case by always moving into tmp0 unconditionally
-    // (caller uses scaled LDR #0 in that fallback).
+    // Step 7: fold constant offset.
     if (offset != 0) {
-        // Small offsets (≤ 0xFFF) fit a single ADD imm12.
         if (offset <= 0xFFF) {
             try code.addImm(RegMap.tmp0, RegMap.tmp0, @intCast(offset));
         } else {
@@ -780,6 +828,11 @@ fn emitMemAddr(
         }
     }
 }
+
+/// VmCtx field offsets. Must match `runtime/aot/runtime.zig::VmCtx`.
+const vmctx_memsize_slot: u12 = 1;       // byte 8, scale 8
+const vmctx_trap_oob_fn_slot: u12 = 10;  // byte 80, scale 8
+
 
 /// Scaled-immediate offset suitable for LDR/STR with given scale.
 /// Returns null if the offset isn't a multiple of `scale` within u12*scale range.
@@ -813,7 +866,8 @@ fn emitLoad(
 
     // Try to fold offset into the load's scaled immediate; else add it to tmp0.
     const folded = scaledOffset(ld.offset, scale);
-    try emitMemAddr(code, reg_map, ld.base, if (folded == null) ld.offset else 0);
+    const end_offset: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+    try emitMemAddr(code, reg_map, ld.base, if (folded == null) ld.offset else 0, end_offset);
     const disp: u12 = if (folded) |d| d else 0;
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
@@ -852,7 +906,8 @@ fn emitStore(
     };
 
     const folded = scaledOffset(st.offset, scale);
-    try emitMemAddr(code, reg_map, st.base, if (folded == null) st.offset else 0);
+    const end_offset: u64 = @as(u64, st.offset) + @as(u64, st.size);
+    try emitMemAddr(code, reg_map, st.base, if (folded == null) st.offset else 0, end_offset);
     const disp: u12 = if (folded) |d| d else 0;
 
     // Materialize the value into tmp1 (or use its home reg). emitMemAddr is
@@ -1276,6 +1331,43 @@ test "load: size 2 signed (i32.load16_s) emits LDRSH W" {
         if ((w & 0xFFC00000) == 0x79C00000) { found = true; break; }
     }
     try std.testing.expect(found);
+}
+
+test "load: bounds check emits B.LS + trap BLR + BRK" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 0, .size = 4 } },
+        .dest = val,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = val } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Walk instructions; find B.cond with cond=LS (cond=0b1001), BLR, BRK.
+    // B.cond encoding: 0101_0100 in bits 31..24, bits 3..0 = cond.
+    // BLR Xn: 1101_0110_0011_1111_0000_00_Rn_00000 → 0xD63F0000 | Rn<<5.
+    // BRK #imm: 1101_0100_001_imm16_00000 → 0xD4200000.
+    var found_bls = false;
+    var found_blr = false;
+    var found_brk = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        // B.cond: opcode 0x54 in bits 31..24, bit 4 = 0, cond in bits 3..0.
+        if ((w & 0xFF000010) == 0x54000000 and (w & 0xF) == 0x9) found_bls = true;
+        if ((w & 0xFFFFFC1F) == 0xD63F0000) found_blr = true;
+        if ((w & 0xFFE0001F) == 0xD4200000) found_brk = true;
+    }
+    try std.testing.expect(found_bls);
+    try std.testing.expect(found_blr);
+    try std.testing.expect(found_brk);
 }
 
 test "store: size 1 emits STRB" {
