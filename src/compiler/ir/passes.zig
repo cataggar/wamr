@@ -36,13 +36,43 @@ pub fn buildUseDef(func: *const ir.IrFunction, allocator: std.mem.Allocator) !st
                 if (!entry.found_existing) entry.value_ptr.* = .{};
                 entry.value_ptr.use_count += 1;
             }
-            // Count uses from call args (unbounded)
-            if (inst.op == .call) {
-                for (inst.op.call.args) |vreg| {
-                    const entry = try info.getOrPut(vreg);
-                    if (!entry.found_existing) entry.value_ptr.* = .{};
-                    entry.value_ptr.use_count += 1;
-                }
+            // Count uses from unbounded VReg lists (call args, ret_multi)
+            switch (inst.op) {
+                .call => |cl| {
+                    for (cl.args) |vreg| {
+                        const entry = try info.getOrPut(vreg);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
+                .call_indirect => |ci| {
+                    const ei_entry = try info.getOrPut(ci.elem_idx);
+                    if (!ei_entry.found_existing) ei_entry.value_ptr.* = .{};
+                    ei_entry.value_ptr.use_count += 1;
+                    for (ci.args) |vreg| {
+                        const entry = try info.getOrPut(vreg);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
+                .call_ref => |cr| {
+                    const fr_entry = try info.getOrPut(cr.func_ref);
+                    if (!fr_entry.found_existing) fr_entry.value_ptr.* = .{};
+                    fr_entry.value_ptr.use_count += 1;
+                    for (cr.args) |vreg| {
+                        const entry = try info.getOrPut(vreg);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
+                .ret_multi => |vregs| {
+                    for (vregs) |vreg| {
+                        const entry = try info.getOrPut(vreg);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
+                else => {},
             }
         }
     }
@@ -554,12 +584,10 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 }
 
 /// The default optimization pipeline.
-/// Note: deadCodeElimination is excluded because the stack-based x86-64
-/// backend does not track call argument VRegs, so DCE incorrectly removes
-/// instructions that compute values consumed implicitly via the operand stack.
 pub const default_passes: []const PassFn = &.{
     &constantFold,
     &commonSubexprElimination,
+    &deadCodeElimination,
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -637,6 +665,70 @@ test "DCE: preserves side-effect instructions" {
 
     const changed = try deadCodeElimination(&func, allocator);
     try std.testing.expect(!changed); // nothing should be removed
+    try std.testing.expectEqual(@as(usize, 3), block.instructions.items.len);
+}
+
+test "DCE: preserves call argument VRegs" {
+    // Regression test: DCE must not remove instructions whose results
+    // are passed as arguments to a call (unbounded VReg list).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const arg0 = func.newVReg();
+    const arg1 = func.newVReg();
+    const args = try allocator.dupe(ir.VReg, &[_]ir.VReg{ arg0, arg1 });
+    defer allocator.free(args);
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = arg0 });
+    try block.append(.{ .op = .{ .iconst_32 = 20 }, .dest = arg1 });
+    try block.append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const changed = try deadCodeElimination(&func, allocator);
+    try std.testing.expect(!changed); // arg0 and arg1 are used by the call
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+}
+
+test "DCE: preserves call_indirect elem_idx and arg VRegs" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const elem = func.newVReg();
+    const arg = func.newVReg();
+    const call_args = try allocator.dupe(ir.VReg, &[_]ir.VReg{arg});
+    defer allocator.free(call_args);
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = elem });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = arg });
+    try block.append(.{ .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = elem, .args = call_args } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const changed = try deadCodeElimination(&func, allocator);
+    try std.testing.expect(!changed); // elem and arg are both used
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+}
+
+test "DCE: preserves ret_multi VRegs" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const ret_vals = try allocator.dupe(ir.VReg, &[_]ir.VReg{ v0, v1 });
+    defer allocator.free(ret_vals);
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1 });
+    try block.append(.{ .op = .{ .ret_multi = ret_vals } });
+
+    const changed = try deadCodeElimination(&func, allocator);
+    try std.testing.expect(!changed); // v0 and v1 are used by ret_multi
     try std.testing.expectEqual(@as(usize, 3), block.instructions.items.len);
 }
 
