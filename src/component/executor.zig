@@ -185,6 +185,7 @@ pub fn callComponentFunc(
     interp.executeFunction(env, exported.core_func_idx) catch return error.TrapInCoreFunction;
 
     // 6. Lift results
+    var result_ptr_for_post_return: u32 = 0;
     if (result_types.len == 0) {
         // No results — nothing to lift
     } else if (flat_result_count <= MAX_FLAT_RESULTS) {
@@ -194,10 +195,10 @@ pub fn callComponentFunc(
         }
     } else {
         // Results were stored in memory; core returned a pointer
-        const result_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+        result_ptr_for_post_return = @bitCast(env.popI32() catch return error.StackUnderflow);
         const mem = memory orelse return error.MemoryNotAvailable;
 
-        var offset: u32 = result_ptr;
+        var offset: u32 = result_ptr_for_post_return;
         for (result_types, 0..) |rt, i| {
             const al = typeAlign(registry, rt);
             offset = abi.alignUp(offset, al);
@@ -208,14 +209,17 @@ pub fn callComponentFunc(
 
     // 7. Post-return callback
     if (lift_opts.post_return_idx) |pr_idx| {
-        // Push the flat results back for post_return to consume
+        // Per spec: post_return receives the flat result value(s).
+        // For inline results (≤ MAX_FLAT_RESULTS): re-push the flat values.
+        // For spilled results: re-push the result pointer as i32.
         if (flat_result_count <= MAX_FLAT_RESULTS) {
             for (out_results[0..result_types.len], result_types) |r, rt| {
                 pushInterfaceValue(env, r, rt, registry) catch {};
             }
         } else {
-            // For spilled results, post_return receives the same pointer
-            // (already consumed from stack, but we can re-push it)
+            // Spilled results: post_return receives the result pointer.
+            // We've already read the ptr above; push it back for post_return.
+            env.pushI32(@bitCast(result_ptr_for_post_return)) catch {};
         }
         interp.executeFunction(env, pr_idx) catch {};
     }
