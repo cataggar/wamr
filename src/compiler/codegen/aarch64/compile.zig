@@ -95,15 +95,37 @@ const BranchPatch = struct {
     const Kind = enum { b_uncond, b_cond };
 };
 
+/// A pending BL whose 26-bit PC-relative offset needs to be patched once
+/// all module functions are compiled and their start offsets are known.
+pub const CallPatch = struct {
+    /// Byte offset of the BL instruction within the target code buffer.
+    patch_offset: usize,
+    /// Local function index (import_count already subtracted).
+    target_func_idx: u32,
+};
+
+/// Context threaded through per-function compilation for cross-function
+/// concerns (calls, imports).
+const FuncCompileCtx = struct {
+    import_count: u32 = 0,
+    call_patches: ?*std.ArrayListUnmanaged(CallPatch) = null,
+    /// FP-relative byte offset of the call-save region where caller-save
+    /// physregs (x0..x15) are spilled around BL instructions.
+    call_save_base: u32 = 0,
+    allocator: std.mem.Allocator,
+};
+
 /// Compile an IR function to AArch64 machine code.
 ///
 /// **AArch64 frame layout** (positive offsets from FP, which equals new SP):
 /// ```
-///   [fp + 0]            = saved FP
-///   [fp + 8]            = saved LR
-///   [fp + 16]           = VMContext pointer (spilled from x0)
-///   [fp + (i+3)*8]      = local i (0 ≤ i < local_count)
-///   [fp + frame_size]   = caller's stack (args beyond x7, etc.)
+///   [fp + 0]                = saved FP
+///   [fp + 8]                = saved LR
+///   [fp + 16]               = VMContext pointer (spilled from x0)
+///   [fp + (i+3)*8]          = local i (0 ≤ i < local_count)
+///   [fp + spill_base]       = RegMap spill slots (256 bytes, 32 slots)
+///   [fp + call_save_base]   = per-physreg call-save slots (128 bytes)
+///   [fp + frame_size]       = caller's stack (args beyond x7, etc.)
 /// ```
 ///
 /// **VMContext ABI**: The VMContext pointer is passed in `x0` (AAPCS64
@@ -115,6 +137,16 @@ const BranchPatch = struct {
 /// supported), spilled to their matching local slots in the prologue.
 /// Declared locals beyond `param_count` are zero-initialized.
 pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
+    // Test-friendly entry: no cross-function linking. Any `.call` op will
+    // fail with error.CallLinkageUnavailable.
+    return compileFunctionImpl(func, .{ .allocator = allocator }, allocator);
+}
+
+pub fn compileFunctionImpl(
+    func: *const ir.IrFunction,
+    ctx: FuncCompileCtx,
+    allocator: std.mem.Allocator,
+) ![]u8 {
     // Phase 1b: stack args beyond x7 aren't supported yet.
     if (func.param_count > 7) return error.TooManyParams;
 
@@ -122,15 +154,20 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
     errdefer code.deinit();
 
     // Frame size: (local_count + 3) × 8 for saved FP/LR + vmctx + locals,
-    // plus 256 bytes of spill headroom (32 slots), aligned to 16
-    // (AArch64 SP alignment). Spill region sits just above the locals.
+    // plus 256 bytes of spill headroom (32 slots), plus 128 bytes for
+    // call-save (16 physregs × 8), aligned to 16 (AArch64 SP alignment).
     const spill_base: u32 = (func.local_count + 3) * 8;
     const spill_capacity: u32 = 256;
-    const raw_frame = spill_base + spill_capacity;
+    const call_save_base: u32 = spill_base + spill_capacity;
+    const call_save_size: u32 = 128;
+    const raw_frame = call_save_base + call_save_size;
     const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
 
     var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
     defer reg_map.deinit();
+
+    var fctx = ctx;
+    fctx.call_save_base = call_save_base;
 
     try code.emitPrologue(frame_size);
 
@@ -149,7 +186,7 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
         block_offsets[bi] = code.len();
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInst(&code, inst, &reg_map, frame_size, &patches, allocator);
+            try compileInst(&code, inst, &reg_map, frame_size, &patches, &fctx);
         }
     }
 
@@ -244,7 +281,7 @@ fn compileInst(
     reg_map: *RegMap,
     frame_size: u32,
     patches: *std.ArrayListUnmanaged(BranchPatch),
-    allocator: std.mem.Allocator,
+    fctx: *FuncCompileCtx,
 ) !void {
     switch (inst.op) {
         // ── Constants ────────────────────────────────────────────────
@@ -309,8 +346,11 @@ fn compileInst(
         .select => |sel| try emitSelect(code, inst, sel, reg_map),
 
         // ── Branches ─────────────────────────────────────────────────
-        .br => |target| try emitBr(code, patches, target, allocator),
-        .br_if => |br| try emitBrIf(code, reg_map, patches, br, allocator),
+        .br => |target| try emitBr(code, patches, target, fctx.allocator),
+        .br_if => |br| try emitBrIf(code, reg_map, patches, br, fctx.allocator),
+
+        // ── Direct function call ─────────────────────────────────────
+        .call => |cl| try emitCall(code, inst, cl, reg_map, fctx),
 
         // ── Locals (FP-relative frame slots) ─────────────────────────
         .local_get => |idx| {
@@ -603,6 +643,104 @@ fn emitBr(
     });
 }
 
+/// ABI arg register for the i-th user argument (i=0 → x1 because x0 = vmctx).
+fn callArgReg(i: u32) emit.Reg {
+    return switch (i) {
+        0 => .x1, 1 => .x2, 2 => .x3, 3 => .x4,
+        4 => .x5, 5 => .x6, 6 => .x7,
+        else => unreachable,
+    };
+}
+
+/// Emit a direct wasm call.
+///
+/// Limitations (Phase 1): no tail calls, no extra results, no imports,
+/// at most 7 arguments. Violations return an error rather than emit
+/// incorrect code.
+///
+/// Sequence: spill all currently-live caller-save physregs (x0..x15) to
+/// fixed per-reg slots in the call-save region, move arguments into
+/// x1..x7 by reading from those save slots (for physreg sources) or the
+/// RegMap spill region (for stack sources), load VMContext into x0, emit
+/// `BL 0` with a patch record, move the result from x0 into the dest
+/// vreg's location, then restore all saved regs.
+///
+/// The result-holding physreg is safe to not skip during restore: because
+/// the RegMap allocates `dest` AFTER the spill and assign() only picks
+/// currently-free regs, `dest.reg` cannot match any reg we saved.
+fn emitCall(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    cl: @TypeOf(@as(ir.Inst.Op, undefined).call),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    if (cl.tail) return error.UnimplementedTailCall;
+    if (cl.extra_results > 0) return error.UnimplementedMultiResult;
+    if (cl.args.len > 7) return error.TooManyCallArgs;
+    if (cl.func_idx < fctx.import_count) return error.UnimplementedImportCall;
+    const call_patches = fctx.call_patches orelse return error.CallLinkageUnavailable;
+
+    // Snapshot live caller-save physregs (x0..x15).
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+
+    // Spill each used caller-save reg to [fp + call_save_base + i*8].
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // Move arguments into x1..x7 by reading from their current source
+    // locations via memory. Physreg sources are read from the call-save
+    // slot we just filled; stack sources from the RegMap spill slot.
+    // This order-independent approach avoids parallel-move hazards.
+    for (cl.args, 0..) |arg_vreg, i| {
+        const target = callArgReg(@intCast(i));
+        const loc = reg_map.get(arg_vreg) orelse return error.UnboundVReg;
+        switch (loc) {
+            .reg => |r| {
+                const reg_idx: u32 = @intFromEnum(r);
+                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                try code.ldrImm(target, .fp, slot_scaled);
+            },
+            .stack => |off| {
+                try code.ldrImm(target, .fp, reg_map.spillOffsetScaled(off));
+            },
+        }
+    }
+
+    // Load VMContext into x0 (was saved above if previously live).
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+
+    // BL 0 (placeholder); record a patch for module-level resolution.
+    const patch_off = code.len();
+    try code.bl(0);
+    try call_patches.append(fctx.allocator, .{
+        .patch_offset = patch_off,
+        .target_func_idx = cl.func_idx - fctx.import_count,
+    });
+
+    // Commit result (in x0) to dest's location BEFORE restoring saved regs,
+    // so restoration can't clobber the result holder (dest.reg is always a
+    // reg that was FREE at snapshot time — i.e. not in `used_snapshot`).
+    if (inst.dest) |dest| {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
+
+    // Restore previously-saved caller-save regs.
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
 fn emitBrIf(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
@@ -672,11 +810,52 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
     var offsets: std.ArrayListUnmanaged(u32) = .empty;
     errdefer offsets.deinit(allocator);
 
+    var global_call_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
+    defer global_call_patches.deinit(allocator);
+
     for (ir_module.functions.items) |func| {
-        try offsets.append(allocator, @intCast(all_code.items.len));
-        const func_code = try compileFunction(&func, allocator);
+        const func_base: u32 = @intCast(all_code.items.len);
+        try offsets.append(allocator, func_base);
+
+        var func_patches: std.ArrayListUnmanaged(CallPatch) = .empty;
+        defer func_patches.deinit(allocator);
+
+        const ctx: FuncCompileCtx = .{
+            .import_count = ir_module.import_count,
+            .call_patches = &func_patches,
+            .allocator = allocator,
+        };
+        const func_code = try compileFunctionImpl(&func, ctx, allocator);
         defer allocator.free(func_code);
+
+        // Globalize patch offsets to module code coordinates.
+        for (func_patches.items) |p| {
+            try global_call_patches.append(allocator, .{
+                .patch_offset = p.patch_offset + func_base,
+                .target_func_idx = p.target_func_idx,
+            });
+        }
         try all_code.appendSlice(allocator, func_code);
+    }
+
+    // Resolve BL patches. offsets[i] is the byte offset of local function i
+    // (indices already exclude imports).
+    for (global_call_patches.items) |p| {
+        if (p.target_func_idx >= offsets.items.len) return error.BadFuncIndex;
+        const target_off: i64 = @intCast(offsets.items[p.target_func_idx]);
+        const patch_off: i64 = @intCast(p.patch_offset);
+        const delta_bytes = target_off - patch_off;
+        if (@mod(delta_bytes, 4) != 0) return error.BranchMisaligned;
+        const word_off = @divExact(delta_bytes, 4);
+        // BL imm26 range: ±128 MB → word_off in [-2^25, 2^25).
+        const limit: i64 = 1 << 25;
+        if (word_off >= limit or word_off < -limit) return error.CallOutOfRange;
+        const bytes = all_code.items[p.patch_offset..][0..4];
+        const existing = std.mem.readInt(u32, bytes, .little);
+        // BL encoding: 100101 imm26 | opcode bits 31-26 = 0b100101
+        const imm26: u26 = @bitCast(@as(i26, @intCast(word_off)));
+        const new_word: u32 = (existing & 0xFC000000) | imm26;
+        std.mem.writeInt(u32, bytes, new_word, .little);
     }
 
     return .{
@@ -756,6 +935,61 @@ test "compileModule: records offsets" {
     try std.testing.expectEqual(@as(usize, 2), result.offsets.len);
     try std.testing.expectEqual(@as(u32, 0), result.offsets[0]);
     try std.testing.expect(result.offsets[1] > 0); // second function starts after first
+}
+
+test "compileModule: direct call between two local functions" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // f0: returns 42
+    var f0 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f0.newBlock();
+        const v = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try module.addFunction(f0);
+
+    // f1: calls f0, returns its result
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f1.newBlock();
+        const v = f1.newVReg();
+        try f1.getBlock(b).append(.{
+            .op = .{ .call = .{ .func_idx = 0, .args = &.{} } },
+            .dest = v,
+            .type = .i32,
+        });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    // Walk f1's code looking for a BL that points at f0 (offset 0).
+    const f1_start = result.offsets[1];
+    const f0_start = result.offsets[0];
+    var found_bl_to_f0 = false;
+    var i: usize = f1_start;
+    while (i + 4 <= result.code.len) : (i += 4) {
+        const word = std.mem.readInt(u32, result.code[i..][0..4], .little);
+        // BL opcode = 0b100101 in top 6 bits → 0x94000000
+        if ((word & 0xFC000000) == 0x94000000) {
+            const imm26_raw: u26 = @truncate(word);
+            const imm26: i26 = @bitCast(imm26_raw);
+            const delta_words: i64 = imm26;
+            const target: i64 = @as(i64, @intCast(i)) + delta_words * 4;
+            if (target == @as(i64, @intCast(f0_start))) {
+                found_bl_to_f0 = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_bl_to_f0);
 }
 
 // ── New handler tests (Phase 1a) ─────────────────────────────────────────────
@@ -1012,7 +1246,27 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
 }
 
 test "compile: unimplemented op returns error.UnimplementedOp" {
-    // .call is not yet implemented — must fail loudly, not silently drop.
+    // popcnt is not yet implemented (needs NEON CNT) — must fail loudly,
+    // not silently drop.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .popcnt = v0 },
+        .dest = v1,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v1 } });
+    try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
+}
+
+test "compile: .call without linkage context returns CallLinkageUnavailable" {
+    // compileFunction (no import_count, no patch list) can't resolve
+    // direct calls; must error loudly rather than emit bogus BL 0.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -1024,7 +1278,7 @@ test "compile: unimplemented op returns error.UnimplementedOp" {
         .type = .i32,
     });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
-    try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
+    try std.testing.expectError(error.CallLinkageUnavailable, compileFunction(&func, allocator));
 }
 
 test "compile: binop with spilled operands emits LDR/STR via spill slots" {
