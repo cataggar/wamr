@@ -77,17 +77,42 @@ const BranchPatch = struct {
 };
 
 /// Compile an IR function to AArch64 machine code.
+///
+/// **AArch64 frame layout** (positive offsets from FP, which equals new SP):
+/// ```
+///   [fp + 0]            = saved FP
+///   [fp + 8]            = saved LR
+///   [fp + 16]           = VMContext pointer (spilled from x0)
+///   [fp + (i+3)*8]      = local i (0 ≤ i < local_count)
+///   [fp + frame_size]   = caller's stack (args beyond x7, etc.)
+/// ```
+///
+/// **VMContext ABI**: The VMContext pointer is passed in `x0` (AAPCS64
+/// first argument) as a hidden prefix to the wasm params. It is spilled
+/// to `[fp + 16]` in the prologue and reloaded into a scratch register
+/// (typically `x16`/`tmp0`) whenever needed.
+///
+/// **Wasm parameters**: passed in `x1..x7` (up to 7 params; more not yet
+/// supported), spilled to their matching local slots in the prologue.
+/// Declared locals beyond `param_count` are zero-initialized.
 pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
+    // Phase 1b: stack args beyond x7 aren't supported yet.
+    if (func.param_count > 7) return error.TooManyParams;
+
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
     var reg_map = RegMap.init(allocator);
     defer reg_map.deinit();
 
-    // Frame size: aligned to 16 bytes (AArch64 SP alignment requirement)
-    const raw_frame = func.local_count * 8 + 256;
+    // Frame size: (local_count + 3) × 8 for saved FP/LR + vmctx + locals,
+    // plus 256 bytes of spill headroom, aligned to 16 (AArch64 SP alignment).
+    const raw_frame = (func.local_count + 3) * 8 + 256;
     const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
     try code.emitPrologue(frame_size);
+
+    // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
+    try emitEntrySpill(&code, func.*);
 
     var block_offsets = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_offsets);
@@ -137,6 +162,50 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
     }
 
     return code.bytes.toOwnedSlice(allocator);
+}
+
+/// FP-relative slot offset (in bytes) for the VMContext pointer.
+const vmctx_slot_offset: u32 = 16;
+
+/// FP-relative slot offset (in bytes, unsigned, positive) for local `idx`.
+fn localSlotOffset(idx: u32) u32 {
+    return (idx + 3) * 8;
+}
+
+/// ABI register holding wasm parameter `i` (0-based). Parameter 0 is in x1
+/// because x0 carries the hidden VMContext pointer.
+fn paramAbiReg(i: u32) emit.Reg {
+    return switch (i) {
+        0 => .x1, 1 => .x2, 2 => .x3, 3 => .x4,
+        4 => .x5, 5 => .x6, 6 => .x7,
+        else => unreachable,
+    };
+}
+
+/// Spill x0 (VMContext) and x1..x7 (wasm params) to their frame slots, and
+/// zero-initialize declared locals. Must be called right after emitPrologue
+/// and before any vreg allocation so we don't clobber these ABI regs.
+fn emitEntrySpill(code: *emit.CodeBuffer, func: ir.IrFunction) !void {
+    // VMContext → [fp + 16]
+    try code.strImm(.x0, .fp, vmctx_slot_offset / 8);
+
+    // Wasm params → local slots [fp + (i+3)*8]
+    var i: u32 = 0;
+    while (i < func.param_count) : (i += 1) {
+        const off_scaled: u12 = @intCast(localSlotOffset(i) / 8);
+        try code.strImm(paramAbiReg(i), .fp, off_scaled);
+    }
+
+    // Zero-init declared locals (wasm spec requires non-param locals to be 0).
+    // Use x16 (tmp0) as the zero source. Always 64-bit store to cover any type.
+    if (func.local_count > func.param_count) {
+        try code.movz(RegMap.tmp0, 0, 0);
+        var j: u32 = func.param_count;
+        while (j < func.local_count) : (j += 1) {
+            const off_scaled: u12 = @intCast(localSlotOffset(j) / 8);
+            try code.strImm(RegMap.tmp0, .fp, off_scaled);
+        }
+    }
 }
 
 fn isRet(op: ir.Inst.Op) bool {
@@ -219,6 +288,21 @@ fn compileInst(
         // ── Branches ─────────────────────────────────────────────────
         .br => |target| try emitBr(code, patches, target, allocator),
         .br_if => |br| try emitBrIf(code, reg_map, patches, br, allocator),
+
+        // ── Locals (FP-relative frame slots) ─────────────────────────
+        .local_get => |idx| {
+            const dest = inst.dest orelse return;
+            const dr = (try destReg(code, reg_map, dest)) orelse return;
+            const off_scaled: u12 = @intCast(localSlotOffset(idx) / 8);
+            // Always 64-bit load: the slot stores the full 8 bytes, and a
+            // subsequent W-form op (or wrap_i64) will ignore the upper bits.
+            try code.ldrImm(dr, .fp, off_scaled);
+        },
+        .local_set => |ls| {
+            const src = useReg(reg_map, ls.val) orelse return;
+            const off_scaled: u12 = @intCast(localSlotOffset(ls.idx) / 8);
+            try code.strImm(src, .fp, off_scaled);
+        },
 
         .ret => |maybe_val| {
             if (maybe_val) |val| {
@@ -771,4 +855,96 @@ test "compile: br_if with two blocks" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
     try std.testing.expect(code.len > 0);
+}
+
+// ── Phase 1b: VMContext ABI + locals tests ───────────────────────────────────
+
+test "compile: entry spills vmctx to [fp+16]" {
+    // Function with no params, no locals: prologue must still spill x0 → [fp+16].
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // First 2 words: prologue (STP + ADD fp, sp, #0)
+    // Third word: STR x0, [fp, #16]
+    //   opcode 0xF9000000 | (imm12=2 << 10) | (rn=29 << 5) | rt=0
+    //   = 0xF9000000 | 0x800 | 0x3A0 | 0 = 0xF9000BA0
+    const str_word = std.mem.readInt(u32, code[8..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0xF9000BA0), str_word);
+}
+
+test "compile: param spill — STR x1 into first local slot" {
+    // 1 param (x1), 1 local (just the param), no body besides ret of local 0.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // words: [0]=STP, [1]=ADD fp,sp,0, [2]=STR x0 vmctx, [3]=STR x1 local0
+    //   STR x1, [fp, #24]: rt=1, rn=29, imm12=3
+    //   = 0xF9000000 | (3<<10) | (29<<5) | 1 = 0xF9000FA1
+    const str_param = std.mem.readInt(u32, code[12..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0xF9000FA1), str_param);
+}
+
+test "compile: zero-init of declared local (beyond params)" {
+    // 0 params, 2 locals. After spilling x0 (vmctx), we MOVZ x16,#0 then
+    // STR x16 to both local slots.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // words: STP, ADD fp, STR x0 vmctx, MOVZ x16 #0, STR x16→local0, STR x16→local1
+    const movz_word = std.mem.readInt(u32, code[12..][0..4], .little);
+    // MOVZ X16, #0, LSL #0 = 0xD2800000 | (0<<5) | 16 = 0xD2800010
+    try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
+    const str0 = std.mem.readInt(u32, code[16..][0..4], .little);
+    // STR x16, [fp, #24]: rt=16, rn=29, imm12=3 → 0xF9000000|(3<<10)|(29<<5)|16
+    try std.testing.expectEqual(@as(u32, 0xF9000FB0), str0);
+    const str1 = std.mem.readInt(u32, code[20..][0..4], .little);
+    // STR x16, [fp, #32]: imm12=4 → 0xF9000000|(4<<10)|(29<<5)|16
+    try std.testing.expectEqual(@as(u32, 0xF90013B0), str1);
+}
+
+test "compile: local_get + local_set round trip" {
+    // local_set 0, const 42; local_get 0; ret.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v0 } } });
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v1, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v1 } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+}
+
+test "compile: rejects more than 7 params (Phase 1b limit)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 8, 1, 8);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    try std.testing.expectError(error.TooManyParams, compileFunction(&func, allocator));
 }
