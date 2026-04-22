@@ -319,8 +319,10 @@ fn compileInst(
         },
         .@"unreachable" => try code.brk(0),
         else => {
-            // TODO(#111): replace this silent drop with an explicit error
-            // once Phase 1 (memory/call/trap path) lands.
+            // Explicit failure for unimplemented ops. Previously this was a
+            // silent no-op which produced incorrect code. Anything that lands
+            // here needs a handler — track remaining work in issue #111.
+            return error.UnimplementedOp;
         },
     }
 }
@@ -947,4 +949,20 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
     try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     try std.testing.expectError(error.TooManyParams, compileFunction(&func, allocator));
+}
+
+test "compile: unimplemented op returns error.UnimplementedOp" {
+    // .call is not yet implemented — must fail loudly, not silently drop.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = &.{} } },
+        .dest = v0,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
 }
