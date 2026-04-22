@@ -316,14 +316,26 @@ fn compileInst(
             try destCommit(code, reg_map, info);
         },
 
-        .add => |bin| try emitBinOp(code, inst, bin, reg_map, .add),
-        .sub => |bin| try emitBinOp(code, inst, bin, reg_map, .sub),
-        .mul => |bin| try emitBinOp(code, inst, bin, reg_map, .mul),
+        .add => |bin| if (inst.type == .f32 or inst.type == .f64)
+            try emitFBinOp(code, inst, bin, reg_map, .add)
+        else
+            try emitBinOp(code, inst, bin, reg_map, .add),
+        .sub => |bin| if (inst.type == .f32 or inst.type == .f64)
+            try emitFBinOp(code, inst, bin, reg_map, .sub)
+        else
+            try emitBinOp(code, inst, bin, reg_map, .sub),
+        .mul => |bin| if (inst.type == .f32 or inst.type == .f64)
+            try emitFBinOp(code, inst, bin, reg_map, .mul)
+        else
+            try emitBinOp(code, inst, bin, reg_map, .mul),
         .@"and" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"and"),
         .@"or" => |bin| try emitBinOp(code, inst, bin, reg_map, .@"or"),
         .xor => |bin| try emitBinOp(code, inst, bin, reg_map, .xor),
 
-        .div_s => |bin| try emitDivRem(code, inst, bin, reg_map, .div_s),
+        .div_s => |bin| if (inst.type == .f32 or inst.type == .f64)
+            try emitFBinOp(code, inst, bin, reg_map, .div)
+        else
+            try emitDivRem(code, inst, bin, reg_map, .div_s),
         .div_u => |bin| try emitDivRem(code, inst, bin, reg_map, .div_u),
         .rem_s => |bin| try emitDivRem(code, inst, bin, reg_map, .rem_s),
         .rem_u => |bin| try emitDivRem(code, inst, bin, reg_map, .rem_u),
@@ -405,6 +417,7 @@ fn compileInst(
         // a V-register. reinterpret is a bit-identical move.
         .f_neg => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .neg),
         .f_abs => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .abs),
+        .f_sqrt => |vreg| try emitFSqrt(code, inst, vreg, reg_map),
         .reinterpret => |vreg| try emitReinterpret(code, inst, vreg, reg_map),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
@@ -647,6 +660,74 @@ fn emitReinterpret(
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     if (src != info.reg) try code.movRegReg(info.reg, src);
+    try destCommit(code, reg_map, info);
+}
+
+const FBinKind = enum { add, sub, mul, div };
+
+/// Emit a scalar float binary op by shuttling operands through the
+/// non-allocatable scratch V-regs V0 / V1.
+///
+/// Sequence:
+///   FMOV v0, src_lhs_gp
+///   FMOV v1, src_rhs_gp
+///   F<op> v0, v0, v1
+///   FMOV dst_gp, v0
+///
+/// This is used by the integer-typed `add`/`sub`/`mul` IR ops when
+/// `inst.type` is a float type (matching the frontend's dispatch: the
+/// frontend emits the integer-named op with a float type for wasm's
+/// f_add/f_sub/f_mul/f_div).
+fn emitFBinOp(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+    kind: FBinKind,
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+
+    const is64 = (inst.type == .f64);
+    if (is64) {
+        try code.fmovDFromGp64(0, lhs);
+        try code.fmovDFromGp64(1, rhs);
+    } else {
+        try code.fmovSFromGp32(0, lhs);
+        try code.fmovSFromGp32(1, rhs);
+    }
+    switch (kind) {
+        .add => try code.faddScalar(is64, 0, 0, 1),
+        .sub => try code.fsubScalar(is64, 0, 0, 1),
+        .mul => try code.fmulScalar(is64, 0, 0, 1),
+        .div => try code.fdivScalar(is64, 0, 0, 1),
+    }
+    if (is64) {
+        try code.fmovGpFromD64(info.reg, 0);
+    } else {
+        try code.fmovGpFromS32(info.reg, 0);
+    }
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit f_sqrt (unary) via scratch V-reg V0.
+fn emitFSqrt(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const is64 = (inst.type == .f64);
+    if (is64) try code.fmovDFromGp64(0, src)
+    else try code.fmovSFromGp32(0, src);
+    try code.fsqrtScalar(is64, 0, 0);
+    if (is64) try code.fmovGpFromD64(info.reg, 0)
+    else try code.fmovGpFromS32(info.reg, 0);
     try destCommit(code, reg_map, info);
 }
 

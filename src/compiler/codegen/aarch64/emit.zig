@@ -448,6 +448,91 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    // ── Scalar FPU ops ──────────────────────────────────────────────
+    // The AArch64 backend currently has no V-register allocator; float
+    // values flow through the integer register file (matching the
+    // don't-care upper-bits convention used by sub-word integer ops).
+    // For the actual FPU computation we shuttle values through scratch
+    // V-regs V0/V1 (non-allocatable) via FMOV. This mirrors the way
+    // emitFSignBit uses integer EOR/AND on the raw bit pattern, but
+    // gives us access to the hardware's rounding / denormal / NaN
+    // semantics for add/sub/mul/div/sqrt/min/max and the various
+    // float→int conversions.
+
+    /// FMOV Sd, Wn — copy bits from a W register into the low 32 bits
+    /// of a scalar V register (other lanes zeroed).
+    pub fn fmovSFromGp32(self: *CodeBuffer, vd: u5, rn: Reg) !void {
+        // sf=0 type=00 rmode=00 opcode=111 : 0001 1110 0010 0111 0000 00 Rn Rd
+        try self.emit32(0x1E270000 | (@as(u32, rn.encoding()) << 5) | vd);
+    }
+
+    /// FMOV Wd, Sn — copy low 32 bits of a scalar V register into a W
+    /// register. Upper 32 bits of the destination X register are zeroed.
+    pub fn fmovGpFromS32(self: *CodeBuffer, rd: Reg, vn: u5) !void {
+        // sf=0 type=00 rmode=00 opcode=110
+        try self.emit32(0x1E260000 | (@as(u32, vn) << 5) | rd.encoding());
+    }
+
+    /// FMOV Dd, Xn — copy bits from an X register into the low 64 bits
+    /// of a scalar V register.
+    pub fn fmovDFromGp64(self: *CodeBuffer, vd: u5, rn: Reg) !void {
+        // sf=1 type=01 rmode=00 opcode=111
+        try self.emit32(0x9E670000 | (@as(u32, rn.encoding()) << 5) | vd);
+    }
+
+    /// FMOV Xd, Dn — copy low 64 bits of a scalar V register into an X
+    /// register.
+    pub fn fmovGpFromD64(self: *CodeBuffer, rd: Reg, vn: u5) !void {
+        // sf=1 type=01 rmode=00 opcode=110
+        try self.emit32(0x9E660000 | (@as(u32, vn) << 5) | rd.encoding());
+    }
+
+    /// Kind of scalar FPU binary op. Values are the opcode bits [15:12]
+    /// in the `Floating-point data-processing (2 source)` encoding.
+    pub const FBinOp = enum(u4) {
+        mul = 0b0000,
+        div = 0b0001,
+        add = 0b0010,
+        sub = 0b0011,
+        max = 0b0100,
+        min = 0b0101,
+    };
+
+    fn emitFBinOp(self: *CodeBuffer, is_f64: bool, op: FBinOp, vd: u5, vn: u5, vm: u5) !void {
+        // 0001 1110 0 ty 1 Rm opcode 10 Rn Rd
+        //   ty: 00 = single (f32), 01 = double (f64), bit 22
+        const ty: u32 = if (is_f64) 1 else 0;
+        const base: u32 = 0x1E200800 | (ty << 22);
+        const opcode_bits: u32 = @as(u32, @intFromEnum(op)) << 12;
+        try self.emit32(base | opcode_bits |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    pub fn faddScalar(self: *CodeBuffer, is_f64: bool, vd: u5, vn: u5, vm: u5) !void {
+        return self.emitFBinOp(is_f64, .add, vd, vn, vm);
+    }
+
+    pub fn fsubScalar(self: *CodeBuffer, is_f64: bool, vd: u5, vn: u5, vm: u5) !void {
+        return self.emitFBinOp(is_f64, .sub, vd, vn, vm);
+    }
+
+    pub fn fmulScalar(self: *CodeBuffer, is_f64: bool, vd: u5, vn: u5, vm: u5) !void {
+        return self.emitFBinOp(is_f64, .mul, vd, vn, vm);
+    }
+
+    pub fn fdivScalar(self: *CodeBuffer, is_f64: bool, vd: u5, vn: u5, vm: u5) !void {
+        return self.emitFBinOp(is_f64, .div, vd, vn, vm);
+    }
+
+    /// FSQRT Sd, Sn / FSQRT Dd, Dn (floating-point data-processing 1 source).
+    pub fn fsqrtScalar(self: *CodeBuffer, is_f64: bool, vd: u5, vn: u5) !void {
+        // 0001 1110 0 ty 1 00001 10000 Rn Rd
+        const ty: u32 = if (is_f64) 1 else 0;
+        try self.emit32(0x1E21C000 | (ty << 22) | (@as(u32, vn) << 5) | vd);
+    }
+
     /// NEG Xd, Xn (alias SUB Xd, XZR, Xn)
     pub fn negReg(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
         // SUB Xd, XZR, Xn: 1|10|01011|00|0|Rm(Rn)|000000|Rn(11111)|Rd
