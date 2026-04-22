@@ -456,6 +456,13 @@ fn hasSideEffect(inst: ir.Inst) bool {
         .atomic_notify, .atomic_wait, .memory_copy, .memory_fill, .memory_grow,
         .memory_init, .data_drop, .table_init, .elem_drop, .table_set, .table_grow,
         => true,
+        // Trapping ops: must not be removed even if result is unused.
+        .load, .table_get,
+        .div_u, .rem_u,
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        => true,
+        // div_s/rem_s trap for integers but not floats (float div produces NaN/Inf).
+        .div_s, .rem_s => inst.type != .f32 and inst.type != .f64,
         else => false,
     };
 }
