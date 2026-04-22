@@ -46,6 +46,8 @@ python3 -m pip install wamrc-bin
 
 ## dist
 
+[dist](https://github.com/ekristen/distillery) is a GitHub release installer.
+
 ```sh
 dist install cataggar/wamr
 ```
