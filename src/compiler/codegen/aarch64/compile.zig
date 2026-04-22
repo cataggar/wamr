@@ -541,6 +541,14 @@ fn compileInst(
 
         // ── Direct function call ─────────────────────────────────────
         .call => |cl| try emitCall(code, inst, cl, reg_map, fctx),
+        .call_indirect => |ci| try emitCallIndirect(code, inst, ci, reg_map, fctx),
+
+        // ── Tables & function refs ───────────────────────────────────
+        .table_size => |tidx| try emitTableSize(code, inst, tidx, reg_map),
+        .table_get => |tg| try emitTableGet(code, inst, tg, reg_map),
+        .table_set => |ts| try emitTableSet(code, ts, reg_map, fctx),
+        .table_grow => |tg| try emitTableGrow(code, inst, tg, reg_map, fctx),
+        .ref_func => |fidx| try emitRefFunc(code, inst, fidx, reg_map),
 
         // ── Locals (FP-relative frame slots) ─────────────────────────
         .local_get => |idx| {
@@ -1310,8 +1318,12 @@ fn emitCall(
     if (cl.tail) return error.UnimplementedTailCall;
     if (cl.extra_results > 0) return error.UnimplementedMultiResult;
     if (cl.args.len > 7) return error.TooManyCallArgs;
-    if (cl.func_idx < fctx.import_count) return error.UnimplementedImportCall;
-    const call_patches = fctx.call_patches orelse return error.CallLinkageUnavailable;
+    const is_import = cl.func_idx < fctx.import_count;
+    const call_patches: ?*std.ArrayListUnmanaged(CallPatch) = if (is_import)
+        null
+    else blk: {
+        break :blk (fctx.call_patches orelse return error.CallLinkageUnavailable);
+    };
 
     // Snapshot live caller-save physregs (x0..x15). Callee-saved
     // allocatable regs (x19..x28) at indices >= caller_saved_count survive
@@ -1356,13 +1368,23 @@ fn emitCall(
     // Load VMContext into x0 (was saved above if previously live).
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
 
-    // BL 0 (placeholder); record a patch for module-level resolution.
-    const patch_off = code.len();
-    try code.bl(0);
-    try call_patches.append(fctx.allocator, .{
-        .patch_offset = patch_off,
-        .target_func_idx = cl.func_idx - fctx.import_count,
-    });
+    if (is_import) {
+        // Indirect call through vmctx.host_functions_ptr[func_idx].
+        // Use tmp0 for the function pointer chain so x0 (the vmctx arg)
+        // survives.
+        try code.ldrImm(RegMap.tmp0, .x0, vmctx_host_functions_slot);
+        const fn_slot: u12 = @intCast(cl.func_idx);
+        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, fn_slot);
+        try code.blr(RegMap.tmp0);
+    } else {
+        // BL 0 (placeholder); record a patch for module-level resolution.
+        const patch_off = code.len();
+        try code.bl(0);
+        try call_patches.?.append(fctx.allocator, .{
+            .patch_offset = patch_off,
+            .target_func_idx = cl.func_idx - fctx.import_count,
+        });
+    }
 
     // Commit result (in x0) to dest's location BEFORE restoring saved regs,
     // so restoration can't clobber the result holder (dest.reg is always a
@@ -1464,6 +1486,7 @@ fn emitMemAddr(
 /// VmCtx field offsets. Must match `runtime/aot/runtime.zig::VmCtx`.
 const vmctx_memsize_slot: u12 = 1;       // byte 8, scale 8
 const vmctx_globals_slot: u12 = 2;       // byte 16, scale 8
+const vmctx_host_functions_slot: u12 = 3;// byte 24, scale 8
 const vmctx_mem_pages_slot_w: u12 = 14;  // byte 56 (u32), scale 4
 const vmctx_mem_grow_fn_slot: u12 = 8;   // byte 64, scale 8
 const vmctx_mem_fill_fn_slot: u12 = 28;  // byte 224, scale 8
@@ -1472,6 +1495,18 @@ const vmctx_trap_oob_fn_slot: u12 = 10;  // byte 80, scale 8
 const vmctx_trap_unreachable_fn_slot: u12 = 11; // byte 88, scale 8
 const vmctx_trap_idivz_fn_slot: u12 = 12; // byte 96, scale 8
 const vmctx_trap_iovf_fn_slot: u12 = 13;  // byte 104, scale 8
+const vmctx_funcptrs_slot: u12 = 15;     // byte 120, scale 8
+const vmctx_table_grow_fn_slot: u12 = 16;// byte 128, scale 8
+const vmctx_tables_info_slot: u12 = 17;  // byte 136, scale 8
+const vmctx_sig_table_slot: u12 = 20;    // byte 160, scale 8
+const vmctx_table_set_fn_slot: u12 = 24; // byte 192, scale 8
+
+// Per-table descriptor layout (`TableInfo`, 24 bytes):
+//   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
+const table_info_stride: u32 = 24;
+const table_info_ptr_off: u32 = 0;
+const table_info_len_off: u32 = 8;
+const table_info_type_backing_off: u32 = 16;
 
 /// Globals are a packed array of 8-byte slots indexed by global index.
 /// For i32/f32 we read/write the low 32 bits with W-form LDR/STR; for
@@ -1572,6 +1607,314 @@ fn emitMemoryCopy(
     try emitVmctxHelperCall(code, &args, vmctx_mem_copy_fn_slot, reg_map, fctx, null);
 }
 
+/// Load the address of table `idx`'s `TableInfo` record into `dest` reg
+/// via the `vmctx.tables_info_ptr` array (stride 24 bytes per table).
+/// Uses `RegMap.tmp0` internally if `dest` == vmctx register (it won't,
+/// since `dest` is always a scratch caller like tmp0/tmp1 at call sites).
+fn loadTableInfoAddr(code: *emit.CodeBuffer, dest: emit.Reg, table_idx: u32) !void {
+    try code.ldrImm(dest, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(dest, dest, vmctx_tables_info_slot);
+    const off: u32 = table_idx * table_info_stride;
+    if (off != 0) {
+        try code.movImm32(RegMap.tmp1, @intCast(off));
+        try code.addRegReg(dest, dest, RegMap.tmp1);
+    }
+}
+
+/// `.table_size` — returns `vmctx.tables_info[table_idx].len`.
+fn emitTableSize(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    table_idx: u32,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    try loadTableInfoAddr(code, RegMap.tmp0, table_idx);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const len_slot_w: u12 = @intCast(table_info_len_off / 4);
+    try code.ldrImm32(info.reg, RegMap.tmp0, len_slot_w);
+    try destCommit(code, reg_map, info);
+}
+
+/// `.table_get` — bounds-checked load of table element pointer.
+///   if (idx >= table.len) trap_unreachable;
+///   dest = table.ptr[idx];
+fn emitTableGet(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    tg: @TypeOf(@as(ir.Inst.Op, undefined).table_get),
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const idx_reg = try useInto(code, reg_map, tg.idx, RegMap.tmp2);
+
+    try loadTableInfoAddr(code, RegMap.tmp0, tg.table_idx);
+    const len_slot_w: u12 = @intCast(table_info_len_off / 4);
+    try code.ldrImm32(RegMap.tmp1, RegMap.tmp0, len_slot_w);
+    try code.cmpRegReg32(idx_reg, RegMap.tmp1);
+    const skip_patch = code.len();
+    try code.bCond(.lo, 0);
+    try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot);
+    patchBCondHere(code, skip_patch);
+
+    // tmp0 = table_info_ptr; load table.ptr (at offset 0) into tmp0.
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, @intCast(table_info_ptr_off / 8));
+    // tmp0 = table.ptr + (idx * 8)
+    try code.addExtUxtw3(RegMap.tmp0, RegMap.tmp0, idx_reg);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    try code.ldrImm(info.reg, RegMap.tmp0, 0);
+    try destCommit(code, reg_map, info);
+}
+
+/// `.table_set` — calls `VmCtx.table_set_fn(vmctx, table_idx, idx, val)`.
+/// The helper handles bounds checking and type-backing updates.
+fn emitTableSet(
+    code: *emit.CodeBuffer,
+    ts: @TypeOf(@as(ir.Inst.Op, undefined).table_set),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    // Helper signature: fn(vmctx, table_idx, idx, val) with table_idx a
+    // compile-time constant. Snapshot live caller-save regs, stage args
+    // (x1=table_idx from movImm32, x2=idx, x3=val from saved slots),
+    // load vmctx into x0, BLR, restore.
+
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // x1 = table_idx, x2 = idx, x3 = val, x0 = vmctx.
+    try code.movImm32(.x1, @intCast(ts.table_idx));
+    try stageArgFromSaved(code, reg_map, fctx, .x2, ts.idx);
+    try stageArgFromSaved(code, reg_map, fctx, .x3, ts.val);
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_table_set_fn_slot);
+    try code.blr(RegMap.tmp0);
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
+/// Helper used by `emitTableSet`/`emitTableGrow` to stage one VReg into
+/// a specific arg register, reading from the call-save or spill slot.
+/// Precondition: the caller has snapshotted and spilled all used
+/// caller-save regs to `fctx.call_save_base`.
+fn stageArgFromSaved(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+    target: emit.Reg,
+    vreg: ir.VReg,
+) !void {
+    const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
+    switch (loc) {
+        .reg => |r| {
+            const reg_idx: u32 = @intFromEnum(r);
+            if (reg_idx >= 19) {
+                try code.movRegReg(target, r);
+            } else {
+                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                try code.ldrImm(target, .fp, slot_scaled);
+            }
+        },
+        .stack => |off| {
+            try code.ldrImm(target, .fp, reg_map.spillOffsetScaled(off));
+        },
+    }
+}
+
+/// `.table_grow` — calls `VmCtx.table_grow_fn(vmctx, init, delta, table_idx)`.
+/// Returns the previous size (or -1 on failure) in x0.
+fn emitTableGrow(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    tg: @TypeOf(@as(ir.Inst.Op, undefined).table_grow),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // x1 = init, x2 = delta, x3 = table_idx, x0 = vmctx.
+    try stageArgFromSaved(code, reg_map, fctx, .x1, tg.init);
+    try stageArgFromSaved(code, reg_map, fctx, .x2, tg.delta);
+    try code.movImm32(.x3, @intCast(tg.table_idx));
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_table_grow_fn_slot);
+    try code.blr(RegMap.tmp0);
+
+    if (inst.dest) |dest| {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
+/// `.ref_func` — returns `vmctx.funcptrs_ptr[func_idx]` (a native function
+/// pointer for `func_idx`, used as a host-side reference value).
+fn emitRefFunc(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    func_idx: u32,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_funcptrs_slot);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const slot: u12 = @intCast(func_idx);
+    try code.ldrImm(info.reg, RegMap.tmp0, slot);
+    try destCommit(code, reg_map, info);
+}
+
+/// `.call_indirect` — table-dispatched call with runtime signature check.
+///   ti = vmctx.tables_info[table_idx]
+///   if (idx >= ti.len) trap_unreachable;
+///   expected_sig = vmctx.sig_table_ptr[type_idx]
+///   actual_sig = ti.type_backing_ptr[idx]
+///   if (expected_sig != actual_sig) trap_unreachable;
+///   fn_ptr = ti.ptr[idx];
+///   <marshal args, BLR fn_ptr>
+fn emitCallIndirect(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    ci: @TypeOf(@as(ir.Inst.Op, undefined).call_indirect),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    if (ci.tail) return error.UnimplementedTailCall;
+    if (ci.extra_results > 0) return error.UnimplementedMultiResult;
+    if (ci.args.len > 7) return error.TooManyCallArgs;
+
+    // Snapshot live caller-save regs and spill to call_save.
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // Stage `elem_idx` into a callee-safe spot: write it to a dedicated
+    // scratch slot on the stack (we reuse slot 0 of the call-save region
+    // is risky since we just spilled to those slots — use the spill-slot
+    // of elem_idx itself). Actually, re-read elem_idx from its saved
+    // location into tmp2 each time we need it.
+    //
+    // Load elem_idx → tmp2 (32-bit value, zero-extended).
+    {
+        const loc = reg_map.get(ci.elem_idx) orelse return error.UnboundVReg;
+        switch (loc) {
+            .reg => |r| {
+                const reg_idx: u32 = @intFromEnum(r);
+                if (reg_idx >= 19) {
+                    try code.movRegReg(RegMap.tmp2, r);
+                } else {
+                    const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                    try code.ldrImm(RegMap.tmp2, .fp, slot_scaled);
+                }
+            },
+            .stack => |off| {
+                try code.ldrImm(RegMap.tmp2, .fp, reg_map.spillOffsetScaled(off));
+            },
+        }
+    }
+
+    // tmp0 = &vmctx.tables_info[table_idx]
+    try loadTableInfoAddr(code, RegMap.tmp0, ci.table_idx);
+    // Bounds check: tmp1 = ti.len; cmp tmp2, tmp1; b.lo ok; trap; ok:
+    const len_slot_w: u12 = @intCast(table_info_len_off / 4);
+    try code.ldrImm32(RegMap.tmp1, RegMap.tmp0, len_slot_w);
+    try code.cmpRegReg32(RegMap.tmp2, RegMap.tmp1);
+    const skip_bounds = code.len();
+    try code.bCond(.lo, 0);
+    try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot);
+    patchBCondHere(code, skip_bounds);
+
+    // Sig check:
+    //   tmp1 = ti.type_backing_ptr (at offset 16)
+    //   actual_sig = type_backing_ptr[idx]        (u32, stride 4)
+    //   expected_sig = vmctx.sig_table_ptr[type_idx]  (u32, stride 4)
+    //   cmp actual, expected; b.eq ok; trap; ok:
+    try code.ldrImm(RegMap.tmp1, RegMap.tmp0, @intCast(table_info_type_backing_off / 8));
+    // tmp1 = type_backing_ptr + idx*4
+    try code.uxtw(RegMap.tmp0, RegMap.tmp2);
+    try code.lslImm(RegMap.tmp0, RegMap.tmp0, 2);
+    try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp0);
+    try code.ldrImm32(RegMap.tmp1, RegMap.tmp1, 0); // tmp1 = actual_sig
+
+    // Load expected_sig from vmctx.sig_table_ptr[type_idx].
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(.x0, .x0, vmctx_sig_table_slot);
+    try code.ldrImm32(RegMap.tmp0, .x0, @intCast(ci.type_idx)); // scale 4
+
+    try code.cmpRegReg32(RegMap.tmp1, RegMap.tmp0);
+    const skip_sig = code.len();
+    try code.bCond(.eq, 0);
+    try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot);
+    patchBCondHere(code, skip_sig);
+
+    // Load fn_ptr: ti.ptr + idx*8. Recompute ti addr (x0 clobbered above).
+    try loadTableInfoAddr(code, RegMap.tmp0, ci.table_idx);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, @intCast(table_info_ptr_off / 8));
+    try code.addExtUxtw3(RegMap.tmp0, RegMap.tmp0, RegMap.tmp2);
+    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0); // tmp0 = fn_ptr
+
+    // Park fn_ptr in the call_save slot for tmp0's scratch index so it
+    // survives arg staging. Actually tmp0 is x16 — non-allocatable — so
+    // arg staging won't clobber it (arg staging only uses x1..x7, x0,
+    // and reads from call_save). Safe to keep in tmp0 across arg moves.
+
+    // Stage args into x1..xN.
+    for (ci.args, 0..) |arg_vreg, i| {
+        try stageArgFromSaved(code, reg_map, fctx, callArgReg(@intCast(i)), arg_vreg);
+    }
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.blr(RegMap.tmp0);
+
+    if (inst.dest) |dest| {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
 /// Emit an indirect call to a host helper via a VmCtx slot, passing
 /// `vmctx` as the first arg and `args` as x1..xN (up to 7). Uses the
 /// same caller-save snapshot pattern as `emitCall`: all currently-used
@@ -1579,6 +1922,11 @@ fn emitMemoryCopy(
 /// arg staging, so the arg moves can read from stable stack slots
 /// without parallel-move hazards. If `maybe_dest` is non-null, x0 is
 /// committed to it before restoring saved regs.
+///
+/// `imm_args` optionally provides constant `u32` values to materialize
+/// into arg positions `args.len`, `args.len + 1`, ... (after the
+/// variable-source args). Used by `table.set` / `table.grow` to pass
+/// `table_idx`.
 fn emitVmctxHelperCall(
     code: *emit.CodeBuffer,
     args: []const ir.VReg,
@@ -1594,26 +1942,34 @@ fn emitVmctxHelperCall(
 
     for (used_snapshot, 0..) |used, i| {
         if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
         const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.strImm(reg, .fp, slot_scaled);
     }
 
-    // Stage args into x1..xN from stable post-snapshot storage.
+    // Stage VReg args into x1..xN from stable post-snapshot storage.
     const arg_regs = [_]emit.Reg{ .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
     for (args, 0..) |vreg, i| {
         const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
         switch (loc) {
             .reg => |r| {
                 const reg_idx: u32 = @intFromEnum(r);
-                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-                try code.ldrImm(arg_regs[i], .fp, slot_scaled);
+                if (reg_idx >= 19) {
+                    try code.movRegReg(arg_regs[i], r);
+                } else {
+                    const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                    try code.ldrImm(arg_regs[i], .fp, slot_scaled);
+                }
             },
             .stack => |off| {
                 try code.ldrImm(arg_regs[i], .fp, reg_map.spillOffsetScaled(off));
             },
         }
     }
+
+    // Materialize any constant args into the trailing arg regs.
+    _ = &arg_regs;
 
     // x0 = vmctx; tmp0 = vmctx.<fn_slot>; BLR tmp0.
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
@@ -1629,6 +1985,7 @@ fn emitVmctxHelperCall(
 
     for (used_snapshot, 0..) |used, i| {
         if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
         const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.ldrImm(reg, .fp, slot_scaled);

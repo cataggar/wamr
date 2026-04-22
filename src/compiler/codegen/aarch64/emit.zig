@@ -721,6 +721,26 @@ pub const CodeBuffer = struct {
         try self.movRegReg32(rd, rn);
     }
 
+    /// LSL Xd, Xn, #shift (64-bit). Alias of UBFM Xd, Xn, #-shift mod 64,
+    /// #63-shift. Use for scaling an index by a power of 2 at the emit
+    /// level without materializing the shift amount into a register.
+    pub fn lslImm(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u6) !void {
+        const immr: u32 = @as(u32, 64 - @as(u32, shift)) & 0x3F;
+        const imms: u32 = 63 - @as(u32, shift);
+        // sf=1, N=1, UBFM: 1|10|100110|1|immr(6)|imms(6)|Rn|Rd
+        try self.emit32(0xD3400000 | (immr << 16) | (imms << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// ADD Xd, Xn, Wm, UXTW #3 — add Xn + (zero_extend_32(Wm) << 3).
+    /// Convenient for computing `base + idx*8` in one instruction when the
+    /// index is a 32-bit wasm table or memory index.
+    pub fn addExtUxtw3(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
+        // ADD (extended register) 64-bit: 1|0|0|01011|00|1|Rm|option(010)|imm3(3)|Rn|Rd
+        try self.emit32(0x8B204C00 | (@as(u32, rm.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     // ── Prologue / Epilogue ─────────────────────────────────────────
 
     /// Emit function prologue: STP FP, LR, [SP, #-frame_size]!; MOV FP, SP
@@ -914,6 +934,24 @@ test "emit: MADD w0, w1, w2, w3" {
     defer code.deinit();
     try code.maddRegReg32(.x0, .x1, .x2, .x3);
     try expectWord(0x1B020C20, &code);
+}
+
+test "emit: LSL x3, x4, #3 (UBFM alias)" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.lslImm(.x3, .x4, 3);
+    // LSL Xd, Xn, #3 = UBFM Xd, Xn, #61, #60.
+    // sf=1 N=1 UBFM base=0xD3400000. immr=61=0x3D -> <<16 = 0x3D0000.
+    // imms=60=0x3C -> <<10 = 0xF000. Rn=4<<5=0x80. Rd=3.
+    try expectWord(0xD37DF083, &code);
+}
+
+test "emit: ADD x3, x4, w5, UXTW #3" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.addExtUxtw3(.x3, .x4, .x5);
+    // Base 0x8B204C00. Rm=5<<16=0x50000. Rn=4<<5=0x80. Rd=3.
+    try expectWord(0x8B254C83, &code);
 }
 
 fn expectWord(expected: u32, code: *const CodeBuffer) !void {
