@@ -192,7 +192,7 @@ pub fn elemSize(t: ctypes.ValType) u32 {
 
 // ── Compound layout (registry-aware) ────────────────────────────────────────
 
-fn alignUp(offset: u32, al: u32) u32 {
+pub fn alignUp(offset: u32, al: u32) u32 {
     if (al == 0) return offset;
     return (offset + al - 1) & ~(al - 1);
 }
@@ -412,7 +412,7 @@ pub fn flattenCount(reg: TypeRegistry, t: ctypes.ValType) u32 {
     };
 }
 
-fn flattenCountDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
+pub fn flattenCountDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
     return switch (td) {
         .record => |r| blk: {
             var count: u32 = 0;

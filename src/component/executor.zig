@@ -249,7 +249,7 @@ fn getResultValTypes(ft: ctypes.FuncType, allocator: Allocator) ![]ctypes.ValTyp
 fn countFlatTypes(registry: TypeRegistry, types: []const ctypes.ValType) u32 {
     var count: u32 = 0;
     for (types) |t| {
-        count += abi.flattenCountDef(registry, t);
+        count += abi.flattenCount(registry, t);
     }
     return count;
 }
@@ -398,6 +398,81 @@ fn storeInterfaceValue(
     };
 }
 
+// ── Canonical built-in functions ─────────────────────────────────────────────
+
+const ResourceTable = instance_mod.ResourceTable;
+
+/// Execute `resource.new(rep) → handle`: allocate a new resource handle.
+pub fn canonResourceNew(
+    resource_table: *ResourceTable,
+    representation: u32,
+    allocator: Allocator,
+) ExecutionError!u32 {
+    return resource_table.new(representation, true, allocator) catch return error.OutOfMemory;
+}
+
+/// Execute `resource.drop(handle)`: deallocate a resource handle.
+/// Returns the representation for the caller to invoke the destructor.
+pub fn canonResourceDrop(
+    resource_table: *ResourceTable,
+    handle: u32,
+    allocator: Allocator,
+) ?u32 {
+    return resource_table.drop(handle, allocator);
+}
+
+/// Execute `resource.rep(handle) → rep`: get the representation for a handle.
+pub fn canonResourceRep(
+    resource_table: *const ResourceTable,
+    handle: u32,
+) ?u32 {
+    return resource_table.rep(handle);
+}
+
+/// Dispatch a canonical built-in function call. Used when the canon section
+/// references resource.new/drop/rep instead of lift/lower.
+pub fn dispatchCanonBuiltin(
+    comp_inst: *ComponentInstance,
+    canon: ctypes.Canon,
+    env: *ExecEnv,
+    allocator: Allocator,
+) ExecutionError!void {
+    switch (canon) {
+        .resource_new => |resource_idx| {
+            if (resource_idx >= comp_inst.resource_tables.len)
+                return error.FunctionNotFound;
+            const rep_val: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const handle = try canonResourceNew(
+                &comp_inst.resource_tables[resource_idx],
+                rep_val,
+                allocator,
+            );
+            env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
+        },
+        .resource_drop => |resource_idx| {
+            if (resource_idx >= comp_inst.resource_tables.len)
+                return error.FunctionNotFound;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            _ = canonResourceDrop(
+                &comp_inst.resource_tables[resource_idx],
+                handle,
+                allocator,
+            );
+        },
+        .resource_rep => |resource_idx| {
+            if (resource_idx >= comp_inst.resource_tables.len)
+                return error.FunctionNotFound;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const rep_val = canonResourceRep(
+                &comp_inst.resource_tables[resource_idx],
+                handle,
+            ) orelse 0;
+            env.pushI32(@bitCast(rep_val)) catch return error.StackOverflow;
+        },
+        .lift, .lower => {}, // Handled by callComponentFunc
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "LiftOptions: parse from CanonOpt array" {
@@ -490,4 +565,36 @@ test "InterfaceValue.deinit: nested record" {
     outer[1] = .{ .record_val = inner };
     const v = InterfaceValue{ .record_val = outer };
     v.deinit(allocator); // frees both inner and outer
+}
+
+test "canonResourceNew and canonResourceRep" {
+    const allocator = std.testing.allocator;
+    var table = ResourceTable{};
+    defer table.deinit(allocator);
+
+    const handle = try canonResourceNew(&table, 42, allocator);
+    try std.testing.expectEqual(@as(?u32, 42), canonResourceRep(&table, handle));
+}
+
+test "canonResourceDrop" {
+    const allocator = std.testing.allocator;
+    var table = ResourceTable{};
+    defer table.deinit(allocator);
+
+    const handle = try canonResourceNew(&table, 99, allocator);
+    const rep = canonResourceDrop(&table, handle, allocator);
+    try std.testing.expectEqual(@as(?u32, 99), rep);
+    // After drop, rep returns null
+    try std.testing.expectEqual(@as(?u32, null), canonResourceRep(&table, handle));
+}
+
+test "canonResourceDrop: double drop returns null" {
+    const allocator = std.testing.allocator;
+    var table = ResourceTable{};
+    defer table.deinit(allocator);
+
+    const handle = try canonResourceNew(&table, 7, allocator);
+    _ = canonResourceDrop(&table, handle, allocator);
+    // Second drop should return null
+    try std.testing.expectEqual(@as(?u32, null), canonResourceDrop(&table, handle, allocator));
 }
