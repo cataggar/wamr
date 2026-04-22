@@ -29,8 +29,12 @@ tests/spec-json/
 .wamr-test-*/
 
 # Windows NUL device artifacts
+NUL
 NUL.*
 wasm-spec-temp/
+
+# AOT artifacts
+*.aot
 
 # Benchmark artifacts
 tests/benchmarks/coremark/coremark/
