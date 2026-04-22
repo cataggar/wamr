@@ -209,6 +209,56 @@ fn buildBinI32Module(
     return out.toOwnedSlice(allocator);
 }
 
+/// Build a wasm module exporting `() -> i32` that does
+///   block
+///     block
+///       i32.const <idx>; br_table 0 1  ;; targets=[0], default=1
+///     end
+///     i32.const 10; return
+///   end
+///   i32.const 20; return
+/// i.e. idx == 0 → returns 10 (hit target[0], break to inner block),
+/// any other idx → returns 20 (default, break to outer block).
+fn buildBrTableModule(allocator: std.mem.Allocator, idx: i32) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    try out.appendSlice(allocator, &[_]u8{
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+    });
+    try out.appendSlice(allocator, &[_]u8{ 0x03, 0x02, 0x01, 0x00 });
+    try out.appendSlice(allocator, &[_]u8{
+        0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00,
+    });
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(allocator);
+    try body.append(allocator, 0x00); // 0 local decls
+    try body.appendSlice(allocator, &[_]u8{ 0x02, 0x40 }); // block void
+    try body.appendSlice(allocator, &[_]u8{ 0x02, 0x40 }); //   block void
+    try body.append(allocator, 0x41); //     i32.const <idx>
+    try encodeSLEB128(&body, allocator, idx);
+    try body.appendSlice(allocator, &[_]u8{ 0x0E, 0x01, 0x00, 0x01 }); // br_table [0] default=1
+    try body.append(allocator, 0x0B); //   end inner
+    try body.appendSlice(allocator, &[_]u8{ 0x41, 0x0A, 0x0F }); //   i32.const 10; return
+    try body.append(allocator, 0x0B); // end outer
+    try body.appendSlice(allocator, &[_]u8{ 0x41, 0x14, 0x0F }); // i32.const 20; return
+    try body.append(allocator, 0x0B); // end function
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try code.append(allocator, 0x01);
+    try encodeULEB128(&code, allocator, @intCast(body.items.len));
+    try code.appendSlice(allocator, body.items);
+
+    try out.append(allocator, 0x0A);
+    try encodeULEB128(&out, allocator, @intCast(code.items.len));
+    try out.appendSlice(allocator, code.items);
+
+    return out.toOwnedSlice(allocator);
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 /// Build a wasm module with a custom bytecode body for a `() -> i32` function.
@@ -477,4 +527,24 @@ test "differential: 20 %u 6 == 2 (i32.rem_u)" {
     const wasm = try buildBinI32Module(testing.allocator, 20, 6, 0x70);
     defer testing.allocator.free(wasm);
     try expectDiffI32(wasm, "f", 2);
+}
+
+// ── br_table ─────────────────────────────────────────────────────────────────
+
+test "differential: br_table idx=0 hits target[0] → returns 10" {
+    const wasm = try buildBrTableModule(testing.allocator, 0);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 10);
+}
+
+test "differential: br_table idx=1 falls through to default → returns 20" {
+    const wasm = try buildBrTableModule(testing.allocator, 1);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 20);
+}
+
+test "differential: br_table idx=100 (out-of-range) → default → returns 20" {
+    const wasm = try buildBrTableModule(testing.allocator, 100);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 20);
 }

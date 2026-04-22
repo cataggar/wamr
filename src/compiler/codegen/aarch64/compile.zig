@@ -359,6 +359,7 @@ fn compileInst(
         // ── Branches ─────────────────────────────────────────────────
         .br => |target| try emitBr(code, patches, target, fctx.allocator),
         .br_if => |br| try emitBrIf(code, reg_map, patches, br, fctx.allocator),
+        .br_table => |bt| try emitBrTable(code, reg_map, patches, bt, fctx.allocator),
 
         // ── Direct function call ─────────────────────────────────────
         .call => |cl| try emitCall(code, inst, cl, reg_map, fctx),
@@ -1027,6 +1028,49 @@ fn emitDivRem(
     try destCommit(code, reg_map, info);
 }
 
+/// Cascaded-compare br_table. For each target i, emits:
+///   cmp idx, #i
+///   b.eq target[i]        ; patched to absolute block by caller
+/// then an unconditional B to the default block at the end. Because the
+/// default branch is taken whenever every EQ compare fails, indices ≥
+/// targets.len naturally dispatch to default (matching wasm semantics
+/// that treats the index as unsigned).
+///
+/// Code size is O(N) instructions. Real wasm br_tables are usually small
+/// (few dozen arms); Phase 4 may replace this with a true jump table via
+/// ADR + register-indexed LDR + BR for hot paths.
+fn emitBrTable(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    patches: *std.ArrayListUnmanaged(BranchPatch),
+    bt: @TypeOf(@as(ir.Inst.Op, undefined).br_table),
+    allocator: std.mem.Allocator,
+) !void {
+    const idx_r = try useInto(code, reg_map, bt.index, RegMap.tmp0);
+    for (bt.targets, 0..) |target, i| {
+        if (i <= 0xFFF) {
+            try code.cmpImm32(idx_r, @intCast(i));
+        } else {
+            try code.movImm32(RegMap.tmp1, @intCast(i));
+            try code.cmpRegReg32(idx_r, RegMap.tmp1);
+        }
+        const patch_off = code.len();
+        try code.bCond(.eq, 0); // placeholder
+        try patches.append(allocator, .{
+            .patch_offset = patch_off,
+            .target_block = target,
+            .kind = .b_cond,
+        });
+    }
+    const default_patch = code.len();
+    try code.b(0); // placeholder
+    try patches.append(allocator, .{
+        .patch_offset = default_patch,
+        .target_block = bt.default,
+        .kind = .b_uncond,
+    });
+}
+
 
 /// Scaled-immediate offset suitable for LDR/STR with given scale.
 /// Returns null if the offset isn't a multiple of `scale` within u12*scale range.
@@ -1318,6 +1362,47 @@ test "compileFunction: div_s by zero codegen produces trap path" {
 
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+}
+
+test "compileFunction: br_table with 2 targets + default compiles" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const idx = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = idx, .type = .i32 });
+
+    const targets = try allocator.alloc(ir.BlockId, 2);
+    targets[0] = b1;
+    targets[1] = b2;
+    try func.getBlock(b0).append(.{ .op = .{ .br_table = .{
+        .index = idx,
+        .targets = targets,
+        .default = b3,
+    } } });
+
+    const r1 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = r1 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = r1 } });
+    const r2 = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 2 }, .dest = r2 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = r2 } });
+    const r3 = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 3 }, .dest = r3 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = r3 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // IR leaks the targets slice (same convention as call.args); free explicitly.
+    allocator.free(targets);
+
     try std.testing.expect(code.len > 0);
     try std.testing.expect(code.len % 4 == 0);
 }
