@@ -781,12 +781,13 @@ fn emitMemAddr(
     }
 }
 
-/// Scaled-immediate offset suitable for LDR/STR W-form (4-byte access).
-/// Returns null if the offset isn't a multiple of 4 within u12*4 range.
-fn scaled4Offset(off: u32) ?u12 {
-    if (off > 0x3FFC) return null;
-    if ((off & 3) != 0) return null;
-    return @intCast(off / 4);
+/// Scaled-immediate offset suitable for LDR/STR with given scale.
+/// Returns null if the offset isn't a multiple of `scale` within u12*scale range.
+fn scaledOffset(off: u32, scale: u32) ?u12 {
+    const max = @as(u32, 0xFFF) * scale;
+    if (off > max) return null;
+    if ((off % scale) != 0) return null;
+    return @intCast(off / scale);
 }
 
 fn emitLoad(
@@ -795,23 +796,46 @@ fn emitLoad(
     ld: @TypeOf(@as(ir.Inst.Op, undefined).load),
     reg_map: *RegMap,
 ) !void {
-    // Phase 1 scope: 4-byte load only; other sizes handled by p1-load-store-other.
-    if (ld.size != 4) return error.UnimplementedLoadSize;
-    if (ld.sign_extend) return error.UnimplementedLoadSign;
     const dest = inst.dest orelse return;
+    const is64 = inst.type == .i64;
 
-    // Try to fold the wasm offset into LDR's scaled immediate; else add it to tmp0.
-    if (scaled4Offset(ld.offset)) |disp| {
-        try emitMemAddr(code, reg_map, ld.base, 0);
-        const info = try destBegin(reg_map, dest, RegMap.tmp1);
-        try code.ldrImm32(info.reg, RegMap.tmp0, disp);
-        try destCommit(code, reg_map, info);
+    // Validate size/sign combinations. i32.load32 can't sign-extend since
+    // there's nothing wider to extend into at 32-bit dest.
+    const scale: u32 = switch (ld.size) {
+        1 => 1,
+        2 => 2,
+        4 => 4,
+        8 => 8,
+        else => return error.UnimplementedLoadSize,
+    };
+    if (ld.sign_extend and ld.size == 8) return error.BadLoadSign; // 8-byte has no extension
+    if (ld.sign_extend and ld.size == 4 and !is64) return error.BadLoadSign;
+
+    // Try to fold offset into the load's scaled immediate; else add it to tmp0.
+    const folded = scaledOffset(ld.offset, scale);
+    try emitMemAddr(code, reg_map, ld.base, if (folded == null) ld.offset else 0);
+    const disp: u12 = if (folded) |d| d else 0;
+
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    if (ld.sign_extend) {
+        switch (ld.size) {
+            1 => if (is64) try code.ldrsbImm64(info.reg, RegMap.tmp0, disp)
+                 else try code.ldrsbImm32(info.reg, RegMap.tmp0, disp),
+            2 => if (is64) try code.ldrshImm64(info.reg, RegMap.tmp0, disp)
+                 else try code.ldrshImm32(info.reg, RegMap.tmp0, disp),
+            4 => try code.ldrswImm(info.reg, RegMap.tmp0, disp), // always X-form
+            else => unreachable,
+        }
     } else {
-        try emitMemAddr(code, reg_map, ld.base, ld.offset);
-        const info = try destBegin(reg_map, dest, RegMap.tmp1);
-        try code.ldrImm32(info.reg, RegMap.tmp0, 0);
-        try destCommit(code, reg_map, info);
+        switch (ld.size) {
+            1 => try code.ldrbImm(info.reg, RegMap.tmp0, disp),
+            2 => try code.ldrhImm(info.reg, RegMap.tmp0, disp),
+            4 => try code.ldrImm32(info.reg, RegMap.tmp0, disp),
+            8 => try code.ldrImm(info.reg, RegMap.tmp0, disp),
+            else => unreachable,
+        }
     }
+    try destCommit(code, reg_map, info);
 }
 
 fn emitStore(
@@ -819,17 +843,28 @@ fn emitStore(
     st: @TypeOf(@as(ir.Inst.Op, undefined).store),
     reg_map: *RegMap,
 ) !void {
-    if (st.size != 4) return error.UnimplementedStoreSize;
+    const scale: u32 = switch (st.size) {
+        1 => 1,
+        2 => 2,
+        4 => 4,
+        8 => 8,
+        else => return error.UnimplementedStoreSize,
+    };
 
-    // Compute effective address in tmp0 (possibly using tmp1). If we fold
-    // offset into STR's scaled imm, pass 0; else fold into tmp0.
-    const disp_opt = scaled4Offset(st.offset);
-    try emitMemAddr(code, reg_map, st.base, if (disp_opt == null) st.offset else 0);
+    const folded = scaledOffset(st.offset, scale);
+    try emitMemAddr(code, reg_map, st.base, if (folded == null) st.offset else 0);
+    const disp: u12 = if (folded) |d| d else 0;
 
     // Materialize the value into tmp1 (or use its home reg). emitMemAddr is
     // done with tmp1 by now, so it's free for `useInto` to reuse.
     const val_reg = try useInto(code, reg_map, st.val, RegMap.tmp1);
-    try code.strImm32(val_reg, RegMap.tmp0, if (disp_opt) |d| d else 0);
+    switch (st.size) {
+        1 => try code.strbImm(val_reg, RegMap.tmp0, disp),
+        2 => try code.strhImm(val_reg, RegMap.tmp0, disp),
+        4 => try code.strImm32(val_reg, RegMap.tmp0, disp),
+        8 => try code.strImm(val_reg, RegMap.tmp0, disp),
+        else => unreachable,
+    }
 }
 
 fn emitBrIf(
@@ -1165,7 +1200,7 @@ test "load i32: unrepresentable offset falls back to movImm + add" {
     try std.testing.expect(code.len % 4 == 0);
 }
 
-test "load: size != 4 returns UnimplementedLoadSize" {
+test "load: size 8 (i64) emits 64-bit LDR X" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -1174,7 +1209,110 @@ test "load: size != 4 returns UnimplementedLoadSize" {
     const val = func.newVReg();
     try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
     try func.getBlock(bid).append(.{
-        .op = .{ .load = .{ .base = addr, .offset = 0, .size = 1 } },
+        .op = .{ .load = .{ .base = addr, .offset = 0, .size = 8 } },
+        .dest = val,
+        .type = .i64,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = val } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // LDR X opcode: bits 31..22 = 0xF94 → mask 0xFFC00000 = 0xF9400000.
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0xF9400000) { found = true; break; }
+    }
+    try std.testing.expect(found);
+}
+
+test "load: size 1 unsigned (i32.load8_u) emits LDRB" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 3, .size = 1 } },
+        .dest = val,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = val } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // LDRB encoding top bits: 0x39400000 in bits 31..22 (mask 0xFFC00000).
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0x39400000) { found = true; break; }
+    }
+    try std.testing.expect(found);
+}
+
+test "load: size 2 signed (i32.load16_s) emits LDRSH W" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 2, .size = 2, .sign_extend = true } },
+        .dest = val,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = val } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // LDRSH W top bits: 0x79C00000 (mask 0xFFC00000).
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0x79C00000) { found = true; break; }
+    }
+    try std.testing.expect(found);
+}
+
+test "store: size 1 emits STRB" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 42 }, .dest = val, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .store = .{ .base = addr, .offset = 0, .size = 1, .val = val } },
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = null } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // STRB top bits: 0x39000000 (mask 0xFFC00000).
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0x39000000) { found = true; break; }
+    }
+    try std.testing.expect(found);
+}
+
+test "load: size != 1,2,4,8 returns UnimplementedLoadSize" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .load = .{ .base = addr, .offset = 0, .size = 3 } },
         .dest = val,
         .type = .i32,
     });

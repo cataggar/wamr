@@ -288,6 +288,60 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rt.encoding());
     }
 
+    /// LDRB Wt, [Xn, #imm12] (zero-extended byte load, unscaled offset).
+    pub fn ldrbImm(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x39400000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// STRB Wt, [Xn, #imm12] (byte store, unscaled offset).
+    pub fn strbImm(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x39000000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// LDRH Wt, [Xn, #imm12*2] (zero-extended halfword load, scaled by 2).
+    pub fn ldrhImm(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x79400000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// STRH Wt, [Xn, #imm12*2] (halfword store, scaled by 2).
+    pub fn strhImm(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x79000000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// LDRSB Xt, [Xn, #imm12] (sign-extend byte → 64-bit).
+    pub fn ldrsbImm64(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x39800000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// LDRSB Wt, [Xn, #imm12] (sign-extend byte → 32-bit, zero-ext upper).
+    pub fn ldrsbImm32(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x39C00000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// LDRSH Xt, [Xn, #imm12*2] (sign-extend halfword → 64-bit).
+    pub fn ldrshImm64(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x79800000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// LDRSH Wt, [Xn, #imm12*2] (sign-extend halfword → 32-bit, zero-ext upper).
+    pub fn ldrshImm32(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0x79C00000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// LDRSW Xt, [Xn, #imm12*4] (sign-extend word → 64-bit).
+    pub fn ldrswImm(self: *CodeBuffer, rt: Reg, rn: Reg, offset: u12) !void {
+        try self.emit32(0xB9800000 | (@as(u32, offset) << 10) |
+            (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
     /// STP Xt1, Xt2, [Xn, #imm7*8]! (store pair, pre-index)
     pub fn stpPre(self: *CodeBuffer, rt1: Reg, rt2: Reg, rn: Reg, imm7: i7) !void {
         const imm: u32 = @as(u32, @as(u7, @bitCast(imm7)));
@@ -648,4 +702,67 @@ test "emit: MOV Xd, SP (ADD xd, sp, #0)" {
     try code.movFromSp(.fp);
     // ADD FP (X29), SP, #0 = 0x910003FD
     try expectWord(0x910003FD, &code);
+}
+
+test "emit: LDRB W0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrbImm(.x0, .x1, 0);
+    try expectWord(0x39400020, &code);
+}
+
+test "emit: STRB W0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.strbImm(.x0, .x1, 0);
+    try expectWord(0x39000020, &code);
+}
+
+test "emit: LDRH W0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrhImm(.x0, .x1, 0);
+    try expectWord(0x79400020, &code);
+}
+
+test "emit: STRH W0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.strhImm(.x0, .x1, 0);
+    try expectWord(0x79000020, &code);
+}
+
+test "emit: LDRSB X0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrsbImm64(.x0, .x1, 0);
+    try expectWord(0x39800020, &code);
+}
+
+test "emit: LDRSB W0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrsbImm32(.x0, .x1, 0);
+    try expectWord(0x39C00020, &code);
+}
+
+test "emit: LDRSH X0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrshImm64(.x0, .x1, 0);
+    try expectWord(0x79800020, &code);
+}
+
+test "emit: LDRSH W0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrshImm32(.x0, .x1, 0);
+    try expectWord(0x79C00020, &code);
+}
+
+test "emit: LDRSW X0, [X1, #0]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrswImm(.x0, .x1, 0);
+    try expectWord(0xB9800020, &code);
 }
