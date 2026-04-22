@@ -6,15 +6,13 @@ A fork of [bytecodealliance/wasm-micro-runtime](https://github.com/bytecodeallia
 
 ## Install
 
-Pre-built binaries are published to [GitHub Releases](https://github.com/cataggar/wamr/releases) and [PyPI](https://pypi.org/project/wamr-bin/). See [installation details](https://github.com/cataggar/wamr/issues/69).
+Install pre-built binaries from [GitHub Releases](https://github.com/cataggar/wamr/releases) with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-$ dist install cataggar/wamr
+$ ghr install cataggar/wamr
 ```
 
-```console
-$ uv tool install wamr-bin
-```
+See [INSTALL.md](INSTALL.md) for alternative installation methods (uv, pip, dist) and detailed instructions.
 
 ## Tools
 
@@ -23,7 +21,7 @@ $ uv tool install wamr-bin
 
 ## Building
 
-Requires [Zig](https://ziglang.org/) 0.15.x. No other dependencies.
+Requires [Zig](https://ziglang.org/) 0.16.x. No other dependencies.
 
 ```console
 $ git clone https://github.com/cataggar/wamr

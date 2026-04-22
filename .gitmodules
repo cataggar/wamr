@@ -1,10 +1,3 @@
-[submodule "tests/unit/llm-enhanced-test"]
-	path = tests/unit/llm-enhanced-test
-	url = https://github.com/wasm-micro-runtime/llm-enhanced-test.git
-	branch = main
-[submodule "third_party/testsuite"]
-	path = third_party/testsuite
-	url = https://github.com/WebAssembly/testsuite.git
 [submodule "tests/spec"]
 	path = tests/spec
 	url = https://github.com/WebAssembly/spec.git
