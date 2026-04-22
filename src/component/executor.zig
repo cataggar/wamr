@@ -731,3 +731,85 @@ test "callComponentFuncAsync: function not found cancels task" {
     try std.testing.expectEqual(@as(usize, 1), tm.tasks.items.len);
     try std.testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(0).?);
 }
+
+test "async poll flow: lift then return then poll" {
+    const allocator = std.testing.allocator;
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(allocator);
+    var ws = async_mod.WaitableSet{};
+    defer ws.deinit(allocator);
+
+    // Simulate the async flow manually
+    const lift_result = try async_canon.asyncLift(.{
+        .waitable_set = &ws,
+        .task_manager = &tm,
+        .allocator = allocator,
+    });
+
+    // Task should be started
+    try std.testing.expectEqual(async_mod.TaskState.started, tm.getState(lift_result.subtask_handle).?);
+
+    // Poll before return — should get null
+    try std.testing.expect(async_canon.asyncPollResult(&tm, lift_result.subtask_handle) == null);
+
+    // Return values
+    var vals = [_]u32{ 42, 99 };
+    async_canon.asyncReturn(&tm, lift_result.subtask_handle, &vals);
+
+    // Now poll — should get results
+    const ret = async_canon.asyncPollResult(&tm, lift_result.subtask_handle);
+    try std.testing.expect(ret != null);
+    try std.testing.expectEqual(@as(u32, 42), ret.?[0]);
+    try std.testing.expectEqual(@as(u32, 99), ret.?[1]);
+}
+
+test "async cancel flow: lift then cancel then poll" {
+    const allocator = std.testing.allocator;
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(allocator);
+
+    const lift_result = try async_canon.asyncLift(.{
+        .task_manager = &tm,
+        .allocator = allocator,
+    });
+
+    async_canon.asyncCancel(&tm, lift_result.subtask_handle);
+    try std.testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(lift_result.subtask_handle).?);
+    try std.testing.expect(async_canon.asyncPollResult(&tm, lift_result.subtask_handle) == null);
+}
+
+test "async waitable set: multiple subtasks" {
+    const allocator = std.testing.allocator;
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(allocator);
+    var ws = async_mod.WaitableSet{};
+    defer ws.deinit(allocator);
+
+    // Create two subtasks
+    const r1 = try async_canon.asyncLift(.{
+        .waitable_set = &ws,
+        .task_manager = &tm,
+        .allocator = allocator,
+    });
+    const r2 = try async_canon.asyncLift(.{
+        .waitable_set = &ws,
+        .task_manager = &tm,
+        .allocator = allocator,
+    });
+
+    // Both registered
+    try std.testing.expectEqual(@as(usize, 2), ws.items.items.len);
+
+    // Complete first one
+    var vals1 = [_]u32{10};
+    async_canon.asyncReturn(&tm, r1.subtask_handle, &vals1);
+
+    // First should be ready, second not
+    try std.testing.expect(async_canon.asyncPollResult(&tm, r1.subtask_handle) != null);
+    try std.testing.expect(async_canon.asyncPollResult(&tm, r2.subtask_handle) == null);
+
+    // Complete second
+    var vals2 = [_]u32{20};
+    async_canon.asyncReturn(&tm, r2.subtask_handle, &vals2);
+    try std.testing.expect(async_canon.asyncPollResult(&tm, r2.subtask_handle) != null);
+}
