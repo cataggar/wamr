@@ -543,6 +543,52 @@ pub const CodeBuffer = struct {
             (@as(u32, vn) << 5));
     }
 
+    // ── Float <-> int conversions (scalar, non-trapping) ────────────
+    // Integer→float conversions always succeed. `sf` selects whether
+    // the source integer reg is W (32-bit) or X (64-bit); `is_f64_dst`
+    // selects whether the destination V reg is interpreted as D or S.
+
+    /// SCVTF Sd/Dd, Wn/Xn — signed integer to float.
+    pub fn scvtfFromGp(
+        self: *CodeBuffer,
+        is_f64_dst: bool,
+        src_is_x: bool,
+        vd: u5,
+        rn: Reg,
+    ) !void {
+        // sf 0 0 11110 type 1 00 010 00000 Rn Rd
+        //   sf bit 31, type bit 22, opcode 010 at bits 18:16
+        const sf: u32 = if (src_is_x) 1 else 0;
+        const ty: u32 = if (is_f64_dst) 1 else 0;
+        try self.emit32(0x1E220000 | (sf << 31) | (ty << 22) |
+            (@as(u32, rn.encoding()) << 5) | vd);
+    }
+
+    /// UCVTF Sd/Dd, Wn/Xn — unsigned integer to float.
+    pub fn ucvtfFromGp(
+        self: *CodeBuffer,
+        is_f64_dst: bool,
+        src_is_x: bool,
+        vd: u5,
+        rn: Reg,
+    ) !void {
+        // opcode 011 at bits 18:16 (bit 16 set vs SCVTF)
+        const sf: u32 = if (src_is_x) 1 else 0;
+        const ty: u32 = if (is_f64_dst) 1 else 0;
+        try self.emit32(0x1E230000 | (sf << 31) | (ty << 22) |
+            (@as(u32, rn.encoding()) << 5) | vd);
+    }
+
+    /// FCVT Dd, Sn — promote single-precision to double-precision.
+    pub fn fcvtPromoteSToD(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x1E22C000 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// FCVT Sd, Dn — demote double-precision to single-precision.
+    pub fn fcvtDemoteDToS(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x1E624000 | (@as(u32, vn) << 5) | vd);
+    }
+
     /// NEG Xd, Xn (alias SUB Xd, XZR, Xn)
     pub fn negReg(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
         // SUB Xd, XZR, Xn: 1|10|01011|00|0|Rm(Rn)|000000|Rn(11111)|Rd

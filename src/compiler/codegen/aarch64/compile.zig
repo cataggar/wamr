@@ -425,6 +425,14 @@ fn compileInst(
         .f_gt => |bin| try emitFCmp(code, inst, bin, reg_map, .gt),
         .f_le => |bin| try emitFCmp(code, inst, bin, reg_map, .ls),
         .f_ge => |bin| try emitFCmp(code, inst, bin, reg_map, .ge),
+
+        // Non-trapping float/int conversions.
+        .convert_i32_s => |vreg| try emitConvertIntToFloat(code, inst, vreg, reg_map, true, false),
+        .convert_i64_s => |vreg| try emitConvertIntToFloat(code, inst, vreg, reg_map, true, true),
+        .convert_i32_u => |vreg| try emitConvertIntToFloat(code, inst, vreg, reg_map, false, false),
+        .convert_i64_u => |vreg| try emitConvertIntToFloat(code, inst, vreg, reg_map, false, true),
+        .demote_f64 => |vreg| try emitDemoteF64(code, inst, vreg, reg_map),
+        .promote_f32 => |vreg| try emitPromoteF32(code, inst, vreg, reg_map),
         .reinterpret => |vreg| try emitReinterpret(code, inst, vreg, reg_map),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
@@ -776,6 +784,64 @@ fn emitFCmp(
     // Result is i32; CSET Wd, cond — upper 32 bits are zeroed by the
     // CSINC-W alias, matching x86_64 SETcc+MOVZX convention.
     try code.cset32(info.reg, cond);
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit a non-trapping int→float conversion via scratch V-reg V0.
+///
+/// `src_is_i64` selects whether the source vreg is read as X (64-bit)
+/// or W (32-bit). Destination float width comes from `inst.type`.
+fn emitConvertIntToFloat(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+    signed: bool,
+    src_is_i64: bool,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const is_f64 = (inst.type == .f64);
+    if (signed) {
+        try code.scvtfFromGp(is_f64, src_is_i64, 0, src);
+    } else {
+        try code.ucvtfFromGp(is_f64, src_is_i64, 0, src);
+    }
+    if (is_f64) try code.fmovGpFromD64(info.reg, 0)
+    else try code.fmovGpFromS32(info.reg, 0);
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit f32.demote_f64 (f64→f32) via scratch V-reg V0.
+fn emitDemoteF64(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    try code.fmovDFromGp64(0, src);
+    try code.fcvtDemoteDToS(0, 0);
+    try code.fmovGpFromS32(info.reg, 0);
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit f64.promote_f32 (f32→f64) via scratch V-reg V0.
+fn emitPromoteF32(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    try code.fmovSFromGp32(0, src);
+    try code.fcvtPromoteSToD(0, 0);
+    try code.fmovGpFromD64(info.reg, 0);
     try destCommit(code, reg_map, info);
 }
 
