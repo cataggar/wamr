@@ -589,6 +589,39 @@ pub const CodeBuffer = struct {
         try self.emit32(0x1E624000 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// FCVTZS Wd/Xd, Sn/Dn — float to signed integer, round toward zero.
+    /// Saturates on overflow and returns 0 for NaN (useful for trunc_sat;
+    /// the trapping wasm form requires callers to bounds-check first).
+    pub fn fcvtzsToGp(
+        self: *CodeBuffer,
+        dst_is_x: bool,
+        src_is_d: bool,
+        rd: Reg,
+        vn: u5,
+    ) !void {
+        // sf 0 0 11110 type 1 rmode=11 opcode=000 00000 Rn Rd
+        // Base (W<-S): 0x1E380000
+        const sf: u32 = if (dst_is_x) 1 else 0;
+        const ty: u32 = if (src_is_d) 1 else 0;
+        try self.emit32(0x1E380000 | (sf << 31) | (ty << 22) |
+            (@as(u32, vn) << 5) | rd.encoding());
+    }
+
+    /// FCVTZU Wd/Xd, Sn/Dn — float to unsigned integer, round toward zero.
+    pub fn fcvtzuToGp(
+        self: *CodeBuffer,
+        dst_is_x: bool,
+        src_is_d: bool,
+        rd: Reg,
+        vn: u5,
+    ) !void {
+        // Same as FCVTZS but opcode=001 (bit 16 set).
+        const sf: u32 = if (dst_is_x) 1 else 0;
+        const ty: u32 = if (src_is_d) 1 else 0;
+        try self.emit32(0x1E390000 | (sf << 31) | (ty << 22) |
+            (@as(u32, vn) << 5) | rd.encoding());
+    }
+
     /// NEG Xd, Xn (alias SUB Xd, XZR, Xn)
     pub fn negReg(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
         // SUB Xd, XZR, Xn: 1|10|01011|00|0|Rm(Rn)|000000|Rn(11111)|Rd

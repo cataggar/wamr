@@ -433,6 +433,14 @@ fn compileInst(
         .convert_i64_u => |vreg| try emitConvertIntToFloat(code, inst, vreg, reg_map, false, true),
         .demote_f64 => |vreg| try emitDemoteF64(code, inst, vreg, reg_map),
         .promote_f32 => |vreg| try emitPromoteF32(code, inst, vreg, reg_map),
+
+        // Trapping float→int truncation (wasm trunc_f*_s/u).
+        .trunc_f32_s, .trunc_f64_s => |vreg| try emitTruncTrapping(code, inst, vreg, reg_map, true),
+        .trunc_f32_u, .trunc_f64_u => |vreg| try emitTruncTrapping(code, inst, vreg, reg_map, false),
+
+        // Saturating float→int truncation (wasm trunc_sat_f*_s/u).
+        .trunc_sat_f32_s, .trunc_sat_f64_s => |vreg| try emitTruncSat(code, inst, vreg, reg_map, true),
+        .trunc_sat_f32_u, .trunc_sat_f64_u => |vreg| try emitTruncSat(code, inst, vreg, reg_map, false),
         .reinterpret => |vreg| try emitReinterpret(code, inst, vreg, reg_map),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
@@ -842,6 +850,178 @@ fn emitPromoteF32(
     try code.fmovSFromGp32(0, src);
     try code.fcvtPromoteSToD(0, 0);
     try code.fmovGpFromD64(info.reg, 0);
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit trapping float→int truncation (wasm's `trunc_f*_s/u`).
+///
+/// Semantics (wasm spec):
+///   * NaN → trap
+///   * ±inf → trap
+///   * out-of-range (would not fit in the target integer type after
+///     round-toward-zero) → trap
+///   * else → FCVTZS/FCVTZU result
+///
+/// Implementation mirrors the x86_64 reference (`emitTruncRangeCheck`):
+///   1. FMOV src into V0 (S or D lane).
+///   2. FCMP V0, V0 — unordered sets V=1; trap on VS (inline helper call).
+///   3. Materialize the lower bound into tmp1 → FMOV V1; FCMP V0, V1.
+///      Trap on MI (strict `<` bound; f32 cases) or LE (inclusive
+///      `<=` bound; f64→i32 signed where `INT_MIN-1` is representable,
+///      and all unsigned cases where `-1.0` is representable).
+///   4. Materialize the upper bound (always strict `<`); FCMP V0, V1;
+///      trap on MI using the INVERTED operand order FCMP V1, V0 so the
+///      skip condition is uniform. (We instead do FCMP V0, V1 and trap
+///      on PL: src >= max; skip when src < max, i.e. MI.) In practice
+///      we use: FCMP V0, V1; skip on MI.
+///   5. FCVTZS/FCVTZU dst, V0.
+fn emitTruncTrapping(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+    signed: bool,
+) !void {
+    const dest = inst.dest orelse return;
+    const dst_is_i32 = (inst.type == .i32);
+    // The IR op is trunc_f32_* or trunc_f64_*; source type is encoded
+    // in the op tag, not inst.type (which is the destination type).
+    const src_is_f32 = switch (inst.op) {
+        .trunc_f32_s, .trunc_f32_u => true,
+        .trunc_f64_s, .trunc_f64_u => false,
+        else => unreachable,
+    };
+
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+
+    // 1. Move source into V0 (S or D lane).
+    if (src_is_f32) try code.fmovSFromGp32(0, src)
+    else try code.fmovDFromGp64(0, src);
+
+    // 2. NaN check: FCMP V0, V0 sets V=1 on unordered.
+    //    Skip the trap when ordered: B.VC skip; trap; skip:
+    try code.fcmpScalar(!src_is_f32, 0, 0);
+    {
+        const skip = code.len();
+        try code.bCond(.vc, 0);
+        try emitTrapHelperCall(code, vmctx_trap_iovf_fn_slot);
+        patchBCondHere(code, skip);
+    }
+
+    // 3. Lower-bound check. Choose bits + inclusivity based on the
+    //    smallest representable value just below INT_MIN (signed) or
+    //    -1.0 (unsigned).
+    const LowerInfo = struct { bits: u64, inclusive_trap: bool };
+    const lo: LowerInfo = if (signed) blk: {
+        if (dst_is_i32) {
+            if (src_is_f32) {
+                // f32 -2^31 = 0xCF000000; -2^31-1 not representable.
+                break :blk .{ .bits = 0xCF000000, .inclusive_trap = false };
+            } else {
+                // f64 -2^31-1 representable exactly: 0xC1E0000000200000.
+                break :blk .{ .bits = 0xC1E0000000200000, .inclusive_trap = true };
+            }
+        } else {
+            break :blk if (src_is_f32)
+                .{ .bits = 0xDF000000, .inclusive_trap = false }
+            else
+                .{ .bits = 0xC3E0000000000000, .inclusive_trap = false };
+        }
+    } else blk: {
+        break :blk if (src_is_f32)
+            .{ .bits = 0xBF800000, .inclusive_trap = true } // -1.0_f32
+        else
+            .{ .bits = 0xBFF0000000000000, .inclusive_trap = true }; // -1.0_f64
+    };
+    if (src_is_f32) {
+        try code.movImm32(RegMap.tmp1, @bitCast(@as(u32, @truncate(lo.bits))));
+        try code.fmovSFromGp32(1, RegMap.tmp1);
+    } else {
+        try code.movImm64(RegMap.tmp1, lo.bits);
+        try code.fmovDFromGp64(1, RegMap.tmp1);
+    }
+    try code.fcmpScalar(!src_is_f32, 0, 1);
+    {
+        // Strict: trap on MI  (src < bound)           → skip on PL
+        // Inclusive: trap on LE  (src <= bound)       → skip on GT
+        const skip = code.len();
+        try code.bCond(if (lo.inclusive_trap) .gt else .pl, 0);
+        try emitTrapHelperCall(code, vmctx_trap_iovf_fn_slot);
+        patchBCondHere(code, skip);
+    }
+
+    // 4. Upper-bound check (always strict `src >= max` traps).
+    const max_bits: u64 = if (signed) blk: {
+        if (dst_is_i32) {
+            break :blk if (src_is_f32) @as(u64, 0x4F000000) else @as(u64, 0x41E0000000000000);
+        } else {
+            break :blk if (src_is_f32) @as(u64, 0x5F000000) else @as(u64, 0x43E0000000000000);
+        }
+    } else blk: {
+        if (dst_is_i32) {
+            break :blk if (src_is_f32) @as(u64, 0x4F800000) else @as(u64, 0x41F0000000000000);
+        } else {
+            break :blk if (src_is_f32) @as(u64, 0x5F800000) else @as(u64, 0x43F0000000000000);
+        }
+    };
+    if (src_is_f32) {
+        try code.movImm32(RegMap.tmp1, @bitCast(@as(u32, @truncate(max_bits))));
+        try code.fmovSFromGp32(1, RegMap.tmp1);
+    } else {
+        try code.movImm64(RegMap.tmp1, max_bits);
+        try code.fmovDFromGp64(1, RegMap.tmp1);
+    }
+    try code.fcmpScalar(!src_is_f32, 0, 1);
+    {
+        // Trap on src >= max (GE) → skip on src < max (MI).
+        const skip = code.len();
+        try code.bCond(.mi, 0);
+        try emitTrapHelperCall(code, vmctx_trap_iovf_fn_slot);
+        patchBCondHere(code, skip);
+    }
+
+    // 5. Allocate dest, then FCVTZ. info.reg fallback is tmp2 which is
+    //    unused above.
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+    const dst_is_x = !dst_is_i32;
+    if (signed) {
+        try code.fcvtzsToGp(dst_is_x, !src_is_f32, info.reg, 0);
+    } else {
+        try code.fcvtzuToGp(dst_is_x, !src_is_f32, info.reg, 0);
+    }
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit saturating float→int truncation (wasm's `trunc_sat_f*_s/u`).
+/// AArch64 FCVTZ[SU] saturates to INT_MIN/MAX (or 0/UINT_MAX) and
+/// returns 0 for NaN, which matches the wasm spec directly — no
+/// range checks needed.
+fn emitTruncSat(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+    signed: bool,
+) !void {
+    const dest = inst.dest orelse return;
+    const dst_is_i32 = (inst.type == .i32);
+    const src_is_f32 = switch (inst.op) {
+        .trunc_sat_f32_s, .trunc_sat_f32_u => true,
+        .trunc_sat_f64_s, .trunc_sat_f64_u => false,
+        else => unreachable,
+    };
+
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    if (src_is_f32) try code.fmovSFromGp32(0, src)
+    else try code.fmovDFromGp64(0, src);
+
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const dst_is_x = !dst_is_i32;
+    if (signed) {
+        try code.fcvtzsToGp(dst_is_x, !src_is_f32, info.reg, 0);
+    } else {
+        try code.fcvtzuToGp(dst_is_x, !src_is_f32, info.reg, 0);
+    }
     try destCommit(code, reg_map, info);
 }
 
