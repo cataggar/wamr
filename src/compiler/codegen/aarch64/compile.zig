@@ -9,21 +9,32 @@ const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
 
 /// Simple VReg → physical register mapping.
+///
+/// Stack-spill layout: when all scratch regs are in use, the allocator
+/// falls back to the frame spill region at `[fp + spill_base + slot*8]`.
+/// `spill_base` is set by `compileFunction` to sit immediately above the
+/// locals area so spill slots don't collide with saved FP/LR, VMContext,
+/// or wasm locals.
 const RegMap = struct {
     entries: std.AutoHashMap(ir.VReg, Location),
     reg_used: [scratch_regs.len]bool = [_]bool{false} ** scratch_regs.len,
     next_stack_offset: u32 = 0,
+    /// Byte offset from FP where the first spill slot lives.
+    spill_base: u32 = 0,
+    /// Maximum bytes reserved for spills (beyond which `assign` errors).
+    spill_capacity: u32 = 0,
 
     const Location = union(enum) {
         reg: emit.Reg,
-        stack: u32, // offset from FP
+        /// Byte offset from `spill_base` for the spill slot.
+        stack: u32,
     };
 
     // Caller-saved scratch registers (AAPCS64: X0–X15 are caller-saved).
     // We reserve X16 (IP0) and X17 (IP1) as non-allocatable scratch for
-    // codegen use (shift-count negation, rem via MSUB, etc.); X18 is
-    // reserved platform register. Once calls land, caller-saved across
-    // call boundaries will need spill/reload handling.
+    // codegen use (shift-count negation, rem via MSUB, spill reload, etc.);
+    // X18 is reserved platform register. Once calls land, caller-saved
+    // across call boundaries will need spill/reload handling.
     const scratch_regs = [_]emit.Reg{
         .x0, .x1, .x2, .x3, .x4, .x5, .x6, .x7,
         .x8, .x9, .x10, .x11, .x12, .x13, .x14, .x15,
@@ -34,9 +45,11 @@ const RegMap = struct {
     pub const tmp0: emit.Reg = .x16;
     pub const tmp1: emit.Reg = .x17;
 
-    fn init(allocator: std.mem.Allocator) RegMap {
+    fn init(allocator: std.mem.Allocator, spill_base: u32, spill_capacity: u32) RegMap {
         return .{
             .entries = std.AutoHashMap(ir.VReg, Location).init(allocator),
+            .spill_base = spill_base,
+            .spill_capacity = spill_capacity,
         };
     }
 
@@ -54,6 +67,7 @@ const RegMap = struct {
             }
         }
         // Spill to stack
+        if (self.next_stack_offset >= self.spill_capacity) return error.OutOfSpillSlots;
         const offset = self.next_stack_offset;
         self.next_stack_offset += 8;
         const loc = Location{ .stack = offset };
@@ -63,6 +77,11 @@ const RegMap = struct {
 
     fn get(self: *const RegMap, vreg: ir.VReg) ?Location {
         return self.entries.get(vreg);
+    }
+
+    /// FP-relative byte offset of a spill slot (scaled by 8 for LDR/STR X).
+    fn spillOffsetScaled(self: *const RegMap, slot_byte_off: u32) u12 {
+        return @intCast((self.spill_base + slot_byte_off) / 8);
     }
 };
 
@@ -102,13 +121,17 @@ pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator)
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
-    var reg_map = RegMap.init(allocator);
+    // Frame size: (local_count + 3) × 8 for saved FP/LR + vmctx + locals,
+    // plus 256 bytes of spill headroom (32 slots), aligned to 16
+    // (AArch64 SP alignment). Spill region sits just above the locals.
+    const spill_base: u32 = (func.local_count + 3) * 8;
+    const spill_capacity: u32 = 256;
+    const raw_frame = spill_base + spill_capacity;
+    const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
+
+    var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
     defer reg_map.deinit();
 
-    // Frame size: (local_count + 3) × 8 for saved FP/LR + vmctx + locals,
-    // plus 256 bytes of spill headroom, aligned to 16 (AArch64 SP alignment).
-    const raw_frame = (func.local_count + 3) * 8 + 256;
-    const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
     try code.emitPrologue(frame_size);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
@@ -227,27 +250,27 @@ fn compileInst(
         // ── Constants ────────────────────────────────────────────────
         .iconst_32 => |val| {
             const dest = inst.dest orelse return;
-            if (try destReg(code, reg_map, dest)) |r| {
-                try code.movImm32(r, val);
-            }
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
+            try code.movImm32(info.reg, val);
+            try destCommit(code, reg_map, info);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
-            if (try destReg(code, reg_map, dest)) |r| {
-                try code.movImm64(r, @bitCast(val));
-            }
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
+            try code.movImm64(info.reg, @bitCast(val));
+            try destCommit(code, reg_map, info);
         },
         .fconst_32 => |val| {
             const dest = inst.dest orelse return;
-            if (try destReg(code, reg_map, dest)) |r| {
-                try code.movImm32(r, @bitCast(val));
-            }
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
+            try code.movImm32(info.reg, @bitCast(val));
+            try destCommit(code, reg_map, info);
         },
         .fconst_64 => |val| {
             const dest = inst.dest orelse return;
-            if (try destReg(code, reg_map, dest)) |r| {
-                try code.movImm64(r, @bitCast(val));
-            }
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
+            try code.movImm64(info.reg, @bitCast(val));
+            try destCommit(code, reg_map, info);
         },
 
         .add => |bin| try emitBinOp(code, inst, bin, reg_map, .add),
@@ -292,28 +315,23 @@ fn compileInst(
         // ── Locals (FP-relative frame slots) ─────────────────────────
         .local_get => |idx| {
             const dest = inst.dest orelse return;
-            const dr = (try destReg(code, reg_map, dest)) orelse return;
+            const info = try destBegin(reg_map, dest, RegMap.tmp0);
             const off_scaled: u12 = @intCast(localSlotOffset(idx) / 8);
             // Always 64-bit load: the slot stores the full 8 bytes, and a
             // subsequent W-form op (or wrap_i64) will ignore the upper bits.
-            try code.ldrImm(dr, .fp, off_scaled);
+            try code.ldrImm(info.reg, .fp, off_scaled);
+            try destCommit(code, reg_map, info);
         },
         .local_set => |ls| {
-            const src = useReg(reg_map, ls.val) orelse return;
+            const src = try useInto(code, reg_map, ls.val, RegMap.tmp0);
             const off_scaled: u12 = @intCast(localSlotOffset(ls.idx) / 8);
             try code.strImm(src, .fp, off_scaled);
         },
 
         .ret => |maybe_val| {
             if (maybe_val) |val| {
-                if (reg_map.get(val)) |loc| {
-                    switch (loc) {
-                        .reg => |r| {
-                            if (r != .x0) try code.movRegReg(.x0, r);
-                        },
-                        .stack => {},
-                    }
-                }
+                const r = try useInto(code, reg_map, val, .x0);
+                if (r != .x0) try code.movRegReg(.x0, r);
             }
             try code.emitEpilogue(frame_size);
         },
@@ -344,14 +362,55 @@ fn tagToCond(comptime tag: std.meta.Tag(ir.Inst.Op)) emit.Cond {
 }
 
 /// Resolve the destination register, returning null if it spills to stack
-/// (in which case the caller silently drops — stack-spill isn't wired up
-/// yet for the new handlers).
+/// (in which case the caller silently drops — kept for handlers that
+/// haven't been converted to the `destBegin`/`destCommit` spill API yet).
 fn destReg(code: *emit.CodeBuffer, reg_map: *RegMap, dest: ir.VReg) !?emit.Reg {
     _ = code;
     const loc = try reg_map.assign(dest);
     return switch (loc) {
         .reg => |r| r,
         .stack => null,
+    };
+}
+
+/// Full-spill-aware dest allocation. Returns a writable register: the
+/// vreg's assigned physreg if any, else `scratch`. Caller must emit
+/// `destCommit` once the result has been written into `info.reg`.
+const DestInfo = struct {
+    reg: emit.Reg,
+    spill_slot: ?u32 = null, // byte offset from spill_base if spilled
+};
+
+fn destBegin(reg_map: *RegMap, dest: ir.VReg, scratch: emit.Reg) !DestInfo {
+    const loc = try reg_map.assign(dest);
+    return switch (loc) {
+        .reg => |r| .{ .reg = r },
+        .stack => |off| .{ .reg = scratch, .spill_slot = off },
+    };
+}
+
+fn destCommit(code: *emit.CodeBuffer, reg_map: *const RegMap, info: DestInfo) !void {
+    if (info.spill_slot) |off| {
+        try code.strImm(info.reg, .fp, reg_map.spillOffsetScaled(off));
+    }
+}
+
+/// Read `vreg`'s value, loading into `scratch` if spilled. Returns the
+/// register holding the value. If the vreg is unbound the caller's
+/// silent-drop contract is preserved via the `useReg` helper below.
+fn useInto(
+    code: *emit.CodeBuffer,
+    reg_map: *const RegMap,
+    vreg: ir.VReg,
+    scratch: emit.Reg,
+) !emit.Reg {
+    const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
+    return switch (loc) {
+        .reg => |r| r,
+        .stack => |off| blk: {
+            try code.ldrImm(scratch, .fp, reg_map.spillOffsetScaled(off));
+            break :blk scratch;
+        },
     };
 }
 
@@ -581,22 +640,23 @@ fn emitBinOp(
     kind: BinOpKind,
 ) !void {
     const dest = inst.dest orelse return;
-    const lhs_loc = reg_map.get(bin.lhs) orelse return;
-    const rhs_loc = reg_map.get(bin.rhs) orelse return;
-    const dest_loc = try reg_map.assign(dest);
-
-    const dest_reg = switch (dest_loc) { .reg => |r| r, .stack => return };
-    const lhs_reg = switch (lhs_loc) { .reg => |r| r, .stack => return };
-    const rhs_reg = switch (rhs_loc) { .reg => |r| r, .stack => return };
+    // Allocate dest first; if spilled, dst_info.reg is tmp0 and we STR on commit.
+    const dst_info = try destBegin(reg_map, dest, RegMap.tmp0);
+    // Load sources. lhs may share tmp0 with dst when dst is spilled — that's
+    // fine, because the final op writes dst_info.reg last.
+    const lhs_scratch: emit.Reg = if (dst_info.spill_slot == null) RegMap.tmp0 else dst_info.reg;
+    const lhs_reg = try useInto(code, reg_map, bin.lhs, lhs_scratch);
+    const rhs_reg = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
 
     switch (kind) {
-        .add => try code.addRegReg(dest_reg, lhs_reg, rhs_reg),
-        .sub => try code.subRegReg(dest_reg, lhs_reg, rhs_reg),
-        .mul => try code.mulRegReg(dest_reg, lhs_reg, rhs_reg),
-        .@"and" => try code.andRegReg(dest_reg, lhs_reg, rhs_reg),
-        .@"or" => try code.orrRegReg(dest_reg, lhs_reg, rhs_reg),
-        .xor => try code.eorRegReg(dest_reg, lhs_reg, rhs_reg),
+        .add => try code.addRegReg(dst_info.reg, lhs_reg, rhs_reg),
+        .sub => try code.subRegReg(dst_info.reg, lhs_reg, rhs_reg),
+        .mul => try code.mulRegReg(dst_info.reg, lhs_reg, rhs_reg),
+        .@"and" => try code.andRegReg(dst_info.reg, lhs_reg, rhs_reg),
+        .@"or" => try code.orrRegReg(dst_info.reg, lhs_reg, rhs_reg),
+        .xor => try code.eorRegReg(dst_info.reg, lhs_reg, rhs_reg),
     }
+    try destCommit(code, reg_map, dst_info);
 }
 
 /// Result of compiling an IR module.
@@ -965,4 +1025,53 @@ test "compile: unimplemented op returns error.UnimplementedOp" {
     });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
+}
+
+test "compile: binop with spilled operands emits LDR/STR via spill slots" {
+    // 17 iconsts keep x0..x15 live, then an ADD with v16+v17 forces spills
+    // for the operands and possibly the dest. Verify code succeeds (no
+    // silent drop) and contains at least one LDR/STR pair against FP.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    // Allocate 17 vregs, each with a distinct iconst. The 17th (v16)
+    // forces spill.
+    var vregs: [18]ir.VReg = undefined;
+    for (&vregs, 0..) |*v, i| {
+        v.* = func.newVReg();
+        try func.getBlock(bid).append(.{
+            .op = .{ .iconst_64 = @intCast(i + 1) },
+            .dest = v.*,
+            .type = .i64,
+        });
+    }
+    // dst = vregs[16] + vregs[17]   (both spilled)
+    const dst = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .add = .{ .lhs = vregs[16], .rhs = vregs[17] } },
+        .dest = dst,
+        .type = .i64,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = dst } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // Scan for LDR Xt, [fp, #imm] (opcode pattern 0xF9400000 + rn=29<<5).
+    // We must see at least one such load (the spill reload).
+    var found_ldr_from_fp = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        // LDR (imm) unsigned offset, 64-bit: top 10 bits == 0x3E5, rn bits 5-9
+        const top = (w >> 22) & 0x3FF;
+        const rn = (w >> 5) & 0x1F;
+        if (top == 0x3E5 and rn == 29) {
+            found_ldr_from_fp = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_ldr_from_fp);
 }
