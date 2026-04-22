@@ -1040,6 +1040,112 @@ pub fn utf8ToUtf16(src: []const u8, out: []u16) !u32 {
     return written;
 }
 
+/// Decode UTF-16LE bytes from linear memory into a UTF-8 string.
+/// Returns a newly-allocated UTF-8 byte slice.
+pub fn utf16ToUtf8(mem: []const u8, ptr: u32, code_units: u32, allocator: Allocator) ![]u8 {
+    const byte_len = @as(u32, code_units) * 2;
+    if (ptr + byte_len > mem.len) return error.BufferTooSmall;
+    const slice = mem[ptr .. ptr + byte_len];
+
+    // First pass: measure UTF-8 length
+    var utf8_len: usize = 0;
+    var i: usize = 0;
+    while (i < slice.len) : (i += 2) {
+        const cu = std.mem.readInt(u16, slice[i..][0..2], .little);
+        const cp = blk: {
+            if (cu >= 0xD800 and cu <= 0xDBFF) {
+                // High surrogate — read low surrogate
+                if (i + 2 >= slice.len) return error.BufferTooSmall;
+                i += 2;
+                const lo = std.mem.readInt(u16, slice[i..][0..2], .little);
+                if (lo < 0xDC00 or lo > 0xDFFF) return error.BufferTooSmall;
+                break :blk @as(u21, @intCast((@as(u32, cu - 0xD800) << 10) + (lo - 0xDC00) + 0x10000));
+            }
+            break :blk @as(u21, @intCast(cu));
+        };
+        utf8_len += std.unicode.utf8CodepointSequenceLength(cp) catch return error.BufferTooSmall;
+    }
+
+    // Second pass: encode
+    const result = try allocator.alloc(u8, utf8_len);
+    errdefer allocator.free(result);
+    var out_i: usize = 0;
+    i = 0;
+    while (i < slice.len) : (i += 2) {
+        const cu = std.mem.readInt(u16, slice[i..][0..2], .little);
+        const cp = blk: {
+            if (cu >= 0xD800 and cu <= 0xDBFF) {
+                i += 2;
+                const lo = std.mem.readInt(u16, slice[i..][0..2], .little);
+                break :blk @as(u21, @intCast((@as(u32, cu - 0xD800) << 10) + (lo - 0xDC00) + 0x10000));
+            }
+            break :blk @as(u21, @intCast(cu));
+        };
+        const n = std.unicode.utf8Encode(cp, result[out_i..]) catch return error.BufferTooSmall;
+        out_i += n;
+    }
+    return result;
+}
+
+/// latin1+utf16 tagged encoding: bit 31 of length indicates encoding.
+/// If bit 31 is clear: Latin-1 (each byte = one code point, all ≤ 0xFF).
+/// If bit 31 is set: UTF-16LE, lower 31 bits = code unit count.
+pub const LATIN1_UTF16_TAG: u32 = 0x8000_0000;
+
+/// Decode a latin1+utf16 tagged string from linear memory into UTF-8.
+pub fn decodeLatin1Utf16(mem: []const u8, ptr: u32, tagged_len: u32, allocator: Allocator) ![]u8 {
+    if (tagged_len & LATIN1_UTF16_TAG != 0) {
+        // UTF-16 encoded
+        const code_units = tagged_len & ~LATIN1_UTF16_TAG;
+        return utf16ToUtf8(mem, ptr, code_units, allocator);
+    } else {
+        // Latin-1 encoded: each byte is a code point ≤ 0xFF
+        if (ptr + tagged_len > mem.len) return error.BufferTooSmall;
+        const latin1 = mem[ptr .. ptr + tagged_len];
+        // Latin-1 → UTF-8: code points 0x80-0xFF become 2-byte sequences
+        var utf8_len: usize = 0;
+        for (latin1) |b| {
+            utf8_len += if (b < 0x80) @as(usize, 1) else @as(usize, 2);
+        }
+        const result = try allocator.alloc(u8, utf8_len);
+        errdefer allocator.free(result);
+        var out_i: usize = 0;
+        for (latin1) |b| {
+            if (b < 0x80) {
+                result[out_i] = b;
+                out_i += 1;
+            } else {
+                result[out_i] = 0xC0 | (b >> 6);
+                result[out_i + 1] = 0x80 | (b & 0x3F);
+                out_i += 2;
+            }
+        }
+        return result;
+    }
+}
+
+/// Encode a UTF-8 string into UTF-16LE, writing to linear memory at `ptr`.
+/// Returns number of UTF-16 code units written.
+pub fn encodeUtf16ToMem(mem: []u8, ptr: u32, src: []const u8) !u32 {
+    var written: u32 = 0;
+    var view = std.unicode.Utf8View.initUnchecked(src);
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp <= 0xFFFF) {
+            if (ptr + written * 2 + 2 > mem.len) return error.BufferTooSmall;
+            storeU16(mem, ptr + written * 2, @intCast(cp));
+            written += 1;
+        } else {
+            if (ptr + written * 2 + 4 > mem.len) return error.BufferTooSmall;
+            const adj = cp - 0x10000;
+            storeU16(mem, ptr + written * 2, @intCast(0xD800 + (adj >> 10)));
+            storeU16(mem, ptr + written * 2 + 2, @intCast(0xDC00 + (adj & 0x3FF)));
+            written += 2;
+        }
+    }
+    return written;
+}
+
 // ── Error set ───────────────────────────────────────────────────────────────
 
 pub const AbiError = error{
@@ -1520,4 +1626,68 @@ test "loadValReg/storeValReg: tuple roundtrip" {
     try std.testing.expectEqual(@as(u8, 1), loaded.tuple_val[0].u8);
     try std.testing.expectEqual(@as(u32, 0xFF00), loaded.tuple_val[1].u32);
     try std.testing.expectEqual(@as(u8, 2), loaded.tuple_val[2].u8);
+}
+
+// ── String encoding tests ──────────────────────────────────────────────────
+
+test "utf16ToUtf8: ASCII" {
+    const allocator = std.testing.allocator;
+    // "Hi" in UTF-16LE: 0x48 0x00 0x69 0x00
+    var mem = [_]u8{ 0x48, 0x00, 0x69, 0x00 };
+    const result = try utf16ToUtf8(&mem, 0, 2, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, "Hi", result);
+}
+
+test "utf16ToUtf8: non-ASCII BMP" {
+    const allocator = std.testing.allocator;
+    // "é" = U+00E9, UTF-16LE: 0xE9 0x00
+    var mem = [_]u8{ 0xE9, 0x00 };
+    const result = try utf16ToUtf8(&mem, 0, 1, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, "\xC3\xA9", result);
+}
+
+test "utf16ToUtf8: surrogate pair" {
+    const allocator = std.testing.allocator;
+    // U+1F600 (😀) = D83D DE00 in UTF-16
+    var mem = [_]u8{ 0x3D, 0xD8, 0x00, 0xDE };
+    const result = try utf16ToUtf8(&mem, 0, 2, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, "\xF0\x9F\x98\x80", result);
+}
+
+test "decodeLatin1Utf16: latin1 mode" {
+    const allocator = std.testing.allocator;
+    // Latin-1: bytes 0x48 0xE9 → "Hé"
+    var mem = [_]u8{ 0x48, 0xE9 };
+    const result = try decodeLatin1Utf16(&mem, 0, 2, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, "H\xC3\xA9", result);
+}
+
+test "decodeLatin1Utf16: utf16 mode (tagged)" {
+    const allocator = std.testing.allocator;
+    // UTF-16 mode: tag bit set, 2 code units for "Hi"
+    var mem = [_]u8{ 0x48, 0x00, 0x69, 0x00 };
+    const tagged_len = LATIN1_UTF16_TAG | 2;
+    const result = try decodeLatin1Utf16(&mem, 0, tagged_len, allocator);
+    defer allocator.free(result);
+    try std.testing.expectEqualSlices(u8, "Hi", result);
+}
+
+test "encodeUtf16ToMem: ASCII" {
+    var mem = [_]u8{0} ** 16;
+    const written = try encodeUtf16ToMem(&mem, 0, "Hi");
+    try std.testing.expectEqual(@as(u32, 2), written);
+    try std.testing.expectEqual(@as(u16, 0x48), std.mem.readInt(u16, mem[0..2], .little));
+    try std.testing.expectEqual(@as(u16, 0x69), std.mem.readInt(u16, mem[2..4], .little));
+}
+
+test "encodeUtf16ToMem: surrogate pair" {
+    var mem = [_]u8{0} ** 16;
+    const written = try encodeUtf16ToMem(&mem, 0, "\xF0\x9F\x98\x80");
+    try std.testing.expectEqual(@as(u32, 2), written); // surrogate pair = 2 code units
+    try std.testing.expectEqual(@as(u16, 0xD83D), std.mem.readInt(u16, mem[0..2], .little));
+    try std.testing.expectEqual(@as(u16, 0xDE00), std.mem.readInt(u16, mem[2..4], .little));
 }
