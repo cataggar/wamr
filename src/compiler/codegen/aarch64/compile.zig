@@ -396,6 +396,14 @@ fn compileInst(
         .global_set => |gs| try emitGlobalSet(code, gs, reg_map),
         .memory_size => try emitMemorySize(code, inst, reg_map),
         .memory_grow => |pages_vreg| try emitMemoryGrow(code, inst, pages_vreg, reg_map, fctx),
+
+        // ── Float bit-level unary ────────────────────────────────────
+        // f_neg and f_abs are sign-bit manipulations; they can be done
+        // as pure integer ops on the float's bit pattern without needing
+        // a V-register. reinterpret is a bit-identical move.
+        .f_neg => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .neg),
+        .f_abs => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .abs),
+        .reinterpret => |vreg| try emitReinterpret(code, inst, vreg, reg_map),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
@@ -591,6 +599,52 @@ fn emitWrap(
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     // wasm i32.wrap_i64: take low 32 bits of i64. UXTW zero-extends.
     try code.uxtw(info.reg, src);
+    try destCommit(code, reg_map, info);
+}
+
+const FSignOp = enum { neg, abs };
+
+/// Emit f_neg / f_abs as pure integer bit manipulation on the float's
+/// bit pattern. Correct regardless of whether the operand came from a
+/// load, iconst, or prior FPU op because all values flow through the
+/// integer scratch pool. Upper bits of 32-bit floats are treated as
+/// don't-care (matches existing sub-word codegen contract).
+fn emitFSignBit(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+    kind: FSignOp,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const is32 = (inst.type == .f32);
+    const mask: u64 = switch (kind) {
+        .neg => if (is32) @as(u64, 0x80000000) else @as(u64, 0x8000000000000000),
+        .abs => if (is32) @as(u64, 0x7FFFFFFF) else @as(u64, 0x7FFFFFFFFFFFFFFF),
+    };
+    // Materialize the mask in tmp2 (x15) so it doesn't collide with the
+    // src or dest scratch slots (tmp0 / tmp1).
+    try code.movImm64(RegMap.tmp2, mask);
+    switch (kind) {
+        .neg => try code.eorRegReg(info.reg, src, RegMap.tmp2),
+        .abs => try code.andRegReg(info.reg, src, RegMap.tmp2),
+    }
+    try destCommit(code, reg_map, info);
+}
+
+/// Bit-identical copy between i32↔f32 and i64↔f64.
+fn emitReinterpret(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    if (src != info.reg) try code.movRegReg(info.reg, src);
     try destCommit(code, reg_map, info);
 }
 
