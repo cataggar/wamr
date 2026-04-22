@@ -106,6 +106,9 @@ pub const component_loader = @import("component/loader.zig");
 /// Component Model canonical ABI (lifting/lowering).
 pub const canonical_abi = @import("component/canonical_abi.zig");
 
+/// Component Model function executor.
+pub const component_executor = @import("component/executor.zig");
+
 /// Component Model instance and resource store.
 pub const component_instance = @import("component/instance.zig");
 

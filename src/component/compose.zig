@@ -205,3 +205,153 @@ test "resolveImports: finds matching exports" {
     try std.testing.expectEqual(@as(usize, 1), bindings.len);
     try std.testing.expectEqualStrings("do-work", bindings[0].import_name);
 }
+
+// ── Composition execution ──────────────────────────────────────────────────
+
+const instance_mod = @import("instance.zig");
+const ComponentInstance = instance_mod.ComponentInstance;
+const InstanceImportBinding = instance_mod.ImportBinding;
+
+/// Instantiate and link multiple components according to a composition plan.
+///
+/// Components are instantiated in order (dependency order). Each entry's
+/// import bindings are resolved against already-instantiated entries.
+///
+/// Returns a slice of ComponentInstance pointers — one per plan entry.
+/// The caller must deinit each instance when done.
+pub fn composeAndInstantiate(
+    plan: CompositionPlan,
+    allocator: std.mem.Allocator,
+) ![]?*ComponentInstance {
+    const instances = try allocator.alloc(?*ComponentInstance, plan.entries.len);
+    errdefer {
+        for (instances) |maybe_inst| {
+            if (maybe_inst) |inst| inst.deinit();
+        }
+        allocator.free(instances);
+    }
+
+    for (instances) |*slot| slot.* = null;
+
+    for (plan.entries, 0..) |entry, i| {
+        // Instantiate the component
+        const inst = try instance_mod.instantiate(entry.component, allocator);
+        instances[i] = inst;
+
+        // Wire imports from previously instantiated components
+        var providers: std.StringHashMapUnmanaged(InstanceImportBinding) = .{};
+        defer providers.deinit(allocator);
+
+        for (entry.import_bindings) |binding| {
+            if (binding.source_entry < i) {
+                if (instances[binding.source_entry]) |source_inst| {
+                    try providers.put(allocator, binding.import_name, .{
+                        .component_export = .{
+                            .instance = source_inst,
+                            .func_name = binding.export_name,
+                        },
+                    });
+                }
+            }
+        }
+
+        try inst.linkImports(providers);
+        try inst.executeStart();
+    }
+
+    return instances;
+}
+
+test "composeAndInstantiate: single component no imports" {
+    const allocator = std.testing.allocator;
+
+    const component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+
+    const entries = [_]CompositionPlan.Entry{
+        .{ .component = &component, .import_bindings = &.{} },
+    };
+    const plan = CompositionPlan{ .entries = &entries };
+
+    const instances = try composeAndInstantiate(plan, allocator);
+    defer {
+        for (instances) |maybe_inst| {
+            if (maybe_inst) |inst| inst.deinit();
+        }
+        allocator.free(instances);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), instances.len);
+    try std.testing.expect(instances[0] != null);
+    try std.testing.expect(instances[0].?.started);
+}
+
+test "composeAndInstantiate: two components with import binding" {
+    const allocator = std.testing.allocator;
+
+    const exports = [_]ctypes.ExportDecl{
+        .{ .name = "greet", .desc = .{ .func = 0 } },
+    };
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "greet", .desc = .{ .func = 0 } },
+    };
+
+    const provider_comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &exports,
+    };
+    const consumer_comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    const bindings = [_]CompositionPlan.ImportBinding{
+        .{ .import_name = "greet", .source_entry = 0, .export_name = "greet" },
+    };
+    const entries = [_]CompositionPlan.Entry{
+        .{ .component = &provider_comp, .import_bindings = &.{} },
+        .{ .component = &consumer_comp, .import_bindings = &bindings },
+    };
+    const plan = CompositionPlan{ .entries = &entries };
+
+    const instances = try composeAndInstantiate(plan, allocator);
+    defer {
+        for (instances) |maybe_inst| {
+            if (maybe_inst) |inst| inst.deinit();
+        }
+        allocator.free(instances);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), instances.len);
+    // Consumer should have the "greet" import resolved
+    const consumer = instances[1].?;
+    const resolved = consumer.getImport("greet");
+    try std.testing.expect(resolved != null);
+    try std.testing.expect(resolved.? == .component_export);
+}

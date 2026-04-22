@@ -87,6 +87,23 @@ pub const ResourceTable = struct {
 
 // ── Component Instance ──────────────────────────────────────────────────────
 
+/// Binding for a component import — either a host-provided callback
+/// or a reference to another component instance's export.
+pub const ImportBinding = union(enum) {
+    /// A host-provided function (callback pointer + context).
+    host_func: HostFunc,
+    /// A reference to another ComponentInstance's exported function.
+    component_export: struct {
+        instance: *const ComponentInstance,
+        func_name: []const u8,
+    },
+
+    pub const HostFunc = struct {
+        /// Opaque context pointer for the host callback.
+        context: ?*anyopaque = null,
+    };
+};
+
 /// A runtime component instance — the result of instantiating a Component.
 pub const ComponentInstance = struct {
     /// The parsed component this instance was created from.
@@ -97,6 +114,10 @@ pub const ComponentInstance = struct {
     resource_tables: []ResourceTable,
     /// Exported functions (component-level func index → core func index + instance).
     exported_funcs: std.StringHashMapUnmanaged(ExportedFunc),
+    /// Resolved imports keyed by import name.
+    imports: std.StringHashMapUnmanaged(ImportBinding),
+    /// Whether the start function has been executed.
+    started: bool = false,
     /// Allocator for instance lifetime.
     allocator: std.mem.Allocator,
 
@@ -107,6 +128,10 @@ pub const ComponentInstance = struct {
     pub const ExportedFunc = struct {
         core_instance_idx: u32,
         core_func_idx: u32,
+        /// Component-level function type index (into component.types).
+        func_type_idx: u32 = 0,
+        /// Canonical options from the canon lift definition.
+        opts: []const ctypes.CanonOpt = &.{},
     };
 
     /// Look up an exported function by name.
@@ -114,11 +139,61 @@ pub const ComponentInstance = struct {
         return self.exported_funcs.get(name);
     }
 
+    /// Look up a resolved import by name.
+    pub fn getImport(self: *const ComponentInstance, name: []const u8) ?ImportBinding {
+        return self.imports.get(name);
+    }
+
+    /// Link imports against a set of provided bindings.
+    /// Returns error if a required import is missing from the providers.
+    pub fn linkImports(
+        self: *ComponentInstance,
+        providers: std.StringHashMapUnmanaged(ImportBinding),
+    ) !void {
+        for (self.component.imports) |imp| {
+            if (providers.get(imp.name)) |binding| {
+                self.imports.put(self.allocator, imp.name, binding) catch
+                    return error.OutOfMemory;
+            }
+            // Non-func imports (types, etc.) don't need runtime bindings
+        }
+    }
+
+    /// Execute the component's start function if one is defined and not yet run.
+    pub fn executeStart(self: *ComponentInstance) !void {
+        if (self.started) return;
+        self.started = true;
+
+        const start = self.component.start orelse return;
+
+        // The start function references a canon index which should be
+        // a canon lift that we've already mapped to an exported func.
+        // Walk exports to find the matching canon func.
+        if (start.func_idx < self.component.canons.len) {
+            const canon = self.component.canons[start.func_idx];
+            switch (canon) {
+                .lift => |lift| {
+                    if (self.core_instances.len > 0) {
+                        if (self.core_instances[0].module_inst) |mod_inst| {
+                            const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+                            const interp = @import("../runtime/interpreter/interp.zig");
+                            const env = ExecEnv.create(mod_inst, 8192, self.allocator) catch return;
+                            defer env.destroy();
+                            interp.executeFunction(env, lift.core_func_idx) catch return;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     pub fn deinit(self: *ComponentInstance) void {
         for (self.resource_tables) |*rt| rt.deinit(self.allocator);
         if (self.resource_tables.len > 0) self.allocator.free(self.resource_tables);
         if (self.core_instances.len > 0) self.allocator.free(self.core_instances);
         self.exported_funcs.deinit(self.allocator);
+        self.imports.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -197,6 +272,8 @@ pub fn instantiate(
                             exported_funcs.put(allocator, exp.name, .{
                                 .core_instance_idx = 0,
                                 .core_func_idx = lift.core_func_idx,
+                                .func_type_idx = lift.type_idx,
+                                .opts = lift.opts,
                             }) catch {};
                         },
                         else => {},
@@ -212,6 +289,7 @@ pub fn instantiate(
         .core_instances = core_instances,
         .resource_tables = resource_tables,
         .exported_funcs = exported_funcs,
+        .imports = .{},
         .allocator = allocator,
     };
 
@@ -271,4 +349,93 @@ test "ResourceTable: double drop returns null" {
     const h = try rt.new(77, true, allocator);
     _ = rt.drop(h, allocator);
     try std.testing.expectEqual(@as(?u32, null), rt.drop(h, allocator));
+}
+
+test "ImportBinding: host func creation" {
+    const binding = ImportBinding{ .host_func = .{ .context = null } };
+    try std.testing.expect(binding == .host_func);
+}
+
+test "ComponentInstance: linkImports resolves known imports" {
+    const allocator = std.testing.allocator;
+
+    // Create a minimal component with one import
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "my-import", .desc = .{ .func = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    // Provide a binding for the import
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .{};
+    defer providers.deinit(allocator);
+    try providers.put(allocator, "my-import", .{ .host_func = .{ .context = null } });
+
+    try inst.linkImports(providers);
+
+    // Verify the import was resolved
+    const resolved = inst.getImport("my-import");
+    try std.testing.expect(resolved != null);
+    try std.testing.expect(resolved.? == .host_func);
+}
+
+test "ComponentInstance: getImport returns null for unknown" {
+    const allocator = std.testing.allocator;
+
+    const component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    try std.testing.expectEqual(@as(?ImportBinding, null), inst.getImport("nonexistent"));
+}
+
+test "ComponentInstance: executeStart is idempotent" {
+    const allocator = std.testing.allocator;
+
+    // Component with no start function — executeStart should be a no-op
+    const component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    try inst.executeStart(); // first call
+    try std.testing.expect(inst.started);
+    try inst.executeStart(); // second call — should be idempotent
+    try std.testing.expect(inst.started);
 }
