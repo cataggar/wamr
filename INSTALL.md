@@ -6,26 +6,9 @@ Pre-built binaries are published to [GitHub Releases](https://github.com/catagga
 
 [ghr](https://github.com/cataggar/ghr) is an installer for GitHub releases. It downloads the right binary for your platform, places it on `PATH`, and can upgrade it later.
 
-Install ghr itself:
-
-```sh
-# uv
-uv tool install ghr-bin
-
-# pip
-python3 -m pip install ghr-bin
-
-# winget
-winget install ghr
-```
-
-Then install WAMR:
-
 ```sh
 ghr install cataggar/wamr
 ```
-
-You may need to run `ghr ensurepath` once so that the ghr bin directory is on your `PATH`.
 
 To install a specific version:
 
