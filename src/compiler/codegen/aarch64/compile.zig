@@ -49,6 +49,12 @@ const RegMap = struct {
 
     entries: std.AutoHashMap(ir.VReg, Location),
     reg_used: [scratch_regs.len]bool = [_]bool{false} ** scratch_regs.len,
+    /// Bit i is set iff `callee_saved_regs[i]` was ever assigned to some
+    /// vreg during this function's compilation. Used to elide the prologue
+    /// save and epilogue restore of callee-saved registers that are never
+    /// clobbered. AAPCS64 requires preserving x19..x28 across calls; a reg
+    /// that's never assigned is never written, so the save/restore is dead.
+    used_callee_mask: u16 = 0,
     next_stack_offset: u32 = 0,
     /// Byte offset from FP where the first spill slot lives.
     spill_base: u32 = 0,
@@ -71,6 +77,9 @@ const RegMap = struct {
         for (scratch_regs, 0..) |r, i| {
             if (!self.reg_used[i]) {
                 self.reg_used[i] = true;
+                if (i >= caller_saved_count) {
+                    self.used_callee_mask |= (@as(u16, 1) << @intCast(i - caller_saved_count));
+                }
                 const loc = Location{ .reg = r };
                 try self.entries.put(vreg, loc);
                 return loc;
@@ -174,6 +183,11 @@ const FuncCompileCtx = struct {
     /// Map from add/sub dest vreg → (mul_lhs, mul_rhs, addend) source
     /// triple. Populated by the FMA pre-pass in lockstep with `mul_fused`.
     fma_info: ?*const std.AutoHashMap(ir.VReg, FmaInfo) = null,
+    /// Byte offsets of every callee-save save/restore block emitted. Each
+    /// entry is the 10 STR/LDR offsets for one `emitCalleeSaveStore` or
+    /// `emitCalleeSaveRestore` call. After the body is compiled, offsets
+    /// for regs not in `RegMap.used_callee_mask` are rewritten as NOPs.
+    callee_save_sites: ?*std.ArrayListUnmanaged([callee_saved_regs.len]usize) = null,
     allocator: std.mem.Allocator,
 };
 
@@ -274,6 +288,10 @@ pub fn compileFunctionImpl(
     fctx.hrp_save_off = hrp_save_off;
     fctx.scratch_base = scratch_base;
     fctx.frame_size = frame_size;
+
+    var callee_save_sites: std.ArrayListUnmanaged([callee_saved_regs.len]usize) = .empty;
+    defer callee_save_sites.deinit(allocator);
+    fctx.callee_save_sites = &callee_save_sites;
 
     // Collect iconst_* values so emitBinOp etc can fold small constants
     // into immediate-form instructions. Scan is cheap — one pass over IR.
@@ -662,7 +680,7 @@ pub fn compileFunctionImpl(
     }
 
     try code.emitPrologue(frame_size);
-    try emitCalleeSaveStore(&code, callee_save_base);
+    try emitCalleeSaveStoreTracked(&code, &fctx);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
     try emitEntrySpill(&code, func.*, hrp_save_off);
@@ -687,9 +705,12 @@ pub fn compileFunctionImpl(
     }
 
     if (!last_was_ret) {
-        try emitCalleeSaveRestore(&code, callee_save_base);
+        try emitCalleeSaveRestoreTracked(&code, &fctx);
         try code.emitEpilogue(frame_size);
     }
+
+    // Elide saves/restores for callee-saved regs never assigned by RegMap.
+    patchUnusedCalleeSaveSlots(&code, callee_save_sites.items, reg_map.used_callee_mask);
 
     // Resolve branch patches.
     for (patches.items) |p| {
@@ -837,25 +858,68 @@ const callee_saved_regs = [_]emit.Reg{
     .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28,
 };
 
-/// Save all callee-saved allocatable registers to `[fp + callee_save_base
-/// + i*8]`. Called once from the prologue, unconditionally — the simple
-/// linear-scan allocator doesn't track per-reg usage precisely enough to
-/// emit targeted saves, and the overhead (10 STRs per function) is small
-/// relative to typical wasm function bodies.
-fn emitCalleeSaveStore(code: *emit.CodeBuffer, callee_save_base: u32) !void {
+/// AArch64 `NOP` (`HINT #0`): 0xd503201f. Little-endian byte pattern.
+const nop_word: u32 = 0xd503201f;
+
+/// Emit prologue saves for all 10 callee-saved allocatable regs and
+/// return the byte offsets of each STR instruction. After the function
+/// body is fully compiled, `patchUnusedCalleeSaveSlots` rewrites the
+/// entries for regs never assigned to vregs (per `RegMap.used_callee_mask`)
+/// with NOPs, eliding the memory traffic of dead saves.
+///
+/// We lay down all 10 slots unconditionally so that prologue size and
+/// every subsequent code offset (block starts, branch patches) are fixed
+/// before we know which regs the allocator will use.
+fn emitCalleeSaveStore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_saved_regs.len]usize {
+    var offs: [callee_saved_regs.len]usize = undefined;
     for (callee_saved_regs, 0..) |r, i| {
+        offs[i] = code.len();
         const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.strImm(r, .fp, off_scaled);
     }
+    return offs;
 }
 
-/// Restore all callee-saved allocatable registers. Emitted before each
-/// epilogue so every return path leaves the registers in the state the
-/// caller expects.
-fn emitCalleeSaveRestore(code: *emit.CodeBuffer, callee_save_base: u32) !void {
+/// Emit epilogue restores for all 10 callee-saved allocatable regs and
+/// return the byte offsets of each LDR. Paired with the prologue store
+/// via `patchUnusedCalleeSaveSlots`.
+fn emitCalleeSaveRestore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_saved_regs.len]usize {
+    var offs: [callee_saved_regs.len]usize = undefined;
     for (callee_saved_regs, 0..) |r, i| {
+        offs[i] = code.len();
         const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.ldrImm(r, .fp, off_scaled);
+    }
+    return offs;
+}
+
+/// Wrap `emitCalleeSaveStore` + site tracking for the prologue.
+fn emitCalleeSaveStoreTracked(code: *emit.CodeBuffer, fctx: *FuncCompileCtx) !void {
+    const offs = try emitCalleeSaveStore(code, fctx.callee_save_base);
+    try fctx.callee_save_sites.?.append(fctx.allocator, offs);
+}
+
+/// Wrap `emitCalleeSaveRestore` + site tracking for epilogues.
+fn emitCalleeSaveRestoreTracked(code: *emit.CodeBuffer, fctx: *FuncCompileCtx) !void {
+    const offs = try emitCalleeSaveRestore(code, fctx.callee_save_base);
+    try fctx.callee_save_sites.?.append(fctx.allocator, offs);
+}
+
+/// Overwrite save/restore slots for callee-saved regs that were never
+/// assigned to any vreg with NOPs. `sites` contains the STR/LDR offsets
+/// captured by each emitCalleeSaveStore/emitCalleeSaveRestore call.
+fn patchUnusedCalleeSaveSlots(
+    code: *emit.CodeBuffer,
+    sites: []const [callee_saved_regs.len]usize,
+    used_mask: u16,
+) void {
+    var nop_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &nop_bytes, nop_word, .little);
+    for (sites) |site| {
+        for (site, 0..) |off, i| {
+            if ((used_mask >> @intCast(i)) & 1 != 0) continue;
+            @memcpy(code.bytes.items[off..][0..4], &nop_bytes);
+        }
     }
 }
 
@@ -989,7 +1053,7 @@ fn compileInst(
                 const r = try useInto(code, reg_map, val, .x0);
                 if (r != .x0) try code.movRegReg(.x0, r);
             }
-            try emitCalleeSaveRestore(code, fctx.callee_save_base);
+            try emitCalleeSaveRestoreTracked(code, fctx);
             try code.emitEpilogue(frame_size);
         },
         .ret_multi => |vregs| try emitRetMulti(code, vregs, reg_map, fctx, frame_size),
@@ -1974,7 +2038,7 @@ fn emitCall(
         // values and deallocates our stack, leaving the CPU state such
         // that branching to the target makes it return directly to our
         // caller — i.e. a real tail call.
-        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogueNoRet(fctx.frame_size);
         if (is_import) {
             try code.br(RegMap.tmp0);
@@ -2544,7 +2608,7 @@ fn emitCallIndirect(
         try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
         // Load vmctx into x0 (last FP-relative read before teardown).
         try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
-        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogueNoRet(fctx.frame_size);
         try code.br(RegMap.tmp0);
         return;
@@ -2629,7 +2693,7 @@ fn emitCallRef(
         }
         try stageArgFromSaved(code, reg_map, fctx, RegMap.tmp0, cr.func_ref);
         try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
-        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogueNoRet(fctx.frame_size);
         try code.br(RegMap.tmp0);
         return;
@@ -2685,7 +2749,7 @@ fn emitRetMulti(
     frame_size: u32,
 ) !void {
     if (vregs.len == 0) {
-        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogue(frame_size);
         return;
     }
@@ -2706,7 +2770,7 @@ fn emitRetMulti(
         }
     }
 
-    try emitCalleeSaveRestore(code, fctx.callee_save_base);
+    try emitCalleeSaveRestoreTracked(code, fctx);
     try code.emitEpilogue(frame_size);
 }
 
