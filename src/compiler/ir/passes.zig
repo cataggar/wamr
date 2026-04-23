@@ -801,8 +801,19 @@ pub fn forwardLocalGet(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
     for (module.functions.items) |*func| {
-        for (passes) |pass| {
-            if (try pass(func, allocator)) total_changes += 1;
+        // Iterate the pipeline until fixpoint so that passes can re-expose
+        // opportunities for each other (e.g. constantFold → CSE → DCE →
+        // more constantFold). Cap iterations as a safety net.
+        var iter: u32 = 0;
+        while (iter < 8) : (iter += 1) {
+            var any_changed = false;
+            for (passes) |pass| {
+                if (try pass(func, allocator)) {
+                    any_changed = true;
+                    total_changes += 1;
+                }
+            }
+            if (!any_changed) break;
         }
     }
     return total_changes;
