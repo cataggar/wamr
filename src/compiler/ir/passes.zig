@@ -980,8 +980,296 @@ pub fn deadLocalSetElimination(func: *ir.IrFunction, allocator: std.mem.Allocato
     return changed;
 }
 
+// ── Function Inlining ───────────────────────────────────────────────────────
+
+/// Shift every VReg referenced by `inst` (reads and def) by `+offset`.
+/// Mirrors `replaceInInst` but applies a constant shift instead of a
+/// single rename.
+fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
+    if (inst.dest) |d| inst.dest = d + offset;
+    switch (inst.op) {
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64,
+        .local_get, .global_get, .br, .@"unreachable",
+        .memory_size, .table_size, .ref_func, .data_drop, .elem_drop,
+        .atomic_fence, .call_result,
+        => {},
+
+        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
+        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
+        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        => |*bin| {
+            bin.lhs += offset;
+            bin.rhs += offset;
+        },
+
+        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        => |*vreg| vreg.* += offset,
+
+        .local_set => |*ls| ls.val += offset,
+        .global_set => |*gs| gs.val += offset,
+        .load => |*ld| ld.base += offset,
+        .store => |*st| {
+            st.base += offset;
+            st.val += offset;
+        },
+        .br_if => |*bi| bi.cond += offset,
+        .br_table => |*bt| bt.index += offset,
+        .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { maybe_vreg.* = v + offset; },
+        .ret_multi => |vregs| {
+            for (@constCast(vregs)) |*v| v.* += offset;
+        },
+        .call => |cl| {
+            for (@constCast(cl.args)) |*arg| arg.* += offset;
+        },
+        .call_indirect => |*ci| {
+            ci.elem_idx += offset;
+            for (@constCast(ci.args)) |*arg| arg.* += offset;
+        },
+        .call_ref => |*cr| {
+            cr.func_ref += offset;
+            for (@constCast(cr.args)) |*arg| arg.* += offset;
+        },
+        .select => |*sel| {
+            sel.cond += offset;
+            sel.if_true += offset;
+            sel.if_false += offset;
+        },
+        .atomic_load => |*al| al.base += offset,
+        .atomic_store => |*ast| {
+            ast.base += offset;
+            ast.val += offset;
+        },
+        .atomic_rmw => |*ar| {
+            ar.base += offset;
+            ar.val += offset;
+        },
+        .atomic_cmpxchg => |*ac| {
+            ac.base += offset;
+            ac.expected += offset;
+            ac.replacement += offset;
+        },
+        .atomic_notify => |*an| {
+            an.base += offset;
+            an.count += offset;
+        },
+        .atomic_wait => |*aw| {
+            aw.base += offset;
+            aw.expected += offset;
+            aw.timeout += offset;
+        },
+        .memory_copy => |*mc| {
+            mc.dst += offset;
+            mc.src += offset;
+            mc.len += offset;
+        },
+        .memory_fill => |*mf| {
+            mf.dst += offset;
+            mf.val += offset;
+            mf.len += offset;
+        },
+        .memory_grow => |*pages| pages.* += offset,
+        .table_get => |*tg| tg.idx += offset,
+        .table_set => |*ts| {
+            ts.idx += offset;
+            ts.val += offset;
+        },
+        .table_grow => |*tg| {
+            tg.init += offset;
+            tg.delta += offset;
+        },
+        .memory_init => |*mi| {
+            mi.dst += offset;
+            mi.src += offset;
+            mi.len += offset;
+        },
+        .table_init => |*ti| {
+            ti.dst += offset;
+            ti.src += offset;
+            ti.len += offset;
+        },
+    }
+}
+
+/// Is this callee eligible for the conservative V1 inliner?
+///   - Exactly 1 block
+///   - ≤ `max_body` non-terminator instructions
+///   - No calls (direct/indirect/ref)
+///   - No memory_grow, no atomics, no traps-we-don't-track
+///   - local_count == param_count (no extra declared locals)
+///   - No `local_set` anywhere (params aren't mutated)
+///   - Every `local_get` targets a param (idx < param_count)
+///   - `result_count` ∈ {0, 1} (no multi-return)
+///   - Terminator: exactly one `ret` at the end
+fn isInlinable(callee: *const ir.IrFunction, max_body: u32) bool {
+    if (callee.blocks.items.len != 1) return false;
+    if (callee.result_count > 1) return false;
+    if (callee.local_count != callee.param_count) return false;
+    const block = callee.blocks.items[0];
+    if (block.instructions.items.len == 0) return false;
+    if (block.instructions.items.len > max_body) return false;
+
+    const last = block.instructions.items[block.instructions.items.len - 1];
+    if (last.op != .ret) return false;
+
+    for (block.instructions.items[0 .. block.instructions.items.len - 1]) |inst| {
+        switch (inst.op) {
+            .call, .call_indirect, .call_ref, .call_result,
+            .memory_grow,
+            .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw,
+            .atomic_cmpxchg, .atomic_notify, .atomic_wait,
+            .memory_copy, .memory_fill, .memory_init, .table_init,
+            .table_grow, .data_drop, .elem_drop,
+            .ret, .ret_multi, .br, .br_if, .br_table, .@"unreachable",
+            .local_set,
+            => return false,
+            .local_get => |idx| if (idx >= callee.param_count) return false,
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Module-level pass: replace direct calls to small leaf functions
+/// with their bodies. Very conservative V1: only inlines callees
+/// whose single-block body meets `isInlinable`. Returns whether any
+/// call site was inlined.
+pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) !bool {
+    _ = allocator;
+    const max_body: u32 = 16;
+
+    // Pre-compute eligibility for each local function (stable pointers:
+    // we only mutate `.blocks` and `.next_vreg` of *other* functions as
+    // we inline; we don't re-enter a function while editing it).
+    var eligible = try std.heap.page_allocator.alloc(bool, module.functions.items.len);
+    defer std.heap.page_allocator.free(eligible);
+    for (module.functions.items, 0..) |*f, i| eligible[i] = isInlinable(f, max_body);
+
+    var any_inlined = false;
+    // Iterate each caller function. Skip self-calls (don't inline a
+    // function into itself — would blow up or loop).
+    for (module.functions.items, 0..) |*caller, caller_idx| {
+        var b: usize = 0;
+        while (b < caller.blocks.items.len) : (b += 1) {
+            const block = &caller.blocks.items[b];
+            var i: usize = 0;
+            while (i < block.instructions.items.len) {
+                const inst = block.instructions.items[i];
+                const call = switch (inst.op) {
+                    .call => |c| c,
+                    else => {
+                        i += 1;
+                        continue;
+                    },
+                };
+                if (call.tail) { i += 1; continue; }
+                if (call.extra_results != 0) { i += 1; continue; }
+                if (call.func_idx < module.import_count) { i += 1; continue; }
+                const callee_local_idx: usize = @intCast(call.func_idx - module.import_count);
+                if (callee_local_idx == caller_idx) { i += 1; continue; }
+                if (callee_local_idx >= module.functions.items.len) { i += 1; continue; }
+                if (!eligible[callee_local_idx]) { i += 1; continue; }
+                const callee = &module.functions.items[callee_local_idx];
+                if (call.args.len != callee.param_count) { i += 1; continue; }
+
+                // ── Inline ───────────────────────────────────────
+                const offset: ir.VReg = caller.next_vreg;
+                caller.next_vreg += callee.next_vreg;
+
+                const call_dest = inst.dest;
+                const call_args = call.args;
+                const callee_block = callee.blocks.items[0];
+
+                // Remove the call from the caller's block; we'll insert
+                // the cloned body at position `i`.
+                _ = block.instructions.orderedRemove(i);
+
+                // Walk callee instructions, cloning each non-ret/non-local_get
+                // into the caller with vregs shifted by `offset`.
+                var ret_val_shifted: ?ir.VReg = null;
+                // Collect local_get renames: (shifted_dest → call_arg)
+                // to apply after all inserts so pre-existing caller uses
+                // of `shifted_dest` aren't accidentally retargeted.
+                var local_renames = std.ArrayList(struct { from: ir.VReg, to: ir.VReg }).empty;
+                defer local_renames.deinit(caller.allocator);
+
+                var insert_at: usize = i;
+                for (callee_block.instructions.items) |citem| {
+                    switch (citem.op) {
+                        .ret => |maybe_v| {
+                            if (maybe_v) |v| ret_val_shifted = v + offset;
+                        },
+                        .local_get => |idx| {
+                            const shifted_dest = (citem.dest orelse continue) + offset;
+                            try local_renames.append(caller.allocator, .{
+                                .from = shifted_dest,
+                                .to = call_args[idx],
+                            });
+                        },
+                        else => {
+                            var cloned = citem;
+                            shiftVRegsInInst(&cloned, offset);
+                            try block.instructions.insert(block.allocator, insert_at, cloned);
+                            insert_at += 1;
+                        },
+                    }
+                }
+
+                // Apply local_get renames. Each shifted_dest is unique
+                // (distinct callee dests) and fresh in the caller's
+                // vreg space, so the order doesn't matter.
+                for (local_renames.items) |r| {
+                    replaceVReg(caller, r.from, r.to);
+                }
+
+                // If the callee returns a local_get's dest directly
+                // (e.g. `local.get 0; return`), the shifted vreg was
+                // never inserted — resolve it through local_renames
+                // before rewriting call_dest consumers.
+                if (ret_val_shifted) |rv| {
+                    for (local_renames.items) |r| {
+                        if (rv == r.from) {
+                            ret_val_shifted = r.to;
+                            break;
+                        }
+                    }
+                }
+
+                // Rewrite the call's dest to the shifted ret value.
+                if (call_dest) |d| {
+                    if (ret_val_shifted) |rv| {
+                        replaceVReg(caller, d, rv);
+                    }
+                }
+
+                any_inlined = true;
+                // Re-scan from `i` — freshly inserted instructions may
+                // expose nested inline opportunities if the callee itself
+                // contained (hypothetical) direct calls. isInlinable
+                // excludes those, so in practice we're done; but staying
+                // at `i` also handles the case where the shifted body is
+                // empty (callee was just `ret`).
+            }
+        }
+    }
+    return any_inlined;
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
+    // Module-level: inline small leaf callees before per-function passes.
+    // Iterate to fixpoint so callers of callers also benefit.
+    var inline_iter: u32 = 0;
+    while (inline_iter < 4) : (inline_iter += 1) {
+        if (!(try inlineSmallFunctions(module, allocator))) break;
+        total_changes += 1;
+    }
     for (module.functions.items) |*func| {
         // Iterate the pipeline until fixpoint so that passes can re-expose
         // opportunities for each other (e.g. constantFold → CSE → DCE →
@@ -1837,4 +2125,48 @@ test "constantFold: select with constant cond picks branch" {
     try std.testing.expect(changed);
     try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.lhs);
     try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.rhs);
+}
+
+test "inlineSmallFunctions: leaf with param-return is inlined" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // Callee: fn id(x) -> x   { local.get 0; return }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    {
+        const callee = &module.functions.items[0];
+        const cb = try callee.newBlock();
+        _ = callee.newVReg(); // param 0 placeholder
+        const v_get = callee.newVReg();
+        try callee.getBlock(cb).append(.{ .op = .{ .local_get = 0 }, .dest = v_get, .type = .i32 });
+        try callee.getBlock(cb).append(.{ .op = .{ .ret = v_get } });
+    }
+
+    // Caller: fn main() -> i32   { i32.const 42; call 0; return }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+    {
+        const caller = &module.functions.items[1];
+        const mb = try caller.newBlock();
+        const v_arg = caller.newVReg();
+        const v_ret = caller.newVReg();
+        try caller.getBlock(mb).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_arg, .type = .i32 });
+        args[0] = v_arg;
+        try caller.getBlock(mb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_ret, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    const inlined = try inlineSmallFunctions(&module, allocator);
+    try std.testing.expect(inlined);
+
+    const caller = &module.functions.items[1];
+    const body = caller.blocks.items[0].instructions.items;
+    // Expect: iconst_32 42, ret v_arg. (Identity callee inlines to nothing but
+    // a rename.) No .call.
+    try std.testing.expectEqual(@as(usize, 2), body.len);
+    try std.testing.expect(body[0].op == .iconst_32);
+    try std.testing.expect(body[1].op == .ret);
+    try std.testing.expectEqual(body[0].dest.?, body[1].op.ret.?);
 }
