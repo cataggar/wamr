@@ -1,6 +1,6 @@
 //! Linear Scan Register Allocator
 //!
-//! Assigns physical x86-64 registers to VRegs based on live range intervals.
+//! Assigns physical registers to VRegs based on live range intervals.
 //! Uses the Poletto & Sarkar algorithm: sort intervals by start, walk in order,
 //! assign from free pool, spill the longest-remaining interval when exhausted.
 //!
@@ -8,18 +8,53 @@
 //! memory_copy, etc.) are modeled as ClobberPoints. The allocator ensures
 //! no VReg assigned to a clobbered register has its live range span the
 //! clobber, eliminating the need for push/pop at those sites.
+//!
+//! Architecture-agnostic: the caller passes a `RegSet` describing the
+//! allocatable registers, their caller/callee-saved partition, and the
+//! spill-slot layout. x86-64 and aarch64 share this implementation.
 
 const std = @import("std");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
 
-/// Physical register identifier (0-15 for x86-64 GPRs).
-pub const PhysReg = u4;
+/// Physical register identifier. Widest architecture we target is aarch64
+/// with 0..30 (v0..v31 is separate). `u8` leaves headroom.
+pub const PhysReg = u8;
+
+/// Maximum number of allocatable registers supported by the bitmasks below.
+/// aarch64's allocatable GPR pool is 25; x86-64's is 10. 64 is ample.
+pub const max_alloc_regs: usize = 64;
 
 /// Physical register or stack slot assignment.
 pub const Allocation = union(enum) {
     reg: PhysReg,
-    stack: i32, // offset from RBP
+    /// Byte offset of the spill slot from the frame pointer. Sign and
+    /// stride come from `RegSet.spill_base`/`spill_stride`.
+    stack: i32,
+};
+
+/// Describes the architecture's register file and spill-slot layout.
+/// Caller constructs this per-function (spill_base may depend on the
+/// locals area size, for example).
+pub const RegSet = struct {
+    /// Allocatable physical register numbers, in preference order within
+    /// the caller- and callee-saved partitions. Length must be ≤
+    /// `max_alloc_regs`.
+    alloc_regs: []const PhysReg,
+    /// Indices into `alloc_regs` of registers that survive a call
+    /// without save/restore. Prefer these for live ranges that span a
+    /// clobber point.
+    callee_saved_indices: []const u8,
+    /// Indices into `alloc_regs` of registers that do NOT survive a
+    /// call. Prefer these for short-lived values to avoid the cost of
+    /// preserving callee-saved regs in the prologue.
+    caller_saved_indices: []const u8,
+    /// Byte offset (from the frame pointer) of the first spill slot.
+    spill_base: i32,
+    /// Byte stride from one spill slot to the next. Negative on
+    /// downward-growing frames (x86-64: -8), positive on upward
+    /// (aarch64: +8).
+    spill_stride: i32,
 };
 
 /// Result of register allocation for one function.
@@ -38,23 +73,14 @@ pub const AllocResult = struct {
     }
 };
 
-/// Allocatable registers as PhysReg IDs.
-/// Excludes RAX (0), RCX (1) — used as scratch temporaries by codegen,
-/// RSP (4), RBP (5) — frame pointers, and R10 (10), R11 (11) — scratch regs.
-/// Callee-saved regs (rbx, r12-r15) are preserved in prologue/epilogue when used.
-const alloc_regs = [_]PhysReg{ 2, 3, 6, 7, 8, 9, 12, 13, 14, 15 };
-// rdx=2, rbx=3, rsi=6, rdi=7, r8=8, r9=9, r12=12, r13=13, r14=14, r15=15
-
-/// Scratch registers for spill loads (not allocatable).
-pub const scratch1: PhysReg = 10; // r10
-pub const scratch2: PhysReg = 11; // r11
-
 /// A point in the instruction stream where specific registers are destroyed.
 /// Used to model calls (clobber caller-saved), memory_copy (clobber rsi+rdi), etc.
+///
+/// `regs_clobbered` is a bitmask over the caller's `RegSet.alloc_regs`:
+/// bit i set means `alloc_regs[i]` is destroyed at this position.
 pub const ClobberPoint = struct {
     pos: u32,
-    /// Which alloc_regs indices are clobbered at this position.
-    regs_clobbered: [alloc_regs.len]bool,
+    regs_clobbered: u64,
 };
 
 /// Run linear scan register allocation on a function.
@@ -62,35 +88,38 @@ pub const ClobberPoint = struct {
 pub fn allocate(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
+    reg_set: RegSet,
     clobbers: []const ClobberPoint,
 ) !AllocResult {
+    std.debug.assert(reg_set.alloc_regs.len <= max_alloc_regs);
+
     // Compute live ranges (sorted by start position)
     const ranges = try analysis.computeLiveRanges(func, allocator);
     defer allocator.free(ranges);
 
     var assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator);
 
-    // Track which registers are free
-    var reg_free = [_]bool{true} ** alloc_regs.len;
+    // Track which register indices are free (bit i ↔ alloc_regs[i]).
+    // Start with the low `alloc_regs.len` bits set.
+    var reg_free: u64 = if (reg_set.alloc_regs.len == 64)
+        std.math.maxInt(u64)
+    else
+        (@as(u64, 1) << @intCast(reg_set.alloc_regs.len)) - 1;
+
     // Active intervals (currently assigned to a register), sorted by end position
     var active: std.ArrayList(ActiveInterval) = .empty;
     defer active.deinit(allocator);
 
     var spill_count: u32 = 0;
 
-    // Spill area must start AFTER the operand-stack area in the frame.
-    // Frame layout (compile.zig): [rbp-8]=VmCtx, [rbp-16..-(1+LC)*8]=locals (LC slots),
-    // [-(2+LC)*8..-(65+LC)*8]=op-stack (64 slots). Spills begin at -(66+LC)*8.
-    const spill_base: i32 = -@as(i32, @intCast((func.local_count + 66) * 8));
-
     for (ranges) |range| {
         // Expire old intervals that ended before this one starts
         expireOldIntervals(&active, range.start, &reg_free);
 
         // Try to find a free register that is safe (not clobbered during this range)
-        if (findSafeReg(&reg_free, range.start, range.end, clobbers)) |reg_idx| {
-            reg_free[reg_idx] = false;
-            try assignments.put(range.vreg, .{ .reg = alloc_regs[reg_idx] });
+        if (findSafeReg(reg_set, reg_free, range.start, range.end, clobbers)) |reg_idx| {
+            reg_free &= ~(@as(u64, 1) << @intCast(reg_idx));
+            try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[reg_idx] });
             try insertActive(&active, allocator, .{
                 .vreg = range.vreg,
                 .end = range.end,
@@ -113,10 +142,11 @@ pub fn allocate(
             if (best_evict) |evict_idx| {
                 const evicted = active.orderedRemove(evict_idx);
                 const stolen_reg = evicted.reg_idx;
-                const spill_offset = spill_base - @as(i32, @intCast(spill_count * 8));
+                const spill_offset = reg_set.spill_base +
+                    @as(i32, @intCast(spill_count)) * reg_set.spill_stride;
                 try assignments.put(evicted.vreg, .{ .stack = spill_offset });
                 spill_count += 1;
-                try assignments.put(range.vreg, .{ .reg = alloc_regs[stolen_reg] });
+                try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[stolen_reg] });
                 try insertActive(&active, allocator, .{
                     .vreg = range.vreg,
                     .end = range.end,
@@ -124,7 +154,8 @@ pub fn allocate(
                 });
             } else {
                 // No safe eviction candidate — spill the new interval
-                const spill_offset = spill_base - @as(i32, @intCast(spill_count * 8));
+                const spill_offset = reg_set.spill_base +
+                    @as(i32, @intCast(spill_count)) * reg_set.spill_stride;
                 try assignments.put(range.vreg, .{ .stack = spill_offset });
                 spill_count += 1;
             }
@@ -140,27 +171,28 @@ pub fn allocate(
 const ActiveInterval = struct {
     vreg: ir.VReg,
     end: u32,
-    reg_idx: usize,
+    reg_idx: u8,
 };
 
 /// Remove intervals from `active` whose end position is <= `pos`.
 fn expireOldIntervals(
     active: *std.ArrayList(ActiveInterval),
     pos: u32,
-    reg_free: *[alloc_regs.len]bool,
+    reg_free: *u64,
 ) void {
     // Active is sorted by end position; remove from front
     while (active.items.len > 0 and active.items[0].end < pos) {
         const expired = active.orderedRemove(0);
-        reg_free[expired.reg_idx] = true;
+        reg_free.* |= (@as(u64, 1) << @intCast(expired.reg_idx));
     }
 }
 
 /// Check if register at `reg_idx` is safe for a live range [start, end].
 /// A register is unsafe if it's clobbered at any point strictly inside the range.
-fn regSafeForRange(reg_idx: usize, start: u32, end: u32, clobbers: []const ClobberPoint) bool {
+fn regSafeForRange(reg_idx: u8, start: u32, end: u32, clobbers: []const ClobberPoint) bool {
+    const bit = @as(u64, 1) << @intCast(reg_idx);
     for (clobbers) |cp| {
-        if (cp.pos > start and cp.pos < end and cp.regs_clobbered[reg_idx]) return false;
+        if (cp.pos > start and cp.pos < end and (cp.regs_clobbered & bit) != 0) return false;
     }
     return true;
 }
@@ -175,40 +207,25 @@ fn spansClobber(start: u32, end: u32, clobbers: []const ClobberPoint) bool {
     return false;
 }
 
-/// Indices of callee-saved registers within alloc_regs.
-/// On both Win64 and SysV: rbx(1), r12(6), r13(7), r14(8), r15(9).
-const callee_saved_indices = [_]usize{ 1, 6, 7, 8, 9 };
-/// Indices of caller-saved registers within alloc_regs.
-/// Win64: rdx(0), r8(4), r9(5). SysV adds: rsi(2), rdi(3).
-const caller_saved_indices = if (@import("builtin").os.tag == .windows)
-    [_]usize{ 0, 4, 5, 2, 3 } // rdx, r8, r9, then rsi/rdi (callee-saved on Win64 but treated as caller-saved for allocation preference since they need prologue save)
-else
-    [_]usize{ 0, 2, 3, 4, 5 }; // rdx, rsi, rdi, r8, r9
-
 /// Find a free register, preferring callee-saved for long-lived values
 /// (those spanning calls) and caller-saved for short-lived values.
 fn findSafeReg(
-    reg_free: *const [alloc_regs.len]bool,
+    reg_set: RegSet,
+    reg_free: u64,
     start: u32,
     end: u32,
     clobbers: []const ClobberPoint,
-) ?usize {
-    if (spansClobber(start, end, clobbers)) {
-        // Prefer callee-saved (survives calls without save/restore)
-        for (callee_saved_indices) |i| {
-            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
-        }
-        for (caller_saved_indices) |i| {
-            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
-        }
-    } else {
-        // Prefer caller-saved (avoids prologue push/pop cost)
-        for (caller_saved_indices) |i| {
-            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
-        }
-        for (callee_saved_indices) |i| {
-            if (reg_free[i] and regSafeForRange(i, start, end, clobbers)) return i;
-        }
+) ?u8 {
+    const prefer_callee = spansClobber(start, end, clobbers);
+    const first: []const u8 = if (prefer_callee) reg_set.callee_saved_indices else reg_set.caller_saved_indices;
+    const second: []const u8 = if (prefer_callee) reg_set.caller_saved_indices else reg_set.callee_saved_indices;
+    for (first) |i| {
+        const bit = @as(u64, 1) << @intCast(i);
+        if ((reg_free & bit) != 0 and regSafeForRange(i, start, end, clobbers)) return i;
+    }
+    for (second) |i| {
+        const bit = @as(u64, 1) << @intCast(i);
+        if ((reg_free & bit) != 0 and regSafeForRange(i, start, end, clobbers)) return i;
     }
     return null;
 }
@@ -227,15 +244,20 @@ fn insertActive(
     try active.insert(allocator, pos, interval);
 }
 
-/// Compute spill slot offset from RBP (legacy helper; callers now use
-/// `spill_base` computed per-function in `allocate`). Kept for potential
-/// unit-test use with the default operand-stack budget of 64 slots.
-fn computeSpillOffset(spill_idx: u32) i32 {
-    const spill_base: i32 = -600;
-    return spill_base - @as(i32, @intCast(spill_idx * 8));
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────
+
+/// Register set used by the in-file tests. Mirrors the legacy x86-64
+/// layout so the test expectations remain meaningful: 10 allocatable
+/// GPRs, rbx+r12..r15 callee-saved, rdx+rsi+rdi+r8+r9 caller-saved,
+/// spill area below rbp with 64-slot operand stack.
+const test_reg_set: RegSet = .{
+    .alloc_regs = &.{ 2, 3, 6, 7, 8, 9, 12, 13, 14, 15 },
+    .callee_saved_indices = &.{ 1, 6, 7, 8, 9 },
+    .caller_saved_indices = &.{ 0, 2, 3, 4, 5 },
+    // func.local_count==1 for all tests: spill_base = -(1 + 66) * 8 = -536.
+    .spill_base = -536,
+    .spill_stride = -8,
+};
 
 test "allocate: simple function gets registers" {
     const allocator = std.testing.allocator;
@@ -252,7 +274,7 @@ test "allocate: simple function gets registers" {
     try block0.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
     try block0.append(.{ .op = .{ .ret = v2 } });
 
-    var result = try allocate(&func, allocator, &.{});
+    var result = try allocate(&func, allocator, test_reg_set, &.{});
     defer result.deinit();
 
     // All 3 VRegs should get registers (only 3 needed, 9 available)
@@ -287,7 +309,7 @@ test "allocate: no spills with few live values" {
     }
     try block0.append(.{ .op = .{ .ret = prev } });
 
-    var result = try allocate(&func, allocator, &.{});
+    var result = try allocate(&func, allocator, test_reg_set, &.{});
     defer result.deinit();
 
     // Low register pressure — no spills expected
@@ -317,7 +339,7 @@ test "allocate: spills when pressure exceeds registers" {
     }
     try block0.append(.{ .op = .{ .ret = sum } });
 
-    var result = try allocate(&func, allocator, &.{});
+    var result = try allocate(&func, allocator, test_reg_set, &.{});
     defer result.deinit();
 
     // Should have some spills (15 values alive > 9 registers)
@@ -328,3 +350,4 @@ test "allocate: spills when pressure exceeds registers" {
         try std.testing.expect(result.get(v) != null);
     }
 }
+

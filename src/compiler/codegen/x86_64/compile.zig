@@ -1202,19 +1202,15 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
         for (block.instructions.items) |ci| {
             switch (ci.op) {
                 .call, .call_indirect, .call_ref, .memory_grow, .memory_copy, .table_grow, .table_set => {
-                    const mask = if (comptime builtin.os.tag == .windows)
-                        [_]bool{ true, false, false, false, true, true, false, false, false, false }
-                    else
-                        [_]bool{ true, false, true, true, true, true, false, false, false, false };
-                    try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = mask });
+                    try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = x86_64_call_clobber_mask });
                 },
-                .memory_fill => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, false, false, true, false, false, false, false, false, false } }),
+                .memory_fill => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = @as(u64, 1) << 3 }),
                 else => {},
             }
             cp_pos += 1;
         }
     }
-    var alloc = try regalloc.allocate(func, allocator, clobbers.items);
+    var alloc = try regalloc.allocate(func, allocator, x86_64_reg_set(func.local_count), clobbers.items);
     defer alloc.deinit();
 
     var pos: u32 = 0;
@@ -1342,6 +1338,47 @@ const GlobalCallPatch = struct {
 
 const regalloc = @import("../../ir/regalloc.zig");
 
+/// x86-64 allocatable GPR set: rdx(2), rbx(3), rsi(6), rdi(7), r8(8), r9(9),
+/// r12(12), r13(13), r14(14), r15(15). Order matches the legacy mask layout,
+/// so `caller_saved_indices` / `callee_saved_indices` are stable indices
+/// into `alloc_regs` and match the bit positions used in clobber masks below.
+const x86_64_alloc_regs = [_]regalloc.PhysReg{ 2, 3, 6, 7, 8, 9, 12, 13, 14, 15 };
+
+/// Indices into `x86_64_alloc_regs` of callee-saved registers (same on
+/// Win64 and SysV): rbx(idx 1), r12..r15 (idx 6..9).
+const x86_64_callee_saved_indices = [_]u8{ 1, 6, 7, 8, 9 };
+
+/// Indices into `x86_64_alloc_regs` of caller-saved registers, by ABI.
+/// On Win64: rdx, r8, r9. On SysV: add rsi, rdi.
+const x86_64_caller_saved_indices = if (builtin.os.tag == .windows)
+    [_]u8{ 0, 4, 5 }
+else
+    [_]u8{ 0, 2, 3, 4, 5 };
+
+/// Bitmask over `x86_64_alloc_regs` indices of caller-saved registers
+/// clobbered by a normal call / host runtime call (memory.grow, table.set,
+/// etc.).
+const x86_64_call_clobber_mask: u64 = blk: {
+    var m: u64 = 0;
+    for (x86_64_caller_saved_indices) |i| m |= @as(u64, 1) << i;
+    break :blk m;
+};
+
+/// Build the per-function `RegSet` for x86-64. `local_count` determines
+/// the spill-slot origin so it must be passed in.
+fn x86_64_reg_set(local_count: u32) regalloc.RegSet {
+    return .{
+        .alloc_regs = &x86_64_alloc_regs,
+        .callee_saved_indices = &x86_64_callee_saved_indices,
+        .caller_saved_indices = &x86_64_caller_saved_indices,
+        // Frame layout (see compileFunctionImpl): [rbp-8]=VmCtx,
+        // [rbp-16..-(1+LC)*8]=locals (LC slots), [-(2+LC)*8..-(65+LC)*8]
+        // =op-stack (64 slots). Spills begin at -(66+LC)*8 and grow down.
+        .spill_base = -@as(i32, @intCast((local_count + 66) * 8)),
+        .spill_stride = -8,
+    };
+}
+
 /// Compile an IR function using the linear scan register allocator.
 /// VRegs are assigned to physical registers; instructions operate directly
 /// on assigned registers without push/pop through a CachedStack.
@@ -1359,20 +1396,13 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
                         // Calls clobber caller-saved allocatable regs.
                         // memory.grow / memory.copy are compiled as host calls (same ABI),
                         // so they clobber the same set of caller-saved registers.
-                        // alloc_regs = [rdx(0), rbx(1), rsi(2), rdi(3), r8(4), r9(5), r12(6), r13(7), r14(8), r15(9)]
-                        // On Win64: rdx, r8, r9 are volatile; rbx/rsi/rdi/r12-r15 callee-saved.
-                        // On SysV: rdx, rsi, rdi, r8, r9 are volatile; rbx/r12-r15 callee-saved.
-                        const mask = if (comptime builtin.os.tag == .windows)
-                            [_]bool{ true, false, false, false, true, true, false, false, false, false }
-                        else
-                            [_]bool{ true, false, true, true, true, true, false, false, false, false };
-                        try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = mask });
+                        try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = x86_64_call_clobber_mask });
                     },
                     .memory_fill => {
-                        // REP STOSB clobbers rdi(7) → index 3
+                        // REP STOSB clobbers rdi (index 3 in alloc_regs).
                         try clobber_points.append(allocator, .{
                             .pos = pos,
-                            .regs_clobbered = .{ false, false, false, true, false, false, false, false, false, false },
+                            .regs_clobbered = @as(u64, 1) << 3,
                         });
                     },
                     else => {},
@@ -1382,7 +1412,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         }
     }
 
-    var alloc_result = try regalloc.allocate(func, allocator, clobber_points.items);
+    var alloc_result = try regalloc.allocate(func, allocator, x86_64_reg_set(func.local_count), clobber_points.items);
     defer alloc_result.deinit();
 
     // Compute which caller-saved registers are actually used by this function.
