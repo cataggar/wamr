@@ -758,6 +758,46 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
     return changed;
 }
 
+/// Forward `local_set K, val` → subsequent `local_get K` within the same
+/// block: rewrite consumers of the `local_get`'s dest to use `val` directly,
+/// turning the `local_get` into dead code that DCE then removes. This
+/// eliminates a STR/LDR round-trip (and an LDR on the initial get) for every
+/// such pair — common in induction-variable heavy loops like
+/// `i = i + 1; local.set i`.
+///
+/// Safety: wasm locals are modifiable only by the current function's
+/// local.set, so call instructions do not invalidate the map. Control-flow
+/// at the block end ends the map's scope. IR is SSA so `val` remains valid
+/// everywhere `local_get`'s dest was consumed.
+pub fn forwardLocalGet(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var last_set = std.AutoHashMap(u32, ir.VReg).init(allocator);
+    defer last_set.deinit();
+
+    for (func.blocks.items) |*block| {
+        last_set.clearRetainingCapacity();
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .local_set => |ls| try last_set.put(ls.idx, ls.val),
+                .local_get => |idx| {
+                    const dest = inst.dest orelse continue;
+                    if (last_set.get(idx)) |val| {
+                        replaceVReg(func, dest, val);
+                        changed = true;
+                    } else {
+                        // First read of this local in the block — remember
+                        // the new dest so subsequent reads of the same local
+                        // in this block can coalesce to this same vreg.
+                        try last_set.put(idx, dest);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
     for (module.functions.items) |*func| {
@@ -770,6 +810,7 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 
 /// The default optimization pipeline.
 pub const default_passes: []const PassFn = &.{
+    &forwardLocalGet,
     &constantFold,
     &strengthReduceMul,
     &commonSubexprElimination,
@@ -1431,4 +1472,49 @@ test "elideRedundantBoundsChecks: call invalidates tracker" {
     _ = try elideRedundantBoundsChecks(&func, allocator);
     // Post-call load cannot be elided because memory_size may have changed.
     try std.testing.expect(!block.instructions.items[3].op.load.bounds_known);
+}
+
+test "forwardLocalGet: set then get within block forwards vreg" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1); // 1 local
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_c = func.newVReg();
+    const v_g = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_g, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_g, .rhs = v_c } }, .dest = v_r, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try forwardLocalGet(&func, allocator);
+    try std.testing.expect(changed);
+    // The add should now use v_c (the forwarded val) on both sides.
+    try std.testing.expectEqual(v_c, block.instructions.items[3].op.add.lhs);
+    try std.testing.expectEqual(v_c, block.instructions.items[3].op.add.rhs);
+}
+
+test "forwardLocalGet: repeated gets without set share the first dest" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_a, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_r, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try forwardLocalGet(&func, allocator);
+    try std.testing.expect(changed);
+    // Both adds' operands should coalesce to v_a (the first get's dest).
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.lhs);
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.rhs);
 }
