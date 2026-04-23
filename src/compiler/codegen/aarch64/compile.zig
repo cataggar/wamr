@@ -317,10 +317,6 @@ pub fn compileFunctionImpl(
     // might need a slot, plus a 16-slot safety margin for pathological
     // interleavings. Slots are 8 bytes.
     const spill_base: u32 = (func.local_count + 3) * 8;
-    const spill_capacity: u32 = blk: {
-        const vreg_slots = func.next_vreg + 16;
-        break :blk @intCast(vreg_slots * 8);
-    };
 
     // Multi-result plumbing. Scan call sites for max `extra_results` and
     // reserve caller-side scratch (`scratch_base`) + HRP save slot
@@ -336,27 +332,11 @@ pub fn compileFunctionImpl(
             }
         }
     }
-    const hrp_save_off: u32 = spill_base + spill_capacity;
-    const scratch_base: u32 = hrp_save_off + 8;
-    const scratch_size: u32 = max_extra_results * 8;
-    const call_save_base: u32 = scratch_base + scratch_size;
-    const call_save_size: u32 = 128;
-    const callee_save_base: u32 = call_save_base + call_save_size;
-    const callee_save_count: u32 = 10; // x19..x28
-    const callee_save_size: u32 = callee_save_count * 8;
-    const raw_frame = callee_save_base + callee_save_size;
-    const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
 
-    var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
-    defer reg_map.deinit();
-    // `reg_map.alloc_result` is assigned after the FMA pre-pass below.
-
+    // spill_capacity is finalized below after the allocator runs (we use
+    // alloc_result.spill_count instead of a conservative next_vreg+16
+    // estimate, which shrinks frames and reduces I-cache pressure).
     var fctx = ctx;
-    fctx.call_save_base = call_save_base;
-    fctx.callee_save_base = callee_save_base;
-    fctx.hrp_save_off = hrp_save_off;
-    fctx.scratch_base = scratch_base;
-    fctx.frame_size = frame_size;
 
     var callee_save_sites: std.ArrayListUnmanaged([callee_saved_regs.len]usize) = .empty;
     defer callee_save_sites.deinit(allocator);
@@ -612,7 +592,32 @@ pub fn compileFunctionImpl(
         live_ranges,
     );
     defer alloc_result.deinit();
+
+    // Finalize frame layout now that we know how many spill slots the
+    // allocator actually consumed. Previously we pre-sized to
+    // (next_vreg+16)*8 which was wasteful; using the allocator's exact
+    // count shrinks frames and reduces I-cache pressure on entry.
+    const spill_capacity: u32 = @as(u32, @intCast(alloc_result.spill_count)) * 8;
+    const hrp_save_off: u32 = spill_base + spill_capacity;
+    const scratch_base: u32 = hrp_save_off + 8;
+    const scratch_size: u32 = max_extra_results * 8;
+    const call_save_base: u32 = scratch_base + scratch_size;
+    const call_save_size: u32 = 128;
+    const callee_save_base: u32 = call_save_base + call_save_size;
+    const callee_save_count: u32 = 10; // x19..x28
+    const callee_save_size: u32 = callee_save_count * 8;
+    const raw_frame = callee_save_base + callee_save_size;
+    const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
+
+    var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
+    defer reg_map.deinit();
     reg_map.alloc_result = &alloc_result;
+
+    fctx.call_save_base = call_save_base;
+    fctx.callee_save_base = callee_save_base;
+    fctx.hrp_save_off = hrp_save_off;
+    fctx.scratch_base = scratch_base;
+    fctx.frame_size = frame_size;
 
     // Liveness-driven register scavenging: compute, for each instruction,
     // the set of vregs whose *last* static read occurs at that instruction.
