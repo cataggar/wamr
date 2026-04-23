@@ -322,6 +322,16 @@ pub fn compileFunctionImpl(
                     try bumpUse(&use_counts, mc.src);
                     try bumpUse(&use_counts, mc.len);
                 },
+                .memory_init => |mi| {
+                    try bumpUse(&use_counts, mi.dst);
+                    try bumpUse(&use_counts, mi.src);
+                    try bumpUse(&use_counts, mi.len);
+                },
+                .table_init => |ti| {
+                    try bumpUse(&use_counts, ti.dst);
+                    try bumpUse(&use_counts, ti.src);
+                    try bumpUse(&use_counts, ti.len);
+                },
                 .table_get => |tg| try bumpUse(&use_counts, tg.idx),
                 .table_set => |ts| {
                     try bumpUse(&use_counts, ts.idx);
@@ -717,6 +727,15 @@ fn compileInst(
         .atomic_fence => try code.dmbIsh(),
         .atomic_load => |ld| try emitAtomicLoad(code, inst, ld, reg_map),
         .atomic_store => |st| try emitAtomicStore(code, st, reg_map),
+
+        // ── Passive segments ─────────────────────────────────────────
+        // memory.init / data.drop are AOT no-ops: active segments are
+        // applied at instantiation; passive memory segments aren't
+        // tracked separately by this runtime. Mirrors x86_64 behavior.
+        .memory_init => {},
+        .data_drop => {},
+        .table_init => |ti| try emitTableInit(code, ti, reg_map, fctx),
+        .elem_drop => |seg_idx| try emitElemDrop(code, seg_idx, reg_map, fctx),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
@@ -1747,6 +1766,8 @@ const vmctx_table_grow_fn_slot: u12 = 16;// byte 128, scale 8
 const vmctx_tables_info_slot: u12 = 17;  // byte 136, scale 8
 const vmctx_sig_table_slot: u12 = 20;    // byte 160, scale 8
 const vmctx_table_set_fn_slot: u12 = 24; // byte 192, scale 8
+const vmctx_table_init_fn_slot: u12 = 18; // byte 144, scale 8
+const vmctx_elem_drop_fn_slot: u12 = 19;  // byte 152, scale 8
 
 // Per-table descriptor layout (`TableInfo`, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
@@ -2229,6 +2250,120 @@ fn emitVmctxHelperCall(
         if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
         try destCommit(code, reg_map, info);
     }
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
+/// Load a VReg's current value into `dest_reg` in a way that is stable
+/// across a prior caller-save snapshot: if the VReg is in a caller-saved
+/// physreg, read from its save slot (not the now-clobbered reg); if it
+/// is in a callee-saved physreg, read from the reg directly; if spilled,
+/// read from the spill slot.
+fn readVregStable(
+    code: *emit.CodeBuffer,
+    reg_map: *const RegMap,
+    fctx: *FuncCompileCtx,
+    vreg: ir.VReg,
+    dest_reg: emit.Reg,
+) !void {
+    const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
+    switch (loc) {
+        .reg => |r| {
+            const reg_idx: u32 = @intFromEnum(r);
+            if (reg_idx >= 19) {
+                if (r != dest_reg) try code.movRegReg(dest_reg, r);
+            } else {
+                const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                try code.ldrImm(dest_reg, .fp, slot_scaled);
+            }
+        },
+        .stack => |off| {
+            try code.ldrImm(dest_reg, .fp, reg_map.spillOffsetScaled(off));
+        },
+    }
+}
+
+fn emitTableInit(
+    code: *emit.CodeBuffer,
+    ti: @TypeOf(@as(ir.Inst.Op, undefined).table_init),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    // Helper signature (matches runtime.tableInitHelper):
+    //   fn (vmctx, packed_seg_table: u64, packed_dst_src: u64, len: u32)
+    //   packed_seg_table = seg_idx | (table_idx << 32)   (compile-time)
+    //   packed_dst_src   = dst     | (src << 32)
+
+    // Snapshot and save live caller-saved regs.
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // x3 = dst | (src << 32). Build in x3 via tmp0 scratch.
+    try readVregStable(code, reg_map, fctx, ti.src, .x3);
+    try code.movRegReg32(.x3, .x3); // zero-extend 32→64
+    try code.lslImm(.x3, .x3, 32);
+    try readVregStable(code, reg_map, fctx, ti.dst, RegMap.tmp0);
+    try code.movRegReg32(RegMap.tmp0, RegMap.tmp0);
+    try code.orrRegReg(.x3, .x3, RegMap.tmp0);
+
+    // x4 = zero-extended len.
+    try readVregStable(code, reg_map, fctx, ti.len, .x4);
+    try code.movRegReg32(.x4, .x4);
+
+    // x2 = packed_seg_table (compile-time constant).
+    const packed_st: u64 =
+        @as(u64, ti.seg_idx) | (@as(u64, ti.table_idx) << 32);
+    try code.movImm64(.x2, packed_st);
+
+    // x0 = vmctx; tmp0 = vmctx.table_init_fn; BLR tmp0.
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_table_init_fn_slot);
+    try code.blr(RegMap.tmp0);
+
+    // Restore caller-saved regs.
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
+fn emitElemDrop(
+    code: *emit.CodeBuffer,
+    seg_idx: u32,
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    // Helper: elemDropHelper(vmctx, seg_idx: u32)
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    try code.movImm32(.x1, @bitCast(seg_idx));
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_elem_drop_fn_slot);
+    try code.blr(RegMap.tmp0);
 
     for (used_snapshot, 0..) |used, i| {
         if (!used) continue;
@@ -3497,18 +3632,23 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
 }
 
 test "compile: unimplemented op returns error.UnimplementedOp" {
-    // data_drop is not yet implemented on aarch64 — must fail loudly,
+    // atomic_rmw is not yet implemented on aarch64 — must fail loudly,
     // not silently drop.
     const allocator = std.testing.allocator;
-    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = val, .type = .i32 });
     try func.getBlock(bid).append(.{
-        .op = .{ .data_drop = 0 },
-        .dest = null,
-        .type = .void,
+        .op = .{ .atomic_rmw = .{ .base = addr, .offset = 0, .size = 4, .val = val, .op = .add } },
+        .dest = result,
+        .type = .i32,
     });
-    try func.getBlock(bid).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
     try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
 }
 
