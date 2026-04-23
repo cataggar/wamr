@@ -30,6 +30,11 @@ jobs:
         with:
           submodules: true
 
+      - name: Install gh-aw extension
+        uses: github/gh-aw-actions/setup-cli@ba90f2186d7ad780ec640f364005fa24e797b360 # v0.68.3
+        with:
+          version: v0.68.3
+
       - name: Install Zig 0.16.0
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
