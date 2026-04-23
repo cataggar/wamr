@@ -368,18 +368,35 @@ pub fn constantFold(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
                     try constants.put(d, v);
                 },
                 .add, .sub, .mul, .@"and", .@"or", .xor,
+                .shl, .shr_s, .shr_u, .rotl, .rotr,
                 .eq, .ne, .lt_s, .gt_s, .le_s, .ge_s,
+                .lt_u, .gt_u, .le_u, .ge_u,
+                .div_s, .div_u, .rem_s, .rem_u,
                 => |bin| {
-                    const lhs = constants.get(bin.lhs) orelse continue;
-                    const rhs = constants.get(bin.rhs) orelse continue;
-                    const result = evalBinOp(inst.op, lhs, rhs) orelse continue;
-                    if (inst.dest) |d| {
-                        try constants.put(d, result);
-                        if (inst.type == .i64) {
-                            inst.op = .{ .iconst_64 = result };
-                        } else {
-                            inst.op = .{ .iconst_32 = @truncate(result) };
+                    const dest = inst.dest orelse continue;
+                    const maybe_lhs = constants.get(bin.lhs);
+                    const maybe_rhs = constants.get(bin.rhs);
+
+                    // Try full constant folding first.
+                    if (maybe_lhs != null and maybe_rhs != null) {
+                        if (evalBinOp(inst.op, maybe_lhs.?, maybe_rhs.?, inst.type)) |result| {
+                            try constants.put(dest, result);
+                            if (inst.type == .i64) {
+                                inst.op = .{ .iconst_64 = result };
+                            } else {
+                                inst.op = .{ .iconst_32 = @truncate(result) };
+                            }
+                            changed = true;
+                            continue;
                         }
+                    }
+
+                    // Algebraic identities: reduce to a single-operand copy.
+                    if (algebraicIdentity(inst.op, maybe_lhs, maybe_rhs, inst.type, bin.lhs, bin.rhs)) |keep| {
+                        replaceVReg(func, dest, keep);
+                        // Turn into a dead iconst; DCE will remove it on the
+                        // next pipeline iteration.
+                        inst.op = .{ .iconst_32 = 0 };
                         changed = true;
                     }
                 },
@@ -392,6 +409,14 @@ pub fn constantFold(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
                         changed = true;
                     }
                 },
+                .select => |sel| {
+                    const dest = inst.dest orelse continue;
+                    const cond = constants.get(sel.cond) orelse continue;
+                    const pick = if (cond != 0) sel.if_true else sel.if_false;
+                    replaceVReg(func, dest, pick);
+                    inst.op = .{ .iconst_32 = 0 };
+                    changed = true;
+                },
                 else => {},
             }
         }
@@ -399,7 +424,46 @@ pub fn constantFold(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     return changed;
 }
 
-fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64) ?i64 {
+/// Return the operand to keep if this op simplifies to a copy of that
+/// operand (e.g., `v + 0` → `v`, `v * 1` → `v`, `v << 0` → `v`).
+fn algebraicIdentity(
+    op: ir.Inst.Op,
+    maybe_lhs: ?i64,
+    maybe_rhs: ?i64,
+    ty: ir.IrType,
+    lhs_reg: ir.VReg,
+    rhs_reg: ir.VReg,
+) ?ir.VReg {
+    const mask: u64 = if (ty == .i64) 63 else 31;
+    const ones: i64 = if (ty == .i64) -1 else @as(i64, @as(i32, -1));
+    // RHS-is-constant cases.
+    if (maybe_rhs) |r| {
+        switch (op) {
+            .add, .sub, .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr => {
+                if ((op == .shl or op == .shr_s or op == .shr_u or op == .rotl or op == .rotr)) {
+                    if ((@as(u64, @bitCast(r)) & mask) == 0) return lhs_reg;
+                } else if (r == 0) return lhs_reg;
+            },
+            .mul => if (r == 1) return lhs_reg,
+            .div_s, .div_u => if (r == 1) return lhs_reg,
+            .@"and" => if (r == ones) return lhs_reg,
+            else => {},
+        }
+    }
+    // LHS-is-constant cases (for commutative ops).
+    if (maybe_lhs) |l| {
+        switch (op) {
+            .add, .@"or", .xor => if (l == 0) return rhs_reg,
+            .mul => if (l == 1) return rhs_reg,
+            .@"and" => if (l == ones) return rhs_reg,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64, ty: ir.IrType) ?i64 {
+    const mask: u64 = if (ty == .i64) 63 else 31;
     return switch (op) {
         .add => lhs +% rhs,
         .sub => lhs -% rhs,
@@ -407,12 +471,99 @@ fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64) ?i64 {
         .@"and" => lhs & rhs,
         .@"or" => lhs | rhs,
         .xor => lhs ^ rhs,
+        .shl => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            break :blk @bitCast(@as(u64, @bitCast(lhs)) << n);
+        },
+        .shr_s => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) break :blk lhs >> n;
+            const l32: i32 = @truncate(lhs);
+            break :blk @as(i64, l32 >> @as(u5, @intCast(n)));
+        },
+        .shr_u => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) {
+                break :blk @bitCast(@as(u64, @bitCast(lhs)) >> n);
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            break :blk @as(i64, l32 >> @as(u5, @intCast(n)));
+        },
+        .rotl => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) {
+                break :blk @bitCast(std.math.rotl(u64, @bitCast(lhs), n));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            break :blk @as(i64, std.math.rotl(u32, l32, n));
+        },
+        .rotr => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) {
+                break :blk @bitCast(std.math.rotr(u64, @bitCast(lhs), n));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            break :blk @as(i64, std.math.rotr(u32, l32, n));
+        },
         .eq => @intFromBool(lhs == rhs),
         .ne => @intFromBool(lhs != rhs),
-        .lt_s => @intFromBool(lhs < rhs),
-        .gt_s => @intFromBool(lhs > rhs),
-        .le_s => @intFromBool(lhs <= rhs),
-        .ge_s => @intFromBool(lhs >= rhs),
+        .lt_s => if (ty == .i64) @intFromBool(lhs < rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) < @as(i32, @truncate(rhs))),
+        .gt_s => if (ty == .i64) @intFromBool(lhs > rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) > @as(i32, @truncate(rhs))),
+        .le_s => if (ty == .i64) @intFromBool(lhs <= rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) <= @as(i32, @truncate(rhs))),
+        .ge_s => if (ty == .i64) @intFromBool(lhs >= rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) >= @as(i32, @truncate(rhs))),
+        .lt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) < @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) < @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .gt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) > @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) > @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .le_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) <= @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) <= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .ge_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) >= @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) >= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .div_s => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                // i64 min / -1 traps; skip to be safe.
+                if (lhs == std.math.minInt(i64) and rhs == -1) break :blk null;
+                break :blk @divTrunc(lhs, rhs);
+            }
+            const l32: i32 = @truncate(lhs);
+            const r32: i32 = @truncate(rhs);
+            if (l32 == std.math.minInt(i32) and r32 == -1) break :blk null;
+            break :blk @as(i64, @divTrunc(l32, r32));
+        },
+        .div_u => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                break :blk @bitCast(@as(u64, @bitCast(lhs)) / @as(u64, @bitCast(rhs)));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            const r32: u32 = @truncate(@as(u64, @bitCast(rhs)));
+            break :blk @as(i64, l32 / r32);
+        },
+        .rem_s => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                if (lhs == std.math.minInt(i64) and rhs == -1) break :blk 0;
+                break :blk @rem(lhs, rhs);
+            }
+            const l32: i32 = @truncate(lhs);
+            const r32: i32 = @truncate(rhs);
+            if (l32 == std.math.minInt(i32) and r32 == -1) break :blk 0;
+            break :blk @as(i64, @rem(l32, r32));
+        },
+        .rem_u => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                break :blk @bitCast(@as(u64, @bitCast(lhs)) % @as(u64, @bitCast(rhs)));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            const r32: u32 = @truncate(@as(u64, @bitCast(rhs)));
+            break :blk @as(i64, l32 % r32);
+        },
         else => null,
     };
 }
@@ -1603,4 +1754,87 @@ test "deadLocalSetElimination: keeps set when local is read" {
     const changed = try deadLocalSetElimination(&func, allocator);
     try std.testing.expect(!changed);
     try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+}
+
+test "constantFold: shl of constants" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const va = func.newVReg();
+    const vb = func.newVReg();
+    const vr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = va, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = vb, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = va, .rhs = vb } }, .dest = vr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = vr } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(i64, 40), block.instructions.items[2].op.iconst_32);
+}
+
+test "constantFold: unsigned compare lt_u" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const va = func.newVReg();
+    const vb = func.newVReg();
+    const vr = func.newVReg();
+    // -1 as i32 (0xFFFFFFFF) < 1 unsigned? No: 0xFFFFFFFF > 1.
+    try block.append(.{ .op = .{ .iconst_32 = -1 }, .dest = va, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = vb, .type = .i32 });
+    try block.append(.{ .op = .{ .lt_u = .{ .lhs = va, .rhs = vb } }, .dest = vr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = vr } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(i64, 0), block.instructions.items[2].op.iconst_32);
+}
+
+test "constantFold: algebraic identity add zero" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const v_param = func.newVReg(); // vreg 0, param
+    const v_zero = func.newVReg();
+    const v_r = func.newVReg();
+    const v_ret = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_param, .rhs = v_zero } }, .dest = v_r, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_r, .rhs = v_r } }, .dest = v_ret, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ret } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    // After identity rewrite, the second add should use v_param directly on both sides.
+    try std.testing.expectEqual(v_param, block.instructions.items[2].op.add.lhs);
+    try std.testing.expectEqual(v_param, block.instructions.items[2].op.add.rhs);
+}
+
+test "constantFold: select with constant cond picks branch" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const v_a = func.newVReg(); // param 0
+    const v_b = func.newVReg(); // param 1
+    const v_cond = func.newVReg();
+    const v_sel = func.newVReg();
+    const v_ret = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_cond, .if_true = v_a, .if_false = v_b } }, .dest = v_sel, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_sel, .rhs = v_sel } }, .dest = v_ret, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ret } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.lhs);
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.rhs);
 }
