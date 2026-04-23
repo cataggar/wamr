@@ -752,15 +752,7 @@ pub const CodeBuffer = struct {
             const scaled: i7 = @intCast(-@as(i8, @intCast(frame_size / 8)));
             try self.stpPre(.fp, .lr, .sp, scaled);
         } else {
-            // SUB SP, SP, #frame_size (12-bit imm, optionally LSL #12 for
-            // frames up to ~16MB — well beyond what we'd ever need).
-            if (frame_size <= 0xFFF) {
-                try self.subImm(.sp, .sp, @intCast(frame_size));
-            } else if ((frame_size & 0xFFF) == 0 and (frame_size >> 12) <= 0xFFF) {
-                try self.subImmShift12(.sp, .sp, @intCast(frame_size >> 12));
-            } else {
-                return error.FrameTooLarge;
-            }
+            try self.emitSpAdjust(frame_size, .sub);
             // STP x29, x30, [sp, #0]
             try self.stpImm(.fp, .lr, .sp, 0);
         }
@@ -776,15 +768,33 @@ pub const CodeBuffer = struct {
             try self.ldpPost(.fp, .lr, .sp, scaled);
         } else {
             try self.ldpImm(.fp, .lr, .sp, 0);
-            if (frame_size <= 0xFFF) {
-                try self.addImm(.sp, .sp, @intCast(frame_size));
-            } else if ((frame_size & 0xFFF) == 0 and (frame_size >> 12) <= 0xFFF) {
-                try self.addImmShift12(.sp, .sp, @intCast(frame_size >> 12));
-            } else {
-                return error.FrameTooLarge;
-            }
+            try self.emitSpAdjust(frame_size, .add);
         }
         try self.ret();
+    }
+
+    /// Shared SP adjustment used by both prologue and epilogue for
+    /// frames that exceed the STP pre-/post-index scaled-immediate range.
+    /// Covers the full 24-bit range by splitting into high 12 bits
+    /// (LSL #12) and low 12 bits where needed — i.e. frames up to
+    /// ~16 MB, well beyond any plausible wasm function. Larger frames
+    /// return `error.FrameTooLarge`.
+    fn emitSpAdjust(self: *CodeBuffer, size: u32, comptime op: enum { add, sub }) !void {
+        if (size > 0xFFFFFF) return error.FrameTooLarge;
+        const high: u12 = @intCast(size >> 12);
+        const low: u12 = @intCast(size & 0xFFF);
+        if (high != 0) {
+            switch (op) {
+                .add => try self.addImmShift12(.sp, .sp, high),
+                .sub => try self.subImmShift12(.sp, .sp, high),
+            }
+        }
+        if (low != 0) {
+            switch (op) {
+                .add => try self.addImm(.sp, .sp, low),
+                .sub => try self.subImm(.sp, .sp, low),
+            }
+        }
     }
 
     /// Patch a 32-bit value at a given offset (for branch fixups).

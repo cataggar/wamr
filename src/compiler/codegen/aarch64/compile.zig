@@ -189,11 +189,21 @@ pub fn compileFunctionImpl(
     errdefer code.deinit();
 
     // Frame size: (local_count + 3) × 8 for saved FP/LR + vmctx + locals,
-    // plus 256 bytes of spill headroom (32 slots), plus 128 bytes for
-    // call-save (16 physregs × 8), plus 80 bytes for 10 callee-saved regs
-    // (x19..x28), aligned to 16 (AArch64 SP alignment).
+    // plus spill headroom (sized from IR vreg pressure, see below), plus
+    // 128 bytes for call-save (16 physregs × 8), plus 80 bytes for 10
+    // callee-saved regs (x19..x28), aligned to 16 (AArch64 SP alignment).
+    //
+    // Spill capacity used to be a fixed 256 bytes (32 slots) which was
+    // enough for micro-benchmarks but overflowed on real workloads
+    // (CoreMark `core_state_transition` lands ~90 live vregs at peak).
+    // Size it conservatively from the number of IR vregs: every vreg
+    // might need a slot, plus a 16-slot safety margin for pathological
+    // interleavings. Slots are 8 bytes.
     const spill_base: u32 = (func.local_count + 3) * 8;
-    const spill_capacity: u32 = 256;
+    const spill_capacity: u32 = blk: {
+        const vreg_slots = func.next_vreg + 16;
+        break :blk @intCast(vreg_slots * 8);
+    };
     const call_save_base: u32 = spill_base + spill_capacity;
     const call_save_size: u32 = 128;
     const callee_save_base: u32 = call_save_base + call_save_size;
@@ -229,6 +239,14 @@ pub fn compileFunctionImpl(
     // same block. The mul's dest must be consumed by the very next use (an
     // integer add/sub of matching type) and used nowhere else. IR vregs are
     // single-assignment so the mul's sources remain valid for MADD/MSUB.
+    // Count uses across EVERY op that reads a vreg, not just binary ops.
+    // Missing ops here means the FMA fusion pre-pass below can decide a
+    // mul's dest is single-use when it actually has more consumers
+    // (e.g. `local_set`, `ret`, `store`, `select`, `call`, `br_if`), and
+    // then skip emitting the mul. Any subsequent read of that vreg then
+    // hits `error.UnboundVReg`. CoreMark caught this via a mul feeding
+    // both an `add` (the FMA candidate) and a `local_set` in the same
+    // block.
     var use_counts = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer use_counts.deinit();
     const bumpUse = struct {
@@ -240,17 +258,78 @@ pub fn compileFunctionImpl(
     }.f;
     for (func.blocks.items) |block| {
         for (block.instructions.items) |inst| {
-            const maybe_bin: ?ir.Inst.BinOp = switch (inst.op) {
+            switch (inst.op) {
+                // Binary ops: two vreg reads.
                 .add, .sub, .mul, .@"and", .@"or", .xor,
                 .div_s, .div_u, .rem_s, .rem_u,
                 .shl, .shr_s, .shr_u, .rotl, .rotr,
                 .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u,
-                .le_s, .le_u, .ge_s, .ge_u => |b| b,
-                else => null,
-            };
-            if (maybe_bin) |b| {
-                try bumpUse(&use_counts, b.lhs);
-                try bumpUse(&use_counts, b.rhs);
+                .le_s, .le_u, .ge_s, .ge_u,
+                .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+                => |b| {
+                    try bumpUse(&use_counts, b.lhs);
+                    try bumpUse(&use_counts, b.rhs);
+                },
+                // Single-operand ops.
+                .local_set => |ls| try bumpUse(&use_counts, ls.val),
+                .global_set => |gs| try bumpUse(&use_counts, gs.val),
+                .eqz,
+                .ctz, .clz, .popcnt,
+                .extend8_s, .extend16_s, .extend32_s,
+                .extend_i32_s, .extend_i32_u, .wrap_i64,
+                .f_neg, .f_abs, .f_sqrt,
+                .convert_i32_s, .convert_i32_u, .convert_i64_s, .convert_i64_u,
+                .demote_f64, .promote_f32,
+                .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+                .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+                .reinterpret,
+                .memory_grow,
+                => |v| try bumpUse(&use_counts, v),
+                .ret => |maybe_v| if (maybe_v) |v| try bumpUse(&use_counts, v),
+                .load => |ld| try bumpUse(&use_counts, ld.base),
+                .store => |st| {
+                    try bumpUse(&use_counts, st.base);
+                    try bumpUse(&use_counts, st.val);
+                },
+                .select => |sel| {
+                    try bumpUse(&use_counts, sel.cond);
+                    try bumpUse(&use_counts, sel.if_true);
+                    try bumpUse(&use_counts, sel.if_false);
+                },
+                .br_if => |bi| try bumpUse(&use_counts, bi.cond),
+                .br_table => |bt| try bumpUse(&use_counts, bt.index),
+                .call => |cl| for (cl.args) |a| try bumpUse(&use_counts, a),
+                .call_indirect => |ci| {
+                    try bumpUse(&use_counts, ci.elem_idx);
+                    for (ci.args) |a| try bumpUse(&use_counts, a);
+                },
+                .call_ref => |cr| {
+                    try bumpUse(&use_counts, cr.func_ref);
+                    for (cr.args) |a| try bumpUse(&use_counts, a);
+                },
+                .memory_fill => |mf| {
+                    try bumpUse(&use_counts, mf.dst);
+                    try bumpUse(&use_counts, mf.val);
+                    try bumpUse(&use_counts, mf.len);
+                },
+                .memory_copy => |mc| {
+                    try bumpUse(&use_counts, mc.dst);
+                    try bumpUse(&use_counts, mc.src);
+                    try bumpUse(&use_counts, mc.len);
+                },
+                .table_get => |tg| try bumpUse(&use_counts, tg.idx),
+                .table_set => |ts| {
+                    try bumpUse(&use_counts, ts.idx);
+                    try bumpUse(&use_counts, ts.val);
+                },
+                .table_grow => |tg| {
+                    try bumpUse(&use_counts, tg.init);
+                    try bumpUse(&use_counts, tg.delta);
+                },
+                // Zero-operand ops (producers only): iconst, fconst, local_get,
+                // global_get, memory_size, ref_func, ref_null, table_size, br,
+                // @"unreachable".
+                else => {},
             }
         }
     }
@@ -529,6 +608,8 @@ fn compileInst(
         .extend8_s => |vreg| try emitExtendImpl(code, inst, vreg, reg_map, .b),
         .extend16_s => |vreg| try emitExtendImpl(code, inst, vreg, reg_map, .h),
         .extend32_s => |vreg| try emitExtendImpl(code, inst, vreg, reg_map, .w),
+        .extend_i32_s => |vreg| try emitExtendImpl(code, inst, vreg, reg_map, .w),
+        .extend_i32_u => |vreg| try emitExtendI32U(code, inst, vreg, reg_map),
         .wrap_i64 => |vreg| try emitWrap(code, inst, vreg, reg_map),
 
         // ── Select (CSEL) ────────────────────────────────────────────
@@ -811,6 +892,22 @@ fn emitWrap(
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     // wasm i32.wrap_i64: take low 32 bits of i64. UXTW zero-extends.
+    try code.uxtw(info.reg, src);
+    try destCommit(code, reg_map, info);
+}
+
+/// wasm `i64.extend_i32_u`: zero-extend 32-bit operand to 64 bits. Same
+/// emit sequence as `wrap_i64` (UXTW = MOV Wd, Wn, which zero-extends
+/// into Xd), but semantically distinct in the IR.
+fn emitExtendI32U(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
     try code.uxtw(info.reg, src);
     try destCommit(code, reg_map, info);
 }
@@ -3166,19 +3263,20 @@ test "compile: zero-init of declared local (beyond params)" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
-    // Layout (large-frame prologue, 3 words):
-    //   [0]   SUB SP, SP, #frame_size
-    //   [4]   STP FP, LR, [SP]
-    //   [8]   MOV FP, SP
-    //   [12]..[48] 10× callee-save STR (40 bytes)
-    //   [52]  STR x0 vmctx, [56] MOVZ x16, [60]/[64] STR x16 → locals.
-    const movz_word = std.mem.readInt(u32, code[56..][0..4], .little);
+    // Layout (small-frame prologue, 2 words — spill region sized
+    // dynamically from vreg count so this function's frame fits in the
+    // STP pre-index scaled imm7 range):
+    //   [0]   STP FP, LR, [SP, #-frame_size]!
+    //   [4]   MOV FP, SP
+    //   [8]..[44] 10× callee-save STR (40 bytes)
+    //   [48]  STR x0 vmctx, [52] MOVZ x16, [56]/[60] STR x16 → locals.
+    const movz_word = std.mem.readInt(u32, code[52..][0..4], .little);
     // MOVZ X16, #0, LSL #0 = 0xD2800000 | (0<<5) | 16 = 0xD2800010
     try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
-    const str0 = std.mem.readInt(u32, code[60..][0..4], .little);
+    const str0 = std.mem.readInt(u32, code[56..][0..4], .little);
     // STR x16, [fp, #24]: rt=16, rn=29, imm12=3 → 0xF9000000|(3<<10)|(29<<5)|16
     try std.testing.expectEqual(@as(u32, 0xF9000FB0), str0);
-    const str1 = std.mem.readInt(u32, code[64..][0..4], .little);
+    const str1 = std.mem.readInt(u32, code[60..][0..4], .little);
     // STR x16, [fp, #32]: imm12=4 → 0xF9000000|(4<<10)|(29<<5)|16
     try std.testing.expectEqual(@as(u32, 0xF90013B0), str1);
 }
@@ -3295,4 +3393,42 @@ test "compile: binop with spilled operands emits LDR/STR via spill slots" {
         }
     }
     try std.testing.expect(found_ldr_from_fp);
+}
+
+test "compileFunction: FMA fusion does not skip mul with non-arith uses" {
+    // Regression test for a bug where the FMA fusion pre-pass only
+    // counted vreg uses in binary ops. A mul whose dest was read by BOTH
+    // a subsequent `add` AND a `local_set` was miscounted as single-use,
+    // fused into a MADD, and its original mul emission was skipped —
+    // leaving the vreg unbound when `local_set` later tried to read it.
+    //
+    // This mirrors the pattern CoreMark's `core_state_transition` hits:
+    //   %v3 = mul %v0, %v1        ; marked single-use, skipped
+    //   %v4 = add %v3, %v2        ; emits MADD using mul_lhs/mul_rhs
+    //   local_set %v3             ; UnboundVReg — v3 was never written
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1); // 1 local (for local_set)
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const block = func.getBlock(b0);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    const v4 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v0, .rhs = v1 } }, .dest = v3, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v3, .rhs = v2 } }, .dest = v4, .type = .i32 });
+    // Second (non-binary-op) use of v3 — local_set. If the pre-pass
+    // misses this use, the mul is fused away and compilation fails with
+    // error.UnboundVReg when we get here.
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v3 } }, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v4 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
 }
