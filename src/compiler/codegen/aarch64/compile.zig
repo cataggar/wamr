@@ -2113,13 +2113,7 @@ fn emitCall(
     // For tail calls these writes are dead, but arg staging still reads
     // back from these slots as the stable per-reg source locations for
     // args whose source reg is clobbered by an earlier arg's target.
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, cl.args);
 
     // Move arguments into x1..x7. `clobbered` tracks which caller-save
     // regs have been overwritten by earlier staging in this same call;
@@ -2505,13 +2499,7 @@ fn emitTableSet(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ ts.idx, ts.val });
 
     // x1 = table_idx, x2 = idx, x3 = val, x0 = vmctx.
     try code.movImm32(.x1, @intCast(ts.table_idx));
@@ -2535,9 +2523,64 @@ fn emitTableSet(
 /// currently-bound vreg is in `dying`. Used by call emitters to skip
 /// the post-call restore of caller-save regs that are dead after the
 /// call (their vreg's last static use is the call itself).
+/// Pre-call save loop: store currently-used caller-save physregs to the
+/// per-function `call_save_base` slot area, so `stageArgFromSaved` can
+/// fall back to the slot when an earlier arg's target clobbers a later
+/// arg's source. Greedy: saves every used caller-save reg (conservative).
+/// Regalloc: limits saves to caller-save regs holding an arg source,
+/// since regalloc proves all other caller-save values are dead at the
+/// call.
+fn saveCallerSaveForCall(
+    code: *emit.CodeBuffer,
+    reg_map: *const RegMap,
+    fctx: *const FuncCompileCtx,
+    used_snapshot: []const bool,
+    arg_sources: []const ir.VReg,
+) !void {
+    const save_mask: u16 = if (reg_map.alloc_result != null)
+        callerSaveArgMask(reg_map, arg_sources)
+    else
+        std.math.maxInt(u16);
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        if ((save_mask >> @intCast(i)) & 1 == 0) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+}
+
 fn dyingCallerSaveMask(reg_map: *const RegMap, dying: []const ir.VReg) u16 {
     var mask: u16 = 0;
     for (dying) |v| {
+        const loc = reg_map.get(v) orelse continue;
+        switch (loc) {
+            .reg => |r| {
+                for (RegMap.scratch_regs, 0..) |sr, i| {
+                    if (sr == r) {
+                        if (i < RegMap.caller_saved_count) {
+                            mask |= (@as(u16, 1) << @intCast(i));
+                        }
+                        break;
+                    }
+                }
+            },
+            .stack => {},
+        }
+    }
+    return mask;
+}
+
+/// Bitmask over `RegMap.scratch_regs` indices of caller-save regs that
+/// currently hold one of the given `args` vregs. Used under regalloc to
+/// limit pre-call save-loops to regs whose values the parallel-move arg
+/// staging actually needs to preserve. All other caller-save regs hold
+/// dead values at the call (regalloc ensures no live vreg spans the
+/// clobber point) and don't need to be spilled.
+fn callerSaveArgMask(reg_map: *const RegMap, args: []const ir.VReg) u16 {
+    var mask: u16 = 0;
+    for (args) |v| {
         const loc = reg_map.get(v) orelse continue;
         switch (loc) {
             .reg => |r| {
@@ -2610,13 +2653,7 @@ fn emitTableGrow(
 ) !void {
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ tg.init, tg.delta });
 
     // x1 = init, x2 = delta, x3 = table_idx, x0 = vmctx.
     try stageArgFromSaved(code, reg_map, fctx, .x1, tg.init, 0);
@@ -2681,12 +2718,11 @@ fn emitCallIndirect(
     // Snapshot live caller-save regs and spill to call_save.
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
+    {
+        var all_args: [8]ir.VReg = undefined;
+        all_args[0] = ci.elem_idx;
+        for (ci.args, 0..) |a, i| all_args[1 + i] = a;
+        try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args[0 .. 1 + ci.args.len]);
     }
 
     // Stage `elem_idx` into a callee-safe spot: write it to a dedicated
@@ -2834,12 +2870,11 @@ fn emitCallRef(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
+    {
+        var all_args: [8]ir.VReg = undefined;
+        all_args[0] = cr.func_ref;
+        for (cr.args, 0..) |a, i| all_args[1 + i] = a;
+        try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args[0 .. 1 + cr.args.len]);
     }
 
     // Load the 64-bit func_ref pointer into tmp0. tmp0 is x16 (non-
@@ -2985,14 +3020,7 @@ fn emitVmctxHelperCall(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, args);
 
     // Stage VReg args into x1..xN from stable post-snapshot storage.
     const arg_regs = [_]emit.Reg{ .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
@@ -3082,13 +3110,7 @@ fn emitTableInit(
     // Snapshot and save live caller-saved regs.
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ ti.src, ti.dst, ti.len });
 
     // x3 = dst | (src << 32). Build in x3 via tmp0 scratch.
     try readVregStable(code, reg_map, fctx, ti.src, .x3);
@@ -3132,13 +3154,7 @@ fn emitElemDrop(
     // Helper: elemDropHelper(vmctx, seg_idx: u32)
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{});
 
     try code.movImm32(.x1, @bitCast(seg_idx));
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
@@ -3546,13 +3562,7 @@ fn emitAtomicNotify(
 ) !void {
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ an.base, an.count });
 
     // x1 = zext32(base) + offset
     try stageArgFromSaved(code, reg_map, fctx, .x1, an.base, 0);
@@ -3605,13 +3615,7 @@ fn emitAtomicWait(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ aw.base, aw.expected, aw.timeout });
 
     // x1 = zext32(base) + offset
     try stageArgFromSaved(code, reg_map, fctx, .x1, aw.base, 0);
