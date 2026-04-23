@@ -527,6 +527,14 @@ pub fn compileFunctionImpl(
     defer mul_fused.deinit();
     var fma_info = std.AutoHashMap(ir.VReg, FmaInfo).init(allocator);
     defer fma_info.deinit();
+    // TEMP: FMA fusion is unsound when regalloc owns live ranges — the IR
+    // liveness analysis (analysis.computeLiveRanges) ends mul_lhs/mul_rhs at
+    // the mul position, but codegen reads them at the add position. If any
+    // instruction between mul and add gets a new dest assigned to one of
+    // those regs, the fused MADD reads garbage. Disabling until live-range
+    // extension for FMA pairs lands.
+    const fma_disabled = reg_map.alloc_result != null;
+    if (!fma_disabled) {
     for (func.blocks.items) |block| {
         const insts = block.instructions.items;
         var i: usize = 0;
@@ -575,6 +583,7 @@ pub fn compileFunctionImpl(
                 break;
             }
         }
+    }
     }
     fctx.mul_fused = &mul_fused;
     fctx.fma_info = &fma_info;
