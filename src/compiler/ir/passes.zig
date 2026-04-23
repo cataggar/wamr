@@ -798,6 +798,37 @@ pub fn forwardLocalGet(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     return changed;
 }
 
+/// Remove `local.set K, v` for any local K that is never read by a
+/// `local.get` anywhere in the function. This is intra-procedural and
+/// trivially sound: wasm locals are frame-scoped; calls never observe
+/// them. In practice this fires heavily after `forwardLocalGet` has
+/// rewritten all reads away.
+pub fn deadLocalSetElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var live_locals = std.AutoHashMap(u32, void).init(allocator);
+    defer live_locals.deinit();
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .local_get) try live_locals.put(inst.op.local_get, {});
+        }
+    }
+
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            const inst = block.instructions.items[i];
+            if (inst.op == .local_set and !live_locals.contains(inst.op.local_set.idx)) {
+                _ = block.instructions.orderedRemove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    return changed;
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
     for (module.functions.items) |*func| {
@@ -826,6 +857,7 @@ pub const default_passes: []const PassFn = &.{
     &strengthReduceMul,
     &commonSubexprElimination,
     &deadCodeElimination,
+    &deadLocalSetElimination,
     &elideRedundantBoundsChecks,
 };
 
@@ -1528,4 +1560,47 @@ test "forwardLocalGet: repeated gets without set share the first dest" {
     // Both adds' operands should coalesce to v_a (the first get's dest).
     try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.lhs);
     try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.rhs);
+}
+
+test "deadLocalSetElimination: removes set of never-read local" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2); // 2 locals
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_c = func.newVReg();
+    const v_g = func.newVReg();
+    // local 0 is set but never read; local 1 is set and read.
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = v_g, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_g } });
+
+    const changed = try deadLocalSetElimination(&func, allocator);
+    try std.testing.expect(changed);
+    // Only the set for local 0 should be removed.
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    // Verify the remaining set is for local 1.
+    try std.testing.expectEqual(@as(u32, 1), block.instructions.items[1].op.local_set.idx);
+}
+
+test "deadLocalSetElimination: keeps set when local is read" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_c = func.newVReg();
+    const v_g = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_g, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_g } });
+
+    const changed = try deadLocalSetElimination(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
 }
