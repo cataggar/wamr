@@ -8,6 +8,7 @@ const std = @import("std");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
 const regalloc = @import("../../ir/regalloc.zig");
+const analysis = @import("../../ir/analysis.zig");
 
 /// Simple VReg → physical register mapping.
 ///
@@ -289,30 +290,17 @@ pub fn compileFunctionImpl(
     // Phase 1b: stack args beyond x7 aren't supported yet.
     if (func.param_count > 7) return error.TooManyParams;
 
-    // Phase 2 of regalloc adoption (issue #100): run the linear-scan
-    // allocator in shadow mode. Its output is discarded here; the
-    // scavenger (`RegMap`) still drives codegen. The purpose is to
-    // exercise `regalloc.allocate` + `collectClobberPoints` on every
-    // function the test suite and CoreMark compile, so that Phase 3
-    // (the emitter flip) starts from a known-good analysis.
+    // Phase 3 of regalloc adoption (issue #100): drive RegMap from a real
+    // linear-scan allocation. `RegMap.assign` consults `alloc_result` first;
+    // greedy scavenging remains as a fallback for vregs the allocator had no
+    // opinion on.
     //
-    // If this errors or trips an internal assertion, it's a genuine
-    // bug — either in the IR, in `analysis.computeLiveRanges`, or in
-    // the allocator — and we want it to surface loudly here rather
-    // than in Phase 3 mixed with codegen changes.
-    // Phase 3: drive RegMap from a real linear-scan allocation.
-    // `RegMap.assign` consults `alloc_result` first; greedy scavenging
-    // remains as a fallback for vregs the allocator had no opinion on.
+    // The actual `regalloc.allocate` call is deferred until after the FMA
+    // fusion pre-pass below, because fused MADD/MSUB reads a mul's sources
+    // at the add position; we need to extend those vregs' live ranges past
+    // the mul before allocation so the sources' physregs aren't reassigned.
     var clobbers = try collectClobberPoints(func, allocator);
     defer clobbers.deinit(allocator);
-
-    var alloc_result = try regalloc.allocate(
-        func,
-        allocator,
-        aarch64RegSet(func.local_count),
-        clobbers.items,
-    );
-    defer alloc_result.deinit();
 
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
@@ -361,7 +349,7 @@ pub fn compileFunctionImpl(
 
     var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
     defer reg_map.deinit();
-    reg_map.alloc_result = &alloc_result;
+    // `reg_map.alloc_result` is assigned after the FMA pre-pass below.
 
     var fctx = ctx;
     fctx.call_save_base = call_save_base;
@@ -527,66 +515,104 @@ pub fn compileFunctionImpl(
     defer mul_fused.deinit();
     var fma_info = std.AutoHashMap(ir.VReg, FmaInfo).init(allocator);
     defer fma_info.deinit();
-    // TEMP: FMA fusion is unsound when regalloc owns live ranges — the IR
-    // liveness analysis (analysis.computeLiveRanges) ends mul_lhs/mul_rhs at
-    // the mul position, but codegen reads them at the add position. If any
-    // instruction between mul and add gets a new dest assigned to one of
-    // those regs, the fused MADD reads garbage. Disabling until live-range
-    // extension for FMA pairs lands.
-    const fma_disabled = reg_map.alloc_result != null;
-    if (!fma_disabled) {
-    for (func.blocks.items) |block| {
-        const insts = block.instructions.items;
-        var i: usize = 0;
-        while (i < insts.len) : (i += 1) {
-            const add_inst = insts[i];
-            const is_add = add_inst.op == .add;
-            const is_sub = add_inst.op == .sub;
-            if (!is_add and !is_sub) continue;
-            if (add_inst.type != .i32 and add_inst.type != .i64) continue;
-            const bin: ir.Inst.BinOp = switch (add_inst.op) {
-                .add => |b| b, .sub => |b| b, else => continue,
-            };
-            const candidates: [2]?ir.VReg = if (is_add)
-                .{ bin.rhs, bin.lhs }
-            else
-                .{ bin.rhs, null };
-            for (candidates) |maybe_mul_dest| {
-                const mul_dest = maybe_mul_dest orelse continue;
-                const uc = use_counts.get(mul_dest) orelse continue;
-                if (uc != 1) continue;
-                var found_bin: ?ir.Inst.BinOp = null;
-                var j: usize = i;
-                while (j > 0) : (j -= 1) {
-                    const prev = insts[j - 1];
-                    if (prev.dest) |d| {
-                        if (d != mul_dest) continue;
-                        if (prev.op == .mul and prev.type == add_inst.type) {
-                            found_bin = prev.op.mul;
-                        }
-                        break;
-                    }
-                }
-                const mul_bin = found_bin orelse continue;
-                const addend = if (is_add and maybe_mul_dest.? == bin.lhs)
-                    bin.rhs
+    // Map from FMA add's dest vreg → global instruction position of the add.
+    // Used below to extend `mul_lhs`/`mul_rhs`/`addend` live ranges past the
+    // mul, so regalloc doesn't reassign their physregs before MADD/MSUB reads
+    // them at the add position.
+    var fma_add_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer fma_add_pos.deinit();
+    {
+        var global_idx: u32 = 0;
+        for (func.blocks.items) |block| {
+            const insts = block.instructions.items;
+            var i: usize = 0;
+            while (i < insts.len) : (i += 1) {
+                defer global_idx += 1;
+                const add_inst = insts[i];
+                const is_add = add_inst.op == .add;
+                const is_sub = add_inst.op == .sub;
+                if (!is_add and !is_sub) continue;
+                if (add_inst.type != .i32 and add_inst.type != .i64) continue;
+                const bin: ir.Inst.BinOp = switch (add_inst.op) {
+                    .add => |b| b, .sub => |b| b, else => continue,
+                };
+                const candidates: [2]?ir.VReg = if (is_add)
+                    .{ bin.rhs, bin.lhs }
                 else
-                    bin.lhs;
-                try mul_fused.put(mul_dest, {});
-                const dest = add_inst.dest orelse continue;
-                try fma_info.put(dest, .{
-                    .mul_lhs = mul_bin.lhs,
-                    .mul_rhs = mul_bin.rhs,
-                    .addend = addend,
-                    .is_sub = is_sub,
-                });
-                break;
+                    .{ bin.rhs, null };
+                for (candidates) |maybe_mul_dest| {
+                    const mul_dest = maybe_mul_dest orelse continue;
+                    const uc = use_counts.get(mul_dest) orelse continue;
+                    if (uc != 1) continue;
+                    var found_bin: ?ir.Inst.BinOp = null;
+                    var j: usize = i;
+                    while (j > 0) : (j -= 1) {
+                        const prev = insts[j - 1];
+                        if (prev.dest) |d| {
+                            if (d != mul_dest) continue;
+                            if (prev.op == .mul and prev.type == add_inst.type) {
+                                found_bin = prev.op.mul;
+                            }
+                            break;
+                        }
+                    }
+                    const mul_bin = found_bin orelse continue;
+                    const addend = if (is_add and maybe_mul_dest.? == bin.lhs)
+                        bin.rhs
+                    else
+                        bin.lhs;
+                    try mul_fused.put(mul_dest, {});
+                    const dest = add_inst.dest orelse continue;
+                    try fma_info.put(dest, .{
+                        .mul_lhs = mul_bin.lhs,
+                        .mul_rhs = mul_bin.rhs,
+                        .addend = addend,
+                        .is_sub = is_sub,
+                    });
+                    try fma_add_pos.put(dest, global_idx);
+                    break;
+                }
             }
         }
     }
-    }
     fctx.mul_fused = &mul_fused;
     fctx.fma_info = &fma_info;
+
+    // Run the linear-scan allocator. Compute live ranges first so we can
+    // extend FMA sources' ranges past the mul position (see comment above).
+    const live_ranges = try analysis.computeLiveRanges(func, allocator);
+    defer allocator.free(live_ranges);
+    if (fma_info.count() > 0) {
+        // Build a vreg→range-index lookup for the patch loop.
+        var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
+        defer range_idx.deinit();
+        try range_idx.ensureTotalCapacity(@intCast(live_ranges.len));
+        for (live_ranges, 0..) |r, idx| {
+            range_idx.putAssumeCapacity(r.vreg, idx);
+        }
+        var it = fma_info.iterator();
+        while (it.next()) |entry| {
+            const add_dest = entry.key_ptr.*;
+            const fi = entry.value_ptr.*;
+            const add_pos = fma_add_pos.get(add_dest) orelse continue;
+            inline for (.{ fi.mul_lhs, fi.mul_rhs, fi.addend }) |src| {
+                if (range_idx.get(src)) |idx| {
+                    if (live_ranges[idx].end < add_pos) {
+                        live_ranges[idx].end = add_pos;
+                    }
+                }
+            }
+        }
+    }
+
+    var alloc_result = try regalloc.allocateFromRanges(
+        allocator,
+        aarch64RegSet(func.local_count),
+        clobbers.items,
+        live_ranges,
+    );
+    defer alloc_result.deinit();
+    reg_map.alloc_result = &alloc_result;
 
     // Liveness-driven register scavenging: compute, for each instruction,
     // the set of vregs whose *last* static read occurs at that instruction.
