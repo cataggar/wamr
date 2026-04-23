@@ -417,6 +417,116 @@ fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64) ?i64 {
     };
 }
 
+// ── Strength Reduction ──────────────────────────────────────────────────────
+
+/// Return the shift amount `k` if `c` is a power of two that fits
+/// within a legal shift for `ir_type` (i32 → k in [1,31], i64 → k in [1,63]).
+/// For i32, `c` is interpreted modulo 2^32 since wasm `i32.mul` is modular,
+/// so `c = 0x80000000` (negative as i32) correctly maps to a shift of 31.
+/// Returns `null` for `c == 0`, `c == 1`, non-powers-of-two, or shift
+/// amounts outside the legal range.
+fn powerOfTwoShift(c: i64, ir_type: ir.IrType) ?u6 {
+    const u: u64 = switch (ir_type) {
+        .i32 => @as(u32, @truncate(@as(u64, @bitCast(c)))),
+        .i64 => @bitCast(c),
+        else => return null,
+    };
+    if (u <= 1) return null;
+    if (u & (u - 1) != 0) return null; // not a power of two
+    const k: u6 = @intCast(@ctz(u));
+    const max: u6 = if (ir_type == .i32) 31 else 63;
+    if (k == 0 or k > max) return null;
+    return k;
+}
+
+/// Rewrite `mul(x, 2^k)` → `shl(x, k)`. `imul` has higher latency than
+/// `shl` on modern x86-64 (3 vs 1 cycles) and on AArch64, so this is a
+/// win for both backends and for code size (no 64-bit immediate needed).
+///
+/// Matches when either operand of a `.mul` is defined by an `iconst_32`
+/// / `iconst_64` whose value is a power of two in `[2, 2^31]` (i32) or
+/// `[2, 2^63]` (i64). A new iconst for the shift amount is inserted
+/// immediately before the rewritten instruction; the original constant
+/// instruction is left untouched (DCE will remove it if it becomes
+/// unused).
+pub fn strengthReduceMul(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer constants.deinit();
+
+    for (func.blocks.items) |*block| {
+        // Build constants map for this block (linear SSA within a block is
+        // sufficient: all producers of a power-of-two constant we care about
+        // are iconst_32 / iconst_64 instructions defined earlier in the same
+        // block via the frontend's straight-line lowering of `i32.const`.)
+        constants.clearRetainingCapacity();
+
+        var i: usize = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const inst = block.instructions.items[i];
+            switch (inst.op) {
+                .iconst_32 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .iconst_64 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .mul => |bin| {
+                    const dest = inst.dest orelse continue;
+                    // Determine which operand is the constant power of two.
+                    const lhs_const = constants.get(bin.lhs);
+                    const rhs_const = constants.get(bin.rhs);
+
+                    var non_const_vreg: ir.VReg = undefined;
+                    var k: u6 = undefined;
+                    if (rhs_const) |c| {
+                        if (powerOfTwoShift(c, inst.type)) |s| {
+                            non_const_vreg = bin.lhs;
+                            k = s;
+                        } else if (lhs_const) |lc| {
+                            if (powerOfTwoShift(lc, inst.type)) |s| {
+                                non_const_vreg = bin.rhs;
+                                k = s;
+                            } else continue;
+                        } else continue;
+                    } else if (lhs_const) |c| {
+                        if (powerOfTwoShift(c, inst.type)) |s| {
+                            non_const_vreg = bin.rhs;
+                            k = s;
+                        } else continue;
+                    } else continue;
+
+                    // Insert a fresh iconst for the shift amount *before* the
+                    // mul, then rewrite the mul into a shl.
+                    const shift_vreg = func.newVReg();
+                    const shift_op: ir.Inst.Op = if (inst.type == .i64)
+                        .{ .iconst_64 = @intCast(k) }
+                    else
+                        .{ .iconst_32 = @intCast(k) };
+                    try block.instructions.insert(
+                        block.allocator,
+                        i,
+                        .{ .op = shift_op, .dest = shift_vreg, .type = inst.type },
+                    );
+                    // After insertion, what was at index i is now at i+1.
+                    block.instructions.items[i + 1].op = .{ .shl = .{
+                        .lhs = non_const_vreg,
+                        .rhs = shift_vreg,
+                    } };
+                    block.instructions.items[i + 1].dest = dest;
+                    // Record the new shift amount constant so downstream muls
+                    // in the same block can see it (harmless — value is small).
+                    try constants.put(shift_vreg, @intCast(k));
+                    changed = true;
+                    i += 1; // skip over the newly-inserted iconst
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 // ── Dead Code Elimination ───────────────────────────────────────────────────
 
 /// Remove instructions whose dest VReg is never used.
@@ -594,6 +704,7 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 /// The default optimization pipeline.
 pub const default_passes: []const PassFn = &.{
     &constantFold,
+    &strengthReduceMul,
     &commonSubexprElimination,
     &deadCodeElimination,
 };
@@ -1054,4 +1165,155 @@ test "reorderBlocks: unreachable block appended at end" {
     try std.testing.expectEqual(@as(ir.BlockId, 1), order[1]);
     // Unreachable block 2 at end
     try std.testing.expectEqual(@as(ir.BlockId, 2), order[2]);
+}
+
+test "strengthReduceMul: mul(x, 8) → shl(x, 3)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg(); // param (fake)
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMul(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Block should now be: iconst_32=8, iconst_32=3, shl(v_x, new_vreg), ret
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 3 }, block.instructions.items[1].op);
+    const shl = block.instructions.items[2];
+    switch (shl.op) {
+        .shl => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+            try std.testing.expectEqual(block.instructions.items[1].dest.?, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(v_r, shl.dest.?);
+}
+
+test "strengthReduceMul: commutative mul(C, x)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_c, .rhs = v_x } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMul(&func, allocator);
+    try std.testing.expect(changed);
+    const shl = block.instructions.items[2];
+    switch (shl.op) {
+        .shl => |bin| try std.testing.expectEqual(v_x, bin.lhs),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 4 }, block.instructions.items[1].op);
+}
+
+test "strengthReduceMul: i64 mul by power of two" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 1 << 40 }, .dest = v_c, .type = .i64 });
+    try block.append(.{
+        .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } },
+        .dest = v_r,
+        .type = .i64,
+    });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMul(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = 40 }, block.instructions.items[1].op);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[1].type);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[2].type);
+}
+
+test "strengthReduceMul: does not rewrite mul by non-power-of-two" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMul(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(usize, 3), block.instructions.items.len);
+    switch (block.instructions.items[1].op) {
+        .mul => {},
+        else => try std.testing.expect(false),
+    }
+}
+
+test "strengthReduceMul: skips C=1 and C=0 and negatives" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c0 = func.newVReg();
+    const v_c1 = func.newVReg();
+    const v_cneg = func.newVReg();
+    const v_r0 = func.newVReg();
+    const v_r1 = func.newVReg();
+    const v_rn = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_c0 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c1 });
+    try block.append(.{ .op = .{ .iconst_32 = -4 }, .dest = v_cneg });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c0 } }, .dest = v_r0 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c1 } }, .dest = v_r1 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_cneg } }, .dest = v_rn });
+    try block.append(.{ .op = .{ .ret = v_r0 } });
+
+    const changed = try strengthReduceMul(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "strengthReduceMul: i32 does not rewrite shift >= 32" {
+    // 2^32 fits in i64 but is illegal as an i32 shift amount.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    // i32 iconst; value 1<<31 = -2147483648 as i32 → still a power of two,
+    // and 31 is a legal shift amount, so this should rewrite.
+    try block.append(.{ .op = .{ .iconst_32 = @bitCast(@as(u32, 1) << 31) }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMul(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 31 }, block.instructions.items[1].op);
 }
