@@ -602,7 +602,6 @@ fn compileInst(
         // ── Unary bit ops ────────────────────────────────────────────
         .clz => |vreg| try emitClz(code, inst, vreg, reg_map),
         .ctz => |vreg| try emitCtz(code, inst, vreg, reg_map),
-        // popcnt requires NEON (CNT on V-reg). Deferred.
 
         // ── Sign extension / wrap ────────────────────────────────────
         .extend8_s => |vreg| try emitExtendImpl(code, inst, vreg, reg_map, .b),
@@ -674,6 +673,16 @@ fn compileInst(
         .f_neg => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .neg),
         .f_abs => |vreg| try emitFSignBit(code, inst, vreg, reg_map, .abs),
         .f_sqrt => |vreg| try emitFSqrt(code, inst, vreg, reg_map),
+        .f_ceil => |vreg| try emitFRint(code, inst, vreg, reg_map, .ceil),
+        .f_floor => |vreg| try emitFRint(code, inst, vreg, reg_map, .floor),
+        .f_trunc => |vreg| try emitFRint(code, inst, vreg, reg_map, .trunc),
+        .f_nearest => |vreg| try emitFRint(code, inst, vreg, reg_map, .nearest),
+
+        .f_min => |bin| try emitFMinMax(code, inst, bin, reg_map, .min),
+        .f_max => |bin| try emitFMinMax(code, inst, bin, reg_map, .max),
+        .f_copysign => |bin| try emitFCopysign(code, inst, bin, reg_map),
+
+        .popcnt => |vreg| try emitPopcnt(code, inst, vreg, reg_map),
 
         .f_eq => |bin| try emitFCmp(code, inst, bin, reg_map, .eq),
         .f_ne => |bin| try emitFCmp(code, inst, bin, reg_map, .ne),
@@ -1023,6 +1032,137 @@ fn emitFSqrt(
     try code.fsqrtScalar(is64, 0, 0);
     if (is64) try code.fmovGpFromD64(info.reg, 0)
     else try code.fmovGpFromS32(info.reg, 0);
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit f.ceil / f.floor / f.trunc / f.nearest via FRINT{P,M,Z,N} on a
+/// scratch V-reg.
+fn emitFRint(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+    mode: emit.CodeBuffer.FRoundMode,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const is64 = (inst.type == .f64);
+    if (is64) try code.fmovDFromGp64(0, src)
+    else try code.fmovSFromGp32(0, src);
+    try code.frintScalar(is64, mode, 0, 0);
+    if (is64) try code.fmovGpFromD64(info.reg, 0)
+    else try code.fmovGpFromS32(info.reg, 0);
+    try destCommit(code, reg_map, info);
+}
+
+const FMinMaxKind = enum { min, max };
+
+/// Emit f.min / f.max via FMIN/FMAX on scratch V-regs V0,V1.
+/// ARM FMIN/FMAX propagate NaNs and handle ±0 per wasm spec.
+fn emitFMinMax(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+    kind: FMinMaxKind,
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+
+    const is64 = (inst.type == .f64);
+    if (is64) {
+        try code.fmovDFromGp64(0, lhs);
+        try code.fmovDFromGp64(1, rhs);
+    } else {
+        try code.fmovSFromGp32(0, lhs);
+        try code.fmovSFromGp32(1, rhs);
+    }
+    switch (kind) {
+        .min => try code.fminScalar(is64, 0, 0, 1),
+        .max => try code.fmaxScalar(is64, 0, 0, 1),
+    }
+    if (is64) {
+        try code.fmovGpFromD64(info.reg, 0);
+    } else {
+        try code.fmovGpFromS32(info.reg, 0);
+    }
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit f.copysign: dest = (lhs & ~sign) | (rhs & sign).
+/// Implemented as pure integer bit-twiddling on the float bit pattern —
+/// no V-register needed. Mirrors emitFSignBit.
+fn emitFCopysign(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.BinOp,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
+    const rhs = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+
+    const is32 = (inst.type == .f32);
+    const sign_mask: u64 = if (is32) @as(u64, 0x80000000) else @as(u64, 0x8000000000000000);
+    const magnitude_mask: u64 = if (is32) @as(u64, 0x7FFFFFFF) else @as(u64, 0x7FFFFFFFFFFFFFFF);
+
+    // tmp2 already holds dest scratch; we need one more scratch for the
+    // masked rhs. Reuse lhs's slot after we've consumed it: materialize
+    // the masks into info.reg and a helper, then combine.
+    //
+    // Sequence (using info.reg as dest, and one temp):
+    //   mov   temp, magnitude_mask
+    //   and   info.reg, lhs, temp
+    //   mov   temp, sign_mask
+    //   and   temp, rhs, temp
+    //   orr   info.reg, info.reg, temp
+    //
+    // Pick a scratch distinct from lhs, rhs, info.reg.
+    const scratch: emit.Reg = blk: {
+        const candidates = [_]emit.Reg{ RegMap.tmp0, RegMap.tmp1, RegMap.tmp2 };
+        for (candidates) |c| {
+            if (c != lhs and c != rhs and c != info.reg) break :blk c;
+        }
+        unreachable;
+    };
+
+    try code.movImm64(scratch, magnitude_mask);
+    try code.andRegReg(info.reg, lhs, scratch);
+    try code.movImm64(scratch, sign_mask);
+    try code.andRegReg(scratch, rhs, scratch);
+    try code.orrRegReg(info.reg, info.reg, scratch);
+
+    try destCommit(code, reg_map, info);
+}
+
+/// Emit wasm i32/i64.popcnt via NEON CNT + ADDV on scratch V0.
+///
+/// Sequence:
+///   FMOV d0, Xsrc     ; move 64 bits of src into V0
+///   CNT  v0.8b, v0.8b ; per-byte popcount (0..8 in each byte)
+///   ADDV b0, v0.8b    ; horizontal sum of the 8 bytes into B0
+///   FMOV Xd, d0       ; move the byte result back to GPR
+///
+/// For i32 src, the frontend zero-extends to 64 bits in the source vreg
+/// (upper 32 bits are always zero in our codegen), so the 64-bit popcount
+/// equals the 32-bit one.
+fn emitPopcnt(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    vreg: ir.VReg,
+    reg_map: *RegMap,
+) !void {
+    const dest = inst.dest orelse return;
+    const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    try code.fmovDFromGp64(0, src);
+    try code.cnt8b(0, 0);
+    try code.addvB8b(0, 0);
+    try code.fmovGpFromD64(info.reg, 0);
     try destCommit(code, reg_map, info);
 }
 
@@ -3311,8 +3451,22 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
 }
 
 test "compile: unimplemented op returns error.UnimplementedOp" {
-    // popcnt is not yet implemented (needs NEON CNT) — must fail loudly,
+    // atomic_fence is not yet implemented on aarch64 — must fail loudly,
     // not silently drop.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    try func.getBlock(bid).append(.{
+        .op = .{ .atomic_fence = {} },
+        .dest = null,
+        .type = .void,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = null } });
+    try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
+}
+
+test "compile: popcnt round-trips via CNT + ADDV" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -3326,7 +3480,18 @@ test "compile: unimplemented op returns error.UnimplementedOp" {
         .type = .i32,
     });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v1 } });
-    try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // Three 4-byte instructions we expect somewhere in the body:
+    //   FMOV d0, Xsrc, CNT v0.8b,v0.8b, ADDV b0,v0.8b, FMOV Xd,d0.
+    // Just sanity-check CNT v0.8b, v0.8b (0x0E205800) appears.
+    var found_cnt = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if (w == 0x0E205800) found_cnt = true;
+    }
+    try std.testing.expect(found_cnt);
 }
 
 test "compile: .call without linkage context returns CallLinkageUnavailable" {

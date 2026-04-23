@@ -575,6 +575,55 @@ pub const CodeBuffer = struct {
         try self.emit32(0x1E21C000 | (ty << 22) | (@as(u32, vn) << 5) | vd);
     }
 
+    /// FMIN Sd, Sn, Sm / FMIN Dd, Dn, Dm — IEEE-754 minNum.
+    /// NaN-propagating (matches wasm's f.min for non-NaN inputs).
+    pub fn fminScalar(self: *CodeBuffer, is_f64: bool, vd: u5, vn: u5, vm: u5) !void {
+        return self.emitFBinOp(is_f64, .min, vd, vn, vm);
+    }
+
+    /// FMAX Sd, Sn, Sm / FMAX Dd, Dn, Dm — IEEE-754 maxNum.
+    pub fn fmaxScalar(self: *CodeBuffer, is_f64: bool, vd: u5, vn: u5, vm: u5) !void {
+        return self.emitFBinOp(is_f64, .max, vd, vn, vm);
+    }
+
+    /// Rounding mode for FRINT* (floating-point round to integral).
+    /// Values are opcode[2:0] at bits [17:15] in the 1-source FP encoding;
+    /// opcode[5:3] is the fixed prefix `001` already present in the base.
+    pub const FRoundMode = enum(u3) {
+        /// FRINTN — round to nearest, ties to even (wasm f.nearest).
+        nearest = 0b000,
+        /// FRINTP — round toward +inf (wasm f.ceil).
+        ceil = 0b001,
+        /// FRINTM — round toward -inf (wasm f.floor).
+        floor = 0b010,
+        /// FRINTZ — round toward zero, a.k.a. truncate (wasm f.trunc).
+        trunc = 0b011,
+    };
+
+    /// FRINTN/P/M/Z Sd, Sn / FRINTN/P/M/Z Dd, Dn — round to integral.
+    pub fn frintScalar(self: *CodeBuffer, is_f64: bool, mode: FRoundMode, vd: u5, vn: u5) !void {
+        // 0001 1110 0 ty 1 001 <mode:3> 10000 Rn Rd
+        const ty: u32 = if (is_f64) 1 else 0;
+        const m: u32 = @intFromEnum(mode);
+        try self.emit32(0x1E244000 | (ty << 22) | (m << 15) |
+            (@as(u32, vn) << 5) | vd);
+    }
+
+    /// CNT Vd.8B, Vn.8B — population count per byte in the low 64 bits of
+    /// a V register. Each destination byte holds popcount(0..=8) of the
+    /// corresponding source byte. Used to implement wasm i32/i64.popcnt
+    /// by following with ADDV B, Bd, Vn.8B to sum all bytes.
+    pub fn cnt8b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        // 0 Q 1 01110 size 10000 00101 10 Rn Rd, Q=0 (8B), size=00
+        try self.emit32(0x0E205800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// ADDV Bd, Vn.8B — sum all 8 bytes of Vn into the low byte of Vd.
+    pub fn addvB8b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        // 0 Q 0 01110 size 11000 11011 10 Rn Rd, Q=0, size=00
+        try self.emit32(0x0E31B800 | (@as(u32, vn) << 5) | vd);
+    }
+
     /// FCMP Sn, Sm / FCMP Dn, Dm — set NZCV from float compare.
     /// Unordered (NaN involved) sets NZCV = 0011 (N=0, Z=0, C=1, V=1).
     pub fn fcmpScalar(self: *CodeBuffer, is_f64: bool, vn: u5, vm: u5) !void {
@@ -1156,4 +1205,60 @@ test "emit: LDRSW X0, [X1, #0]" {
     defer code.deinit();
     try code.ldrswImm(.x0, .x1, 0);
     try expectWord(0xB9800020, &code);
+}
+
+test "emit: FMIN s0, s1, s2" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.fminScalar(false, 0, 1, 2);
+    try expectWord(0x1E225820, &code);
+}
+
+test "emit: FMAX d0, d1, d2" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.fmaxScalar(true, 0, 1, 2);
+    try expectWord(0x1E624820, &code);
+}
+
+test "emit: FRINTN s0, s1" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.frintScalar(false, .nearest, 0, 1);
+    try expectWord(0x1E244020, &code);
+}
+
+test "emit: FRINTP d0, d1 (ceil)" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.frintScalar(true, .ceil, 0, 1);
+    try expectWord(0x1E64C020, &code);
+}
+
+test "emit: FRINTM s0, s1 (floor)" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.frintScalar(false, .floor, 0, 1);
+    try expectWord(0x1E254020, &code);
+}
+
+test "emit: FRINTZ d0, d1 (trunc)" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.frintScalar(true, .trunc, 0, 1);
+    try expectWord(0x1E65C020, &code);
+}
+
+test "emit: CNT v0.8b, v1.8b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.cnt8b(0, 1);
+    try expectWord(0x0E205820, &code);
+}
+
+test "emit: ADDV b0, v1.8b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.addvB8b(0, 1);
+    try expectWord(0x0E31B820, &code);
 }
