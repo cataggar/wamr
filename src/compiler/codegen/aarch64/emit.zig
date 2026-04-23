@@ -690,6 +690,12 @@ pub const CodeBuffer = struct {
         try self.emit32(0x35000000 | (@as(u32, imm19) << 5) | rt.encoding());
     }
 
+    /// CBZ Xt, #imm19 — branch if 64-bit reg is zero (word offset).
+    pub fn cbz64(self: *CodeBuffer, rt: Reg, offset_words: i19) !void {
+        const imm19: u19 = @bitCast(offset_words);
+        try self.emit32(0xB4000000 | (@as(u32, imm19) << 5) | rt.encoding());
+    }
+
     /// LSE atomic read-modify-write ops (ARMv8.1-A). All variants emit a
     /// single seq-cst instruction (acquire + release) that atomically
     /// loads the old value at [Rn] into Rt and writes a derived value.
@@ -905,6 +911,14 @@ pub const CodeBuffer = struct {
         const immr: u32 = @as(u32, 64 - @as(u32, shift)) & 0x3F;
         const imms: u32 = 63 - @as(u32, shift);
         // sf=1, N=1, UBFM: 1|10|100110|1|immr(6)|imms(6)|Rn|Rd
+        try self.emit32(0xD3400000 | (immr << 16) | (imms << 10) |
+            (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// LSR Xd, Xn, #shift (64-bit). Alias of UBFM Xd, Xn, #shift, #63.
+    pub fn lsrImm(self: *CodeBuffer, rd: Reg, rn: Reg, shift: u6) !void {
+        const immr: u32 = @as(u32, shift);
+        const imms: u32 = 63;
         try self.emit32(0xD3400000 | (immr << 16) | (imms << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
@@ -1452,6 +1466,17 @@ test "emit: CBNZ W offset" {
     defer code2.deinit();
     try code2.cbnz32(.x0, 1);
     try expectWord(0x35000020, &code2);
+}
+
+test "emit: CBZ X offset" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.cbz64(.x5, 4);
+    try expectWord(0xB4000085, &code);
+    var code2 = CodeBuffer.init(std.testing.allocator);
+    defer code2.deinit();
+    try code2.cbz64(.lr, 1);
+    try expectWord(0xB400003E, &code2);
 }
 
 test "emit: LSE LDADDAL W" {

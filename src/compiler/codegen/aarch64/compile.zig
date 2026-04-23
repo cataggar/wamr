@@ -305,6 +305,15 @@ pub fn compileFunctionImpl(
                     try bumpUse(&use_counts, acx.expected);
                     try bumpUse(&use_counts, acx.replacement);
                 },
+                .atomic_notify => |an| {
+                    try bumpUse(&use_counts, an.base);
+                    try bumpUse(&use_counts, an.count);
+                },
+                .atomic_wait => |aw| {
+                    try bumpUse(&use_counts, aw.base);
+                    try bumpUse(&use_counts, aw.expected);
+                    try bumpUse(&use_counts, aw.timeout);
+                },
                 .select => |sel| {
                     try bumpUse(&use_counts, sel.cond);
                     try bumpUse(&use_counts, sel.if_true);
@@ -646,6 +655,7 @@ fn compileInst(
         // ── Direct function call ─────────────────────────────────────
         .call => |cl| try emitCall(code, inst, cl, reg_map, fctx),
         .call_indirect => |ci| try emitCallIndirect(code, inst, ci, reg_map, fctx),
+        .call_ref => |cr| try emitCallRef(code, inst, cr, reg_map, fctx),
 
         // ── Tables & function refs ───────────────────────────────────
         .table_size => |tidx| try emitTableSize(code, inst, tidx, reg_map),
@@ -738,6 +748,8 @@ fn compileInst(
         .atomic_store => |st| try emitAtomicStore(code, st, reg_map),
         .atomic_rmw => |rmw| try emitAtomicRmw(code, inst, rmw, reg_map),
         .atomic_cmpxchg => |cx| try emitAtomicCmpxchg(code, inst, cx, reg_map),
+        .atomic_notify => |an| try emitAtomicNotify(code, inst, an, reg_map, fctx),
+        .atomic_wait => |aw| try emitAtomicWait(code, inst, aw, reg_map, fctx),
 
         // ── Passive segments ─────────────────────────────────────────
         // memory.init / data.drop are AOT no-ops: active segments are
@@ -1779,6 +1791,9 @@ const vmctx_sig_table_slot: u12 = 20;    // byte 160, scale 8
 const vmctx_table_set_fn_slot: u12 = 24; // byte 192, scale 8
 const vmctx_table_init_fn_slot: u12 = 18; // byte 144, scale 8
 const vmctx_elem_drop_fn_slot: u12 = 19;  // byte 152, scale 8
+const vmctx_futex_wait32_fn_slot: u12 = 25; // byte 200, scale 8
+const vmctx_futex_wait64_fn_slot: u12 = 26; // byte 208, scale 8
+const vmctx_futex_notify_fn_slot: u12 = 27; // byte 216, scale 8
 
 // Per-table descriptor layout (`TableInfo`, 24 bytes):
 //   { ptr: u64, len: u32, _pad: u32, type_backing_ptr: u64 }
@@ -2194,7 +2209,71 @@ fn emitCallIndirect(
     }
 }
 
-/// Emit an indirect call to a host helper via a VmCtx slot, passing
+/// `.call_ref` — call via a native funcref pointer value. Null-checks
+/// the pointer (traps via `VmCtx.trap_unreachable_fn` on null), then
+/// performs an indirect call with `vmctx` in x0 and args in x1..xN.
+fn emitCallRef(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    cr: @TypeOf(@as(ir.Inst.Op, undefined).call_ref),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    if (cr.tail) return error.UnimplementedTailCall;
+    if (cr.extra_results > 0) return error.UnimplementedMultiResult;
+    if (cr.args.len > 7) return error.TooManyCallArgs;
+
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // Load the 64-bit func_ref pointer into tmp0. tmp0 is x16 (non-
+    // allocatable) so it survives arg staging below.
+    try stageArgFromSaved(code, reg_map, fctx, RegMap.tmp0, cr.func_ref);
+
+    // Null check: CBZ tmp0, trap_block; fall through on non-null.
+    // Trap block is: x0 = vmctx; tmp1 = vmctx.trap_unreachable_fn; BLR tmp1.
+    // Total 3 instructions = 12 bytes = 3 words, then BR over.
+    // Simpler: branch forward to skip trap.
+    const cbz_site = code.len();
+    try code.cbz64(RegMap.tmp0, 0); // patched below
+    // trap: load vmctx, load fn, blr (noreturn)
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp1, .x0, vmctx_trap_unreachable_fn_slot);
+    try code.blr(RegMap.tmp1);
+    // CBZ shares the b.cond imm19 encoding at bits [23:5], so the same
+    // patch helper works.
+    patchBCondHere(code, cbz_site);
+
+    // Stage args into x1..xN (tmp0 holds fn_ptr, non-allocatable).
+    for (cr.args, 0..) |arg_vreg, i| {
+        try stageArgFromSaved(code, reg_map, fctx, callArgReg(@intCast(i)), arg_vreg);
+    }
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.blr(RegMap.tmp0);
+
+    if (inst.dest) |dest| {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
+
 /// `vmctx` as the first arg and `args` as x1..xN (up to 7). Uses the
 /// same caller-save snapshot pattern as `emitCall`: all currently-used
 /// scratch regs are spilled to the function's `call_save` region before
@@ -2762,6 +2841,135 @@ fn emitAtomicCmpxchg(
 
     try code.casAl(info.reg, RegMap.tmp2, RegMap.tmp0, cx.size);
     try destCommit(code, reg_map, info);
+}
+
+/// `.atomic_notify` — calls `VmCtx.futex_notify_fn(vmctx, addr, count)`.
+/// `addr` = zext32(base) + offset (NOT the effective memory pointer —
+/// helper interprets it as a wasm linear-memory offset).
+fn emitAtomicNotify(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    an: @TypeOf(@as(ir.Inst.Op, undefined).atomic_notify),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // x1 = zext32(base) + offset
+    try stageArgFromSaved(code, reg_map, fctx, .x1, an.base);
+    try code.uxtw(.x1, .x1);
+    if (an.offset > 0) {
+        try code.movImm32(RegMap.tmp0, @intCast(an.offset));
+        try code.addRegReg(.x1, .x1, RegMap.tmp0);
+    }
+    // x2 = count
+    try stageArgFromSaved(code, reg_map, fctx, .x2, an.count);
+    // x0 = vmctx, tmp0 = helper, BLR.
+    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.ldrImm(RegMap.tmp0, .x0, vmctx_futex_notify_fn_slot);
+    try code.blr(RegMap.tmp0);
+
+    if (inst.dest) |dest| {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
+}
+
+/// `.atomic_wait` — calls `VmCtx.futex_wait32_fn` or `futex_wait64_fn`.
+/// Signatures (AAPCS64, 8 arg regs available, all fit):
+///   wait32(vmctx, addr, expected, timeout_lo, timeout_hi) → i32
+///   wait64(vmctx, addr, exp_lo, exp_hi, timeout_lo, timeout_hi) → i32
+/// Our IR packs both timeout halves into one i64 VReg `timeout`, and
+/// for wait64 `expected` is an i64 VReg. We split into lo/hi halves at
+/// the call site.
+fn emitAtomicWait(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    aw: @TypeOf(@as(ir.Inst.Op, undefined).atomic_wait),
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    switch (aw.size) {
+        4, 8 => {},
+        else => return error.UnimplementedAtomicSize,
+    }
+
+    var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
+    for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+
+    // x1 = zext32(base) + offset
+    try stageArgFromSaved(code, reg_map, fctx, .x1, aw.base);
+    try code.uxtw(.x1, .x1);
+    if (aw.offset > 0) {
+        try code.movImm32(RegMap.tmp0, @intCast(aw.offset));
+        try code.addRegReg(.x1, .x1, RegMap.tmp0);
+    }
+
+    if (aw.size == 4) {
+        // x2 = expected (u32, zero-extended from low 32)
+        try stageArgFromSaved(code, reg_map, fctx, .x2, aw.expected);
+        try code.uxtw(.x2, .x2);
+        // x3 = timeout_lo, x4 = timeout_hi (timeout is i64).
+        try stageArgFromSaved(code, reg_map, fctx, .x3, aw.timeout);
+        try code.movRegReg(.x4, .x3);
+        try code.lsrImm(.x4, .x4, 32);
+        try code.uxtw(.x3, .x3);
+        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, .x0, vmctx_futex_wait32_fn_slot);
+    } else {
+        // wait64: expected is i64 → exp_lo (x2) / exp_hi (x3).
+        try stageArgFromSaved(code, reg_map, fctx, .x2, aw.expected);
+        try code.movRegReg(.x3, .x2);
+        try code.lsrImm(.x3, .x3, 32);
+        try code.uxtw(.x2, .x2);
+        // timeout → timeout_lo (x4) / timeout_hi (x5).
+        try stageArgFromSaved(code, reg_map, fctx, .x4, aw.timeout);
+        try code.movRegReg(.x5, .x4);
+        try code.lsrImm(.x5, .x5, 32);
+        try code.uxtw(.x4, .x4);
+        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, .x0, vmctx_futex_wait64_fn_slot);
+    }
+
+    try code.blr(RegMap.tmp0);
+
+    if (inst.dest) |dest| {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
+
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.ldrImm(reg, .fp, slot_scaled);
+    }
 }
 
 fn emitBrIf(
@@ -3725,19 +3933,15 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
 }
 
 test "compile: unimplemented op returns error.UnimplementedOp" {
-    // atomic_notify is not yet implemented on aarch64 — must fail loudly,
-    // not silently drop.
+    // call_result is not yet implemented on aarch64 (needs multi-result
+    // plumbing) — must fail loudly, not silently drop.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const bid = try func.newBlock();
-    const addr = func.newVReg();
-    const count = func.newVReg();
     const result = func.newVReg();
-    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
-    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = count, .type = .i32 });
     try func.getBlock(bid).append(.{
-        .op = .{ .atomic_notify = .{ .base = addr, .offset = 0, .count = count } },
+        .op = .{ .call_result = 0 },
         .dest = result,
         .type = .i32,
     });
@@ -3828,6 +4032,64 @@ test "compile: atomic_cmpxchg emits CASAL" {
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
         if ((w & 0xFFE0FC00) == 0x88E0FC00) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "compile: call_ref emits CBZ + BLR" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const fref = func.newVReg();
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_64 = 0 }, .dest = fref, .type = .i64 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = fref, .args = &.{}, .extra_results = 0, .tail = false } },
+        .dest = result,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // CBZ X: 0xB4000000 base (sf=1). BLR Xn: 0xD63F0000.
+    var found_cbz = false;
+    var found_blr = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFF000000) == 0xB4000000) found_cbz = true;
+        if ((w & 0xFFFFFC1F) == 0xD63F0000) found_blr = true;
+    }
+    try std.testing.expect(found_cbz);
+    try std.testing.expect(found_blr);
+}
+
+test "compile: atomic_notify dispatches helper via VmCtx slot 27" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const count = func.newVReg();
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = count, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .atomic_notify = .{ .base = addr, .offset = 0, .count = count } },
+        .dest = result,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // LDR Xt, [Xn, #27*8]: sf=1, 11|111|00|01|imm12|Rn|Rt = 0xF9400000 |
+    // (imm12<<10) | (Rn<<5) | Rt. Mask opcode + imm12 (bits [21:10]=27).
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0xF9400000 and ((w >> 10) & 0xFFF) == 27) found = true;
     }
     try std.testing.expect(found);
 }
