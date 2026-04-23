@@ -48,6 +48,8 @@ const vmctx_func_table_field: i32 = 40; // VmCtx.func_table_ptr offset
 const vmctx_mem_pages_field: i32 = 56; // VmCtx.memory_pages offset (u32)
 const vmctx_func_table_len_field: i32 = 60; // VmCtx.func_table_len offset (u32)
 const vmctx_mem_grow_fn_field: i32 = 64; // VmCtx.mem_grow_fn offset (usize)
+const vmctx_mem_fill_fn_field: i32 = 224; // VmCtx.mem_fill_fn offset (usize)
+const vmctx_mem_copy_fn_field: i32 = 232; // VmCtx.mem_copy_fn offset (usize)
 const vmctx_instance_ptr_field: i32 = 72; // VmCtx.instance_ptr offset (usize)
 const vmctx_trap_oob_fn_field: i32 = 80; // VmCtx.trap_oob_fn offset (usize)
 const vmctx_trap_unreachable_fn_field: i32 = 88;
@@ -1199,14 +1201,13 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
             switch (ci.op) {
-                .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
+                .call, .call_indirect, .call_ref, .memory_grow, .memory_copy, .table_grow, .table_set => {
                     const mask = if (comptime builtin.os.tag == .windows)
                         [_]bool{ true, false, false, false, true, true, false, false, false, false }
                     else
                         [_]bool{ true, false, true, true, true, true, false, false, false, false };
                     try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = mask });
                 },
-                .memory_copy => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, false, true, true, false, false, false, false, false, false } }),
                 .memory_fill => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = .{ false, false, false, true, false, false, false, false, false, false } }),
                 else => {},
             }
@@ -1354,10 +1355,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (func.blocks.items) |block| {
             for (block.instructions.items) |ci| {
                 switch (ci.op) {
-                    .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
+                    .call, .call_indirect, .call_ref, .memory_grow, .memory_copy, .table_grow, .table_set => {
                         // Calls clobber caller-saved allocatable regs.
-                        // memory.grow is compiled as a host call, same ABI, so it
-                        // clobbers the same set of caller-saved registers.
+                        // memory.grow / memory.copy are compiled as host calls (same ABI),
+                        // so they clobber the same set of caller-saved registers.
                         // alloc_regs = [rdx(0), rbx(1), rsi(2), rdi(3), r8(4), r9(5), r12(6), r13(7), r14(8), r15(9)]
                         // On Win64: rdx, r8, r9 are volatile; rbx/rsi/rdi/r12-r15 callee-saved.
                         // On SysV: rdx, rsi, rdi, r8, r9 are volatile; rbx/r12-r15 callee-saved.
@@ -1366,13 +1367,6 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
                         else
                             [_]bool{ true, false, true, true, true, true, false, false, false, false };
                         try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = mask });
-                    },
-                    .memory_copy => {
-                        // REP MOVSB clobbers rsi(6) and rdi(7) → indices 2, 3
-                        try clobber_points.append(allocator, .{
-                            .pos = pos,
-                            .regs_clobbered = .{ false, false, true, true, false, false, false, false, false, false },
-                        });
                     },
                     .memory_fill => {
                         // REP STOSB clobbers rdi(7) → index 3
@@ -1419,11 +1413,6 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (func.blocks.items) |block| {
             for (block.instructions.items) |blk_inst| {
                 switch (blk_inst.op) {
-                    .memory_copy => {
-                        for (callee_saved_alloc, 0..) |cs_reg, i| {
-                            if (cs_reg == .rsi or cs_reg == .rdi) used_callee_saved[i] = true;
-                        }
-                    },
                     .memory_fill => {
                         for (callee_saved_alloc, 0..) |cs_reg, i| {
                             if (cs_reg == .rdi) used_callee_saved[i] = true;
@@ -2563,35 +2552,25 @@ fn compileInstRA(
             try code.movMemRegSized(.rax, st_disp, .rcx, st.size);
         },
         .memory_copy => |mc| {
-            // REP MOVSB: rdi=dst, rsi=src, rcx=len
-            //
-            // Bounds check semantics (wasm spec): trap if either
-            //   src + len > mem_size  OR  dst + len > mem_size.
-            // We materialize len in rcx and each address in rax, call the
-            // dynamic bounds check for src, then again for dst, both while
-            // r10 still holds VmCtx*. Only afterwards do we replace r10
-            // with mem_base and fold it into rsi/rdi for REP MOVSB.
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
-            const len_reg = try useVReg(code, alloc_result, mc.len, .rcx);
-            if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
-            try code.zeroExtend32(.rcx); // wasm lengths are u32
-            const src_reg = try useVReg(code, alloc_result, mc.src, .rsi);
-            if (src_reg != .rsi) try code.movRegReg(.rsi, src_reg);
-            try code.zeroExtend32(.rsi); // wasm addresses are i32
-            const dst_reg = try useVReg(code, alloc_result, mc.dst, .rdi);
-            if (dst_reg != .rdi) try code.movRegReg(.rdi, dst_reg);
-            try code.zeroExtend32(.rdi); // wasm addresses are i32
-            // Bounds-check src: rax = src, rcx = len.
-            try code.movRegReg(.rax, .rsi);
-            try emitMemBoundsCheckDynamic(code);
-            // Bounds-check dst: rax = dst, rcx = len.
-            try code.movRegReg(.rax, .rdi);
-            try emitMemBoundsCheckDynamic(code);
-            // All checks passed — resolve mem_base and fold into src/dst.
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
-            try code.addRegReg(.rsi, .r10); // rsi = mem_base + src
-            try code.addRegReg(.rdi, .r10); // rdi = mem_base + dst
-            try code.emitSlice(&.{ 0xF3, 0xA4 }); // REP MOVSB
+            // Call the host helper via vmctx.mem_copy_fn(vmctx, dst, src, len).
+            // The helper handles bounds-check + overlapping memmove semantics.
+            // ABI-portable via param_regs.
+            // Regalloc treats this op as a call (see clobber points).
+            const args_arr = [_]ir.VReg{ mc.dst, mc.src, mc.len };
+            try emitCallRegArgMoves(code, alloc_result, &args_arr, 3);
+            // Zero-extend all three u32 args in-place.
+            try code.zeroExtend32(param_regs[1]);
+            try code.zeroExtend32(param_regs[2]);
+            try code.zeroExtend32(param_regs[3]);
+            // Load vmctx + helper fn pointer (uses rax + param_regs[0]).
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegMem(.rax, param_regs[0], vmctx_mem_copy_fn_field);
+
+            const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
+            const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
+            if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
+            try code.callReg(.rax);
+            if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
         },
         .memory_fill => |mf| {
             // REP STOSB: rdi=dst, al=val, rcx=len
@@ -2629,17 +2608,20 @@ fn compileInstRA(
         .memory_grow => |pages_vreg| {
             const dest = inst.dest orelse return;
             // Call the host grow helper via vmctx.mem_grow_fn(vmctx, delta_pages).
-            // Win64 ABI: RCX=vmctx, RDX=delta_pages, shadow space = 32 bytes.
+            // ABI-portable: arg0 → param_regs[0] (rcx on Win64, rdi on SysV),
+            // arg1 → param_regs[1] (rdx on Win64, rsi on SysV).
             // The regalloc treats this op as a call (see clobber point collection),
             // so no caller-saved vregs are live across this instruction.
-            const pages_reg = try useVReg(code, alloc_result, pages_vreg, .rdx);
-            if (pages_reg != .rdx) try code.movRegReg(.rdx, pages_reg);
-            try code.zeroExtend32(.rdx);
+            const arg_vmctx = param_regs[0];
+            const arg_pages = param_regs[1];
+            const pages_reg = try useVReg(code, alloc_result, pages_vreg, arg_pages);
+            if (pages_reg != arg_pages) try code.movRegReg(arg_pages, pages_reg);
+            try code.zeroExtend32(arg_pages);
 
-            // Load vmctx into rcx.
-            try code.movRegMem(.rcx, .rbp, vmctx_offset);
+            // Load vmctx into param_regs[0].
+            try code.movRegMem(arg_vmctx, .rbp, vmctx_offset);
             // Load grow helper pointer into rax.
-            try code.movRegMem(.rax, .rcx, vmctx_mem_grow_fn_field);
+            try code.movRegMem(.rax, arg_vmctx, vmctx_mem_grow_fn_field);
 
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
             const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
@@ -4442,7 +4424,7 @@ test "compileFunctionRA: extend_i32_s emits MOVSXD" {
     try std.testing.expect(containsBytes(code, &.{ 0x63 }));
 }
 
-test "compileFunctionRA: memory_copy emits REP MOVSB" {
+test "compileFunctionRA: memory_copy emits call via mem_copy_fn" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -4463,8 +4445,12 @@ test "compileFunctionRA: memory_copy emits REP MOVSB" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // Should contain REP MOVSB (F3 A4)
-    try std.testing.expect(containsBytes(code, &.{ 0xF3, 0xA4 }));
+    // Must NOT contain REP MOVSB (F3 A4): the inline path was buggy on overlap,
+    // we now dispatch through the vmctx.mem_copy_fn host helper which implements
+    // memmove semantics.
+    try std.testing.expect(!containsBytes(code, &.{ 0xF3, 0xA4 }));
+    // Must contain CALL reg (FF /2): dispatch to the helper via rax.
+    try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
 }
 
 test "compileFunctionRA: memory_fill emits REP STOSB" {
