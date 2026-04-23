@@ -355,6 +355,19 @@ pub const VmCtx = extern struct {
     /// Signature: fn (vmctx: *VmCtx, addr: u32, count: u32) callconv(.c) i32
     /// Returns number of waiters woken.
     futex_notify_fn: usize = 0,
+    /// Native function pointer for `memory.fill` host helper.
+    /// Signature: fn (vmctx: *VmCtx, dst: u32, val: u32, len: u32) callconv(.c) void
+    /// Performs bounds check against `memory_size`; traps via `trap_oob_fn`
+    /// if `dst + len > memory_size`. Otherwise writes `val & 0xFF` to
+    /// `len` bytes starting at `memory_base + dst`.
+    mem_fill_fn: usize = 0,
+    /// Native function pointer for `memory.copy` host helper.
+    /// Signature: fn (vmctx: *VmCtx, dst: u32, src: u32, len: u32) callconv(.c) void
+    /// Performs bounds checks against `memory_size` for both ranges;
+    /// traps via `trap_oob_fn` if either `dst + len` or `src + len`
+    /// exceeds `memory_size`. Handles overlapping regions (memmove
+    /// semantics).
+    mem_copy_fn: usize = 0,
 };
 
 /// Entry in the sorted `ptr_to_sig` array. 16 bytes per entry.
@@ -513,6 +526,47 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
         g_mem_size = vmctx.memory_size;
     }
     return @intCast(old_pages);
+}
+
+/// Host helper invoked from AOT-compiled `memory.fill` sites.
+/// wasm: `memory.fill(dst, val, len)` → writes `val & 0xFF` to `len`
+/// bytes starting at `dst`. Traps (via `vmctx.trap_oob_fn`) if
+/// `dst + len > memory_size`. `len == 0` is a no-op even at the
+/// boundary, matching the wasm spec's pure-inequality check.
+pub fn memFillHelper(vmctx: *VmCtx, dst: u32, val: u32, len: u32) callconv(.c) void {
+    const end: u64 = @as(u64, dst) + @as(u64, len);
+    if (end > vmctx.memory_size) {
+        const trap_fn: *const fn (*VmCtx) callconv(.c) noreturn =
+            @ptrFromInt(vmctx.trap_oob_fn);
+        trap_fn(vmctx);
+    }
+    if (len == 0) return;
+    const base: [*]u8 = @ptrFromInt(vmctx.memory_base);
+    const b: u8 = @truncate(val);
+    @memset(base[dst..@intCast(end)], b);
+}
+
+/// Host helper invoked from AOT-compiled `memory.copy` sites.
+/// wasm: `memory.copy(dst, src, len)` — bounds-checks both ranges
+/// then performs a memmove-style copy (correct for overlapping
+/// regions).
+pub fn memCopyHelper(vmctx: *VmCtx, dst: u32, src: u32, len: u32) callconv(.c) void {
+    const d_end: u64 = @as(u64, dst) + @as(u64, len);
+    const s_end: u64 = @as(u64, src) + @as(u64, len);
+    if (d_end > vmctx.memory_size or s_end > vmctx.memory_size) {
+        const trap_fn: *const fn (*VmCtx) callconv(.c) noreturn =
+            @ptrFromInt(vmctx.trap_oob_fn);
+        trap_fn(vmctx);
+    }
+    if (len == 0) return;
+    const base: [*]u8 = @ptrFromInt(vmctx.memory_base);
+    const d_slice = base[dst..@intCast(d_end)];
+    const s_slice = base[src..@intCast(s_end)];
+    if (dst <= src) {
+        std.mem.copyForwards(u8, d_slice, s_slice);
+    } else {
+        std.mem.copyBackwards(u8, d_slice, s_slice);
+    }
 }
 
 /// AOT host helper for table.grow.
@@ -1334,6 +1388,8 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     }
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
+    vmctx.mem_fill_fn = @intFromPtr(&memFillHelper);
+    vmctx.mem_copy_fn = @intFromPtr(&memCopyHelper);
     vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
     vmctx.trap_unreachable_fn = @intFromPtr(&aotTrapUnreachable);
     vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
@@ -1625,6 +1681,8 @@ pub fn callFuncScalar(
     }
     vmctx.instance_ptr = @intFromPtr(inst);
     vmctx.mem_grow_fn = @intFromPtr(&memGrowHelper);
+    vmctx.mem_fill_fn = @intFromPtr(&memFillHelper);
+    vmctx.mem_copy_fn = @intFromPtr(&memCopyHelper);
     vmctx.trap_oob_fn = @intFromPtr(&aotTrapOOB);
     vmctx.trap_unreachable_fn = @intFromPtr(&aotTrapUnreachable);
     vmctx.trap_idivz_fn = @intFromPtr(&aotTrapIntDivZero);
@@ -2108,6 +2166,8 @@ test "VmCtx layout: fields at expected offsets" {
     try std.testing.expectEqual(@as(usize, 200), @offsetOf(VmCtx, "futex_wait32_fn"));
     try std.testing.expectEqual(@as(usize, 208), @offsetOf(VmCtx, "futex_wait64_fn"));
     try std.testing.expectEqual(@as(usize, 216), @offsetOf(VmCtx, "futex_notify_fn"));
+    try std.testing.expectEqual(@as(usize, 224), @offsetOf(VmCtx, "mem_fill_fn"));
+    try std.testing.expectEqual(@as(usize, 232), @offsetOf(VmCtx, "mem_copy_fn"));
 }
 
 test "getFuncAddr: import indices return null" {

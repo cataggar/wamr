@@ -285,6 +285,35 @@ pub fn build(b: *std.Build) void {
     });
     aot_harness_module.addImport("wamr", lib_module);
 
+    // ── CoreMark AOT runner ────────────────────────────────────────────
+    // Loads a CoreMark wasi `.wasm` and executes it through the Zig AOT
+    // backend (same pipeline as differential tests). Replaces the old
+    // C-based `tests/standalone/coremark/run.sh` for gating the Zig
+    // backend on real CoreMark workloads.
+    const coremark_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/coremark_aot_runner.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    coremark_module.addImport("wamr", lib_module);
+
+    const coremark_exe = b.addExecutable(.{
+        .name = "coremark-aot-runner",
+        .root_module = coremark_module,
+    });
+    b.installArtifact(coremark_exe);
+
+    const run_coremark_nofp = b.addRunArtifact(coremark_exe);
+    run_coremark_nofp.addArg("tests/standalone/coremark/coremark_wasi_nofp.wasm");
+    const run_coremark_fp = b.addRunArtifact(coremark_exe);
+    run_coremark_fp.addArg("tests/standalone/coremark/coremark_wasi.wasm");
+    const coremark_step = b.step(
+        "coremark-aot",
+        "Run the CoreMark wasi benchmarks through the Zig AOT backend",
+    );
+    coremark_step.dependOn(&run_coremark_nofp.step);
+    coremark_step.dependOn(&run_coremark_fp.step);
+
     const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, interp, aot, diff)");
     inline for (.{ "loader", "interp", "aot", "diff" }) |tgt| {
         const fuzz_mod = b.createModule(.{
