@@ -980,6 +980,37 @@ pub fn deadLocalSetElimination(func: *ir.IrFunction, allocator: std.mem.Allocato
     return changed;
 }
 
+/// Constant-fold `br_if` whose condition is a known `iconst_32`. If the
+/// condition is zero, rewrite to `br else_block`; otherwise rewrite to
+/// `br then_block`. Uses a per-block iconst_32 map (conditions are
+/// always i32 in wasm). Unreachable successors are cleaned up later by
+/// DCE / block reordering. The fold opens up further straight-line
+/// optimizations.
+pub fn foldConstantBranches(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        var iconst32 = std.AutoHashMap(ir.VReg, i32).init(allocator);
+        defer iconst32.deinit();
+
+        for (block.instructions.items) |*inst| {
+            switch (inst.op) {
+                .iconst_32 => |c| {
+                    if (inst.dest) |d| try iconst32.put(d, c);
+                },
+                .br_if => |bi| {
+                    if (iconst32.get(bi.cond)) |c| {
+                        const target = if (c != 0) bi.then_block else bi.else_block;
+                        inst.* = .{ .op = .{ .br = target } };
+                        changed = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 // ── Function Inlining ───────────────────────────────────────────────────────
 
 /// Shift every VReg referenced by `inst` (reads and def) by `+offset`.
@@ -1142,7 +1173,7 @@ fn isInlinable(callee: *const ir.IrFunction, max_body: u32) bool {
 /// call site was inlined.
 pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) !bool {
     _ = allocator;
-    const max_body: u32 = 16;
+    const max_body: u32 = 32;
 
     // Pre-compute eligibility for each local function (stable pointers:
     // we only mutate `.blocks` and `.next_vreg` of *other* functions as
@@ -1294,6 +1325,7 @@ pub const default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
     &strengthReduceMul,
+    &foldConstantBranches,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -2169,4 +2201,46 @@ test "inlineSmallFunctions: leaf with param-return is inlined" {
     try std.testing.expect(body[0].op == .iconst_32);
     try std.testing.expect(body[1].op == .ret);
     try std.testing.expectEqual(body[0].dest.?, body[1].op.ret.?);
+}
+
+test "foldConstantBranches: zero cond picks else block" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldConstantBranches(&func, allocator);
+    try std.testing.expect(changed);
+    const last = func.getBlock(b0).instructions.items[1];
+    try std.testing.expect(last.op == .br);
+    try std.testing.expectEqual(b2, last.op.br);
+}
+
+test "foldConstantBranches: nonzero cond picks then block" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldConstantBranches(&func, allocator);
+    try std.testing.expect(changed);
+    const last = func.getBlock(b0).instructions.items[1];
+    try std.testing.expect(last.op == .br);
+    try std.testing.expectEqual(b1, last.op.br);
 }
