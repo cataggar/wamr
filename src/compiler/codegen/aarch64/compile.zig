@@ -2239,51 +2239,69 @@ fn emitMemAddr(
     offset: u32,
     end_offset: u64,
 ) !void {
+    try emitMemAddrImpl(code, reg_map, base_vreg, offset, end_offset, false);
+}
+
+fn emitMemAddrSkipBounds(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    base_vreg: ir.VReg,
+    offset: u32,
+) !void {
+    try emitMemAddrImpl(code, reg_map, base_vreg, offset, 0, true);
+}
+
+fn emitMemAddrImpl(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    base_vreg: ir.VReg,
+    offset: u32,
+    end_offset: u64,
+    skip_bounds: bool,
+) !void {
     // Step 1: zero-extend wasm address into tmp2 (kept alive across check).
     const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
     try code.movRegReg32(RegMap.tmp2, src);
 
-    // Step 2: compute end = tmp2 + end_offset in tmp1.
-    if (end_offset == 0) {
-        try code.movRegReg(RegMap.tmp1, RegMap.tmp2);
-    } else if (end_offset <= 0xFFF) {
-        try code.addImm(RegMap.tmp1, RegMap.tmp2, @intCast(end_offset));
-    } else {
-        try code.movImm64(RegMap.tmp1, end_offset);
-        try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
+    if (!skip_bounds) {
+        // Step 2: compute end = tmp2 + end_offset in tmp1.
+        if (end_offset == 0) {
+            try code.movRegReg(RegMap.tmp1, RegMap.tmp2);
+        } else if (end_offset <= 0xFFF) {
+            try code.addImm(RegMap.tmp1, RegMap.tmp2, @intCast(end_offset));
+        } else {
+            try code.movImm64(RegMap.tmp1, end_offset);
+            try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
+        }
+
+        // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1).
+        try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 1);
+
+        // Step 4: cmp end, mem_size; B.LS over_trap.
+        try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
+        const over_patch = code.len();
+        try code.bCond(.ls, 0); // placeholder
+
+        // Trap path.
+        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
+        try code.blr(RegMap.tmp0);
+        try code.brk(0);
+
+        // Patch B.LS to land here.
+        const over_target = code.len();
+        const delta_words: i19 = @intCast(@divExact(
+            @as(i64, @intCast(over_target)) - @as(i64, @intCast(over_patch)),
+            4,
+        ));
+        const existing = std.mem.readInt(u32, code.bytes.items[over_patch..][0..4], .little);
+        const imm19: u19 = @bitCast(delta_words);
+        const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
+        code.patch32(over_patch, new_word);
     }
 
-    // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1).
-    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 1);
-
-    // Step 4: cmp end, mem_size; B.LS over_trap (≤ is in-bounds since
-    // accesses of size s are valid when end = addr+s ≤ memory_size).
-    try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
-    const over_patch = code.len();
-    try code.bCond(.ls, 0); // placeholder
-
-    // Trap path: arg0=vmctx, call vmctx.trap_oob_fn (noreturn). We read
-    // vmctx again because tmp0 now holds mem_size. BRK after BLR is
-    // defensive — the helper is declared noreturn.
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
-    // trap_oob_fn is at VmCtx offset 80 = scale-8 slot 10.
-    try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
-    try code.blr(RegMap.tmp0);
-    try code.brk(0);
-
-    // Patch B.LS to land here.
-    const over_target = code.len();
-    const delta_words: i19 = @intCast(@divExact(
-        @as(i64, @intCast(over_target)) - @as(i64, @intCast(over_patch)),
-        4,
-    ));
-    const existing = std.mem.readInt(u32, code.bytes.items[over_patch..][0..4], .little);
-    const imm19: u19 = @bitCast(delta_words);
-    const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
-    code.patch32(over_patch, new_word);
-
-    // Step 5: reload vmctx, then load memory_base (at +0).
+    // Step 5: load mem_base into tmp0.
     try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
 
@@ -3382,7 +3400,12 @@ fn emitLoad(
     // Try to fold offset into the load's scaled immediate; else add it to tmp0.
     const folded = scaledOffset(ld.offset, scale);
     const end_offset: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
-    try emitMemAddr(code, reg_map, ld.base, if (folded == null) ld.offset else 0, end_offset);
+    const folded_offset: u32 = if (folded == null) ld.offset else 0;
+    if (ld.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, ld.base, folded_offset);
+    } else {
+        try emitMemAddr(code, reg_map, ld.base, folded_offset, end_offset);
+    }
     const disp: u12 = if (folded) |d| d else 0;
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
@@ -3422,7 +3445,12 @@ fn emitStore(
 
     const folded = scaledOffset(st.offset, scale);
     const end_offset: u64 = @as(u64, st.offset) + @as(u64, st.size);
-    try emitMemAddr(code, reg_map, st.base, if (folded == null) st.offset else 0, end_offset);
+    const folded_offset: u32 = if (folded == null) st.offset else 0;
+    if (st.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, st.base, folded_offset);
+    } else {
+        try emitMemAddr(code, reg_map, st.base, folded_offset, end_offset);
+    }
     const disp: u12 = if (folded) |d| d else 0;
 
     // Materialize the value into tmp1 (or use its home reg). emitMemAddr is

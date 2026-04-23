@@ -691,6 +691,73 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
 pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
 
 /// Run a sequence of optimization passes on an IR module.
+/// Redundant bounds-check elimination within each basic block.
+///
+/// For every `.load` and `.store`, codegen emits an inline wasm-memory
+/// bounds check that verifies `zext(base) + offset + size <= memory_size`.
+/// When two accesses in the same block share the same `base` vreg, the
+/// first check already validates any subsequent access whose
+/// `offset + size` does not exceed the max previously validated end.
+///
+/// This pass marks such accesses with `bounds_known = true`; both backends
+/// skip emitting the check for those.
+///
+/// Safety conditions:
+/// - Same block only (no cross-block dominator walk — conservative).
+/// - Any call / atomic / `memory_grow` / `memory_copy` / `memory_fill`
+///   can change `memory_size`, so the tracker is cleared at those points.
+/// - IR is SSA, so a base vreg's value never changes once defined.
+pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var max_end = std.AutoHashMap(ir.VReg, u64).init(allocator);
+    defer max_end.deinit();
+
+    for (func.blocks.items) |block| {
+        max_end.clearRetainingCapacity();
+        for (block.instructions.items) |*inst| {
+            switch (inst.op) {
+                .load => |*ld| {
+                    const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+                    const prev = max_end.get(ld.base) orelse 0;
+                    if (end <= prev) {
+                        if (!ld.bounds_known) {
+                            ld.bounds_known = true;
+                            changed = true;
+                        }
+                    } else {
+                        try max_end.put(ld.base, end);
+                    }
+                },
+                .store => |*st| {
+                    const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
+                    const prev = max_end.get(st.base) orelse 0;
+                    if (end <= prev) {
+                        if (!st.bounds_known) {
+                            st.bounds_known = true;
+                            changed = true;
+                        }
+                    } else {
+                        try max_end.put(st.base, end);
+                    }
+                },
+                // Anything that can change memory_size, trap, or otherwise
+                // invalidate the "already checked" property: clear the
+                // tracker. (memory.grow can extend memory; calls can grow
+                // or shrink via imports; atomics/traps can't shrink but
+                // cost us nothing to be conservative.)
+                .memory_grow,
+                .call, .call_indirect, .call_ref,
+                .memory_copy, .memory_fill, .memory_init,
+                .table_grow, .table_init,
+                .atomic_notify, .atomic_wait,
+                => max_end.clearRetainingCapacity(),
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
     for (module.functions.items) |*func| {
@@ -707,6 +774,7 @@ pub const default_passes: []const PassFn = &.{
     &strengthReduceMul,
     &commonSubexprElimination,
     &deadCodeElimination,
+    &elideRedundantBoundsChecks,
 };
 
 // ── Block Reordering ────────────────────────────────────────────────────────
@@ -1316,4 +1384,51 @@ test "strengthReduceMul: i32 does not rewrite shift >= 32" {
     const changed = try strengthReduceMul(&func, allocator);
     try std.testing.expect(changed);
     try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 31 }, block.instructions.items[1].op);
+}
+
+test "elideRedundantBoundsChecks: back-to-back loads on same base" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_a, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_c } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    // First load establishes end=4. Second load end=8 > 4, so it sets new max
+    // and is NOT elided. Third load end=8 == max, IS elided.
+    try std.testing.expect(!block.instructions.items[1].op.load.bounds_known);
+    try std.testing.expect(!block.instructions.items[2].op.load.bounds_known);
+    try std.testing.expect(block.instructions.items[3].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: call invalidates tracker" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try block.append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_b } });
+
+    _ = try elideRedundantBoundsChecks(&func, allocator);
+    // Post-call load cannot be elided because memory_size may have changed.
+    try std.testing.expect(!block.instructions.items[3].op.load.bounds_known);
 }

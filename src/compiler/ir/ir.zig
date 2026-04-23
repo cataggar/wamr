@@ -74,8 +74,8 @@ pub const Inst = struct {
         local_set: struct { idx: u32, val: VReg },
 
         // Memory
-        load: struct { base: VReg, offset: u32, size: u8, sign_extend: bool = false },
-        store: struct { base: VReg, offset: u32, size: u8, val: VReg },
+        load: struct { base: VReg, offset: u32, size: u8, sign_extend: bool = false, bounds_known: bool = false },
+        store: struct { base: VReg, offset: u32, size: u8, val: VReg, bounds_known: bool = false },
 
         // Control flow
         br: BlockId,
