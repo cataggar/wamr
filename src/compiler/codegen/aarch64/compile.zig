@@ -3771,6 +3771,119 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
     };
 }
 
+// ── Register-Allocator Preparation ─────────────────────────────────────────
+//
+// Phase 1 of the linear-scan regalloc adoption (plan in issue #100): define
+// the aarch64 `RegSet` and a `collectClobberPoints` helper that mirrors the
+// x86-64 version in `../x86_64/compile.zig`. This code is not yet wired into
+// codegen — `RegMap` remains the source of truth for vreg → physreg
+// assignment. It exists so Phase 2 can run allocation in shadow mode and
+// Phase 3 can flip emitters without also introducing new analysis in the
+// same step.
+
+const regalloc = @import("../../ir/regalloc.zig");
+
+/// Allocatable aarch64 GPRs, in stable index order used by clobber masks.
+///
+/// Indices 0..14 map to x0..x14 (AAPCS64 caller-saved; x15 is reserved as
+/// a non-allocatable scratch `RegMap.tmp2`). Indices 15..24 map to
+/// x19..x28 (callee-saved). x16/x17 are `RegMap.tmp0/tmp1`, x18 is the
+/// platform register, x29/x30 are FP/LR, and x31 is SP — all excluded.
+pub const aarch64_alloc_regs = [_]regalloc.PhysReg{
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+};
+
+/// Indices into `aarch64_alloc_regs` of AAPCS64 caller-saved registers
+/// (x0..x14). Used as the "prefer when live range doesn't span a call"
+/// pool.
+pub const aarch64_caller_saved_indices = [_]u8{
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+};
+
+/// Indices into `aarch64_alloc_regs` of AAPCS64 callee-saved registers
+/// (x19..x28). Preferred for live ranges that span a call, since they
+/// survive without save/restore.
+pub const aarch64_callee_saved_indices = [_]u8{
+    15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+};
+
+/// Bitmask over `aarch64_alloc_regs` of registers destroyed by any
+/// AAPCS64-compatible procedure call (direct, indirect, or vmctx
+/// helper): x0..x14 (indices 0..14). x15..x17 are our own non-
+/// allocatable scratches, x18 is platform-reserved.
+pub const aarch64_call_clobber_mask: u64 = (@as(u64, 1) << 15) - 1;
+
+/// Build the per-function `RegSet` for aarch64. `local_count` sets the
+/// spill-slot origin above the operand stack.
+///
+/// Frame layout (matches `compileFunctionImpl` / `emitEntrySpill`):
+/// `[fp+0]` = saved fp, `[fp+8]` = saved lr, `[fp+16]` = vmctx slot,
+/// `[fp+24 .. fp+24+LC*8]` = locals, then a 64-slot operand stack, then
+/// spills growing upward. Spills begin at `fp + 24 + (LC + 64)*8`.
+pub fn aarch64RegSet(local_count: u32) regalloc.RegSet {
+    return .{
+        .alloc_regs = &aarch64_alloc_regs,
+        .callee_saved_indices = &aarch64_callee_saved_indices,
+        .caller_saved_indices = &aarch64_caller_saved_indices,
+        .spill_base = @as(i32, 24) + @as(i32, @intCast(local_count + 64)) * 8,
+        .spill_stride = 8,
+    };
+}
+
+/// Scan `func` and emit a `ClobberPoint` for every instruction that
+/// destroys caller-saved registers under AAPCS64. Positions use the same
+/// flat indexing as `analysis.computeLiveRanges` (one counter, block-
+/// major, instruction-minor), so they line up with the allocator's live
+/// ranges without further translation.
+///
+/// Clobbering ops on aarch64:
+///   - `.call`, `.call_indirect`, `.call_ref` — direct/indirect/callable-
+///     reference calls, all go through `bl`/`blr`.
+///   - `.memory_grow`, `.memory_copy`, `.memory_fill`, `.memory_init` —
+///     compiled as vmctx helper calls (see `emitVmctxHelperCall`).
+///   - `.table_set`, `.table_grow`, `.table_init` — likewise.
+///   - `.atomic_wait`, `.atomic_notify` — vmctx helper calls.
+/// All use a `bl` to a C ABI helper and therefore clobber the full
+/// caller-saved set.
+///
+/// Not clobbered (executed inline): `.atomic_load`, `.atomic_store`,
+/// `.atomic_rmw`, `.atomic_cmpxchg`, `.atomic_fence` (LSE atomics).
+pub fn collectClobberPoints(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.ArrayList(regalloc.ClobberPoint) {
+    var clobbers: std.ArrayList(regalloc.ClobberPoint) = .empty;
+    errdefer clobbers.deinit(allocator);
+
+    var pos: u32 = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |ci| {
+            switch (ci.op) {
+                .call,
+                .call_indirect,
+                .call_ref,
+                .memory_grow,
+                .memory_copy,
+                .memory_fill,
+                .memory_init,
+                .table_set,
+                .table_grow,
+                .table_init,
+                .atomic_wait,
+                .atomic_notify,
+                => try clobbers.append(allocator, .{
+                    .pos = pos,
+                    .regs_clobbered = aarch64_call_clobber_mask,
+                }),
+                else => {},
+            }
+            pos += 1;
+        }
+    }
+    return clobbers;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 test "compileFunction: iconst_32 + ret" {
@@ -4901,4 +5014,83 @@ test "compileFunction: FMA fusion does not skip mul with non-arith uses" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
     try std.testing.expect(code.len > 0);
+}
+
+test "collectClobberPoints: no calls → empty" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const block = func.getBlock(b0);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    var cps = try collectClobberPoints(&func, allocator);
+    defer cps.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), cps.items.len);
+}
+
+test "collectClobberPoints: one ClobberPoint per call, correct mask" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const block = func.getBlock(b0);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    // Mix of clobbering and non-clobbering ops to verify positions.
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0, .type = .i32 }); // pos 0
+    try block.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v1 });    // pos 1
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = func.newVReg(), .type = .i32 }); // pos 2
+    try block.append(.{ .op = .{ .memory_fill = .{ .dst = v0, .val = v0, .len = v0 } } });  // pos 3
+    try block.append(.{ .op = .{ .ret = v1 } });                                 // pos 4
+
+    var cps = try collectClobberPoints(&func, allocator);
+    defer cps.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cps.items.len);
+    try std.testing.expectEqual(@as(u32, 1), cps.items[0].pos);
+    try std.testing.expectEqual(@as(u32, 3), cps.items[1].pos);
+    // Full caller-saved set (x0..x14 = indices 0..14): (1<<15) - 1 = 0x7FFF.
+    try std.testing.expectEqual(@as(u64, 0x7FFF), cps.items[0].regs_clobbered);
+    try std.testing.expectEqual(@as(u64, 0x7FFF), cps.items[1].regs_clobbered);
+}
+
+test "collectClobberPoints: positions are monotonic across blocks" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+    const v0 = func.newVReg();
+    try block0.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 }); // pos 0
+    try block0.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = func.newVReg() }); // pos 1
+    try block0.append(.{ .op = .{ .br = b1 } });                   // pos 2
+    try block1.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = func.newVReg() }); // pos 3
+    try block1.append(.{ .op = .{ .ret = v0 } });                                 // pos 4
+
+    var cps = try collectClobberPoints(&func, allocator);
+    defer cps.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), cps.items.len);
+    try std.testing.expectEqual(@as(u32, 1), cps.items[0].pos);
+    try std.testing.expectEqual(@as(u32, 3), cps.items[1].pos);
+    try std.testing.expect(cps.items[0].pos < cps.items[1].pos);
+}
+
+test "aarch64RegSet: sane layout for a tiny function" {
+    const rs = aarch64RegSet(0);
+    // 25 allocatable GPRs, 15 caller-saved + 10 callee-saved.
+    try std.testing.expectEqual(@as(usize, 25), rs.alloc_regs.len);
+    try std.testing.expectEqual(@as(usize, 15), rs.caller_saved_indices.len);
+    try std.testing.expectEqual(@as(usize, 10), rs.callee_saved_indices.len);
+    // Spill stride grows upward (away from fp).
+    try std.testing.expect(rs.spill_stride > 0);
+    // With zero locals, first spill lives above the 64-slot operand stack.
+    try std.testing.expect(rs.spill_base >= 24 + 64 * 8);
 }
