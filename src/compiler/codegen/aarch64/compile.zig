@@ -125,6 +125,16 @@ const FuncCompileCtx = struct {
     /// FP-relative byte offset of the callee-save region where x19..x28
     /// are saved in the prologue and restored in each epilogue.
     callee_save_base: u32 = 0,
+    /// FP-relative byte offset of the Hidden-Return-Pointer save slot.
+    /// Only meaningful when this function's `result_count > 1`. The
+    /// caller passes &scratch as the `param_count+1`-th arg; the
+    /// prologue stashes it here so `ret_multi` can re-load it.
+    hrp_save_off: u32 = 0,
+    /// FP-relative byte offset of the caller-side scratch region where
+    /// extra results of calls (beyond the one returned in x0) are
+    /// written by the callee. Sized to `max_extra_results * 8` bytes.
+    /// `call_result` reads back from `[fp + scratch_base + idx*8]`.
+    scratch_base: u32 = 0,
     /// VReg → signed i64 value for `iconst_*` definitions in this function.
     /// Used to fold constants into immediate-form instructions (e.g.
     /// ADD/SUB imm). The iconst itself is still materialized into its home
@@ -204,7 +214,25 @@ pub fn compileFunctionImpl(
         const vreg_slots = func.next_vreg + 16;
         break :blk @intCast(vreg_slots * 8);
     };
-    const call_save_base: u32 = spill_base + spill_capacity;
+
+    // Multi-result plumbing. Scan call sites for max `extra_results` and
+    // reserve caller-side scratch (`scratch_base`) + HRP save slot
+    // (`hrp_save_off`, only meaningful if result_count > 1).
+    var max_extra_results: u32 = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .call => |cl| max_extra_results = @max(max_extra_results, cl.extra_results),
+                .call_indirect => |ci| max_extra_results = @max(max_extra_results, ci.extra_results),
+                .call_ref => |cr| max_extra_results = @max(max_extra_results, cr.extra_results),
+                else => {},
+            }
+        }
+    }
+    const hrp_save_off: u32 = spill_base + spill_capacity;
+    const scratch_base: u32 = hrp_save_off + 8;
+    const scratch_size: u32 = max_extra_results * 8;
+    const call_save_base: u32 = scratch_base + scratch_size;
     const call_save_size: u32 = 128;
     const callee_save_base: u32 = call_save_base + call_save_size;
     const callee_save_count: u32 = 10; // x19..x28
@@ -218,6 +246,8 @@ pub fn compileFunctionImpl(
     var fctx = ctx;
     fctx.call_save_base = call_save_base;
     fctx.callee_save_base = callee_save_base;
+    fctx.hrp_save_off = hrp_save_off;
+    fctx.scratch_base = scratch_base;
 
     // Collect iconst_* values so emitBinOp etc can fold small constants
     // into immediate-form instructions. Scan is cheap — one pass over IR.
@@ -286,6 +316,7 @@ pub fn compileFunctionImpl(
                 .memory_grow,
                 => |v| try bumpUse(&use_counts, v),
                 .ret => |maybe_v| if (maybe_v) |v| try bumpUse(&use_counts, v),
+                .ret_multi => |vregs| for (vregs) |v| try bumpUse(&use_counts, v),
                 .load => |ld| try bumpUse(&use_counts, ld.base),
                 .store => |st| {
                     try bumpUse(&use_counts, st.base);
@@ -427,7 +458,7 @@ pub fn compileFunctionImpl(
     try emitCalleeSaveStore(&code, callee_save_base);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
-    try emitEntrySpill(&code, func.*);
+    try emitEntrySpill(&code, func.*, hrp_save_off);
 
     var block_offsets = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_offsets);
@@ -501,7 +532,7 @@ fn paramAbiReg(i: u32) emit.Reg {
 /// Spill x0 (VMContext) and x1..x7 (wasm params) to their frame slots, and
 /// zero-initialize declared locals. Must be called right after emitPrologue
 /// and before any vreg allocation so we don't clobber these ABI regs.
-fn emitEntrySpill(code: *emit.CodeBuffer, func: ir.IrFunction) !void {
+fn emitEntrySpill(code: *emit.CodeBuffer, func: ir.IrFunction, hrp_save_off: u32) !void {
     // VMContext → [fp + 16]
     try code.strImm(.x0, .fp, vmctx_slot_offset / 8);
 
@@ -510,6 +541,15 @@ fn emitEntrySpill(code: *emit.CodeBuffer, func: ir.IrFunction) !void {
     while (i < func.param_count) : (i += 1) {
         const off_scaled: u12 = @intCast(localSlotOffset(i) / 8);
         try code.strImm(paramAbiReg(i), .fp, off_scaled);
+    }
+
+    // Multi-value returns: callee receives an HRP (host-result pointer)
+    // as an implicit trailing arg in x(1 + param_count). Stash to the
+    // dedicated frame slot so `.ret_multi` can retrieve it.
+    if (func.result_count > 1) {
+        if (func.param_count >= 7) return error.TooManyParamsForMultiResult;
+        const hrp_reg = paramAbiReg(func.param_count);
+        try frameStore(code, hrp_reg, hrp_save_off);
     }
 
     // Zero-init declared locals (wasm spec requires non-param locals to be 0).
@@ -524,9 +564,56 @@ fn emitEntrySpill(code: *emit.CodeBuffer, func: ir.IrFunction) !void {
     }
 }
 
+/// Store `src` to `[fp + offset]`, handling offsets that overflow the
+/// 12-bit scaled immediate of STR Xt. For large offsets we materialize
+/// the byte offset into tmp0 and use an extended-register form via ADD
+/// into tmp0. LDR/STR scaled imm12 covers up to 32760 bytes for the X
+/// form, so most real frames fit directly.
+fn frameStore(code: *emit.CodeBuffer, src: emit.Reg, offset: u32) !void {
+    if (offset % 8 == 0 and offset / 8 <= 4095) {
+        try code.strImm(src, .fp, @intCast(offset / 8));
+    } else {
+        try emitMovImm64(code, RegMap.tmp0, offset);
+        try code.addRegReg(RegMap.tmp0, RegMap.tmp0, .fp);
+        try code.strImm(src, RegMap.tmp0, 0);
+    }
+}
+
+/// Load `[fp + offset]` into `dst`, mirroring `frameStore`.
+fn frameLoad(code: *emit.CodeBuffer, dst: emit.Reg, offset: u32) !void {
+    if (offset % 8 == 0 and offset / 8 <= 4095) {
+        try code.ldrImm(dst, .fp, @intCast(offset / 8));
+    } else {
+        try emitMovImm64(code, RegMap.tmp0, offset);
+        try code.addRegReg(RegMap.tmp0, RegMap.tmp0, .fp);
+        try code.ldrImm(dst, RegMap.tmp0, 0);
+    }
+}
+
+/// Compute `dst = fp + offset` for offsets that may exceed the 12-bit
+/// ADD-immediate range.
+fn frameAddr(code: *emit.CodeBuffer, dst: emit.Reg, offset: u32) !void {
+    if (offset <= 4095) {
+        try code.addImm(dst, .fp, @intCast(offset));
+    } else if ((offset & 0xFFF) == 0 and (offset >> 12) <= 4095) {
+        try code.addImmShift12(dst, .fp, @intCast(offset >> 12));
+    } else {
+        try emitMovImm64(code, dst, offset);
+        try code.addRegReg(dst, dst, .fp);
+    }
+}
+
+/// Materialize a 32-bit unsigned immediate into `dst` via MOVZ/MOVK.
+fn emitMovImm64(code: *emit.CodeBuffer, dst: emit.Reg, imm: u32) !void {
+    const lo: u16 = @truncate(imm);
+    const hi: u16 = @truncate(imm >> 16);
+    try code.movz(dst, lo, 0);
+    if (hi != 0) try code.movk(dst, hi, 1);
+}
+
 fn isRet(op: ir.Inst.Op) bool {
     return switch (op) {
-        .ret => true,
+        .ret, .ret_multi => true,
         else => false,
     };
 }
@@ -692,6 +779,8 @@ fn compileInst(
             try emitCalleeSaveRestore(code, fctx.callee_save_base);
             try code.emitEpilogue(frame_size);
         },
+        .ret_multi => |vregs| try emitRetMulti(code, vregs, reg_map, fctx, frame_size),
+        .call_result => |idx| try emitCallResult(code, inst, idx, reg_map, fctx),
         .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot),
         .global_get => |idx| try emitGlobalGet(code, inst, idx, reg_map),
         .global_set => |gs| try emitGlobalSet(code, gs, reg_map),
@@ -1605,8 +1694,10 @@ fn emitCall(
     fctx: *FuncCompileCtx,
 ) !void {
     if (cl.tail) return error.UnimplementedTailCall;
-    if (cl.extra_results > 0) return error.UnimplementedMultiResult;
-    if (cl.args.len > 7) return error.TooManyCallArgs;
+    // args + optional HRP must fit in the 7 user-arg slots.
+    const total_call_regs: u32 = @as(u32, @intCast(cl.args.len)) +
+        (if (cl.extra_results > 0) @as(u32, 1) else 0);
+    if (total_call_regs > 7) return error.TooManyCallArgs;
     const is_import = cl.func_idx < fctx.import_count;
     const call_patches: ?*std.ArrayListUnmanaged(CallPatch) = if (is_import)
         null
@@ -1652,6 +1743,13 @@ fn emitCall(
                 try code.ldrImm(target, .fp, reg_map.spillOffsetScaled(off));
             },
         }
+    }
+
+    // Pass HRP (caller-side scratch region) in the slot after the last
+    // user arg, if this call produces extra results.
+    if (cl.extra_results > 0) {
+        const hrp_target = callArgReg(@intCast(cl.args.len));
+        try frameAddr(code, hrp_target, fctx.scratch_base);
     }
 
     // Load VMContext into x0 (was saved above if previously live).
@@ -2103,8 +2201,9 @@ fn emitCallIndirect(
     fctx: *FuncCompileCtx,
 ) !void {
     if (ci.tail) return error.UnimplementedTailCall;
-    if (ci.extra_results > 0) return error.UnimplementedMultiResult;
-    if (ci.args.len > 7) return error.TooManyCallArgs;
+    const total_ci_regs: u32 = @as(u32, @intCast(ci.args.len)) +
+        (if (ci.extra_results > 0) @as(u32, 1) else 0);
+    if (total_ci_regs > 7) return error.TooManyCallArgs;
 
     // Snapshot live caller-save regs and spill to call_save.
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
@@ -2191,6 +2290,10 @@ fn emitCallIndirect(
     for (ci.args, 0..) |arg_vreg, i| {
         try stageArgFromSaved(code, reg_map, fctx, callArgReg(@intCast(i)), arg_vreg);
     }
+    if (ci.extra_results > 0) {
+        const hrp_target = callArgReg(@intCast(ci.args.len));
+        try frameAddr(code, hrp_target, fctx.scratch_base);
+    }
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
     try code.blr(RegMap.tmp0);
 
@@ -2220,8 +2323,9 @@ fn emitCallRef(
     fctx: *FuncCompileCtx,
 ) !void {
     if (cr.tail) return error.UnimplementedTailCall;
-    if (cr.extra_results > 0) return error.UnimplementedMultiResult;
-    if (cr.args.len > 7) return error.TooManyCallArgs;
+    const total_cr_regs: u32 = @as(u32, @intCast(cr.args.len)) +
+        (if (cr.extra_results > 0) @as(u32, 1) else 0);
+    if (total_cr_regs > 7) return error.TooManyCallArgs;
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
@@ -2255,6 +2359,10 @@ fn emitCallRef(
     for (cr.args, 0..) |arg_vreg, i| {
         try stageArgFromSaved(code, reg_map, fctx, callArgReg(@intCast(i)), arg_vreg);
     }
+    if (cr.extra_results > 0) {
+        const hrp_target = callArgReg(@intCast(cr.args.len));
+        try frameAddr(code, hrp_target, fctx.scratch_base);
+    }
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
     try code.blr(RegMap.tmp0);
 
@@ -2273,8 +2381,60 @@ fn emitCallRef(
     }
 }
 
+/// `.call_result idx` — read the `idx`-th extra result slot written by
+/// the preceding call into its dest vreg. Caller-side scratch lives at
+/// `[fp + scratch_base]`, with each result occupying 8 bytes.
+fn emitCallResult(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    idx: u8,
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+) !void {
+    const dest = inst.dest orelse return;
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+    const off: u32 = fctx.scratch_base + @as(u32, idx) * 8;
+    try frameLoad(code, info.reg, off);
+    try destCommit(code, reg_map, info);
+}
 
-/// `vmctx` as the first arg and `args` as x1..xN (up to 7). Uses the
+/// `.ret_multi [v0, v1, ...]` — first result → x0; remaining → written
+/// through the saved HRP at `[hrp + (i-1)*8]`. Emits the full epilogue
+/// (callee-save restore + emitEpilogue).
+fn emitRetMulti(
+    code: *emit.CodeBuffer,
+    vregs: []const ir.VReg,
+    reg_map: *RegMap,
+    fctx: *FuncCompileCtx,
+    frame_size: u32,
+) !void {
+    if (vregs.len == 0) {
+        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try code.emitEpilogue(frame_size);
+        return;
+    }
+
+    // First result → x0.
+    const first = try useInto(code, reg_map, vregs[0], .x0);
+    if (first != .x0) try code.movRegReg(.x0, first);
+
+    if (vregs.len > 1) {
+        // Load HRP into tmp0 (non-allocatable, stable across arg reads).
+        try frameLoad(code, RegMap.tmp0, fctx.hrp_save_off);
+        // Write extra results through HRP.
+        var i: u32 = 1;
+        while (i < vregs.len) : (i += 1) {
+            const src = try useInto(code, reg_map, vregs[i], RegMap.tmp1);
+            const scaled: u12 = @intCast(i - 1);
+            try code.strImm(src, RegMap.tmp0, scaled);
+        }
+    }
+
+    try emitCalleeSaveRestore(code, fctx.callee_save_base);
+    try code.emitEpilogue(frame_size);
+}
+
+
 /// same caller-save snapshot pattern as `emitCall`: all currently-used
 /// scratch regs are spilled to the function's `call_save` region before
 /// arg staging, so the arg moves can read from stable stack slots
@@ -3932,21 +4092,87 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
     try std.testing.expectError(error.TooManyParams, compileFunction(&func, allocator));
 }
 
-test "compile: unimplemented op returns error.UnimplementedOp" {
-    // call_result is not yet implemented on aarch64 (needs multi-result
-    // plumbing) — must fail loudly, not silently drop.
+test "compile: unimplemented op returns error.UnimplementedTailCall" {
+    // Tail calls remain unimplemented on aarch64 — must fail loudly,
+    // not silently drop.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const bid = try func.newBlock();
-    const result = func.newVReg();
+    const v0 = func.newVReg();
     try func.getBlock(bid).append(.{
-        .op = .{ .call_result = 0 },
-        .dest = result,
+        .op = .{ .call = .{ .func_idx = 0, .args = &.{}, .tail = true } },
+        .dest = v0,
         .type = .i32,
     });
-    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
-    try std.testing.expectError(error.UnimplementedOp, compileFunction(&func, allocator));
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    // Provide minimal linkage so emitCall proceeds past the
+    // CallLinkageUnavailable check and reaches the tail check.
+    var patches: std.ArrayListUnmanaged(CallPatch) = .empty;
+    defer patches.deinit(allocator);
+    const ctx: FuncCompileCtx = .{
+        .allocator = allocator,
+        .import_count = 0,
+        .call_patches = &patches,
+    };
+    try std.testing.expectError(
+        error.UnimplementedTailCall,
+        compileFunctionImpl(&func, ctx, allocator),
+    );
+}
+
+test "compileModule: multi-result call (ret_multi + call_result)" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // f0: () -> (i32, i32, i32) returning (10, 20, 30)
+    var f0 = ir.IrFunction.init(allocator, 0, 3, 0);
+    const rets = try allocator.alloc(ir.VReg, 3);
+    defer allocator.free(rets);
+    {
+        const b = try f0.newBlock();
+        const v0 = f0.newVReg();
+        const v1 = f0.newVReg();
+        const v2 = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 30 }, .dest = v2, .type = .i32 });
+        rets[0] = v0;
+        rets[1] = v1;
+        rets[2] = v2;
+        try f0.getBlock(b).append(.{ .op = .{ .ret_multi = rets } });
+    }
+    _ = try module.addFunction(f0);
+
+    // f1: () -> i32 — calls f0, sums the 3 results.
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f1.newBlock();
+        const r0 = f1.newVReg();
+        const r1 = f1.newVReg();
+        const r2 = f1.newVReg();
+        const s0 = f1.newVReg();
+        const s1 = f1.newVReg();
+        try f1.getBlock(b).append(.{
+            .op = .{ .call = .{ .func_idx = 0, .args = &.{}, .extra_results = 2 } },
+            .dest = r0,
+            .type = .i32,
+        });
+        try f1.getBlock(b).append(.{ .op = .{ .call_result = 0 }, .dest = r1, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .call_result = 1 }, .dest = r2, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = r0, .rhs = r1 } }, .dest = s0, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = s0, .rhs = r2 } }, .dest = s1, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = s1 } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    try std.testing.expect(result.code.len > 0);
+    try std.testing.expect(result.code.len % 4 == 0);
 }
 
 test "compile: popcnt round-trips via CNT + ADDV" {
