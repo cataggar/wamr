@@ -258,6 +258,11 @@ pub const CodeBuffer = struct {
         try self.emit32(0xD63F0000 | (@as(u32, rn.encoding()) << 5));
     }
 
+    /// BR Xn (branch to register, no link — used for tail calls)
+    pub fn br(self: *CodeBuffer, rn: Reg) !void {
+        try self.emit32(0xD61F0000 | (@as(u32, rn.encoding()) << 5));
+    }
+
     /// RET (return via LR, alias for BR X30)
     pub fn ret(self: *CodeBuffer) !void {
         try self.emit32(0xD65F03C0);
@@ -954,6 +959,14 @@ pub const CodeBuffer = struct {
     /// Emit function epilogue: LDP FP, LR, [SP], #frame_size; RET
     /// Matching large-frame fallback for emitPrologue.
     pub fn emitEpilogue(self: *CodeBuffer, frame_size: u32) !void {
+        try self.emitEpilogueNoRet(frame_size);
+        try self.ret();
+    }
+
+    /// Same as emitEpilogue but without the trailing RET — used by tail
+    /// calls, which tear down the frame and then branch (B / BR) directly
+    /// to the target function.
+    pub fn emitEpilogueNoRet(self: *CodeBuffer, frame_size: u32) !void {
         if (frame_size / 8 <= 63) {
             const scaled: i7 = @intCast(@as(i8, @intCast(frame_size / 8)));
             try self.ldpPost(.fp, .lr, .sp, scaled);
@@ -961,7 +974,6 @@ pub const CodeBuffer = struct {
             try self.ldpImm(.fp, .lr, .sp, 0);
             try self.emitSpAdjust(frame_size, .add);
         }
-        try self.ret();
     }
 
     /// Shared SP adjustment used by both prologue and epilogue for

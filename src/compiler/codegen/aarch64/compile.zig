@@ -135,6 +135,9 @@ const FuncCompileCtx = struct {
     /// written by the callee. Sized to `max_extra_results * 8` bytes.
     /// `call_result` reads back from `[fp + scratch_base + idx*8]`.
     scratch_base: u32 = 0,
+    /// Total frame size (in bytes). Needed by tail-call emitters to
+    /// tear down the frame before branching to the target.
+    frame_size: u32 = 0,
     /// VReg → signed i64 value for `iconst_*` definitions in this function.
     /// Used to fold constants into immediate-form instructions (e.g.
     /// ADD/SUB imm). The iconst itself is still materialized into its home
@@ -248,6 +251,7 @@ pub fn compileFunctionImpl(
     fctx.callee_save_base = callee_save_base;
     fctx.hrp_save_off = hrp_save_off;
     fctx.scratch_base = scratch_base;
+    fctx.frame_size = frame_size;
 
     // Collect iconst_* values so emitBinOp etc can fold small constants
     // into immediate-form instructions. Scan is cheap — one pass over IR.
@@ -614,6 +618,9 @@ fn emitMovImm64(code: *emit.CodeBuffer, dst: emit.Reg, imm: u32) !void {
 fn isRet(op: ir.Inst.Op) bool {
     return switch (op) {
         .ret, .ret_multi => true,
+        .call => |cl| cl.tail,
+        .call_indirect => |ci| ci.tail,
+        .call_ref => |cr| cr.tail,
         else => false,
     };
 }
@@ -1693,7 +1700,6 @@ fn emitCall(
     reg_map: *RegMap,
     fctx: *FuncCompileCtx,
 ) !void {
-    if (cl.tail) return error.UnimplementedTailCall;
     // args + optional HRP must fit in the 7 user-arg slots.
     const total_call_regs: u32 = @as(u32, @intCast(cl.args.len)) +
         (if (cl.extra_results > 0) @as(u32, 1) else 0);
@@ -1712,6 +1718,8 @@ fn emitCall(
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
 
     // Spill each used caller-save reg to [fp + call_save_base + i*8].
+    // For tail calls these writes are dead, but arg staging still reads
+    // back from these slots as the stable per-reg source locations.
     for (used_snapshot, 0..) |used, i| {
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
@@ -1722,38 +1730,61 @@ fn emitCall(
 
     // Move arguments into x1..x7 by reading from their current source
     // locations via memory. Physreg sources are read from the call-save
-    // slot we just filled; stack sources from the RegMap spill slot.
+    // slot we just filled; stack sources from the RegMap spill region.
     // This order-independent approach avoids parallel-move hazards.
     for (cl.args, 0..) |arg_vreg, i| {
-        const target = callArgReg(@intCast(i));
-        const loc = reg_map.get(arg_vreg) orelse return error.UnboundVReg;
-        switch (loc) {
-            .reg => |r| {
-                const reg_idx: u32 = @intFromEnum(r);
-                if (reg_idx >= 19) {
-                    // Callee-saved source reg was not spilled across BL — just
-                    // MOV it into the target arg reg directly.
-                    try code.movRegReg(target, r);
-                } else {
-                    const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-                    try code.ldrImm(target, .fp, slot_scaled);
-                }
-            },
-            .stack => |off| {
-                try code.ldrImm(target, .fp, reg_map.spillOffsetScaled(off));
-            },
-        }
+        try stageArgFromSaved(code, reg_map, fctx, callArgReg(@intCast(i)), arg_vreg);
     }
 
-    // Pass HRP (caller-side scratch region) in the slot after the last
-    // user arg, if this call produces extra results.
+    // HRP handling. For a normal (non-tail) call, pass a pointer to our
+    // own scratch region so the callee writes extras there for
+    // `call_result` to pick up. For a tail call we instead forward our
+    // caller's HRP (saved in the prologue at `hrp_save_off`), because
+    // wasm tail-call semantics require matching signatures and the
+    // callee's extras flow straight into our caller's scratch.
     if (cl.extra_results > 0) {
         const hrp_target = callArgReg(@intCast(cl.args.len));
-        try frameAddr(code, hrp_target, fctx.scratch_base);
+        if (cl.tail) {
+            try frameLoad(code, hrp_target, fctx.hrp_save_off);
+        } else {
+            try frameAddr(code, hrp_target, fctx.scratch_base);
+        }
     }
 
     // Load VMContext into x0 (was saved above if previously live).
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+
+    if (cl.tail) {
+        // For imports the target lives in a vmctx slot; load it into
+        // tmp0 BEFORE tearing down the frame (vmctx reads need FP).
+        // tmp0 (x16) is a caller-save register not touched by the
+        // epilogue, so it survives to the `br` below.
+        if (is_import) {
+            try code.ldrImm(RegMap.tmp0, .x0, vmctx_host_functions_slot);
+            const fn_slot: u12 = @intCast(cl.func_idx);
+            try code.ldrImm(RegMap.tmp0, RegMap.tmp0, fn_slot);
+        }
+        // Tear down frame. The epilogue restores FP/LR to the caller's
+        // values and deallocates our stack, leaving the CPU state such
+        // that branching to the target makes it return directly to our
+        // caller — i.e. a real tail call.
+        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try code.emitEpilogueNoRet(fctx.frame_size);
+        if (is_import) {
+            try code.br(RegMap.tmp0);
+        } else {
+            // Emit B imm26 (opcode 0x14000000) with a patch record. The
+            // module-level call patcher preserves bits 31:26 from the
+            // existing encoding, so B and BL are both patched correctly.
+            const patch_off = code.len();
+            try code.b(0);
+            try call_patches.?.append(fctx.allocator, .{
+                .patch_offset = patch_off,
+                .target_func_idx = cl.func_idx - fctx.import_count,
+            });
+        }
+        return;
+    }
 
     if (is_import) {
         // Indirect call through vmctx.host_functions_ptr[func_idx].
@@ -2200,7 +2231,6 @@ fn emitCallIndirect(
     reg_map: *RegMap,
     fctx: *FuncCompileCtx,
 ) !void {
-    if (ci.tail) return error.UnimplementedTailCall;
     const total_ci_regs: u32 = @as(u32, @intCast(ci.args.len)) +
         (if (ci.extra_results > 0) @as(u32, 1) else 0);
     if (total_ci_regs > 7) return error.TooManyCallArgs;
@@ -2290,6 +2320,30 @@ fn emitCallIndirect(
     for (ci.args, 0..) |arg_vreg, i| {
         try stageArgFromSaved(code, reg_map, fctx, callArgReg(@intCast(i)), arg_vreg);
     }
+    if (ci.tail) {
+        // Tail: args already in x1..x7. Forward our caller's HRP if the
+        // tail target is multi-result. Then re-materialize the target
+        // fn_ptr into tmp0 AFTER any HRP load (which can transiently
+        // use tmp0 as scratch on the large-offset path), load vmctx, and
+        // finally tear down the frame + BR.
+        if (ci.extra_results > 0) {
+            const hrp_target = callArgReg(@intCast(ci.args.len));
+            try frameLoad(code, hrp_target, fctx.hrp_save_off);
+        }
+        // Recompute fn_ptr into tmp0. We already passed the bounds and
+        // sig checks above; tmp2 still holds elem_idx.
+        try loadTableInfoAddr(code, RegMap.tmp0, ci.table_idx);
+        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, @intCast(table_info_ptr_off / 8));
+        try code.addExtUxtw3(RegMap.tmp0, RegMap.tmp0, RegMap.tmp2);
+        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
+        // Load vmctx into x0 (last FP-relative read before teardown).
+        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try code.emitEpilogueNoRet(fctx.frame_size);
+        try code.br(RegMap.tmp0);
+        return;
+    }
+
     if (ci.extra_results > 0) {
         const hrp_target = callArgReg(@intCast(ci.args.len));
         try frameAddr(code, hrp_target, fctx.scratch_base);
@@ -2322,7 +2376,6 @@ fn emitCallRef(
     reg_map: *RegMap,
     fctx: *FuncCompileCtx,
 ) !void {
-    if (cr.tail) return error.UnimplementedTailCall;
     const total_cr_regs: u32 = @as(u32, @intCast(cr.args.len)) +
         (if (cr.extra_results > 0) @as(u32, 1) else 0);
     if (total_cr_regs > 7) return error.TooManyCallArgs;
@@ -2359,6 +2412,23 @@ fn emitCallRef(
     for (cr.args, 0..) |arg_vreg, i| {
         try stageArgFromSaved(code, reg_map, fctx, callArgReg(@intCast(i)), arg_vreg);
     }
+    if (cr.tail) {
+        // Tail: forward caller's HRP if callee has extras, then re-stage
+        // fn_ref into tmp0 (the HRP load can clobber tmp0 on the
+        // large-offset path, so we refresh it here). Load vmctx, tear
+        // down, and BR.
+        if (cr.extra_results > 0) {
+            const hrp_target = callArgReg(@intCast(cr.args.len));
+            try frameLoad(code, hrp_target, fctx.hrp_save_off);
+        }
+        try stageArgFromSaved(code, reg_map, fctx, RegMap.tmp0, cr.func_ref);
+        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try emitCalleeSaveRestore(code, fctx.callee_save_base);
+        try code.emitEpilogueNoRet(fctx.frame_size);
+        try code.br(RegMap.tmp0);
+        return;
+    }
+
     if (cr.extra_results > 0) {
         const hrp_target = callArgReg(@intCast(cr.args.len));
         try frameAddr(code, hrp_target, fctx.scratch_base);
@@ -4092,33 +4162,100 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
     try std.testing.expectError(error.TooManyParams, compileFunction(&func, allocator));
 }
 
-test "compile: unimplemented op returns error.UnimplementedTailCall" {
-    // Tail calls remain unimplemented on aarch64 — must fail loudly,
-    // not silently drop.
+test "compile: unimplemented op returns error.UnimplementedOp" {
+    // `.convert_s` / `.convert_u` are legacy IR variants that the
+    // current frontend no longer emits; they have no aarch64 handler and
+    // must fail loudly via the dispatch `else` branch rather than
+    // silently drop.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const bid = try func.newBlock();
     const v0 = func.newVReg();
-    try func.getBlock(bid).append(.{
-        .op = .{ .call = .{ .func_idx = 0, .args = &.{}, .tail = true } },
-        .dest = v0,
-        .type = .i32,
-    });
-    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
-    // Provide minimal linkage so emitCall proceeds past the
-    // CallLinkageUnavailable check and reaches the tail check.
-    var patches: std.ArrayListUnmanaged(CallPatch) = .empty;
-    defer patches.deinit(allocator);
-    const ctx: FuncCompileCtx = .{
-        .allocator = allocator,
-        .import_count = 0,
-        .call_patches = &patches,
-    };
+    const v1 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .convert_s = v0 }, .dest = v1, .type = .f32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v1 } });
     try std.testing.expectError(
-        error.UnimplementedTailCall,
-        compileFunctionImpl(&func, ctx, allocator),
+        error.UnimplementedOp,
+        compileFunction(&func, allocator),
     );
+}
+
+test "compileModule: direct tail call emits B (not BL) to target" {
+    // Verify `.call{tail=true}` to a local function compiles to a real
+    // tail — i.e. a B (0x14000000) patched to the callee's entry,
+    // preceded by the frame teardown (LDP + optional SP adjust). Not
+    // a BL with a dead epilogue after it.
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // f0: (i32) -> i32 returning x + 1.
+    var f0 = ir.IrFunction.init(allocator, 1, 1, 1);
+    {
+        const b = try f0.newBlock();
+        const p = f0.newVReg();
+        const one = f0.newVReg();
+        const sum = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .local_get = 0 }, .dest = p, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 1 }, .dest = one, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = p, .rhs = one } }, .dest = sum, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = sum } });
+    }
+    _ = try module.addFunction(f0);
+
+    // f1: (i32) -> i32 that `return_call f0(x)` — a direct tail call.
+    var f1 = ir.IrFunction.init(allocator, 1, 1, 1);
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+    {
+        const b = try f1.newBlock();
+        const p = f1.newVReg();
+        const r = f1.newVReg();
+        try f1.getBlock(b).append(.{ .op = .{ .local_get = 0 }, .dest = p, .type = .i32 });
+        args[0] = p;
+        try f1.getBlock(b).append(.{
+            .op = .{ .call = .{ .func_idx = 0, .args = args, .tail = true } },
+            .dest = r,
+            .type = .i32,
+        });
+        // No trailing ret: tail call is a terminator.
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    // Walk f1's code looking for a B (not BL) that targets f0.
+    const f1_start = result.offsets[1];
+    const f1_end = result.code.len;
+    const f0_start = result.offsets[0];
+    var found_b_to_f0 = false;
+    var saw_bl = false;
+    var i: usize = f1_start;
+    while (i + 4 <= f1_end) : (i += 4) {
+        const word = std.mem.readInt(u32, result.code[i..][0..4], .little);
+        // B opcode = 0b000101_xxxxxx → top 6 bits == 0x14000000
+        if ((word & 0xFC000000) == 0x14000000) {
+            const imm26_raw: u26 = @truncate(word);
+            const imm26: i26 = @bitCast(imm26_raw);
+            const target: i64 = @as(i64, @intCast(i)) + @as(i64, imm26) * 4;
+            if (target == @as(i64, @intCast(f0_start))) {
+                found_b_to_f0 = true;
+            }
+        }
+        // BL opcode = 0b100101 → 0x94000000. Tail call must NOT emit BL.
+        if ((word & 0xFC000000) == 0x94000000) {
+            const imm26_raw: u26 = @truncate(word);
+            const imm26: i26 = @bitCast(imm26_raw);
+            const target: i64 = @as(i64, @intCast(i)) + @as(i64, imm26) * 4;
+            if (target == @as(i64, @intCast(f0_start))) saw_bl = true;
+        }
+    }
+    try std.testing.expect(found_b_to_f0);
+    try std.testing.expect(!saw_bl);
 }
 
 test "compileModule: multi-result call (ret_multi + call_result)" {
