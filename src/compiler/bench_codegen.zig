@@ -194,6 +194,18 @@ fn bodyDeadIntermediates(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = result } }) catch unreachable;
 }
 
+/// Body that multiplies a function-result placeholder by a power-of-two
+/// constant (8). With the `strengthReduceMul` pass this becomes `shl x, 3`.
+fn bodyMulByPow2(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const x = func.newVReg();
+    const c = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = x }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = c }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = x, .rhs = c } }, .dest = result }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
 fn runBenchWithPasses(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -277,6 +289,13 @@ pub fn main() !void {
         dce_result.name,
         dce_result.cyclesPerOp(),
         dce_result.code_size,
+    });
+
+    const mul_result = try runBenchWithPasses(allocator, "mul(x, 8) → shl(x, 3)", &bodyMulByPow2);
+    std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{
+        mul_result.name,
+        mul_result.cyclesPerOp(),
+        mul_result.code_size,
     });
 
     std.debug.print("\n", .{});
