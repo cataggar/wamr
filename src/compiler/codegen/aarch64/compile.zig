@@ -85,6 +85,28 @@ const RegMap = struct {
         return loc;
     }
 
+    /// Release the physical register held by `vreg` so it becomes available
+    /// to subsequent `assign` calls. Called by codegen after the last static
+    /// use of `vreg` (liveness-driven scavenging). The vreg's entry is
+    /// removed so any further read via `get` fails-fast with a clear signal.
+    /// Spilled (stack) vregs are not reclaimed — spill slots are stable for
+    /// the lifetime of the function (other slots may still be live above).
+    fn freeVReg(self: *RegMap, vreg: ir.VReg) void {
+        const loc = self.entries.get(vreg) orelse return;
+        switch (loc) {
+            .reg => |r| {
+                for (scratch_regs, 0..) |sr, i| {
+                    if (sr == r) {
+                        self.reg_used[i] = false;
+                        break;
+                    }
+                }
+                _ = self.entries.remove(vreg);
+            },
+            .stack => {}, // spill slot retained (simple bump allocator)
+        }
+    }
+
     fn get(self: *const RegMap, vreg: ir.VReg) ?Location {
         return self.entries.get(vreg);
     }
@@ -458,6 +480,187 @@ pub fn compileFunctionImpl(
     fctx.mul_fused = &mul_fused;
     fctx.fma_info = &fma_info;
 
+    // Liveness-driven register scavenging: compute, for each instruction,
+    // the set of vregs whose *last* static read occurs at that instruction.
+    // After emitting the instruction, those vregs' physical registers are
+    // released via `reg_map.freeVReg` and become available for subsequent
+    // dests. Without this, `RegMap.assign` is a bump-allocator that spills
+    // everything after 25 vregs — a major CoreMark hot-path cost.
+    //
+    // The kill set is fusion-aware: a `.mul` that gets fused into a following
+    // `.add` (MADD) does not emit and has no effective reads, so its listed
+    // operands' kills are attributed to the FMA add (which reads them via
+    // `fma_info` instead of the mul's intermediate `dest`).
+    var total_insts: usize = 0;
+    for (func.blocks.items) |block| total_insts += block.instructions.items.len;
+
+    var block_flat_base = try allocator.alloc(usize, func.blocks.items.len);
+    defer allocator.free(block_flat_base);
+    {
+        var acc: usize = 0;
+        for (func.blocks.items, 0..) |block, bi| {
+            block_flat_base[bi] = acc;
+            acc += block.instructions.items.len;
+        }
+    }
+
+    const kill_lists = try allocator.alloc(std.ArrayListUnmanaged(ir.VReg), total_insts);
+    defer {
+        for (kill_lists) |*kl| kl.deinit(allocator);
+        allocator.free(kill_lists);
+    }
+    for (kill_lists) |*kl| kl.* = .empty;
+
+    {
+        var seen = std.AutoHashMap(ir.VReg, void).init(allocator);
+        defer seen.deinit();
+        const recordKill = struct {
+            fn f(
+                s: *std.AutoHashMap(ir.VReg, void),
+                kls: []std.ArrayListUnmanaged(ir.VReg),
+                alloc: std.mem.Allocator,
+                v: ir.VReg,
+                flat_idx: usize,
+            ) !void {
+                const e = try s.getOrPut(v);
+                if (e.found_existing) return;
+                try kls[flat_idx].append(alloc, v);
+            }
+        }.f;
+
+        var bi_rev = func.blocks.items.len;
+        while (bi_rev > 0) {
+            bi_rev -= 1;
+            const insts = func.blocks.items[bi_rev].instructions.items;
+            var ii_rev = insts.len;
+            while (ii_rev > 0) {
+                ii_rev -= 1;
+                const inst = insts[ii_rev];
+                const flat_idx = block_flat_base[bi_rev] + ii_rev;
+
+                // FMA fusion awareness: a fused mul has no effective reads
+                // (it doesn't emit); a fused add reads mul's sources + addend.
+                const is_fused_mul = if (inst.dest) |d|
+                    inst.op == .mul and mul_fused.contains(d)
+                else
+                    false;
+                if (is_fused_mul) continue;
+
+                if (inst.dest) |d| {
+                    if (fma_info.get(d)) |fi| {
+                        try recordKill(&seen, kill_lists, allocator, fi.mul_lhs, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, fi.mul_rhs, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, fi.addend, flat_idx);
+                        continue;
+                    }
+                }
+
+                switch (inst.op) {
+                    .add, .sub, .mul, .@"and", .@"or", .xor,
+                    .div_s, .div_u, .rem_s, .rem_u,
+                    .shl, .shr_s, .shr_u, .rotl, .rotr,
+                    .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u,
+                    .le_s, .le_u, .ge_s, .ge_u,
+                    .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+                    => |b| {
+                        try recordKill(&seen, kill_lists, allocator, b.lhs, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, b.rhs, flat_idx);
+                    },
+                    .local_set => |ls| try recordKill(&seen, kill_lists, allocator, ls.val, flat_idx),
+                    .global_set => |gs| try recordKill(&seen, kill_lists, allocator, gs.val, flat_idx),
+                    .eqz,
+                    .ctz, .clz, .popcnt,
+                    .extend8_s, .extend16_s, .extend32_s,
+                    .extend_i32_s, .extend_i32_u, .wrap_i64,
+                    .f_neg, .f_abs, .f_sqrt,
+                    .convert_i32_s, .convert_i32_u, .convert_i64_s, .convert_i64_u,
+                    .demote_f64, .promote_f32,
+                    .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+                    .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+                    .reinterpret,
+                    .memory_grow,
+                    => |v| try recordKill(&seen, kill_lists, allocator, v, flat_idx),
+                    .ret => |maybe_v| if (maybe_v) |v| try recordKill(&seen, kill_lists, allocator, v, flat_idx),
+                    .ret_multi => |vregs| for (vregs) |v| try recordKill(&seen, kill_lists, allocator, v, flat_idx),
+                    .load => |ld| try recordKill(&seen, kill_lists, allocator, ld.base, flat_idx),
+                    .store => |st| {
+                        try recordKill(&seen, kill_lists, allocator, st.base, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, st.val, flat_idx);
+                    },
+                    .atomic_load => |ald| try recordKill(&seen, kill_lists, allocator, ald.base, flat_idx),
+                    .atomic_store => |ast| {
+                        try recordKill(&seen, kill_lists, allocator, ast.base, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, ast.val, flat_idx);
+                    },
+                    .atomic_rmw => |arm| {
+                        try recordKill(&seen, kill_lists, allocator, arm.base, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, arm.val, flat_idx);
+                    },
+                    .atomic_cmpxchg => |acx| {
+                        try recordKill(&seen, kill_lists, allocator, acx.base, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, acx.expected, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, acx.replacement, flat_idx);
+                    },
+                    .atomic_notify => |an| {
+                        try recordKill(&seen, kill_lists, allocator, an.base, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, an.count, flat_idx);
+                    },
+                    .atomic_wait => |aw| {
+                        try recordKill(&seen, kill_lists, allocator, aw.base, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, aw.expected, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, aw.timeout, flat_idx);
+                    },
+                    .select => |sel| {
+                        try recordKill(&seen, kill_lists, allocator, sel.cond, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, sel.if_true, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, sel.if_false, flat_idx);
+                    },
+                    .br_if => |bi| try recordKill(&seen, kill_lists, allocator, bi.cond, flat_idx),
+                    .br_table => |bt| try recordKill(&seen, kill_lists, allocator, bt.index, flat_idx),
+                    .call => |cl| for (cl.args) |a| try recordKill(&seen, kill_lists, allocator, a, flat_idx),
+                    .call_indirect => |ci| {
+                        try recordKill(&seen, kill_lists, allocator, ci.elem_idx, flat_idx);
+                        for (ci.args) |a| try recordKill(&seen, kill_lists, allocator, a, flat_idx);
+                    },
+                    .call_ref => |cr| {
+                        try recordKill(&seen, kill_lists, allocator, cr.func_ref, flat_idx);
+                        for (cr.args) |a| try recordKill(&seen, kill_lists, allocator, a, flat_idx);
+                    },
+                    .memory_fill => |mf| {
+                        try recordKill(&seen, kill_lists, allocator, mf.dst, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, mf.val, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, mf.len, flat_idx);
+                    },
+                    .memory_copy => |mc| {
+                        try recordKill(&seen, kill_lists, allocator, mc.dst, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, mc.src, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, mc.len, flat_idx);
+                    },
+                    .memory_init => |mi| {
+                        try recordKill(&seen, kill_lists, allocator, mi.dst, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, mi.src, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, mi.len, flat_idx);
+                    },
+                    .table_init => |ti| {
+                        try recordKill(&seen, kill_lists, allocator, ti.dst, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, ti.src, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, ti.len, flat_idx);
+                    },
+                    .table_get => |tg| try recordKill(&seen, kill_lists, allocator, tg.idx, flat_idx),
+                    .table_set => |ts| {
+                        try recordKill(&seen, kill_lists, allocator, ts.idx, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, ts.val, flat_idx);
+                    },
+                    .table_grow => |tg| {
+                        try recordKill(&seen, kill_lists, allocator, tg.init, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, tg.delta, flat_idx);
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
     try code.emitPrologue(frame_size);
     try emitCalleeSaveStore(&code, callee_save_base);
 
@@ -474,9 +677,12 @@ pub fn compileFunctionImpl(
     var last_was_ret = false;
     for (func.blocks.items, 0..) |block, bi| {
         block_offsets[bi] = code.len();
-        for (block.instructions.items) |inst| {
+        for (block.instructions.items, 0..) |inst, ii| {
             last_was_ret = isRet(inst.op);
             try compileInst(&code, inst, &reg_map, frame_size, &patches, &fctx);
+            // Release physregs of vregs whose last static use is this inst.
+            const flat_idx = block_flat_base[bi] + ii;
+            for (kill_lists[flat_idx].items) |v| reg_map.freeVReg(v);
         }
     }
 
