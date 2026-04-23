@@ -361,9 +361,7 @@ pub fn compileFunctionImpl(
 
     var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
     defer reg_map.deinit();
-    // TODO(regalloc-flip): enable once the CRC bug in Phase 3 is resolved.
-    // reg_map.alloc_result = &alloc_result;
-    _ = &alloc_result;
+    reg_map.alloc_result = &alloc_result;
 
     var fctx = ctx;
     fctx.call_save_base = call_save_base;
@@ -2181,6 +2179,7 @@ fn emitCall(
     // vreg died at this call (the reg is dead after BL — nothing reads
     // it, so the ldr would be wasted work).
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask >> @intCast(i)) & 1 != 0) continue;
@@ -2488,6 +2487,7 @@ fn emitTableSet(
     try code.blr(RegMap.tmp0);
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -2598,6 +2598,7 @@ fn emitTableGrow(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -2772,6 +2773,7 @@ fn emitCallIndirect(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask_ci >> @intCast(i)) & 1 != 0) continue;
@@ -2862,6 +2864,7 @@ fn emitCallRef(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask_cr >> @intCast(i)) & 1 != 0) continue;
@@ -2992,6 +2995,7 @@ fn emitVmctxHelperCall(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3075,6 +3079,7 @@ fn emitTableInit(
 
     // Restore caller-saved regs.
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3106,6 +3111,7 @@ fn emitElemDrop(
     try code.blr(RegMap.tmp0);
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3534,6 +3540,7 @@ fn emitAtomicNotify(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3614,6 +3621,7 @@ fn emitAtomicWait(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
