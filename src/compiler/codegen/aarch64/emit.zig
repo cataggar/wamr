@@ -624,6 +624,38 @@ pub const CodeBuffer = struct {
         try self.emit32(0x0E31B800 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// DMB ISH — full data memory barrier (inner shareable domain).
+    /// Provides seq-cst ordering when paired around plain loads/stores.
+    pub fn dmbIsh(self: *CodeBuffer) !void {
+        try self.emit32(0xD5033BBF);
+    }
+
+    /// LDAR / LDARB / LDARH — load-acquire (seq-cst), no offset.
+    /// size: 1 → LDARB Wt, 2 → LDARH Wt, 4 → LDAR Wt, 8 → LDAR Xt.
+    pub fn ldarSized(self: *CodeBuffer, rt: Reg, rn: Reg, size: u8) !void {
+        const base: u32 = switch (size) {
+            1 => 0x08DFFC00,
+            2 => 0x48DFFC00,
+            4 => 0x88DFFC00,
+            8 => 0xC8DFFC00,
+            else => return error.BadLdarSize,
+        };
+        try self.emit32(base | (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// STLR / STLRB / STLRH — store-release (seq-cst), no offset.
+    /// size: 1 → STLRB Wt, 2 → STLRH Wt, 4 → STLR Wt, 8 → STLR Xt.
+    pub fn stlrSized(self: *CodeBuffer, rt: Reg, rn: Reg, size: u8) !void {
+        const base: u32 = switch (size) {
+            1 => 0x089FFC00,
+            2 => 0x489FFC00,
+            4 => 0x889FFC00,
+            8 => 0xC89FFC00,
+            else => return error.BadStlrSize,
+        };
+        try self.emit32(base | (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
     /// FCMP Sn, Sm / FCMP Dn, Dm — set NZCV from float compare.
     /// Unordered (NaN involved) sets NZCV = 0011 (N=0, Z=0, C=1, V=1).
     pub fn fcmpScalar(self: *CodeBuffer, is_f64: bool, vn: u5, vm: u5) !void {
@@ -1261,4 +1293,33 @@ test "emit: ADDV b0, v1.8b" {
     defer code.deinit();
     try code.addvB8b(0, 1);
     try expectWord(0x0E31B820, &code);
+}
+
+test "emit: DMB ISH" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.dmbIsh();
+    try expectWord(0xD5033BBF, &code);
+}
+
+test "emit: LDAR Wt/Xt + LDARB/LDARH" {
+    const sizes = [_]u8{ 1, 2, 4, 8 };
+    const expected = [_]u32{ 0x08DFFC20, 0x48DFFC20, 0x88DFFC20, 0xC8DFFC20 };
+    for (sizes, expected) |size, want| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ldarSized(.x0, .x1, size);
+        try expectWord(want, &code);
+    }
+}
+
+test "emit: STLR Wt/Xt + STLRB/STLRH" {
+    const sizes = [_]u8{ 1, 2, 4, 8 };
+    const expected = [_]u32{ 0x089FFC20, 0x489FFC20, 0x889FFC20, 0xC89FFC20 };
+    for (sizes, expected) |size, want| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.stlrSized(.x0, .x1, size);
+        try expectWord(want, &code);
+    }
 }

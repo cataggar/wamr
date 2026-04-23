@@ -291,6 +291,11 @@ pub fn compileFunctionImpl(
                     try bumpUse(&use_counts, st.base);
                     try bumpUse(&use_counts, st.val);
                 },
+                .atomic_load => |ald| try bumpUse(&use_counts, ald.base),
+                .atomic_store => |ast| {
+                    try bumpUse(&use_counts, ast.base);
+                    try bumpUse(&use_counts, ast.val);
+                },
                 .select => |sel| {
                     try bumpUse(&use_counts, sel.cond);
                     try bumpUse(&use_counts, sel.if_true);
@@ -707,6 +712,11 @@ fn compileInst(
         .trunc_sat_f32_s, .trunc_sat_f64_s => |vreg| try emitTruncSat(code, inst, vreg, reg_map, true),
         .trunc_sat_f32_u, .trunc_sat_f64_u => |vreg| try emitTruncSat(code, inst, vreg, reg_map, false),
         .reinterpret => |vreg| try emitReinterpret(code, inst, vreg, reg_map),
+
+        // ── Atomics (minimal seq-cst subset) ─────────────────────────
+        .atomic_fence => try code.dmbIsh(),
+        .atomic_load => |ld| try emitAtomicLoad(code, inst, ld, reg_map),
+        .atomic_store => |st| try emitAtomicStore(code, st, reg_map),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
@@ -2490,6 +2500,42 @@ fn emitStore(
     }
 }
 
+fn emitAtomicLoad(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    ld: @TypeOf(@as(ir.Inst.Op, undefined).atomic_load),
+    reg_map: *RegMap,
+) !void {
+    // wasm threads: seq-cst load. LDAR has no offset form, so always fold
+    // the full offset into the base address in tmp0. Upper bits of sub-word
+    // loads are zero-extended by LDARB/LDARH; LDAR Wt also zeroes bits[63:32].
+    const dest = inst.dest orelse return;
+    switch (ld.size) {
+        1, 2, 4, 8 => {},
+        else => return error.UnimplementedAtomicSize,
+    }
+    const end_offset: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+    try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    try code.ldarSized(info.reg, RegMap.tmp0, ld.size);
+    try destCommit(code, reg_map, info);
+}
+
+fn emitAtomicStore(
+    code: *emit.CodeBuffer,
+    st: @TypeOf(@as(ir.Inst.Op, undefined).atomic_store),
+    reg_map: *RegMap,
+) !void {
+    switch (st.size) {
+        1, 2, 4, 8 => {},
+        else => return error.UnimplementedAtomicSize,
+    }
+    const end_offset: u64 = @as(u64, st.offset) + @as(u64, st.size);
+    try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
+    const val_reg = try useInto(code, reg_map, st.val, RegMap.tmp1);
+    try code.stlrSized(val_reg, RegMap.tmp0, st.size);
+}
+
 fn emitBrIf(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
@@ -3451,14 +3497,14 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
 }
 
 test "compile: unimplemented op returns error.UnimplementedOp" {
-    // atomic_fence is not yet implemented on aarch64 — must fail loudly,
+    // data_drop is not yet implemented on aarch64 — must fail loudly,
     // not silently drop.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 0);
     defer func.deinit();
     const bid = try func.newBlock();
     try func.getBlock(bid).append(.{
-        .op = .{ .atomic_fence = {} },
+        .op = .{ .data_drop = 0 },
         .dest = null,
         .type = .void,
     });
