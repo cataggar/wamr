@@ -239,6 +239,19 @@ pub fn compileFunctionImpl(
     // Phase 1b: stack args beyond x7 aren't supported yet.
     if (func.param_count > 7) return error.TooManyParams;
 
+    // Phase 2 of regalloc adoption (issue #100): run the linear-scan
+    // allocator in shadow mode. Its output is discarded here; the
+    // scavenger (`RegMap`) still drives codegen. The purpose is to
+    // exercise `regalloc.allocate` + `collectClobberPoints` on every
+    // function the test suite and CoreMark compile, so that Phase 3
+    // (the emitter flip) starts from a known-good analysis.
+    //
+    // If this errors or trips an internal assertion, it's a genuine
+    // bug — either in the IR, in `analysis.computeLiveRanges`, or in
+    // the allocator — and we want it to surface loudly here rather
+    // than in Phase 3 mixed with codegen changes.
+    try shadowRunRegalloc(func, allocator);
+
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
@@ -3882,6 +3895,47 @@ pub fn collectClobberPoints(
         }
     }
     return clobbers;
+}
+
+/// Phase 2 shim: run the linear-scan allocator on `func` and discard the
+/// result. Exercises `collectClobberPoints`, `analysis.computeLiveRanges`,
+/// and `regalloc.allocate` on every aarch64 function the compiler sees,
+/// so bugs surface here before Phase 3 depends on the output.
+///
+/// This is called unconditionally from `compileFunctionImpl` and will be
+/// deleted in Phase 3 (replaced by a real consumer of the allocation).
+fn shadowRunRegalloc(func: *const ir.IrFunction, allocator: std.mem.Allocator) !void {
+    var clobbers = try collectClobberPoints(func, allocator);
+    defer clobbers.deinit(allocator);
+
+    var alloc_result = try regalloc.allocate(
+        func,
+        allocator,
+        aarch64RegSet(func.local_count),
+        clobbers.items,
+    );
+    defer alloc_result.deinit();
+
+    // Sanity: every vreg the allocator assigns lands on either a real
+    // aarch64 GPR or a nonzero spill offset. A bogus mapping (e.g., a
+    // reg number outside `aarch64_alloc_regs`) would indicate a broken
+    // RegSet setup.
+    var it = alloc_result.assignments.iterator();
+    while (it.next()) |e| {
+        switch (e.value_ptr.*) {
+            .reg => |r| {
+                var found = false;
+                for (aarch64_alloc_regs) |ar| {
+                    if (r == ar) {
+                        found = true;
+                        break;
+                    }
+                }
+                std.debug.assert(found);
+            },
+            .stack => |off| std.debug.assert(off >= 0),
+        }
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
