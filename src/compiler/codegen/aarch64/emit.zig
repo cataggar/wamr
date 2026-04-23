@@ -656,6 +656,102 @@ pub const CodeBuffer = struct {
         try self.emit32(base | (@as(u32, rn.encoding()) << 5) | rt.encoding());
     }
 
+    /// LDAXR / LDAXRB / LDAXRH — load-acquire exclusive (CAS loop entry).
+    pub fn ldaxrSized(self: *CodeBuffer, rt: Reg, rn: Reg, size: u8) !void {
+        const base: u32 = switch (size) {
+            1 => 0x085FFC00,
+            2 => 0x485FFC00,
+            4 => 0x885FFC00,
+            8 => 0xC85FFC00,
+            else => return error.BadLdaxrSize,
+        };
+        try self.emit32(base | (@as(u32, rn.encoding()) << 5) | rt.encoding());
+    }
+
+    /// STLXR / STLXRB / STLXRH — store-release exclusive. `rs` receives
+    /// the status (0 = success). rs must differ from rt and rn.
+    pub fn stlxrSized(self: *CodeBuffer, rs: Reg, rt: Reg, rn: Reg, size: u8) !void {
+        const base: u32 = switch (size) {
+            1 => 0x0800FC00,
+            2 => 0x4800FC00,
+            4 => 0x8800FC00,
+            8 => 0xC800FC00,
+            else => return error.BadStlxrSize,
+        };
+        try self.emit32(base |
+            (@as(u32, rs.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) |
+            rt.encoding());
+    }
+
+    /// CBNZ Wt, #imm19 — branch if 32-bit reg is non-zero (word offset).
+    pub fn cbnz32(self: *CodeBuffer, rt: Reg, offset_words: i19) !void {
+        const imm19: u19 = @bitCast(offset_words);
+        try self.emit32(0x35000000 | (@as(u32, imm19) << 5) | rt.encoding());
+    }
+
+    /// LSE atomic read-modify-write ops (ARMv8.1-A). All variants emit a
+    /// single seq-cst instruction (acquire + release) that atomically
+    /// loads the old value at [Rn] into Rt and writes a derived value.
+    /// Size selects the base opcode (byte/half/word/dword); opcode12 is
+    /// the operation selector in bits [15:12].
+    pub const LseOp = enum(u32) {
+        add = 0x0000,   // LDADD  — new = old + Rs
+        clr = 0x1000,   // LDCLR  — new = old & ~Rs
+        eor = 0x2000,   // LDEOR  — new = old ^ Rs
+        set = 0x3000,   // LDSET  — new = old | Rs
+        swp = 0x8000,   // SWP    — new = Rs
+    };
+
+    pub fn lseAtomic(
+        self: *CodeBuffer,
+        op: LseOp,
+        rs: Reg,
+        rt: Reg,
+        rn: Reg,
+        size: u8,
+    ) !void {
+        // A=1, R=1 (acquire+release) — "AL" suffix.
+        const size_base: u32 = switch (size) {
+            1 => 0x38E00000,
+            2 => 0x78E00000,
+            4 => 0xB8E00000,
+            8 => 0xF8E00000,
+            else => return error.BadLseSize,
+        };
+        try self.emit32(size_base | @intFromEnum(op) |
+            (@as(u32, rs.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) |
+            rt.encoding());
+    }
+
+    /// LSE CAS (AL variant): atomically, if [Rn] == Rs then [Rn] := Rt;
+    /// Rs is updated to the old value of [Rn] unconditionally. Size picks
+    /// the variant (CASALB/H/W/X).
+    pub fn casAl(self: *CodeBuffer, rs: Reg, rt: Reg, rn: Reg, size: u8) !void {
+        const size_base: u32 = switch (size) {
+            1 => 0x08E0FC00,
+            2 => 0x48E0FC00,
+            4 => 0x88E0FC00,
+            8 => 0xC8E0FC00,
+            else => return error.BadCasSize,
+        };
+        try self.emit32(size_base |
+            (@as(u32, rs.encoding()) << 16) |
+            (@as(u32, rn.encoding()) << 5) |
+            rt.encoding());
+    }
+
+    /// NEG Xd, Xm — 64-bit negation via SUB Xd, XZR, Xm.
+    pub fn negReg64(self: *CodeBuffer, rd: Reg, rm: Reg) !void {
+        try self.emit32(0xCB0003E0 | (@as(u32, rm.encoding()) << 16) | rd.encoding());
+    }
+
+    /// MVN Xd, Xm — 64-bit bitwise NOT via ORN Xd, XZR, Xm.
+    pub fn mvnReg64(self: *CodeBuffer, rd: Reg, rm: Reg) !void {
+        try self.emit32(0xAA2003E0 | (@as(u32, rm.encoding()) << 16) | rd.encoding());
+    }
+
     /// FCMP Sn, Sm / FCMP Dn, Dm — set NZCV from float compare.
     /// Unordered (NaN involved) sets NZCV = 0011 (N=0, Z=0, C=1, V=1).
     pub fn fcmpScalar(self: *CodeBuffer, is_f64: bool, vn: u5, vm: u5) !void {
@@ -1322,4 +1418,98 @@ test "emit: STLR Wt/Xt + STLRB/STLRH" {
         try code.stlrSized(.x0, .x1, size);
         try expectWord(want, &code);
     }
+}
+
+test "emit: LDAXR sized" {
+    const sizes = [_]u8{ 1, 2, 4, 8 };
+    const expected = [_]u32{ 0x085FFC20, 0x485FFC20, 0x885FFC20, 0xC85FFC20 };
+    for (sizes, expected) |size, want| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ldaxrSized(.x0, .x1, size);
+        try expectWord(want, &code);
+    }
+}
+
+test "emit: STLXR sized" {
+    const sizes = [_]u8{ 1, 2, 4, 8 };
+    // STLXR Ws=w2, Wt=w0, [x1]
+    const expected = [_]u32{ 0x0802FC20, 0x4802FC20, 0x8802FC20, 0xC802FC20 };
+    for (sizes, expected) |size, want| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.stlxrSized(.x2, .x0, .x1, size);
+        try expectWord(want, &code);
+    }
+}
+
+test "emit: CBNZ W offset" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.cbnz32(.x2, 0);
+    try expectWord(0x35000002, &code);
+    var code2 = CodeBuffer.init(std.testing.allocator);
+    defer code2.deinit();
+    try code2.cbnz32(.x0, 1);
+    try expectWord(0x35000020, &code2);
+}
+
+test "emit: LSE LDADDAL W" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.lseAtomic(.add, .x1, .x0, .x2, 4);
+    try expectWord(0xB8E10040, &code);
+}
+
+test "emit: LSE LDCLRAL W" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.lseAtomic(.clr, .x1, .x0, .x2, 4);
+    try expectWord(0xB8E11040, &code);
+}
+
+test "emit: LSE LDSETAL W" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.lseAtomic(.set, .x1, .x0, .x2, 4);
+    try expectWord(0xB8E13040, &code);
+}
+
+test "emit: LSE LDEORAL W" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.lseAtomic(.eor, .x1, .x0, .x2, 4);
+    try expectWord(0xB8E12040, &code);
+}
+
+test "emit: LSE SWPAL W" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.lseAtomic(.swp, .x1, .x0, .x2, 4);
+    try expectWord(0xB8E18040, &code);
+}
+
+test "emit: LSE CASAL sizes" {
+    const sizes = [_]u8{ 1, 2, 4, 8 };
+    const expected = [_]u32{ 0x08E1FC40, 0x48E1FC40, 0x88E1FC40, 0xC8E1FC40 };
+    for (sizes, expected) |size, want| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.casAl(.x1, .x0, .x2, size);
+        try expectWord(want, &code);
+    }
+}
+
+test "emit: NEG x0, x1" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.negReg64(.x0, .x1);
+    try expectWord(0xCB0103E0, &code);
+}
+
+test "emit: MVN x0, x1" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.mvnReg64(.x0, .x1);
+    try expectWord(0xAA2103E0, &code);
 }

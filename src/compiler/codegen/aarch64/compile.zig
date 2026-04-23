@@ -296,6 +296,15 @@ pub fn compileFunctionImpl(
                     try bumpUse(&use_counts, ast.base);
                     try bumpUse(&use_counts, ast.val);
                 },
+                .atomic_rmw => |arm| {
+                    try bumpUse(&use_counts, arm.base);
+                    try bumpUse(&use_counts, arm.val);
+                },
+                .atomic_cmpxchg => |acx| {
+                    try bumpUse(&use_counts, acx.base);
+                    try bumpUse(&use_counts, acx.expected);
+                    try bumpUse(&use_counts, acx.replacement);
+                },
                 .select => |sel| {
                     try bumpUse(&use_counts, sel.cond);
                     try bumpUse(&use_counts, sel.if_true);
@@ -727,6 +736,8 @@ fn compileInst(
         .atomic_fence => try code.dmbIsh(),
         .atomic_load => |ld| try emitAtomicLoad(code, inst, ld, reg_map),
         .atomic_store => |st| try emitAtomicStore(code, st, reg_map),
+        .atomic_rmw => |rmw| try emitAtomicRmw(code, inst, rmw, reg_map),
+        .atomic_cmpxchg => |cx| try emitAtomicCmpxchg(code, inst, cx, reg_map),
 
         // ── Passive segments ─────────────────────────────────────────
         // memory.init / data.drop are AOT no-ops: active segments are
@@ -2671,6 +2682,88 @@ fn emitAtomicStore(
     try code.stlrSized(val_reg, RegMap.tmp0, st.size);
 }
 
+fn emitAtomicRmw(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    rmw: @TypeOf(@as(ir.Inst.Op, undefined).atomic_rmw),
+    reg_map: *RegMap,
+) !void {
+    // ARMv8.1-A LSE one-instruction seq-cst atomics.
+    //   add  -> LDADDAL        Rs=val, Rt=old, [Rn=addr]
+    //   sub  -> NEG tmp, val;  LDADDAL tmp, old, [addr]
+    //   and  -> MVN tmp, val;  LDCLRAL tmp, old, [addr]   (clear bits in ~val)
+    //   or   -> LDSETAL        Rs=val, Rt=old
+    //   xor  -> LDEORAL        Rs=val, Rt=old
+    //   xchg -> SWPAL          Rs=val, Rt=old
+    switch (rmw.size) {
+        1, 2, 4, 8 => {},
+        else => return error.UnimplementedAtomicSize,
+    }
+    const dest = inst.dest orelse return error.AtomicRmwMissingDest;
+    const end_offset: u64 = @as(u64, rmw.offset) + @as(u64, rmw.size);
+    try emitMemAddr(code, reg_map, rmw.base, rmw.offset, end_offset);
+
+    // After emitMemAddr: tmp0 = effective address, tmp1/tmp2 free.
+    const val_src = try useInto(code, reg_map, rmw.val, RegMap.tmp1);
+
+    // For sub/and we need a mutated copy of val in tmp1.
+    var rs_reg: emit.Reg = val_src;
+    var lse_op: emit.CodeBuffer.LseOp = undefined;
+    switch (rmw.op) {
+        .add => lse_op = .add,
+        .sub => {
+            try code.negReg64(RegMap.tmp1, val_src);
+            rs_reg = RegMap.tmp1;
+            lse_op = .add;
+        },
+        .@"and" => {
+            try code.mvnReg64(RegMap.tmp1, val_src);
+            rs_reg = RegMap.tmp1;
+            lse_op = .clr;
+        },
+        .@"or" => lse_op = .set,
+        .xor => lse_op = .eor,
+        .xchg => lse_op = .swp,
+    }
+
+    // The result (old value) goes into info.reg. LDADDAL / LDCLRAL / etc
+    // require Rt (destination) distinct from Rs on the constrained path —
+    // and info.reg is always in the scratch pool (never tmp0/1/2), so Rt
+    // != Rn (addr=tmp0) and Rt != Rs (rs_reg ∈ {tmp1, val's home reg}).
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+    try code.lseAtomic(lse_op, rs_reg, info.reg, RegMap.tmp0, rmw.size);
+    try destCommit(code, reg_map, info);
+}
+
+fn emitAtomicCmpxchg(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    cx: @TypeOf(@as(ir.Inst.Op, undefined).atomic_cmpxchg),
+    reg_map: *RegMap,
+) !void {
+    // ARMv8.1-A LSE CASAL: one instruction. Rs = expected (input) & old
+    // value (output). So we load expected into the dest register and
+    // CASAL updates it in place.
+    switch (cx.size) {
+        1, 2, 4, 8 => {},
+        else => return error.UnimplementedAtomicSize,
+    }
+    const dest = inst.dest orelse return error.AtomicCmpxchgMissingDest;
+    const end_offset: u64 = @as(u64, cx.offset) + @as(u64, cx.size);
+    try emitMemAddr(code, reg_map, cx.base, cx.offset, end_offset);
+
+    // info.reg receives `expected`, then CASAL updates it in-place to old.
+    const info = try destBegin(reg_map, dest, RegMap.tmp1);
+    const exp_src = try useInto(code, reg_map, cx.expected, info.reg);
+    if (exp_src != info.reg) try code.movRegReg(info.reg, exp_src);
+
+    const rep_src = try useInto(code, reg_map, cx.replacement, RegMap.tmp2);
+    if (rep_src != RegMap.tmp2) try code.movRegReg(RegMap.tmp2, rep_src);
+
+    try code.casAl(info.reg, RegMap.tmp2, RegMap.tmp0, cx.size);
+    try destCommit(code, reg_map, info);
+}
+
 fn emitBrIf(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
@@ -3632,19 +3725,19 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
 }
 
 test "compile: unimplemented op returns error.UnimplementedOp" {
-    // atomic_rmw is not yet implemented on aarch64 — must fail loudly,
+    // atomic_notify is not yet implemented on aarch64 — must fail loudly,
     // not silently drop.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const bid = try func.newBlock();
     const addr = func.newVReg();
-    const val = func.newVReg();
+    const count = func.newVReg();
     const result = func.newVReg();
     try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
-    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = val, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = count, .type = .i32 });
     try func.getBlock(bid).append(.{
-        .op = .{ .atomic_rmw = .{ .base = addr, .offset = 0, .size = 4, .val = val, .op = .add } },
+        .op = .{ .atomic_notify = .{ .base = addr, .offset = 0, .count = count } },
         .dest = result,
         .type = .i32,
     });
@@ -3678,6 +3771,65 @@ test "compile: popcnt round-trips via CNT + ADDV" {
         if (w == 0x0E205800) found_cnt = true;
     }
     try std.testing.expect(found_cnt);
+}
+
+test "compile: atomic_rmw add emits LDADDAL" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const val = func.newVReg();
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = val, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .atomic_rmw = .{ .base = addr, .offset = 0, .size = 4, .val = val, .op = .add } },
+        .dest = result,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // Look for any LDADDAL Ws, Wt, [Xn]: top 12 bits = 0xB8E and
+    // opcode[15:12]=0000. Mask low bits for Rs/Rn/Rt.
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0xB8E00000) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "compile: atomic_cmpxchg emits CASAL" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const expected = func.newVReg();
+    const replacement = func.newVReg();
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 1 }, .dest = expected, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 2 }, .dest = replacement, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .atomic_cmpxchg = .{ .base = addr, .offset = 0, .size = 4, .expected = expected, .replacement = replacement } },
+        .dest = result,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    // Look for CASAL W: 0x88E0FC00 base, Rs/Rn/Rt in low bits.
+    var found = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0x88E0FC00) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "compile: .call without linkage context returns CallLinkageUnavailable" {
