@@ -1564,6 +1564,83 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     return changed;
 }
 
+// ── Wrap-of-extend cancellation ────────────────────────────────────────────
+
+/// Eliminate `wrap_i64(extend_i32_s(x))` and `wrap_i64(extend_i32_u(x))`
+/// — both compose to the identity on the original i32 value.
+///
+/// The frontend (and inliner / function-merging passes) sometimes
+/// produce these chains when an i32 is briefly widened to i64 to
+/// participate in a helper or comparison and then narrowed back.
+///
+/// Soundness:
+///   - `extend_i32_s(x)` places the low 32 bits of the result equal to
+///     x's bit pattern (and sign-extends the upper 32 from x's sign
+///     bit). `extend_i32_u(x)` places x in the low 32 and zeros the
+///     upper. In both cases `wrap_i64` returns the low 32, recovering
+///     x exactly.
+///
+/// We always rewrite when the pattern matches; the inner extend is
+/// left in place (it may have other uses) and DCE drops it later if
+/// it ends up unused.
+pub fn foldWrapOfExtend(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    const Rewrite = struct {
+        blk: ir.BlockId,
+        ii: u32,
+        wrap_dest: ir.VReg,
+        inner_src: ir.VReg,
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const wrap_dest = inst.dest orelse continue;
+            const wrap_src = switch (inst.op) {
+                .wrap_i64 => |v| v,
+                else => continue,
+            };
+            const pb = def_block.get(wrap_src) orelse continue;
+            const pi = def_idx.get(wrap_src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const inner_src = switch (producer.op) {
+                .extend_i32_s, .extend_i32_u => |v| v,
+                else => continue,
+            };
+            try rewrites.append(allocator, .{
+                .blk = @intCast(bi),
+                .ii = @intCast(ii),
+                .wrap_dest = wrap_dest,
+                .inner_src = inner_src,
+            });
+        }
+    }
+
+    for (rewrites.items) |r| {
+        replaceVReg(func, r.wrap_dest, r.inner_src);
+        const inst = &func.blocks.items[r.blk].instructions.items[r.ii];
+        inst.op = .{ .iconst_32 = 0 };
+        changed = true;
+    }
+    return changed;
+}
+
 // ── Float unary idempotents ────────────────────────────────────────────────
 
 /// Simplify chained unary float operations:
@@ -2342,6 +2419,7 @@ pub const default_passes: []const PassFn = &.{
     &foldSelectOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -4871,5 +4949,86 @@ test "foldFloatUnaryIdempotents: composes with DCE" {
     // Both f_negs should now be gone.
     for (block.instructions.items) |inst| {
         try std.testing.expect(inst.op != .f_neg);
+    }
+}
+
+test "foldWrapOfExtend: wrap_i64(extend_i32_s(x)) reduces to x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_x, .type = .i32 });
+    try block.append(.{ .op = .{ .extend_i32_s = v_x }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_ext }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    const changed = try foldWrapOfExtend(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, block.instructions.items[3].op);
+}
+
+test "foldWrapOfExtend: wrap_i64(extend_i32_u(x)) reduces to x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_x, .type = .i32 });
+    try block.append(.{ .op = .{ .extend_i32_u = v_x }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_ext }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    const changed = try foldWrapOfExtend(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, block.instructions.items[3].op);
+}
+
+test "foldWrapOfExtend: skip when wrap source is not an extend" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_y = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 0xDEADBEEFCAFE }, .dest = v_y, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_y }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    const changed = try foldWrapOfExtend(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldWrapOfExtend: composes with DCE to drop the extend" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_x, .type = .i32 });
+    try block.append(.{ .op = .{ .extend_i32_s = v_x }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_ext }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    _ = try foldWrapOfExtend(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .extend_i32_s);
+        try std.testing.expect(inst.op != .wrap_i64);
     }
 }
