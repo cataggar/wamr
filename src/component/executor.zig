@@ -444,34 +444,23 @@ pub fn dispatchCanonBuiltin(
 ) ExecutionError!void {
     switch (canon) {
         .resource_new => |resource_idx| {
-            if (resource_idx >= comp_inst.resource_tables.len)
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
                 return error.FunctionNotFound;
             const rep_val: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const handle = try canonResourceNew(
-                &comp_inst.resource_tables[resource_idx],
-                rep_val,
-                allocator,
-            );
+            const handle = try canonResourceNew(rt, rep_val, allocator);
             env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
         },
         .resource_drop => |resource_idx| {
-            if (resource_idx >= comp_inst.resource_tables.len)
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
                 return error.FunctionNotFound;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            _ = canonResourceDrop(
-                &comp_inst.resource_tables[resource_idx],
-                handle,
-                allocator,
-            );
+            _ = canonResourceDrop(rt, handle, allocator);
         },
         .resource_rep => |resource_idx| {
-            if (resource_idx >= comp_inst.resource_tables.len)
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
                 return error.FunctionNotFound;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const rep_val = canonResourceRep(
-                &comp_inst.resource_tables[resource_idx],
-                handle,
-            ) orelse 0;
+            const rep_val = canonResourceRep(rt, handle) orelse 0;
             env.pushI32(@bitCast(rep_val)) catch return error.StackOverflow;
         },
         .lift, .lower => {}, // Handled by callComponentFunc

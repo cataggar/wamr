@@ -87,21 +87,72 @@ pub const ResourceTable = struct {
 
 // ── Component Instance ──────────────────────────────────────────────────────
 
-/// Binding for a component import — either a host-provided callback
-/// or a reference to another component instance's export.
+/// Host-facing type of an interface value passed across a component boundary.
+pub const InterfaceValue = @import("canonical_abi.zig").InterfaceValue;
+
+/// A host-provided function that satisfies a component `func` import.
+///
+/// Phase 2A will invoke this from a canon-lowered core trampoline, after
+/// the trampoline has decoded the core ABI representation into component-level
+/// `InterfaceValue`s. For Phase 1B the field is captured but never called.
+///
+/// Memory ownership for compound result values (strings, lists, records)
+/// follows the standard canonical-ABI convention: the callee allocates
+/// into `allocator`; the trampoline that invoked the host func owns the
+/// resulting values and is responsible for lifting them back into core memory.
+pub const HostFunc = struct {
+    /// Opaque context pointer forwarded to `call`.
+    context: ?*anyopaque = null,
+    /// Host-side implementation. Null is legal in tests where the call path
+    /// is not exercised; `linkImports` does not require it to be set.
+    call: ?*const fn (
+        ctx: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: std.mem.Allocator,
+    ) anyerror!void = null,
+    /// Optional component-level function type index, for Phase 2B validation.
+    type_idx: ?u32 = null,
+};
+
+/// A member of a host-provided instance binding.
+pub const HostInstanceMember = union(enum) {
+    func: HostFunc,
+    /// Placeholder for host-side resource-type identity. For Phase 1B we
+    /// carry only the raw component resource-type index the host claims to
+    /// implement; real opaque identity / lift/lower glue lands in Phase 2A.
+    resource_type: u32,
+};
+
+/// A host binding for an instance-typed component import. The members map
+/// names (e.g. `"[method]output-stream.write"`) to host implementations.
+///
+/// `ComponentInstance` stores these by borrowed pointer — callers must keep
+/// the `HostInstance` alive for at least the lifetime of every
+/// `ComponentInstance` whose imports point at it.
+pub const HostInstance = struct {
+    members: std.StringHashMapUnmanaged(HostInstanceMember) = .empty,
+
+    pub fn deinit(self: *HostInstance, allocator: std.mem.Allocator) void {
+        self.members.deinit(allocator);
+    }
+};
+
+/// Binding for a component import — either a host-provided callback,
+/// a host-provided instance (member map), or a reference to another
+/// component instance's export.
 pub const ImportBinding = union(enum) {
-    /// A host-provided function (callback pointer + context).
+    /// A host-provided function.
     host_func: HostFunc,
+    /// A host-provided instance (WASI p2 top-level imports are always
+    /// instance-typed; this is the common Phase 2B path).
+    host_instance: *const HostInstance,
     /// A reference to another ComponentInstance's exported function.
     component_export: struct {
         instance: *const ComponentInstance,
         func_name: []const u8,
     },
-
-    pub const HostFunc = struct {
-        /// Opaque context pointer for the host callback.
-        context: ?*anyopaque = null,
-    };
 };
 
 /// A runtime component instance — the result of instantiating a Component.
@@ -110,8 +161,12 @@ pub const ComponentInstance = struct {
     component: *const ctypes.Component,
     /// Core module instances created during instantiation.
     core_instances: []CoreInstanceEntry,
-    /// Resource tables, one per resource type defined in the component.
-    resource_tables: []ResourceTable,
+    /// Resource tables, keyed by the raw component resource type index
+    /// (as referenced by `canon resource.{new,drop,rep}`). Allocated
+    /// lazily on first access so the dense `[]ResourceTable` layout (which
+    /// silently assumed resource indices were dense over locally declared
+    /// resources) no longer corrupts on aliased or imported resources.
+    resource_tables: std.AutoHashMapUnmanaged(u32, ResourceTable),
     /// Exported functions (component-level func index → core func index + instance).
     exported_funcs: std.StringHashMapUnmanaged(ExportedFunc),
     /// Resolved imports keyed by import name.
@@ -144,18 +199,56 @@ pub const ComponentInstance = struct {
         return self.imports.get(name);
     }
 
+    /// Get-or-create the resource table for a given component resource type
+    /// index. Resource tables are lazily allocated on first use.
+    pub fn getOrCreateResourceTable(self: *ComponentInstance, type_idx: u32) !*ResourceTable {
+        const gop = try self.resource_tables.getOrPut(self.allocator, type_idx);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        return gop.value_ptr;
+    }
+
+    /// Kind-classify a top-level component import. Pure-type imports (those
+    /// whose sole purpose is to introduce a type index) do not need a runtime
+    /// binding; every other kind must be satisfied by `linkImports`.
+    fn importIsRuntime(imp: ctypes.ImportDecl) bool {
+        return switch (imp.desc) {
+            .type => false,
+            .module, .func, .value, .component, .instance => true,
+        };
+    }
+
+    /// Validate that `binding` is compatible with `imp.desc`'s kind. Returns
+    /// `error.ImportKindMismatch` for an outright mismatch. Cross-component
+    /// wiring via `component_export` is accepted for any runtime kind and is
+    /// validated more thoroughly at call time.
+    fn importKindMatches(imp: ctypes.ImportDecl, binding: ImportBinding) bool {
+        return switch (binding) {
+            .component_export => true,
+            .host_func => imp.desc == .func,
+            .host_instance => imp.desc == .instance,
+        };
+    }
+
     /// Link imports against a set of provided bindings.
-    /// Returns error if a required import is missing from the providers.
+    ///
+    /// Every runtime (non-type-only) top-level import must have a provider;
+    /// missing ones fail with `error.MissingImport`. Kind mismatches (e.g.
+    /// binding a `host_func` to an instance-typed import) fail with
+    /// `error.ImportKindMismatch`. Pure `.type` imports are satisfied by the
+    /// type system and require no runtime binding.
     pub fn linkImports(
         self: *ComponentInstance,
         providers: std.StringHashMapUnmanaged(ImportBinding),
     ) !void {
         for (self.component.imports) |imp| {
-            if (providers.get(imp.name)) |binding| {
+            const maybe_binding = providers.get(imp.name);
+            if (maybe_binding) |binding| {
+                if (!importKindMatches(imp, binding)) return error.ImportKindMismatch;
                 self.imports.put(self.allocator, imp.name, binding) catch
                     return error.OutOfMemory;
+            } else if (importIsRuntime(imp)) {
+                return error.MissingImport;
             }
-            // Non-func imports (types, etc.) don't need runtime bindings
         }
     }
 
@@ -189,8 +282,9 @@ pub const ComponentInstance = struct {
     }
 
     pub fn deinit(self: *ComponentInstance) void {
-        for (self.resource_tables) |*rt| rt.deinit(self.allocator);
-        if (self.resource_tables.len > 0) self.allocator.free(self.resource_tables);
+        var rt_it = self.resource_tables.valueIterator();
+        while (rt_it.next()) |rt| rt.deinit(self.allocator);
+        self.resource_tables.deinit(self.allocator);
         if (self.core_instances.len > 0) self.allocator.free(self.core_instances);
         self.exported_funcs.deinit(self.allocator);
         self.imports.deinit(self.allocator);
@@ -206,6 +300,8 @@ pub const InstantiationError = error{
     CoreModuleLoadFailed,
     CoreModuleInstantiateFailed,
     ImportResolutionFailed,
+    MissingImport,
+    ImportKindMismatch,
 };
 
 /// Instantiate a parsed component, producing a runnable ComponentInstance.
@@ -220,17 +316,8 @@ pub fn instantiate(
     errdefer allocator.destroy(inst);
 
     // Count resource types
-    var resource_count: u32 = 0;
-    for (component.types) |td| {
-        if (td == .resource) resource_count += 1;
-    }
-
-    // Allocate resource tables
-    const resource_tables: []ResourceTable = if (resource_count > 0) blk: {
-        const rts = allocator.alloc(ResourceTable, resource_count) catch return error.OutOfMemory;
-        for (rts) |*rt| rt.* = .{};
-        break :blk rts;
-    } else &.{};
+    // Resource tables are allocated lazily on first use (see
+    // ComponentInstance.getOrCreateResourceTable). Nothing to do here.
 
     // Instantiate core modules
     const core_module_count = component.core_modules.len;
@@ -287,7 +374,7 @@ pub fn instantiate(
     inst.* = .{
         .component = component,
         .core_instances = core_instances,
-        .resource_tables = resource_tables,
+        .resource_tables = .empty,
         .exported_funcs = exported_funcs,
         .imports = .{},
         .allocator = allocator,
@@ -438,4 +525,125 @@ test "ComponentInstance: executeStart is idempotent" {
     try std.testing.expect(inst.started);
     try inst.executeStart(); // second call — should be idempotent
     try std.testing.expect(inst.started);
+}
+
+test "linkImports: missing runtime import returns MissingImport" {
+    const allocator = std.testing.allocator;
+
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "my-func", .desc = .{ .func = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &imports,      .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .{};
+    defer providers.deinit(allocator);
+    try std.testing.expectError(error.MissingImport, inst.linkImports(providers));
+}
+
+test "linkImports: kind mismatch returns ImportKindMismatch" {
+    const allocator = std.testing.allocator;
+
+    // Instance-typed import must be satisfied with host_instance, not host_func.
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/streams", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &imports,      .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .{};
+    defer providers.deinit(allocator);
+    try providers.put(allocator, "wasi:io/streams", .{ .host_func = .{} });
+    try std.testing.expectError(error.ImportKindMismatch, inst.linkImports(providers));
+}
+
+test "linkImports: host_instance binding satisfies instance import" {
+    const allocator = std.testing.allocator;
+
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/streams", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &imports,      .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    var host: HostInstance = .{};
+    defer host.deinit(allocator);
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .{};
+    defer providers.deinit(allocator);
+    try providers.put(allocator, "wasi:io/streams", .{ .host_instance = &host });
+
+    try inst.linkImports(providers);
+    const resolved = inst.getImport("wasi:io/streams") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(resolved == .host_instance);
+    try std.testing.expectEqual(&host, resolved.host_instance);
+}
+
+test "linkImports: type import needs no binding" {
+    const allocator = std.testing.allocator;
+
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "T", .desc = .{ .type = .sub_resource } },
+    };
+    const component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &imports,      .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .{};
+    defer providers.deinit(allocator);
+    try inst.linkImports(providers); // no error despite empty providers
+}
+
+test "ComponentInstance: resource tables are lazy and keyed by typeidx" {
+    const allocator = std.testing.allocator;
+
+    const component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, allocator);
+    defer inst.deinit();
+
+    // No tables allocated up front.
+    try std.testing.expectEqual(@as(u32, 0), inst.resource_tables.count());
+
+    // Sparse resource type indices are fine.
+    const rt_a = try inst.getOrCreateResourceTable(5);
+    const rt_b = try inst.getOrCreateResourceTable(42);
+    try std.testing.expect(rt_a != rt_b);
+    try std.testing.expectEqual(@as(u32, 2), inst.resource_tables.count());
+
+    // Repeated access returns the same table.
+    const rt_a2 = try inst.getOrCreateResourceTable(5);
+    try std.testing.expectEqual(rt_a, rt_a2);
 }
