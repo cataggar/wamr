@@ -1075,113 +1075,60 @@ fn hasSideEffect(inst: ir.Inst) bool {
 
 // ── Common Subexpression Elimination ────────────────────────────────────────
 
-/// Dominator-scoped CSE. Deduplicates identical pure, non-trapping
-/// instructions across basic blocks whenever the earlier def dominates
-/// the later one. Walks the dominator tree in preorder using a
-/// stack-based DFS; entries added by a block are popped when that
-/// block's subtree is fully visited, so sibling subtrees don't see each
-/// other's defs.
+/// Block-local CSE: deduplicate identical pure, non-trapping
+/// instructions within a basic block.
 ///
-/// Replacement is done via `replaceVReg` — redundant instructions are
-/// left in place with their uses rewritten; subsequent
-/// `deadCodeElimination` removes them.
+/// **Why block-local only:** A previous iteration of this pass walked
+/// the dominator tree to extend CSE across blocks. That version was
+/// reverted because it was unsound against the AArch64 codegen, which
+/// iterates `func.blocks.items` in raw block-id order rather than RPO
+/// or dom-tree order. Cross-block CSE picks a canonical def in some
+/// dominator block; if that block has a higher block-id than the
+/// blocks where the (formerly redundant) def's uses live, codegen
+/// observes the use before the def and fails with `error.UnboundVReg`.
+/// CoreMark hits this on a `iconst_32 1` deduplicated across many
+/// blocks whose def-block id is far higher than its use-blocks'.
 ///
-/// Value keys include `inst.type` so that same-tag, same-operands ops
-/// of different types (e.g., `convert_i32_s` lowered from
-/// `f32.convert_i32_s` vs `f64.convert_i32_s`) are never conflated.
+/// Re-enabling cross-block CSE requires either:
+///   1. Teaching codegen to iterate blocks in dom-tree / RPO order; or
+///   2. Restricting CSE to pick a representative whose block-id is
+///      ≤ all candidate use blocks.
+/// Tracked under issue #136. The dom/loop analysis code in
+/// `analysis.zig` is independent and remains in place for future use
+/// (LICM, GVN, etc.).
+///
+/// Replacement is via `replaceVReg`; the now-redundant instruction is
+/// left in place with its uses rewritten and `deadCodeElimination`
+/// removes it.
 pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    if (func.blocks.items.len == 0) return false;
-
-    var dom = try analysis.computeDominators(func, allocator);
-    defer dom.deinit();
-
-    // Build dominator-tree children: children[b] = { c : idom[c] == b and c != b }.
-    const nblocks = func.blocks.items.len;
-    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
-    defer {
-        for (children) |*list| list.deinit(allocator);
-        allocator.free(children);
-    }
-    for (children) |*list| list.* = .empty;
-    for (0..nblocks) |i| {
-        const bid: ir.BlockId = @intCast(i);
-        const idom = dom.idom[bid] orelse continue;
-        if (idom == bid) continue; // entry is its own idom
-        try children[idom].append(allocator, bid);
-    }
-
-    // Value table: list of (op, type, def_vreg) entries visible on the
-    // current dominator path. We snapshot the length on block entry and
-    // restore it on exit to emulate a scoped table without hash-context
-    // plumbing. Lookup is linear in the current path depth — OK for
-    // realistic IR sizes and matches the cost profile of the original
-    // block-local CSE.
-    const Entry = struct { inst: ir.Inst, def: ir.VReg };
-    var table: std.ArrayList(Entry) = .empty;
-    defer table.deinit(allocator);
-
-    // DFS frame: (block, phase). Phase 0 = process block + snapshot table
-    // length and schedule children; phase 1 = restore table length on exit.
-    const Frame = struct { bid: ir.BlockId, phase: u1, snapshot_len: usize };
-    var stack: std.ArrayList(Frame) = .empty;
-    defer stack.deinit(allocator);
-
-    // Start at entry (block 0). Only reachable blocks have a non-null idom
-    // (entry's idom is itself). Unreachable blocks are never visited.
-    if (dom.idom[0] == null) return false;
-    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snapshot_len = 0 });
-
+    _ = allocator;
     var changed = false;
-    while (stack.items.len > 0) {
-        const top = &stack.items[stack.items.len - 1];
-        if (top.phase == 1) {
-            // Exiting this block's subtree — restore table to the snapshot.
-            table.shrinkRetainingCapacity(top.snapshot_len);
-            _ = stack.pop();
-            continue;
-        }
 
-        const bid = top.bid;
-        top.phase = 1;
-        top.snapshot_len = table.items.len;
+    for (func.blocks.items) |*block| {
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            const inst = &block.instructions.items[i];
+            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) {
+                i += 1;
+                continue;
+            }
 
-        const block = &func.blocks.items[bid];
-        for (block.instructions.items) |*inst| {
-            if (inst.dest == null) continue;
-            if (hasSideEffect(inst.*) or !isPure(inst.*)) continue;
-
-            // Look up earliest matching def on the current dom path.
-            var found: ?ir.VReg = null;
-            for (table.items) |e| {
-                if (e.inst.type == inst.type and sameOp(e.inst, inst.*)) {
-                    found = e.def;
+            // Look backwards within the same block for a matching def.
+            // Type check guards against same-tag-different-type aliasing
+            // (e.g. f32.convert_i32_s vs f64.convert_i32_s lower to the
+            // same IR tag).
+            var j: usize = 0;
+            while (j < i) : (j += 1) {
+                const earlier = block.instructions.items[j];
+                if (earlier.dest != null and earlier.type == inst.type and sameOp(earlier, inst.*)) {
+                    replaceVReg(func, inst.dest.?, earlier.dest.?);
+                    changed = true;
                     break;
                 }
             }
-            if (found) |earlier_def| {
-                // Only count as a real change if the redundant instruction
-                // actually had uses — otherwise it was already dead weight
-                // that DCE will sweep regardless. Without this guard the
-                // pass would spuriously keep returning `changed=true` and
-                // prevent `runPasses` from reaching its fixpoint.
-                const uses = countUsesOfVReg(func, inst.dest.?);
-                if (uses > 0) {
-                    replaceVReg(func, inst.dest.?, earlier_def);
-                    changed = true;
-                }
-                // Don't record this instruction — an earlier entry already
-                // covers any future match on the dominator path.
-            } else {
-                try table.append(allocator, .{ .inst = inst.*, .def = inst.dest.? });
-            }
-        }
-
-        // Schedule children for visit.
-        for (children[bid].items) |c| {
-            try stack.append(allocator, .{ .bid = c, .phase = 0, .snapshot_len = 0 });
+            i += 1;
         }
     }
-
     return changed;
 }
 
@@ -2721,9 +2668,12 @@ test "CSE: deduplicates identical add" {
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v2 }, block.instructions.items[4].op);
 }
 
-test "CSE: cross-block dominator substitution" {
+test "CSE: cross-block CSE intentionally not performed" {
+    // Block-local CSE only — see commonSubexprElimination doc comment for
+    // why cross-block CSE was reverted (codegen iterates by raw block-id,
+    // not RPO, breaking dominator-based rewrites in CoreMark).
     // b0 defines add(v0, v1) = v2; b0 branches to b1; b1 recomputes the
-    // same add into v3. b0 dominates b1, so v3 must be rewritten to v2.
+    // same add into v3. The current pass must NOT rewrite v3 to v2.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 0);
     defer func.deinit();
@@ -2742,9 +2692,11 @@ test "CSE: cross-block dominator substitution" {
     try func.getBlock(b1).append(.{ .op = .{ .ret = v3 } });
 
     const changed = try commonSubexprElimination(&func, allocator);
-    try std.testing.expect(changed);
+    try std.testing.expect(!changed);
 
-    try std.testing.expectEqual(ir.Inst.Op{ .ret = v2 }, func.getBlock(b1).instructions.items[1].op);
+    // b1's add is preserved as a fresh def of v3, and ret still uses v3.
+    try std.testing.expectEqual(@as(?ir.VReg, v3), func.getBlock(b1).instructions.items[0].dest);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v3 }, func.getBlock(b1).instructions.items[1].op);
 }
 
 test "CSE: sibling defs do not match at merge" {
@@ -2847,11 +2799,9 @@ test "CSE: trapping int div_s is not deduplicated" {
     try std.testing.expectEqual(@as(?ir.VReg, v3), block.instructions.items[3].dest);
 }
 
-test "CSE: loop header def reused in body" {
-    // b0 → b1(header): adds v0+v1 into v_h; br_if body/exit.
-    // body → b1 (back-edge). body recomputes v0+v1 as v_body and writes
-    // it to a local (so v_body has a real use). Since b1 dominates body,
-    // CSE should rewrite that use to v_h.
+test "CSE: loop header def not rewritten in body (block-local only)" {
+    // Block-local CSE only — see commonSubexprElimination doc comment.
+    // The loop body's redundant add is NOT rewritten to the header's def.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 1);
     defer func.deinit();
@@ -2875,26 +2825,19 @@ test "CSE: loop header def reused in body" {
     try func.getBlock(h).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = body, .else_block = exit } } });
 
     try func.getBlock(body).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_body });
-    // Real use of v_body so CSE has something to rewrite.
     try func.getBlock(body).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_body } } });
     try func.getBlock(body).append(.{ .op = .{ .br = h } });
 
     try func.getBlock(exit).append(.{ .op = .{ .ret = v_h } });
 
     const changed = try commonSubexprElimination(&func, allocator);
-    try std.testing.expect(changed);
+    try std.testing.expect(!changed);
 
-    // The local_set in body must now reference v_h, not v_body.
+    // local_set still references v_body (no cross-block rewrite).
     try std.testing.expectEqual(
-        ir.Inst.Op{ .local_set = .{ .idx = 0, .val = v_h } },
+        ir.Inst.Op{ .local_set = .{ .idx = 0, .val = v_body } },
         func.getBlock(body).instructions.items[1].op,
     );
-
-    // Idempotent: a second run finds the redundant add but its dest
-    // (v_body) now has zero uses, so it's treated as already-dead and
-    // not reported as a change.
-    const again = try commonSubexprElimination(&func, allocator);
-    try std.testing.expect(!again);
 }
 
 test "CSE: unreachable block is skipped" {
