@@ -43,7 +43,7 @@ jobs:
           - os: ubuntu-22.04
             target: riscv64-linux
             name: linux-riscv64
-          - os: ubuntu-22.04
+          - os: windows-latest
             target: aarch64-windows
             name: windows-arm64
           - os: ubuntu-22.04
@@ -66,6 +66,27 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=${{ steps.version.outputs.version }}"
 
+      - name: Azure login (for signing)
+        if: endsWith(matrix.target, '-windows')
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows binaries with Trusted Signing
+        if: endsWith(matrix.target, '-windows')
+        uses: azure/trusted-signing-action@b443cf8ea4124818d2ea9f043cba29fc3ec47b16 # v1.2.0
+        with:
+          endpoint: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+          files-folder: zig-out/bin
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Package
         shell: bash
         run: |
@@ -81,12 +102,28 @@ jobs:
             cp "zig-out/bin/${tool}${EXT}" "$PKGNAME/bin/"
           done
           cp LICENSE README.md "$PKGNAME/"
-          tar czf "$PKGNAME.tar.gz" "$PKGNAME"
-          if command -v sha256sum &>/dev/null; then
-            sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-          else
-            shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-          fi
+          case "${{ matrix.target }}" in
+            *-windows)
+              if command -v zip &>/dev/null; then
+                zip -r "$PKGNAME.zip" "$PKGNAME"
+              else
+                powershell -Command "Compress-Archive -Path '$PKGNAME' -DestinationPath '$PKGNAME.zip'"
+              fi
+              if command -v sha256sum &>/dev/null; then
+                sha256sum "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
+              else
+                shasum -a 256 "$PKGNAME.zip" > "$PKGNAME.zip.sha256"
+              fi
+              ;;
+            *)
+              tar czf "$PKGNAME.tar.gz" "$PKGNAME"
+              if command -v sha256sum &>/dev/null; then
+                sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
+              else
+                shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
+              fi
+              ;;
+          esac
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -101,6 +138,7 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             wamr-*.tar.gz
+            wamr-*.zip
             wamr-*.sha256
             wamr-*.sbom.spdx.json
 
@@ -151,6 +189,7 @@ jobs:
           subject-path: |
             wamr-*.tar.gz
             wamr-*.tar.xz
+            wamr-*.zip
 
       - name: Create release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
@@ -182,6 +221,7 @@ jobs:
           files: |
             wamr-*.tar.gz
             wamr-*.tar.xz
+            wamr-*.zip
             wamr-*.sha256
             wamr-*.sbom.spdx.json
           draft: false
