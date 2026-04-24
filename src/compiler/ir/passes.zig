@@ -1564,6 +1564,100 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     return changed;
 }
 
+// ── Inverse-compare / eqz fusion ───────────────────────────────────────────
+
+/// Rewrite `eqz(cmp(a, b))` as the inverse comparison on `(a, b)`, where
+/// `cmp` is any integer relational op. The original `eqz` instruction is
+/// rewritten in place to hold the inverse comparison, preserving its dest
+/// VReg. The original comparison may become dead and will be reaped by
+/// `deadCodeElimination`.
+///
+/// Mappings:
+///   eqz(eq)   → ne     eqz(ne)   → eq
+///   eqz(lt_s) → ge_s   eqz(ge_s) → lt_s
+///   eqz(le_s) → gt_s   eqz(gt_s) → le_s
+///   eqz(lt_u) → ge_u   eqz(ge_u) → lt_u
+///   eqz(le_u) → gt_u   eqz(gt_u) → le_u
+///
+/// Soundness:
+///   - Integer relops produce exactly 0 or 1 (wasm semantics), so their
+///     logical negation IS the inverse comparison. eqz(1) = 0 = !(1);
+///     eqz(0) = 1 = !(0).
+///   - Skipped for float compares: eqz is integer-only and the IR
+///     doesn't emit `eqz(f_eq)` etc.
+///
+/// Why bother with this in addition to `foldBranchOnEqz`:
+///   - Covers cases where the eqz result is used by `select`, stored to
+///     a local, or used as an operand to another op — not just by a
+///     terminator br_if.
+///   - Removes a compare + eqz sequence; backend emits a single compare
+///     with the inverse condition code.
+pub fn foldInverseCompareEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    // Rewrites must be applied after the scan so that iteration doesn't
+    // see a half-mutated instruction stream.
+    const Rewrite = struct {
+        blk: ir.BlockId,
+        ii: u32,
+        new_op: ir.Inst.Op,
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const src = switch (inst.op) {
+                .eqz => |v| v,
+                else => continue,
+            };
+            const pb = def_block.get(src) orelse continue;
+            const pi = def_idx.get(src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const new_op: ?ir.Inst.Op = switch (producer.op) {
+                .eq => |b| .{ .ne = b },
+                .ne => |b| .{ .eq = b },
+                .lt_s => |b| .{ .ge_s = b },
+                .ge_s => |b| .{ .lt_s = b },
+                .le_s => |b| .{ .gt_s = b },
+                .gt_s => |b| .{ .le_s = b },
+                .lt_u => |b| .{ .ge_u = b },
+                .ge_u => |b| .{ .lt_u = b },
+                .le_u => |b| .{ .gt_u = b },
+                .gt_u => |b| .{ .le_u = b },
+                else => null,
+            };
+            if (new_op) |op| {
+                try rewrites.append(allocator, .{
+                    .blk = @intCast(bi),
+                    .ii = @intCast(ii),
+                    .new_op = op,
+                });
+            }
+        }
+    }
+
+    for (rewrites.items) |r| {
+        func.blocks.items[r.blk].instructions.items[r.ii].op = r.new_op;
+        changed = true;
+    }
+    return changed;
+}
+
 // ── Function Inlining ───────────────────────────────────────────────────────
 
 /// Shift every VReg referenced by `inst` (reads and def) by `+offset`.
@@ -1960,6 +2054,7 @@ pub const default_passes: []const PassFn = &.{
     &strengthReduceMulShiftAdd,
     &strengthReduceDivRem,
     &foldConstantBranches,
+    &foldInverseCompareEqz,
     &foldBranchOnEqz,
     &commonSubexprElimination,
     &deadCodeElimination,
@@ -3965,4 +4060,150 @@ test "foldBranchOnEqz: pipeline drops dead eqz after DCE" {
     // eqz should be gone; only the br_if remains.
     try std.testing.expectEqual(@as(usize, 1), func.getBlock(b0).instructions.items.len);
     try std.testing.expect(func.getBlock(b0).instructions.items[0].op == .br_if);
+}
+
+test "foldInverseCompareEqz: eqz(eq) becomes ne" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_neg = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = v1 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp });
+    try block.append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+    try block.append(.{ .op = .{ .ret = v_neg } });
+
+    const changed = try foldInverseCompareEqz(&func, allocator);
+    try std.testing.expect(changed);
+
+    // The eqz instruction (index 3) should now be .ne on v0, v1.
+    switch (block.instructions.items[3].op) {
+        .ne => |b| {
+            try std.testing.expectEqual(v0, b.lhs);
+            try std.testing.expectEqual(v1, b.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    // dest preserved.
+    try std.testing.expectEqual(@as(?ir.VReg, v_neg), block.instructions.items[3].dest);
+}
+
+test "foldInverseCompareEqz: all 10 mappings" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        src: ir.Inst.Op,
+        expect_tag: std.meta.Tag(ir.Inst.Op),
+    }{
+        .{ .src = .{ .eq   = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ne   },
+        .{ .src = .{ .ne   = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .eq   },
+        .{ .src = .{ .lt_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ge_s },
+        .{ .src = .{ .ge_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .lt_s },
+        .{ .src = .{ .le_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .gt_s },
+        .{ .src = .{ .gt_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .le_s },
+        .{ .src = .{ .lt_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ge_u },
+        .{ .src = .{ .ge_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .lt_u },
+        .{ .src = .{ .le_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .gt_u },
+        .{ .src = .{ .gt_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .le_u },
+    };
+    for (cases) |c| {
+        var func = ir.IrFunction.init(allocator, 2, 2, 0);
+        defer func.deinit();
+        const b0 = try func.newBlock();
+        var block = &func.blocks.items[b0];
+        const v0 = func.newVReg();
+        const v1 = func.newVReg();
+        const v_cmp = func.newVReg();
+        const v_neg = func.newVReg();
+        var src = c.src;
+        switch (src) {
+            .eq, .ne, .lt_s, .ge_s, .le_s, .gt_s,
+            .lt_u, .ge_u, .le_u, .gt_u,
+            => |*b| {
+                b.lhs = v0;
+                b.rhs = v1;
+            },
+            else => unreachable,
+        }
+        try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+        try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1 });
+        try block.append(.{ .op = src, .dest = v_cmp });
+        try block.append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+        try block.append(.{ .op = .{ .ret = v_neg } });
+
+        _ = try foldInverseCompareEqz(&func, allocator);
+        try std.testing.expectEqual(c.expect_tag, std.meta.activeTag(block.instructions.items[3].op));
+    }
+}
+
+test "foldInverseCompareEqz: non-compare producer is skipped" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v0 = func.newVReg();
+    const v_neg = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v0 });
+    try block.append(.{ .op = .{ .eqz = v0 }, .dest = v_neg });
+    try block.append(.{ .op = .{ .ret = v_neg } });
+
+    const changed = try foldInverseCompareEqz(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .eqz);
+}
+
+test "foldInverseCompareEqz: cross-block producer" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_neg = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .lt_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_neg } });
+
+    const changed = try foldInverseCompareEqz(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(std.meta.Tag(ir.Inst.Op).ge_s, std.meta.activeTag(func.getBlock(b1).instructions.items[0].op));
+}
+
+test "foldInverseCompareEqz: composes with DCE to drop dead compare" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_neg = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = v1 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp });
+    try block.append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+    try block.append(.{ .op = .{ .ret = v_neg } });
+
+    _ = try foldInverseCompareEqz(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // The original eq producing v_cmp is now unused and should be gone.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .eq);
+    }
 }
