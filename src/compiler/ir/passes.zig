@@ -1564,6 +1564,113 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     return changed;
 }
 
+// ── Sign-extending load fold ────────────────────────────────────────────────
+
+/// Fold `extend{8,16,32}_s(load size=N, sign_extend=false)` into the
+/// load itself by setting `sign_extend = true` and dropping the extend.
+///
+/// This collapses the wasm pattern `i32.load8_u; i32.extend8_s` (and
+/// matching i64/16/32 variants) into a single sign-extending load,
+/// which is the same machine instruction either way (`ldrsb` /
+/// `movsx` etc.) — saving one IR instruction per occurrence.
+///
+/// Soundness:
+///   - `load size=1 sign_extend=false type=i32` produces zero-extended
+///     low byte of the loaded value; `extend8_s` re-interprets the low
+///     byte as signed and sign-extends. The composition is exactly the
+///     semantics of `load size=1 sign_extend=true type=i32`.
+///   - We require the load result to have exactly one use (this
+///     extend). Otherwise other consumers depend on the zero-extended
+///     value and changing the load would corrupt them.
+///   - load.type and extend.type must match (we never bridge i32↔i64
+///     here; that requires an explicit `extend_i32_s/u`).
+///   - extend32_s is only meaningful on i64, matching the wasm
+///     `i64.load32_s` pattern.
+pub fn foldSignExtendingLoad(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    const Rewrite = struct {
+        ext_blk: ir.BlockId,
+        ext_ii: u32,
+        load_blk: ir.BlockId,
+        load_ii: u32,
+        ext_dest: ir.VReg,
+        load_dest: ir.VReg,
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const ext_dest = inst.dest orelse continue;
+            const ext_type = inst.type;
+            const want_size: u8 = switch (inst.op) {
+                .extend8_s => 1,
+                .extend16_s => 2,
+                .extend32_s => blk: {
+                    if (ext_type != .i64) continue;
+                    break :blk 4;
+                },
+                else => continue,
+            };
+            const src = switch (inst.op) {
+                .extend8_s, .extend16_s, .extend32_s => |v| v,
+                else => unreachable,
+            };
+            const pb = def_block.get(src) orelse continue;
+            const pi = def_idx.get(src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const ld = switch (producer.op) {
+                .load => |l| l,
+                else => continue,
+            };
+            if (ld.size != want_size) continue;
+            if (ld.sign_extend) continue;
+            if (producer.type != ext_type) continue;
+            if (countUsesOfVReg(func, src) != 1) continue;
+            const load_dest = producer.dest orelse continue;
+            try rewrites.append(allocator, .{
+                .ext_blk = @intCast(bi),
+                .ext_ii = @intCast(ii),
+                .load_blk = pb,
+                .load_ii = pi,
+                .ext_dest = ext_dest,
+                .load_dest = load_dest,
+            });
+        }
+    }
+
+    for (rewrites.items) |r| {
+        // Flip the load to sign-extending.
+        const load_inst = &func.blocks.items[r.load_blk].instructions.items[r.load_ii];
+        switch (load_inst.op) {
+            .load => |*ld| ld.sign_extend = true,
+            else => continue,
+        }
+        // Redirect consumers of the extend's dest to the load's dest.
+        replaceVReg(func, r.ext_dest, r.load_dest);
+        // Neutralise the extend instruction so DCE removes it.
+        const ext_inst = &func.blocks.items[r.ext_blk].instructions.items[r.ext_ii];
+        ext_inst.op = .{ .iconst_32 = 0 };
+        changed = true;
+    }
+    return changed;
+}
+
 // ── Select-on-Eqz folding ──────────────────────────────────────────────────
 
 /// Collapse `select(cond=eqz(x), if_true=a, if_false=b)` into
@@ -2113,6 +2220,7 @@ pub const default_passes: []const PassFn = &.{
     &foldInverseCompareEqz,
     &foldBranchOnEqz,
     &foldSelectOnEqz,
+    &foldSignExtendingLoad,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -4346,5 +4454,191 @@ test "foldSelectOnEqz: composes with DCE to drop dead eqz" {
 
     for (block.instructions.items) |inst| {
         try std.testing.expect(inst.op != .eqz);
+    }
+}
+
+test "foldSignExtendingLoad: extend8_s of i32 load size=1 sign_extend=false" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = false } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Load should now be sign-extending.
+    switch (block.instructions.items[1].op) {
+        .load => |ld| try std.testing.expect(ld.sign_extend),
+        else => try std.testing.expect(false),
+    }
+    // ret should now reference v_byte (load's dest), not v_ext.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_byte }, block.instructions.items[3].op);
+}
+
+test "foldSignExtendingLoad: extend16_s + size=2 i64 load" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_half = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 2, .sign_extend = false } },
+        .dest = v_half,
+        .type = .i64,
+    });
+    try block.append(.{ .op = .{ .extend16_s = v_half }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(changed);
+    switch (block.instructions.items[1].op) {
+        .load => |ld| try std.testing.expect(ld.sign_extend),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldSignExtendingLoad: extend32_s + size=4 i64 load" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_word = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4, .sign_extend = false } },
+        .dest = v_word,
+        .type = .i64,
+    });
+    try block.append(.{ .op = .{ .extend32_s = v_word }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(changed);
+    switch (block.instructions.items[1].op) {
+        .load => |ld| try std.testing.expect(ld.sign_extend),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldSignExtendingLoad: skip when load already sign-extends" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = true } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSignExtendingLoad: skip when load size mismatches extend width" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_word = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    // size=2 load with extend8_s (mismatched)
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 2, .sign_extend = false } },
+        .dest = v_word,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_word }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSignExtendingLoad: skip when load result has multiple uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_sum = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = false } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    // Second use of v_byte (zero-extended consumer).
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_byte, .rhs = v_byte } }, .dest = v_sum });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSignExtendingLoad: composes with DCE to drop the extend" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = false } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    _ = try foldSignExtendingLoad(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // No remaining extend8_s instruction.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .extend8_s);
     }
 }
