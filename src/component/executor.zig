@@ -804,3 +804,250 @@ test "async waitable set: multiple subtasks" {
     async_canon.asyncReturn(&tm, r2.subtask_handle, &vals2);
     try std.testing.expect(async_canon.asyncPollResult(&tm, r2.subtask_handle) != null);
 }
+
+// ── Canon-lower host trampoline ─────────────────────────────────────────────
+
+const core_runtime_types = @import("../runtime/common/types.zig");
+const HostFunc = instance_mod.HostFunc;
+
+/// Lower options carved out of the canon.lower opts array. Mirrors
+/// `LiftOptions` but is owned by the trampoline context so it's cheap to
+/// resolve once at instantiation time instead of on every call.
+pub const LowerOptions = struct {
+    memory_idx: ?u32 = null,
+    realloc_idx: ?u32 = null,
+    string_encoding: ctypes.StringEncoding = .utf8,
+
+    pub fn fromOpts(opts: []const ctypes.CanonOpt) LowerOptions {
+        var lo = LowerOptions{};
+        for (opts) |opt| {
+            switch (opt) {
+                .memory => |idx| lo.memory_idx = idx,
+                .realloc => |idx| lo.realloc_idx = idx,
+                .post_return => {},
+                .string_encoding => |enc| lo.string_encoding = enc,
+            }
+        }
+        return lo;
+    }
+};
+
+/// Per-import-slot context for the canon-lower trampoline. Owned by the
+/// `ComponentInstance` that installs the trampoline onto a core
+/// ModuleInstance's `host_func_entries`.
+pub const ComponentTrampolineCtx = struct {
+    comp_inst: *ComponentInstance,
+    host_func: HostFunc,
+    /// Component-level parameter types, cached so `trampoline` doesn't have
+    /// to re-walk the FuncType on every call.
+    param_types: []const ctypes.ValType,
+    /// Component-level result types, same rationale.
+    result_types: []const ctypes.ValType,
+    lower_opts: LowerOptions,
+
+    pub fn deinit(self: *ComponentTrampolineCtx, allocator: Allocator) void {
+        allocator.free(self.param_types);
+        allocator.free(self.result_types);
+    }
+};
+
+/// Shared trampoline entry point installed on every lowered core import.
+/// Reads the core arguments off the ExecEnv stack, lifts them into
+/// `InterfaceValue`s, invokes the bound `HostFunc`, and lowers the result
+/// values back onto the core stack.
+///
+/// **Flat params/results only.** Spill via `realloc` (>16 flat params or
+/// >1 flat result) is intentionally deferred to the Phase 2A.3 slice. A
+/// context whose param_types flatten to more than `MAX_FLAT_PARAMS` cores
+/// will trap with `error.Trap`.
+///
+/// Stack discipline mirrors the rest of the interpreter: args were pushed
+/// in natural order by the caller, so the last flat core value is on top.
+/// We iterate parameter types back-to-front, popping each param's flat
+/// encoding. Results are pushed in natural order.
+pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const ctx: *ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
+    const allocator = ctx.comp_inst.allocator;
+    const registry = TypeRegistry.init(ctx.comp_inst.component);
+
+    // Reject compound/spill shapes up front.
+    const flat_params = countFlatTypes(registry, ctx.param_types);
+    const flat_results = countFlatTypes(registry, ctx.result_types);
+    if (flat_params > MAX_FLAT_PARAMS or flat_results > MAX_FLAT_RESULTS) return error.Trap;
+
+    // Lift args: walk param_types back-to-front so the last flat core value
+    // (which is on top of stack) becomes the last arg.
+    const args = allocator.alloc(InterfaceValue, ctx.param_types.len) catch return error.Trap;
+    defer allocator.free(args);
+    var i: usize = ctx.param_types.len;
+    while (i > 0) {
+        i -= 1;
+        args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch return error.Trap;
+    }
+
+    // Invoke host. Host owns allocation of any compound result values via
+    // `allocator`; we do not free them here — simple (non-compound) values
+    // need no cleanup, and compound results are out of scope for 2A.2.
+    const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch return error.Trap;
+    defer allocator.free(results);
+    const call = ctx.host_func.call orelse return error.Trap;
+    call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch return error.Trap;
+
+    // Lower results: push in natural order.
+    for (results, ctx.result_types) |r, t| {
+        pushInterfaceValue(env, r, t, registry) catch return error.Trap;
+    }
+}
+
+// ── Trampoline tests ────────────────────────────────────────────────────────
+
+test "componentTrampoline: flat i32 host func with per-slot ctx" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Fake a minimal core module with one imported function (i32, i32) -> i32.
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "sub", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{ .i32, .i32 }, .results = &.{.i32} },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+
+    // Build a minimal component whose HostFunc computes a - b (non-commutative).
+    const Component = ctypes.Component;
+    var component = Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const Host = struct {
+        fn sub(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            in: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            out[0] = .{ .s32 = in[0].s32 - in[1].s32 };
+        }
+    };
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 2);
+    param_types[0] = .s32;
+    param_types[1] = .s32;
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 1);
+    result_types[0] = .s32;
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.sub },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{},
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 1);
+    entries[0] = .{ .func = &componentTrampoline, .ctx = @ptrCast(&tctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, entries);
+
+    // Call via the interpreter's normal dispatch path: push args (7, 2),
+    // executeFunction on import slot 0, expect 7 - 2 = 5.
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    try env.pushI32(7);
+    try env.pushI32(2);
+    try @import("../runtime/interpreter/interp.zig").executeFunction(env, 0);
+    try testing.expectEqual(@as(i32, 5), try env.popI32());
+}
+
+test "componentTrampoline: traps when flat params would spill" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Build a core module with one import taking 17 i32 params (1 over MAX).
+    var param_kinds: [17]core_types_mod.ValType = undefined;
+    for (&param_kinds) |*p| p.* = .i32;
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "many", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &param_kinds, .results = &.{} },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+
+    var component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const Host = struct {
+        fn noop(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            _: []const InterfaceValue,
+            _: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {}
+    };
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 17);
+    for (param_types) |*p| p.* = .s32;
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 0);
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.noop },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{},
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 1);
+    entries[0] = .{ .func = &componentTrampoline, .ctx = @ptrCast(&tctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, entries);
+
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    var n: i32 = 0;
+    while (n < 17) : (n += 1) try env.pushI32(n);
+    // executeFunction wraps HostFnError -> error.Unreachable for the trap.
+    try std.testing.expectError(error.Unreachable, @import("../runtime/interpreter/interp.zig").executeFunction(env, 0));
+}
