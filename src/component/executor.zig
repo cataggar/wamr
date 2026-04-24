@@ -838,6 +838,10 @@ pub const LowerOptions = struct {
 pub const ComponentTrampolineCtx = struct {
     comp_inst: *ComponentInstance,
     host_func: HostFunc,
+    /// Component-level function index this trampoline is lowering. Kept so
+    /// `ComponentInstance.linkImports` can re-bind the host_func after the
+    /// caller supplies providers.
+    component_func_idx: u32 = 0,
     /// Component-level parameter types, cached so `trampoline` doesn't have
     /// to re-walk the FuncType on every call.
     param_types: []const ctypes.ValType,

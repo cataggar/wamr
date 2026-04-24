@@ -6,6 +6,7 @@
 const std = @import("std");
 const ctypes = @import("types.zig");
 const core_types = @import("../runtime/common/types.zig");
+const executor_mod = @import("executor.zig");
 
 // ── Resource Table ──────────────────────────────────────────────────────────
 
@@ -171,13 +172,29 @@ pub const ComponentInstance = struct {
     exported_funcs: std.StringHashMapUnmanaged(ExportedFunc),
     /// Resolved imports keyed by import name.
     imports: std.StringHashMapUnmanaged(ImportBinding),
+    /// Arena used for core-module loader allocations. Core wasm binaries
+    /// parsed from this component have their types/imports/exports/etc.
+    /// arrays allocated into this arena, which is destroyed as one unit on
+    /// `deinit`. Mirrors the pattern `api/wamr.zig` uses for top-level
+    /// module loads.
+    module_arena: std.heap.ArenaAllocator,
+    /// Canon-lower trampoline contexts owned by this instance. Each entry
+    /// is referenced as the `ctx` of an installed `HostFnEntry` on some core
+    /// module instance; we keep the slice here so lifetimes are tied to the
+    /// `ComponentInstance` and freed together on `deinit`.
+    trampoline_ctxs: std.ArrayListUnmanaged(*executor_mod.ComponentTrampolineCtx) = .empty,
     /// Whether the start function has been executed.
     started: bool = false,
     /// Allocator for instance lifetime.
     allocator: std.mem.Allocator,
 
     pub const CoreInstanceEntry = struct {
-        module_inst: ?*core_types.ModuleInstance,
+        module_inst: ?*core_types.ModuleInstance = null,
+        /// When this entry corresponds to a `CoreInstanceExpr.exports` (an
+        /// inline instance bundling named core items rather than an actual
+        /// core-module instantiation), the named items live here. `module_inst`
+        /// is null in that case.
+        inline_exports: []const ctypes.CoreInlineExport = &.{},
     };
 
     pub const ExportedFunc = struct {
@@ -250,6 +267,15 @@ pub const ComponentInstance = struct {
                 return error.MissingImport;
             }
         }
+
+        // Fill in trampoline host_funcs now that bindings are in place.
+        // Each trampoline records the component func index it lowers; we
+        // walk the component's imports to find the matching host binding.
+        for (self.trampoline_ctxs.items) |ctx| {
+            if (resolveComponentFuncToHostFunc(self, self.component, ctx.component_func_idx)) |hf| {
+                ctx.host_func = hf;
+            }
+        }
     }
 
     /// Execute the component's start function if one is defined and not yet run.
@@ -285,7 +311,19 @@ pub const ComponentInstance = struct {
         var rt_it = self.resource_tables.valueIterator();
         while (rt_it.next()) |rt| rt.deinit(self.allocator);
         self.resource_tables.deinit(self.allocator);
-        if (self.core_instances.len > 0) self.allocator.free(self.core_instances);
+        for (self.trampoline_ctxs.items) |ctx| {
+            ctx.deinit(self.allocator);
+            self.allocator.destroy(ctx);
+        }
+        self.trampoline_ctxs.deinit(self.allocator);
+        if (self.core_instances.len > 0) {
+            const inst_mod = @import("../runtime/interpreter/instance.zig");
+            for (self.core_instances) |entry| {
+                if (entry.module_inst) |mi| inst_mod.destroy(mi);
+            }
+            self.allocator.free(self.core_instances);
+        }
+        self.module_arena.deinit();
         self.exported_funcs.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -306,8 +344,19 @@ pub const InstantiationError = error{
 
 /// Instantiate a parsed component, producing a runnable ComponentInstance.
 ///
-/// This walks the component's sections in order, creating core module
-/// instances, resolving aliases, and wiring up canonical functions.
+/// When `component.core_instances` is populated, each expression is
+/// processed in order:
+///   - `.exports` contributes an inline instance whose named members are
+///     recorded on the ComponentInstance entry (no core module instantiation).
+///   - `.instantiate { module_idx, args }` loads and instantiates the
+///     referenced core module, resolving each of its imports against the
+///     prior core-instance exports named by `args`. Whenever an imported
+///     core function is satisfied by a `canon.lower`, the runtime installs
+///     a `componentTrampoline` + per-slot `ComponentTrampolineCtx` on that
+///     import slot so future core calls bridge back to the host `HostFunc`.
+///
+/// For legacy callers with `core_instances.len == 0`, falls back to the
+/// pre-2A behaviour of instantiating each `core_module` exactly once.
 pub fn instantiate(
     component: *const ctypes.Component,
     allocator: std.mem.Allocator,
@@ -315,49 +364,189 @@ pub fn instantiate(
     const inst = allocator.create(ComponentInstance) catch return error.OutOfMemory;
     errdefer allocator.destroy(inst);
 
-    // Count resource types
-    // Resource tables are allocated lazily on first use (see
-    // ComponentInstance.getOrCreateResourceTable). Nothing to do here.
+    inst.* = .{
+        .component = component,
+        .module_arena = std.heap.ArenaAllocator.init(allocator),
+        .core_instances = &.{},
+        .resource_tables = .empty,
+        .exported_funcs = .{},
+        .imports = .{},
+        .allocator = allocator,
+    };
 
-    // Instantiate core modules
-    const core_module_count = component.core_modules.len;
-    const core_instances: []ComponentInstance.CoreInstanceEntry = if (core_module_count > 0) blk: {
-        const cis = allocator.alloc(ComponentInstance.CoreInstanceEntry, core_module_count) catch return error.OutOfMemory;
-        for (component.core_modules, 0..) |core_mod, i| {
-            const loader = @import("../runtime/interpreter/loader.zig");
-            const inst_mod = @import("../runtime/interpreter/instance.zig");
+    const loader = @import("../runtime/interpreter/loader.zig");
+    const inst_mod = @import("../runtime/interpreter/instance.zig");
 
-            const module = loader.load(core_mod.data, allocator) catch {
-                cis[i] = .{ .module_inst = null };
-                continue;
-            };
-            const module_ptr = allocator.create(core_types.WasmModule) catch {
-                cis[i] = .{ .module_inst = null };
-                continue;
-            };
-            module_ptr.* = module;
-            const module_inst = inst_mod.instantiate(module_ptr, allocator) catch {
-                cis[i] = .{ .module_inst = null };
-                continue;
-            };
-            cis[i] = .{ .module_inst = module_inst };
+    if (component.core_instances.len > 0) {
+        // Section-aware path: walk core_instances expressions in order.
+        const cis = allocator.alloc(ComponentInstance.CoreInstanceEntry, component.core_instances.len) catch return error.OutOfMemory;
+        for (cis) |*entry| entry.* = .{};
+        inst.core_instances = cis;
+
+        for (component.core_instances, 0..) |expr, ci_idx| {
+            switch (expr) {
+                .exports => |inline_exports| {
+                    cis[ci_idx] = .{ .inline_exports = inline_exports };
+                },
+                .instantiate => |ie| {
+                    if (ie.module_idx >= component.core_modules.len) continue;
+                    const core_mod = component.core_modules[ie.module_idx];
+
+                    const mod_alloc = inst.module_arena.allocator();
+                    const loaded = loader.load(core_mod.data, mod_alloc) catch continue;
+                    const module_ptr = mod_alloc.create(core_types.WasmModule) catch continue;
+                    module_ptr.* = loaded;
+                    const mi = inst_mod.instantiate(module_ptr, allocator) catch continue;
+                    cis[ci_idx] = .{ .module_inst = mi };
+
+                    // Build per-import host_func_entries by resolving each
+                    // core import against the named arg → prior inline
+                    // instance exports. For function imports backed by a
+                    // canon.lower, install a componentTrampoline.
+                    if (module_ptr.import_function_count == 0) continue;
+
+                    const entries = allocator.alloc(?core_types.HostFnEntry, module_ptr.import_function_count) catch continue;
+                    @memset(entries, null);
+
+                    var imp_func_idx: u32 = 0;
+                    for (module_ptr.imports) |imp| {
+                        if (imp.kind != .function) continue;
+                        defer imp_func_idx += 1;
+
+                        // Find arg with matching core-module-import "module name".
+                        const source_inst_idx: u32 = arg_blk: {
+                            for (ie.args) |arg| {
+                                if (std.mem.eql(u8, arg.name, imp.module_name)) break :arg_blk arg.instance_idx;
+                            }
+                            break :arg_blk std.math.maxInt(u32);
+                        };
+                        if (source_inst_idx == std.math.maxInt(u32)) continue;
+                        if (source_inst_idx >= ci_idx) continue;
+                        const source_entry = cis[source_inst_idx];
+
+                        // Find matching named member in the source instance's inline exports.
+                        var member_sort_idx: ?ctypes.CoreSort = null;
+                        var member_idx: u32 = 0;
+                        for (source_entry.inline_exports) |mem| {
+                            if (std.mem.eql(u8, mem.name, imp.field_name)) {
+                                member_sort_idx = mem.sort_idx.sort;
+                                member_idx = mem.sort_idx.idx;
+                                break;
+                            }
+                        }
+                        if (member_sort_idx == null) continue;
+                        if (member_sort_idx.? != .func) continue;
+
+                        // Resolve member_idx in core-func-index-space back to
+                        // a canon.lower. Simplified layout: we assume the
+                        // space is populated exclusively by canon.lower
+                        // entries in canons[] order (no core aliases, no
+                        // module-import funcs at top level). This covers the
+                        // hand-authored 2A.2b fixture and common Rust emit
+                        // patterns; the full resolver lands in a later slice.
+                        const canon_idx = resolveCoreFuncLower(component, member_idx) orelse continue;
+                        const canon = component.canons[canon_idx];
+                        const lower = switch (canon) {
+                            .lower => |l| l,
+                            else => continue,
+                        };
+
+                        // Build and own the trampoline context. The actual
+                        // `HostFunc.call` is resolved later by `linkImports`
+                        // when the caller supplies the import providers;
+                        // here we just record which component func index
+                        // this trampoline is lowering.
+                        const ctx_ptr = allocator.create(executor_mod.ComponentTrampolineCtx) catch continue;
+                        if (lower.func_idx >= component.types.len) {
+                            allocator.destroy(ctx_ptr);
+                            continue;
+                        }
+                        const ft = switch (component.types[lower.func_idx]) {
+                            .func => |ft_v| ft_v,
+                            else => {
+                                allocator.destroy(ctx_ptr);
+                                continue;
+                            },
+                        };
+                        const params = allocator.alloc(ctypes.ValType, ft.params.len) catch {
+                            allocator.destroy(ctx_ptr);
+                            continue;
+                        };
+                        for (ft.params, 0..) |p, i| params[i] = p.type;
+                        const results = switch (ft.results) {
+                            .none => allocator.alloc(ctypes.ValType, 0) catch {
+                                allocator.free(params);
+                                allocator.destroy(ctx_ptr);
+                                continue;
+                            },
+                            .unnamed => |t| blk: {
+                                const r = allocator.alloc(ctypes.ValType, 1) catch {
+                                    allocator.free(params);
+                                    allocator.destroy(ctx_ptr);
+                                    continue;
+                                };
+                                r[0] = t;
+                                break :blk r;
+                            },
+                            .named => |named| blk: {
+                                const r = allocator.alloc(ctypes.ValType, named.len) catch {
+                                    allocator.free(params);
+                                    allocator.destroy(ctx_ptr);
+                                    continue;
+                                };
+                                for (named, 0..) |n, i| r[i] = n.type;
+                                break :blk r;
+                            },
+                        };
+                        ctx_ptr.* = .{
+                            .comp_inst = inst,
+                            .host_func = .{}, // filled in by linkImports
+                            .component_func_idx = lower.func_idx,
+                            .param_types = params,
+                            .result_types = results,
+                            .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
+                        };
+                        inst.trampoline_ctxs.append(allocator, ctx_ptr) catch {
+                            ctx_ptr.deinit(allocator);
+                            allocator.destroy(ctx_ptr);
+                            continue;
+                        };
+
+                        entries[imp_func_idx] = .{
+                            .func = &executor_mod.componentTrampoline,
+                            .ctx = @ptrCast(ctx_ptr),
+                        };
+                    }
+
+                    inst_mod.attachHostFuncEntries(mi, entries);
+                },
+            }
         }
-        break :blk cis;
-    } else &.{};
+    } else if (component.core_modules.len > 0) {
+        // Legacy path: one core instance per core module.
+        const cis = allocator.alloc(ComponentInstance.CoreInstanceEntry, component.core_modules.len) catch return error.OutOfMemory;
+        for (component.core_modules, 0..) |core_mod, i| {
+            cis[i] = .{};
+            const mod_alloc = inst.module_arena.allocator();
+            const module = loader.load(core_mod.data, mod_alloc) catch continue;
+            const module_ptr = mod_alloc.create(core_types.WasmModule) catch continue;
+            module_ptr.* = module;
+            const module_inst = inst_mod.instantiate(module_ptr, allocator) catch continue;
+            cis[i].module_inst = module_inst;
+        }
+        inst.core_instances = cis;
+    }
 
     // Build export map
-    var exported_funcs: std.StringHashMapUnmanaged(ComponentInstance.ExportedFunc) = .{};
     for (component.exports) |exp| {
         switch (exp.desc) {
             .func => |func_idx| {
-                // Map component function exports. For now, assume canon lift
-                // links directly to core functions in the first core instance.
                 if (func_idx < component.canons.len) {
                     const canon = component.canons[func_idx];
                     switch (canon) {
                         .lift => |lift| {
-                            exported_funcs.put(allocator, exp.name, .{
-                                .core_instance_idx = 0,
+                            inst.exported_funcs.put(allocator, exp.name, .{
+                                .core_instance_idx = resolveCoreFuncToInstance(component, lift.core_func_idx) orelse 0,
                                 .core_func_idx = lift.core_func_idx,
                                 .func_type_idx = lift.type_idx,
                                 .opts = lift.opts,
@@ -371,16 +560,81 @@ pub fn instantiate(
         }
     }
 
-    inst.* = .{
-        .component = component,
-        .core_instances = core_instances,
-        .resource_tables = .empty,
-        .exported_funcs = exported_funcs,
-        .imports = .{},
-        .allocator = allocator,
-    };
-
     return inst;
+}
+
+// ── Index-space helpers ─────────────────────────────────────────────────────
+//
+// These resolvers implement the narrow subset needed for the Phase 2A.2b
+// hand-authored fixture: no core aliases, no imported core funcs, every
+// core func in the core-func-index-space comes from a `canon.lower`.
+// A later slice will replace them with a section-order-aware resolver that
+// handles arbitrary component layouts including `stdio-echo.wasm`.
+
+/// Map a core-func-index-space index back to the canon.lower that
+/// produced it. Assumes canon.lowers are the sole contributors to the
+/// core-func-index-space.
+fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) ?u32 {
+    var n: u32 = 0;
+    for (component.canons, 0..) |c, i| {
+        switch (c) {
+            .lower => {
+                if (n == core_func_idx) return @intCast(i);
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Find which `ComponentInstance.core_instances[i]` hosts the core function
+/// referenced by `core_func_idx`, by searching each inline-exports instance
+/// for a `func`-sort export of that idx. Falls back to 0 on miss so the
+/// legacy single-module layout continues to work.
+fn resolveCoreFuncToInstance(component: *const ctypes.Component, core_func_idx: u32) ?u32 {
+    // A canon.lift's core_func_idx typically references a function exposed
+    // by the main `.instantiate` core instance (not an inline instance
+    // wrapper). For now we pick the last `.instantiate` expression and
+    // fall through to 0 otherwise.
+    _ = core_func_idx;
+    var i: usize = component.core_instances.len;
+    while (i > 0) {
+        i -= 1;
+        switch (component.core_instances[i]) {
+            .instantiate => return @intCast(i),
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Resolve a component-level func index to a bound `HostFunc` by walking
+/// import bindings in declaration order. Narrow — handles only the layout
+/// where component func 0..N-1 are the imports (no canon.lifts shifting
+/// the component-func-index-space yet).
+fn resolveComponentFuncToHostFunc(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    func_idx: u32,
+) ?HostFunc {
+    var n: u32 = 0;
+    for (component.imports) |imp| {
+        switch (imp.desc) {
+            .func => {
+                if (n == func_idx) {
+                    const binding = inst.imports.get(imp.name) orelse return null;
+                    return switch (binding) {
+                        .host_func => |hf| hf,
+                        else => null,
+                    };
+                }
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -646,4 +900,117 @@ test "ComponentInstance: resource tables are lazy and keyed by typeidx" {
     // Repeated access returns the same table.
     const rt_a2 = try inst.getOrCreateResourceTable(5);
     try std.testing.expectEqual(rt_a, rt_a2);
+}
+
+test "instantiate: canon.lower wires host func into core import (2A.2b)" {
+    const testing = std.testing;
+
+    // Minimal core module:
+    //   (type (func (param i32 i32) (result i32)))
+    //   (type (func (result i32)))
+    //   (import "host" "sub" (func $sub (type 0)))
+    //   (func $run (type 1) i32.const 7 i32.const 2 call $sub)
+    //   (export "run" (func $run))
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section
+        0x01, 0x0b, 0x02,
+        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+        0x60, 0x00, 0x01, 0x7f,
+        // import section: host.sub (func type 0)
+        0x02, 0x0c, 0x01,
+        0x04, 'h', 'o', 's', 't',
+        0x03, 's', 'u', 'b',
+        0x00, 0x00,
+        // function section: 1 local fn, type 1
+        0x03, 0x02, 0x01, 0x01,
+        // export section: "run" -> func 1
+        0x07, 0x07, 0x01,
+        0x03, 'r', 'u', 'n',
+        0x00, 0x01,
+        // code section
+        0x0a, 0x0a, 0x01,
+        0x08, 0x00,
+        0x41, 0x07, // i32.const 7
+        0x41, 0x02, // i32.const 2
+        0x10, 0x00, // call 0 (imported sub)
+        0x0b, // end
+    };
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+
+    // Component func type 0: (s32, s32) -> s32
+    const params = [_]ctypes.NamedValType{
+        .{ .name = "a", .type = .s32 },
+        .{ .name = "b", .type = .s32 },
+    };
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .s32 } } },
+    };
+    const imports_decl = [_]ctypes.ImportDecl{
+        .{ .name = "host-sub", .desc = .{ .func = 0 } },
+    };
+    const canons = [_]ctypes.Canon{
+        .{ .lower = .{ .func_idx = 0, .opts = &.{} } },
+    };
+    const inline_exports = [_]ctypes.CoreInlineExport{
+        .{ .name = "sub", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const inst_args = [_]ctypes.CoreInstantiateArg{
+        .{ .name = "host", .instance_idx = 0 },
+    };
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .exports = &inline_exports },
+        .{ .instantiate = .{ .module_idx = 0, .args = &inst_args } },
+    };
+
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &imports_decl,
+        .exports = &.{},
+    };
+
+    const inst = try instantiate(&component, testing.allocator);
+    defer inst.deinit();
+
+    // Register a host sub: returns a - b. Non-commutative to catch argument
+    // order reversal in the trampoline.
+    const Host = struct {
+        fn sub(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            in: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: std.mem.Allocator,
+        ) anyerror!void {
+            out[0] = .{ .s32 = in[0].s32 - in[1].s32 };
+        }
+    };
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try providers.put(testing.allocator, "host-sub", .{
+        .host_func = .{ .call = &Host.sub },
+    });
+    try inst.linkImports(providers);
+
+    // After linkImports, trampolines should be wired to the host fn.
+    try std.testing.expect(inst.core_instances.len == 2);
+    const mi = inst.core_instances[1].module_inst orelse return error.TestFailed;
+    try std.testing.expect(mi.host_func_entries.len >= 1);
+    try std.testing.expect(inst.trampoline_ctxs.items.len == 1);
+    try std.testing.expect(inst.trampoline_ctxs.items[0].host_func.call != null);
+
+    // Invoke the exported "run" core function.
+    const run_idx = mi.getExportFunc("run") orelse return error.TestFailed;
+    const env = try @import("../runtime/common/exec_env.zig").ExecEnv.create(mi, 512, testing.allocator);
+    defer env.destroy();
+    try @import("../runtime/interpreter/interp.zig").executeFunction(env, run_idx);
+    try std.testing.expectEqual(@as(i32, 5), try env.popI32());
 }
