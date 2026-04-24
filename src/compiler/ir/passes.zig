@@ -696,6 +696,103 @@ pub fn strengthReduceMul(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
 
 // ── Dead Code Elimination ───────────────────────────────────────────────────
 
+/// Rewrite `div_u(x, 2^k)` → `shr_u(x, k)` and `rem_u(x, 2^k)` → `and(x, 2^k - 1)`.
+/// Unsigned integer division and modulo by a power-of-two constant
+/// divisor are equivalent to a shift and a mask, which are ~5-10× faster
+/// than the hardware divider on both x86-64 and AArch64 and avoid the
+/// microarchitectural div-unit pressure.
+///
+/// Only rewrites when the rhs is produced by an `iconst_32` /
+/// `iconst_64` defined earlier in the same block (matches
+/// `strengthReduceMul`'s straight-line lowering assumption). Signed
+/// `div_s`/`rem_s` are intentionally NOT handled here — they require
+/// rounding-toward-zero bias adjustment for negative dividends which is
+/// several additional ops; those patterns are better left to a dedicated
+/// magic-number pass.
+///
+/// Safety: `powerOfTwoShift` rejects c == 0, so we never rewrite a
+/// division that could trap at runtime; c == 1 is also rejected (the
+/// result would be `x` / `0` which the existing `constantFold` handles
+/// algebraically if it fires). Float div/rem are unchanged (not
+/// integer, `powerOfTwoShift` returns null).
+pub fn strengthReduceDivRem(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer constants.deinit();
+
+    for (func.blocks.items) |*block| {
+        constants.clearRetainingCapacity();
+
+        var i: usize = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const inst = block.instructions.items[i];
+            switch (inst.op) {
+                .iconst_32 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .iconst_64 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .div_u => |bin| {
+                    const dest = inst.dest orelse continue;
+                    if (inst.type != .i32 and inst.type != .i64) continue;
+                    const rhs_const = constants.get(bin.rhs) orelse continue;
+                    const k = powerOfTwoShift(rhs_const, inst.type) orelse continue;
+
+                    const shift_vreg = func.newVReg();
+                    const shift_op: ir.Inst.Op = if (inst.type == .i64)
+                        .{ .iconst_64 = @intCast(k) }
+                    else
+                        .{ .iconst_32 = @intCast(k) };
+                    try block.instructions.insert(
+                        block.allocator,
+                        i,
+                        .{ .op = shift_op, .dest = shift_vreg, .type = inst.type },
+                    );
+                    block.instructions.items[i + 1].op = .{ .shr_u = .{
+                        .lhs = bin.lhs,
+                        .rhs = shift_vreg,
+                    } };
+                    block.instructions.items[i + 1].dest = dest;
+                    try constants.put(shift_vreg, @intCast(k));
+                    changed = true;
+                    i += 1; // skip over the newly-inserted iconst
+                },
+                .rem_u => |bin| {
+                    const dest = inst.dest orelse continue;
+                    if (inst.type != .i32 and inst.type != .i64) continue;
+                    const rhs_const = constants.get(bin.rhs) orelse continue;
+                    const k = powerOfTwoShift(rhs_const, inst.type) orelse continue;
+
+                    // mask = 2^k - 1. Compute in u64 to avoid sign-shift
+                    // edge cases; truncate for the i32 iconst.
+                    const mask_u: u64 = (@as(u64, 1) << k) - 1;
+                    const mask_vreg = func.newVReg();
+                    const mask_op: ir.Inst.Op = if (inst.type == .i64)
+                        .{ .iconst_64 = @bitCast(mask_u) }
+                    else
+                        .{ .iconst_32 = @bitCast(@as(u32, @truncate(mask_u))) };
+                    try block.instructions.insert(
+                        block.allocator,
+                        i,
+                        .{ .op = mask_op, .dest = mask_vreg, .type = inst.type },
+                    );
+                    block.instructions.items[i + 1].op = .{ .@"and" = .{
+                        .lhs = bin.lhs,
+                        .rhs = mask_vreg,
+                    } };
+                    block.instructions.items[i + 1].dest = dest;
+                    try constants.put(mask_vreg, @as(i64, @bitCast(mask_u)));
+                    changed = true;
+                    i += 1;
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 /// Remove instructions whose dest VReg is never used.
 pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     var changed = false;
@@ -1498,6 +1595,7 @@ pub const default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
     &strengthReduceMul,
+    &strengthReduceDivRem,
     &foldConstantBranches,
     &commonSubexprElimination,
     &deadCodeElimination,
@@ -2727,4 +2825,174 @@ test "foldConstantBranches: nonzero cond picks then block" {
     const last = func.getBlock(b0).instructions.items[1];
     try std.testing.expect(last.op == .br);
     try std.testing.expectEqual(b1, last.op.br);
+}
+
+test "strengthReduceDivRem: div_u(x, 8) → shr_u(x, 3)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Block: iconst_32=8, iconst_32=3, shr_u(v_x, shift_vreg), ret.
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 3 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .shr_u => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+            try std.testing.expectEqual(block.instructions.items[1].dest.?, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(v_r, block.instructions.items[2].dest.?);
+}
+
+test "strengthReduceDivRem: rem_u(x, 16) → and(x, 15)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_c });
+    try block.append(.{ .op = .{ .rem_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Block: iconst_32=16, iconst_32=15, and(v_x, mask_vreg), ret.
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 15 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .@"and" => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+            try std.testing.expectEqual(block.instructions.items[1].dest.?, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(v_r, block.instructions.items[2].dest.?);
+}
+
+test "strengthReduceDivRem: i64 div_u by 2^32" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 1 << 32 }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = 32 }, block.instructions.items[1].op);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[1].type);
+    switch (block.instructions.items[2].op) {
+        .shr_u => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "strengthReduceDivRem: rem_u i64 by 2^63 uses full mask" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    const divisor: i64 = @bitCast(@as(u64, 1) << 63); // interpreted as 2^63 unsigned
+    try block.append(.{ .op = .{ .iconst_64 = divisor }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .rem_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Mask for rem_u by 2^63 is 2^63 - 1 == 0x7FFF_FFFF_FFFF_FFFF.
+    const expected_mask: i64 = @bitCast((@as(u64, 1) << 63) - 1);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = expected_mask }, block.instructions.items[1].op);
+}
+
+test "strengthReduceDivRem: does not rewrite non-power-of-two divisor" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(!changed);
+    // Original div_u still present.
+    try std.testing.expectEqual(@as(usize, 3), block.instructions.items.len);
+    try std.testing.expect(block.instructions.items[1].op == .div_u);
+}
+
+test "strengthReduceDivRem: does not rewrite div_s / rem_s (signed left alone)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_s = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .div_s);
+}
+
+test "strengthReduceDivRem: does not rewrite div_u by 1" {
+    // c == 1 is rejected by powerOfTwoShift (shift amount 0 disallowed).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .div_u);
 }
