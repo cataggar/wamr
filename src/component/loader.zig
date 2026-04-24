@@ -56,6 +56,22 @@ const BinaryReader = struct {
         return result.value;
     }
 
+    /// Read a signed LEB128 in `s33` form (component valtype discriminator).
+    /// Non-negative values are type indices; negative values encode primitive
+    /// valtypes and handle forms.
+    fn readS33(self: *BinaryReader) LoadError!i64 {
+        const slice = self.data[self.pos..];
+        const result = leb128_mod.readSigned(i64, slice) catch |err| switch (err) {
+            error.Overflow => return error.InvalidEncoding,
+            error.UnexpectedEnd => return error.UnexpectedEnd,
+        };
+        // s33: value must fit in 33 signed bits.
+        if (result.value < -(@as(i64, 1) << 32) or result.value >= (@as(i64, 1) << 32))
+            return error.InvalidEncoding;
+        self.pos += result.bytes_read;
+        return result.value;
+    }
+
     fn readFixedU32(self: *BinaryReader) LoadError!u32 {
         if (self.pos + 4 > self.data.len) return error.UnexpectedEnd;
         const val = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
@@ -512,9 +528,26 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
     };
 }
 
+/// Decode a component-model `valtype`.
+///
+/// Encoded as a signed LEB128 in `s33` form. Non-negative values are type
+/// indices into the component type-index space; negative values are
+/// primitive valtypes or handle forms. The `own` / `borrow` variants are
+/// followed by an unsigned LEB128 `typeidx`.
+///
+/// See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
 fn readValType(reader: *BinaryReader) LoadError!ctypes.ValType {
-    const b = try reader.readByte();
-    return switch (b) {
+    const raw = try reader.readS33();
+    if (raw >= 0) {
+        return .{ .type_idx = @intCast(raw) };
+    }
+    // Negative: primitive / handle form. Single-byte signed-LEB negatives
+    // reach us as values -1..-64; the spec assigns each to a byte-tag
+    // which equals `0x80 + raw` (so -1 → 0x7F, -24 → 0x68). Larger negative
+    // values can't possibly be a primitive code.
+    if (raw < -64) return error.InvalidEncoding;
+    const tag: u8 = @intCast(raw + 0x80);
+    return switch (tag) {
         0x7F => .bool,
         0x7E => .s8,
         0x7D => .u8,
@@ -530,7 +563,7 @@ fn readValType(reader: *BinaryReader) LoadError!ctypes.ValType {
         0x73 => .string,
         0x69 => .{ .own = try reader.readU32() },
         0x68 => .{ .borrow = try reader.readU32() },
-        else => .{ .type_idx = @as(u32, b) },
+        else => error.InvalidEncoding,
     };
 }
 
@@ -664,4 +697,41 @@ test "readValType: primitive types" {
     try std.testing.expect(v2 == .s32);
     const v3 = try readValType(&reader);
     try std.testing.expect(v3 == .string);
+}
+
+test "readValType: own/borrow with typeidx" {
+    // own 3, borrow 5
+    var reader = BinaryReader{ .data = &[_]u8{ 0x69, 0x03, 0x68, 0x05 } };
+    const v1 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 3), v1.own);
+    const v2 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 5), v2.borrow);
+}
+
+test "readValType: typeidx non-negative, single byte" {
+    // 0 and 63 encode as single bytes 0x00 and 0x3F in signed-LEB.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x00, 0x3F } };
+    const v1 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 0), v1.type_idx);
+    const v2 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 63), v2.type_idx);
+}
+
+test "readValType: typeidx >= 64 requires multi-byte signed LEB" {
+    // typeidx 64: signed-LEB `0xC0 0x00` (cont + value 64, trailing 0).
+    // typeidx 128: signed-LEB `0x80 0x01`.
+    // typeidx 8192: signed-LEB `0x80 0xC0 0x00` (trailing 0 to keep sign positive).
+    var reader = BinaryReader{ .data = &[_]u8{ 0xC0, 0x00, 0x80, 0x01, 0x80, 0xC0, 0x00 } };
+    const v64 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 64), v64.type_idx);
+    const v128 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 128), v128.type_idx);
+    const v8192 = try readValType(&reader);
+    try std.testing.expectEqual(@as(u32, 8192), v8192.type_idx);
+}
+
+test "readValType: rejects unknown negative code" {
+    // 0x67 decodes as signed LEB -25, which has no primitive mapping.
+    var reader = BinaryReader{ .data = &[_]u8{0x67} };
+    try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
 }
