@@ -694,6 +694,154 @@ pub fn strengthReduceMul(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
     return changed;
 }
 
+/// Classification of a constant multiplier that reduces to a single
+/// shift plus an add (or subtract) of the multiplicand.
+const ShiftAddKind = struct { k: u6, is_plus: bool };
+
+/// Return `{ k, is_plus }` if `c` is `2^k + 1` (is_plus=true) or
+/// `2^k - 1` (is_plus=false) with `k` in the legal shift range for
+/// `ir_type`. Used to recognise multipliers that reduce to
+/// `(x << k) + x` or `(x << k) - x` rather than a single shift.
+///
+/// `k == 0` (for the plus form: C == 2) is excluded so this helper
+/// does not poach cases already handled by `powerOfTwoShift`
+/// (`mul x, 2` → `shl x, 1`). `k == 1` for the minus form (C == 1)
+/// is a no-op multiply handled by `constantFold`.
+fn shiftPlusMinusOne(c: i64, ir_type: ir.IrType) ?ShiftAddKind {
+    const u: u64 = switch (ir_type) {
+        .i32 => @as(u32, @truncate(@as(u64, @bitCast(c)))),
+        .i64 => @bitCast(c),
+        else => return null,
+    };
+    if (u < 3) return null;
+    const max: u6 = if (ir_type == .i32) 31 else 63;
+
+    // 2^k + 1: `u - 1` is a non-zero power of two, k = ctz(u-1), k >= 1.
+    const p = u - 1;
+    if (p != 0 and (p & (p - 1)) == 0) {
+        const k: u6 = @intCast(@ctz(p));
+        if (k >= 1 and k <= max) return .{ .k = k, .is_plus = true };
+    }
+
+    // 2^k - 1: `u + 1` is a non-zero power of two, k = ctz(u+1), k >= 2.
+    // Skip when `u + 1` wraps to 0 in u64 (i.e. u == 2^64 - 1, i64 case).
+    const q = u +% 1;
+    if (q != 0 and (q & (q -% 1)) == 0) {
+        const k: u6 = @intCast(@ctz(q));
+        if (k >= 2 and k <= max) return .{ .k = k, .is_plus = false };
+    }
+
+    return null;
+}
+
+/// Rewrite `mul(x, 2^k + 1)` → `add(shl(x, k), x)` and
+/// `mul(x, 2^k - 1)` → `sub(shl(x, k), x)`. This covers the common
+/// small-integer multipliers — 3, 5, 7, 9, 15, 17, 31, 33, ... — that
+/// turn into a single latency-1 shift + add/sub on AArch64 and x86-64
+/// instead of the 3–4 cycle integer multiplier. Array indexing with
+/// element sizes like 3, 5, 6 (2*3), 9, 12 is the dominant source in
+/// real workloads; the pow2-only `strengthReduceMul` misses these
+/// entirely.
+///
+/// Matches only when the constant operand of `.mul` is defined by an
+/// `iconst_32` / `iconst_64` in the same block (matching
+/// `strengthReduceMul`'s block-local lowering assumption). Does not
+/// fire when the constant is a power of two — those are left to
+/// `strengthReduceMul`.
+///
+/// Cost: replaces 1 mul with 2 arithmetic instructions (plus a shift
+/// amount iconst that DCE / backend constant-folding will coalesce).
+/// On both target backends `shl` + `add`/`sub` decode to the
+/// `add x, x, x, lsl #k` style fused AArch64 instruction or an
+/// `lea`/shift-add sequence on x86-64, so the net is usually a strict
+/// win vs `imul`.
+pub fn strengthReduceMulShiftAdd(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer constants.deinit();
+
+    for (func.blocks.items) |*block| {
+        constants.clearRetainingCapacity();
+
+        var i: usize = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const inst = block.instructions.items[i];
+            switch (inst.op) {
+                .iconst_32 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .iconst_64 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .mul => |bin| {
+                    const dest = inst.dest orelse continue;
+                    const lhs_const = constants.get(bin.lhs);
+                    const rhs_const = constants.get(bin.rhs);
+
+                    // Skip if either operand is already a power of two —
+                    // `strengthReduceMul` handles that pattern and will
+                    // convert it to a single `shl` which dominates this
+                    // two-instruction form.
+                    if (rhs_const) |rc| if (powerOfTwoShift(rc, inst.type) != null) continue;
+                    if (lhs_const) |lc| if (powerOfTwoShift(lc, inst.type) != null) continue;
+
+                    var x_vreg: ir.VReg = undefined;
+                    var info: ShiftAddKind = undefined;
+                    if (rhs_const) |c| {
+                        if (shiftPlusMinusOne(c, inst.type)) |r| {
+                            x_vreg = bin.lhs;
+                            info = r;
+                        } else if (lhs_const) |lc| {
+                            if (shiftPlusMinusOne(lc, inst.type)) |r| {
+                                x_vreg = bin.rhs;
+                                info = r;
+                            } else continue;
+                        } else continue;
+                    } else if (lhs_const) |c| {
+                        if (shiftPlusMinusOne(c, inst.type)) |r| {
+                            x_vreg = bin.rhs;
+                            info = r;
+                        } else continue;
+                    } else continue;
+
+                    // Splice in two instructions *before* the mul at index i:
+                    //   [i]   iconst shift_vreg = k
+                    //   [i+1] shl    shl_vreg   = x << shift_vreg
+                    // and rewrite the mul (now at index i+2) to add/sub.
+                    const shift_vreg = func.newVReg();
+                    const shl_vreg = func.newVReg();
+                    const shift_op: ir.Inst.Op = if (inst.type == .i64)
+                        .{ .iconst_64 = @intCast(info.k) }
+                    else
+                        .{ .iconst_32 = @intCast(info.k) };
+                    try block.instructions.insert(
+                        block.allocator,
+                        i,
+                        .{ .op = shift_op, .dest = shift_vreg, .type = inst.type },
+                    );
+                    try block.instructions.insert(
+                        block.allocator,
+                        i + 1,
+                        .{ .op = .{ .shl = .{ .lhs = x_vreg, .rhs = shift_vreg } }, .dest = shl_vreg, .type = inst.type },
+                    );
+                    if (info.is_plus) {
+                        block.instructions.items[i + 2].op = .{ .add = .{ .lhs = shl_vreg, .rhs = x_vreg } };
+                    } else {
+                        block.instructions.items[i + 2].op = .{ .sub = .{ .lhs = shl_vreg, .rhs = x_vreg } };
+                    }
+                    block.instructions.items[i + 2].dest = dest;
+
+                    try constants.put(shift_vreg, @intCast(info.k));
+                    changed = true;
+                    i += 2; // skip over the two newly-inserted instructions
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 // ── Dead Code Elimination ───────────────────────────────────────────────────
 
 /// Rewrite `div_u(x, 2^k)` → `shr_u(x, k)` and `rem_u(x, 2^k)` → `and(x, 2^k - 1)`.
@@ -1747,6 +1895,7 @@ pub const default_passes: []const PassFn = &.{
     &constantFold,
     &algebraicSimplify,
     &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
     &strengthReduceDivRem,
     &foldConstantBranches,
     &commonSubexprElimination,
@@ -3430,4 +3579,191 @@ test "algebraicSimplify: is idempotent (no spin after first fire)" {
     try std.testing.expect(first);
     const second = try algebraicSimplify(&func, allocator);
     try std.testing.expect(!second);
+}
+
+test "strengthReduceMulShiftAdd: mul(x, 3) -> (x << 1) + x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Expected block: iconst=3, iconst=1, shl(v_x, shift), add(shl_res, v_x), ret.
+    try std.testing.expectEqual(@as(usize, 5), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 1 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .shl => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+            try std.testing.expectEqual(block.instructions.items[1].dest.?, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    switch (block.instructions.items[3].op) {
+        .add => |bin| {
+            try std.testing.expectEqual(block.instructions.items[2].dest.?, bin.lhs);
+            try std.testing.expectEqual(v_x, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(v_r, block.instructions.items[3].dest.?);
+}
+
+test "strengthReduceMulShiftAdd: mul(x, 7) -> (x << 3) - x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 3 }, block.instructions.items[1].op);
+    try std.testing.expect(block.instructions.items[2].op == .shl);
+    switch (block.instructions.items[3].op) {
+        .sub => |bin| {
+            try std.testing.expectEqual(block.instructions.items[2].dest.?, bin.lhs);
+            try std.testing.expectEqual(v_x, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "strengthReduceMulShiftAdd: mul(x, 5) commutative" {
+    // Constant on the LHS; x on the RHS.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_c, .rhs = v_x } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    // shift amount = 2, op = add, the non-constant multiplicand is v_x.
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 2 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .shl => |bin| try std.testing.expectEqual(v_x, bin.lhs),
+        else => try std.testing.expect(false),
+    }
+    switch (block.instructions.items[3].op) {
+        .add => |bin| try std.testing.expectEqual(v_x, bin.rhs),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "strengthReduceMulShiftAdd: i64 mul by 9 -> (x << 3) + x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 9 }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = 3 }, block.instructions.items[1].op);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[1].type);
+    try std.testing.expect(block.instructions.items[2].op == .shl);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[2].type);
+    try std.testing.expect(block.instructions.items[3].op == .add);
+}
+
+test "strengthReduceMulShiftAdd: does not touch power-of-two multiplier" {
+    // mul by 8 is pow2 — `strengthReduceMul` handles it; this pass must skip.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .mul);
+}
+
+test "strengthReduceMulShiftAdd: does not touch mul by 10 (neither 2^k+/-1)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .mul);
+}
+
+test "strengthReduceMulShiftAdd: pipeline composition with strengthReduceMul" {
+    // Feed both multipliers into the default pipeline order and verify each
+    // selects the appropriate pass.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c8 = func.newVReg();
+    const v_c3 = func.newVReg();
+    const v_r1 = func.newVReg();
+    const v_r2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c8 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_c3 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c8 } }, .dest = v_r1 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c3 } }, .dest = v_r2 });
+    try block.append(.{ .op = .{ .ret = v_r2 } });
+
+    _ = try strengthReduceMul(&func, allocator);
+    _ = try strengthReduceMulShiftAdd(&func, allocator);
+
+    // Expect: no remaining `.mul` instructions.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .mul);
+    }
 }
