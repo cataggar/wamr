@@ -4,6 +4,20 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Whether the selected target CPU can execute AOT code natively.
+    // Test/bench binaries that exercise AOT execution (codegen-bench,
+    // spec-test-runner, coremark-aot-runner) are only installed on these
+    // arches so cross-compiled release builds for e.g. riscv64 don't try
+    // to compile x86-only inline asm or the AOT execution path.
+    const target_arch = target.result.cpu.arch;
+    const aot_executable_target = switch (target_arch) {
+        .x86_64, .aarch64 => true,
+        else => false,
+    };
+    // codegen-bench uses x86-specific `rdtsc` inline asm and only
+    // exercises the x86-64 codegen path.
+    const bench_target = target_arch == .x86_64;
+
     // ── Build flags ────────────────────────────────────────────────────
     const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse false;
     const stack_protector = b.option(bool, "stack-protector", "Enable stack protector (requires libc)") orelse false;
@@ -161,7 +175,7 @@ pub fn build(b: *std.Build) void {
         .name = "spec-test-runner",
         .root_module = spec_runner_module,
     });
-    b.installArtifact(spec_runner_exe);
+    if (aot_executable_target) b.installArtifact(spec_runner_exe);
 
     // Run the spec suite through the AOT pipeline. Non-blocking convenience
     // step; not wired into the default `test` aggregate while codegen gaps
@@ -267,7 +281,7 @@ pub fn build(b: *std.Build) void {
         .name = "codegen-bench",
         .root_module = bench_module,
     });
-    b.installArtifact(bench_exe);
+    if (bench_target) b.installArtifact(bench_exe);
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run codegen benchmarks");
@@ -301,7 +315,7 @@ pub fn build(b: *std.Build) void {
         .name = "coremark-aot-runner",
         .root_module = coremark_module,
     });
-    b.installArtifact(coremark_exe);
+    if (aot_executable_target) b.installArtifact(coremark_exe);
 
     const run_coremark_nofp = b.addRunArtifact(coremark_exe);
     run_coremark_nofp.addArg("tests/standalone/coremark/coremark_wasi_nofp.wasm");
