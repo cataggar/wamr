@@ -241,6 +241,33 @@ fn instantiateImpl(
     return inst;
 }
 
+/// Attach a slice of context-carrying host function entries to an already
+/// instantiated module. Used by higher layers (e.g. the component-model
+/// canon-lower trampoline) to install per-slot host state.
+///
+/// The slice length must equal `inst.module.import_function_count`; each slot
+/// maps to an imported function index. `null` entries fall through to the
+/// existing legacy `host_functions` slot and the WASI resolver.
+///
+/// Ownership transfers: `inst` will free `entries` on destroy. Caller must
+/// not free the slice separately.
+///
+/// NOTE: entries installed this way are NOT visible to a core module's start
+/// function, which runs during `instantiate` before this call. Modules that
+/// need host dispatch during start should extend the `instantiate` API to
+/// accept entries up front (Phase 2A follow-up).
+pub fn attachHostFuncEntries(
+    inst: *types.ModuleInstance,
+    entries: []?types.HostFnEntry,
+) void {
+    const allocator = inst.allocator;
+    if (inst.owns_host_func_entries and inst.host_func_entries.len > 0) {
+        allocator.free(inst.host_func_entries);
+    }
+    inst.host_func_entries = entries;
+    inst.owns_host_func_entries = true;
+}
+
 /// Destroy a module instance, freeing all allocated resources.
 pub fn destroy(inst: *types.ModuleInstance) void {
     const allocator = inst.allocator;
@@ -250,6 +277,8 @@ pub fn destroy(inst: *types.ModuleInstance) void {
     if (inst.import_functions.len > 0) allocator.free(inst.import_functions);
     if (inst.owns_host_functions and inst.host_functions.len > 0)
         allocator.free(inst.host_functions);
+    if (inst.owns_host_func_entries and inst.host_func_entries.len > 0)
+        allocator.free(inst.host_func_entries);
     // Free locally defined tags (imported tags are owned by their source instance)
     for (inst.tags[inst.module.import_tag_count..]) |t| allocator.destroy(t);
     if (inst.tags.len > 0) allocator.free(inst.tags);
@@ -1055,4 +1084,80 @@ test "instantiate: non-wasi imports have null host functions" {
 
     try testing.expectEqual(@as(usize, 1), inst.host_functions.len);
     try testing.expect(inst.host_functions[0] == null);
+}
+
+test "attachHostFuncEntries: context-carrying host fn receives ctx and takes priority" {
+    const imports = [_]types.ImportDesc{
+        .{
+            .module_name = "host",
+            .field_name = "addn",
+            .kind = .function,
+            .func_type_idx = 0,
+        },
+    };
+    const func_types = [_]types.FuncType{
+        .{ .params = &.{ .i32, .i32 }, .results = &.{.i32} },
+    };
+    var module = types.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const inst = try instantiate(&module, testing.allocator);
+    defer destroy(inst);
+
+    const TestCtx = struct {
+        bias: i32,
+        const Self = @This();
+        fn trampoline(env_opaque: *anyopaque, ctx: ?*anyopaque) types.HostFnError!void {
+            const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
+            // Stack is LIFO: pop b first, then a.
+            const b = env.popI32() catch return error.StackUnderflow;
+            const a = env.popI32() catch return error.StackUnderflow;
+            env.pushI32(a + b + self.bias) catch return error.StackOverflow;
+        }
+    };
+    var tctx = TestCtx{ .bias = 100 };
+    const entries = try testing.allocator.alloc(?types.HostFnEntry, 1);
+    entries[0] = .{ .func = &TestCtx.trampoline, .ctx = @ptrCast(&tctx) };
+    attachHostFuncEntries(inst, entries);
+
+    // Execute import function index 0 with args (3, 4) -> 3 + 4 + 100 = 107.
+    const env = try ExecEnv.create(inst, 256, testing.allocator);
+    defer env.destroy();
+    try env.pushI32(3);
+    try env.pushI32(4);
+    try interp.executeFunction(env, 0);
+    const result = try env.popI32();
+    try testing.expectEqual(@as(i32, 107), result);
+}
+
+test "attachHostFuncEntries: null entry falls through to legacy host_functions" {
+    const imports = [_]types.ImportDesc{
+        .{
+            .module_name = "wasi",
+            .field_name = "thread-spawn",
+            .kind = .function,
+            .func_type_idx = 0,
+        },
+    };
+    const func_types = [_]types.FuncType{
+        .{ .params = &.{.i32}, .results = &.{.i32} },
+    };
+    var module = types.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const inst = try instantiate(&module, testing.allocator);
+    defer destroy(inst);
+
+    const entries = try testing.allocator.alloc(?types.HostFnEntry, 1);
+    entries[0] = null; // explicit null — must fall through
+    attachHostFuncEntries(inst, entries);
+
+    // Legacy WASI resolver should still be active at slot 0.
+    try testing.expect(inst.host_functions[0] != null);
+    try testing.expect(inst.host_func_entries[0] == null);
 }
