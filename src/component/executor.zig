@@ -860,47 +860,101 @@ pub const ComponentTrampolineCtx = struct {
 /// `InterfaceValue`s, invokes the bound `HostFunc`, and lowers the result
 /// values back onto the core stack.
 ///
-/// **Flat params/results only.** Spill via `realloc` (>16 flat params or
-/// >1 flat result) is intentionally deferred to the Phase 2A.3 slice. A
-/// context whose param_types flatten to more than `MAX_FLAT_PARAMS` cores
-/// will trap with `error.Trap`.
+/// Trampoline executed when a core wasm function imported by `canon.lower`
+/// is called. Pops args from the core stack, lifts them to component-level
+/// `InterfaceValue`s, invokes the bound `HostFunc`, and lowers the result
+/// values back onto the core stack.
 ///
 /// Stack discipline mirrors the rest of the interpreter: args were pushed
 /// in natural order by the caller, so the last flat core value is on top.
-/// We iterate parameter types back-to-front, popping each param's flat
-/// encoding. Results are pushed in natural order.
+///
+/// Param/result spill follows the canon ABI for `lower`:
+/// - `flat_params <= MAX_FLAT_PARAMS`: each param is on the stack as flat
+///   core values (back-to-front pop order).
+/// - `flat_params > MAX_FLAT_PARAMS`: a single i32 ptr on the stack points
+///   at a tuple of params laid out per the canon ABI.
+/// - `flat_results <= MAX_FLAT_RESULTS`: results are pushed back as flat
+///   core values.
+/// - `flat_results > MAX_FLAT_RESULTS`: an additional i32 ptr was pushed by
+///   the caller (after the params or param-ptr) into which results must be
+///   stored. The trampoline returns nothing.
+///
+/// Either spill path requires `lower_opts.memory_idx` to resolve the linear
+/// memory; if absent the trampoline traps.
 pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const ctx: *ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
     const allocator = ctx.comp_inst.allocator;
     const registry = TypeRegistry.init(ctx.comp_inst.component);
 
-    // Reject compound/spill shapes up front.
     const flat_params = countFlatTypes(registry, ctx.param_types);
     const flat_results = countFlatTypes(registry, ctx.result_types);
-    if (flat_params > MAX_FLAT_PARAMS or flat_results > MAX_FLAT_RESULTS) return error.Trap;
+    const params_spill = flat_params > MAX_FLAT_PARAMS;
+    const results_spill = flat_results > MAX_FLAT_RESULTS;
 
-    // Lift args: walk param_types back-to-front so the last flat core value
-    // (which is on top of stack) becomes the last arg.
+    // Resolve linear memory for either spill path. The memory option is
+    // mandatory whenever spilling occurs, and we need a non-empty
+    // core_instances list to actually own a memory.
+    if (params_spill or results_spill) {
+        if (ctx.lower_opts.memory_idx == null) return error.Trap;
+        if (ctx.comp_inst.core_instances.len == 0) return error.Trap;
+    }
+
+    // Pop result-destination pointer first if results spill (it was pushed
+    // last by the caller).
+    var result_dest_ptr: u32 = 0;
+    if (results_spill) {
+        result_dest_ptr = @bitCast(env.popI32() catch return error.Trap);
+    }
+
+    // Lift args.
     const args = allocator.alloc(InterfaceValue, ctx.param_types.len) catch return error.Trap;
     defer allocator.free(args);
-    var i: usize = ctx.param_types.len;
-    while (i > 0) {
-        i -= 1;
-        args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch return error.Trap;
+    if (params_spill) {
+        const params_ptr: u32 = @bitCast(env.popI32() catch return error.Trap);
+        const mem_idx = ctx.lower_opts.memory_idx.?;
+        const mi = ctx.comp_inst.core_instances[0].module_inst orelse return error.Trap;
+        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        var offset: u32 = params_ptr;
+        for (ctx.param_types, 0..) |pt, i| {
+            const al = typeAlign(registry, pt);
+            offset = abi.alignUp(offset, al);
+            args[i] = loadInterfaceValue(mem.data, offset, pt, registry, allocator) catch return error.Trap;
+            offset += typeSize(registry, pt);
+        }
+    } else {
+        // Walk param_types back-to-front so the last flat core value
+        // (which is on top of stack) becomes the last arg.
+        var i: usize = ctx.param_types.len;
+        while (i > 0) {
+            i -= 1;
+            args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch return error.Trap;
+        }
     }
 
     // Invoke host. Host owns allocation of any compound result values via
-    // `allocator`; we do not free them here — simple (non-compound) values
-    // need no cleanup, and compound results are out of scope for 2A.2.
+    // `allocator`; simple values need no cleanup.
     const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch return error.Trap;
     defer allocator.free(results);
     const call = ctx.host_func.call orelse return error.Trap;
     call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch return error.Trap;
 
-    // Lower results: push in natural order.
-    for (results, ctx.result_types) |r, t| {
-        pushInterfaceValue(env, r, t, registry) catch return error.Trap;
+    // Lower results.
+    if (results_spill) {
+        const mem_idx = ctx.lower_opts.memory_idx.?;
+        const mi = ctx.comp_inst.core_instances[0].module_inst orelse return error.Trap;
+        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        var offset: u32 = result_dest_ptr;
+        for (results, ctx.result_types) |r, t| {
+            const al = typeAlign(registry, t);
+            offset = abi.alignUp(offset, al);
+            storeInterfaceValue(mem.data, offset, r, t, registry);
+            offset += typeSize(registry, t);
+        }
+    } else {
+        for (results, ctx.result_types) |r, t| {
+            pushInterfaceValue(env, r, t, registry) catch return error.Trap;
+        }
     }
 }
 
@@ -984,7 +1038,7 @@ test "componentTrampoline: flat i32 host func with per-slot ctx" {
     try testing.expectEqual(@as(i32, 5), try env.popI32());
 }
 
-test "componentTrampoline: traps when flat params would spill" {
+test "componentTrampoline: traps on spill without memory option" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
     const inst_mod_core = @import("../runtime/interpreter/instance.zig");
@@ -1054,4 +1108,176 @@ test "componentTrampoline: traps when flat params would spill" {
     while (n < 17) : (n += 1) try env.pushI32(n);
     // executeFunction wraps HostFnError -> error.Unreachable for the trap.
     try std.testing.expectError(error.Unreachable, @import("../runtime/interpreter/interp.zig").executeFunction(env, 0));
+}
+
+test "componentTrampoline: param spill loads tuple from memory" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Core module with one memory and a host import that takes a single i32
+    // (the spilled-params ptr) and returns nothing.
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "many", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{.i32}, .results = &.{} },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    // ownership of core_inst is transferred to comp_inst.core_instances[0]
+    // below; comp_inst.deinit will destroy it.
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    // Inject the core instance into core_instances[0] so the trampoline can
+    // find the memory through it.
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    // Host fn: capture args into a buffer the test owns.
+    const Captured = struct {
+        var seen: [17]i32 = undefined;
+        var count: usize = 0;
+        fn cb(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            in: []const InterfaceValue,
+            _: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            count = in.len;
+            for (in, 0..) |v, i| seen[i] = v.s32;
+        }
+    };
+    Captured.count = 0;
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 17);
+    for (param_types) |*p| p.* = .s32;
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 0);
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Captured.cb },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{ .memory_idx = 0 },
+    };
+    defer tctx.deinit(testing.allocator);
+
+    // Layout 17 s32 args at offset 64 in linear memory.
+    const mem = core_inst.getMemory(0).?;
+    const base: u32 = 64;
+    var k: u32 = 0;
+    while (k < 17) : (k += 1) {
+        const off = base + k * 4;
+        const v: i32 = @as(i32, @intCast(k)) + 100;
+        std.mem.writeInt(i32, mem.data[off..][0..4], v, .little);
+    }
+
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    try env.pushI32(@intCast(base));
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    try testing.expectEqual(@as(usize, 17), Captured.count);
+    var j: usize = 0;
+    while (j < 17) : (j += 1) {
+        try testing.expectEqual(@as(i32, @intCast(j)) + 100, Captured.seen[j]);
+    }
+}
+
+test "componentTrampoline: result spill stores tuple into memory" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Imported host fn signature for canon.lower with results spill: takes
+    // an i32 dest_ptr (no params) and returns nothing.
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "many_results", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{.i32}, .results = &.{} },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    // ownership transferred to comp_inst.core_instances[0] below.
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    // Host fn: produce two s32 results.
+    const Host = struct {
+        fn pair(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            _: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            out[0] = .{ .s32 = 0xCAFE };
+            out[1] = .{ .s32 = 0xBEEF };
+        }
+    };
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 0);
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 2);
+    result_types[0] = .s32;
+    result_types[1] = .s32;
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.pair },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{ .memory_idx = 0 },
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const dest_ptr: u32 = 128;
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    try env.pushI32(@intCast(dest_ptr));
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    const mem = core_inst.getMemory(0).?;
+    const r0 = std.mem.readInt(i32, mem.data[dest_ptr..][0..4], .little);
+    const r1 = std.mem.readInt(i32, mem.data[dest_ptr + 4 ..][0..4], .little);
+    try testing.expectEqual(@as(i32, 0xCAFE), r0);
+    try testing.expectEqual(@as(i32, 0xBEEF), r1);
 }
