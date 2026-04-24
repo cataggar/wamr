@@ -545,9 +545,10 @@ pub fn instantiate(
                     const canon = component.canons[func_idx];
                     switch (canon) {
                         .lift => |lift| {
+                            const resolved = resolveLiftedCoreFunc(inst, component, lift.core_func_idx);
                             inst.exported_funcs.put(allocator, exp.name, .{
-                                .core_instance_idx = resolveCoreFuncToInstance(component, lift.core_func_idx) orelse 0,
-                                .core_func_idx = lift.core_func_idx,
+                                .core_instance_idx = if (resolved) |r| r.core_instance_idx else 0,
+                                .core_func_idx = if (resolved) |r| r.local_func_idx else lift.core_func_idx,
                                 .func_type_idx = lift.type_idx,
                                 .opts = lift.opts,
                             }) catch {};
@@ -609,10 +610,63 @@ fn resolveCoreFuncToInstance(component: *const ctypes.Component, core_func_idx: 
     return null;
 }
 
+/// Resolve a `canon.lift.core_func_idx` (component core-func-index-space) to
+/// the (core_instance_idx, local_func_idx) pair where the function actually
+/// lives, so the executor can call it via `interp.executeFunction` with the
+/// module-local index.
+///
+/// Phase 2A.2c layout assumption: the core-func-index-space is built up by
+/// (in this order) all `canon.lower` entries, then all `Alias.instance_export`
+/// entries with `sort = .core(.func)`. A full section-order-aware resolver
+/// will replace this once the loader emits ordered per-index-space streams.
+fn resolveLiftedCoreFunc(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    core_func_idx: u32,
+) ?struct { core_instance_idx: u32, local_func_idx: u32 } {
+    var n: u32 = 0;
+
+    // canon.lowers occupy the low end of the core-func-index-space. They are
+    // imports into a core module — not callable as exports — so a canon.lift
+    // pointing at one would be malformed; we still skip past their slots.
+    for (component.canons) |c| {
+        switch (c) {
+            .lower => {
+                if (n == core_func_idx) return null;
+                n += 1;
+            },
+            else => {},
+        }
+    }
+
+    // Then aliases of core-instance exports of sort = .core(.func).
+    for (component.aliases) |a| {
+        switch (a) {
+            .instance_export => |ie| {
+                const is_core_func = switch (ie.sort) {
+                    .core => |cs| cs == .func,
+                    else => false,
+                };
+                if (!is_core_func) continue;
+                if (n == core_func_idx) {
+                    if (ie.instance_idx >= inst.core_instances.len) return null;
+                    const target = inst.core_instances[ie.instance_idx];
+                    const mi = target.module_inst orelse return null;
+                    const local = mi.getExportFunc(ie.name) orelse return null;
+                    return .{
+                        .core_instance_idx = ie.instance_idx,
+                        .local_func_idx = local,
+                    };
+                }
+                n += 1;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// Resolve a component-level func index to a bound `HostFunc` by walking
-/// import bindings in declaration order. Narrow — handles only the layout
-/// where component func 0..N-1 are the imports (no canon.lifts shifting
-/// the component-func-index-space yet).
 fn resolveComponentFuncToHostFunc(
     inst: *const ComponentInstance,
     component: *const ctypes.Component,
@@ -1013,4 +1067,129 @@ test "instantiate: canon.lower wires host func into core import (2A.2b)" {
     defer env.destroy();
     try @import("../runtime/interpreter/interp.zig").executeFunction(env, run_idx);
     try std.testing.expectEqual(@as(i32, 5), try env.popI32());
+}
+
+test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
+    const testing = std.testing;
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Same shape as the 2A.2b fixture, but `run` takes the args instead of
+    // hard-coding constants. A canon.lift then exposes it as a component
+    // export, and callComponentFunc invokes it through the lift.
+    //
+    //   (module
+    //     (type (func (param i32 i32) (result i32)))
+    //     (import "host" "sub" (func (type 0)))
+    //     (func (type 0)
+    //       local.get 0 local.get 1 call 0)
+    //     (export "run" (func 1)))
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section (1 type)
+        0x01, 0x07, 0x01,
+        0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+        // import section (1 import)
+        0x02, 0x0c, 0x01,
+        0x04, 'h', 'o', 's', 't',
+        0x03, 's', 'u', 'b',
+        0x00, 0x00,
+        // function section (1 local fn)
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "run" -> func 1
+        0x07, 0x07, 0x01,
+        0x03, 'r', 'u', 'n',
+        0x00, 0x01,
+        // code section (1 body, 8 bytes)
+        0x0a, 0x0a, 0x01,
+        0x08, 0x00,
+        0x20, 0x00, 0x20, 0x01,
+        0x10, 0x00,
+        0x0b,
+    };
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+
+    const params = [_]ctypes.NamedValType{
+        .{ .name = "a", .type = .s32 },
+        .{ .name = "b", .type = .s32 },
+    };
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &params, .results = .{ .unnamed = .s32 } } },
+    };
+    const imports_decl = [_]ctypes.ImportDecl{
+        .{ .name = "host-sub", .desc = .{ .func = 0 } },
+    };
+    // Canon order: lower first (core-func 0), then lift (component func 1).
+    const canons = [_]ctypes.Canon{
+        .{ .lower = .{ .func_idx = 0, .opts = &.{} } },
+        .{ .lift = .{ .core_func_idx = 1, .type_idx = 0, .opts = &.{} } },
+    };
+    const inline_exports = [_]ctypes.CoreInlineExport{
+        .{ .name = "sub", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const inst_args = [_]ctypes.CoreInstantiateArg{
+        .{ .name = "host", .instance_idx = 0 },
+    };
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .exports = &inline_exports },
+        .{ .instantiate = .{ .module_idx = 0, .args = &inst_args } },
+    };
+    const aliases_decl = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = 1,
+            .name = "run",
+        } },
+    };
+    const exports_decl = [_]ctypes.ExportDecl{
+        .{ .name = "run", .desc = .{ .func = 1 } },
+    };
+
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases_decl,
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &imports_decl,
+        .exports = &exports_decl,
+    };
+
+    const inst = try instantiate(&component, testing.allocator);
+    defer inst.deinit();
+
+    const Host = struct {
+        fn sub(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            in: []const abi_mod.InterfaceValue,
+            out: []abi_mod.InterfaceValue,
+            _: std.mem.Allocator,
+        ) anyerror!void {
+            out[0] = .{ .s32 = in[0].s32 - in[1].s32 };
+        }
+    };
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try providers.put(testing.allocator, "host-sub", .{
+        .host_func = .{ .call = &Host.sub },
+    });
+    try inst.linkImports(providers);
+
+    // Confirm export resolution found the right (instance, local) pair.
+    const exported = inst.getExport("run") orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 1), exported.core_instance_idx);
+    try std.testing.expectEqual(@as(u32, 1), exported.core_func_idx);
+
+    var args = [_]abi_mod.InterfaceValue{
+        .{ .s32 = 7 },
+        .{ .s32 = 2 },
+    };
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "run", &args, &results, testing.allocator);
+    try std.testing.expectEqual(@as(i32, 5), results[0].s32);
 }
