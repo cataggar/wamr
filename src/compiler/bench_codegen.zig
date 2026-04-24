@@ -175,6 +175,18 @@ fn bodyRmwAdd8(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = result } }) catch unreachable;
 }
 
+/// Body with a shl by a compile-time constant — exercises the shift-imm
+/// fast path (C1/D1 form, no CL load). Issue #137.
+fn bodyShlImm(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const x = func.newVReg();
+    const k = func.newVReg();
+    const r = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = x, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = k, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .shl = .{ .lhs = x, .rhs = k } }, .dest = r, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = r } }) catch unreachable;
+}
+
 /// Body with several dead intermediate values — used to demonstrate DCE effect.
 fn bodyDeadIntermediates(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     const a = func.newVReg();
@@ -267,6 +279,7 @@ pub fn main() !void {
         .{ .name = "atomic_rmw xchg i32", .body = &bodyRmwXchg32 },
         .{ .name = "atomic_rmw add i8", .body = &bodyRmwAdd8 },
         .{ .name = "atomic_cmpxchg i32", .body = &bodyCmpxchg32 },
+        .{ .name = "shl i32 by const 3", .body = &bodyShlImm },
     };
 
     for (benchmarks) |b| {

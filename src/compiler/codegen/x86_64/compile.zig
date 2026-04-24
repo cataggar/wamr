@@ -689,49 +689,89 @@ fn compileInst(
 
         // ── Shifts ────────────────────────────────────────────────────
         .shl => {
-            try stack.pop(code, .rcx); // count → RCX (CL)
-            try stack.pop(code, .rax); // value
-            // SHL RAX, CL: REX.W D3 /4
-            try code.rexW(.rax, .rax);
-            try code.emitByte(0xD3);
-            try code.modrm(0b11, 4, emit.Reg.rax.low3());
-            try stack.push(code, .rax);
+            if (stack.topIsConst()) {
+                const imm: u8 = @intCast(stack.topConstVal() & 0x3f);
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.shiftRegImm8(.rax, 4, imm, true);
+                try stack.push(code, .rax);
+            } else {
+                try stack.pop(code, .rcx); // count → RCX (CL)
+                try stack.pop(code, .rax); // value
+                // SHL RAX, CL: REX.W D3 /4
+                try code.rexW(.rax, .rax);
+                try code.emitByte(0xD3);
+                try code.modrm(0b11, 4, emit.Reg.rax.low3());
+                try stack.push(code, .rax);
+            }
         },
         .shr_s => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            // SAR RAX, CL: REX.W D3 /7
-            try code.rexW(.rax, .rax);
-            try code.emitByte(0xD3);
-            try code.modrm(0b11, 7, emit.Reg.rax.low3());
-            try stack.push(code, .rax);
+            if (stack.topIsConst()) {
+                const imm: u8 = @intCast(stack.topConstVal() & 0x3f);
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.shiftRegImm8(.rax, 7, imm, true);
+                try stack.push(code, .rax);
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                // SAR RAX, CL: REX.W D3 /7
+                try code.rexW(.rax, .rax);
+                try code.emitByte(0xD3);
+                try code.modrm(0b11, 7, emit.Reg.rax.low3());
+                try stack.push(code, .rax);
+            }
         },
         .shr_u => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            // SHR RAX, CL: REX.W D3 /5
-            try code.rexW(.rax, .rax);
-            try code.emitByte(0xD3);
-            try code.modrm(0b11, 5, emit.Reg.rax.low3());
-            try stack.push(code, .rax);
+            if (stack.topIsConst()) {
+                const imm: u8 = @intCast(stack.topConstVal() & 0x3f);
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.shiftRegImm8(.rax, 5, imm, true);
+                try stack.push(code, .rax);
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                // SHR RAX, CL: REX.W D3 /5
+                try code.rexW(.rax, .rax);
+                try code.emitByte(0xD3);
+                try code.modrm(0b11, 5, emit.Reg.rax.low3());
+                try stack.push(code, .rax);
+            }
         },
         .rotl => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            // ROL RAX, CL: REX.W D3 /0
-            try code.rexW(.rax, .rax);
-            try code.emitByte(0xD3);
-            try code.modrm(0b11, 0, emit.Reg.rax.low3());
-            try stack.push(code, .rax);
+            if (stack.topIsConst()) {
+                const imm: u8 = @intCast(stack.topConstVal() & 0x3f);
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.shiftRegImm8(.rax, 0, imm, true);
+                try stack.push(code, .rax);
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                // ROL RAX, CL: REX.W D3 /0
+                try code.rexW(.rax, .rax);
+                try code.emitByte(0xD3);
+                try code.modrm(0b11, 0, emit.Reg.rax.low3());
+                try stack.push(code, .rax);
+            }
         },
         .rotr => {
-            try stack.pop(code, .rcx);
-            try stack.pop(code, .rax);
-            // ROR RAX, CL: REX.W D3 /1
-            try code.rexW(.rax, .rax);
-            try code.emitByte(0xD3);
-            try code.modrm(0b11, 1, emit.Reg.rax.low3());
-            try stack.push(code, .rax);
+            if (stack.topIsConst()) {
+                const imm: u8 = @intCast(stack.topConstVal() & 0x3f);
+                stack.dropTop();
+                try stack.pop(code, .rax);
+                if (imm != 0) try code.shiftRegImm8(.rax, 1, imm, true);
+                try stack.push(code, .rax);
+            } else {
+                try stack.pop(code, .rcx);
+                try stack.pop(code, .rax);
+                // ROR RAX, CL: REX.W D3 /1
+                try code.rexW(.rax, .rax);
+                try code.emitByte(0xD3);
+                try code.modrm(0b11, 1, emit.Reg.rax.low3());
+                try stack.push(code, .rax);
+            }
         },
 
         // ── Division / remainder ──────────────────────────────────────
@@ -3023,6 +3063,27 @@ fn compileInstRA(
         // ── Shifts ────────────────────────────────────────────────────
         .shl, .shr_s, .shr_u, .rotl, .rotr => |bin| {
             const dest = inst.dest orelse return;
+            const is64 = inst.type == .i64;
+            const digit: u3 = switch (inst.op) {
+                .shl => 4,
+                .shr_u => 5,
+                .shr_s => 7,
+                .rotl => 0,
+                .rotr => 1,
+                else => unreachable,
+            };
+            // Constant-count fast path: emit `C1 /digit ib` (or `D1 /digit`
+            // when imm==1) and skip the MOV-to-CL entirely. Mask imm to
+            // wasm-semantic bit width: 5 bits for i32, 6 bits for i64.
+            if (const_vals.get(bin.rhs)) |cnt| {
+                const mask: u64 = if (is64) 0x3f else 0x1f;
+                const imm: u8 = @intCast(@as(u64, @bitCast(cnt)) & mask);
+                const val_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
+                if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
+                if (imm != 0) try code.shiftRegImm8(.rax, digit, imm, is64);
+                try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
+                return;
+            }
             // Load val first to avoid clobbering if both share a register
             const val_reg = try useVReg(code, alloc_result, bin.lhs, .rax);
             if (val_reg != .rax) try code.movRegReg(.rax, val_reg);
@@ -3034,7 +3095,6 @@ fn compileInstRA(
             // In 64-bit REX.W form x86 masks CL to 6 bits, so shift-by-32
             // produces wrong results; wasm i32 shifts mask by 5 bits, which
             // matches the 32-bit x86 form natively.
-            const is64 = inst.type == .i64;
             switch (inst.op) {
                 .shl => {
                     if (is64) try code.rexW(.rax, .rax);
@@ -4783,8 +4843,141 @@ test "compileFunctionRA: shift does not emit dead r11 save" {
     // `mov r11, rax` = 49 89 C3. `mov rax, r11` = 4C 89 D8. Neither should appear.
     try std.testing.expect(!containsBytes(code, &.{ 0x49, 0x89, 0xC3 }));
     try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x89, 0xD8 }));
-    // Shift opcode D3 E0 (shl rax, cl with REX.W) must still appear.
+    // With a constant shift count the backend now emits the imm form
+    // `C1 E0 02` (shl eax, 2) and skips the MOV-to-CL entirely.
+    try std.testing.expect(containsBytes(code, &.{ 0xC1, 0xE0, 0x02 }));
+    // The CL-based form `D3 E0` must not appear for this constant count.
+    try std.testing.expect(!containsBytes(code, &.{ 0xD3, 0xE0 }));
+}
+
+test "compileFunctionRA: shl by non-constant still uses CL form" {
+    // Negative test for the imm fast path: when rhs is not a known constant
+    // (e.g. a function parameter) we must fall back to `D3 /digit` with CL.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 2, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // CL-based shift `D3 E0` must still be used.
     try std.testing.expect(containsBytes(code, &.{ 0xD3, 0xE0 }));
+}
+
+test "compileFunctionRA: shl i64 by constant 3 emits REX.W C1 E0 03" {
+    // 64-bit shift by a constant picks the imm form with REX.W.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 10 }, .dest = v0, .type = .i64 });
+    try block.append(.{ .op = .{ .iconst_64 = 3 }, .dest = v1, .type = .i64 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // REX.W + C1 /4 ib = `48 C1 E0 03` (shl rax, 3).
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0xC1, 0xE0, 0x03 }));
+}
+
+test "compileFunctionRA: shl by constant 1 uses D1 form (no imm byte)" {
+    // Count of 1 uses the 1-byte shorter `D1 /digit` encoding.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // `D1 E0` = shl eax, 1. No C1 form, no D3/CL form.
+    try std.testing.expect(containsBytes(code, &.{ 0xD1, 0xE0 }));
+    try std.testing.expect(!containsBytes(code, &.{ 0xC1, 0xE0 }));
+    try std.testing.expect(!containsBytes(code, &.{ 0xD3, 0xE0 }));
+}
+
+test "compileFunctionRA: shr_u/shr_s/rotl/rotr by constant use imm form" {
+    const allocator = std.testing.allocator;
+    const Case = struct {
+        tag: []const u8,
+        expected: [3]u8, // C1 /digit ib (ib=2)
+        build: *const fn (lhs: ir.VReg, rhs: ir.VReg) ir.Inst.Op,
+    };
+    const B = struct {
+        fn shr_u(lhs: ir.VReg, rhs: ir.VReg) ir.Inst.Op {
+            return .{ .shr_u = .{ .lhs = lhs, .rhs = rhs } };
+        }
+        fn shr_s(lhs: ir.VReg, rhs: ir.VReg) ir.Inst.Op {
+            return .{ .shr_s = .{ .lhs = lhs, .rhs = rhs } };
+        }
+        fn rotl(lhs: ir.VReg, rhs: ir.VReg) ir.Inst.Op {
+            return .{ .rotl = .{ .lhs = lhs, .rhs = rhs } };
+        }
+        fn rotr(lhs: ir.VReg, rhs: ir.VReg) ir.Inst.Op {
+            return .{ .rotr = .{ .lhs = lhs, .rhs = rhs } };
+        }
+    };
+    const cases = [_]Case{
+        .{ .tag = "shr_u", .expected = .{ 0xC1, 0xE8, 0x02 }, .build = &B.shr_u },
+        .{ .tag = "shr_s", .expected = .{ 0xC1, 0xF8, 0x02 }, .build = &B.shr_s },
+        .{ .tag = "rotl", .expected = .{ 0xC1, 0xC0, 0x02 }, .build = &B.rotl },
+        .{ .tag = "rotr", .expected = .{ 0xC1, 0xC8, 0x02 }, .build = &B.rotr },
+    };
+    for (cases) |c| {
+        var func = ir.IrFunction.init(allocator, 0, 1, 0);
+        defer func.deinit();
+        const block_id = try func.newBlock();
+        const block = func.getBlock(block_id);
+        const v0 = func.newVReg();
+        const v1 = func.newVReg();
+        const v2 = func.newVReg();
+        try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0, .type = .i32 });
+        try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+        try block.append(.{ .op = c.build(v0, v1), .dest = v2, .type = .i32 });
+        try block.append(.{ .op = .{ .ret = v2 } });
+
+        const compile_result = try compileFunctionRA(&func, 0, allocator);
+        const code = compile_result.code;
+        defer allocator.free(compile_result.call_patches);
+        defer allocator.free(code);
+
+        if (!containsBytes(code, &c.expected)) {
+            std.debug.print("case {s}: expected bytes not found\n", .{c.tag});
+            try std.testing.expect(false);
+        }
+    }
 }
 
 test "compileFunctionRA: div does not emit dead r11 save around operand load" {
