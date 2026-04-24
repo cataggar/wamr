@@ -608,6 +608,29 @@ pub const CodeBuffer = struct {
         }
     }
 
+    /// Emit a shift/rotate with an immediate count: `SHL/SHR/SAR/ROL/ROR reg, imm8`.
+    /// `digit` selects the operation via the ModR/M /r extension:
+    /// 0=ROL, 1=ROR, 4=SHL, 5=SHR, 7=SAR. If `is64` is true, emits REX.W for
+    /// 64-bit operand size; otherwise 32-bit (zero-extended to 64 as usual).
+    /// The caller is responsible for masking `imm` to wasm-correct bits
+    /// (& 0x1f for i32, & 0x3f for i64); this helper just encodes the byte.
+    /// Uses the 1-byte form `D1 /digit` when `imm == 1` to save an immediate byte.
+    pub fn shiftRegImm8(self: *CodeBuffer, dst: Reg, digit: u3, imm: u8, is64: bool) !void {
+        if (is64) {
+            try self.rexW(.rax, dst);
+        } else if (dst.isExtended()) {
+            try self.rex(false, .rax, dst);
+        }
+        if (imm == 1) {
+            try self.emitByte(0xD1);
+            try self.modrm(0b11, digit, dst.low3());
+        } else {
+            try self.emitByte(0xC1);
+            try self.modrm(0b11, digit, dst.low3());
+            try self.emitByte(imm);
+        }
+    }
+
     /// XOR r32, r32 — zero register without REX.W (2 bytes, zero idiom).
     pub fn xorReg32(self: *CodeBuffer, reg: Reg) !void {
         if (reg.isExtended()) try self.rex(false, reg, reg);
