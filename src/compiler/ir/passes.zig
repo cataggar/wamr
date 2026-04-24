@@ -1502,6 +1502,68 @@ pub fn foldConstantBranches(func: *ir.IrFunction, allocator: std.mem.Allocator) 
     return changed;
 }
 
+// ── Branch-on-Eqz folding ───────────────────────────────────────────────────
+
+/// Collapse `br_if(cond=eqz(x), then=A, else=B)` into
+/// `br_if(cond=x, then=B, else=A)`.
+///
+/// This removes a redundant `eqz` whose only use is the branch and flips
+/// the target polarity. On aarch64 this turns `cmp ... ; cbz` into
+/// `cbnz`, saving an instruction; on x86-64 the eqz lowers to a
+/// `test/sete` + jump that becomes a single `test + jnz`.
+///
+/// Soundness:
+///   - The rewrite is semantics-preserving: `eqz(x) != 0` iff `x == 0`,
+///     so swapping the branch targets inverts the condition back.
+///   - We only rewrite when the `eqz`'s single use is this br_if (so the
+///     eqz becomes dead and DCE reaps it next iteration). If the eqz has
+///     other uses we can still flip the branch, but we'd leave the eqz
+///     live with no saving — skip to avoid churning `runPasses`.
+pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    // Build a vreg -> defining-instruction index so we can identify
+    // producers that may be in a different block from the terminator.
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    for (func.blocks.items) |*block| {
+        if (block.instructions.items.len == 0) continue;
+        const term = &block.instructions.items[block.instructions.items.len - 1];
+        switch (term.op) {
+            .br_if => |bi| {
+                const producer_block = def_block.get(bi.cond) orelse continue;
+                const producer_ii = def_idx.get(bi.cond) orelse continue;
+                const producer = &func.blocks.items[producer_block].instructions.items[producer_ii];
+                const inner = switch (producer.op) {
+                    .eqz => |v| v,
+                    else => continue,
+                };
+                if (countUsesOfVReg(func, bi.cond) != 1) continue;
+                term.op = .{ .br_if = .{
+                    .cond = inner,
+                    .then_block = bi.else_block,
+                    .else_block = bi.then_block,
+                } };
+                changed = true;
+            },
+            else => {},
+        }
+    }
+    return changed;
+}
+
 // ── Function Inlining ───────────────────────────────────────────────────────
 
 /// Shift every VReg referenced by `inst` (reads and def) by `+offset`.
@@ -1898,6 +1960,7 @@ pub const default_passes: []const PassFn = &.{
     &strengthReduceMulShiftAdd,
     &strengthReduceDivRem,
     &foldConstantBranches,
+    &foldBranchOnEqz,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -3766,4 +3829,140 @@ test "strengthReduceMulShiftAdd: pipeline composition with strengthReduceMul" {
     for (block.instructions.items) |inst| {
         try std.testing.expect(inst.op != .mul);
     }
+}
+
+test "foldBranchOnEqz: swaps targets and drops eqz use" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(changed);
+
+    const term = func.getBlock(b0).instructions.items[1];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_x, bi.cond);
+            try std.testing.expectEqual(b2, bi.then_block);
+            try std.testing.expectEqual(b1, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldBranchOnEqz: skips when eqz has multiple uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    // second use of v_c
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v_c, .rhs = v_c } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(!changed);
+
+    const term = func.getBlock(b0).instructions.items[2];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_c, bi.cond);
+            try std.testing.expectEqual(b1, bi.then_block);
+            try std.testing.expectEqual(b2, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldBranchOnEqz: no-op when br_if cond is not eqz" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_a });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_b });
+    try func.getBlock(b0).append(.{ .op = .{ .eq = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_c });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldBranchOnEqz: cross-block eqz producer" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const mid = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try func.getBlock(entry).append(.{ .op = .{ .br = mid } });
+    try func.getBlock(mid).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(changed);
+    const term = func.getBlock(mid).instructions.items[0];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_x, bi.cond);
+            try std.testing.expectEqual(b2, bi.then_block);
+            try std.testing.expectEqual(b1, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldBranchOnEqz: pipeline drops dead eqz after DCE" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    _ = try foldBranchOnEqz(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // eqz should be gone; only the br_if remains.
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b0).instructions.items.len);
+    try std.testing.expect(func.getBlock(b0).instructions.items[0].op == .br_if);
 }
