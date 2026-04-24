@@ -824,6 +824,89 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
     return changed;
 }
 
+/// Value-independent algebraic simplifications. Complements
+/// `constantFold` (which only fires when a concrete constant operand
+/// is visible) by exploiting the fact that `x op x` often reduces to
+/// a constant or to `x` itself, regardless of `x`'s value:
+///
+///   sub x, x        -> 0
+///   xor x, x        -> 0
+///   and x, x        -> x
+///   or  x, x        -> x
+///   eq  x, x        -> 1
+///   ne  x, x        -> 0
+///   lt_s/lt_u x, x  -> 0
+///   gt_s/gt_u x, x  -> 0
+///   le_s/le_u x, x  -> 1
+///   ge_s/ge_u x, x  -> 1
+///
+/// These patterns appear after `forwardLocalGet` or `commonSubexprElimination`
+/// coalesce two vregs into one (e.g. a loop guard that was already
+/// proven earlier). They are all sound without value knowledge:
+///
+/// - None of the integer operations above trap (div/rem are deliberately
+///   excluded — `x/x` traps when x == 0).
+/// - Float compares are deliberately excluded — `NaN == NaN` is false,
+///   so `f_eq x, x` does not reduce to 1.
+/// - Operations that reduce to a constant leave the original dest in
+///   place (now produced by an `iconst_*`); users see the new value.
+/// - Operations that reduce to `x` rewrite uses via `replaceVReg` and
+///   leave an `iconst_32 = 0` placeholder for `deadCodeElimination` to
+///   sweep, matching the convention used by `constantFold`.
+pub fn algebraicSimplify(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    _ = allocator;
+    var changed = false;
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |*inst| {
+            const dest = inst.dest orelse continue;
+            const is_int = inst.type == .i32 or inst.type == .i64;
+            if (!is_int) continue;
+
+            switch (inst.op) {
+                .sub, .xor => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    if (inst.type == .i64) {
+                        inst.op = .{ .iconst_64 = 0 };
+                    } else {
+                        inst.op = .{ .iconst_32 = 0 };
+                    }
+                    changed = true;
+                },
+                .@"and", .@"or" => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    const keep = bin.lhs;
+                    replaceVReg(func, dest, keep);
+                    inst.op = .{ .iconst_32 = 0 };
+                    changed = true;
+                },
+                .eq, .le_s, .le_u, .ge_s, .ge_u => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    // Match `constantFold` convention: width is `inst.type`.
+                    if (inst.type == .i64) {
+                        inst.op = .{ .iconst_64 = 1 };
+                    } else {
+                        inst.op = .{ .iconst_32 = 1 };
+                    }
+                    changed = true;
+                },
+                .ne, .lt_s, .lt_u, .gt_s, .gt_u => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    if (inst.type == .i64) {
+                        inst.op = .{ .iconst_64 = 0 };
+                    } else {
+                        inst.op = .{ .iconst_32 = 0 };
+                    }
+                    changed = true;
+                },
+                else => {},
+            }
+        }
+    }
+
+    return changed;
+}
+
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
         .store, .local_set, .global_set, .call, .call_indirect, .call_ref, .ret, .ret_multi, .br, .br_if, .br_table, .@"unreachable",
@@ -1662,6 +1745,7 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 pub const default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
+    &algebraicSimplify,
     &strengthReduceMul,
     &strengthReduceDivRem,
     &foldConstantBranches,
@@ -3179,4 +3263,171 @@ test "elideRedundantBoundsChecks: fence in dominator hides upstream entries" {
 
     _ = try elideRedundantBoundsChecks(&func, allocator);
     try std.testing.expect(!func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+}
+
+test "algebraicSimplify: sub x, x -> iconst 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .sub = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[1].op);
+    try std.testing.expectEqual(@as(?ir.VReg, v_r), func.getBlock(b0).instructions.items[1].dest);
+}
+
+test "algebraicSimplify: sub x, x i64 -> iconst_64 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_64 = 42 }, .dest = v_x, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .sub = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = 0 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: xor x, x -> iconst 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .xor = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: and x, x -> x (users rewritten)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .@"and" = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    // ret must now reference v_x directly.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, func.getBlock(b0).instructions.items[2].op);
+}
+
+test "algebraicSimplify: or x, x -> x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .@"or" = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, func.getBlock(b0).instructions.items[2].op);
+}
+
+test "algebraicSimplify: eq x, x -> iconst 1" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .eq = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 1 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: ne x, x -> iconst 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .ne = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: le_u x, x -> 1; lt_u x, x -> 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_le = func.newVReg();
+    const v_lt = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .le_u = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_le });
+    try func.getBlock(b0).append(.{ .op = .{ .lt_u = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_lt });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_le } });
+
+    _ = try algebraicSimplify(&func, allocator);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 1 }, func.getBlock(b0).instructions.items[1].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[2].op);
+}
+
+test "algebraicSimplify: sub with distinct operands is unchanged" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_a });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = v_b });
+    try func.getBlock(b0).append(.{ .op = .{ .sub = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(func.getBlock(b0).instructions.items[2].op == .sub);
+}
+
+test "algebraicSimplify: is idempotent (no spin after first fire)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .xor = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const first = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(first);
+    const second = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(!second);
 }
