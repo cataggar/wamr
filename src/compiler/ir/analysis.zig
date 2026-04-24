@@ -688,6 +688,194 @@ pub fn computeDominators(
     };
 }
 
+// ── Natural-loop detection ──────────────────────────────────────────────
+
+/// A natural loop identified by a single header and one or more latches
+/// (blocks with back-edges to the header). Multiple back-edges to the
+/// same header are merged into one loop, matching the standard
+/// "natural loops of a flow graph" definition.
+///
+/// Invariants:
+///   - `header ∈ blocks` and every `latch ∈ blocks`.
+///   - `header` dominates every block in `blocks`.
+///   - `blocks` and `latches` are sorted ascending, no duplicates.
+pub const Loop = struct {
+    header: ir.BlockId,
+    latches: []ir.BlockId,
+    blocks: []ir.BlockId,
+
+    /// O(log N) membership test (blocks is sorted).
+    pub fn containsBlock(self: *const Loop, bid: ir.BlockId) bool {
+        var lo: usize = 0;
+        var hi: usize = self.blocks.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const v = self.blocks[mid];
+            if (v == bid) return true;
+            if (v < bid) lo = mid + 1 else hi = mid;
+        }
+        return false;
+    }
+};
+
+/// A forest of natural loops for a function. Each loop is identified by
+/// its index in `loops`. `header_loop` maps a header block ID back to
+/// its loop index, so callers can answer "is this block a loop header?"
+/// and "what loop does this header start?" in O(1).
+pub const LoopForest = struct {
+    loops: []Loop,
+    header_loop: std.AutoHashMap(ir.BlockId, u32),
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *LoopForest) void {
+        for (self.loops) |*loop| {
+            self.allocator.free(loop.latches);
+            self.allocator.free(loop.blocks);
+        }
+        self.allocator.free(self.loops);
+        self.header_loop.deinit();
+    }
+
+    /// Returns true if `bid` is the header of some loop in this forest.
+    pub fn isHeader(self: *const LoopForest, bid: ir.BlockId) bool {
+        return self.header_loop.contains(bid);
+    }
+};
+
+/// Compute the natural-loop forest for `func` using the supplied
+/// dominator tree. Only reachable back-edges contribute to loops;
+/// unreachable subgraphs (null idom) are ignored.
+pub fn computeLoops(
+    func: *const ir.IrFunction,
+    dom: *const DomTree,
+    allocator: std.mem.Allocator,
+) !LoopForest {
+    const nblocks = func.blocks.items.len;
+
+    const successors = try buildSuccessors(func, allocator);
+    defer {
+        var sit = successors.iterator();
+        while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
+        @constCast(&successors).deinit();
+    }
+    var predecessors = try buildPredecessors(func, allocator);
+    defer {
+        var pit = predecessors.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    // ── Collect back-edges per header ──
+    // A back-edge is t → h where h dominates t. Both ends must be
+    // reachable (have a non-null idom).
+    var latches_by_header = std.AutoHashMap(ir.BlockId, std.ArrayList(ir.BlockId)).init(allocator);
+    defer {
+        var it = latches_by_header.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        latches_by_header.deinit();
+    }
+
+    var from_idx: usize = 0;
+    while (from_idx < nblocks) : (from_idx += 1) {
+        const from: ir.BlockId = @intCast(from_idx);
+        if (dom.idom[from] == null) continue;
+        const succs = successors.get(from) orelse continue;
+        for (succs) |to| {
+            if (dom.idom[to] == null) continue;
+            if (!dom.dominates(to, from)) continue;
+            const gop = try latches_by_header.getOrPut(to);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            // br_table / br_if may produce duplicate (from → to) edges.
+            var dup = false;
+            for (gop.value_ptr.items) |l| {
+                if (l == from) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) try gop.value_ptr.append(allocator, from);
+        }
+    }
+
+    // ── Materialize one Loop per header ──
+    var loops: std.ArrayList(Loop) = .empty;
+    errdefer {
+        for (loops.items) |*loop| {
+            allocator.free(loop.latches);
+            allocator.free(loop.blocks);
+        }
+        loops.deinit(allocator);
+    }
+
+    var header_loop = std.AutoHashMap(ir.BlockId, u32).init(allocator);
+    errdefer header_loop.deinit();
+
+    // Scratch buffers reused across headers.
+    var in_loop = try allocator.alloc(bool, nblocks);
+    defer allocator.free(in_loop);
+    var worklist: std.ArrayList(ir.BlockId) = .empty;
+    defer worklist.deinit(allocator);
+
+    var hit = latches_by_header.iterator();
+    while (hit.next()) |entry| {
+        const header = entry.key_ptr.*;
+        const latch_list = entry.value_ptr.*;
+
+        // Standard natural-loop body computation: start from header, add
+        // each latch, then walk predecessors but never past the header.
+        @memset(in_loop, false);
+        in_loop[header] = true;
+        worklist.clearRetainingCapacity();
+        for (latch_list.items) |latch| {
+            if (!in_loop[latch]) {
+                in_loop[latch] = true;
+                try worklist.append(allocator, latch);
+            }
+        }
+        while (worklist.pop()) |bid| {
+            const preds = predecessors.get(bid) orelse continue;
+            for (preds) |p| {
+                if (!in_loop[p]) {
+                    in_loop[p] = true;
+                    try worklist.append(allocator, p);
+                }
+            }
+        }
+
+        // Freeze in_loop → sorted blocks slice.
+        var count: usize = 0;
+        for (in_loop) |b| {
+            if (b) count += 1;
+        }
+        const blocks_slice = try allocator.alloc(ir.BlockId, count);
+        errdefer allocator.free(blocks_slice);
+        var bi: usize = 0;
+        for (in_loop, 0..) |b, idx| {
+            if (b) {
+                blocks_slice[bi] = @intCast(idx);
+                bi += 1;
+            }
+        }
+
+        // Sort latches ascending, no duplicates (duplicates already filtered above).
+        const latches_slice = try allocator.dupe(ir.BlockId, latch_list.items);
+        std.mem.sort(ir.BlockId, latches_slice, {}, std.sort.asc(ir.BlockId));
+
+        try header_loop.put(header, @intCast(loops.items.len));
+        try loops.append(allocator, .{
+            .header = header,
+            .latches = latches_slice,
+            .blocks = blocks_slice,
+        });
+    }
+
+    return .{
+        .loops = try loops.toOwnedSlice(allocator),
+        .header_loop = header_loop,
+        .allocator = allocator,
+    };
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "buildSuccessors: linear block" {
@@ -1014,4 +1202,215 @@ test "computeDominators: unreachable block has null idom" {
     try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b0]);
     try std.testing.expectEqual(@as(?ir.BlockId, null), dom.idom[b1]);
     try std.testing.expect(!dom.dominates(b0, b1));
+}
+
+test "computeLoops: no loops in DAG" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var lf = try computeLoops(&func, &dom, allocator);
+    defer lf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), lf.loops.len);
+    try std.testing.expect(!lf.isHeader(b0));
+    try std.testing.expect(!lf.isHeader(b1));
+}
+
+test "computeLoops: self-loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock(); // self-loop
+    const b2 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var lf = try computeLoops(&func, &dom, allocator);
+    defer lf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), lf.loops.len);
+    const loop = &lf.loops[0];
+    try std.testing.expectEqual(b1, loop.header);
+    try std.testing.expectEqual(@as(usize, 1), loop.latches.len);
+    try std.testing.expectEqual(b1, loop.latches[0]);
+    try std.testing.expect(loop.containsBlock(b1));
+    try std.testing.expect(!loop.containsBlock(b0));
+    try std.testing.expect(!loop.containsBlock(b2));
+    try std.testing.expect(lf.isHeader(b1));
+}
+
+test "computeLoops: while-loop body" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 → b1(header) → b2(body) → b1 (back-edge) | b3(exit)
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b2, .else_block = b3 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var lf = try computeLoops(&func, &dom, allocator);
+    defer lf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), lf.loops.len);
+    const loop = &lf.loops[0];
+    try std.testing.expectEqual(b1, loop.header);
+    try std.testing.expectEqual(@as(usize, 2), loop.blocks.len);
+    try std.testing.expect(loop.containsBlock(b1));
+    try std.testing.expect(loop.containsBlock(b2));
+    try std.testing.expect(!loop.containsBlock(b0));
+    try std.testing.expect(!loop.containsBlock(b3));
+    try std.testing.expectEqual(@as(usize, 1), loop.latches.len);
+    try std.testing.expectEqual(b2, loop.latches[0]);
+}
+
+test "computeLoops: multiple latches share header" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 → h; h branches to b2 or b3; both jump back to h; h has exit b4.
+    const b0 = try func.newBlock();
+    const h = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = h } });
+    try func.getBlock(h).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(h).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b2, .else_block = b3 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v1 });
+    try func.getBlock(b2).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = h, .else_block = b4 } } });
+    try func.getBlock(b3).append(.{ .op = .{ .br = h } });
+    try func.getBlock(b4).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var lf = try computeLoops(&func, &dom, allocator);
+    defer lf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), lf.loops.len);
+    const loop = &lf.loops[0];
+    try std.testing.expectEqual(h, loop.header);
+    try std.testing.expectEqual(@as(usize, 2), loop.latches.len);
+    // Sorted ascending.
+    try std.testing.expectEqual(b2, loop.latches[0]);
+    try std.testing.expectEqual(b3, loop.latches[1]);
+    try std.testing.expect(loop.containsBlock(h));
+    try std.testing.expect(loop.containsBlock(b2));
+    try std.testing.expect(loop.containsBlock(b3));
+    try std.testing.expect(!loop.containsBlock(b0));
+    try std.testing.expect(!loop.containsBlock(b4));
+}
+
+test "computeLoops: nested loops" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // outer: h_o → h_i → body → h_i (inner back-edge) | exit_i → h_o (outer back-edge) | exit_o
+    const b0 = try func.newBlock();
+    const h_o = try func.newBlock();
+    const h_i = try func.newBlock();
+    const body = try func.newBlock();
+    const exit_i = try func.newBlock();
+    const exit_o = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = h_o } });
+    try func.getBlock(h_o).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(h_o).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = h_i, .else_block = exit_o } } });
+    try func.getBlock(h_i).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v1 });
+    try func.getBlock(h_i).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = body, .else_block = exit_i } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = h_i } });
+    try func.getBlock(exit_i).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v2 });
+    try func.getBlock(exit_i).append(.{ .op = .{ .br_if = .{ .cond = v2, .then_block = h_o, .else_block = exit_o } } });
+    try func.getBlock(exit_o).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var lf = try computeLoops(&func, &dom, allocator);
+    defer lf.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), lf.loops.len);
+    try std.testing.expect(lf.isHeader(h_o));
+    try std.testing.expect(lf.isHeader(h_i));
+
+    const outer = &lf.loops[lf.header_loop.get(h_o).?];
+    const inner = &lf.loops[lf.header_loop.get(h_i).?];
+
+    // Inner loop: h_i and body only.
+    try std.testing.expectEqual(@as(usize, 2), inner.blocks.len);
+    try std.testing.expect(inner.containsBlock(h_i));
+    try std.testing.expect(inner.containsBlock(body));
+
+    // Outer loop contains all inner blocks plus h_o and exit_i.
+    try std.testing.expect(outer.containsBlock(h_o));
+    try std.testing.expect(outer.containsBlock(h_i));
+    try std.testing.expect(outer.containsBlock(body));
+    try std.testing.expect(outer.containsBlock(exit_i));
+    try std.testing.expect(!outer.containsBlock(exit_o));
+    try std.testing.expect(!outer.containsBlock(b0));
+}
+
+test "computeLoops: irreducible-ish (no back-edge without dominator) produces no loops" {
+    // Ensure we don't spuriously report a loop when CFG has a cycle but
+    // no edge target dominates its source (dominator-based natural-loop
+    // detection ignores irreducible cycles by design).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 → {b1, b2}; b1 → b2; b2 → b1. Neither b1 nor b2 dominates
+    // the other because both are entered directly from b0.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v1 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = b2, .else_block = b0 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v2 });
+    try func.getBlock(b2).append(.{ .op = .{ .br_if = .{ .cond = v2, .then_block = b1, .else_block = b0 } } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var lf = try computeLoops(&func, &dom, allocator);
+    defer lf.deinit();
+
+    // Only b0 dominates b1 and b2. There's an edge b1→b0 and b2→b0
+    // (b0 dominates both), so those are back-edges ⇒ one natural loop
+    // headed at b0. The cycle b1↔b2 is irreducible and not reported.
+    try std.testing.expectEqual(@as(usize, 1), lf.loops.len);
+    try std.testing.expectEqual(b0, lf.loops[0].header);
+    try std.testing.expectEqual(@as(usize, 3), lf.loops[0].blocks.len);
 }
