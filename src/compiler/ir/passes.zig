@@ -1034,70 +1034,138 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
 pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
 
 /// Run a sequence of optimization passes on an IR module.
-/// Redundant bounds-check elimination within each basic block.
+/// Redundant bounds-check elimination, dominator-scoped.
 ///
 /// For every `.load` and `.store`, codegen emits an inline wasm-memory
 /// bounds check that verifies `zext(base) + offset + size <= memory_size`.
-/// When two accesses in the same block share the same `base` vreg, the
-/// first check already validates any subsequent access whose
+/// When an access is dominated by a prior access sharing the same `base`
+/// vreg, the first check already validates any later access whose
 /// `offset + size` does not exceed the max previously validated end.
 ///
 /// This pass marks such accesses with `bounds_known = true`; both backends
 /// skip emitting the check for those.
 ///
-/// Safety conditions:
-/// - Same block only (no cross-block dominator walk — conservative).
-/// - Any call / atomic / `memory_grow` / `memory_copy` / `memory_fill`
-///   can change `memory_size`, so the tracker is cleared at those points.
+/// Soundness / scope:
+/// - Walks the dominator tree in DFS order. Entries produced in a
+///   dominator block are visible to all its dom-tree descendants. This
+///   generalises the earlier block-local version and catches the typical
+///   loop-body pattern where the header or preheader dominates every
+///   access in the loop.
+/// - Wasm memory grows monotonically (there is no `memory.shrink`; all
+///   mutations only extend it), so `zext(base) + offset + size <=
+///   memory_size_old` implies `... <= memory_size_new`. A prior check
+///   therefore stays valid across calls / memory.grow / memory.copy /
+///   memory.fill / table mutations / atomics. We still clear the active
+///   entries on those opcodes as a conservative guard against future IR
+///   operations that could shrink memory.
 /// - IR is SSA, so a base vreg's value never changes once defined.
+/// - `valid_start` is the index into `table` below which entries are
+///   shadowed by a fence on the current dominator path. Siblings in the
+///   dom-tree are unaffected because we restore `valid_start` on block
+///   exit.
 pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    var changed = false;
-    var max_end = std.AutoHashMap(ir.VReg, u64).init(allocator);
-    defer max_end.deinit();
+    if (func.blocks.items.len == 0) return false;
 
-    for (func.blocks.items) |block| {
-        max_end.clearRetainingCapacity();
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    const nblocks = func.blocks.items.len;
+    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer {
+        for (children) |*list| list.deinit(allocator);
+        allocator.free(children);
+    }
+    for (children) |*list| list.* = .empty;
+    for (0..nblocks) |i| {
+        const bid: ir.BlockId = @intCast(i);
+        const idom = dom.idom[bid] orelse continue;
+        if (idom == bid) continue;
+        try children[idom].append(allocator, bid);
+    }
+
+    const Entry = struct { base: ir.VReg, max_end: u64 };
+    var table: std.ArrayList(Entry) = .empty;
+    defer table.deinit(allocator);
+    var valid_start: usize = 0;
+
+    const Frame = struct {
+        bid: ir.BlockId,
+        phase: u1,
+        snap_len: usize,
+        snap_valid_start: usize,
+    };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+
+    if (dom.idom[0] == null) return false;
+    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+
+    var changed = false;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.phase == 1) {
+            table.shrinkRetainingCapacity(top.snap_len);
+            valid_start = top.snap_valid_start;
+            _ = stack.pop();
+            continue;
+        }
+        const bid = top.bid;
+        top.phase = 1;
+        top.snap_len = table.items.len;
+        top.snap_valid_start = valid_start;
+
+        const block = &func.blocks.items[bid];
         for (block.instructions.items) |*inst| {
             switch (inst.op) {
                 .load => |*ld| {
                     const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
-                    const prev = max_end.get(ld.base) orelse 0;
+                    var prev: u64 = 0;
+                    for (table.items[valid_start..]) |e| {
+                        if (e.base == ld.base and e.max_end > prev) prev = e.max_end;
+                    }
                     if (end <= prev) {
                         if (!ld.bounds_known) {
                             ld.bounds_known = true;
                             changed = true;
                         }
                     } else {
-                        try max_end.put(ld.base, end);
+                        try table.append(allocator, .{ .base = ld.base, .max_end = end });
                     }
                 },
                 .store => |*st| {
                     const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
-                    const prev = max_end.get(st.base) orelse 0;
+                    var prev: u64 = 0;
+                    for (table.items[valid_start..]) |e| {
+                        if (e.base == st.base and e.max_end > prev) prev = e.max_end;
+                    }
                     if (end <= prev) {
                         if (!st.bounds_known) {
                             st.bounds_known = true;
                             changed = true;
                         }
                     } else {
-                        try max_end.put(st.base, end);
+                        try table.append(allocator, .{ .base = st.base, .max_end = end });
                     }
                 },
-                // Anything that can change memory_size, trap, or otherwise
-                // invalidate the "already checked" property: clear the
-                // tracker. (memory.grow can extend memory; calls can grow
-                // or shrink via imports; atomics/traps can't shrink but
-                // cost us nothing to be conservative.)
+                // Fences: conservatively hide entries from upstream scope
+                // for the remainder of this block and its dom-tree
+                // descendants. (See header comment on why this is
+                // strictly defensive given wasm memory semantics.)
                 .memory_grow,
                 .call, .call_indirect, .call_ref,
                 .memory_copy, .memory_fill, .memory_init,
                 .table_grow, .table_init,
                 .atomic_notify, .atomic_wait,
-                => max_end.clearRetainingCapacity(),
+                => valid_start = table.items.len,
                 else => {},
             }
         }
+
+        for (children[bid].items) |c| {
+            try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+        }
     }
+
     return changed;
 }
 
@@ -2995,4 +3063,120 @@ test "strengthReduceDivRem: does not rewrite div_u by 1" {
     const changed = try strengthReduceDivRem(&func, allocator);
     try std.testing.expect(!changed);
     try std.testing.expect(block.instructions.items[1].op == .div_u);
+}
+
+test "elideRedundantBoundsChecks: cross-block via dominator" {
+    // b0: load base+0 size=8 (establishes end=8).
+    // b0 -> b1: load base+0 size=4 (end=4 <= 8, should be elided).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_b } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: sibling does not dominate" {
+    // b0 -> {b1, b2} -> b3. b1 establishes a bounds check. b2 does NOT,
+    // because b1 does not dominate b2. b3 is dominated only by b0, so it
+    // also gets NO free bounds_known from either sibling.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_1 = func.newVReg();
+    const v_2 = func.newVReg();
+    const v_3 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_1, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_2, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_3, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_3 } });
+
+    _ = try elideRedundantBoundsChecks(&func, allocator);
+    // Neither b1's nor b2's load is dominated by the other, so neither
+    // can elide; b3 is not dominated by either of them either.
+    try std.testing.expect(!func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+    try std.testing.expect(!func.getBlock(b2).instructions.items[0].op.load.bounds_known);
+    try std.testing.expect(!func.getBlock(b3).instructions.items[0].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: loop body inherits from preheader" {
+    // preheader(b0) dominates header(b1) dominates body(b2). preheader does
+    // a wide load establishing max_end=8; body does a narrower load, must
+    // be elided.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    // b0 (preheader): establishes bounds for base [0,8).
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    // b1 (header): branches to body or exit.
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b2, .else_block = b3 } } });
+    // b2 (body): load base+4 size=4.
+    try func.getBlock(b2).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_a } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    // Body load must inherit bounds_known from preheader via dom.
+    try std.testing.expect(func.getBlock(b2).instructions.items[0].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: fence in dominator hides upstream entries" {
+    // b0 loads base+0 size=8; b0 then calls (fence) and branches to b1.
+    // b1's load must NOT be elided because the fence conservatively hides
+    // the earlier bounds check for the remainder of b0 and its dom subtree.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_b } });
+
+    _ = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(!func.getBlock(b1).instructions.items[0].op.load.bounds_known);
 }
