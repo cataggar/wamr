@@ -1564,6 +1564,126 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     return changed;
 }
 
+// ── Float unary idempotents ────────────────────────────────────────────────
+
+/// Simplify chained unary float operations:
+///   f_neg(f_neg(x)) -> x        (involution)
+///   f_abs(f_abs(x)) -> f_abs(x) (idempotent)
+///   f_abs(f_neg(x)) -> f_abs(x) (|-x| = |x|)
+///
+/// Soundness on IEEE-754 floats:
+///   - f_neg only flips the sign bit and otherwise preserves the bit
+///     pattern (including NaN payloads), so f_neg(f_neg(x)) bit-for-bit
+///     equals x. -0.0 round-trips back to -0.0.
+///   - f_abs clears the sign bit; clearing twice is the same as
+///     clearing once, so f_abs is idempotent.
+///   - f_abs(f_neg(x)) clears the sign bit no matter what f_neg
+///     produced, matching f_abs(x).
+///
+/// We always rewrite without checking the inner producer's use count:
+/// even if the inner f_neg/f_abs has other uses it stays alive, and
+/// our rewrite still removes one outer instruction. DCE will drop the
+/// inner if it later becomes dead.
+pub fn foldFloatUnaryIdempotents(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    const Action = enum { replace_with_inner_src, replace_with_inner_dest, rewrite_operand };
+    const Rewrite = struct {
+        action: Action,
+        outer_blk: ir.BlockId,
+        outer_ii: u32,
+        outer_dest: ir.VReg,
+        new_vreg: ir.VReg, // replacement / new operand
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const outer_dest = inst.dest orelse continue;
+            const outer_src: ir.VReg = switch (inst.op) {
+                .f_neg, .f_abs => |v| v,
+                else => continue,
+            };
+            const pb = def_block.get(outer_src) orelse continue;
+            const pi = def_idx.get(outer_src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const producer_dest = producer.dest orelse continue;
+
+            switch (inst.op) {
+                .f_neg => {
+                    // f_neg(f_neg(x)) -> x
+                    if (producer.op == .f_neg) {
+                        const inner_src = producer.op.f_neg;
+                        try rewrites.append(allocator, .{
+                            .action = .replace_with_inner_src,
+                            .outer_blk = @intCast(bi),
+                            .outer_ii = @intCast(ii),
+                            .outer_dest = outer_dest,
+                            .new_vreg = inner_src,
+                        });
+                    }
+                },
+                .f_abs => {
+                    if (producer.op == .f_abs) {
+                        // f_abs(f_abs(x)) -> f_abs(x): same value as
+                        // inner; redirect consumers of outer to inner.
+                        try rewrites.append(allocator, .{
+                            .action = .replace_with_inner_dest,
+                            .outer_blk = @intCast(bi),
+                            .outer_ii = @intCast(ii),
+                            .outer_dest = outer_dest,
+                            .new_vreg = producer_dest,
+                        });
+                    } else if (producer.op == .f_neg) {
+                        // f_abs(f_neg(x)) -> f_abs(x): rewrite this
+                        // f_abs's operand to skip the inner f_neg.
+                        const inner_src = producer.op.f_neg;
+                        try rewrites.append(allocator, .{
+                            .action = .rewrite_operand,
+                            .outer_blk = @intCast(bi),
+                            .outer_ii = @intCast(ii),
+                            .outer_dest = outer_dest,
+                            .new_vreg = inner_src,
+                        });
+                    }
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    for (rewrites.items) |r| {
+        const inst = &func.blocks.items[r.outer_blk].instructions.items[r.outer_ii];
+        switch (r.action) {
+            .replace_with_inner_src, .replace_with_inner_dest => {
+                replaceVReg(func, r.outer_dest, r.new_vreg);
+                // Neutralise the outer; DCE drops it.
+                inst.op = .{ .iconst_32 = 0 };
+            },
+            .rewrite_operand => {
+                inst.op = .{ .f_abs = r.new_vreg };
+            },
+        }
+        changed = true;
+    }
+    return changed;
+}
+
 // ── Sign-extending load fold ────────────────────────────────────────────────
 
 /// Fold `extend{8,16,32}_s(load size=N, sign_extend=false)` into the
@@ -2221,6 +2341,7 @@ pub const default_passes: []const PassFn = &.{
     &foldBranchOnEqz,
     &foldSelectOnEqz,
     &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -4640,5 +4761,115 @@ test "foldSignExtendingLoad: composes with DCE to drop the extend" {
     // No remaining extend8_s instruction.
     for (block.instructions.items) |inst| {
         try std.testing.expect(inst.op != .extend8_s);
+    }
+}
+
+test "foldFloatUnaryIdempotents: f_neg(f_neg(x)) becomes x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_n1 = func.newVReg();
+    const v_n2 = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = 1.5 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_x }, .dest = v_n1, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_n1 }, .dest = v_n2, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_n2 } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(changed);
+
+    // ret should now reference v_x directly.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, block.instructions.items[3].op);
+}
+
+test "foldFloatUnaryIdempotents: f_abs(f_abs(x)) becomes f_abs(x)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a1 = func.newVReg();
+    const v_a2 = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = -1.5 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_abs = v_x }, .dest = v_a1, .type = .f32 });
+    try block.append(.{ .op = .{ .f_abs = v_a1 }, .dest = v_a2, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_a2 } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(changed);
+
+    // ret should now reference v_a1 (inner f_abs's dest).
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_a1 }, block.instructions.items[3].op);
+}
+
+test "foldFloatUnaryIdempotents: f_abs(f_neg(x)) becomes f_abs(x)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_n = func.newVReg();
+    const v_a = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_64 = 1.5 }, .dest = v_x, .type = .f64 });
+    try block.append(.{ .op = .{ .f_neg = v_x }, .dest = v_n, .type = .f64 });
+    try block.append(.{ .op = .{ .f_abs = v_n }, .dest = v_a, .type = .f64 });
+    try block.append(.{ .op = .{ .ret = v_a } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(changed);
+
+    // The f_abs at index 2 should now read v_x directly.
+    switch (block.instructions.items[2].op) {
+        .f_abs => |v| try std.testing.expectEqual(v_x, v),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldFloatUnaryIdempotents: no-op on unrelated unary (e.g., f_sqrt)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_s = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = 4.0 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_sqrt = v_x }, .dest = v_s, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_s } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldFloatUnaryIdempotents: composes with DCE" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_n1 = func.newVReg();
+    const v_n2 = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = 7.0 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_x }, .dest = v_n1, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_n1 }, .dest = v_n2, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_n2 } });
+
+    _ = try foldFloatUnaryIdempotents(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // Both f_negs should now be gone.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .f_neg);
     }
 }
