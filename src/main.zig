@@ -1,5 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const wamr = @import("wamr");
+
+const aot_supported = switch (builtin.cpu.arch) {
+    .x86_64, .aarch64 => true,
+    else => false,
+};
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -75,6 +81,15 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runAot(data: []const u8, allocator: std.mem.Allocator) void {
+    if (comptime aot_supported) {
+        runAotReal(data, allocator);
+    } else {
+        std.debug.print("Error: AOT execution not supported on this architecture\n", .{});
+        std.process.exit(1);
+    }
+}
+
+fn runAotReal(data: []const u8, allocator: std.mem.Allocator) void {
     const aot_loader = wamr.aot_loader;
     const aot_runtime = wamr.aot_runtime;
 

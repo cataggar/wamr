@@ -46,9 +46,6 @@ jobs:
           - os: windows-latest
             target: aarch64-windows
             name: windows-arm64
-          - os: ubuntu-22.04
-            target: wasm32-wasi
-            name: wasi
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
