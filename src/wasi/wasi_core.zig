@@ -45,7 +45,8 @@ pub fn memWriteU64(mem: []u8, offset: u32, val: u64) bool {
 
 /// Core logic for `fd_write`.  Walks the iov array for stdout/stderr,
 /// writes the data via `std.debug.print`, and stores the byte count at
-/// `nwritten_ptr`.
+/// `nwritten_ptr`. Under `zig test` the actual print is suppressed so
+/// unit-test runs don't pollute the test runner's stdio.
 pub fn fdWriteCore(mem: []u8, fd: i32, iovs_ptr: u32, iovs_len: u32, nwritten_ptr: u32) i32 {
     // Only support stdout (1) and stderr (2)
     if (fd != 1 and fd != 2) return WASI_EBADF;
@@ -57,7 +58,9 @@ pub fn fdWriteCore(mem: []u8, fd: i32, iovs_ptr: u32, iovs_len: u32, nwritten_pt
         const buf_len = memReadU32(mem, iov_offset + 4) orelse break;
         if (buf_ptr + buf_len > mem.len) break;
         const data = mem[buf_ptr .. buf_ptr + buf_len];
-        std.debug.print("{s}", .{data});
+        if (!@import("builtin").is_test) {
+            std.debug.print("{s}", .{data});
+        }
         total_written += buf_len;
     }
 
