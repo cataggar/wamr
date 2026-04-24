@@ -180,15 +180,61 @@ pub const CoreTypeDef = union(enum) {
     module: CoreModuleType,
 };
 
-/// Declares the shape of a component type (its imports and exports).
-pub const ComponentTypeDecl = struct {
-    imports: []const ImportDecl,
-    exports: []const ExportDecl,
+/// Declarator inside a component-type or instance-type declaration.
+///
+/// Per the component-model binary format, the declarator list mixes
+/// type definitions, aliases, and import/export descriptors; their
+/// relative order establishes the nested type-index space used by
+/// subsequent declarators in the same list.
+///
+/// See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
+pub const Decl = union(enum) {
+    core_type: CoreTypeDef,
+    type: TypeDef,
+    alias: Alias,
+    import: ImportDecl,
+    @"export": ExportDecl,
 };
 
-/// Declares the shape of an instance type (its exports only).
+/// Declares the shape of a component type.
+///
+/// `decls` preserves the on-wire order of nested core-type, type, alias,
+/// import, and export declarations. The `imports` and `exports` helpers
+/// provide filtered views for callers that only care about externally
+/// visible declarators.
+pub const ComponentTypeDecl = struct {
+    decls: []const Decl,
+
+    pub fn importCount(self: ComponentTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .import) {
+            n += 1;
+        };
+        return n;
+    }
+
+    pub fn exportCount(self: ComponentTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .@"export") {
+            n += 1;
+        };
+        return n;
+    }
+};
+
+/// Declares the shape of an instance type.
+///
+/// Like `ComponentTypeDecl` but without import decls.
 pub const InstanceTypeDecl = struct {
-    exports: []const ExportDecl,
+    decls: []const Decl,
+
+    pub fn exportCount(self: InstanceTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .@"export") {
+            n += 1;
+        };
+        return n;
+    }
 };
 
 // ── Sorts ───────────────────────────────────────────────────────────────────

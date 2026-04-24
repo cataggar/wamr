@@ -494,36 +494,44 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
         0x41 => blk: {
             // component type
             const count = try reader.readU32();
-            var imp_list: std.ArrayListUnmanaged(ctypes.ImportDecl) = .empty;
-            var exp_list: std.ArrayListUnmanaged(ctypes.ExportDecl) = .empty;
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const decl_tag = try reader.readByte();
-                switch (decl_tag) {
-                    0x03 => try imp_list.append(allocator, try parseImport(reader)),
-                    0x04 => try exp_list.append(allocator, try parseExport(reader)),
-                    else => return error.InvalidEncoding,
-                }
-            }
-            break :blk .{ .component = .{
-                .imports = try imp_list.toOwnedSlice(allocator),
-                .exports = try exp_list.toOwnedSlice(allocator),
-            } };
+            const decls = try allocator.alloc(ctypes.Decl, count);
+            errdefer allocator.free(decls);
+            for (decls) |*d| d.* = try parseDecl(reader, allocator, .component_type);
+            break :blk .{ .component = .{ .decls = decls } };
         },
         0x42 => blk: {
             // instance type
             const count = try reader.readU32();
-            var exp_list: std.ArrayListUnmanaged(ctypes.ExportDecl) = .empty;
-            var i: u32 = 0;
-            while (i < count) : (i += 1) {
-                const decl_tag = try reader.readByte();
-                if (decl_tag != 0x04) return error.InvalidEncoding;
-                try exp_list.append(allocator, try parseExport(reader));
-            }
-            break :blk .{ .instance = .{
-                .exports = try exp_list.toOwnedSlice(allocator),
-            } };
+            const decls = try allocator.alloc(ctypes.Decl, count);
+            errdefer allocator.free(decls);
+            for (decls) |*d| d.* = try parseDecl(reader, allocator, .instance_type);
+            break :blk .{ .instance = .{ .decls = decls } };
         },
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Scope of a declarator list: which decl tags are legal.
+const DeclScope = enum { component_type, instance_type };
+
+/// Parse a single declarator inside a component-type or instance-type body.
+///
+/// See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
+fn parseDecl(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+    scope: DeclScope,
+) LoadError!ctypes.Decl {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => .{ .core_type = try parseCoreType(reader, allocator) },
+        0x01 => .{ .type = try parseTypeDef(reader, allocator) },
+        0x02 => .{ .alias = try parseAlias(reader) },
+        0x03 => blk: {
+            if (scope != .component_type) return error.InvalidEncoding;
+            break :blk .{ .import = try parseImport(reader) };
+        },
+        0x04 => .{ .@"export" = try parseExport(reader) },
         else => error.InvalidEncoding,
     };
 }
@@ -734,4 +742,68 @@ test "readValType: rejects unknown negative code" {
     // 0x67 decodes as signed LEB -25, which has no primitive mapping.
     var reader = BinaryReader{ .data = &[_]u8{0x67} };
     try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+}
+
+test "parseTypeDef: instance type with `sub resource` type decl" {
+    // Mirrors the first type definition in every Rust wasm32-wasip2 component:
+    //   (type (instance
+    //     (type $p (sub resource))            ; decl 0x01, type, resource with no dtor
+    //     (export "pollable" (type (eq $p)))  ; decl 0x04, export, type bound eq 0
+    //   ))
+    // Binary form:
+    //   0x42              ; instance-type tag
+    //   0x02              ; 2 decls
+    //   0x01              ; decl 1: type
+    //     0x3F 0x00       ; resource with no destructor
+    //   0x04              ; decl 2: export
+    //     0x08 "pollable" ; name (len=8)
+    //     0x03            ; externdesc: type
+    //     0x00 0x00       ; bound: eq, typeidx 0
+    const data = [_]u8{
+        0x42, 0x02,
+        0x01, 0x3F, 0x00,
+        0x04, 0x08, 'p', 'o', 'l', 'l', 'a', 'b', 'l', 'e',
+        0x03, 0x00, 0x00,
+    };
+    var reader = BinaryReader{ .data = &data };
+    const td = try parseTypeDef(&reader, std.testing.allocator);
+    defer {
+        // Free the decls slice (individual decls don't own heap beyond exports' names which are slices into `data`).
+        std.testing.allocator.free(td.instance.decls);
+    }
+    try std.testing.expect(td == .instance);
+    try std.testing.expectEqual(@as(usize, 2), td.instance.decls.len);
+    try std.testing.expect(td.instance.decls[0] == .type);
+    try std.testing.expect(td.instance.decls[0].type == .resource);
+    try std.testing.expect(td.instance.decls[1] == .@"export");
+    try std.testing.expectEqualStrings("pollable", td.instance.decls[1].@"export".name);
+    try std.testing.expect(td.instance.decls[1].@"export".desc == .type);
+    try std.testing.expectEqual(@as(u32, 0), td.instance.decls[1].@"export".desc.type.eq);
+}
+
+test "parseTypeDef: component type with import and alias decls" {
+    // (type (component
+    //   (import "x" (instance (type 0)))   ; decl 0x03, import
+    //   (alias outer 0 0 (type))           ; decl 0x02, alias outer
+    // ))
+    const data = [_]u8{
+        0x41, 0x02,
+        0x03, 0x01, 'x', 0x05, 0x00, // import name="x" externdesc=instance type 0
+        0x02, 0x03, 0x01, 0x00, 0x00, // alias: sort=type(0x03), outer(0x01), count=0, idx=0
+    };
+    var reader = BinaryReader{ .data = &data };
+    const td = try parseTypeDef(&reader, std.testing.allocator);
+    defer std.testing.allocator.free(td.component.decls);
+    try std.testing.expect(td == .component);
+    try std.testing.expectEqual(@as(usize, 2), td.component.decls.len);
+    try std.testing.expect(td.component.decls[0] == .import);
+    try std.testing.expectEqualStrings("x", td.component.decls[0].import.name);
+    try std.testing.expect(td.component.decls[1] == .alias);
+}
+
+test "parseTypeDef: instance type rejects import decl" {
+    // Instance types cannot contain import decls (0x03).
+    const data = [_]u8{ 0x42, 0x01, 0x03 };
+    var reader = BinaryReader{ .data = &data };
+    try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
 }
