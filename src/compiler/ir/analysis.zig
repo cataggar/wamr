@@ -460,6 +460,234 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
     }
 }
 
+// ── Dominator tree (Cooper-Harvey-Kennedy) ──────────────────────────────
+
+/// Immediate-dominator tree for the function's CFG, rooted at the entry
+/// block (block 0). Owns no block-ID storage — `idom`/`post_order` are
+/// sized to `func.blocks.items.len`.
+///
+/// - `idom[b]` is the immediate dominator of block `b`. The entry block
+///   dominates only itself, so `idom[entry] == entry`. Unreachable blocks
+///   (not visited from entry) have `idom[b] == null`.
+/// - `post_order` lists reachable blocks in DFS post-order from the entry.
+///   Reverse post-order (RPO) is the natural iteration order for forward
+///   dataflow and is used internally by this pass.
+///
+/// Algorithm: "A Simple, Fast Dominance Algorithm" — Cooper, Harvey,
+/// Kennedy (2001). O(N²) worst-case on pathological CFGs, near-linear in
+/// practice on structured wasm CFGs.
+pub const DomTree = struct {
+    idom: []?ir.BlockId,
+    /// Post-order numbering for each block, or `null` if unreachable.
+    /// Higher number ⇒ later in post-order ⇒ earlier in reverse post-order.
+    post_num: []?u32,
+    /// Reachable blocks in DFS post-order from entry (length ≤ nblocks).
+    post_order: []ir.BlockId,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DomTree) void {
+        self.allocator.free(self.idom);
+        self.allocator.free(self.post_num);
+        self.allocator.free(self.post_order);
+    }
+
+    /// Returns true if `a` dominates `b` (reflexive: every block dominates
+    /// itself). Unreachable blocks are dominated only by themselves.
+    pub fn dominates(self: *const DomTree, a: ir.BlockId, b: ir.BlockId) bool {
+        if (a == b) return true;
+        if (self.idom[b] == null) return false;
+        var cur: ir.BlockId = b;
+        while (true) {
+            const next = self.idom[cur] orelse return false;
+            if (next == a) return true;
+            // Entry's idom is itself; stop to avoid infinite loop.
+            if (next == cur) return false;
+            cur = next;
+        }
+    }
+};
+
+/// Compute predecessors for each block from `buildSuccessors`. The
+/// `BasicBlock.predecessors` field is not guaranteed to be populated by
+/// all IR producers, so passes that need predecessors should use this.
+pub fn buildPredecessors(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.BlockId, []const ir.BlockId) {
+    const successors = try buildSuccessors(func, allocator);
+    defer {
+        var it = successors.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        @constCast(&successors).deinit();
+    }
+
+    var lists = std.AutoHashMap(ir.BlockId, std.ArrayList(ir.BlockId)).init(allocator);
+    defer {
+        var it = lists.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        lists.deinit();
+    }
+    for (0..func.blocks.items.len) |idx| {
+        try lists.put(@intCast(idx), .empty);
+    }
+
+    var sit = successors.iterator();
+    while (sit.next()) |entry| {
+        const from = entry.key_ptr.*;
+        for (entry.value_ptr.*) |to| {
+            const list_ptr = lists.getPtr(to).?;
+            // Deduplicate (br_table may list a target more than once).
+            var already = false;
+            for (list_ptr.items) |p| {
+                if (p == from) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) try list_ptr.append(allocator, from);
+        }
+    }
+
+    var result = std.AutoHashMap(ir.BlockId, []const ir.BlockId).init(allocator);
+    errdefer {
+        var it = result.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        result.deinit();
+    }
+    var lit = lists.iterator();
+    while (lit.next()) |entry| {
+        const owned = try entry.value_ptr.toOwnedSlice(allocator);
+        try result.put(entry.key_ptr.*, owned);
+    }
+    return result;
+}
+
+/// Compute the dominator tree for `func` rooted at block 0.
+pub fn computeDominators(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) !DomTree {
+    const nblocks = func.blocks.items.len;
+
+    const successors = try buildSuccessors(func, allocator);
+    defer {
+        var sit = successors.iterator();
+        while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
+        @constCast(&successors).deinit();
+    }
+    var predecessors = try buildPredecessors(func, allocator);
+    defer {
+        var pit = predecessors.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    // ── Iterative DFS to produce post-order from entry (block 0) ──
+    var post_order: std.ArrayList(ir.BlockId) = .empty;
+    errdefer post_order.deinit(allocator);
+
+    const post_num = try allocator.alloc(?u32, nblocks);
+    errdefer allocator.free(post_num);
+    @memset(post_num, null);
+
+    if (nblocks > 0) {
+        const StackEntry = struct { bid: ir.BlockId, next_succ: usize };
+        var visited = try allocator.alloc(bool, nblocks);
+        defer allocator.free(visited);
+        @memset(visited, false);
+
+        var stack: std.ArrayList(StackEntry) = .empty;
+        defer stack.deinit(allocator);
+
+        const entry: ir.BlockId = 0;
+        visited[entry] = true;
+        try stack.append(allocator, .{ .bid = entry, .next_succ = 0 });
+
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            const succs = successors.get(top.bid) orelse &[_]ir.BlockId{};
+            if (top.next_succ < succs.len) {
+                const s = succs[top.next_succ];
+                top.next_succ += 1;
+                if (!visited[s]) {
+                    visited[s] = true;
+                    try stack.append(allocator, .{ .bid = s, .next_succ = 0 });
+                }
+            } else {
+                const bid = top.bid;
+                post_num[bid] = @intCast(post_order.items.len);
+                try post_order.append(allocator, bid);
+                _ = stack.pop();
+            }
+        }
+    }
+
+    // ── Cooper-Harvey-Kennedy iterative idom computation ──
+    const idom = try allocator.alloc(?ir.BlockId, nblocks);
+    errdefer allocator.free(idom);
+    @memset(idom, null);
+
+    if (nblocks > 0 and post_num[0] != null) {
+        // Entry dominates itself.
+        idom[0] = 0;
+
+        // Reverse post-order excluding entry.
+        const Intersect = struct {
+            fn call(idom_slice: []const ?ir.BlockId, post: []const ?u32, b1_in: ir.BlockId, b2_in: ir.BlockId) ir.BlockId {
+                var b1 = b1_in;
+                var b2 = b2_in;
+                while (b1 != b2) {
+                    while (post[b1].? < post[b2].?) b1 = idom_slice[b1].?;
+                    while (post[b2].? < post[b1].?) b2 = idom_slice[b2].?;
+                }
+                return b1;
+            }
+        };
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            // Iterate reverse post-order, skipping the entry node (last in post_order).
+            var i: usize = post_order.items.len;
+            while (i > 0) {
+                i -= 1;
+                const b = post_order.items[i];
+                if (b == 0) continue;
+
+                const preds = predecessors.get(b) orelse &[_]ir.BlockId{};
+                // Pick first processed predecessor as the running idom.
+                var new_idom_opt: ?ir.BlockId = null;
+                var other_start: usize = 0;
+                for (preds, 0..) |p, pi| {
+                    if (idom[p] != null) {
+                        new_idom_opt = p;
+                        other_start = pi + 1;
+                        break;
+                    }
+                }
+                const new_idom_first = new_idom_opt orelse continue;
+                var new_idom = new_idom_first;
+                for (preds[other_start..]) |p| {
+                    if (idom[p] != null) {
+                        new_idom = Intersect.call(idom, post_num, p, new_idom);
+                    }
+                }
+                if (idom[b] == null or idom[b].? != new_idom) {
+                    idom[b] = new_idom;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    return .{
+        .idom = idom,
+        .post_num = post_num,
+        .post_order = try post_order.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "buildSuccessors: linear block" {
@@ -657,4 +885,133 @@ test "buildSuccessors: loop backedge" {
     try std.testing.expectEqual(@as(usize, 1), succs.get(b0).?.len);
     // Block 1 has successors b0 and b1 (loop)
     try std.testing.expectEqual(@as(usize, 2), succs.get(b1).?.len);
+}
+
+test "buildPredecessors: diamond" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // entry → {b1, b2} → b3
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    var preds = try buildPredecessors(&func, allocator);
+    defer {
+        var it = preds.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        preds.deinit();
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), preds.get(b0).?.len);
+    try std.testing.expectEqual(@as(usize, 1), preds.get(b1).?.len);
+    try std.testing.expectEqual(@as(usize, 1), preds.get(b2).?.len);
+    try std.testing.expectEqual(@as(usize, 2), preds.get(b3).?.len);
+}
+
+test "computeDominators: linear chain" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b0]);
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b1]);
+    try std.testing.expectEqual(@as(?ir.BlockId, b1), dom.idom[b2]);
+    try std.testing.expect(dom.dominates(b0, b2));
+    try std.testing.expect(dom.dominates(b1, b2));
+    try std.testing.expect(!dom.dominates(b2, b0));
+}
+
+test "computeDominators: diamond idom is entry for merge" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+
+    // Entry dominates itself.
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b0]);
+    // Sides' idom is entry.
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b1]);
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b2]);
+    // Merge's idom is entry (neither side dominates the merge).
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b3]);
+
+    try std.testing.expect(dom.dominates(b0, b3));
+    try std.testing.expect(!dom.dominates(b1, b3));
+    try std.testing.expect(!dom.dominates(b2, b3));
+}
+
+test "computeDominators: simple loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 → b1 → (self-loop or to b2)
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b0]);
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b1]);
+    // b1 is the only predecessor of b2 that is reachable; b1 dominates b2.
+    try std.testing.expectEqual(@as(?ir.BlockId, b1), dom.idom[b2]);
+    try std.testing.expect(dom.dominates(b0, b2));
+    try std.testing.expect(dom.dominates(b1, b2));
+}
+
+test "computeDominators: unreachable block has null idom" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock(); // unreachable
+    try func.getBlock(b0).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+
+    try std.testing.expectEqual(@as(?ir.BlockId, b0), dom.idom[b0]);
+    try std.testing.expectEqual(@as(?ir.BlockId, null), dom.idom[b1]);
+    try std.testing.expect(!dom.dominates(b0, b1));
 }
