@@ -235,6 +235,7 @@ fn getParamValTypes(ft: ctypes.FuncType, allocator: Allocator) ![]ctypes.ValType
 
 fn getResultValTypes(ft: ctypes.FuncType, allocator: Allocator) ![]ctypes.ValType {
     return switch (ft.results) {
+        .none => try allocator.alloc(ctypes.ValType, 0),
         .unnamed => |t| {
             const types = try allocator.alloc(ctypes.ValType, 1);
             types[0] = t;
@@ -521,6 +522,7 @@ pub fn callComponentFuncAsync(
             switch (td) {
                 .func => |ft| {
                     switch (ft.results) {
+                        .none => break :blk 0,
                         .unnamed => break :blk 1,
                         .named => |named| break :blk named.len,
                     }

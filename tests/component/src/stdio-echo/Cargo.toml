@@ -1,0 +1,13 @@
+[package]
+name="stdio-echo"
+version="0.0.1"
+edition="2021"
+[[bin]]
+name="stdio-echo"
+path="src/main.rs"
+[profile.release]
+opt-level="s"
+lto=true
+strip=true
+codegen-units=1
+panic="abort"

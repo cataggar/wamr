@@ -114,9 +114,12 @@ pub const FuncType = struct {
     results: ResultList,
 
     pub const ResultList = union(enum) {
-        /// Single unnamed result type.
+        /// No result (spec: `0x01 0x00`).
+        none,
+        /// Single unnamed result type (spec: `0x00 <valtype>`).
         unnamed: ValType,
-        /// Named result types (like a record).
+        /// Named result types. Retained for backward compatibility with older
+        /// component-model encodings; no longer produced by the current spec.
         named: []const NamedValType,
     };
 };
@@ -157,6 +160,11 @@ pub const CoreExportDecl = struct {
 
 /// A type definition in the component type index space.
 pub const TypeDef = union(enum) {
+    // Primitive / handle / indexed value type used directly as a type def
+    // (per the `defvaltype` grammar, a type def can be a single valtype byte
+    // e.g. `(type (borrow $r))` or `(type u32)` inside an instance-type body).
+    val: ValType,
+
     // Compound types
     record: RecordType,
     variant: VariantType,
@@ -357,6 +365,11 @@ pub const ImportDecl = struct {
 pub const ExportDecl = struct {
     name: []const u8,
     desc: ExternDesc,
+    /// Set for top-level component exports (see spec `export` rule):
+    ///   export ::= en:<exportname'> si:<sortidx> ed?:<externdesc>?
+    /// Null for export declarators inside a component-type / instance-type
+    /// body, which carry only a name and a descriptor.
+    sort_idx: ?SortIdx = null,
 };
 
 // ── Instance expressions ────────────────────────────────────────────────────

@@ -42,6 +42,11 @@ const BinaryReader = struct {
         return b;
     }
 
+    fn peekByte(self: *BinaryReader) LoadError!u8 {
+        if (self.pos >= self.data.len) return error.UnexpectedEnd;
+        return self.data[self.pos];
+    }
+
     fn readBytes(self: *BinaryReader, n: usize) LoadError![]const u8 {
         if (self.pos + n > self.data.len) return error.UnexpectedEnd;
         const slice = self.data[self.pos .. self.pos + n];
@@ -215,7 +220,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
-                    try exports.append(allocator, try parseExport(&reader));
+                    try exports.append(allocator, try parseTopLevelExport(&reader));
                 }
             },
             .value => {
@@ -223,6 +228,10 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 reader.pos = section_start + section_size;
             },
         }
+        // Defensive: every typed-section parser above should have consumed
+        // exactly `section_size` bytes. If a bug causes under- or over-read
+        // we'd otherwise misalign the next section header.
+        if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
     }
 
     return .{
@@ -380,12 +389,18 @@ fn parseAlias(reader: *BinaryReader) LoadError!ctypes.Alias {
     const target_tag = try reader.readByte();
     switch (target_tag) {
         0x00 => {
-            // export alias
+            // alias export: instance export
             const instance_idx = try reader.readU32();
             const name = try reader.readName();
             return .{ .instance_export = .{ .sort = sort, .instance_idx = instance_idx, .name = name } };
         },
         0x01 => {
+            // alias core export: core instance export
+            const instance_idx = try reader.readU32();
+            const name = try reader.readName();
+            return .{ .instance_export = .{ .sort = sort, .instance_idx = instance_idx, .name = name } };
+        },
+        0x02 => {
             // outer alias
             const outer_count = try reader.readU32();
             const idx = try reader.readU32();
@@ -396,6 +411,18 @@ fn parseAlias(reader: *BinaryReader) LoadError!ctypes.Alias {
 }
 
 fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.TypeDef {
+    // `deftype` starts with a tag byte that selects a compound type;
+    // the remaining space (primvaltypes 0x64..0x7F, own 0x69, borrow 0x68,
+    // and any non-negative typeidx encoded as signed-LEB) is a bare valtype.
+    // Peek the first byte and dispatch without consuming if not recognized.
+    const tag = try reader.peekByte();
+    return switch (tag) {
+        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x3F, 0x40, 0x41, 0x42 => parseCompoundTypeDef(reader, allocator),
+        else => .{ .val = try readValType(reader) },
+    };
+}
+
+fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.TypeDef {
     const tag = try reader.readByte();
     return switch (tag) {
         // Defined types
@@ -417,8 +444,11 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
                 c.name = try reader.readName();
                 const has_type = try reader.readByte();
                 c.type = if (has_type != 0) try readValType(reader) else null;
-                const has_refines = try reader.readByte();
-                c.refines = if (has_refines != 0) try reader.readU32() else null;
+                // Current spec: case ends with a trailing 0x00 byte. (Older
+                // drafts used a `refines` u32; no longer emitted.)
+                const trailer = try reader.readByte();
+                if (trailer != 0x00) return error.InvalidEncoding;
+                c.refines = null;
             }
             break :blk .{ .variant = .{ .cases = cases } };
         },
@@ -469,6 +499,9 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
         },
         0x40 => blk: {
             // func type
+            // Current spec (2024): paramlist is a bare vec<labelvaltype>,
+            // resultlist is `0x00 valtype` (one result) | `0x01 0x00` (none).
+            // See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
             const param_count = try reader.readU32();
             const params = try allocator.alloc(ctypes.NamedValType, param_count);
             for (params) |*p| {
@@ -477,16 +510,12 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
             }
             const result_tag = try reader.readByte();
             const results: ctypes.FuncType.ResultList = switch (result_tag) {
-                0x00 => .{ .named = blk2: {
-                    const rcount = try reader.readU32();
-                    const r = try allocator.alloc(ctypes.NamedValType, rcount);
-                    for (r) |*rv| {
-                        rv.name = try reader.readName();
-                        rv.type = try readValType(reader);
-                    }
-                    break :blk2 r;
-                } },
-                0x01 => .{ .unnamed = try readValType(reader) },
+                0x00 => .{ .unnamed = try readValType(reader) },
+                0x01 => blk2: {
+                    const zero = try reader.readByte();
+                    if (zero != 0x00) return error.InvalidEncoding;
+                    break :blk2 .none;
+                },
                 else => return error.InvalidEncoding,
             };
             break :blk .{ .func = .{ .params = params, .results = results } };
@@ -658,16 +687,70 @@ fn readExternDesc(reader: *BinaryReader) LoadError!ctypes.ExternDesc {
     };
 }
 
-fn parseImport(reader: *BinaryReader) LoadError!ctypes.ImportDecl {
+/// Read an `importname'` / `exportname'` (identical grammar per spec):
+///
+///   importname' ::= 0x00 len:<u32> in:<importname>
+///                 | 0x01 len:<u32> in:<importname>
+///                 | 0x02 len:<u32> in:<importname> vs:<versionsuffix>
+///
+/// The prefix tag distinguishes plain names from annotated/versioned names.
+/// For now we return the raw `in` bytes and swallow any `versionsuffix` —
+/// the runtime only needs the interface name to match against host bindings.
+fn readExternName(reader: *BinaryReader) LoadError![]const u8 {
+    const prefix = try reader.readByte();
+    if (prefix > 0x02) return error.InvalidEncoding;
     const name = try reader.readName();
+    if (prefix == 0x02) {
+        // versionsuffix ::= len:<u32> vs:<semversuffix> — skip over it.
+        _ = try reader.readName();
+    }
+    return name;
+}
+
+fn parseImport(reader: *BinaryReader) LoadError!ctypes.ImportDecl {
+    const name = try readExternName(reader);
     const desc = try readExternDesc(reader);
     return .{ .name = name, .desc = desc };
 }
 
 fn parseExport(reader: *BinaryReader) LoadError!ctypes.ExportDecl {
-    const name = try reader.readName();
+    // exportdecl (used inside component/instance type bodies):
+    //   en:<exportname'> ed:<externdesc>
+    const name = try readExternName(reader);
     const desc = try readExternDesc(reader);
     return .{ .name = name, .desc = desc };
+}
+
+/// Parse a top-level `export` entry from the export section:
+///   export ::= en:<exportname'> si:<sortidx> ed?:<externdesc>?
+///
+/// Distinct from `parseExport` (the declarator form used inside
+/// component/instance types), which has no sortidx and a mandatory descriptor.
+fn parseTopLevelExport(reader: *BinaryReader) LoadError!ctypes.ExportDecl {
+    const name = try readExternName(reader);
+    const sort_idx = try readSortIdx(reader);
+    const has_desc = try reader.readByte();
+    const desc: ctypes.ExternDesc = switch (has_desc) {
+        0x00 => inferExternDescFromSort(sort_idx),
+        0x01 => try readExternDesc(reader),
+        else => return error.InvalidEncoding,
+    };
+    return .{ .name = name, .desc = desc, .sort_idx = sort_idx };
+}
+
+/// When a top-level export omits its externdesc, the sortidx itself describes
+/// the kind. For sorts that carry a type idx (func/component/instance) we
+/// have no explicit type; fall back to a best-effort placeholder. The runtime
+/// treats these as opaque until Phase 1B index-space resolution fills them in.
+fn inferExternDescFromSort(si: ctypes.SortIdx) ctypes.ExternDesc {
+    return switch (si.sort) {
+        .func => .{ .func = 0 },
+        .value => .{ .value = .{ .type_idx = 0 } },
+        .type => .{ .type = .{ .eq = si.idx } },
+        .component => .{ .component = 0 },
+        .instance => .{ .instance = 0 },
+        .core => .{ .module = 0 },
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -756,13 +839,14 @@ test "parseTypeDef: instance type with `sub resource` type decl" {
     //   0x01              ; decl 1: type
     //     0x3F 0x00       ; resource with no destructor
     //   0x04              ; decl 2: export
+    //     0x00            ; exportname' prefix
     //     0x08 "pollable" ; name (len=8)
     //     0x03            ; externdesc: type
     //     0x00 0x00       ; bound: eq, typeidx 0
     const data = [_]u8{
         0x42, 0x02,
         0x01, 0x3F, 0x00,
-        0x04, 0x08, 'p', 'o', 'l', 'l', 'a', 'b', 'l', 'e',
+        0x04, 0x00, 0x08, 'p', 'o', 'l', 'l', 'a', 'b', 'l', 'e',
         0x03, 0x00, 0x00,
     };
     var reader = BinaryReader{ .data = &data };
@@ -788,8 +872,8 @@ test "parseTypeDef: component type with import and alias decls" {
     // ))
     const data = [_]u8{
         0x41, 0x02,
-        0x03, 0x01, 'x', 0x05, 0x00, // import name="x" externdesc=instance type 0
-        0x02, 0x03, 0x01, 0x00, 0x00, // alias: sort=type(0x03), outer(0x01), count=0, idx=0
+        0x03, 0x00, 0x01, 'x', 0x05, 0x00, // import name'=(0x00 "x") externdesc=instance type 0
+        0x02, 0x03, 0x02, 0x00, 0x00, // alias: sort=type(0x03), outer(0x02), count=0, idx=0
     };
     var reader = BinaryReader{ .data = &data };
     const td = try parseTypeDef(&reader, std.testing.allocator);
@@ -806,4 +890,56 @@ test "parseTypeDef: instance type rejects import decl" {
     const data = [_]u8{ 0x42, 0x01, 0x03 };
     var reader = BinaryReader{ .data = &data };
     try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
+}
+
+test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
+    // Prebuilt binary of tests/component/src/stdio-echo/ — a minimal
+    // Rust `fn main { println!("echo: ..."); }` compiled with
+    // `cargo build --release --target wasm32-wasip2`. This is the canonical
+    // Phase 1A regression fixture for #142: before the loader rework every
+    // wasm32-wasip2 component failed at the first `type` section.
+    const data = @embedFile("fixtures/stdio-echo.wasm");
+
+    // The loader allocates many small slices but has no Component.deinit yet
+    // (see #142 Phase 1B). Use an arena so the test doesn't leak.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+
+    // Verified via `wasm-tools component wit`: world `root` imports 13
+    // wasi interfaces (io/poll, io/error, io/streams, cli/environment,
+    // cli/exit, cli/stdin, cli/stdout, cli/stderr, and 5 cli/terminal-*),
+    // and exports one: wasi:cli/run@0.2.0.
+    try std.testing.expectEqual(@as(usize, 13), comp.imports.len);
+    try std.testing.expectEqual(@as(usize, 1), comp.exports.len);
+
+    // Every import is an instance import (WASI p2 pattern — never flat funcs).
+    for (comp.imports) |imp| {
+        try std.testing.expect(imp.desc == .instance);
+    }
+    // The sole export is the wasi:cli/run instance.
+    try std.testing.expect(comp.exports[0].desc == .instance);
+    try std.testing.expect(std.mem.startsWith(u8, comp.exports[0].name, "wasi:cli/run@"));
+
+    // Spot-check a handful of imports against the golden list from wasm-tools.
+    const expected = [_][]const u8{
+        "wasi:io/poll@0.2.6",
+        "wasi:io/streams@0.2.6",
+        "wasi:cli/stdin@0.2.6",
+        "wasi:cli/stdout@0.2.6",
+        "wasi:cli/exit@0.2.6",
+    };
+    for (expected) |name| {
+        var found = false;
+        for (comp.imports) |imp| {
+            if (std.mem.eql(u8, imp.name, name)) {
+                found = true;
+                break;
+            }
+        }
+        std.testing.expect(found) catch |err| {
+            std.debug.print("missing expected import: {s}\n", .{name});
+            return err;
+        };
+    }
 }
