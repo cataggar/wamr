@@ -1564,6 +1564,62 @@ pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     return changed;
 }
 
+// ── Select-on-Eqz folding ──────────────────────────────────────────────────
+
+/// Collapse `select(cond=eqz(x), if_true=a, if_false=b)` into
+/// `select(cond=x, if_true=b, if_false=a)`.
+///
+/// Mirror of `foldBranchOnEqz` for the non-terminator case. Removes a
+/// redundant `eqz` whose only use is the select and swaps the chosen
+/// arms. On aarch64 this maps `cmp; cset` style sequences to a single
+/// `csel` with the inverse condition.
+///
+/// Soundness: `eqz(x) != 0 ⇔ x == 0`, so swapping if_true/if_false
+/// inverts the condition back. Skipped unless the eqz has exactly this
+/// one use (otherwise rewriting would leave the eqz live and waste a
+/// `runPasses` iteration on a no-op fixpoint check).
+pub fn foldSelectOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |*inst| {
+            const sel = switch (inst.op) {
+                .select => |s| s,
+                else => continue,
+            };
+            const pb = def_block.get(sel.cond) orelse continue;
+            const pi = def_idx.get(sel.cond) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const inner = switch (producer.op) {
+                .eqz => |v| v,
+                else => continue,
+            };
+            if (countUsesOfVReg(func, sel.cond) != 1) continue;
+            inst.op = .{ .select = .{
+                .cond = inner,
+                .if_true = sel.if_false,
+                .if_false = sel.if_true,
+            } };
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 // ── Inverse-compare / eqz fusion ───────────────────────────────────────────
 
 /// Rewrite `eqz(cmp(a, b))` as the inverse comparison on `(a, b)`, where
@@ -2056,6 +2112,7 @@ pub const default_passes: []const PassFn = &.{
     &foldConstantBranches,
     &foldInverseCompareEqz,
     &foldBranchOnEqz,
+    &foldSelectOnEqz,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -4205,5 +4262,89 @@ test "foldInverseCompareEqz: composes with DCE to drop dead compare" {
     // The original eq producing v_cmp is now unused and should be gone.
     for (block.instructions.items) |inst| {
         try std.testing.expect(inst.op != .eq);
+    }
+}
+
+test "foldSelectOnEqz: swaps if_true/if_false and drops eqz use" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 3, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_a });
+    try block.append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_b });
+    try block.append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_c, .if_true = v_a, .if_false = v_b } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try foldSelectOnEqz(&func, allocator);
+    try std.testing.expect(changed);
+
+    switch (block.instructions.items[4].op) {
+        .select => |s| {
+            try std.testing.expectEqual(v_x, s.cond);
+            try std.testing.expectEqual(v_b, s.if_true);
+            try std.testing.expectEqual(v_a, s.if_false);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldSelectOnEqz: skip when eqz has multiple uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 3, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    const v_q = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_a });
+    try block.append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_b });
+    try block.append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_c, .rhs = v_c } }, .dest = v_q });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_c, .if_true = v_a, .if_false = v_b } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try foldSelectOnEqz(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSelectOnEqz: composes with DCE to drop dead eqz" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 3, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_a });
+    try block.append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_b });
+    try block.append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_c, .if_true = v_a, .if_false = v_b } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    _ = try foldSelectOnEqz(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .eqz);
     }
 }
