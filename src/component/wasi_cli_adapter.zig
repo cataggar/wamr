@@ -1765,6 +1765,9 @@ pub const WasiCliAdapter = struct {
         const members = [_]M{
             .{ .name = "[method]descriptor.get-type", .call = &fsDescriptorGetType },
             .{ .name = "[method]descriptor.stat", .call = &fsDescriptorStat },
+            .{ .name = "[method]descriptor.stat-at", .call = &fsDescriptorStatAt },
+            .{ .name = "[method]descriptor.set-times", .call = &fsDescriptorSetTimes },
+            .{ .name = "[method]descriptor.set-times-at", .call = &fsDescriptorSetTimesAt },
             .{ .name = "[method]descriptor.open-at", .call = &fsDescriptorOpenAt },
             .{ .name = "[method]descriptor.read-via-stream", .call = &fsDescriptorReadViaStream },
             .{ .name = "[method]descriptor.write-via-stream", .call = &fsDescriptorWriteViaStream },
@@ -1932,44 +1935,199 @@ pub const WasiCliAdapter = struct {
         };
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        var dt: DescType = .unknown;
-        var size: u64 = 0;
-        var nlink: u64 = 1;
 
-        switch (d.*) {
-            .preopen, .dir => {
-                dt = .directory;
+        const stat_result: ?std.Io.File.Stat = switch (d.*) {
+            .preopen => |dir| dir.stat(io) catch null,
+            .dir => |dir| dir.stat(io) catch null,
+            .file => |f| f.stat(io) catch |err| {
+                results[0] = try fsResultErr(allocator, mapFsError(err));
+                return;
             },
-            .file => |f| {
-                dt = .regular_file;
-                if (f.stat(io)) |st| {
-                    size = st.size;
-                    nlink = @intCast(st.nlink);
-                    dt = switch (st.kind) {
-                        .directory => .directory,
-                        .file => .regular_file,
-                        .block_device => .block_device,
-                        .character_device => .character_device,
-                        .named_pipe => .fifo,
-                        .sym_link => .symbolic_link,
-                        .unix_domain_socket => .socket,
-                        else => .unknown,
-                    };
-                } else |err| {
-                    results[0] = try fsResultErr(allocator, mapFsError(err));
-                    return;
-                }
-            },
+        };
+
+        if (stat_result) |st| {
+            results[0] = try fsResultOk(allocator, try buildDescriptorStatRecord(allocator, st));
+            return;
         }
 
+        // Dir handle but `dir.stat` failed (or unsupported on this target).
+        // Fall back to a minimal record with timestamps as `option::none`.
         const fields = try allocator.alloc(InterfaceValue, 6);
-        fields[0] = .{ .variant_val = .{ .discriminant = @intFromEnum(dt), .payload = null } };
-        fields[1] = .{ .u64 = nlink };
-        fields[2] = .{ .u64 = size };
+        fields[0] = .{ .variant_val = .{ .discriminant = @intFromEnum(WasiCliAdapter.DescType.directory), .payload = null } };
+        fields[1] = .{ .u64 = 1 };
+        fields[2] = .{ .u64 = 0 };
         fields[3] = .{ .option_val = .{ .is_some = false, .payload = null } };
         fields[4] = .{ .option_val = .{ .is_some = false, .payload = null } };
         fields[5] = .{ .option_val = .{ .is_some = false, .payload = null } };
         results[0] = try fsResultOk(allocator, .{ .record_val = fields });
+    }
+
+    /// `[method]descriptor.stat-at: (borrow<descriptor>, path-flags, string)
+    ///   -> result<descriptor-stat, error-code>`.
+    fn fsDescriptorStatAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        // path-flags (args[1]): advisory; we always follow symlinks today.
+        const path_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = switch (d.*) {
+            .preopen => |dir| dir,
+            .dir => |dir| dir,
+            .file => {
+                results[0] = try fsResultErr(allocator, .not_directory);
+                return;
+            },
+        };
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const st = base_dir.statFile(io, path_bytes, .{}) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        results[0] = try fsResultOk(allocator, try buildDescriptorStatRecord(allocator, st));
+    }
+
+    /// `[method]descriptor.set-times: (borrow<descriptor>, new-timestamp, new-timestamp)
+    ///   -> result<_, error-code>`.
+    fn fsDescriptorSetTimes(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const ats = try liftNewTimestamp(args[1]);
+        const mts = try liftNewTimestamp(args[2]);
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        switch (d.*) {
+            .file => |f| {
+                f.setTimestamps(io, .{
+                    .access_timestamp = ats,
+                    .modify_timestamp = mts,
+                }) catch |err| {
+                    results[0] = try fsResultErr(allocator, mapFsError(err));
+                    return;
+                };
+            },
+            .preopen, .dir => {
+                // The `Io.Dir` API has no whole-directory setTimestamps;
+                // only `setTimestamps(sub_path, ...)`. For a bare directory
+                // descriptor (no sub_path), we report `not_permitted`.
+                results[0] = try fsResultErr(allocator, .not_permitted);
+                return;
+            },
+        }
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.set-times-at: (borrow<descriptor>, path-flags, string,
+    ///   new-timestamp, new-timestamp) -> result<_, error-code>`.
+    fn fsDescriptorSetTimesAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 5 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_flags: u32 = switch (args[1]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
+        const path_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const ats = try liftNewTimestamp(args[3]);
+        const mts = try liftNewTimestamp(args[4]);
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = switch (d.*) {
+            .preopen => |dir| dir,
+            .dir => |dir| dir,
+            .file => {
+                results[0] = try fsResultErr(allocator, .not_directory);
+                return;
+            },
+        };
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        // path-flags bit 0 = symlink-follow (per WIT); 0 means "don't follow".
+        const follow_symlinks = (path_flags & 0b1) != 0;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.setTimestamps(io, path_bytes, .{
+            .follow_symlinks = follow_symlinks,
+            .access_timestamp = ats,
+            .modify_timestamp = mts,
+        }) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
     }
 
     /// `[method]descriptor.open-at: (borrow<descriptor>, path-flags, string,
@@ -3971,6 +4129,100 @@ fn buildDatetimeRecord(allocator: Allocator, dt: Datetime) !InterfaceValue {
     return .{ .record_val = fields };
 }
 
+/// Convert `std.Io.Timestamp` (i96 nanoseconds since UNIX epoch) into the
+/// WIT `datetime { seconds: u64, nanoseconds: u32 }` record. Negative
+/// epoch values clamp to `{0,0}` (WIT u64 cannot represent pre-1970).
+/// Seconds saturate at u64 max for far-future timestamps.
+fn ioTimestampToDatetime(ts: std.Io.Timestamp) Datetime {
+    if (ts.nanoseconds <= 0) return .{ .seconds = 0, .nanoseconds = 0 };
+    const NS_PER_S: i96 = 1_000_000_000;
+    const secs_i96 = @divTrunc(ts.nanoseconds, NS_PER_S);
+    const nsec_i96 = @mod(ts.nanoseconds, NS_PER_S);
+    const secs: u64 = if (secs_i96 > std.math.maxInt(u64))
+        std.math.maxInt(u64)
+    else
+        @intCast(secs_i96);
+    const nsec: u32 = @intCast(nsec_i96);
+    return .{ .seconds = secs, .nanoseconds = nsec };
+}
+
+/// Lift an optional `Io.Timestamp` into the WIT `option<datetime>`.
+/// `null` becomes `option::none`; non-null becomes `option::some(datetime)`.
+fn buildOptionalDatetime(allocator: Allocator, maybe_ts: ?std.Io.Timestamp) !InterfaceValue {
+    if (maybe_ts) |ts| {
+        const dt_iv = try allocator.create(InterfaceValue);
+        dt_iv.* = try buildDatetimeRecord(allocator, ioTimestampToDatetime(ts));
+        return .{ .option_val = .{ .is_some = true, .payload = dt_iv } };
+    } else {
+        return .{ .option_val = .{ .is_some = false, .payload = null } };
+    }
+}
+
+/// Lift the host `Io.File.Stat` into the WIT `descriptor-stat` record.
+/// Field order matches the WIT declaration:
+///   { type, link-count, size, data-access-timestamp,
+///     data-modification-timestamp, status-change-timestamp }.
+fn buildDescriptorStatRecord(
+    allocator: Allocator,
+    st: std.Io.File.Stat,
+) !InterfaceValue {
+    const dt: WasiCliAdapter.DescType = switch (st.kind) {
+        .directory => .directory,
+        .file => .regular_file,
+        .block_device => .block_device,
+        .character_device => .character_device,
+        .named_pipe => .fifo,
+        .sym_link => .symbolic_link,
+        .unix_domain_socket => .socket,
+        else => .unknown,
+    };
+    const fields = try allocator.alloc(InterfaceValue, 6);
+    fields[0] = .{ .variant_val = .{ .discriminant = @intFromEnum(dt), .payload = null } };
+    fields[1] = .{ .u64 = @intCast(st.nlink) };
+    fields[2] = .{ .u64 = st.size };
+    fields[3] = try buildOptionalDatetime(allocator, st.atime);
+    fields[4] = try buildOptionalDatetime(allocator, st.mtime);
+    fields[5] = try buildOptionalDatetime(allocator, st.ctime);
+    return .{ .record_val = fields };
+}
+
+/// Lift the WIT `new-timestamp` variant into `std.Io.File.SetTimestamp`.
+/// Discriminant order per the canonical `wasi:filesystem` WIT:
+///   0 = no-change → `.unchanged`
+///   1 = now       → `.now`
+///   2 = timestamp(datetime) → `.new`
+fn liftNewTimestamp(arg: InterfaceValue) !std.Io.File.SetTimestamp {
+    const v = switch (arg) {
+        .variant_val => |v| v,
+        else => return error.InvalidArgs,
+    };
+    switch (v.discriminant) {
+        0 => return .unchanged,
+        1 => return .now,
+        2 => {
+            const payload = v.payload orelse return error.InvalidArgs;
+            const record = switch (payload.*) {
+                .record_val => |r| r,
+                else => return error.InvalidArgs,
+            };
+            if (record.len < 2) return error.InvalidArgs;
+            const secs_u64: u64 = switch (record[0]) {
+                .u64 => |x| x,
+                else => return error.InvalidArgs,
+            };
+            const nsec_u32: u32 = switch (record[1]) {
+                .u32 => |x| x,
+                else => return error.InvalidArgs,
+            };
+            // Clamp seconds into i96 range — i96 easily holds u64.
+            const secs_i96: i96 = @intCast(secs_u64);
+            const nsec_i96: i96 = @intCast(nsec_u32);
+            return .{ .new = .{ .nanoseconds = secs_i96 * 1_000_000_000 + nsec_i96 } };
+        },
+        else => return error.InvalidArgs,
+    }
+}
+
 // ── Top-level CLI dispatch ─────────────────────────────────────────────────
 
 const ctypes_root = @import("types.zig");
@@ -5238,6 +5490,164 @@ test "filesystem: open-at sandbox rejects .. and absolute paths (#145)" {
     try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath("a/b/c.txt"));
     try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath(""));
     try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath("..foo"));
+}
+
+test "filesystem: ioTimestampToDatetime clamps + splits ns (#177)" {
+    const testing = std.testing;
+
+    const zero = ioTimestampToDatetime(.{ .nanoseconds = 0 });
+    try testing.expectEqual(@as(u64, 0), zero.seconds);
+    try testing.expectEqual(@as(u32, 0), zero.nanoseconds);
+
+    // Negative epoch clamps to (0, 0).
+    const neg = ioTimestampToDatetime(.{ .nanoseconds = -42 });
+    try testing.expectEqual(@as(u64, 0), neg.seconds);
+    try testing.expectEqual(@as(u32, 0), neg.nanoseconds);
+
+    // 1.5 seconds.
+    const one_half = ioTimestampToDatetime(.{ .nanoseconds = 1_500_000_000 });
+    try testing.expectEqual(@as(u64, 1), one_half.seconds);
+    try testing.expectEqual(@as(u32, 500_000_000), one_half.nanoseconds);
+}
+
+test "filesystem: liftNewTimestamp covers all three variants (#177)" {
+    const testing = std.testing;
+
+    const unchanged = try liftNewTimestamp(.{ .variant_val = .{ .discriminant = 0, .payload = null } });
+    try testing.expect(unchanged == .unchanged);
+
+    const now_v = try liftNewTimestamp(.{ .variant_val = .{ .discriminant = 1, .payload = null } });
+    try testing.expect(now_v == .now);
+
+    var dt_fields = [_]InterfaceValue{
+        .{ .u64 = 1_700_000_000 },
+        .{ .u32 = 500_000_000 },
+    };
+    const dt_iv = InterfaceValue{ .record_val = &dt_fields };
+    const new_v = try liftNewTimestamp(.{ .variant_val = .{ .discriminant = 2, .payload = &dt_iv } });
+    try testing.expect(new_v == .new);
+    try testing.expectEqual(@as(i96, 1_700_000_000 * 1_000_000_000 + 500_000_000), new_v.new.nanoseconds);
+
+    // Bad discriminant rejects.
+    try testing.expectError(error.InvalidArgs, liftNewTimestamp(.{ .variant_val = .{ .discriminant = 7, .payload = null } }));
+}
+
+test "filesystem: stat returns mtime/ctime as option::some (#177)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "hello" });
+
+    const file = try tmp.dir.openFile(io, "f.txt", .{ .mode = .read_only });
+    const handle = try adapter.pushFsDescriptor(.{ .file = file });
+
+    var args = [_]InterfaceValue{.{ .handle = handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.fsDescriptorStat(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const rec = results[0].result_val.payload.?.*.record_val;
+    try testing.expectEqual(@as(usize, 6), rec.len);
+
+    // size = 5 ("hello").
+    try testing.expectEqual(@as(u64, 5), rec[2].u64);
+    // atime / mtime / ctime — at least mtime + ctime should be is_some on
+    // any sane host filesystem with nonzero seconds.
+    try testing.expect(rec[4].option_val.is_some);
+    try testing.expect(rec[5].option_val.is_some);
+    const mtime_dt = rec[4].option_val.payload.?.*.record_val;
+    try testing.expect(mtime_dt[0].u64 > 0);
+}
+
+test "filesystem: set-times round-trips a known timestamp (#177)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
+    const file = try tmp.dir.openFile(io, "f.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = file });
+
+    var dt_fields = [_]InterfaceValue{
+        .{ .u64 = 1_700_000_000 },
+        .{ .u32 = 0 },
+    };
+    const dt_iv = InterfaceValue{ .record_val = &dt_fields };
+    const ts_arg = InterfaceValue{ .variant_val = .{ .discriminant = 2, .payload = &dt_iv } };
+
+    var set_args = [_]InterfaceValue{
+        .{ .handle = handle },
+        ts_arg,
+        ts_arg,
+    };
+    var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.fsDescriptorSetTimes(&adapter, &ci, &set_args, &set_results, testing.allocator);
+    defer set_results[0].deinit(testing.allocator);
+
+    try testing.expect(set_results[0] == .result_val);
+    try testing.expect(set_results[0].result_val.is_ok);
+
+    // Stat back and confirm mtime.seconds matches.
+    var stat_args = [_]InterfaceValue{.{ .handle = handle }};
+    var stat_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorStat(&adapter, &ci, &stat_args, &stat_results, testing.allocator);
+    defer stat_results[0].deinit(testing.allocator);
+
+    try testing.expect(stat_results[0].result_val.is_ok);
+    const rec = stat_results[0].result_val.payload.?.*.record_val;
+    try testing.expect(rec[4].option_val.is_some);
+    const mtime_dt = rec[4].option_val.payload.?.*.record_val;
+    // Some filesystems quantize sub-second granularity; just verify
+    // seconds round-tripped exactly.
+    try testing.expectEqual(@as(u64, 1_700_000_000), mtime_dt[0].u64);
+}
+
+test "filesystem: set-times on dir descriptor returns not_permitted (#177)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const handle = try adapter.addPreopen("/tmp", tmp.dir);
+    // Avoid double-close: tmp.cleanup() owns tmp.dir.
+    adapter.fs_descriptor_table.items[handle] = null;
+    const reused = try adapter.pushFsDescriptor(.{ .preopen = tmp.dir });
+
+    const ts_arg = InterfaceValue{ .variant_val = .{ .discriminant = 0, .payload = null } };
+    var args = [_]InterfaceValue{
+        .{ .handle = reused },
+        ts_arg,
+        ts_arg,
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.fsDescriptorSetTimes(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    // Hand the slot back so adapter.deinit doesn't re-close tmp.dir.
+    adapter.fs_descriptor_table.items[reused] = null;
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
 }
 
 test "populateWasiProviders: binds wasi:sockets/* (#148)" {
