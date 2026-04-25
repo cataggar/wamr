@@ -114,9 +114,12 @@ pub const FuncType = struct {
     results: ResultList,
 
     pub const ResultList = union(enum) {
-        /// Single unnamed result type.
+        /// No result (spec: `0x01 0x00`).
+        none,
+        /// Single unnamed result type (spec: `0x00 <valtype>`).
         unnamed: ValType,
-        /// Named result types (like a record).
+        /// Named result types. Retained for backward compatibility with older
+        /// component-model encodings; no longer produced by the current spec.
         named: []const NamedValType,
     };
 };
@@ -157,6 +160,11 @@ pub const CoreExportDecl = struct {
 
 /// A type definition in the component type index space.
 pub const TypeDef = union(enum) {
+    // Primitive / handle / indexed value type used directly as a type def
+    // (per the `defvaltype` grammar, a type def can be a single valtype byte
+    // e.g. `(type (borrow $r))` or `(type u32)` inside an instance-type body).
+    val: ValType,
+
     // Compound types
     record: RecordType,
     variant: VariantType,
@@ -180,15 +188,61 @@ pub const CoreTypeDef = union(enum) {
     module: CoreModuleType,
 };
 
-/// Declares the shape of a component type (its imports and exports).
-pub const ComponentTypeDecl = struct {
-    imports: []const ImportDecl,
-    exports: []const ExportDecl,
+/// Declarator inside a component-type or instance-type declaration.
+///
+/// Per the component-model binary format, the declarator list mixes
+/// type definitions, aliases, and import/export descriptors; their
+/// relative order establishes the nested type-index space used by
+/// subsequent declarators in the same list.
+///
+/// See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
+pub const Decl = union(enum) {
+    core_type: CoreTypeDef,
+    type: TypeDef,
+    alias: Alias,
+    import: ImportDecl,
+    @"export": ExportDecl,
 };
 
-/// Declares the shape of an instance type (its exports only).
+/// Declares the shape of a component type.
+///
+/// `decls` preserves the on-wire order of nested core-type, type, alias,
+/// import, and export declarations. The `imports` and `exports` helpers
+/// provide filtered views for callers that only care about externally
+/// visible declarators.
+pub const ComponentTypeDecl = struct {
+    decls: []const Decl,
+
+    pub fn importCount(self: ComponentTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .import) {
+            n += 1;
+        };
+        return n;
+    }
+
+    pub fn exportCount(self: ComponentTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .@"export") {
+            n += 1;
+        };
+        return n;
+    }
+};
+
+/// Declares the shape of an instance type.
+///
+/// Like `ComponentTypeDecl` but without import decls.
 pub const InstanceTypeDecl = struct {
-    exports: []const ExportDecl,
+    decls: []const Decl,
+
+    pub fn exportCount(self: InstanceTypeDecl) usize {
+        var n: usize = 0;
+        for (self.decls) |d| if (d == .@"export") {
+            n += 1;
+        };
+        return n;
+    }
 };
 
 // ── Sorts ───────────────────────────────────────────────────────────────────
@@ -311,6 +365,11 @@ pub const ImportDecl = struct {
 pub const ExportDecl = struct {
     name: []const u8,
     desc: ExternDesc,
+    /// Set for top-level component exports (see spec `export` rule):
+    ///   export ::= en:<exportname'> si:<sortidx> ed?:<externdesc>?
+    /// Null for export declarators inside a component-type / instance-type
+    /// body, which carry only a name and a descriptor.
+    sort_idx: ?SortIdx = null,
 };
 
 // ── Instance expressions ────────────────────────────────────────────────────
@@ -385,6 +444,13 @@ pub const Component = struct {
     aliases: []const Alias,
     /// Component-level type definitions.
     types: []const TypeDef,
+    /// Type index-space → local `types[]` mapping. Each entry is the
+    /// local idx into `types` for slots produced by a `(type ...)` def,
+    /// or null for slots produced by a `(import ... (type ...))` /
+    /// `(alias ... (type ...))` whose target def isn't materialized
+    /// in `types`. When empty (hand-authored fixtures), callers fall
+    /// back to direct indexing of `types`.
+    type_indexspace: []const ?u32 = &.{},
     /// Canonical function definitions.
     canons: []const Canon,
     /// Start function.
@@ -393,6 +459,24 @@ pub const Component = struct {
     imports: []const ImportDecl,
     /// Component exports.
     exports: []const ExportDecl,
+    /// Core-func index-space contributors in binary declaration order.
+    /// Each entry records whether the slot was contributed by a canon
+    /// or by an `Alias.instance_export` with `sort = .core(.func)`,
+    /// along with the index into the corresponding per-section array.
+    /// Empty when the component was constructed without a loader (e.g.
+    /// hand-authored test fixtures); callers in that case fall back to
+    /// the section-order heuristic in `indexspace.resolveCoreFunc`.
+    core_func_indexspace: []const CoreFuncContributor = &.{},
+};
+
+/// A single contributor to the core-func index space.
+pub const CoreFuncContributor = union(enum) {
+    /// Index into `component.canons`. Only canon kinds that contribute
+    /// to the core-func indexspace (`.lower`, `.resource_drop`,
+    /// `.resource_new`, `.resource_rep`) appear here; `.lift` does not.
+    canon: u32,
+    /// Index into `component.aliases`.
+    alias: u32,
 };
 
 /// A core module embedded within a component (stored as raw bytes

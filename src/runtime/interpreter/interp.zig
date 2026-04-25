@@ -777,7 +777,14 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
     while (true) {
         const module = env.module_inst.module;
         if (current_func_idx < module.import_function_count) {
-            // Check for native host functions first
+            // Prefer context-carrying host entries when present.
+            if (current_func_idx < env.module_inst.host_func_entries.len) {
+                if (env.module_inst.host_func_entries[current_func_idx]) |entry| {
+                    entry.func(@ptrCast(env), entry.ctx) catch return error.Unreachable;
+                    return;
+                }
+            }
+            // Fall back to legacy context-less host functions.
             if (current_func_idx < env.module_inst.host_functions.len) {
                 if (env.module_inst.host_functions[current_func_idx]) |host_fn| {
                     host_fn(@ptrCast(env)) catch return error.Unreachable;
@@ -2943,7 +2950,17 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                         const n: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         const src: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
                         const dst: u64 = if (is_64) @bitCast(try env.popI64()) else @as(u64, @as(u32, @bitCast(try env.popI32())));
-                        if (dst + n > dst_mem.data.len or src + n > src_mem.data.len) return error.OutOfBoundsMemoryAccess;
+                        if (dst + n > dst_mem.data.len or src + n > src_mem.data.len) {
+                            std.debug.print("\nMEMCOPY-OOB dst=0x{x} src=0x{x} n=0x{x} mem_len=0x{x} call_depth={}\n", .{ dst, src, n, dst_mem.data.len, env.call_depth });
+                            var k: usize = env.call_depth;
+                            while (k > 0) {
+                                k -= 1;
+                                const fr = &env.call_stack[k];
+                                std.debug.print("  frame[{}] func_idx={} ip={} local_count={} return_arity={}\n", .{ k, fr.func_idx, fr.ip, fr.local_count, fr.return_arity });
+                            }
+                            std.debug.print("  module: imports={} funcs={} memlen=0x{x}\n", .{ env.module_inst.module.import_function_count, env.module_inst.module.functions.len, dst_mem.data.len });
+                            return error.OutOfBoundsMemoryAccess;
+                        }
                         const d: usize = @intCast(dst);
                         const s: usize = @intCast(src);
                         const len: usize = @intCast(n);

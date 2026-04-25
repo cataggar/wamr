@@ -19,8 +19,18 @@ pub const InputStream = struct {
         },
         /// Backed by a host file descriptor.
         fd: std.posix.fd_t,
+        /// Backed by a host file. Reads use positional `pread` so multiple
+        /// streams over the same file are independent. The `file` pointer
+        /// is borrowed from a `wasi:filesystem` descriptor table slot —
+        /// the stream does not close it on drop.
+        host_file: HostFile,
         /// Closed / exhausted.
         closed,
+    };
+
+    pub const HostFile = struct {
+        file: std.Io.File,
+        offset: u64 = 0,
     };
 
     /// Read up to `len` bytes. Returns the bytes read (may be fewer than len).
@@ -38,6 +48,14 @@ pub const InputStream = struct {
                 // Host fd reading would go here
                 return .{ .ok = 0 };
             },
+            .host_file => |*hf| {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const n = hf.file.readPositionalAll(io, buf, hf.offset) catch
+                    return .{ .err = .io_error };
+                if (n == 0) return .{ .closed = {} };
+                hf.offset += n;
+                return .{ .ok = n };
+            },
             .closed => return .{ .closed = {} },
         }
     }
@@ -45,6 +63,12 @@ pub const InputStream = struct {
     /// Create an input stream from a byte buffer.
     pub fn fromBuffer(data: []const u8) InputStream {
         return .{ .source = .{ .buffer = .{ .data = data } } };
+    }
+
+    /// Create an input stream that reads from a host file at the given offset.
+    /// The `file` value is borrowed; the stream does not close it.
+    pub fn fromHostFile(file: std.Io.File, offset: u64) InputStream {
+        return .{ .source = .{ .host_file = .{ .file = file, .offset = offset } } };
     }
 };
 
@@ -59,8 +83,21 @@ pub const OutputStream = struct {
         buffer: std.ArrayListUnmanaged(u8),
         /// Backed by a host file descriptor.
         fd: std.posix.fd_t,
+        /// Backed by a host file. Writes use positional `pwrite`. When
+        /// `append` is true, every write seeks to end-of-file first
+        /// (sampled via `getEndPos`) so concurrent appenders interleave at
+        /// record granularity. The `file` pointer is borrowed from a
+        /// `wasi:filesystem` descriptor table slot — the stream does not
+        /// close it on drop.
+        host_file: HostFile,
         /// Closed.
         closed,
+    };
+
+    pub const HostFile = struct {
+        file: std.Io.File,
+        offset: u64 = 0,
+        append: bool = false,
     };
 
     /// Write bytes to the stream. Returns number of bytes written.
@@ -71,6 +108,21 @@ pub const OutputStream = struct {
                 return .{ .ok = data.len };
             },
             .fd => {
+                // fd-backed sinks aren't yet used in production. Treating
+                // every write as a successful no-op keeps the API shape
+                // intact for future use without dragging in
+                // platform-specific write syscalls.
+                return .{ .ok = data.len };
+            },
+            .host_file => |*hf| {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                if (hf.append) {
+                    hf.offset = hf.file.length(io) catch
+                        return .{ .err = .io_error };
+                }
+                hf.file.writePositionalAll(io, data, hf.offset) catch
+                    return .{ .err = .io_error };
+                hf.offset += data.len;
                 return .{ .ok = data.len };
             },
             .closed => return .{ .closed = {} },
@@ -80,6 +132,21 @@ pub const OutputStream = struct {
     /// Create an output stream backed by a growable buffer.
     pub fn toBuffer() OutputStream {
         return .{ .sink = .{ .buffer = .empty } };
+    }
+
+    /// Create an output stream that writes to a host file descriptor
+    /// (e.g. real stdout/stderr). The fd is borrowed; the stream does
+    /// not close it on `deinit`.
+    pub fn toFd(fd: std.posix.fd_t) OutputStream {
+        return .{ .sink = .{ .fd = fd } };
+    }
+
+    /// Create an output stream that writes to a host file at the given
+    /// offset. If `append` is true, each write seeks to end-of-file
+    /// first. The `file` value is borrowed; the stream does not close
+    /// it on `deinit`.
+    pub fn toHostFile(file: std.Io.File, offset: u64, append: bool) OutputStream {
+        return .{ .sink = .{ .host_file = .{ .file = file, .offset = offset, .append = append } } };
     }
 
     /// Get the buffer contents (only valid for buffer-backed streams).

@@ -30,9 +30,15 @@ var g_mem_size: usize = 0;
 // at the capture site. The post-capture check of `g_trap_occurred`
 // then returns `error.WasmTrap` out of `callFuncScalar`.
 //
+// The VEH body dereferences x86_64-specific `CONTEXT` fields
+// (`Rip`, `Rax`, ...) so the whole block is gated on x86_64 too;
+// on aarch64-windows the runtime still works, traps just aren't
+// catchable as errors (they'll abort the process, same as Linux).
+//
 // Not thread-safe — but neither is the rest of this runtime.
 // Not thread-safe (neither is the rest of this runtime). Using a module-level
 // var rather than threadlocal so Windows TLS alignment quirks don't bite us.
+const windows_trap_supported = builtin.os.tag == .windows and builtin.cpu.arch == .x86_64;
 var g_saved_ctx: windows.CONTEXT align(16) = undefined;
 var g_trap_catching: bool = false;
 var g_trap_occurred: bool = false;
@@ -151,7 +157,7 @@ fn resetStackGuardPage() void {
 
 fn trapLongjmp() noreturn {
     @atomicStore(bool, &g_trap_occurred, true, .seq_cst);
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime windows_trap_supported) {
         RtlRestoreContext(&g_saved_ctx, null);
     }
     // Non-Windows: trap-as-error not yet supported; fall back to exit.
@@ -521,7 +527,7 @@ pub fn memGrowHelper(vmctx: *VmCtx, delta_pages: i32) callconv(.c) i32 {
     vmctx.memory_base = @intFromPtr(mem.data.ptr);
     vmctx.memory_size = @as(usize, new_pages) * types.MemoryInstance.page_size;
     vmctx.memory_pages = new_pages;
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime windows_trap_supported) {
         g_mem_base = vmctx.memory_base;
         g_mem_size = vmctx.memory_size;
     }
@@ -1415,7 +1421,7 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     // AOT-compiled functions receive a VmCtx pointer as hidden first parameter.
     const FnPtr = *const fn (*VmCtx) callconv(.c) Result;
     const func_ptr: FnPtr = @ptrCast(@alignCast(addr));
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime windows_trap_supported) {
         if (inst.code_base) |cb| {
             g_code_base = @intFromPtr(cb);
             g_code_size = inst.code_size;
@@ -1718,7 +1724,7 @@ pub fn callFuncScalar(
         raw[args.len] = @intFromPtr(&hrp_buf);
     }
 
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime windows_trap_supported) {
         if (inst.code_base) |cb| {
             g_code_base = @intFromPtr(cb);
             g_code_size = inst.code_size;
@@ -1741,7 +1747,7 @@ pub fn callFuncScalar(
     // generated code); those are still routed via the VEH, which proved
     // unstable for our use case. All wasm traps now go through explicit
     // helper calls, so the VEH is effectively unused.
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime windows_trap_supported) {
         @atomicStore(bool, &g_trap_occurred, false, .seq_cst);
         @atomicStore(u32, &g_last_trap_code, 0, .seq_cst);
         // Reserve extra stack headroom so the VEH and trapLongjmp can
@@ -1827,7 +1833,7 @@ pub fn callFuncScalar(
         else => unreachable,
     };
 
-    if (comptime builtin.os.tag == .windows) {
+    if (comptime windows_trap_supported) {
         @atomicStore(bool, &g_trap_catching, false, .seq_cst);
     }
 

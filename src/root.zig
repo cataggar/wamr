@@ -109,6 +109,9 @@ pub const canonical_abi = @import("component/canonical_abi.zig");
 /// Component Model function executor.
 pub const component_executor = @import("component/executor.zig");
 
+/// Component Model index-space resolvers.
+pub const component_indexspace = @import("component/indexspace.zig");
+
 /// Component Model instance and resource store.
 pub const component_instance = @import("component/instance.zig");
 
@@ -117,6 +120,9 @@ pub const component_async = @import("component/async.zig");
 
 /// Component composition and linking.
 pub const component_compose = @import("component/compose.zig");
+
+/// Minimal WASI cli/run-style host adapter for component instances.
+pub const wasi_cli_adapter = @import("component/wasi_cli_adapter.zig");
 
 /// WASI Preview 2 core interfaces (clocks, random, CLI, filesystem).
 pub const wasi_p2_core = @import("wasi/preview2/core.zig");

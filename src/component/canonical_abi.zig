@@ -11,21 +11,86 @@ const Allocator = std.mem.Allocator;
 // ── Type registry ───────────────────────────────────────────────────────────
 
 /// Resolves type indices to their definitions from a parsed Component.
+///
+/// May be augmented with a per-trampoline "extended" type indexspace whose
+/// entries cover instance-type-body local type defs that aren't otherwise
+/// reachable from the component-level indexspace. When `extended_indexspace`
+/// is populated, indices `>= component.type_indexspace.len` are looked up
+/// in the extended view first and fall back to direct indexing of
+/// `extended_types`.
 pub const TypeRegistry = struct {
     types: []const ctypes.TypeDef,
+    /// When non-empty, indexed by type-indexspace position to map to a
+    /// local `types[]` index (or null for non-materialized slots).
+    /// When empty, `get(idx)` falls back to direct indexing of `types`.
+    indexspace: []const ?u32 = &.{},
+
+    /// Optional second type-def array consulted for indices that fall
+    /// past `indexspace.len` (or `types.len` when `indexspace` is empty).
+    /// Populated by canon.lower trampolines that need to resolve
+    /// instance-type-body local types.
+    extended_types: []const ctypes.TypeDef = &.{},
+    /// Maps extended-indexspace positions (relative to the start of the
+    /// extension; absolute index = `base + i`) to a local index into
+    /// `extended_types`. When empty and `extended_types` is non-empty,
+    /// extension lookups index `extended_types` directly.
+    extended_indexspace: []const ?u32 = &.{},
 
     pub fn init(component: *const ctypes.Component) TypeRegistry {
-        return .{ .types = component.types };
+        return .{ .types = component.types, .indexspace = component.type_indexspace };
     }
 
     pub fn fromTypes(types: []const ctypes.TypeDef) TypeRegistry {
         return .{ .types = types };
     }
 
-    /// Resolve a type index to its TypeDef.
+    /// Build a registry that looks up `idx` in `(component, extension)`.
+    /// `extension_types` and `extension_indexspace` are appended to the
+    /// component's view: for an index `i` past the component's indexspace
+    /// (or types) length, the extension is consulted with the offset
+    /// `i - base`.
+    pub fn fromExtended(
+        component: *const ctypes.Component,
+        extension_types: []const ctypes.TypeDef,
+        extension_indexspace: []const ?u32,
+    ) TypeRegistry {
+        return .{
+            .types = component.types,
+            .indexspace = component.type_indexspace,
+            .extended_types = extension_types,
+            .extended_indexspace = extension_indexspace,
+        };
+    }
+
+    /// Returns the index past which `get` consults the extension.
+    fn baseSpan(self: TypeRegistry) u32 {
+        if (self.indexspace.len > 0) return @intCast(self.indexspace.len);
+        return @intCast(self.types.len);
+    }
+
+    /// Resolve a type indexspace position to its TypeDef.
     pub fn get(self: TypeRegistry, idx: u32) ?ctypes.TypeDef {
-        if (idx >= self.types.len) return null;
-        return self.types[idx];
+        const base = self.baseSpan();
+        if (idx < base) {
+            if (self.indexspace.len > 0) {
+                const local = self.indexspace[idx] orelse return null;
+                if (local >= self.types.len) return null;
+                return self.types[local];
+            }
+            if (idx >= self.types.len) return null;
+            return self.types[idx];
+        }
+        // Extension lookup. `idx` is offset by `base`.
+        if (self.extended_types.len == 0) return null;
+        const ext_idx: u32 = idx - base;
+        if (self.extended_indexspace.len > 0) {
+            if (ext_idx >= self.extended_indexspace.len) return null;
+            const local = self.extended_indexspace[ext_idx] orelse return null;
+            if (local >= self.extended_types.len) return null;
+            return self.extended_types[local];
+        }
+        if (ext_idx >= self.extended_types.len) return null;
+        return self.extended_types[ext_idx];
     }
 
     /// Resolve a ValType that carries a type index to its TypeDef.
@@ -251,6 +316,7 @@ fn alignOfTypeDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
             break :blk @max(1, payload_align);
         },
         .resource => 4,
+        .val => |v| @max(1, alignOfType(reg, v)),
         else => 4,
     };
 }
@@ -332,6 +398,7 @@ fn sizeOfTypeDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
             break :blk alignUp(payload_offset + payload_size, total_align);
         },
         .resource => 4,
+        .val => |v| sizeOfType(reg, v),
         else => 4,
     };
 }
@@ -414,6 +481,7 @@ pub fn flattenCount(reg: TypeRegistry, t: ctypes.ValType) u32 {
 
 pub fn flattenCountDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
     return switch (td) {
+        .val => |v| flattenCount(reg, v),
         .record => |r| blk: {
             var count: u32 = 0;
             for (r.fields) |f| count += flattenCount(reg, f.type);
@@ -441,6 +509,7 @@ pub fn flattenCountDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
             break :blk 1 + max_payload;
         },
         .resource => 1,
+        .list => 2,
         else => 1,
     };
 }
@@ -592,6 +661,13 @@ pub fn loadValReg(memory: []const u8, ptr: u32, t: ctypes.ValType, reg: TypeRegi
 
 fn loadValFromDef(memory: []const u8, ptr: u32, td: ctypes.TypeDef, reg: TypeRegistry, alloc: Allocator) LoadError!InterfaceValue {
     return switch (td) {
+        // `(type (val <vt>))` — re-dispatch on the inner ValType.
+        .val => |v| try loadValReg(memory, ptr, v, reg, alloc),
+        // `(type (list T))` — list is laid out in linear memory as (ptr, len).
+        .list => .{ .list = .{
+            .ptr = loadU32(memory, ptr),
+            .len = loadU32(memory, ptr + 4),
+        } },
         .record => |r| blk: {
             const vals = try alloc.alloc(InterfaceValue, r.fields.len);
             var offset: u32 = ptr;
@@ -826,6 +902,13 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
 
 fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceValue, reg: TypeRegistry) StoreError!void {
     switch (td) {
+        // `(type (val <vt>))` — re-dispatch on the inner ValType.
+        .val => |v| try storeValReg(memory, ptr, v, val, reg),
+        // `(type (list T))` — store as (ptr, len) pair in linear memory.
+        .list => {
+            storeU32(memory, ptr, val.list.ptr);
+            storeU32(memory, ptr + 4, val.list.len);
+        },
         .record => |r| {
             var offset: u32 = ptr;
             for (r.fields, 0..) |f, i| {
@@ -1223,6 +1306,50 @@ test "elemSize: primitive types" {
 
 test "elemSize: compounds return 0 without registry" {
     try std.testing.expectEqual(@as(u32, 0), elemSize(.{ .record = 0 }));
+}
+
+test "TypeRegistry: extended types append past component indexspace" {
+    // Component with one direct type and a 2-slot indexspace.
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .val = .u32 },
+    };
+    const comp_idxspace = [_]?u32{ 0, null };
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+
+    // Extension: two more typedefs (a list and a result), with a
+    // compact identity indexspace mapping ext_idx 0 -> 0, 1 -> 1.
+    const ext_types = [_]ctypes.TypeDef{
+        .{ .list = .{ .element = .u8 } },
+        .{ .result = .{ .ok = .u32, .err = null } },
+    };
+    const ext_idxspace = [_]?u32{ 0, 1 };
+
+    const reg = TypeRegistry.fromExtended(&component, &ext_types, &ext_idxspace);
+
+    // Component-level lookup unchanged.
+    const td0 = reg.get(0) orelse return error.TestUnexpectedNull;
+    try std.testing.expect(td0 == .val);
+    try std.testing.expect(reg.get(1) == null); // null indexspace slot
+
+    // Extension lookups: idx >= base (= component.type_indexspace.len = 2).
+    const td_ext0 = reg.get(2) orelse return error.TestUnexpectedNull;
+    try std.testing.expect(td_ext0 == .list);
+    const td_ext1 = reg.get(3) orelse return error.TestUnexpectedNull;
+    try std.testing.expect(td_ext1 == .result);
+    try std.testing.expect(reg.get(4) == null); // past extension
+}
+
+test "TypeRegistry: fromExtended falls back to component-only when ext empty" {
+    const comp_types = [_]ctypes.TypeDef{ .{ .val = .u32 } };
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+
+    const reg = TypeRegistry.fromExtended(&component, &.{}, &.{});
+    const td = reg.get(0) orelse return error.TestUnexpectedNull;
+    try std.testing.expect(td == .val);
+    try std.testing.expect(reg.get(1) == null);
 }
 
 test "flatten: basic types" {

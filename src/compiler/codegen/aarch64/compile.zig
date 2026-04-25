@@ -293,7 +293,9 @@ pub fn compileFunctionImpl(
     // Phase 3 of regalloc adoption (issue #100): drive RegMap from a real
     // linear-scan allocation. `RegMap.assign` consults `alloc_result` first;
     // greedy scavenging remains as a fallback for vregs the allocator had no
-    // opinion on.
+    // opinion on. This subsumes the earlier Phase 2 shadow-mode run that
+    // landed on `main` via #135 — the allocator now produces real assignments
+    // rather than being a no-op consistency check.
     //
     // The actual `regalloc.allocate` call is deferred until after the FMA
     // fusion pre-pass below, because fused MADD/MSUB reads a mul's sources
