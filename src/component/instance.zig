@@ -406,6 +406,9 @@ pub const ComponentInstance = struct {
         for (self.trampoline_ctxs.items) |ctx| {
             if (resolveComponentFuncToHostFunc(self, self.component, ctx.component_func_idx)) |hf| {
                 ctx.host_func = hf;
+                std.debug.print("LINK comp_func={} -> host_func.call={any}\n", .{ ctx.component_func_idx, hf.call != null });
+            } else {
+                std.debug.print("LINK comp_func={} -> NULL\n", .{ctx.component_func_idx});
             }
         }
     }
@@ -635,7 +638,12 @@ pub fn instantiate(
                                     continue;
                                 }
 
-                                // Inline-exports source — canon.lower trampoline path.
+                                // Inline-exports source — member is a core func that is either:
+                                //   (a) a `canon.lower` (host trampoline), or
+                                //   (b) an `alias core export` of another core instance's
+                                //       func (cross-instance wiring, e.g. shim's exports
+                                //       routed into $main via wit-component's shim/fixup
+                                //       pattern).
                                 var member_sort_idx: ?ctypes.CoreSort = null;
                                 var member_idx: u32 = 0;
                                 for (source_entry.inline_exports) |mem| {
@@ -648,25 +656,69 @@ pub fn instantiate(
                                 if (member_sort_idx == null) continue;
                                 if (member_sort_idx.? != .func) continue;
 
-                                const canon_idx = resolveCoreFuncLower(component, member_idx) orelse continue;
+                                const cfref = indexspace.resolveCoreFunc(component, member_idx) orelse continue;
+                                std.debug.print("IMPORT-RES ci={} imp_func={} field={s} cfref={s}\n", .{ ci_idx, imp_func_idx, imp.field_name, @tagName(cfref) });
+                                // Aliased core func — resolve to the underlying
+                                // {module_inst, func_idx} pair from a previously
+                                // instantiated core instance.
+                                switch (cfref) {
+                                    .aliased => |alias_idx| {
+                                        const al = component.aliases[alias_idx];
+                                        const ie_al = switch (al) {
+                                            .instance_export => |x| x,
+                                            else => continue,
+                                        };
+                                        if (ie_al.instance_idx >= ci_idx) continue;
+                                        const al_src = cis[ie_al.instance_idx];
+                                        const al_mi = al_src.module_inst orelse continue;
+                                        const al_func_idx = al_mi.getExportFunc(ie_al.name) orelse continue;
+                                        std.debug.print("  ALIASED-WIRED src_ci={} name={s} func_idx={}\n", .{ ie_al.instance_idx, ie_al.name, al_func_idx });
+                                        imps_buf[imp_func_idx] = .{ .module_inst = al_mi, .func_idx = al_func_idx };
+                                        is_cross[imp_func_idx] = true;
+                                        if (first_cross_src == null) first_cross_src = al_mi;
+                                        has_imports_resolved = true;
+                                        continue;
+                                    },
+                                    .lowered => {},
+                                    else => continue,
+                                }
+                                const canon_idx = cfref.lowered;
                                 const canon = component.canons[canon_idx];
                                 const lower = switch (canon) {
                                     .lower => |l| l,
                                     else => continue,
                                 };
 
+                                std.debug.print("  LOWERED canon_idx={} lower.func_idx={} types.len={}\n", .{ canon_idx, lower.func_idx, component.types.len });
                                 const ctx_ptr = allocator.create(executor_mod.ComponentTrampolineCtx) catch continue;
-                                if (lower.func_idx >= component.types.len) {
+                                // Prefer name-based lookup (correct for real components).
+                                // Fall back to direct types[lower.func_idx] indexing for
+                                // hand-authored fixtures that put the FuncType at that
+                                // top-level type slot without a nested instance-type body.
+                                const rft_opt: ?ResolvedFuncType = resolveCompFuncType(component, lower.func_idx) orelse blk: {
+                                    if (lower.func_idx >= component.types.len) break :blk null;
+                                    break :blk switch (component.types[lower.func_idx]) {
+                                        .func => |f| ResolvedFuncType{ .ft = f },
+                                        else => null,
+                                    };
+                                };
+                                const rft = rft_opt orelse {
+                                    std.debug.print("  LOWERED-NO-TYPE func_idx={}\n", .{lower.func_idx});
                                     allocator.destroy(ctx_ptr);
                                     continue;
-                                }
-                                const ft = switch (component.types[lower.func_idx]) {
-                                    .func => |ft_v| ft_v,
-                                    else => {
+                                };
+                                // When the FuncType came from an instance-type body, its
+                                // param/result `.type_idx` references are local to that
+                                // body. Rewrite them to concrete forms (or leave as
+                                // .type_idx fallback) so the trampoline param/result
+                                // walk doesn't misinterpret sizes.
+                                const ft: ctypes.FuncType = if (rft.decls) |decls|
+                                    rewriteInstanceFuncType(allocator, decls, rft.ft) catch {
                                         allocator.destroy(ctx_ptr);
                                         continue;
-                                    },
-                                };
+                                    }
+                                else
+                                    rft.ft;
                                 const params = allocator.alloc(ctypes.ValType, ft.params.len) catch {
                                     allocator.destroy(ctx_ptr);
                                     continue;
@@ -835,6 +887,11 @@ pub fn instantiate(
                     cis[ci_idx] = .{ .module_inst = mi };
 
                     if (entries.len > 0) inst_mod.attachHostFuncEntries(mi, entries);
+                    {
+                        var nset: u32 = 0;
+                        for (entries) |e| if (e != null) { nset += 1; };
+                        std.debug.print("ATTACH ci={} entries.len={} nset={} import_func_count={}\n", .{ ci_idx, entries.len, nset, import_func_count });
+                    }
                     if (imps_buf.len > 0) allocator.free(imps_buf);
                     if (is_cross.len > 0) allocator.free(is_cross);
                     if (mems_buf.len > 0) allocator.free(mems_buf);
@@ -1073,6 +1130,198 @@ fn resolveCoreGlobalToMI(
     const exp = src_mi.module.findExport(ie.name, .global) orelse return null;
     if (exp.index >= src_mi.globals.len) return null;
     return src_mi.globals[exp.index];
+}
+
+/// Walk `component.type_indexspace[idx]` (loader-populated) to find the
+/// local entry in `component.types`. Falls back to direct indexing for
+/// hand-authored fixtures that bypass the loader.
+fn resolveTypeDef(component: *const ctypes.Component, type_idx: u32) ?ctypes.TypeDef {
+    if (component.type_indexspace.len > 0) {
+        if (type_idx >= component.type_indexspace.len) return null;
+        const local = component.type_indexspace[type_idx] orelse return null;
+        if (local >= component.types.len) return null;
+        return component.types[local];
+    }
+    if (type_idx >= component.types.len) return null;
+    return component.types[type_idx];
+}
+
+/// Resolve a component-func index to its function type. Handles imports,
+/// aliases of imported-instance members, and `canon.lift` entries.
+/// Inside an instance-type body, type indices are local. This helper
+/// walks decls in order, resolving the Nth type-producing declarator
+/// to its concrete `TypeDef`. Used by the canonical-ABI trampoline to
+/// dereference param/result `.type_idx` references.
+fn resolveInstanceTypeLocal(decls: []const ctypes.Decl, idx: u32) ?ctypes.TypeDef {
+    var n: u32 = 0;
+    for (decls) |d| switch (d) {
+        .type => |td| {
+            if (n == idx) return td;
+            n += 1;
+        },
+        .alias => {
+            // Aliases of types produce a binding but we don't track the
+            // outer-resolved type here; return null to surface a fallback.
+            if (n == idx) return null;
+            n += 1;
+        },
+        .@"export" => |e| {
+            if (e.desc == .type) {
+                // Resource exports / type-eq exports — caller treats as
+                // an opaque resource handle.
+                if (n == idx) return null;
+                n += 1;
+            }
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Lower a possibly-local `ValType` referring into an instance-type body
+/// to a `ValType` that the trampoline can lower without a TypeRegistry.
+/// Handles unwrapping `.type_idx` chains to `.own` / `.borrow` /
+/// primitive forms.
+fn rewriteInstanceTypeValType(decls: []const ctypes.Decl, vt: ctypes.ValType) ctypes.ValType {
+    switch (vt) {
+        .type_idx => |i| {
+            const td = resolveInstanceTypeLocal(decls, i) orelse return vt;
+            return switch (td) {
+                .val => |inner| rewriteInstanceTypeValType(decls, inner),
+                else => vt,
+            };
+        },
+        else => return vt,
+    }
+}
+
+/// Same as `rewriteInstanceTypeValType` but rewrites the params and
+/// results of a `FuncType` and allocates a fresh slice via `allocator`.
+fn rewriteInstanceFuncType(
+    allocator: std.mem.Allocator,
+    decls: []const ctypes.Decl,
+    ft: ctypes.FuncType,
+) !ctypes.FuncType {
+    const new_params = try allocator.alloc(ctypes.NamedValType, ft.params.len);
+    for (ft.params, 0..) |p, i| {
+        new_params[i] = .{ .name = p.name, .type = rewriteInstanceTypeValType(decls, p.type) };
+    }
+    const new_results: ctypes.FuncType.ResultList = switch (ft.results) {
+        .none => .none,
+        .unnamed => |v| .{ .unnamed = rewriteInstanceTypeValType(decls, v) },
+        .named => |list| blk: {
+            const new_list = try allocator.alloc(ctypes.NamedValType, list.len);
+            for (list, 0..) |p, i| new_list[i] = .{ .name = p.name, .type = rewriteInstanceTypeValType(decls, p.type) };
+            break :blk .{ .named = new_list };
+        },
+    };
+    return .{ .params = new_params, .results = new_results };
+}
+
+const ResolvedFuncType = struct {
+    ft: ctypes.FuncType,
+    /// When the FuncType came from an instance-type body, its
+    /// param/result `.type_idx` references are local to that body's
+    /// type space. Callers must rewrite via `rewriteInstanceTypeValType`
+    /// using this `decls` list before consuming the types.
+    decls: ?[]const ctypes.Decl = null,
+};
+
+fn resolveCompFuncType(component: *const ctypes.Component, func_idx: u32) ?ResolvedFuncType {
+    const ref = indexspace.resolveCompFunc(component, func_idx) orelse {
+        std.debug.print("    rcft({}) -> null (no compfunc ref)\n", .{func_idx});
+        return null;
+    };
+    switch (ref) {
+        .imported => |imp_idx| {
+            const imp = component.imports[imp_idx];
+            const tidx = switch (imp.desc) {
+                .func => |t| t,
+                else => return null,
+            };
+            const td = resolveTypeDef(component, tidx) orelse return null;
+            return switch (td) {
+                .func => |ft| .{ .ft = ft },
+                else => null,
+            };
+        },
+        .aliased => |alias_idx| {
+            const ie = component.aliases[alias_idx].instance_export;
+            const inst_ref = indexspace.resolveCompInstance(component, ie.instance_idx) orelse {
+                std.debug.print("    rcft({}) aliased -> no compinst ref idx={}\n", .{ func_idx, ie.instance_idx });
+                return null;
+            };
+            const inst_type_idx: u32 = switch (inst_ref) {
+                .imported => |i| switch (component.imports[i].desc) {
+                    .instance => |t| t,
+                    else => return null,
+                },
+                else => {
+                    std.debug.print("    rcft({}) aliased -> inst_ref={s} (not imported)\n", .{ func_idx, @tagName(inst_ref) });
+                    return null;
+                },
+            };
+            const inst_td = resolveTypeDef(component, inst_type_idx) orelse {
+                std.debug.print("    rcft({}) aliased -> no typedef inst_type_idx={}\n", .{ func_idx, inst_type_idx });
+                return null;
+            };
+            const decls = switch (inst_td) {
+                .instance => |it| it.decls,
+                else => |t| {
+                    std.debug.print("    rcft({}) aliased -> inst_td not instance: {s}\n", .{ func_idx, @tagName(t) });
+                    return null;
+                },
+            };
+            for (decls) |d| switch (d) {
+                .@"export" => |e| {
+                    if (!std.mem.eql(u8, e.name, ie.name)) continue;
+                    const tidx = switch (e.desc) {
+                        .func => |t| t,
+                        else => return null,
+                    };
+                    var n: u32 = 0;
+                    var found: ?ctypes.FuncType = null;
+                    for (decls) |d2| {
+                        switch (d2) {
+                            .type => |td2| {
+                                if (n == tidx) {
+                                    found = switch (td2) {
+                                        .func => |ft| ft,
+                                        else => null,
+                                    };
+                                }
+                                n += 1;
+                            },
+                            .alias => n += 1,
+                            .@"export" => |e2| {
+                                if (e2.desc == .type) n += 1;
+                            },
+                            else => {},
+                        }
+                        if (found != null) break;
+                    }
+                    if (found) |ft| return .{ .ft = ft, .decls = decls };
+                    std.debug.print("    rcft({}) aliased -> export found name={s} but type tidx={} not in decls (total={})\n", .{ func_idx, ie.name, tidx, decls.len });
+                    for (decls, 0..) |dd, di| std.debug.print("      [{}]={s}\n", .{ di, @tagName(dd) });
+                    return null;
+                },
+                else => {},
+            };
+            std.debug.print("    rcft({}) aliased -> export name={s} not found in {} decls\n", .{ func_idx, ie.name, decls.len });
+            return null;
+        },
+        .lifted => |canon_idx| {
+            const lift = switch (component.canons[canon_idx]) {
+                .lift => |l| l,
+                else => return null,
+            };
+            const td = resolveTypeDef(component, lift.type_idx) orelse return null;
+            return switch (td) {
+                .func => |ft| .{ .ft = ft },
+                else => null,
+            };
+        },
+    }
 }
 
 /// Resolve a `canon.lift.core_func_idx` (component core-func-index-space) to

@@ -424,6 +424,7 @@ pub fn flattenCount(reg: TypeRegistry, t: ctypes.ValType) u32 {
 
 pub fn flattenCountDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
     return switch (td) {
+        .val => |v| flattenCount(reg, v),
         .record => |r| blk: {
             var count: u32 = 0;
             for (r.fields) |f| count += flattenCount(reg, f.type);

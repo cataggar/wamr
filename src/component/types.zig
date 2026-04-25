@@ -459,6 +459,24 @@ pub const Component = struct {
     imports: []const ImportDecl,
     /// Component exports.
     exports: []const ExportDecl,
+    /// Core-func index-space contributors in binary declaration order.
+    /// Each entry records whether the slot was contributed by a canon
+    /// or by an `Alias.instance_export` with `sort = .core(.func)`,
+    /// along with the index into the corresponding per-section array.
+    /// Empty when the component was constructed without a loader (e.g.
+    /// hand-authored test fixtures); callers in that case fall back to
+    /// the section-order heuristic in `indexspace.resolveCoreFunc`.
+    core_func_indexspace: []const CoreFuncContributor = &.{},
+};
+
+/// A single contributor to the core-func index space.
+pub const CoreFuncContributor = union(enum) {
+    /// Index into `component.canons`. Only canon kinds that contribute
+    /// to the core-func indexspace (`.lower`, `.resource_drop`,
+    /// `.resource_new`, `.resource_rep`) appear here; `.lift` does not.
+    canon: u32,
+    /// Index into `component.aliases`.
+    alias: u32,
 };
 
 /// A core module embedded within a component (stored as raw bytes

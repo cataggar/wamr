@@ -135,6 +135,26 @@ pub const CoreFuncRef = union(enum) {
 };
 
 pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRef {
+    // Prefer the loader-provided binary-order indexspace when present
+    // (real components from wit-component / wasm-tools). Hand-authored
+    // fixtures that bypass the loader fall back to the section-order
+    // heuristic below.
+    if (component.core_func_indexspace.len > 0) {
+        if (idx >= component.core_func_indexspace.len) return null;
+        const c = component.core_func_indexspace[idx];
+        return switch (c) {
+            .alias => |a| .{ .aliased = a },
+            .canon => |canon_idx| switch (component.canons[canon_idx]) {
+                .lower => .{ .lowered = canon_idx },
+                .resource_drop => .{ .resource_drop = canon_idx },
+                .resource_new => .{ .resource_new = canon_idx },
+                .resource_rep => .{ .resource_rep = canon_idx },
+                .lift => null, // lift never contributes to core-func indexspace
+            },
+        };
+    }
+    // Fallback (hand-authored fixtures, no loader): assume canon
+    // entries declared first, aliases second.
     var n: u32 = 0;
     for (component.canons, 0..) |c, i| {
         switch (c) {
@@ -154,7 +174,7 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
                 if (n == idx) return .{ .resource_rep = @intCast(i) };
                 n += 1;
             },
-            .lift => {}, // contributes to component-func indexspace, not core-func
+            .lift => {},
         }
     }
     for (component.aliases, 0..) |a, i| {
