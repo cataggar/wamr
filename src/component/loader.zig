@@ -134,6 +134,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
     var imports: std.ArrayListUnmanaged(ctypes.ImportDecl) = .empty;
     var exports: std.ArrayListUnmanaged(ctypes.ExportDecl) = .empty;
     var start: ?ctypes.Start = null;
+    // Tracks the type index space in section-encounter order. Each entry
+    // is the local idx into `type_defs` for that slot, or null when
+    // the slot is consumed by an import (`.type`-bound) or alias whose
+    // target type def we don't materialize. Required to resolve real
+    // wasm32-wasip2 components where types and aliases interleave.
+    var type_indexspace: std.ArrayListUnmanaged(?u32) = .empty;
 
     while (reader.remaining() > 0) {
         const section_id_byte = try reader.readByte();
@@ -189,14 +195,24 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
-                    try aliases.append(allocator, try parseAlias(&reader));
+                    const a = try parseAlias(&reader);
+                    try aliases.append(allocator, a);
+                    // Aliases of sort .type contribute a slot to the
+                    // type indexspace (target unresolved here → null).
+                    const sort: ctypes.Sort = switch (a) {
+                        .instance_export => |ie| ie.sort,
+                        .outer => |o| o.sort,
+                    };
+                    if (sort == .type) try type_indexspace.append(allocator, null);
                 }
             },
             .type => {
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
+                    const local_idx: u32 = @intCast(type_defs.items.len);
                     try type_defs.append(allocator, try parseTypeDef(&reader, allocator));
+                    try type_indexspace.append(allocator, local_idx);
                 }
             },
             .canon => {
@@ -213,7 +229,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
-                    try imports.append(allocator, try parseImport(&reader));
+                    const imp = try parseImport(&reader);
+                    try imports.append(allocator, imp);
+                    if (imp.desc == .type) try type_indexspace.append(allocator, null);
                 }
             },
             .@"export" => {
@@ -242,6 +260,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         .instances = try instances.toOwnedSlice(allocator),
         .aliases = try aliases.toOwnedSlice(allocator),
         .types = try type_defs.toOwnedSlice(allocator),
+        .type_indexspace = try type_indexspace.toOwnedSlice(allocator),
         .canons = try canons.toOwnedSlice(allocator),
         .start = start,
         .imports = try imports.toOwnedSlice(allocator),

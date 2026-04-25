@@ -126,14 +126,11 @@ pub fn callComponentFunc(
 
     // Resolve the function type
     const func_type = blk: {
-        if (exported.func_type_idx < comp_inst.component.types.len) {
-            const td = comp_inst.component.types[exported.func_type_idx];
-            switch (td) {
-                .func => |ft| break :blk ft,
-                else => return error.InvalidFuncType,
-            }
+        const td = registry.get(exported.func_type_idx) orelse return error.InvalidFuncType;
+        switch (td) {
+            .func => |ft| break :blk ft,
+            else => return error.InvalidFuncType,
         }
-        return error.InvalidFuncType;
     };
 
     // 2. Compute flat counts for params and results
@@ -320,20 +317,33 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
             try env.pushI32(@bitCast(val.list.ptr));
             try env.pushI32(@bitCast(val.list.len));
         },
-        // result<no-payload, no-payload>: flat repr is just the i32
-        // discriminant. WASI commonly returns this from `wasi:cli/run.run`
-        // and `wasi:io/streams.[method]output-stream.blocking-write-and-flush`,
-        // so the trampoline+lift paths support it directly. Result variants
-        // with payloads still go through the registry-aware spill path.
+        // result<T, E>: flat repr is `[i32 disc] ++ join(flatten(T), flatten(E))`,
+        // where the per-slot join takes the wider of the two arms (treated as
+        // i32 here since stdio-echo's variants land on i32-only payloads).
+        // Inactive slots are zero-filled; payload values for the active arm
+        // are recursively pushed and any remaining slots are then zero-filled.
+        // A future slice can extend this to mixed i32/i64/f32/f64 joins.
         .result => |idx| {
             const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
             const r = switch (td) {
                 .result => |rt| rt,
                 else => return error.CompoundNeedsRegistry,
             };
-            if (r.ok != null or r.err != null) return error.CompoundNeedsRegistry;
+            const total_payload_slots = abi.flattenCount(registry, t) - 1;
             const disc: i32 = if (val.result_val.is_ok) 0 else 1;
             try env.pushI32(disc);
+
+            const arm_type: ?ctypes.ValType = if (val.result_val.is_ok) r.ok else r.err;
+            var pushed: u32 = 0;
+            if (arm_type) |at| {
+                if (val.result_val.payload) |p| {
+                    try pushInterfaceValue(env, p.*, at, registry);
+                    pushed = abi.flattenCount(registry, at);
+                }
+            }
+            while (pushed < total_payload_slots) : (pushed += 1) {
+                try env.pushI32(0);
+            }
         },
         .record, .variant, .tuple, .flags, .enum_, .option, .type_idx => {
             return error.CompoundNeedsRegistry;
@@ -378,15 +388,22 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             .len = @bitCast(try env.popI32()),
             .ptr = @bitCast(try env.popI32()),
         } },
-        // result<no-payload, no-payload>: pop one i32 discriminant.
-        // See pushInterfaceValue rationale.
+        // result<T, E>: pop the discriminant, then pop and discard all
+        // remaining payload slots (caller currently doesn't inspect the
+        // typed payload; a future slice can lift it through `loadValReg`-
+        // style logic). See pushInterfaceValue for the join rationale.
         .result => |idx| blk: {
             const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
-            const r = switch (td) {
+            _ = switch (td) {
                 .result => |rt| rt,
                 else => return error.CompoundNeedsRegistry,
             };
-            if (r.ok != null or r.err != null) return error.CompoundNeedsRegistry;
+            const total_payload_slots = abi.flattenCount(registry, t) - 1;
+            // Payload slots are pushed last, so they pop first.
+            var i: u32 = 0;
+            while (i < total_payload_slots) : (i += 1) {
+                _ = try env.popI32();
+            }
             const disc = try env.popI32();
             break :blk .{ .result_val = .{ .is_ok = disc == 0, .payload = null } };
         },
@@ -530,8 +547,8 @@ pub fn callComponentFuncAsync(
 
     // Get function type for result count
     const result_count: usize = blk: {
-        if (exported.func_type_idx < comp_inst.component.types.len) {
-            const td = comp_inst.component.types[exported.func_type_idx];
+        const reg = TypeRegistry.init(comp_inst.component);
+        if (reg.get(exported.func_type_idx)) |td| {
             switch (td) {
                 .func => |ft| {
                     switch (ft.results) {
@@ -957,9 +974,13 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     }
 
     // Invoke host. Host owns allocation of any compound result values via
-    // `allocator`; simple values need no cleanup.
+    // `allocator`; we deinit each result after lowering so payloads
+    // (e.g. `.result_val.payload` for input-stream.blocking-read) don't leak.
     const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch return error.Trap;
-    defer allocator.free(results);
+    defer {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+    }
     const call = ctx.host_func.call orelse return error.Trap;
     call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch return error.Trap;
 
@@ -1304,4 +1325,48 @@ test "componentTrampoline: result spill stores tuple into memory" {
     const r1 = std.mem.readInt(i32, mem.data[dest_ptr + 4 ..][0..4], .little);
     try testing.expectEqual(@as(i32, 0xCAFE), r0);
     try testing.expectEqual(@as(i32, 0xBEEF), r1);
+}
+
+test "pushInterfaceValue/popInterfaceValue: result<_, primitive> roundtrip (#155)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // result<_, u32>: ok arm empty, err arm flat = [i32]; total = 2 i32s.
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .result = .{ .ok = null, .err = .u32 } },
+    };
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &type_defs,      .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const registry = TypeRegistry.init(&component);
+    const t: ctypes.ValType = .{ .result = 0 };
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    // Push ok arm: should produce [i32 0, i32 0] (zero-filled payload slot).
+    try pushInterfaceValue(env, .{ .result_val = .{ .is_ok = true, .payload = null } }, t, registry);
+    const lifted_ok = try popInterfaceValue(env, t, registry, testing.allocator);
+    try testing.expect(lifted_ok.result_val.is_ok);
+
+    // Push err arm with payload u32=0xCAFEu: produces [i32 1, i32 0xCAFE].
+    const err_payload: InterfaceValue = .{ .u32 = 0xCAFE };
+    try pushInterfaceValue(
+        env,
+        .{ .result_val = .{ .is_ok = false, .payload = &err_payload } },
+        t,
+        registry,
+    );
+    // Verify the underlying core stack layout: top = payload (0xCAFE), below = disc (1).
+    const payload_slot: u32 = @bitCast(try env.popI32());
+    const disc_slot = try env.popI32();
+    try testing.expectEqual(@as(u32, 0xCAFE), payload_slot);
+    try testing.expectEqual(@as(i32, 1), disc_slot);
 }

@@ -13,17 +13,27 @@ const Allocator = std.mem.Allocator;
 /// Resolves type indices to their definitions from a parsed Component.
 pub const TypeRegistry = struct {
     types: []const ctypes.TypeDef,
+    /// When non-empty, indexed by type-indexspace position to map to a
+    /// local `types[]` index (or null for non-materialized slots).
+    /// When empty, `get(idx)` falls back to direct indexing of `types`.
+    indexspace: []const ?u32 = &.{},
 
     pub fn init(component: *const ctypes.Component) TypeRegistry {
-        return .{ .types = component.types };
+        return .{ .types = component.types, .indexspace = component.type_indexspace };
     }
 
     pub fn fromTypes(types: []const ctypes.TypeDef) TypeRegistry {
         return .{ .types = types };
     }
 
-    /// Resolve a type index to its TypeDef.
+    /// Resolve a type indexspace position to its TypeDef.
     pub fn get(self: TypeRegistry, idx: u32) ?ctypes.TypeDef {
+        if (self.indexspace.len > 0) {
+            if (idx >= self.indexspace.len) return null;
+            const local = self.indexspace[idx] orelse return null;
+            if (local >= self.types.len) return null;
+            return self.types[local];
+        }
         if (idx >= self.types.len) return null;
         return self.types[idx];
     }
