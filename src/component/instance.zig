@@ -7,6 +7,7 @@ const std = @import("std");
 const ctypes = @import("types.zig");
 const core_types = @import("../runtime/common/types.zig");
 const executor_mod = @import("executor.zig");
+const indexspace = @import("indexspace.zig");
 
 // ── Resource Table ──────────────────────────────────────────────────────────
 
@@ -567,25 +568,28 @@ pub fn instantiate(
         inst.core_instances = cis;
     }
 
-    // Build export map
+    // Build export map: walk top-level component exports, resolve each
+    // `.func` export through the component-func index space to its backing
+    // `canon.lift`, and register an entry in `exported_funcs` keyed by the
+    // export name. Locally-built instance exports (e.g. `wasi:cli/run`) are
+    // a separate slice (#151).
     for (component.exports) |exp| {
-        switch (exp.desc) {
-            .func => |func_idx| {
-                if (func_idx < component.canons.len) {
-                    const canon = component.canons[func_idx];
-                    switch (canon) {
-                        .lift => |lift| {
-                            const resolved = resolveLiftedCoreFunc(inst, component, lift.core_func_idx);
-                            inst.exported_funcs.put(allocator, exp.name, .{
-                                .core_instance_idx = if (resolved) |r| r.core_instance_idx else 0,
-                                .core_func_idx = if (resolved) |r| r.local_func_idx else lift.core_func_idx,
-                                .func_type_idx = lift.type_idx,
-                                .opts = lift.opts,
-                            }) catch {};
-                        },
-                        else => {},
-                    }
-                }
+        const si = exp.sort_idx orelse continue;
+        if (si.sort != .func) continue;
+        const ref = indexspace.resolveCompFunc(component, si.idx) orelse continue;
+        const canon_idx = switch (ref) {
+            .lifted => |i| i,
+            else => continue,
+        };
+        switch (component.canons[canon_idx]) {
+            .lift => |lift| {
+                const resolved = resolveLiftedCoreFunc(inst, component, lift.core_func_idx);
+                inst.exported_funcs.put(allocator, exp.name, .{
+                    .core_instance_idx = if (resolved) |r| r.core_instance_idx else 0,
+                    .core_func_idx = if (resolved) |r| r.local_func_idx else lift.core_func_idx,
+                    .func_type_idx = lift.type_idx,
+                    .opts = lift.opts,
+                }) catch {};
             },
             else => {},
         }
@@ -603,20 +607,13 @@ pub fn instantiate(
 // handles arbitrary component layouts including `stdio-echo.wasm`.
 
 /// Map a core-func-index-space index back to the canon.lower that
-/// produced it. Assumes canon.lowers are the sole contributors to the
-/// core-func-index-space.
+/// produced it. Returns null when the index does not point to a lower
+/// (e.g. when it refers to an aliased core func).
 fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) ?u32 {
-    var n: u32 = 0;
-    for (component.canons, 0..) |c, i| {
-        switch (c) {
-            .lower => {
-                if (n == core_func_idx) return @intCast(i);
-                n += 1;
-            },
-            else => {},
-        }
-    }
-    return null;
+    return switch (indexspace.resolveCoreFunc(component, core_func_idx) orelse return null) {
+        .lowered => |i| i,
+        .aliased => null,
+    };
 }
 
 /// Find which `ComponentInstance.core_instances[i]` hosts the core function
@@ -654,46 +651,24 @@ fn resolveLiftedCoreFunc(
     component: *const ctypes.Component,
     core_func_idx: u32,
 ) ?struct { core_instance_idx: u32, local_func_idx: u32 } {
-    var n: u32 = 0;
-
-    // canon.lowers occupy the low end of the core-func-index-space. They are
-    // imports into a core module — not callable as exports — so a canon.lift
-    // pointing at one would be malformed; we still skip past their slots.
-    for (component.canons) |c| {
-        switch (c) {
-            .lower => {
-                if (n == core_func_idx) return null;
-                n += 1;
-            },
-            else => {},
-        }
+    const ref = indexspace.resolveCoreFunc(component, core_func_idx) orelse return null;
+    switch (ref) {
+        // canon.lowers are imports into core modules — not callable as
+        // exports — so a canon.lift pointing at one is malformed.
+        .lowered => return null,
+        .aliased => |alias_idx| {
+            const a = component.aliases[alias_idx];
+            const ie = a.instance_export;
+            if (ie.instance_idx >= inst.core_instances.len) return null;
+            const target = inst.core_instances[ie.instance_idx];
+            const mi = target.module_inst orelse return null;
+            const local = mi.getExportFunc(ie.name) orelse return null;
+            return .{
+                .core_instance_idx = ie.instance_idx,
+                .local_func_idx = local,
+            };
+        },
     }
-
-    // Then aliases of core-instance exports of sort = .core(.func).
-    for (component.aliases) |a| {
-        switch (a) {
-            .instance_export => |ie| {
-                const is_core_func = switch (ie.sort) {
-                    .core => |cs| cs == .func,
-                    else => false,
-                };
-                if (!is_core_func) continue;
-                if (n == core_func_idx) {
-                    if (ie.instance_idx >= inst.core_instances.len) return null;
-                    const target = inst.core_instances[ie.instance_idx];
-                    const mi = target.module_inst orelse return null;
-                    const local = mi.getExportFunc(ie.name) orelse return null;
-                    return .{
-                        .core_instance_idx = ie.instance_idx,
-                        .local_func_idx = local,
-                    };
-                }
-                n += 1;
-            },
-            else => {},
-        }
-    }
-    return null;
 }
 
 /// Resolve a component-level func index to a bound `HostFunc`.
@@ -710,80 +685,56 @@ fn resolveComponentFuncToHostFunc(
     component: *const ctypes.Component,
     func_idx: u32,
 ) ?HostFunc {
-    var n: u32 = 0;
-
-    // 1) Direct top-level func imports.
-    for (component.imports) |imp| {
-        switch (imp.desc) {
-            .func => {
-                if (n == func_idx) {
-                    const binding = inst.imports.get(imp.name) orelse return null;
-                    return switch (binding) {
-                        .host_func => |hf| hf,
-                        else => null,
-                    };
-                }
-                n += 1;
-            },
-            else => {},
-        }
+    const ref = indexspace.resolveCompFunc(component, func_idx) orelse return null;
+    switch (ref) {
+        .imported => |imp_idx| {
+            const imp = component.imports[imp_idx];
+            const binding = inst.imports.get(imp.name) orelse return null;
+            return switch (binding) {
+                .host_func => |hf| hf,
+                else => null,
+            };
+        },
+        .aliased => |alias_idx| {
+            const ie = component.aliases[alias_idx].instance_export;
+            const inst_ref = indexspace.resolveCompInstance(component, ie.instance_idx) orelse return null;
+            // Only aliases pointing at imported component instances are
+            // host-bound. Aliases of locally-instantiated instances are
+            // resolved to their underlying canon.lift / canon.lower elsewhere.
+            const imp_decl = switch (inst_ref) {
+                .imported => |i| component.imports[i],
+                else => return null,
+            };
+            const binding = inst.imports.get(imp_decl.name) orelse return null;
+            const host_inst = switch (binding) {
+                .host_instance => |hi| hi,
+                else => return null,
+            };
+            const member = host_inst.members.get(ie.name) orelse return null;
+            return switch (member) {
+                .func => |hf| hf,
+                .resource_type => null,
+            };
+        },
+        // canon.lifts are not host-bound — they are component-defined
+        // funcs implemented by core code.
+        .lifted => return null,
     }
-
-    // 2) Aliases that name a component-level func member of an imported
-    //    component instance.
-    for (component.aliases) |a| {
-        switch (a) {
-            .instance_export => |ie| {
-                const is_comp_func = switch (ie.sort) {
-                    .func => true,
-                    else => false,
-                };
-                if (!is_comp_func) continue;
-                if (n == func_idx) {
-                    const imp_decl = resolveImportedInstance(component, ie.instance_idx) orelse return null;
-                    const binding = inst.imports.get(imp_decl.name) orelse return null;
-                    const host_inst = switch (binding) {
-                        .host_instance => |hi| hi,
-                        else => return null,
-                    };
-                    const member = host_inst.members.get(ie.name) orelse return null;
-                    return switch (member) {
-                        .func => |hf| hf,
-                        .resource_type => null,
-                    };
-                }
-                n += 1;
-            },
-            else => {},
-        }
-    }
-
-    return null;
 }
 
 /// Resolve a component-level instance index to its `ImportDecl` if it
-/// refers to an imported component instance.
-///
-/// The component instance index space is contributed by: imports of kind
-/// `instance`, then locally instantiated component instances
-/// (`component.instances`), then aliases of `Sort.instance` (rare).
-/// Phase 2B narrow assumption: only the imported-instance prefix is
-/// supported. Returns null for indices past the imported region.
+/// refers to an imported component instance. Returns null for locally
+/// instantiated or aliased instances (callers wanting the broader form
+/// should use `indexspace.resolveCompInstance` directly).
 fn resolveImportedInstance(
     component: *const ctypes.Component,
     instance_idx: u32,
 ) ?ctypes.ImportDecl {
-    var n: u32 = 0;
-    for (component.imports) |imp| {
-        switch (imp.desc) {
-            .instance => {
-                if (n == instance_idx) return imp;
-                n += 1;
-            },
-            else => {},
-        }
-    }
-    return null;
+    const ref = indexspace.resolveCompInstance(component, instance_idx) orelse return null;
+    return switch (ref) {
+        .imported => |i| component.imports[i],
+        else => null,
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1238,7 +1189,7 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
         } },
     };
     const exports_decl = [_]ctypes.ExportDecl{
-        .{ .name = "run", .desc = .{ .func = 1 } },
+        .{ .name = "run", .desc = .{ .func = 1 }, .sort_idx = .{ .sort = .func, .idx = 1 } },
     };
 
     const component = ctypes.Component{

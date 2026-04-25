@@ -675,7 +675,7 @@ test "WasiCliAdapter: hello-world fixture (cli/stdout + io/streams + run)" {
     };
 
     const exports_decl = [_]ctypes.ExportDecl{
-        .{ .name = "run", .desc = .{ .func = 3 } },
+        .{ .name = "run", .desc = .{ .func = 3 }, .sort_idx = .{ .sort = .func, .idx = 3 } },
     };
 
     const component = ctypes.Component{
@@ -839,7 +839,7 @@ test "runLoadedComponent: matches versioned WASI import names" {
     };
 
     const exports_decl = [_]ctypes.ExportDecl{
-        .{ .name = "run", .desc = .{ .func = 3 } },
+        .{ .name = "run", .desc = .{ .func = 3 }, .sort_idx = .{ .sort = .func, .idx = 3 } },
     };
 
     const component = ctypes.Component{

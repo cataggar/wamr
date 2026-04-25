@@ -109,6 +109,9 @@ pub const canonical_abi = @import("component/canonical_abi.zig");
 /// Component Model function executor.
 pub const component_executor = @import("component/executor.zig");
 
+/// Component Model index-space resolvers.
+pub const component_indexspace = @import("component/indexspace.zig");
+
 /// Component Model instance and resource store.
 pub const component_instance = @import("component/instance.zig");
 
