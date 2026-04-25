@@ -954,8 +954,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     if (params_spill) {
         const params_ptr: u32 = @bitCast(env.popI32() catch return error.Trap);
         const mem_idx = ctx.lower_opts.memory_idx.?;
-        const mi = ctx.comp_inst.firstModuleInst() orelse return error.Trap;
-        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.Trap;
         var offset: u32 = params_ptr;
         for (ctx.param_types, 0..) |pt, i| {
             const al = typeAlign(registry, pt);
@@ -987,8 +986,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     // Lower results.
     if (results_spill) {
         const mem_idx = ctx.lower_opts.memory_idx.?;
-        const mi = ctx.comp_inst.firstModuleInst() orelse return error.Trap;
-        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.Trap;
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
             const al = typeAlign(registry, t);

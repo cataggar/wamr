@@ -237,6 +237,54 @@ pub const ComponentInstance = struct {
         return null;
     }
 
+    /// Resolve a top-level core memory indexspace index to the underlying
+    /// `*MemoryInstance`. Used by `componentTrampoline` and host-side
+    /// helpers to find the memory referenced by a `(memory N)` canonical
+    /// option, where `N` is the component-level core memory index — which
+    /// may be contributed by an `alias core export` decl pointing at a
+    /// memory exported by a different core instance than the "first" one.
+    ///
+    /// Resolution order:
+    ///   1. If `N` is contributed by an `alias core export`, follow it
+    ///      through the source core instance to the underlying memory.
+    ///   2. Otherwise, fall back to `firstModuleInst().getMemory(N)` —
+    ///      preserves behavior for hand-authored fixtures with a single
+    ///      core module (where the local memory idx matches N).
+    pub fn resolveTopLevelMemory(self: *const ComponentInstance, idx: u32) ?*core_types.MemoryInstance {
+        const ref = indexspace.resolveCoreMemory(self.component, idx) orelse {
+            const mi = self.firstModuleInst() orelse return null;
+            return mi.getMemory(idx);
+        };
+        const ie = self.component.aliases[ref.aliased].instance_export;
+        if (ie.instance_idx >= self.core_instances.len) return null;
+        const src_mi = self.core_instances[ie.instance_idx].module_inst orelse return null;
+        const exp = src_mi.module.findExport(ie.name, .memory) orelse return null;
+        if (exp.index >= src_mi.memories.len) return null;
+        return src_mi.memories[exp.index];
+    }
+
+    /// Resolve a top-level core func indexspace index to a callable
+    /// `(*ModuleInstance, local_func_idx)` pair, suitable for invoking
+    /// from a host context (e.g. calling `cabi_realloc`). Only the
+    /// alias-core-export contributors yield a directly-callable function;
+    /// canon.lower / resource.* canons are imports and return null.
+    pub fn resolveTopLevelCoreFunc(
+        self: *const ComponentInstance,
+        idx: u32,
+    ) ?struct { mi: *core_types.ModuleInstance, local_idx: u32 } {
+        const ref = indexspace.resolveCoreFunc(self.component, idx) orelse return null;
+        switch (ref) {
+            .lowered, .resource_drop, .resource_new, .resource_rep => return null,
+            .aliased => |alias_idx| {
+                const ie = self.component.aliases[alias_idx].instance_export;
+                if (ie.instance_idx >= self.core_instances.len) return null;
+                const mi = self.core_instances[ie.instance_idx].module_inst orelse return null;
+                const local = mi.getExportFunc(ie.name) orelse return null;
+                return .{ .mi = mi, .local_idx = local };
+            },
+        }
+    }
+
     /// Read `len` bytes starting at guest linear-memory offset `ptr` from the
     /// canonical memory of this component. Used by host adapter callbacks
     /// invoked from `componentTrampoline` to materialize `list<u8>` /
@@ -248,11 +296,37 @@ pub const ComponentInstance = struct {
     /// Returns null if no such instance is present, the memory is missing,
     /// or the slice is out of bounds.
     pub fn readGuestBytes(self: *const ComponentInstance, ptr: u32, len: u32) ?[]const u8 {
-        const mi = self.firstModuleInst() orelse return null;
-        const mem = mi.getMemory(0) orelse return null;
+        const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);
         if (end > mem.data.len) return null;
         return mem.data[ptr..end];
+    }
+
+    /// Return the "canonical" guest memory: the one that
+    /// `cabi_realloc` allocates into and that lift/lower of compound
+    /// types reads/writes through. Prefers a top-level core memory 0
+    /// (which under wit-component output is `alias core export $main
+    /// "memory"`); falls back to the first module instance's memory[0]
+    /// for legacy hand-authored fixtures.
+    pub fn canonicalMemory(self: *const ComponentInstance) ?*core_types.MemoryInstance {
+        if (self.resolveTopLevelMemory(0)) |m| return m;
+        const mi = self.firstModuleInst() orelse return null;
+        return mi.getMemory(0);
+    }
+
+    /// Locate the module instance that owns `cabi_realloc`. wit-component
+    /// emits `cabi_realloc` on the same core module that owns the
+    /// canonical memory (`$main` in stdio-echo); legacy fixtures put it
+    /// on the only module instance.
+    fn reallocOwner(self: *const ComponentInstance) ?*core_types.ModuleInstance {
+        // First try: walk all core instances looking for one that exports
+        // `cabi_realloc`. This is robust regardless of which instance the
+        // canonical memory aliases through.
+        for (self.core_instances) |entry| {
+            const mi = entry.module_inst orelse continue;
+            if (mi.getExportFunc("cabi_realloc") != null) return mi;
+        }
+        return null;
     }
 
     /// Allocate `len` bytes inside the canonical guest linear memory and
@@ -268,14 +342,14 @@ pub const ComponentInstance = struct {
     /// the main core module; we call it with `(0, 0, align=1, len)` to
     /// allocate fresh space.
     pub fn hostAllocAndWrite(self: *ComponentInstance, bytes: []const u8) ?u32 {
-        const mi = self.firstModuleInst() orelse return null;
-        const realloc_local = mi.getExportFunc("cabi_realloc") orelse return null;
+        const realloc_owner = self.reallocOwner() orelse return null;
+        const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
         const executor = @import("executor.zig");
-        const env = ExecEnv.create(mi, 4096, self.allocator) catch return null;
+        const env = ExecEnv.create(realloc_owner, 4096, self.allocator) catch return null;
         defer env.destroy();
         const ptr = executor.callRealloc(env, realloc_local, 0, 0, 1, @intCast(bytes.len)) catch return null;
-        const mem = mi.getMemory(0) orelse return null;
+        const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + bytes.len;
         if (end > mem.data.len) return null;
         @memcpy(mem.data[ptr..end], bytes);
