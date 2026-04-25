@@ -81,7 +81,15 @@ pub fn main(init: std.process.Init) !void {
     if (wasm_data.len >= 8 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.wasm_magic) {
         const version = std.mem.readInt(u32, wasm_data[4..8], .little);
         if (version == wamr.types.component_version) {
-            runComponent(wasm_data, allocator, io);
+            // Inherit host env. EnvVar slices borrow from the existing
+            // environ_map (lifetime: the entire process).
+            var env_list: std.ArrayListUnmanaged(wamr.wasi_cli_adapter.EnvVar) = .empty;
+            defer env_list.deinit(allocator);
+            var it = init.environ_map.array_hash_map.iterator();
+            while (it.next()) |kv| {
+                env_list.append(allocator, .{ .name = kv.key_ptr.*, .value = kv.value_ptr.* }) catch {};
+            }
+            runComponent(wasm_data, allocator, io, path, wasm_args.items, env_list.items);
             return;
         }
     }
@@ -90,10 +98,26 @@ pub fn main(init: std.process.Init) !void {
     runWasm(wasm_data, stack_size, &wasm_args, allocator);
 }
 
-fn runComponent(data: []const u8, allocator: std.mem.Allocator, io: std.Io) void {
+fn runComponent(
+    data: []const u8,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    wasm_path: []const u8,
+    wasm_args: []const []const u8,
+    env_vars: []const wamr.wasi_cli_adapter.EnvVar,
+) void {
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
     defer adapter.deinit();
+
+    // argv[0] = wasm path, rest = user args (matches wasmtime convention).
+    var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch
+        std.process.exit(1);
+    defer allocator.free(argv_buf);
+    argv_buf[0] = wasm_path;
+    for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
+    adapter.setArguments(argv_buf);
+    adapter.setEnvironment(env_vars);
 
     const outcome = adapter_mod.runComponentBytes(data, allocator, &adapter) catch |err| {
         switch (err) {
