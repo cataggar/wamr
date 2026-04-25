@@ -455,22 +455,33 @@ pub fn instantiate(
                     const module_ptr = mod_alloc.create(core_types.WasmModule) catch continue;
                     module_ptr.* = loaded;
 
-                    // Resolve every function import against `with` args BEFORE
-                    // instantiation. Two backends:
+                    // Resolve every import against `with` args BEFORE
+                    // instantiation. Three backends:
                     //   * Cross-instance: the source `with`-arg is a real core
-                    //     module instance; wire `import_functions[i]` so the
-                    //     interpreter dispatches into the source's body
-                    //     (interp.executeFunction switches `env.module_inst`).
-                    //   * Canon.lower: the source is an inline-exports bundle
-                    //     pointing at a `canon lower` core func; install a
-                    //     `componentTrampoline` on `host_func_entries[i]`.
-                    // Slots not satisfied by either backend remain unresolved
-                    // (interp falls through to a no-op stub).
+                    //     module instance; wire the appropriate per-kind slot
+                    //     (`import_functions` / `memories` / `tables` /
+                    //     `globals`) so the interpreter dispatches into the
+                    //     source's body / shares the same MemoryInstance etc.
+                    //   * Canon.lower (function-only): the source is an
+                    //     inline-exports bundle pointing at a `canon lower`
+                    //     core func; install a `componentTrampoline` on
+                    //     `host_func_entries[i]`.
+                    //   * Unresolved: function slots fall through to a no-op
+                    //     stub; non-function unresolved imports trap at
+                    //     instantiation (current `instantiateWithImports`
+                    //     contract — caller must satisfy them).
                     const import_func_count = module_ptr.import_function_count;
+                    const import_mem_count = module_ptr.import_memory_count;
+                    const import_tbl_count = module_ptr.import_table_count;
+                    const import_glob_count = module_ptr.import_global_count;
                     var entries: []?core_types.HostFnEntry = &.{};
                     var imps_buf: []core_types.ImportedFunction = &.{};
                     var is_cross: []bool = &.{};
+                    var mems_buf: []*core_types.MemoryInstance = &.{};
+                    var tbls_buf: []*core_types.TableInstance = &.{};
+                    var globs_buf: []*core_types.GlobalInstance = &.{};
                     var first_cross_src: ?*core_types.ModuleInstance = null;
+                    var has_imports_resolved = false;
                     if (import_func_count > 0) {
                         entries = allocator.alloc(?core_types.HostFnEntry, import_func_count) catch continue;
                         @memset(entries, null);
@@ -485,124 +496,187 @@ pub fn instantiate(
                         };
                         @memset(is_cross, false);
                     }
+                    // Per-kind resolution buffers; allocated lazily so a module
+                    // with e.g. zero memory imports never touches the allocator.
+                    if (import_mem_count > 0) {
+                        mems_buf = allocator.alloc(*core_types.MemoryInstance, import_mem_count) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            continue;
+                        };
+                    }
+                    if (import_tbl_count > 0) {
+                        tbls_buf = allocator.alloc(*core_types.TableInstance, import_tbl_count) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            if (mems_buf.len > 0) allocator.free(mems_buf);
+                            continue;
+                        };
+                    }
+                    if (import_glob_count > 0) {
+                        globs_buf = allocator.alloc(*core_types.GlobalInstance, import_glob_count) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            if (mems_buf.len > 0) allocator.free(mems_buf);
+                            if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                            continue;
+                        };
+                    }
 
+                    // Walk imports once, dispatching by kind. Per-kind running
+                    // index counters track the position within the per-kind
+                    // import sequence — the interpreter's `ImportContext`
+                    // fields are indexed by these (not by the global import
+                    // index).
                     var imp_func_idx: u32 = 0;
+                    var imp_mem_idx: u32 = 0;
+                    var imp_tbl_idx: u32 = 0;
+                    var imp_glob_idx: u32 = 0;
                     for (module_ptr.imports) |imp| {
-                        if (imp.kind != .function) continue;
-                        defer imp_func_idx += 1;
-
+                        // Find the `with` arg whose name matches this import's
+                        // wasm "module" string (component-model `with` keys).
                         const source_inst_idx: u32 = arg_blk: {
                             for (ie.args) |arg| {
                                 if (std.mem.eql(u8, arg.name, imp.module_name)) break :arg_blk arg.instance_idx;
                             }
                             break :arg_blk std.math.maxInt(u32);
                         };
-                        if (source_inst_idx == std.math.maxInt(u32)) continue;
-                        if (source_inst_idx >= ci_idx) continue;
-                        const source_entry = cis[source_inst_idx];
 
-                        if (source_entry.module_inst) |src_mi| {
-                            // Cross-instance core wiring: look up the named
-                            // export in the source module instance.
-                            const target_func_idx = src_mi.getExportFunc(imp.field_name) orelse continue;
-                            imps_buf[imp_func_idx] = .{ .module_inst = src_mi, .func_idx = target_func_idx };
-                            is_cross[imp_func_idx] = true;
-                            if (first_cross_src == null) first_cross_src = src_mi;
-                            continue;
-                        }
+                        switch (imp.kind) {
+                            .function => {
+                                defer imp_func_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const source_entry = cis[source_inst_idx];
 
-                        // Inline-exports source — existing canon.lower path.
-                        var member_sort_idx: ?ctypes.CoreSort = null;
-                        var member_idx: u32 = 0;
-                        for (source_entry.inline_exports) |mem| {
-                            if (std.mem.eql(u8, mem.name, imp.field_name)) {
-                                member_sort_idx = mem.sort_idx.sort;
-                                member_idx = mem.sort_idx.idx;
-                                break;
-                            }
-                        }
-                        if (member_sort_idx == null) continue;
-                        if (member_sort_idx.? != .func) continue;
+                                if (source_entry.module_inst) |src_mi| {
+                                    const target_func_idx = src_mi.getExportFunc(imp.field_name) orelse continue;
+                                    imps_buf[imp_func_idx] = .{ .module_inst = src_mi, .func_idx = target_func_idx };
+                                    is_cross[imp_func_idx] = true;
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
 
-                        // Resolve member_idx in core-func-index-space back to
-                        // a canon.lower. Simplified layout: we assume the
-                        // space is populated exclusively by canon.lower
-                        // entries in canons[] order (no core aliases, no
-                        // module-import funcs at top level). This covers the
-                        // hand-authored 2A.2b fixture and common Rust emit
-                        // patterns; the full resolver lands in a later slice.
-                        const canon_idx = resolveCoreFuncLower(component, member_idx) orelse continue;
-                        const canon = component.canons[canon_idx];
-                        const lower = switch (canon) {
-                            .lower => |l| l,
-                            else => continue,
-                        };
+                                // Inline-exports source — canon.lower trampoline path.
+                                var member_sort_idx: ?ctypes.CoreSort = null;
+                                var member_idx: u32 = 0;
+                                for (source_entry.inline_exports) |mem| {
+                                    if (std.mem.eql(u8, mem.name, imp.field_name)) {
+                                        member_sort_idx = mem.sort_idx.sort;
+                                        member_idx = mem.sort_idx.idx;
+                                        break;
+                                    }
+                                }
+                                if (member_sort_idx == null) continue;
+                                if (member_sort_idx.? != .func) continue;
 
-                        // Build and own the trampoline context. The actual
-                        // `HostFunc.call` is resolved later by `linkImports`
-                        // when the caller supplies the import providers;
-                        // here we just record which component func index
-                        // this trampoline is lowering.
-                        const ctx_ptr = allocator.create(executor_mod.ComponentTrampolineCtx) catch continue;
-                        if (lower.func_idx >= component.types.len) {
-                            allocator.destroy(ctx_ptr);
-                            continue;
-                        }
-                        const ft = switch (component.types[lower.func_idx]) {
-                            .func => |ft_v| ft_v,
-                            else => {
-                                allocator.destroy(ctx_ptr);
-                                continue;
-                            },
-                        };
-                        const params = allocator.alloc(ctypes.ValType, ft.params.len) catch {
-                            allocator.destroy(ctx_ptr);
-                            continue;
-                        };
-                        for (ft.params, 0..) |p, i| params[i] = p.type;
-                        const results = switch (ft.results) {
-                            .none => allocator.alloc(ctypes.ValType, 0) catch {
-                                allocator.free(params);
-                                allocator.destroy(ctx_ptr);
-                                continue;
-                            },
-                            .unnamed => |t| blk: {
-                                const r = allocator.alloc(ctypes.ValType, 1) catch {
-                                    allocator.free(params);
+                                const canon_idx = resolveCoreFuncLower(component, member_idx) orelse continue;
+                                const canon = component.canons[canon_idx];
+                                const lower = switch (canon) {
+                                    .lower => |l| l,
+                                    else => continue,
+                                };
+
+                                const ctx_ptr = allocator.create(executor_mod.ComponentTrampolineCtx) catch continue;
+                                if (lower.func_idx >= component.types.len) {
+                                    allocator.destroy(ctx_ptr);
+                                    continue;
+                                }
+                                const ft = switch (component.types[lower.func_idx]) {
+                                    .func => |ft_v| ft_v,
+                                    else => {
+                                        allocator.destroy(ctx_ptr);
+                                        continue;
+                                    },
+                                };
+                                const params = allocator.alloc(ctypes.ValType, ft.params.len) catch {
                                     allocator.destroy(ctx_ptr);
                                     continue;
                                 };
-                                r[0] = t;
-                                break :blk r;
-                            },
-                            .named => |named| blk: {
-                                const r = allocator.alloc(ctypes.ValType, named.len) catch {
-                                    allocator.free(params);
+                                for (ft.params, 0..) |p, i| params[i] = p.type;
+                                const results = switch (ft.results) {
+                                    .none => allocator.alloc(ctypes.ValType, 0) catch {
+                                        allocator.free(params);
+                                        allocator.destroy(ctx_ptr);
+                                        continue;
+                                    },
+                                    .unnamed => |t| blk2: {
+                                        const r = allocator.alloc(ctypes.ValType, 1) catch {
+                                            allocator.free(params);
+                                            allocator.destroy(ctx_ptr);
+                                            continue;
+                                        };
+                                        r[0] = t;
+                                        break :blk2 r;
+                                    },
+                                    .named => |named| blk2: {
+                                        const r = allocator.alloc(ctypes.ValType, named.len) catch {
+                                            allocator.free(params);
+                                            allocator.destroy(ctx_ptr);
+                                            continue;
+                                        };
+                                        for (named, 0..) |n, i| r[i] = n.type;
+                                        break :blk2 r;
+                                    },
+                                };
+                                ctx_ptr.* = .{
+                                    .comp_inst = inst,
+                                    .host_func = .{},
+                                    .component_func_idx = lower.func_idx,
+                                    .param_types = params,
+                                    .result_types = results,
+                                    .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
+                                };
+                                inst.trampoline_ctxs.append(allocator, ctx_ptr) catch {
+                                    ctx_ptr.deinit(allocator);
                                     allocator.destroy(ctx_ptr);
                                     continue;
                                 };
-                                for (named, 0..) |n, i| r[i] = n.type;
-                                break :blk r;
-                            },
-                        };
-                        ctx_ptr.* = .{
-                            .comp_inst = inst,
-                            .host_func = .{}, // filled in by linkImports
-                            .component_func_idx = lower.func_idx,
-                            .param_types = params,
-                            .result_types = results,
-                            .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
-                        };
-                        inst.trampoline_ctxs.append(allocator, ctx_ptr) catch {
-                            ctx_ptr.deinit(allocator);
-                            allocator.destroy(ctx_ptr);
-                            continue;
-                        };
 
-                        entries[imp_func_idx] = .{
-                            .func = &executor_mod.componentTrampoline,
-                            .ctx = @ptrCast(ctx_ptr),
-                        };
+                                entries[imp_func_idx] = .{
+                                    .func = &executor_mod.componentTrampoline,
+                                    .ctx = @ptrCast(ctx_ptr),
+                                };
+                            },
+                            .memory => {
+                                defer imp_mem_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const src_mi = cis[source_inst_idx].module_inst orelse continue;
+                                const exp = src_mi.module.findExport(imp.field_name, .memory) orelse continue;
+                                if (exp.index >= src_mi.memories.len) continue;
+                                mems_buf[imp_mem_idx] = src_mi.memories[exp.index];
+                                if (first_cross_src == null) first_cross_src = src_mi;
+                                has_imports_resolved = true;
+                            },
+                            .table => {
+                                defer imp_tbl_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const src_mi = cis[source_inst_idx].module_inst orelse continue;
+                                const exp = src_mi.module.findExport(imp.field_name, .table) orelse continue;
+                                if (exp.index >= src_mi.tables.len) continue;
+                                tbls_buf[imp_tbl_idx] = src_mi.tables[exp.index];
+                                if (first_cross_src == null) first_cross_src = src_mi;
+                                has_imports_resolved = true;
+                            },
+                            .global => {
+                                defer imp_glob_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const src_mi = cis[source_inst_idx].module_inst orelse continue;
+                                const exp = src_mi.module.findExport(imp.field_name, .global) orelse continue;
+                                if (exp.index >= src_mi.globals.len) continue;
+                                globs_buf[imp_glob_idx] = src_mi.globals[exp.index];
+                                if (first_cross_src == null) first_cross_src = src_mi;
+                                has_imports_resolved = true;
+                            },
+                            else => {},
+                        }
                     }
 
                     // Instantiate, optionally seeding `import_functions` for
@@ -613,17 +687,27 @@ pub fn instantiate(
                     // import is unresolved (caught by the no-op stub before
                     // `import_functions` is consulted).
                     const mi = blk: {
-                        if (first_cross_src) |placeholder| {
-                            for (imps_buf, 0..) |*slot, i| {
-                                if (!is_cross[i]) {
-                                    slot.* = .{ .module_inst = placeholder, .func_idx = 0 };
+                        if (has_imports_resolved or first_cross_src != null) {
+                            if (first_cross_src) |placeholder| {
+                                for (imps_buf, 0..) |*slot, i| {
+                                    if (!is_cross[i]) {
+                                        slot.* = .{ .module_inst = placeholder, .func_idx = 0 };
+                                    }
                                 }
                             }
-                            const ctx = inst_mod.ImportContext{ .functions = imps_buf };
+                            const ctx = inst_mod.ImportContext{
+                                .functions = imps_buf,
+                                .memories = mems_buf,
+                                .tables = tbls_buf,
+                                .globals = globs_buf,
+                            };
                             break :blk inst_mod.instantiateWithImports(module_ptr, allocator, ctx) catch {
                                 if (entries.len > 0) allocator.free(entries);
                                 if (imps_buf.len > 0) allocator.free(imps_buf);
                                 if (is_cross.len > 0) allocator.free(is_cross);
+                                if (mems_buf.len > 0) allocator.free(mems_buf);
+                                if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                                if (globs_buf.len > 0) allocator.free(globs_buf);
                                 continue;
                             };
                         }
@@ -631,6 +715,9 @@ pub fn instantiate(
                             if (entries.len > 0) allocator.free(entries);
                             if (imps_buf.len > 0) allocator.free(imps_buf);
                             if (is_cross.len > 0) allocator.free(is_cross);
+                            if (mems_buf.len > 0) allocator.free(mems_buf);
+                            if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                            if (globs_buf.len > 0) allocator.free(globs_buf);
                             continue;
                         };
                     };
@@ -639,6 +726,9 @@ pub fn instantiate(
                     if (entries.len > 0) inst_mod.attachHostFuncEntries(mi, entries);
                     if (imps_buf.len > 0) allocator.free(imps_buf);
                     if (is_cross.len > 0) allocator.free(is_cross);
+                    if (mems_buf.len > 0) allocator.free(mems_buf);
+                    if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                    if (globs_buf.len > 0) allocator.free(globs_buf);
                 },
             }
         }
@@ -1465,6 +1555,45 @@ test "instantiate: H1 micro-fixture — multi-core-module composition with cross
     var results: [1]abi_mod.InterfaceValue = undefined;
     try executor.callComponentFunc(inst, "g", &args, &results, std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 8), results[0].u32);
+}
+
+test "instantiate: H1.2 micro-fixture — cross-instance memory wiring (#156 H1.2)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Two-module composition (see fixtures/h1-mem.wat):
+    //   $A exports memory "mem".
+    //   $B imports "a"."mem", stores 42 at offset 0 then loads it.
+    //   Component lifts $b's "g" as export "g" : u32 → must be 42.
+    // Exercises `(with NAME (instance N))` matching against a real source
+    // instance's *memory* export, populating ImportContext.memories so the
+    // shared MemoryInstance is seen by both core modules.
+    const data = @embedFile("fixtures/h1-mem.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try inst.linkImports(providers);
+
+    // Both core instances must share the same MemoryInstance.
+    try std.testing.expect(inst.core_instances.len == 2);
+    const mi_a = inst.core_instances[0].module_inst orelse return error.TestFailed;
+    const mi_b = inst.core_instances[1].module_inst orelse return error.TestFailed;
+    try std.testing.expect(mi_a.memories.len >= 1);
+    try std.testing.expect(mi_b.memories.len >= 1);
+    try std.testing.expectEqual(mi_a.memories[0], mi_b.memories[0]);
+
+    var args: [0]abi_mod.InterfaceValue = .{};
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "g", &args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 42), results[0].u32);
 }
 
 test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)" {
