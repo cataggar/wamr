@@ -76,9 +76,27 @@ pub const WasiCliAdapter = struct {
     io_streams_iface: HostInstance = .{},
     io_poll_iface: HostInstance = .{},
     io_error_iface: HostInstance = .{},
+    clocks_wall_iface: HostInstance = .{},
+    clocks_monotonic_iface: HostInstance = .{},
 
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
+
+    /// Optional deterministic-clock injection. When set, `wasi:clocks/wall-clock.now`
+    /// returns this datetime instead of reading the host wall clock — used by
+    /// tests that assert on the lifted `record { seconds, nanoseconds }`.
+    wall_clock_override: ?Datetime = null,
+    /// Optional deterministic-monotonic-clock injection. When set,
+    /// `wasi:clocks/monotonic-clock.now` and `subscribe-*` use this value
+    /// (`subscribe-instant` clamps the deadline; `subscribe-duration` adds
+    /// to it). Defaults to live `std.time.Instant`.
+    monotonic_clock_override: ?u64 = null,
+    /// Counter that mints unique synthetic `pollable` handles for
+    /// `subscribe-instant` / `subscribe-duration`. The handles are opaque
+    /// from the runtime's perspective — every pollable produced by the
+    /// clocks adapter is treated as immediately ready (same simplification
+    /// as the existing `wasi:io/poll` stub). Resource-drop is a no-op.
+    next_pollable_handle: u32 = 1,
 
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
     /// after the component runs to inspect captured output.
@@ -107,6 +125,8 @@ pub const WasiCliAdapter = struct {
         self.io_streams_iface.deinit(self.allocator);
         self.io_poll_iface.deinit(self.allocator);
         self.io_error_iface.deinit(self.allocator);
+        self.clocks_wall_iface.deinit(self.allocator);
+        self.clocks_monotonic_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
     }
@@ -377,6 +397,65 @@ pub const WasiCliAdapter = struct {
         });
     }
 
+    /// Register `wasi:clocks/wall-clock` (#146).
+    ///
+    /// Members:
+    ///   - `now: () -> datetime`        (real-time clock; nanos since UNIX epoch)
+    ///   - `resolution: () -> datetime` (clock granularity, conservatively `1ns`)
+    ///
+    /// `datetime` is `record { seconds: u64, nanoseconds: u32 }`. Lift uses
+    /// `std.time.nanoTimestamp` unless `wall_clock_override` is set (test mode).
+    pub fn populateWasiClocksWallClock(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        wall_clock_name: []const u8,
+    ) !void {
+        try self.clocks_wall_iface.members.put(self.allocator, "now", .{
+            .func = .{ .context = self, .call = &wallClockNow },
+        });
+        try self.clocks_wall_iface.members.put(self.allocator, "resolution", .{
+            .func = .{ .context = self, .call = &wallClockResolution },
+        });
+        try providers.put(self.allocator, wall_clock_name, .{
+            .host_instance = &self.clocks_wall_iface,
+        });
+    }
+
+    /// Register `wasi:clocks/monotonic-clock` (#146).
+    ///
+    /// Members:
+    ///   - `now: () -> instant`                          (`u64`, ns since arbitrary epoch)
+    ///   - `resolution: () -> duration`                  (`u64`, ns)
+    ///   - `subscribe-instant: (instant) -> own<pollable>`
+    ///   - `subscribe-duration: (duration) -> own<pollable>`
+    ///
+    /// The `subscribe-*` calls mint synthetic always-ready pollable handles,
+    /// matching the `wasi:io/poll` stub: stdio-style components never
+    /// actually multiplex on a deadline, but they do drop the returned
+    /// pollables, so `[resource-drop]pollable` (already wired by
+    /// `populateWasiIoPollError`) handles cleanup.
+    pub fn populateWasiClocksMonotonicClock(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        monotonic_clock_name: []const u8,
+    ) !void {
+        try self.clocks_monotonic_iface.members.put(self.allocator, "now", .{
+            .func = .{ .context = self, .call = &monotonicClockNow },
+        });
+        try self.clocks_monotonic_iface.members.put(self.allocator, "resolution", .{
+            .func = .{ .context = self, .call = &monotonicClockResolution },
+        });
+        try self.clocks_monotonic_iface.members.put(self.allocator, "subscribe-instant", .{
+            .func = .{ .context = self, .call = &monotonicSubscribe },
+        });
+        try self.clocks_monotonic_iface.members.put(self.allocator, "subscribe-duration", .{
+            .func = .{ .context = self, .call = &monotonicSubscribe },
+        });
+        try providers.put(self.allocator, monotonic_clock_name, .{
+            .host_instance = &self.clocks_monotonic_iface,
+        });
+    }
+
     /// `(own<R>) -> ()` no-op — the host never produces non-stream
     /// resources on the happy path, so dropping one is purely guest-side
     /// bookkeeping that we can swallow.
@@ -387,6 +466,97 @@ pub const WasiCliAdapter = struct {
         _: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {}
+
+    /// `wasi:clocks/wall-clock.now: () -> datetime` (#146).
+    /// Lifts UNIX-epoch nanos into `record { seconds: u64, nanoseconds: u32 }`.
+    /// Honors `self.wall_clock_override` for deterministic tests.
+    fn wallClockNow(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const dt = self.wall_clock_override orelse readClockDatetime(.REALTIME);
+        results[0] = try buildDatetimeRecord(allocator, dt);
+    }
+
+    /// `wasi:clocks/wall-clock.resolution: () -> datetime` (#146).
+    /// Reports a 1-nanosecond resolution; conservative for any host that
+    /// can read `nanoTimestamp`.
+    fn wallClockResolution(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = try buildDatetimeRecord(allocator, .{ .seconds = 0, .nanoseconds = 1 });
+    }
+
+    /// `wasi:clocks/monotonic-clock.now: () -> instant` (#146).
+    /// `instant` lifts as a flat `u64`. Honors `monotonic_clock_override`.
+    fn monotonicClockNow(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .u64 = self.monotonicNs() };
+    }
+
+    /// `wasi:clocks/monotonic-clock.resolution: () -> duration` (#146).
+    /// `duration` lifts as `u64`; we report 1ns.
+    fn monotonicClockResolution(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .u64 = 1 };
+    }
+
+    /// `wasi:clocks/monotonic-clock.subscribe-instant: (instant) -> own<pollable>`
+    /// **and** `subscribe-duration: (duration) -> own<pollable>` (#146).
+    ///
+    /// Both shapes are identical at the canonical-ABI level (`(u64) -> i32`),
+    /// so a single host fn services both members. We mint a synthetic
+    /// always-ready pollable handle. Real `poll.poll` integration arrives
+    /// when (and if) the runtime grows a cooperative scheduler.
+    fn monotonicSubscribe(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        // The deadline argument is ignored by the always-ready stub, but
+        // accept any flat-u64-like representation produced by the lift.
+        switch (args[0]) {
+            .u64, .s64, .u32, .s32 => {},
+            else => return error.InvalidArgs,
+        }
+        const handle = self.next_pollable_handle;
+        self.next_pollable_handle +%= 1;
+        results[0] = .{ .handle = handle };
+    }
+
+    /// Read the monotonic clock as nanoseconds. Honors
+    /// `monotonic_clock_override` for tests.
+    fn monotonicNs(self: *const WasiCliAdapter) u64 {
+        if (self.monotonic_clock_override) |v| return v;
+        return readClockNs(.MONOTONIC);
+    }
 
     fn allocStreamHandle(self: *WasiCliAdapter, stream: *streams.OutputStream) !u32 {
         // Linear scan for a free slot before extending; output streams are
@@ -799,6 +969,63 @@ pub const WasiCliAdapter = struct {
     }
 };
 
+/// `wasi:clocks/wall-clock.datetime`: a record of `(seconds: u64, nanoseconds: u32)`.
+pub const Datetime = struct {
+    seconds: u64,
+    nanoseconds: u32,
+};
+
+/// Read a POSIX clock and lift it into a `Datetime`. On failure (or where
+/// `clock_gettime` is unavailable, e.g. Windows / freestanding), returns
+/// the zero datetime — sufficient for the spec contract on those targets
+/// (host clocks are never observed by the unit tests, which use the
+/// adapter's deterministic-clock injection paths). Both fields are
+/// clamped to valid ranges (`seconds >= 0`, `nanoseconds < 1e9`).
+fn readClockDatetime(clock_id: ClockId) Datetime {
+    if (!have_posix_clock) return .{ .seconds = 0, .nanoseconds = 0 };
+    var ts: std.posix.timespec = undefined;
+    const rc = std.posix.system.clock_gettime(clock_id, &ts);
+    if (std.posix.errno(rc) != .SUCCESS) return .{ .seconds = 0, .nanoseconds = 0 };
+    const secs: u64 = if (ts.sec < 0) 0 else @intCast(ts.sec);
+    const nsec_raw = ts.nsec;
+    const nsec: u32 = if (nsec_raw < 0)
+        0
+    else if (nsec_raw >= 1_000_000_000)
+        999_999_999
+    else
+        @intCast(nsec_raw);
+    return .{ .seconds = secs, .nanoseconds = nsec };
+}
+
+/// Read a POSIX clock and flatten to nanoseconds since its epoch. Used for
+/// `monotonic-clock.now`, where preview-2's `instant` is a flat `u64`.
+fn readClockNs(clock_id: ClockId) u64 {
+    const dt = readClockDatetime(clock_id);
+    return dt.seconds *% 1_000_000_000 +% @as(u64, dt.nanoseconds);
+}
+
+/// Cross-platform alias for the host clock-id type. On POSIX targets it
+/// is `std.posix.clockid_t`; on Windows `std.posix.clockid_t` is `void`
+/// and `clock_gettime` is unusable, so we substitute a plain enum so
+/// `.REALTIME` / `.MONOTONIC` enum literals at the call sites still
+/// compile. `readClockDatetime` short-circuits before consulting the
+/// value on those targets, so the substitute never reaches the syscall.
+const have_posix_clock = @import("builtin").os.tag != .windows and
+    @hasDecl(std.posix.system, "clock_gettime");
+const ClockId = if (have_posix_clock)
+    std.posix.clockid_t
+else
+    enum { REALTIME, MONOTONIC };
+
+/// Allocate an `InterfaceValue` carrying a `record { seconds: u64, nanoseconds: u32 }`
+/// shape. Caller (the trampoline) `deinit`s the result via the same allocator.
+fn buildDatetimeRecord(allocator: Allocator, dt: Datetime) !InterfaceValue {
+    const fields = try allocator.alloc(InterfaceValue, 2);
+    fields[0] = .{ .u64 = dt.seconds };
+    fields[1] = .{ .u32 = dt.nanoseconds };
+    return .{ .record_val = fields };
+}
+
 // ── Top-level CLI dispatch ─────────────────────────────────────────────────
 
 const ctypes_root = @import("types.zig");
@@ -854,6 +1081,8 @@ pub fn populateWasiProviders(
     var matched_streams: ?[]const u8 = null;
     var matched_poll: ?[]const u8 = null;
     var matched_error: ?[]const u8 = null;
+    var matched_wall_clock: ?[]const u8 = null;
+    var matched_monotonic_clock: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
@@ -882,6 +1111,10 @@ pub fn populateWasiProviders(
             matched_poll = imp.name;
         if (matched_error == null and matchesWasiPrefix(imp.name, "wasi:io/error"))
             matched_error = imp.name;
+        if (matched_wall_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/wall-clock"))
+            matched_wall_clock = imp.name;
+        if (matched_monotonic_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/monotonic-clock"))
+            matched_monotonic_clock = imp.name;
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -940,6 +1173,18 @@ pub fn populateWasiProviders(
     );
     if (matched_poll == null) _ = providers.remove("wasi:io/poll");
     if (matched_error == null) _ = providers.remove("wasi:io/error");
+
+    try adapter.populateWasiClocksWallClock(
+        providers,
+        matched_wall_clock orelse "wasi:clocks/wall-clock",
+    );
+    if (matched_wall_clock == null) _ = providers.remove("wasi:clocks/wall-clock");
+
+    try adapter.populateWasiClocksMonotonicClock(
+        providers,
+        matched_monotonic_clock orelse "wasi:clocks/monotonic-clock",
+    );
+    if (matched_monotonic_clock == null) _ = providers.remove("wasi:clocks/monotonic-clock");
 }
 
 /// Run an already-loaded component. See `runComponentBytes` for the
@@ -1634,4 +1879,100 @@ test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
 
     try testing.expect(outcome.is_ok);
     try testing.expectEqualStrings("echo: hello\n", adapter.getStdoutBytes());
+}
+
+test "populateWasiProviders: binds wasi:clocks/wall-clock + monotonic-clock (#146)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:clocks/wall-clock@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:clocks/monotonic-clock@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:clocks/wall-clock@0.2.6"));
+    try testing.expect(providers.contains("wasi:clocks/monotonic-clock@0.2.6"));
+    // Bare names must NOT be registered when the component imports the versioned form.
+    try testing.expect(!providers.contains("wasi:clocks/wall-clock"));
+    try testing.expect(!providers.contains("wasi:clocks/monotonic-clock"));
+
+    try testing.expect(adapter.clocks_wall_iface.members.contains("now"));
+    try testing.expect(adapter.clocks_wall_iface.members.contains("resolution"));
+    try testing.expect(adapter.clocks_monotonic_iface.members.contains("now"));
+    try testing.expect(adapter.clocks_monotonic_iface.members.contains("resolution"));
+    try testing.expect(adapter.clocks_monotonic_iface.members.contains("subscribe-instant"));
+    try testing.expect(adapter.clocks_monotonic_iface.members.contains("subscribe-duration"));
+}
+
+test "wasi:clocks/wall-clock.now lifts injected datetime through record_val (#146)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    adapter.wall_clock_override = .{ .seconds = 1_700_000_000, .nanoseconds = 123_456_789 };
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.wallClockNow(&adapter, &ci, &.{}, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .record_val);
+    try testing.expectEqual(@as(usize, 2), results[0].record_val.len);
+    try testing.expectEqual(@as(u64, 1_700_000_000), results[0].record_val[0].u64);
+    try testing.expectEqual(@as(u32, 123_456_789), results[0].record_val[1].u32);
+}
+
+test "wasi:clocks/wall-clock.resolution returns 1ns datetime (#146)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.wallClockResolution(null, &ci, &.{}, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .record_val);
+    try testing.expectEqual(@as(u64, 0), results[0].record_val[0].u64);
+    try testing.expectEqual(@as(u32, 1), results[0].record_val[1].u32);
+}
+
+test "wasi:clocks/monotonic-clock.now lifts injected u64 instant (#146)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    adapter.monotonic_clock_override = 42_000_000_000;
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.monotonicClockNow(&adapter, &ci, &.{}, &results, testing.allocator);
+    try testing.expectEqual(@as(u64, 42_000_000_000), results[0].u64);
+}
+
+test "wasi:clocks/monotonic-clock.subscribe-instant mints unique pollable handles (#146)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const args: [1]InterfaceValue = .{.{ .u64 = 0 }};
+    var r1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.monotonicSubscribe(&adapter, &ci, &args, &r1, testing.allocator);
+    try WasiCliAdapter.monotonicSubscribe(&adapter, &ci, &args, &r2, testing.allocator);
+
+    try testing.expect(r1[0].handle != r2[0].handle);
 }
