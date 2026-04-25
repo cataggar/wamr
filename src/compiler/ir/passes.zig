@@ -2264,34 +2264,68 @@ pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
     // a terminator within the same block; we must insert before the first
     // executed control-flow instruction.)
     //
-    // If `inc.value` is itself another phi's dest (phi-of-phi), the source
-    // value is no longer live as a VReg in the predecessor block — it's
-    // carried via `source_site.local`. Emit a `local_get → fresh_vreg`
-    // first, then set our local from that fresh vreg.
-    for (sites.items) |site| {
-        for (site.incoming) |inc| {
-            const pblock = func.getBlock(inc.block);
+    // Parallel-copy lowering: group all (site, inc) pairs by inc.block
+    // and emit ALL local_get reads of phi-of-phi sources BEFORE ANY
+    // local_set writes on the same edge. This avoids the read-after-
+    // write hazard when one phi at S has inc.value = another phi at S
+    // dest, both filled on the same pred edge.
+    {
+        // Build pred -> list of (site_idx, inc.value) groups.
+        var by_pred: std.AutoHashMap(ir.BlockId, std.ArrayList(struct { site_idx: usize, val: ir.VReg })) = .init(allocator);
+        defer {
+            var it = by_pred.iterator();
+            while (it.next()) |e| e.value_ptr.deinit(allocator);
+            by_pred.deinit();
+        }
+        for (sites.items, 0..) |site, sidx| {
+            for (site.incoming) |inc| {
+                const gop = try by_pred.getOrPut(inc.block);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(allocator, .{ .site_idx = sidx, .val = inc.value });
+            }
+        }
+
+        var it = by_pred.iterator();
+        while (it.next()) |entry| {
+            const pred_id = entry.key_ptr.*;
+            const group = entry.value_ptr.items;
+            const pblock = func.getBlock(pred_id);
             std.debug.assert(pblock.instructions.items.len > 0);
             var insert_at: usize = pblock.instructions.items.len;
             for (pblock.instructions.items, 0..) |pinst, idx| {
                 if (isTerminatorOp(pinst.op)) { insert_at = idx; break; }
             }
-            var src_val: ir.VReg = inc.value;
-            if (dest_to_site.get(inc.value)) |src_idx| {
-                const src_site = sites.items[src_idx];
-                const fresh = func.newVReg();
+
+            // Phase A: for each phi-of-phi entry, emit local_get of
+            // source site's local into a fresh vreg. Remember the mapped
+            // value (fresh vreg or inc.value) per group entry.
+            var mapped_vals = try allocator.alloc(ir.VReg, group.len);
+            defer allocator.free(mapped_vals);
+            for (group, 0..) |g, gi| {
+                if (dest_to_site.get(g.val)) |src_idx| {
+                    const src_site = sites.items[src_idx];
+                    const fresh = func.newVReg();
+                    try pblock.instructions.insert(pblock.allocator, insert_at, .{
+                        .op = .{ .local_get = src_site.local },
+                        .type = src_site.ty,
+                        .dest = fresh,
+                    });
+                    insert_at += 1;
+                    mapped_vals[gi] = fresh;
+                } else {
+                    mapped_vals[gi] = g.val;
+                }
+            }
+
+            // Phase B: emit local_sets using mapped values.
+            for (group, 0..) |g, gi| {
+                const site = sites.items[g.site_idx];
                 try pblock.instructions.insert(pblock.allocator, insert_at, .{
-                    .op = .{ .local_get = src_site.local },
-                    .type = src_site.ty,
-                    .dest = fresh,
+                    .op = .{ .local_set = .{ .idx = site.local, .val = mapped_vals[gi] } },
+                    .type = site.ty,
                 });
                 insert_at += 1;
-                src_val = fresh;
             }
-            try pblock.instructions.insert(pblock.allocator, insert_at, .{
-                .op = .{ .local_set = .{ .idx = site.local, .val = src_val } },
-                .type = site.ty,
-            });
         }
     }
 
