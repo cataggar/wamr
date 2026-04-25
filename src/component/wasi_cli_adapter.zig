@@ -48,42 +48,36 @@ const streams = @import("../wasi/preview2/streams.zig");
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
+    stderr: streams.OutputStream,
     /// Captured stdin buffer. Defaults to empty; callers populate via
     /// `setStdinBytes` before running the component. The slice is
     /// borrowed — keep it alive for as long as the component runs.
     stdin: streams.InputStream = .{ .source = .closed },
+
+    /// Set by `wasi:cli/exit.exit` (or `exit-with-code`). The host fn
+    /// also returns `error.Trap`; `runLoadedComponent` checks this
+    /// field to translate the trap into a normal `RunOutcome`.
+    exit_code: ?u32 = null,
+
     /// `HostInstance` registered for the simple test interface name
     /// (e.g. `"wasi:hello/world"`). Stored inline so the adapter owns its
     /// lifetime; callers pass a stable pointer to `linkImports`.
     write_iface: HostInstance = .{},
-    /// `HostInstance` for `wasi:cli/stdout` (member: `get-stdout`).
     cli_stdout_iface: HostInstance = .{},
-    /// `HostInstance` for `wasi:cli/stdin` (member: `get-stdin`).
+    cli_stderr_iface: HostInstance = .{},
     cli_stdin_iface: HostInstance = .{},
-    /// `HostInstance` for `wasi:io/streams` (members:
-    /// `[method]output-stream.blocking-write-and-flush`,
-    /// `[resource-drop]output-stream`).
+    cli_exit_iface: HostInstance = .{},
+    cli_environment_iface: HostInstance = .{},
+    cli_terminal_stdin_iface: HostInstance = .{},
+    cli_terminal_stdout_iface: HostInstance = .{},
+    cli_terminal_stderr_iface: HostInstance = .{},
+    cli_terminal_input_iface: HostInstance = .{},
+    cli_terminal_output_iface: HostInstance = .{},
     io_streams_iface: HostInstance = .{},
-    /// `HostInstance` for `wasi:io/poll`. Stdio-echo imports this for
-    /// type-resolution; only `[resource-drop]pollable` is wired with a
-    /// no-op since the guest never blocks on stdout. Other members trap
-    /// on call (left absent, so the trampoline reports an unresolved
-    /// import).
     io_poll_iface: HostInstance = .{},
-    /// `HostInstance` for `wasi:io/error`. Same shape as `io_poll_iface`:
-    /// only `[resource-drop]error` is wired; the host never produces an
-    /// `error` resource on the happy path.
     io_error_iface: HostInstance = .{},
 
-    /// Adapter-internal output-stream resource handles. Deliberately
-    /// independent of `ComponentInstance.resource_tables` — these handles
-    /// only flow through host calls and never need to round-trip into
-    /// guest-side `resource.{new,drop,rep}`. `0` is reserved and means
-    /// "stdout"; future handle types (stderr, files) will get distinct
-    /// non-zero values.
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
-    /// Adapter-internal input-stream handles, parallel to `stream_table`.
-    /// Same handle-vs-resource-table rationale.
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
 
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
@@ -92,19 +86,34 @@ pub const WasiCliAdapter = struct {
         return .{
             .allocator = allocator,
             .stdout = streams.OutputStream.toBuffer(),
+            .stderr = streams.OutputStream.toBuffer(),
         };
     }
 
     pub fn deinit(self: *WasiCliAdapter) void {
         self.stdout.deinit(self.allocator);
+        self.stderr.deinit(self.allocator);
         self.write_iface.deinit(self.allocator);
         self.cli_stdout_iface.deinit(self.allocator);
+        self.cli_stderr_iface.deinit(self.allocator);
         self.cli_stdin_iface.deinit(self.allocator);
+        self.cli_exit_iface.deinit(self.allocator);
+        self.cli_environment_iface.deinit(self.allocator);
+        self.cli_terminal_stdin_iface.deinit(self.allocator);
+        self.cli_terminal_stdout_iface.deinit(self.allocator);
+        self.cli_terminal_stderr_iface.deinit(self.allocator);
+        self.cli_terminal_input_iface.deinit(self.allocator);
+        self.cli_terminal_output_iface.deinit(self.allocator);
         self.io_streams_iface.deinit(self.allocator);
         self.io_poll_iface.deinit(self.allocator);
         self.io_error_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
+    }
+
+    /// Captured stderr bytes (separate buffer from stdout).
+    pub fn getStderrBytes(self: *const WasiCliAdapter) []const u8 {
+        return self.stderr.getBufferContents();
     }
 
     /// Set the captured stdin to read from `bytes`. The slice is
@@ -169,6 +178,36 @@ pub const WasiCliAdapter = struct {
         );
         try self.io_streams_iface.members.put(
             self.allocator,
+            "[method]output-stream.write",
+            .{ .func = .{ .context = self, .call = &outputStreamWrite } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.check-write",
+            .{ .func = .{ .context = self, .call = &outputStreamCheckWrite } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.blocking-flush",
+            .{ .func = .{ .context = self, .call = &outputStreamBlockingFlush } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.flush",
+            .{ .func = .{ .context = self, .call = &outputStreamBlockingFlush } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.subscribe",
+            .{ .func = .{ .context = self, .call = &outputStreamSubscribe } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]input-stream.subscribe",
+            .{ .func = .{ .context = self, .call = &inputStreamSubscribe } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
             "[resource-drop]output-stream",
             .{ .func = .{ .context = self, .call = &dropOutputStream } },
         );
@@ -180,11 +219,118 @@ pub const WasiCliAdapter = struct {
         );
         try self.io_streams_iface.members.put(
             self.allocator,
+            "[method]input-stream.read",
+            .{ .func = .{ .context = self, .call = &blockingRead } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
             "[resource-drop]input-stream",
             .{ .func = .{ .context = self, .call = &dropInputStream } },
         );
         try providers.put(self.allocator, io_streams_name, .{
             .host_instance = &self.io_streams_iface,
+        });
+    }
+
+    /// Register `wasi:cli/stderr` (mirror of stdout but writing to the
+    /// adapter's separate stderr buffer).
+    pub fn populateWasiCliStderr(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        cli_stderr_name: []const u8,
+    ) !void {
+        try self.cli_stderr_iface.members.put(self.allocator, "get-stderr", .{
+            .func = .{ .context = self, .call = &getStderrHandle },
+        });
+        try providers.put(self.allocator, cli_stderr_name, .{
+            .host_instance = &self.cli_stderr_iface,
+        });
+    }
+
+    /// Register `wasi:cli/exit`. `exit` and `exit-with-code` set
+    /// `self.exit_code` and surface as `error.Trap`; `runLoadedComponent`
+    /// translates that into a normal `RunOutcome` carrying the code.
+    pub fn populateWasiCliExit(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        cli_exit_name: []const u8,
+    ) !void {
+        try self.cli_exit_iface.members.put(self.allocator, "exit", .{
+            .func = .{ .context = self, .call = &cliExit },
+        });
+        try self.cli_exit_iface.members.put(self.allocator, "exit-with-code", .{
+            .func = .{ .context = self, .call = &cliExitWithCode },
+        });
+        try providers.put(self.allocator, cli_exit_name, .{
+            .host_instance = &self.cli_exit_iface,
+        });
+    }
+
+    /// Register `wasi:cli/environment`. All three accessors return
+    /// empty/none — sufficient for stdio-style components that don't
+    /// inspect env or args.
+    pub fn populateWasiCliEnvironment(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        cli_env_name: []const u8,
+    ) !void {
+        try self.cli_environment_iface.members.put(self.allocator, "get-environment", .{
+            .func = .{ .context = self, .call = &getEnvironment },
+        });
+        try self.cli_environment_iface.members.put(self.allocator, "get-arguments", .{
+            .func = .{ .context = self, .call = &getArguments },
+        });
+        try self.cli_environment_iface.members.put(self.allocator, "initial-cwd", .{
+            .func = .{ .context = self, .call = &initialCwd },
+        });
+        try providers.put(self.allocator, cli_env_name, .{
+            .host_instance = &self.cli_environment_iface,
+        });
+    }
+
+    /// Register `wasi:cli/terminal-{stdin,stdout,stderr,input,output}`.
+    /// In captured-buffer mode there is no real TTY, so each
+    /// `get-terminal-*` returns `none`. Resource-drop members on
+    /// `terminal-input` / `terminal-output` are wired as no-ops in
+    /// case the guest's runtime drops a freshly-pulled handle.
+    pub fn populateWasiCliTerminal(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        terminal_stdin_name: []const u8,
+        terminal_stdout_name: []const u8,
+        terminal_stderr_name: []const u8,
+        terminal_input_name: []const u8,
+        terminal_output_name: []const u8,
+    ) !void {
+        try self.cli_terminal_stdin_iface.members.put(self.allocator, "get-terminal-stdin", .{
+            .func = .{ .context = self, .call = &getTerminalNone },
+        });
+        try providers.put(self.allocator, terminal_stdin_name, .{
+            .host_instance = &self.cli_terminal_stdin_iface,
+        });
+        try self.cli_terminal_stdout_iface.members.put(self.allocator, "get-terminal-stdout", .{
+            .func = .{ .context = self, .call = &getTerminalNone },
+        });
+        try providers.put(self.allocator, terminal_stdout_name, .{
+            .host_instance = &self.cli_terminal_stdout_iface,
+        });
+        try self.cli_terminal_stderr_iface.members.put(self.allocator, "get-terminal-stderr", .{
+            .func = .{ .context = self, .call = &getTerminalNone },
+        });
+        try providers.put(self.allocator, terminal_stderr_name, .{
+            .host_instance = &self.cli_terminal_stderr_iface,
+        });
+        try self.cli_terminal_input_iface.members.put(self.allocator, "[resource-drop]terminal-input", .{
+            .func = .{ .context = self, .call = &noopResourceDrop },
+        });
+        try providers.put(self.allocator, terminal_input_name, .{
+            .host_instance = &self.cli_terminal_input_iface,
+        });
+        try self.cli_terminal_output_iface.members.put(self.allocator, "[resource-drop]terminal-output", .{
+            .func = .{ .context = self, .call = &noopResourceDrop },
+        });
+        try providers.put(self.allocator, terminal_output_name, .{
+            .host_instance = &self.cli_terminal_output_iface,
         });
     }
 
@@ -302,6 +448,111 @@ pub const WasiCliAdapter = struct {
         results[0] = .{ .handle = handle };
     }
 
+    /// `wasi:cli/stderr.get-stderr: () -> own<output-stream>`. Mirror of
+    /// `getStdoutHandle` for the captured stderr buffer.
+    fn getStderrHandle(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const handle = try self.allocStreamHandle(&self.stderr);
+        results[0] = .{ .handle = handle };
+    }
+
+    /// `wasi:cli/exit.exit: (result<_, _>) -> ()`. The arg is a
+    /// `result<_, _>` discriminant where `0` (ok) → exit 0, `1` (err) →
+    /// exit 1. Sets `self.exit_code` then traps so the run unwinds.
+    fn cliExit(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        const code: u32 = if (args.len > 0) switch (args[0]) {
+            .result_val => |rv| if (rv.is_ok) @as(u32, 0) else 1,
+            else => 0,
+        } else 0;
+        self.exit_code = code;
+        return error.WasiExit;
+    }
+
+    /// `wasi:cli/exit.exit-with-code: (u8) -> ()`. Sets the exit code
+    /// and traps. Mirrors `cliExit` for the typed-code form added in
+    /// later WASI 0.2 drafts.
+    fn cliExitWithCode(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        const code: u32 = if (args.len > 0) switch (args[0]) {
+            .u8 => |v| @intCast(v),
+            .u32 => |v| v,
+            .u64 => |v| @truncate(v),
+            else => 0,
+        } else 0;
+        self.exit_code = code;
+        return error.WasiExit;
+    }
+
+    /// `wasi:cli/environment.get-environment: () -> list<tuple<string,string>>`.
+    /// Returns an empty list (canonical pair `ptr=0, len=0`).
+    fn getEnvironment(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
+    }
+
+    /// `wasi:cli/environment.get-arguments: () -> list<string>`. Empty.
+    fn getArguments(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
+    }
+
+    /// `wasi:cli/environment.initial-cwd: () -> option<string>`. None.
+    fn initialCwd(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+    }
+
+    /// `wasi:cli/terminal-*.get-terminal-*: () -> option<terminal-*>`.
+    /// Captured-buffer mode has no TTY → return `none`.
+    fn getTerminalNone(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+    }
+
     /// `wasi:io/streams.[method]output-stream.blocking-write-and-flush:
     ///   (own<output-stream>, list<u8>) -> result<_, stream-error>`.
     /// Looks up the handle, writes the guest bytes through, and returns
@@ -334,6 +585,94 @@ pub const WasiCliAdapter = struct {
             .err, .closed => return error.IoError,
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]output-stream.write: (borrow<output-stream>, list<u8>)
+    ///   -> result<_, stream-error>`. Same write semantics as
+    /// `blocking-write-and-flush`; the captured buffer never blocks.
+    fn outputStreamWrite(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const list = switch (args[1]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const stream = self.lookupStream(handle) orelse return error.InvalidHandle;
+        const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
+            return error.OutOfBoundsMemory;
+        switch (stream.write(bytes, self.allocator)) {
+            .ok => {},
+            .err, .closed => return error.IoError,
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]output-stream.check-write: (borrow<output-stream>)
+    ///   -> result<u64, stream-error>`. The captured buffer can always
+    /// accept; report a generous chunk so the guest writes in one call.
+    fn outputStreamCheckWrite(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        _ = ctx_opaque;
+        if (args.len == 0 or results.len == 0) return error.InvalidArgs;
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = .{ .u64 = 64 * 1024 };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = payload } };
+    }
+
+    /// `[method]output-stream.blocking-flush: (borrow<output-stream>)
+    ///   -> result<_, stream-error>`. Captured buffer is unbuffered; ok.
+    fn outputStreamBlockingFlush(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]output-stream.subscribe: (borrow<output-stream>)
+    ///   -> own<pollable>`. Captured-buffer streams are always ready;
+    /// return a sentinel handle that drop-pollable will swallow.
+    fn outputStreamSubscribe(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (args.len == 0 or results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .handle = 0 };
+    }
+
+    /// `[method]input-stream.subscribe: (borrow<input-stream>)
+    ///   -> own<pollable>`. Same sentinel as the output side — the
+    /// captured stdin buffer is always ready.
+    fn inputStreamSubscribe(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (args.len == 0 or results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .handle = 0 };
     }
 
     /// `wasi:io/streams.[resource-drop]output-stream: (own<output-stream>) -> ()`.
@@ -503,7 +842,15 @@ pub fn populateWasiProviders(
     providers: *std.StringHashMapUnmanaged(ImportBinding),
 ) !void {
     var matched_stdout: ?[]const u8 = null;
+    var matched_stderr: ?[]const u8 = null;
     var matched_stdin: ?[]const u8 = null;
+    var matched_exit: ?[]const u8 = null;
+    var matched_environment: ?[]const u8 = null;
+    var matched_terminal_stdin: ?[]const u8 = null;
+    var matched_terminal_stdout: ?[]const u8 = null;
+    var matched_terminal_stderr: ?[]const u8 = null;
+    var matched_terminal_input: ?[]const u8 = null;
+    var matched_terminal_output: ?[]const u8 = null;
     var matched_streams: ?[]const u8 = null;
     var matched_poll: ?[]const u8 = null;
     var matched_error: ?[]const u8 = null;
@@ -511,8 +858,24 @@ pub fn populateWasiProviders(
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
             matched_stdout = imp.name;
+        if (matched_stderr == null and matchesWasiPrefix(imp.name, "wasi:cli/stderr"))
+            matched_stderr = imp.name;
         if (matched_stdin == null and matchesWasiPrefix(imp.name, "wasi:cli/stdin"))
             matched_stdin = imp.name;
+        if (matched_exit == null and matchesWasiPrefix(imp.name, "wasi:cli/exit"))
+            matched_exit = imp.name;
+        if (matched_environment == null and matchesWasiPrefix(imp.name, "wasi:cli/environment"))
+            matched_environment = imp.name;
+        if (matched_terminal_stdin == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-stdin"))
+            matched_terminal_stdin = imp.name;
+        if (matched_terminal_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-stdout"))
+            matched_terminal_stdout = imp.name;
+        if (matched_terminal_stderr == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-stderr"))
+            matched_terminal_stderr = imp.name;
+        if (matched_terminal_input == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-input"))
+            matched_terminal_input = imp.name;
+        if (matched_terminal_output == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-output"))
+            matched_terminal_output = imp.name;
         if (matched_streams == null and matchesWasiPrefix(imp.name, "wasi:io/streams"))
             matched_streams = imp.name;
         if (matched_poll == null and matchesWasiPrefix(imp.name, "wasi:io/poll"))
@@ -532,11 +895,43 @@ pub fn populateWasiProviders(
     if (matched_stdout == null) _ = providers.remove("wasi:cli/stdout");
     if (matched_streams == null) _ = providers.remove("wasi:io/streams");
 
+    try adapter.populateWasiCliStderr(
+        providers,
+        matched_stderr orelse "wasi:cli/stderr",
+    );
+    if (matched_stderr == null) _ = providers.remove("wasi:cli/stderr");
+
     try adapter.populateWasiCliStdin(
         providers,
         matched_stdin orelse "wasi:cli/stdin",
     );
     if (matched_stdin == null) _ = providers.remove("wasi:cli/stdin");
+
+    try adapter.populateWasiCliExit(
+        providers,
+        matched_exit orelse "wasi:cli/exit",
+    );
+    if (matched_exit == null) _ = providers.remove("wasi:cli/exit");
+
+    try adapter.populateWasiCliEnvironment(
+        providers,
+        matched_environment orelse "wasi:cli/environment",
+    );
+    if (matched_environment == null) _ = providers.remove("wasi:cli/environment");
+
+    try adapter.populateWasiCliTerminal(
+        providers,
+        matched_terminal_stdin orelse "wasi:cli/terminal-stdin",
+        matched_terminal_stdout orelse "wasi:cli/terminal-stdout",
+        matched_terminal_stderr orelse "wasi:cli/terminal-stderr",
+        matched_terminal_input orelse "wasi:cli/terminal-input",
+        matched_terminal_output orelse "wasi:cli/terminal-output",
+    );
+    if (matched_terminal_stdin == null) _ = providers.remove("wasi:cli/terminal-stdin");
+    if (matched_terminal_stdout == null) _ = providers.remove("wasi:cli/terminal-stdout");
+    if (matched_terminal_stderr == null) _ = providers.remove("wasi:cli/terminal-stderr");
+    if (matched_terminal_input == null) _ = providers.remove("wasi:cli/terminal-input");
+    if (matched_terminal_output == null) _ = providers.remove("wasi:cli/terminal-output");
 
     try adapter.populateWasiIoPollError(
         providers,
@@ -566,12 +961,17 @@ pub fn runLoadedComponent(
     if (inst.getExport("run") == null) return error.NoRunExport;
 
     var results: [1]abi_root.InterfaceValue = undefined;
-    executor_root.callComponentFunc(inst, "run", &.{}, &results, allocator) catch return error.Trap;
-
-    return .{ .is_ok = switch (results[0]) {
-        .result_val => |rv| rv.is_ok,
-        else => true,
-    } };
+    if (executor_root.callComponentFunc(inst, "run", &.{}, &results, allocator)) |_| {
+        return .{ .is_ok = switch (results[0]) {
+            .result_val => |rv| rv.is_ok,
+            else => true,
+        } };
+    } else |_| {
+        // `wasi:cli/exit.{exit, exit-with-code}` traps after stashing
+        // a code on the adapter; translate that into a normal outcome.
+        if (adapter.exit_code) |code| return .{ .is_ok = code == 0 };
+        return error.Trap;
+    }
 }
 
 /// Load + instantiate + run a component binary, mapping its `run` export
@@ -1152,4 +1552,56 @@ test "populateWasiProviders: binds wasi:cli/stdin (#152)" {
         .ok => |n| try testing.expectEqualStrings("hello\n", buf[0..n]),
         else => try testing.expect(false),
     }
+}
+
+test "populateWasiProviders: binds full cli surface (#153)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:cli/stderr@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/exit@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/environment@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/terminal-stdin@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/terminal-stdout@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/terminal-stderr@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/terminal-input@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/terminal-output@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:cli/stderr@0.2.6"));
+    try testing.expect(providers.contains("wasi:cli/exit@0.2.6"));
+    try testing.expect(providers.contains("wasi:cli/environment@0.2.6"));
+    try testing.expect(providers.contains("wasi:cli/terminal-stdin@0.2.6"));
+    try testing.expect(providers.contains("wasi:cli/terminal-output@0.2.6"));
+
+    try testing.expect(adapter.cli_stderr_iface.members.contains("get-stderr"));
+    try testing.expect(adapter.cli_exit_iface.members.contains("exit"));
+    try testing.expect(adapter.cli_exit_iface.members.contains("exit-with-code"));
+    try testing.expect(adapter.cli_environment_iface.members.contains("get-environment"));
+    try testing.expect(adapter.cli_environment_iface.members.contains("get-arguments"));
+    try testing.expect(adapter.cli_environment_iface.members.contains("initial-cwd"));
+    try testing.expect(adapter.cli_terminal_stdin_iface.members.contains("get-terminal-stdin"));
+    try testing.expect(adapter.cli_terminal_input_iface.members.contains("[resource-drop]terminal-input"));
+    try testing.expect(adapter.cli_terminal_output_iface.members.contains("[resource-drop]terminal-output"));
+
+    // Output-stream method trio used by Rust's stdlib (instead of
+    // `blocking-write-and-flush`).
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.write"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.check-write"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.blocking-flush"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.subscribe"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]input-stream.subscribe"));
 }
