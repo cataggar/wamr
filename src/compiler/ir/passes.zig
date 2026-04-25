@@ -2381,6 +2381,105 @@ pub fn foldConstantBranches(func: *ir.IrFunction, allocator: std.mem.Allocator) 
     return changed;
 }
 
+// ── Address-mode folding (load/store offset) ────────────────────────────────
+
+/// Fold `add base, iconst_32 C` feeding into `load`/`store` by absorbing
+/// C into the load/store's existing immediate offset:
+///
+///     iconst_32 C            ;; const-fold candidate
+///     v_add = add base, C    ;; (or add C, base)
+///     load  v_add, offset=N  =>  load  base, offset=N+C
+///
+/// This is a block-local peephole. The same `add` may have other uses;
+/// we don't remove it — DCE will reap it if all its consumers were
+/// loads/stores that we folded.
+///
+/// Soundness:
+///   - Only fires when the add's IR type is `.i32` (memory32 base).
+///     Memory64 (i64 base) is intentionally skipped: the add could
+///     produce a value > 2^32 and the offset is u32.
+///   - Only fires when C is a non-negative i32 (so its u32 reinterpretation
+///     is < 2^31). Negative consts are mathematically equivalent
+///     (mod 2^32) but mix poorly with the bounds-check end address.
+///   - new_offset = N + C is checked to fit in i32 (≤ 0x7FFFFFFF).
+///     Since the original code already computed `add(base, C)` as i32
+///     wrap arithmetic and the load's runtime address is computed as
+///     `base + N + C` mod 2^32, both old and new produce the same
+///     32-bit effective address. Bounds-check semantics are preserved
+///     because the codegen helper recomputes `addr + size` from the new
+///     base+offset, and the numeric end address is identical.
+///   - We do NOT touch `bounds_known`: that flag was set by
+///     `elideRedundantBoundsChecks` based on the original instruction's
+///     numeric address; that address is unchanged after the fold.
+///
+/// Idempotent and safe inside the `runPasses` fixpoint loop. Composes
+/// with `constantFold` (folds chains of `add base, c1; add ., c2`) and
+/// with `deadCodeElimination` (removes the now-dead add).
+pub fn foldLoadStoreOffset(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        var iconst32 = std.AutoHashMap(ir.VReg, i32).init(allocator);
+        defer iconst32.deinit();
+
+        const AddInfo = struct { other: ir.VReg, c: u32 };
+        var add_info = std.AutoHashMap(ir.VReg, AddInfo).init(allocator);
+        defer add_info.deinit();
+
+        for (block.instructions.items) |*inst| {
+            switch (inst.op) {
+                .iconst_32 => |c| {
+                    if (inst.dest) |d| try iconst32.put(d, c);
+                },
+                .add => |bin| {
+                    if (inst.type != .i32) continue;
+                    const dest = inst.dest orelse continue;
+                    if (iconst32.get(bin.rhs)) |c| {
+                        if (c >= 0) {
+                            try add_info.put(dest, .{ .other = bin.lhs, .c = @as(u32, @intCast(c)) });
+                        }
+                    } else if (iconst32.get(bin.lhs)) |c| {
+                        if (c >= 0) {
+                            try add_info.put(dest, .{ .other = bin.rhs, .c = @as(u32, @intCast(c)) });
+                        }
+                    }
+                },
+                .load => |ld| {
+                    if (add_info.get(ld.base)) |info| {
+                        const new_off: u64 = @as(u64, ld.offset) + @as(u64, info.c);
+                        if (new_off <= std.math.maxInt(i32)) {
+                            inst.op = .{ .load = .{
+                                .base = info.other,
+                                .offset = @as(u32, @intCast(new_off)),
+                                .size = ld.size,
+                                .sign_extend = ld.sign_extend,
+                                .bounds_known = ld.bounds_known,
+                            } };
+                            changed = true;
+                        }
+                    }
+                },
+                .store => |st| {
+                    if (add_info.get(st.base)) |info| {
+                        const new_off: u64 = @as(u64, st.offset) + @as(u64, info.c);
+                        if (new_off <= std.math.maxInt(i32)) {
+                            inst.op = .{ .store = .{
+                                .base = info.other,
+                                .offset = @as(u32, @intCast(new_off)),
+                                .size = st.size,
+                                .val = st.val,
+                                .bounds_known = st.bounds_known,
+                            } };
+                            changed = true;
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 // ── Branch-on-Eqz folding ───────────────────────────────────────────────────
 
 /// Collapse `br_if(cond=eqz(x), then=A, else=B)` into
@@ -3316,6 +3415,7 @@ pub const default_passes: []const PassFn = &.{
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
+    &foldLoadStoreOffset,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -6345,4 +6445,113 @@ test "splitCriticalEdges + lowerPhisToLocals: round-trip on critical-edge CFG" {
     // After splitting + lowering: b3's preds are {b2, edge_block_from_b1}
     // and neither should be b1 itself.
     for (b3_preds) |p| try std.testing.expect(p != b1);
+}
+
+test "foldLoadStoreOffset: add base, const into load offset" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    var block = &func.blocks.items[b0];
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load }, .type = .i32 });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const ld = func.getBlock(b0).instructions.items[3].op.load;
+    try std.testing.expectEqual(v_base, ld.base);
+    try std.testing.expectEqual(@as(u32, 16), ld.offset);
+}
+
+test "foldLoadStoreOffset: add const, base (commuted)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_val = func.newVReg();
+    var block = &func.blocks.items[b0];
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_c, .rhs = v_base } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_val, .type = .i32 });
+    try block.append(.{ .op = .{ .store = .{ .base = v_addr, .offset = 0, .size = 4, .val = v_val } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const st = func.getBlock(b0).instructions.items[4].op.store;
+    try std.testing.expectEqual(v_base, st.base);
+    try std.testing.expectEqual(@as(u32, 8), st.offset);
+}
+
+test "foldLoadStoreOffset: skips negative const" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    var block = &func.blocks.items[b0];
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = -4 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load }, .type = .i32 });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldLoadStoreOffset: skips i64 add (memory64 base)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    var block = &func.blocks.items[b0];
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i64 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i64 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load }, .type = .i32 });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldLoadStoreOffset: preserves bounds_known" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    var block = &func.blocks.items[b0];
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4, .bounds_known = true } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load }, .type = .i32 });
+
+    _ = try foldLoadStoreOffset(&func, allocator);
+    const ld = func.getBlock(b0).instructions.items[3].op.load;
+    try std.testing.expect(ld.bounds_known);
+    try std.testing.expectEqual(@as(u32, 4), ld.offset);
 }
