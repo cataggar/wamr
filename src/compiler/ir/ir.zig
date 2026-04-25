@@ -228,6 +228,9 @@ pub const BasicBlock = struct {
     }
 
     pub fn deinit(self: *BasicBlock) void {
+        for (self.instructions.items) |inst| {
+            if (inst.op == .phi) self.allocator.free(inst.op.phi);
+        }
         self.instructions.deinit(self.allocator);
         self.predecessors.deinit(self.allocator);
     }
