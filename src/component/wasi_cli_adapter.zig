@@ -982,7 +982,7 @@ pub const Datetime = struct {
 /// adapter's deterministic-clock injection paths). Both fields are
 /// clamped to valid ranges (`seconds >= 0`, `nanoseconds < 1e9`).
 fn readClockDatetime(clock_id: ClockId) Datetime {
-    if (!@hasDecl(std.posix.system, "clock_gettime")) return .{ .seconds = 0, .nanoseconds = 0 };
+    if (!have_posix_clock) return .{ .seconds = 0, .nanoseconds = 0 };
     var ts: std.posix.timespec = undefined;
     const rc = std.posix.system.clock_gettime(clock_id, &ts);
     if (std.posix.errno(rc) != .SUCCESS) return .{ .seconds = 0, .nanoseconds = 0 };
@@ -1005,10 +1005,14 @@ fn readClockNs(clock_id: ClockId) u64 {
 }
 
 /// Cross-platform alias for the host clock-id type. On POSIX targets it
-/// is `std.posix.clockid_t`; elsewhere `clock_gettime` is unavailable
-/// and `readClockDatetime` short-circuits before consulting the value,
-/// so any `enum {}` placeholder works.
-const ClockId = if (@hasDecl(std.posix.system, "clock_gettime"))
+/// is `std.posix.clockid_t`; on Windows `std.posix.clockid_t` is `void`
+/// and `clock_gettime` is unusable, so we substitute a plain enum so
+/// `.REALTIME` / `.MONOTONIC` enum literals at the call sites still
+/// compile. `readClockDatetime` short-circuits before consulting the
+/// value on those targets, so the substitute never reaches the syscall.
+const have_posix_clock = @import("builtin").os.tag != .windows and
+    @hasDecl(std.posix.system, "clock_gettime");
+const ClockId = if (have_posix_clock)
     std.posix.clockid_t
 else
     enum { REALTIME, MONOTONIC };
