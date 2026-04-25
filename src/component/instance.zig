@@ -571,31 +571,93 @@ pub fn instantiate(
     // Build export map: walk top-level component exports, resolve each
     // `.func` export through the component-func index space to its backing
     // `canon.lift`, and register an entry in `exported_funcs` keyed by the
-    // export name. Locally-built instance exports (e.g. `wasi:cli/run`) are
-    // a separate slice (#151).
+    // export name.
+    //
+    // Top-level *instance* exports (e.g. `wasi:cli/run@0.2.6`) are
+    // handled by walking the locally-instantiated instance's inline-exports
+    // and registering each member func under both the dotted name
+    // (`<instance-name>/<member>`) and — for the canonical `wasi:cli/run`
+    // shape — the bare member name so the existing `runComponent` adapter
+    // can locate `"run"` without knowing the version suffix.
     for (component.exports) |exp| {
         const si = exp.sort_idx orelse continue;
-        if (si.sort != .func) continue;
-        const ref = indexspace.resolveCompFunc(component, si.idx) orelse continue;
-        const canon_idx = switch (ref) {
-            .lifted => |i| i,
-            else => continue,
-        };
-        switch (component.canons[canon_idx]) {
-            .lift => |lift| {
-                const resolved = resolveLiftedCoreFunc(inst, component, lift.core_func_idx);
-                inst.exported_funcs.put(allocator, exp.name, .{
-                    .core_instance_idx = if (resolved) |r| r.core_instance_idx else 0,
-                    .core_func_idx = if (resolved) |r| r.local_func_idx else lift.core_func_idx,
-                    .func_type_idx = lift.type_idx,
-                    .opts = lift.opts,
-                }) catch {};
-            },
+        switch (si.sort) {
+            .func => registerLiftedExport(inst, component, allocator, exp.name, si.idx),
+            .instance => registerInstanceExport(inst, component, allocator, exp.name, si.idx),
             else => {},
         }
     }
 
     return inst;
+}
+
+fn registerLiftedExport(
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    func_idx: u32,
+) void {
+    const ref = indexspace.resolveCompFunc(component, func_idx) orelse return;
+    const canon_idx = switch (ref) {
+        .lifted => |i| i,
+        else => return,
+    };
+    switch (component.canons[canon_idx]) {
+        .lift => |lift| {
+            const resolved = resolveLiftedCoreFunc(inst, component, lift.core_func_idx);
+            inst.exported_funcs.put(allocator, name, .{
+                .core_instance_idx = if (resolved) |r| r.core_instance_idx else 0,
+                .core_func_idx = if (resolved) |r| r.local_func_idx else lift.core_func_idx,
+                .func_type_idx = lift.type_idx,
+                .opts = lift.opts,
+            }) catch {};
+        },
+        else => {},
+    }
+}
+
+fn registerInstanceExport(
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    allocator: std.mem.Allocator,
+    instance_name: []const u8,
+    instance_idx: u32,
+) void {
+    const ref = indexspace.resolveCompInstance(component, instance_idx) orelse return;
+    const local_idx = switch (ref) {
+        .local => |i| i,
+        // Re-exported imported instances and aliased instances aren't
+        // backed by lifts inside this component — nothing to register.
+        else => return,
+    };
+    if (local_idx >= component.instances.len) return;
+    const expr = component.instances[local_idx];
+    const inline_exports = switch (expr) {
+        .exports => |e| e,
+        // An `instantiate`-form local instance would require resolving
+        // exports of another component definition; not yet supported.
+        .instantiate => return,
+    };
+
+    const expose_bare = isWasiCliRunName(instance_name);
+
+    for (inline_exports) |mem| {
+        if (mem.sort_idx.sort != .func) continue;
+        const dotted = std.fmt.allocPrint(inst.module_arena.allocator(), "{s}/{s}", .{ instance_name, mem.name }) catch continue;
+        registerLiftedExport(inst, component, allocator, dotted, mem.sort_idx.idx);
+        if (expose_bare and std.mem.eql(u8, mem.name, "run")) {
+            registerLiftedExport(inst, component, allocator, "run", mem.sort_idx.idx);
+        }
+    }
+}
+
+/// Match `wasi:cli/run` and `wasi:cli/run@<version>` instance export names.
+fn isWasiCliRunName(name: []const u8) bool {
+    const prefix = "wasi:cli/run";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const rest = name[prefix.len..];
+    return rest.len == 0 or rest[0] == '@';
 }
 
 // ── Index-space helpers ─────────────────────────────────────────────────────
@@ -1003,7 +1065,6 @@ test "ComponentInstance: resource tables are lazy and keyed by typeidx" {
 }
 
 test "instantiate: canon.lower wires host func into core import (2A.2b)" {
-    const testing = std.testing;
 
     // Minimal core module:
     //   (type (func (param i32 i32) (result i32)))
@@ -1077,7 +1138,7 @@ test "instantiate: canon.lower wires host func into core import (2A.2b)" {
         .exports = &.{},
     };
 
-    const inst = try instantiate(&component, testing.allocator);
+    const inst = try instantiate(&component, std.testing.allocator);
     defer inst.deinit();
 
     // Register a host sub: returns a - b. Non-commutative to catch argument
@@ -1094,8 +1155,8 @@ test "instantiate: canon.lower wires host func into core import (2A.2b)" {
         }
     };
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
-    defer providers.deinit(testing.allocator);
-    try providers.put(testing.allocator, "host-sub", .{
+    defer providers.deinit(std.testing.allocator);
+    try providers.put(std.testing.allocator, "host-sub", .{
         .host_func = .{ .call = &Host.sub },
     });
     try inst.linkImports(providers);
@@ -1109,14 +1170,13 @@ test "instantiate: canon.lower wires host func into core import (2A.2b)" {
 
     // Invoke the exported "run" core function.
     const run_idx = mi.getExportFunc("run") orelse return error.TestFailed;
-    const env = try @import("../runtime/common/exec_env.zig").ExecEnv.create(mi, 512, testing.allocator);
+    const env = try @import("../runtime/common/exec_env.zig").ExecEnv.create(mi, 512, std.testing.allocator);
     defer env.destroy();
     try @import("../runtime/interpreter/interp.zig").executeFunction(env, run_idx);
     try std.testing.expectEqual(@as(i32, 5), try env.popI32());
 }
 
 test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
-    const testing = std.testing;
     const executor = @import("executor.zig");
     const abi_mod = @import("canonical_abi.zig");
 
@@ -1205,7 +1265,7 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
         .exports = &exports_decl,
     };
 
-    const inst = try instantiate(&component, testing.allocator);
+    const inst = try instantiate(&component, std.testing.allocator);
     defer inst.deinit();
 
     const Host = struct {
@@ -1220,8 +1280,8 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
         }
     };
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
-    defer providers.deinit(testing.allocator);
-    try providers.put(testing.allocator, "host-sub", .{
+    defer providers.deinit(std.testing.allocator);
+    try providers.put(std.testing.allocator, "host-sub", .{
         .host_func = .{ .call = &Host.sub },
     });
     try inst.linkImports(providers);
@@ -1236,6 +1296,87 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
         .{ .s32 = 2 },
     };
     var results: [1]abi_mod.InterfaceValue = undefined;
-    try executor.callComponentFunc(inst, "run", &args, &results, testing.allocator);
+    try executor.callComponentFunc(inst, "run", &args, &results, std.testing.allocator);
     try std.testing.expectEqual(@as(i32, 5), results[0].s32);
+}
+
+test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)" {
+    // Hand-authored component:
+    //   - 1 core module exporting "run" (no imports, no host calls)
+    //   - 1 core instance instantiating it
+    //   - 1 alias of the core "run" → core-func-idx 0
+    //   - 1 canon.lift over that core func → comp-func-idx 0
+    //   - 1 local component-instance bundling { "run": comp-func 0 }
+    //     (instance-idx 0)
+    //   - 1 top-level export "wasi:cli/run@0.2.6" → instance 0
+    //
+    // After instantiate(), inst.getExport("run") and
+    // inst.getExport("wasi:cli/run@0.2.6/run") must both resolve to
+    // the lifted core export.
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // function section: 1 fn of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "run" -> func 0
+        0x07, 0x07, 0x01, 0x03, 'r', 'u', 'n', 0x00, 0x00,
+        // code section: empty body
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &.{}, .results = .none } },
+    };
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+    const aliases_decl = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = 0,
+            .name = "run",
+        } },
+    };
+    const canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 0, .type_idx = 0, .opts = &.{} } },
+    };
+    const inline_exp = [_]ctypes.InlineExport{
+        .{ .name = "run", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &inline_exp },
+    };
+    const exports_decl = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:cli/run@0.2.6",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &aliases_decl,
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &exports_decl,
+    };
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    const bare = inst.getExport("run") orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 0), bare.core_instance_idx);
+    try std.testing.expectEqual(@as(u32, 0), bare.core_func_idx);
+
+    const dotted = inst.getExport("wasi:cli/run@0.2.6/run") orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u32, 0), dotted.core_instance_idx);
+    try std.testing.expectEqual(@as(u32, 0), dotted.core_func_idx);
 }
