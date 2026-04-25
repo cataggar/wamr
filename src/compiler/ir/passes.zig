@@ -1492,6 +1492,135 @@ pub fn forwardLocalGet(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool
     return changed;
 }
 
+/// Promote a wasm local to its single defining VReg across blocks, when
+/// safe. Fires only when ALL of the following hold for a non-parameter
+/// local L:
+///   1. L has exactly one `local_set L = v` instruction in the function,
+///      at block W, instruction index k.
+///   2. Every `local_get L` is in a block U with `id(U) >= id(W)` AND
+///      block W dominates U (so the set always executes first dynamically).
+///      For same-block reads (U == W), the get must come strictly after k.
+///
+/// When fired, every `local_get L → dest` is replaced by `dest := v`
+/// (the get is removed and `dest` rewritten to `v` everywhere); the
+/// single `local_set L` is also removed. This removes the wasm-local
+/// entirely from the IR, exposing `v` to constant-folding, CSE, and
+/// LICM across blocks.
+///
+/// Soundness is conservative: we deliberately reject the case where a
+/// dominator def has higher block-id than the use (the AArch64 codegen
+/// iterates blocks in raw id-order and would reject a backward def→use
+/// span). This is the same constraint that makes the staged SSA
+/// pipeline tricky; here we sidestep it by only promoting forward spans.
+///
+/// Intentionally narrow: this is *not* full SSA construction. It does
+/// not introduce phi nodes and only fires for the simplest common case.
+pub fn promoteSingleDefLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.local_count == 0) return false;
+    const param_count = func.param_count;
+    if (func.local_count <= param_count) return false;
+
+    const SetSite = struct {
+        block: ir.BlockId,
+        inst_idx: usize,
+        val: ir.VReg,
+        ty: ir.IrType,
+    };
+
+    const set_count = try allocator.alloc(u32, func.local_count);
+    defer allocator.free(set_count);
+    @memset(set_count, 0);
+    const set_site = try allocator.alloc(SetSite, func.local_count);
+    defer allocator.free(set_site);
+
+    for (func.blocks.items, 0..) |block, bidx| {
+        for (block.instructions.items, 0..) |inst, iidx| {
+            if (inst.op != .local_set) continue;
+            const ls = inst.op.local_set;
+            if (ls.idx >= func.local_count) continue;
+            set_count[ls.idx] += 1;
+            set_site[ls.idx] = .{
+                .block = @intCast(bidx),
+                .inst_idx = iidx,
+                .val = ls.val,
+                .ty = inst.type,
+            };
+        }
+    }
+
+    // Identify candidates: non-param locals with exactly one local_set.
+    var any_candidate = false;
+    var L: u32 = param_count;
+    while (L < func.local_count) : (L += 1) {
+        if (set_count[L] == 1) { any_candidate = true; break; }
+    }
+    if (!any_candidate) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    // Verify each candidate's gets are all dominated and id-ordered.
+    const safe = try allocator.alloc(bool, func.local_count);
+    defer allocator.free(safe);
+    @memset(safe, false);
+
+    L = param_count;
+    while (L < func.local_count) : (L += 1) {
+        if (set_count[L] != 1) continue;
+        const s = set_site[L];
+        var ok = true;
+        outer: for (func.blocks.items, 0..) |block, bidx| {
+            const u_id: ir.BlockId = @intCast(bidx);
+            for (block.instructions.items, 0..) |inst, iidx| {
+                if (inst.op != .local_get) continue;
+                if (inst.op.local_get != L) continue;
+                if (u_id == s.block) {
+                    if (iidx <= s.inst_idx) { ok = false; break :outer; }
+                } else {
+                    if (u_id < s.block) { ok = false; break :outer; }
+                    if (!dom.dominates(s.block, u_id)) { ok = false; break :outer; }
+                }
+            }
+        }
+        if (ok) safe[L] = true;
+    }
+
+    var changed = false;
+    L = param_count;
+    while (L < func.local_count) : (L += 1) {
+        if (!safe[L]) continue;
+        const s = set_site[L];
+
+        // Replace each get's dest with s.val and remove the get.
+        for (func.blocks.items) |*block| {
+            var i: usize = 0;
+            while (i < block.instructions.items.len) {
+                const inst = &block.instructions.items[i];
+                if (inst.op == .local_get and inst.op.local_get == L) {
+                    if (inst.dest) |d| replaceVReg(func, d, s.val);
+                    _ = block.instructions.orderedRemove(i);
+                    continue;
+                }
+                i += 1;
+            }
+        }
+
+        // Remove the unique local_set.
+        const sblock = func.getBlock(s.block);
+        var j: usize = 0;
+        while (j < sblock.instructions.items.len) : (j += 1) {
+            const inst = sblock.instructions.items[j];
+            if (inst.op == .local_set and inst.op.local_set.idx == L) {
+                _ = sblock.instructions.orderedRemove(j);
+                break;
+            }
+        }
+        changed = true;
+    }
+
+    return changed;
+}
+
 /// Remove `local.set K, v` for any local K that is never read by a
 /// `local.get` anywhere in the function. This is intra-procedural and
 /// trivially sound: wasm locals are frame-scoped; calls never observe
@@ -3618,6 +3747,7 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 /// The default optimization pipeline.
 pub const default_passes: []const PassFn = &.{
     &forwardLocalGet,
+    &promoteSingleDefLocals,
     &constantFold,
     &algebraicSimplify,
     &strengthReduceMul,
