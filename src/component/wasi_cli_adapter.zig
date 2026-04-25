@@ -58,6 +58,16 @@ pub const WasiCliAdapter = struct {
     /// `[method]output-stream.blocking-write-and-flush`,
     /// `[resource-drop]output-stream`).
     io_streams_iface: HostInstance = .{},
+    /// `HostInstance` for `wasi:io/poll`. Stdio-echo imports this for
+    /// type-resolution; only `[resource-drop]pollable` is wired with a
+    /// no-op since the guest never blocks on stdout. Other members trap
+    /// on call (left absent, so the trampoline reports an unresolved
+    /// import).
+    io_poll_iface: HostInstance = .{},
+    /// `HostInstance` for `wasi:io/error`. Same shape as `io_poll_iface`:
+    /// only `[resource-drop]error` is wired; the host never produces an
+    /// `error` resource on the happy path.
+    io_error_iface: HostInstance = .{},
 
     /// Adapter-internal output-stream resource handles. Deliberately
     /// independent of `ComponentInstance.resource_tables` — these handles
@@ -81,6 +91,8 @@ pub const WasiCliAdapter = struct {
         self.write_iface.deinit(self.allocator);
         self.cli_stdout_iface.deinit(self.allocator);
         self.io_streams_iface.deinit(self.allocator);
+        self.io_poll_iface.deinit(self.allocator);
+        self.io_error_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
     }
 
@@ -147,6 +159,44 @@ pub const WasiCliAdapter = struct {
             .host_instance = &self.io_streams_iface,
         });
     }
+
+    /// Register `wasi:io/poll` and `wasi:io/error` host bindings.
+    ///
+    /// Both interfaces only need `[resource-drop]<resource>` wired for the
+    /// stdio-echo happy path — the guest never blocks on a pollable nor
+    /// inspects an error to-debug-string when stdout writes succeed. Any
+    /// other member call will surface as an unresolved-import trap.
+    pub fn populateWasiIoPollError(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        io_poll_name: []const u8,
+        io_error_name: []const u8,
+    ) !void {
+        try self.io_poll_iface.members.put(self.allocator, "[resource-drop]pollable", .{
+            .func = .{ .context = self, .call = &noopResourceDrop },
+        });
+        try providers.put(self.allocator, io_poll_name, .{
+            .host_instance = &self.io_poll_iface,
+        });
+
+        try self.io_error_iface.members.put(self.allocator, "[resource-drop]error", .{
+            .func = .{ .context = self, .call = &noopResourceDrop },
+        });
+        try providers.put(self.allocator, io_error_name, .{
+            .host_instance = &self.io_error_iface,
+        });
+    }
+
+    /// `(own<R>) -> ()` no-op — the host never produces non-stream
+    /// resources on the happy path, so dropping one is purely guest-side
+    /// bookkeeping that we can swallow.
+    fn noopResourceDrop(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {}
 
     fn allocStreamHandle(self: *WasiCliAdapter, stream: *streams.OutputStream) !u32 {
         // Linear scan for a free slot before extending; output streams are
@@ -308,16 +358,23 @@ pub fn populateWasiProviders(
 ) !void {
     var matched_stdout: ?[]const u8 = null;
     var matched_streams: ?[]const u8 = null;
+    var matched_poll: ?[]const u8 = null;
+    var matched_error: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
             matched_stdout = imp.name;
         if (matched_streams == null and matchesWasiPrefix(imp.name, "wasi:io/streams"))
             matched_streams = imp.name;
+        if (matched_poll == null and matchesWasiPrefix(imp.name, "wasi:io/poll"))
+            matched_poll = imp.name;
+        if (matched_error == null and matchesWasiPrefix(imp.name, "wasi:io/error"))
+            matched_error = imp.name;
     }
-    // Always populate both interfaces' members; only register
-    // providers for the names the component actually imports so
-    // `linkImports` strict-checking surfaces unrelated misses.
+    // Always populate every interface's members so the adapter's
+    // HostInstance maps are well-formed; only register providers for
+    // the names the component actually imports so `linkImports`
+    // strict-checking surfaces unrelated misses.
     try adapter.populateWasiCliRun(
         providers,
         matched_stdout orelse "wasi:cli/stdout",
@@ -325,6 +382,14 @@ pub fn populateWasiProviders(
     );
     if (matched_stdout == null) _ = providers.remove("wasi:cli/stdout");
     if (matched_streams == null) _ = providers.remove("wasi:io/streams");
+
+    try adapter.populateWasiIoPollError(
+        providers,
+        matched_poll orelse "wasi:io/poll",
+        matched_error orelse "wasi:io/error",
+    );
+    if (matched_poll == null) _ = providers.remove("wasi:io/poll");
+    if (matched_error == null) _ = providers.remove("wasi:io/error");
 }
 
 /// Run an already-loaded component. See `runComponentBytes` for the
@@ -861,4 +926,38 @@ test "runLoadedComponent: matches versioned WASI import names" {
     const outcome = try runLoadedComponent(&component, testing.allocator, &adapter);
     try testing.expect(outcome.is_ok);
     try testing.expectEqualStrings("hello, world!\n", adapter.getStdoutBytes());
+}
+
+test "populateWasiProviders: binds wasi:io/poll and wasi:io/error (#154)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Hand-build a component with versioned poll + error instance imports.
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:io/poll@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:io/poll@0.2.6"));
+    try testing.expect(providers.contains("wasi:io/error@0.2.6"));
+    // Bare names (no version suffix) must NOT be registered when the
+    // component imports the versioned form.
+    try testing.expect(!providers.contains("wasi:io/poll"));
+    try testing.expect(!providers.contains("wasi:io/error"));
+
+    // Resource-drop members are wired so the guest can drop pollables/errors.
+    try testing.expect(adapter.io_poll_iface.members.contains("[resource-drop]pollable"));
+    try testing.expect(adapter.io_error_iface.members.contains("[resource-drop]error"));
 }
