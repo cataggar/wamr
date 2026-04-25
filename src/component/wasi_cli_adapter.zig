@@ -124,6 +124,72 @@ const FsErrorCode = enum(u32) {
     cross_device = 36,
 };
 
+/// `wasi:sockets/network.error-code` discriminants in WIT-declaration order
+/// (37 variants). Used as `.variant_val.discriminant` for the err arm of
+/// `result<_, error-code>` returns from sockets host fns.
+const SocketErrorCode = enum(u32) {
+    unknown = 0,
+    access_denied = 1,
+    not_supported = 2,
+    invalid_argument = 3,
+    out_of_memory = 4,
+    timeout = 5,
+    concurrency_conflict = 6,
+    not_in_progress = 7,
+    would_block = 8,
+    invalid_state = 9,
+    new_socket_limit = 10,
+    address_not_bindable = 11,
+    address_in_use = 12,
+    remote_unreachable = 13,
+    connection_refused = 14,
+    connection_reset = 15,
+    connection_aborted = 16,
+    datagram_too_large = 17,
+    name_unresolvable = 18,
+    temporary_resolver_failure = 19,
+    permanent_resolver_failure = 20,
+};
+
+/// IPv4 vs IPv6 — matches the discriminant order of `ip-address-family`.
+const IpAddressFamily = enum(u32) {
+    ipv4 = 0,
+    ipv6 = 1,
+};
+
+const SocketKind = enum { tcp, udp };
+
+const SocketState = enum { unbound, bound, listening, connected, closed };
+
+/// Adapter-side `tcp-socket` / `udp-socket` rep. Default-deny: the adapter
+/// never actually binds a host socket; methods that would touch the network
+/// return `error-code.access-denied`. The slot exists so that
+/// `address-family` and the other pure getters have something to read.
+///
+/// TODO(#148): replace with a real `std.Io.net.Socket` once the capability
+/// allow-list lands. The shape is intentionally minimal.
+pub const Socket = struct {
+    kind: SocketKind,
+    family: IpAddressFamily,
+    state: SocketState = .unbound,
+};
+
+/// Adapter-side `network` rep. Currently empty — the WIT declares zero
+/// methods on `network`, and the default-deny capability model means the
+/// rep does not need to carry an allow-list yet.
+pub const Network = struct {};
+
+/// Adapter-side `resolve-address-stream` rep. `pos` advances on each
+/// `resolve-next-address` until `pos == results.len`, after which the
+/// stream returns `option<ip-address>::none`. The slice and `self`
+/// itself are owned by the adapter and freed in `deinit` /
+/// `[resource-drop]resolve-address-stream`.
+pub const ResolveAddressStream = struct {
+    results: []std.Io.net.IpAddress,
+    pos: usize,
+    allocator: Allocator,
+};
+
 /// Map a Zig std.fs / std.posix error to the closest `error-code` variant.
 /// Errors not represented map to `.io` so the guest still sees a
 /// well-typed result rather than a host trap.
@@ -186,6 +252,13 @@ pub const WasiCliAdapter = struct {
     random_insecure_seed_iface: HostInstance = .{},
     fs_types_iface: HostInstance = .{},
     fs_preopens_iface: HostInstance = .{},
+    sockets_network_iface: HostInstance = .{},
+    sockets_instance_network_iface: HostInstance = .{},
+    sockets_tcp_iface: HostInstance = .{},
+    sockets_tcp_create_iface: HostInstance = .{},
+    sockets_udp_iface: HostInstance = .{},
+    sockets_udp_create_iface: HostInstance = .{},
+    sockets_ip_name_lookup_iface: HostInstance = .{},
 
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
@@ -204,6 +277,18 @@ pub const WasiCliAdapter = struct {
     /// `dir_handle` indexes into `fs_descriptor_table`. The string is owned
     /// by the adapter and freed in `deinit`.
     fs_preopens: std.ArrayListUnmanaged(FsPreopen) = .empty,
+
+    /// `wasi:sockets/network` resource table. Slot index = guest handle.
+    /// Slots are nulled on `[resource-drop]network`.
+    network_table: std.ArrayListUnmanaged(?Network) = .empty,
+    /// `wasi:sockets/{tcp,udp}` socket resource table. Slot index = guest
+    /// handle (shared across both kinds — `Socket.kind` discriminates).
+    /// Slots are nulled on `[resource-drop]tcp-socket` /
+    /// `[resource-drop]udp-socket`.
+    socket_table: std.ArrayListUnmanaged(?Socket) = .empty,
+    /// `wasi:sockets/ip-name-lookup.resolve-address-stream` table. Slots
+    /// own the heap-allocated stream struct; nulled on resource-drop.
+    resolve_streams: std.ArrayListUnmanaged(?*ResolveAddressStream) = .empty,
 
     /// Optional deterministic-clock injection. When set, `wasi:clocks/wall-clock.now`
     /// returns this datetime instead of reading the host wall clock — used by
@@ -260,6 +345,13 @@ pub const WasiCliAdapter = struct {
         self.random_insecure_seed_iface.deinit(self.allocator);
         self.fs_types_iface.deinit(self.allocator);
         self.fs_preopens_iface.deinit(self.allocator);
+        self.sockets_network_iface.deinit(self.allocator);
+        self.sockets_instance_network_iface.deinit(self.allocator);
+        self.sockets_tcp_iface.deinit(self.allocator);
+        self.sockets_tcp_create_iface.deinit(self.allocator);
+        self.sockets_udp_iface.deinit(self.allocator);
+        self.sockets_udp_create_iface.deinit(self.allocator);
+        self.sockets_ip_name_lookup_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -286,6 +378,19 @@ pub const WasiCliAdapter = struct {
         self.fs_descriptor_table.deinit(self.allocator);
         for (self.fs_preopens.items) |p| self.allocator.free(p.name);
         self.fs_preopens.deinit(self.allocator);
+
+        // wasi:sockets resource tables. Sockets and networks are POD, so
+        // dropping a slot simply discards it. Resolve streams own their
+        // result slice + the heap struct itself.
+        self.network_table.deinit(self.allocator);
+        self.socket_table.deinit(self.allocator);
+        for (self.resolve_streams.items) |maybe| {
+            if (maybe) |s| {
+                self.allocator.free(s.results);
+                self.allocator.destroy(s);
+            }
+        }
+        self.resolve_streams.deinit(self.allocator);
     }
 
     /// Captured stderr bytes (separate buffer from stdout).
@@ -1788,6 +1893,501 @@ pub const WasiCliAdapter = struct {
             },
         }
     }
+
+    // ── wasi:sockets/* (#148) ──────────────────────────────────────────────
+    //
+    // Default-deny capability model: every method that would touch the
+    // network returns `error-code.access-denied` (or, for resolution,
+    // `name-unresolvable`). Pure getters (e.g. `address-family`,
+    // `is-listening`) read the adapter-side `Socket` rep so they can
+    // answer without IO. The TODOs throughout flag the code paths the
+    // future allow-list capability work will fill in.
+
+    /// Build a `result<X, error-code>` err InterfaceValue. Caller-owned via
+    /// `allocator`. Mirrors `fsResultErr` but specialized to sockets'
+    /// error-code variant indices.
+    fn socketResultErr(allocator: Allocator, code: SocketErrorCode) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+    }
+
+    /// Build a `result<X, error-code>` ok InterfaceValue.
+    fn socketResultOk(allocator: Allocator, value: InterfaceValue) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = value;
+        return .{ .result_val = .{ .is_ok = true, .payload = payload } };
+    }
+
+    fn lookupSocket(self: *WasiCliAdapter, handle: u32) ?*Socket {
+        if (handle >= self.socket_table.items.len) return null;
+        if (self.socket_table.items[handle]) |*s| return s;
+        return null;
+    }
+
+    fn pushSocket(self: *WasiCliAdapter, s: Socket) !u32 {
+        for (self.socket_table.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.socket_table.items[i] = s;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.socket_table.items.len);
+        try self.socket_table.append(self.allocator, s);
+        return idx;
+    }
+
+    fn pushNetwork(self: *WasiCliAdapter, n: Network) !u32 {
+        for (self.network_table.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.network_table.items[i] = n;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.network_table.items.len);
+        try self.network_table.append(self.allocator, n);
+        return idx;
+    }
+
+    fn pushResolveStream(self: *WasiCliAdapter, s: *ResolveAddressStream) !u32 {
+        for (self.resolve_streams.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.resolve_streams.items[i] = s;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.resolve_streams.items.len);
+        try self.resolve_streams.append(self.allocator, s);
+        return idx;
+    }
+
+    /// Generic `(...) -> result<_, error-code>` access-denied stub. Used as
+    /// the body of every default-deny socket method.
+    fn socketDenyAccess(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = try socketResultErr(allocator, .access_denied);
+    }
+
+    /// `(own<R>) -> ()` no-op resource drop that nulls the matching slot in
+    /// the socket table.
+    fn socketResourceDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle < self.socket_table.items.len) {
+            self.socket_table.items[handle] = null;
+        }
+    }
+
+    fn networkResourceDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle < self.network_table.items.len) {
+            self.network_table.items[handle] = null;
+        }
+    }
+
+    /// `wasi:sockets/instance-network.instance-network: () -> own<network>`.
+    fn instanceNetwork(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const h = try self.pushNetwork(.{});
+        results[0] = .{ .handle = h };
+    }
+
+    /// `wasi:sockets/tcp-create-socket.create-tcp-socket:
+    ///   (ip-address-family) -> result<own<tcp-socket>, error-code>`.
+    fn createTcpSocket(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const fam_disc: u32 = switch (args[0]) {
+            .enum_val => |d| d,
+            .u32 => |d| d,
+            .variant_val => |v| v.discriminant,
+            else => return error.InvalidArgs,
+        };
+        const fam: IpAddressFamily = if (fam_disc == 0) .ipv4 else .ipv6;
+        const h = try self.pushSocket(.{ .kind = .tcp, .family = fam });
+        results[0] = try socketResultOk(allocator, .{ .handle = h });
+    }
+
+    /// `wasi:sockets/udp-create-socket.create-udp-socket:
+    ///   (ip-address-family) -> result<own<udp-socket>, error-code>`.
+    fn createUdpSocket(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const fam_disc: u32 = switch (args[0]) {
+            .enum_val => |d| d,
+            .u32 => |d| d,
+            .variant_val => |v| v.discriminant,
+            else => return error.InvalidArgs,
+        };
+        const fam: IpAddressFamily = if (fam_disc == 0) .ipv4 else .ipv6;
+        const h = try self.pushSocket(.{ .kind = .udp, .family = fam });
+        results[0] = try socketResultOk(allocator, .{ .handle = h });
+    }
+
+    /// `[method]tcp-socket.address-family / [method]udp-socket.address-family:
+    ///   (borrow<X>) -> ip-address-family`. Pure getter — reads the rep.
+    fn socketAddressFamily(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            // Unknown rep — default to ipv4 to keep the call total.
+            results[0] = .{ .enum_val = @intFromEnum(IpAddressFamily.ipv4) };
+            return;
+        };
+        results[0] = .{ .enum_val = @intFromEnum(s.family) };
+    }
+
+    /// `[method]tcp-socket.is-listening: (borrow<tcp-socket>) -> bool`.
+    fn tcpIsListening(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = .{ .bool = false };
+            return;
+        };
+        results[0] = .{ .bool = s.state == .listening };
+    }
+
+    /// `[method]X.subscribe: (borrow<X>) -> own<pollable>`. Mints a stub
+    /// always-ready pollable — same simplification as the clocks adapter.
+    fn socketSubscribe(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const h = self.next_pollable_handle;
+        self.next_pollable_handle += 1;
+        results[0] = .{ .handle = h };
+    }
+
+    /// `wasi:sockets/ip-name-lookup.resolve-addresses:
+    ///   (borrow<network>, string) -> result<own<resolve-address-stream>,
+    ///                                        error-code>`.
+    ///
+    /// Default-deny: always returns `error-code.name-unresolvable`. A
+    /// real `std.Io.net.HostName.lookup` integration is deferred until
+    /// the allow-list capability lands (see #148 follow-up).
+    fn resolveAddresses(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = try socketResultErr(allocator, .name_unresolvable);
+    }
+
+    /// `[method]resolve-address-stream.resolve-next-address:
+    ///   (borrow<resolve-address-stream>) -> result<option<ip-address>, error-code>`.
+    fn resolveNextAddress(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.resolve_streams.items.len) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const stream = self.resolve_streams.items[handle] orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        // Always exhausted on the default-deny path — return ok(none).
+        _ = stream;
+        const none_val = InterfaceValue{ .option_val = .{ .is_some = false, .payload = null } };
+        results[0] = try socketResultOk(allocator, none_val);
+    }
+
+    /// `[resource-drop]resolve-address-stream`.
+    fn resolveStreamDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.resolve_streams.items.len) return;
+        if (self.resolve_streams.items[handle]) |s| {
+            self.allocator.free(s.results);
+            self.allocator.destroy(s);
+            self.resolve_streams.items[handle] = null;
+        }
+    }
+
+    /// Register `wasi:sockets/network` (#148). The WIT declares zero
+    /// methods; only the resource-drop is bound.
+    pub fn populateWasiSocketsNetwork(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.sockets_network_iface.members.put(self.allocator, "[resource-drop]network", .{
+            .func = .{ .context = self, .call = &networkResourceDrop },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_network_iface,
+        });
+    }
+
+    /// Register `wasi:sockets/instance-network` (#148).
+    pub fn populateWasiSocketsInstanceNetwork(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.sockets_instance_network_iface.members.put(self.allocator, "instance-network", .{
+            .func = .{ .context = self, .call = &instanceNetwork },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_instance_network_iface,
+        });
+    }
+
+    /// Register `wasi:sockets/tcp` (#148). Default-deny: every method that
+    /// would touch the network returns `error-code.access-denied`. Pure
+    /// getters (`address-family`, `is-listening`) read the rep.
+    pub fn populateWasiSocketsTcp(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        // Per-method routing: most methods go to the default-deny stub;
+        // a few have specific handlers.
+        const members = [_]M{
+            // network IO — all access-denied.
+            .{ .name = "[method]tcp-socket.start-bind", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.finish-bind", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.start-connect", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.finish-connect", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.start-listen", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.finish-listen", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.accept", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.local-address", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.remote-address", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.shutdown", .call = &socketDenyAccess },
+            // setters that surface socket options — also access-denied.
+            .{ .name = "[method]tcp-socket.set-listen-backlog-size", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.set-keep-alive-enabled", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.set-keep-alive-idle-time", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.set-keep-alive-interval", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.set-keep-alive-count", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.set-hop-limit", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.set-receive-buffer-size", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.set-send-buffer-size", .call = &socketDenyAccess },
+            // getters that surface socket options. They return
+            // `result<X, error-code>` per WIT, so default-deny is well-typed.
+            .{ .name = "[method]tcp-socket.keep-alive-enabled", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.keep-alive-idle-time", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.keep-alive-interval", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.keep-alive-count", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.hop-limit", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.receive-buffer-size", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.send-buffer-size", .call = &socketDenyAccess },
+            // pure getters answerable from the rep.
+            .{ .name = "[method]tcp-socket.address-family", .call = &socketAddressFamily },
+            .{ .name = "[method]tcp-socket.is-listening", .call = &tcpIsListening },
+            // pollable + drop.
+            .{ .name = "[method]tcp-socket.subscribe", .call = &socketSubscribe },
+            .{ .name = "[resource-drop]tcp-socket", .call = &socketResourceDrop },
+        };
+        for (members) |m| {
+            try self.sockets_tcp_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_tcp_iface,
+        });
+    }
+
+    /// Register `wasi:sockets/tcp-create-socket` (#148).
+    pub fn populateWasiSocketsTcpCreateSocket(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.sockets_tcp_create_iface.members.put(self.allocator, "create-tcp-socket", .{
+            .func = .{ .context = self, .call = &createTcpSocket },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_tcp_create_iface,
+        });
+    }
+
+    /// Register `wasi:sockets/udp` (#148). Default-deny across all IO
+    /// methods. The two sub-resources `incoming-datagram-stream` and
+    /// `outgoing-datagram-stream` only have their resource-drops bound;
+    /// the host never produces handles for them on the default-deny path.
+    pub fn populateWasiSocketsUdp(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]M{
+            .{ .name = "[method]udp-socket.start-bind", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.finish-bind", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.stream", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.local-address", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.remote-address", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.unicast-hop-limit", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.set-unicast-hop-limit", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.receive-buffer-size", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.set-receive-buffer-size", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.send-buffer-size", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.set-send-buffer-size", .call = &socketDenyAccess },
+            .{ .name = "[method]udp-socket.address-family", .call = &socketAddressFamily },
+            .{ .name = "[method]udp-socket.subscribe", .call = &socketSubscribe },
+            .{ .name = "[resource-drop]udp-socket", .call = &socketResourceDrop },
+            // Datagram-stream sub-resources. The host never returns a
+            // handle to one (because `udp-socket.stream` is access-denied),
+            // but a guest may still receive a guest-side wrapper that
+            // calls drop on dispose, so the drop must be linkable. The
+            // method bodies are wired to default-deny too in case a guest
+            // somehow constructs a synthetic handle.
+            .{ .name = "[resource-drop]incoming-datagram-stream", .call = &noopResourceDrop },
+            .{ .name = "[method]incoming-datagram-stream.receive", .call = &socketDenyAccess },
+            .{ .name = "[method]incoming-datagram-stream.subscribe", .call = &socketSubscribe },
+            .{ .name = "[resource-drop]outgoing-datagram-stream", .call = &noopResourceDrop },
+            .{ .name = "[method]outgoing-datagram-stream.check-send", .call = &socketDenyAccess },
+            .{ .name = "[method]outgoing-datagram-stream.send", .call = &socketDenyAccess },
+            .{ .name = "[method]outgoing-datagram-stream.subscribe", .call = &socketSubscribe },
+        };
+        for (members) |m| {
+            try self.sockets_udp_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_udp_iface,
+        });
+    }
+
+    /// Register `wasi:sockets/udp-create-socket` (#148).
+    pub fn populateWasiSocketsUdpCreateSocket(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.sockets_udp_create_iface.members.put(self.allocator, "create-udp-socket", .{
+            .func = .{ .context = self, .call = &createUdpSocket },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_udp_create_iface,
+        });
+    }
+
+    /// Register `wasi:sockets/ip-name-lookup` (#148). DNS resolution is
+    /// stubbed to `error-code.name-unresolvable`; the
+    /// `resolve-address-stream` resource is fully wired so a real
+    /// implementation can drop in later without changing the contract.
+    pub fn populateWasiSocketsIpNameLookup(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.sockets_ip_name_lookup_iface.members.put(self.allocator, "resolve-addresses", .{
+            .func = .{ .context = self, .call = &resolveAddresses },
+        });
+        try self.sockets_ip_name_lookup_iface.members.put(self.allocator, "[method]resolve-address-stream.resolve-next-address", .{
+            .func = .{ .context = self, .call = &resolveNextAddress },
+        });
+        try self.sockets_ip_name_lookup_iface.members.put(self.allocator, "[method]resolve-address-stream.subscribe", .{
+            .func = .{ .context = self, .call = &socketSubscribe },
+        });
+        try self.sockets_ip_name_lookup_iface.members.put(self.allocator, "[resource-drop]resolve-address-stream", .{
+            .func = .{ .context = self, .call = &resolveStreamDrop },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_ip_name_lookup_iface,
+        });
+    }
 };
 
 /// `wasi:clocks/wall-clock.datetime`: a record of `(seconds: u64, nanoseconds: u32)`.
@@ -1909,6 +2509,13 @@ pub fn populateWasiProviders(
     var matched_random_insecure_seed: ?[]const u8 = null;
     var matched_fs_types: ?[]const u8 = null;
     var matched_fs_preopens: ?[]const u8 = null;
+    var matched_sockets_network: ?[]const u8 = null;
+    var matched_sockets_instance_network: ?[]const u8 = null;
+    var matched_sockets_tcp: ?[]const u8 = null;
+    var matched_sockets_tcp_create: ?[]const u8 = null;
+    var matched_sockets_udp: ?[]const u8 = null;
+    var matched_sockets_udp_create: ?[]const u8 = null;
+    var matched_sockets_ip_name_lookup: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
@@ -1956,6 +2563,23 @@ pub fn populateWasiProviders(
             matched_fs_types = imp.name;
         if (matched_fs_preopens == null and matchesWasiPrefix(imp.name, "wasi:filesystem/preopens"))
             matched_fs_preopens = imp.name;
+        // wasi:sockets/* (#148). `instance-network` shares the
+        // `wasi:sockets/` prefix with `network`, so probe more-specific
+        // names first to avoid an aliasing match.
+        if (matched_sockets_instance_network == null and matchesWasiPrefix(imp.name, "wasi:sockets/instance-network"))
+            matched_sockets_instance_network = imp.name;
+        if (matched_sockets_tcp_create == null and matchesWasiPrefix(imp.name, "wasi:sockets/tcp-create-socket"))
+            matched_sockets_tcp_create = imp.name;
+        if (matched_sockets_udp_create == null and matchesWasiPrefix(imp.name, "wasi:sockets/udp-create-socket"))
+            matched_sockets_udp_create = imp.name;
+        if (matched_sockets_ip_name_lookup == null and matchesWasiPrefix(imp.name, "wasi:sockets/ip-name-lookup"))
+            matched_sockets_ip_name_lookup = imp.name;
+        if (matched_sockets_tcp == null and matchesWasiPrefix(imp.name, "wasi:sockets/tcp"))
+            matched_sockets_tcp = imp.name;
+        if (matched_sockets_udp == null and matchesWasiPrefix(imp.name, "wasi:sockets/udp"))
+            matched_sockets_udp = imp.name;
+        if (matched_sockets_network == null and matchesWasiPrefix(imp.name, "wasi:sockets/network"))
+            matched_sockets_network = imp.name;
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -2056,6 +2680,48 @@ pub fn populateWasiProviders(
         matched_fs_preopens orelse "wasi:filesystem/preopens",
     );
     if (matched_fs_preopens == null) _ = providers.remove("wasi:filesystem/preopens");
+
+    try adapter.populateWasiSocketsNetwork(
+        providers,
+        matched_sockets_network orelse "wasi:sockets/network",
+    );
+    if (matched_sockets_network == null) _ = providers.remove("wasi:sockets/network");
+
+    try adapter.populateWasiSocketsInstanceNetwork(
+        providers,
+        matched_sockets_instance_network orelse "wasi:sockets/instance-network",
+    );
+    if (matched_sockets_instance_network == null) _ = providers.remove("wasi:sockets/instance-network");
+
+    try adapter.populateWasiSocketsTcp(
+        providers,
+        matched_sockets_tcp orelse "wasi:sockets/tcp",
+    );
+    if (matched_sockets_tcp == null) _ = providers.remove("wasi:sockets/tcp");
+
+    try adapter.populateWasiSocketsTcpCreateSocket(
+        providers,
+        matched_sockets_tcp_create orelse "wasi:sockets/tcp-create-socket",
+    );
+    if (matched_sockets_tcp_create == null) _ = providers.remove("wasi:sockets/tcp-create-socket");
+
+    try adapter.populateWasiSocketsUdp(
+        providers,
+        matched_sockets_udp orelse "wasi:sockets/udp",
+    );
+    if (matched_sockets_udp == null) _ = providers.remove("wasi:sockets/udp");
+
+    try adapter.populateWasiSocketsUdpCreateSocket(
+        providers,
+        matched_sockets_udp_create orelse "wasi:sockets/udp-create-socket",
+    );
+    if (matched_sockets_udp_create == null) _ = providers.remove("wasi:sockets/udp-create-socket");
+
+    try adapter.populateWasiSocketsIpNameLookup(
+        providers,
+        matched_sockets_ip_name_lookup orelse "wasi:sockets/ip-name-lookup",
+    );
+    if (matched_sockets_ip_name_lookup == null) _ = providers.remove("wasi:sockets/ip-name-lookup");
 }
 
 /// Run an already-loaded component. See `runComponentBytes` for the
@@ -3018,4 +3684,177 @@ test "filesystem: open-at sandbox rejects .. and absolute paths (#145)" {
     try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath("a/b/c.txt"));
     try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath(""));
     try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath("..foo"));
+}
+
+test "populateWasiProviders: binds wasi:sockets/* (#148)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:sockets/network@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/instance-network@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/tcp@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/tcp-create-socket@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/udp@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/udp-create-socket@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/ip-name-lookup@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:sockets/network@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/instance-network@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/tcp@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/tcp-create-socket@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/udp@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/udp-create-socket@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/ip-name-lookup@0.2.6"));
+    // Bare names (no @-suffix) must NOT linger when only versioned imports
+    // were declared.
+    try testing.expect(!providers.contains("wasi:sockets/network"));
+    try testing.expect(!providers.contains("wasi:sockets/tcp"));
+
+    // Spot-check that key methods are wired.
+    try testing.expect(adapter.sockets_network_iface.members.contains("[resource-drop]network"));
+    try testing.expect(adapter.sockets_instance_network_iface.members.contains("instance-network"));
+    try testing.expect(adapter.sockets_tcp_create_iface.members.contains("create-tcp-socket"));
+    try testing.expect(adapter.sockets_udp_create_iface.members.contains("create-udp-socket"));
+    try testing.expect(adapter.sockets_tcp_iface.members.contains("[method]tcp-socket.start-bind"));
+    try testing.expect(adapter.sockets_tcp_iface.members.contains("[method]tcp-socket.address-family"));
+    try testing.expect(adapter.sockets_tcp_iface.members.contains("[method]tcp-socket.subscribe"));
+    try testing.expect(adapter.sockets_tcp_iface.members.contains("[resource-drop]tcp-socket"));
+    try testing.expect(adapter.sockets_udp_iface.members.contains("[method]udp-socket.start-bind"));
+    try testing.expect(adapter.sockets_udp_iface.members.contains("[resource-drop]udp-socket"));
+    try testing.expect(adapter.sockets_udp_iface.members.contains("[resource-drop]incoming-datagram-stream"));
+    try testing.expect(adapter.sockets_udp_iface.members.contains("[resource-drop]outgoing-datagram-stream"));
+    try testing.expect(adapter.sockets_ip_name_lookup_iface.members.contains("resolve-addresses"));
+    try testing.expect(adapter.sockets_ip_name_lookup_iface.members.contains("[method]resolve-address-stream.resolve-next-address"));
+    try testing.expect(adapter.sockets_ip_name_lookup_iface.members.contains("[resource-drop]resolve-address-stream"));
+}
+
+test "sockets: create-tcp-socket allocates slot (#148)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .enum_val = 1 }}; // ipv6
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(usize, 1), adapter.socket_table.items.len);
+    const slot = adapter.socket_table.items[0].?;
+    try testing.expectEqual(SocketKind.tcp, slot.kind);
+    try testing.expectEqual(IpAddressFamily.ipv6, slot.family);
+    try testing.expectEqual(SocketState.unbound, slot.state);
+}
+
+test "sockets: create-udp-socket allocates slot (#148)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .enum_val = 0 }}; // ipv4
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createUdpSocket(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(usize, 1), adapter.socket_table.items.len);
+    const slot = adapter.socket_table.items[0].?;
+    try testing.expectEqual(SocketKind.udp, slot.kind);
+    try testing.expectEqual(IpAddressFamily.ipv4, slot.family);
+}
+
+test "sockets: instance-network returns network handle (#148)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    try testing.expectEqual(@as(usize, 1), adapter.network_table.items.len);
+    try testing.expect(adapter.network_table.items[0] != null);
+}
+
+test "sockets: tcp start-bind returns access-denied by default (#148)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Allocate a socket the call refers to.
+    var ci: ComponentInstance = undefined;
+    const create_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var create_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &create_args, &create_results, testing.allocator);
+    defer testing.allocator.destroy(create_results[0].result_val.payload.?);
+
+    // start-bind is a default-deny stub.
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, .{ .u32 = 0 } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.socketDenyAccess(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(!results[0].result_val.is_ok);
+    const err = results[0].result_val.payload.?.*;
+    try testing.expectEqual(@as(u32, @intFromEnum(SocketErrorCode.access_denied)), err.variant_val.discriminant);
+}
+
+test "sockets: tcp address-family reads rep family (#148)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const create_args = [_]InterfaceValue{.{ .enum_val = 1 }}; // ipv6
+    var create_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &create_args, &create_results, testing.allocator);
+    defer testing.allocator.destroy(create_results[0].result_val.payload.?);
+
+    const args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.socketAddressFamily(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .enum_val);
+    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv6)), results[0].enum_val);
+}
+
+test "sockets: ip-name-lookup smoke (#148)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // resolve-addresses is default-deny: it must return name-unresolvable
+    // cleanly without panicking.
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .string = .{ .ptr = 0, .len = 0 } } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveAddresses(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(!results[0].result_val.is_ok);
+    const err = results[0].result_val.payload.?.*;
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
+        err.variant_val.discriminant,
+    );
 }
