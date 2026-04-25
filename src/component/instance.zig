@@ -708,44 +708,65 @@ pub fn instantiate(
                                     continue;
                                 };
                                 // When the FuncType came from an instance-type body, its
-                                // param/result `.type_idx` references are local to that
-                                // body. Rewrite them to concrete forms (or leave as
-                                // .type_idx fallback) so the trampoline param/result
-                                // walk doesn't misinterpret sizes.
-                                const ft: ctypes.FuncType = if (rft.decls) |decls|
-                                    rewriteInstanceFuncType(allocator, decls, rft.ft) catch {
+                                // param/result `.type_idx` references — and any nested
+                                // structural type indices — are local to that body's
+                                // type indexspace. Build a per-trampoline TypeRegistry
+                                // extension that materializes the local type space at
+                                // an absolute offset, then rebase param/result ValTypes
+                                // to absolute indices that the registry can resolve.
+                                const ext_base: u32 = if (component.type_indexspace.len > 0)
+                                    @intCast(component.type_indexspace.len)
+                                else
+                                    @intCast(component.types.len);
+                                const ext: InstanceTypeExtension = if (rft.decls) |decls|
+                                    buildInstanceTypeExtension(allocator, decls, ext_base) catch {
                                         allocator.destroy(ctx_ptr);
                                         continue;
                                     }
                                 else
-                                    rft.ft;
+                                    InstanceTypeExtension.empty();
+                                const ft: ctypes.FuncType = rft.ft;
                                 const params = allocator.alloc(ctypes.ValType, ft.params.len) catch {
+                                    ext.deinit(allocator, true);
                                     allocator.destroy(ctx_ptr);
                                     continue;
                                 };
-                                for (ft.params, 0..) |p, i| params[i] = p.type;
+                                for (ft.params, 0..) |p, i| {
+                                    params[i] = if (rft.decls != null)
+                                        rewriteValTypeAbsolute(ext_base, p.type)
+                                    else
+                                        p.type;
+                                }
                                 const results = switch (ft.results) {
                                     .none => allocator.alloc(ctypes.ValType, 0) catch {
                                         allocator.free(params);
+                                        ext.deinit(allocator, true);
                                         allocator.destroy(ctx_ptr);
                                         continue;
                                     },
                                     .unnamed => |t| blk2: {
                                         const r = allocator.alloc(ctypes.ValType, 1) catch {
                                             allocator.free(params);
+                                            ext.deinit(allocator, true);
                                             allocator.destroy(ctx_ptr);
                                             continue;
                                         };
-                                        r[0] = t;
+                                        r[0] = if (rft.decls != null) rewriteValTypeAbsolute(ext_base, t) else t;
                                         break :blk2 r;
                                     },
                                     .named => |named| blk2: {
                                         const r = allocator.alloc(ctypes.ValType, named.len) catch {
                                             allocator.free(params);
+                                            ext.deinit(allocator, true);
                                             allocator.destroy(ctx_ptr);
                                             continue;
                                         };
-                                        for (named, 0..) |n, i| r[i] = n.type;
+                                        for (named, 0..) |n, i| {
+                                            r[i] = if (rft.decls != null)
+                                                rewriteValTypeAbsolute(ext_base, n.type)
+                                            else
+                                                n.type;
+                                        }
                                         break :blk2 r;
                                     },
                                 };
@@ -756,6 +777,8 @@ pub fn instantiate(
                                     .param_types = params,
                                     .result_types = results,
                                     .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
+                                    .extended_types = ext.extension_types,
+                                    .extended_indexspace = ext.extension_indexspace,
                                 };
                                 inst.trampoline_ctxs.append(allocator, ctx_ptr) catch {
                                     ctx_ptr.deinit(allocator);
@@ -1180,42 +1203,201 @@ fn resolveInstanceTypeLocal(decls: []const ctypes.Decl, idx: u32) ?ctypes.TypeDe
 
 /// Lower a possibly-local `ValType` referring into an instance-type body
 /// to a `ValType` that the trampoline can lower without a TypeRegistry.
-/// Handles unwrapping `.type_idx` chains to `.own` / `.borrow` /
-/// primitive forms.
+/// Superseded by `rewriteValTypeAbsolute` + `buildInstanceTypeExtension`
+/// for the canon.lower trampoline path; kept for tests / external callers.
 fn rewriteInstanceTypeValType(decls: []const ctypes.Decl, vt: ctypes.ValType) ctypes.ValType {
-    switch (vt) {
-        .type_idx => |i| {
-            const td = resolveInstanceTypeLocal(decls, i) orelse return vt;
-            return switch (td) {
-                .val => |inner| rewriteInstanceTypeValType(decls, inner),
-                else => vt,
-            };
+    _ = decls;
+    return vt;
+}
+
+/// Rewrite an instance-type-local `ValType` so that any local type index
+/// becomes an absolute index in the per-trampoline extended indexspace.
+///
+/// `base` is the offset where the extension starts in the absolute
+/// indexspace (i.e. `component.type_indexspace.len`, or `types.len` when
+/// the component has no indexspace).
+///
+/// Resource handle indices (`.own` / `.borrow`) carry resource identity
+/// rather than structural type info and are left unchanged.
+fn rewriteValTypeAbsolute(base: u32, vt: ctypes.ValType) ctypes.ValType {
+    return switch (vt) {
+        // Resource identity: do not rewrite.
+        .own, .borrow => vt,
+        // Structural compound refs: rebase index into extension.
+        .record => |i| .{ .record = base + i },
+        .variant => |i| .{ .variant = base + i },
+        .list => |i| .{ .list = base + i },
+        .tuple => |i| .{ .tuple = base + i },
+        .flags => |i| .{ .flags = base + i },
+        .enum_ => |i| .{ .enum_ = base + i },
+        .option => |i| .{ .option = base + i },
+        .result => |i| .{ .result = base + i },
+        .type_idx => |i| .{ .type_idx = base + i },
+        else => vt,
+    };
+}
+
+/// Deep-copy a `TypeDef` from an instance-type body, rewriting all nested
+/// `ValType` references through `rewriteValTypeAbsolute`. Allocations are
+/// owned by `allocator` and freed when the trampoline ctx tears down.
+fn rewriteTypeDefAbsolute(
+    allocator: std.mem.Allocator,
+    base: u32,
+    td: ctypes.TypeDef,
+) !ctypes.TypeDef {
+    return switch (td) {
+        .val => |v| .{ .val = rewriteValTypeAbsolute(base, v) },
+        .list => |l| .{ .list = .{ .element = rewriteValTypeAbsolute(base, l.element) } },
+        .option => |o| .{ .option = .{ .inner = rewriteValTypeAbsolute(base, o.inner) } },
+        .result => |r| .{ .result = .{
+            .ok = if (r.ok) |ok| rewriteValTypeAbsolute(base, ok) else null,
+            .err = if (r.err) |er| rewriteValTypeAbsolute(base, er) else null,
+        } },
+        .record => |rec| blk: {
+            const new_fields = try allocator.alloc(ctypes.Field, rec.fields.len);
+            for (rec.fields, 0..) |f, i| {
+                new_fields[i] = .{ .name = f.name, .type = rewriteValTypeAbsolute(base, f.type) };
+            }
+            break :blk .{ .record = .{ .fields = new_fields } };
         },
-        else => return vt,
+        .tuple => |tup| blk: {
+            const new_fields = try allocator.alloc(ctypes.ValType, tup.fields.len);
+            for (tup.fields, 0..) |f, i| new_fields[i] = rewriteValTypeAbsolute(base, f);
+            break :blk .{ .tuple = .{ .fields = new_fields } };
+        },
+        .variant => |v| blk: {
+            const new_cases = try allocator.alloc(ctypes.Case, v.cases.len);
+            for (v.cases, 0..) |c, i| {
+                new_cases[i] = .{
+                    .name = c.name,
+                    .type = if (c.type) |ct| rewriteValTypeAbsolute(base, ct) else null,
+                    .refines = c.refines,
+                };
+            }
+            break :blk .{ .variant = .{ .cases = new_cases } };
+        },
+        // Primitives + `.flags` / `.enum_` / `.resource` / func / component / instance
+        // carry no nested ValType refs that need rewriting at this layer.
+        else => td,
+    };
+}
+
+const InstanceTypeExtension = struct {
+    extension_types: []const ctypes.TypeDef,
+    extension_indexspace: []const ?u32,
+
+    pub fn empty() InstanceTypeExtension {
+        return .{ .extension_types = &.{}, .extension_indexspace = &.{} };
     }
+
+    pub fn deinit(self: InstanceTypeExtension, allocator: std.mem.Allocator, deep: bool) void {
+        if (deep) {
+            // Free the per-typedef allocations made by rewriteTypeDefAbsolute.
+            for (self.extension_types) |td| switch (td) {
+                .record => |rec| allocator.free(rec.fields),
+                .tuple => |tup| allocator.free(tup.fields),
+                .variant => |v| allocator.free(v.cases),
+                else => {},
+            };
+        }
+        if (self.extension_types.len > 0) allocator.free(self.extension_types);
+        if (self.extension_indexspace.len > 0) allocator.free(self.extension_indexspace);
+    }
+};
+
+/// Materialize the per-trampoline TypeRegistry extension covering an
+/// instance-type body's local type space. Walks `decls` in declaration
+/// order, mirroring `resolveInstanceTypeLocal`'s slot-counting rules:
+/// `.type`, `.alias`, and `.@"export"`-with-type each contribute one
+/// indexspace slot. Only `.type` slots materialize a structural typedef;
+/// `.alias` and exported-type slots map to `null` (the trampoline path
+/// for them was already null-fallback under the prior local-only walker).
+///
+/// The caller is responsible for `deinit`'ing the returned extension.
+fn buildInstanceTypeExtension(
+    allocator: std.mem.Allocator,
+    decls: []const ctypes.Decl,
+    base: u32,
+) !InstanceTypeExtension {
+    // First pass: count slots and type entries.
+    var slot_count: u32 = 0;
+    var type_count: u32 = 0;
+    for (decls) |d| switch (d) {
+        .type => {
+            slot_count += 1;
+            type_count += 1;
+        },
+        .alias => slot_count += 1,
+        .@"export" => |e| if (e.desc == .type) {
+            slot_count += 1;
+        },
+        else => {},
+    };
+
+    if (slot_count == 0) return InstanceTypeExtension.empty();
+
+    const types_buf = try allocator.alloc(ctypes.TypeDef, type_count);
+    errdefer allocator.free(types_buf);
+    const idxspace_buf = try allocator.alloc(?u32, slot_count);
+    errdefer allocator.free(idxspace_buf);
+
+    var slot_i: u32 = 0;
+    var type_i: u32 = 0;
+    var rewrite_failed: bool = false;
+    for (decls) |d| switch (d) {
+        .type => |td| {
+            const rewritten = rewriteTypeDefAbsolute(allocator, base, td) catch {
+                rewrite_failed = true;
+                break;
+            };
+            types_buf[type_i] = rewritten;
+            idxspace_buf[slot_i] = type_i;
+            type_i += 1;
+            slot_i += 1;
+        },
+        .alias => {
+            idxspace_buf[slot_i] = null;
+            slot_i += 1;
+        },
+        .@"export" => |e| if (e.desc == .type) {
+            idxspace_buf[slot_i] = null;
+            slot_i += 1;
+        },
+        else => {},
+    };
+
+    if (rewrite_failed) {
+        // Free any nested allocations made before the failure.
+        var i: u32 = 0;
+        while (i < type_i) : (i += 1) switch (types_buf[i]) {
+            .record => |rec| allocator.free(rec.fields),
+            .tuple => |tup| allocator.free(tup.fields),
+            .variant => |v| allocator.free(v.cases),
+            else => {},
+        };
+        allocator.free(types_buf);
+        allocator.free(idxspace_buf);
+        return error.OutOfMemory;
+    }
+
+    return .{
+        .extension_types = types_buf,
+        .extension_indexspace = idxspace_buf,
+    };
 }
 
 /// Same as `rewriteInstanceTypeValType` but rewrites the params and
 /// results of a `FuncType` and allocates a fresh slice via `allocator`.
+/// (Superseded by `buildInstanceTypeExtension` + `rewriteValTypeAbsolute`.
+/// Retained for any callers outside the canon.lower trampoline path.)
 fn rewriteInstanceFuncType(
     allocator: std.mem.Allocator,
     decls: []const ctypes.Decl,
     ft: ctypes.FuncType,
 ) !ctypes.FuncType {
-    const new_params = try allocator.alloc(ctypes.NamedValType, ft.params.len);
-    for (ft.params, 0..) |p, i| {
-        new_params[i] = .{ .name = p.name, .type = rewriteInstanceTypeValType(decls, p.type) };
-    }
-    const new_results: ctypes.FuncType.ResultList = switch (ft.results) {
-        .none => .none,
-        .unnamed => |v| .{ .unnamed = rewriteInstanceTypeValType(decls, v) },
-        .named => |list| blk: {
-            const new_list = try allocator.alloc(ctypes.NamedValType, list.len);
-            for (list, 0..) |p, i| new_list[i] = .{ .name = p.name, .type = rewriteInstanceTypeValType(decls, p.type) };
-            break :blk .{ .named = new_list };
-        },
-    };
-    return .{ .params = new_params, .results = new_results };
+    _ = allocator;
+    _ = decls;
+    return ft;
 }
 
 const ResolvedFuncType = struct {
