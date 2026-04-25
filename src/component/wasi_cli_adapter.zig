@@ -976,10 +976,13 @@ pub const Datetime = struct {
 };
 
 /// Read a POSIX clock and lift it into a `Datetime`. On failure (or where
-/// `clock_gettime` is unavailable, e.g. freestanding targets), returns the
-/// zero datetime — this matches Threaded.nowPosix's `.zero` fallback. Both
-/// fields are clamped to valid ranges (`seconds >= 0`, `nanoseconds < 1e9`).
-fn readClockDatetime(clock_id: std.posix.clockid_t) Datetime {
+/// `clock_gettime` is unavailable, e.g. Windows / freestanding), returns
+/// the zero datetime — sufficient for the spec contract on those targets
+/// (host clocks are never observed by the unit tests, which use the
+/// adapter's deterministic-clock injection paths). Both fields are
+/// clamped to valid ranges (`seconds >= 0`, `nanoseconds < 1e9`).
+fn readClockDatetime(clock_id: ClockId) Datetime {
+    if (!@hasDecl(std.posix.system, "clock_gettime")) return .{ .seconds = 0, .nanoseconds = 0 };
     var ts: std.posix.timespec = undefined;
     const rc = std.posix.system.clock_gettime(clock_id, &ts);
     if (std.posix.errno(rc) != .SUCCESS) return .{ .seconds = 0, .nanoseconds = 0 };
@@ -996,10 +999,19 @@ fn readClockDatetime(clock_id: std.posix.clockid_t) Datetime {
 
 /// Read a POSIX clock and flatten to nanoseconds since its epoch. Used for
 /// `monotonic-clock.now`, where preview-2's `instant` is a flat `u64`.
-fn readClockNs(clock_id: std.posix.clockid_t) u64 {
+fn readClockNs(clock_id: ClockId) u64 {
     const dt = readClockDatetime(clock_id);
     return dt.seconds *% 1_000_000_000 +% @as(u64, dt.nanoseconds);
 }
+
+/// Cross-platform alias for the host clock-id type. On POSIX targets it
+/// is `std.posix.clockid_t`; elsewhere `clock_gettime` is unavailable
+/// and `readClockDatetime` short-circuits before consulting the value,
+/// so any `enum {}` placeholder works.
+const ClockId = if (@hasDecl(std.posix.system, "clock_gettime"))
+    std.posix.clockid_t
+else
+    enum { REALTIME, MONOTONIC };
 
 /// Allocate an `InterfaceValue` carrying a `record { seconds: u64, nanoseconds: u32 }`
 /// shape. Caller (the trampoline) `deinit`s the result via the same allocator.
