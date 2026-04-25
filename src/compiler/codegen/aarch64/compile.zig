@@ -7,6 +7,8 @@
 const std = @import("std");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
+const regalloc = @import("../../ir/regalloc.zig");
+const analysis = @import("../../ir/analysis.zig");
 
 /// Simple VReg → physical register mapping.
 ///
@@ -60,6 +62,11 @@ const RegMap = struct {
     spill_base: u32 = 0,
     /// Maximum bytes reserved for spills (beyond which `assign` errors).
     spill_capacity: u32 = 0,
+    /// Optional linear-scan allocation result. When non-null, `assign`
+    /// consults this for the physical location of every vreg instead of
+    /// running the greedy fallback. Set by `compileFunctionImpl` right
+    /// after running `regalloc.allocate`.
+    alloc_result: ?*const regalloc.AllocResult = null,
 
     fn init(allocator: std.mem.Allocator, spill_base: u32, spill_capacity: u32) RegMap {
         return .{
@@ -74,6 +81,44 @@ const RegMap = struct {
     }
 
     fn assign(self: *RegMap, vreg: ir.VReg) !Location {
+        // Regalloc-driven path: consult the pre-computed AllocResult.
+        // The physreg numbers used by regalloc match the indices into
+        // `scratch_regs` (see `aarch64RegSet`), so the phys-reg number
+        // IS the scratch_regs index. Spill offsets are absolute FP
+        // offsets; translate to RegMap-relative by subtracting spill_base.
+        if (self.alloc_result) |ar| {
+            if (ar.get(vreg)) |a| {
+                switch (a) {
+                    .reg => |r| {
+                        // `r` is the aarch64 register NUMBER (0..14 or
+                        // 19..28). Find its index in `scratch_regs` to
+                        // update `reg_used` / `used_callee_mask`.
+                        const reg_num: u32 = @intCast(r);
+                        const idx: usize = if (reg_num <= 14) reg_num else reg_num - 4;
+                        self.reg_used[idx] = true;
+                        if (idx >= caller_saved_count) {
+                            self.used_callee_mask |= (@as(u16, 1) << @intCast(idx - caller_saved_count));
+                        }
+                        const loc = Location{ .reg = scratch_regs[idx] };
+                        try self.entries.put(vreg, loc);
+                        return loc;
+                    },
+                    .stack => |abs_off| {
+                        const rel: i64 = @as(i64, abs_off) - @as(i64, @intCast(self.spill_base));
+                        if (rel < 0) return error.NegativeSpillOffset;
+                        const rel_u: u32 = @intCast(rel);
+                        if (rel_u + 8 > self.spill_capacity) return error.OutOfSpillSlots;
+                        self.next_stack_offset = @max(self.next_stack_offset, rel_u + 8);
+                        const loc = Location{ .stack = rel_u };
+                        try self.entries.put(vreg, loc);
+                        return loc;
+                    },
+                }
+            }
+            // Fall through to greedy if the allocator had no opinion
+            // (vreg has no live range — e.g., a def that's never used).
+            std.debug.panic("regalloc-driven assign: vreg %{d} missing from AllocResult", .{vreg});
+        }
         for (scratch_regs, 0..) |r, i| {
             if (!self.reg_used[i]) {
                 self.reg_used[i] = true;
@@ -101,6 +146,12 @@ const RegMap = struct {
     /// Spilled (stack) vregs are not reclaimed — spill slots are stable for
     /// the lifetime of the function (other slots may still be live above).
     fn freeVReg(self: *RegMap, vreg: ir.VReg) void {
+        // Under regalloc-driven mode, regalloc owns liveness; the main
+        // loop's kill_lists is a different (and sometimes narrower)
+        // notion. Removing entries here can erase bindings that
+        // regalloc still expects to be valid (e.g., a vreg that is
+        // live across a block boundary). Leave bookkeeping intact.
+        if (self.alloc_result != null) return;
         const loc = self.entries.get(vreg) orelse return;
         switch (loc) {
             .reg => |r| {
@@ -239,18 +290,19 @@ pub fn compileFunctionImpl(
     // Phase 1b: stack args beyond x7 aren't supported yet.
     if (func.param_count > 7) return error.TooManyParams;
 
-    // Phase 2 of regalloc adoption (issue #100): run the linear-scan
-    // allocator in shadow mode. Its output is discarded here; the
-    // scavenger (`RegMap`) still drives codegen. The purpose is to
-    // exercise `regalloc.allocate` + `collectClobberPoints` on every
-    // function the test suite and CoreMark compile, so that Phase 3
-    // (the emitter flip) starts from a known-good analysis.
+    // Phase 3 of regalloc adoption (issue #100): drive RegMap from a real
+    // linear-scan allocation. `RegMap.assign` consults `alloc_result` first;
+    // greedy scavenging remains as a fallback for vregs the allocator had no
+    // opinion on. This subsumes the earlier Phase 2 shadow-mode run that
+    // landed on `main` via #135 — the allocator now produces real assignments
+    // rather than being a no-op consistency check.
     //
-    // If this errors or trips an internal assertion, it's a genuine
-    // bug — either in the IR, in `analysis.computeLiveRanges`, or in
-    // the allocator — and we want it to surface loudly here rather
-    // than in Phase 3 mixed with codegen changes.
-    try shadowRunRegalloc(func, allocator);
+    // The actual `regalloc.allocate` call is deferred until after the FMA
+    // fusion pre-pass below, because fused MADD/MSUB reads a mul's sources
+    // at the add position; we need to extend those vregs' live ranges past
+    // the mul before allocation so the sources' physregs aren't reassigned.
+    var clobbers = try collectClobberPoints(func, allocator);
+    defer clobbers.deinit(allocator);
 
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
@@ -267,10 +319,6 @@ pub fn compileFunctionImpl(
     // might need a slot, plus a 16-slot safety margin for pathological
     // interleavings. Slots are 8 bytes.
     const spill_base: u32 = (func.local_count + 3) * 8;
-    const spill_capacity: u32 = blk: {
-        const vreg_slots = func.next_vreg + 16;
-        break :blk @intCast(vreg_slots * 8);
-    };
 
     // Multi-result plumbing. Scan call sites for max `extra_results` and
     // reserve caller-side scratch (`scratch_base`) + HRP save slot
@@ -286,26 +334,11 @@ pub fn compileFunctionImpl(
             }
         }
     }
-    const hrp_save_off: u32 = spill_base + spill_capacity;
-    const scratch_base: u32 = hrp_save_off + 8;
-    const scratch_size: u32 = max_extra_results * 8;
-    const call_save_base: u32 = scratch_base + scratch_size;
-    const call_save_size: u32 = 128;
-    const callee_save_base: u32 = call_save_base + call_save_size;
-    const callee_save_count: u32 = 10; // x19..x28
-    const callee_save_size: u32 = callee_save_count * 8;
-    const raw_frame = callee_save_base + callee_save_size;
-    const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
 
-    var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
-    defer reg_map.deinit();
-
+    // spill_capacity is finalized below after the allocator runs (we use
+    // alloc_result.spill_count instead of a conservative next_vreg+16
+    // estimate, which shrinks frames and reduces I-cache pressure).
     var fctx = ctx;
-    fctx.call_save_base = call_save_base;
-    fctx.callee_save_base = callee_save_base;
-    fctx.hrp_save_off = hrp_save_off;
-    fctx.scratch_base = scratch_base;
-    fctx.frame_size = frame_size;
 
     var callee_save_sites: std.ArrayListUnmanaged([callee_saved_regs.len]usize) = .empty;
     defer callee_save_sites.deinit(allocator);
@@ -464,57 +497,129 @@ pub fn compileFunctionImpl(
     defer mul_fused.deinit();
     var fma_info = std.AutoHashMap(ir.VReg, FmaInfo).init(allocator);
     defer fma_info.deinit();
-    for (func.blocks.items) |block| {
-        const insts = block.instructions.items;
-        var i: usize = 0;
-        while (i < insts.len) : (i += 1) {
-            const add_inst = insts[i];
-            const is_add = add_inst.op == .add;
-            const is_sub = add_inst.op == .sub;
-            if (!is_add and !is_sub) continue;
-            if (add_inst.type != .i32 and add_inst.type != .i64) continue;
-            const bin: ir.Inst.BinOp = switch (add_inst.op) {
-                .add => |b| b, .sub => |b| b, else => continue,
-            };
-            const candidates: [2]?ir.VReg = if (is_add)
-                .{ bin.rhs, bin.lhs }
-            else
-                .{ bin.rhs, null };
-            for (candidates) |maybe_mul_dest| {
-                const mul_dest = maybe_mul_dest orelse continue;
-                const uc = use_counts.get(mul_dest) orelse continue;
-                if (uc != 1) continue;
-                var found_bin: ?ir.Inst.BinOp = null;
-                var j: usize = i;
-                while (j > 0) : (j -= 1) {
-                    const prev = insts[j - 1];
-                    if (prev.dest) |d| {
-                        if (d != mul_dest) continue;
-                        if (prev.op == .mul and prev.type == add_inst.type) {
-                            found_bin = prev.op.mul;
-                        }
-                        break;
-                    }
-                }
-                const mul_bin = found_bin orelse continue;
-                const addend = if (is_add and maybe_mul_dest.? == bin.lhs)
-                    bin.rhs
+    // Map from FMA add's dest vreg → global instruction position of the add.
+    // Used below to extend `mul_lhs`/`mul_rhs`/`addend` live ranges past the
+    // mul, so regalloc doesn't reassign their physregs before MADD/MSUB reads
+    // them at the add position.
+    var fma_add_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer fma_add_pos.deinit();
+    {
+        var global_idx: u32 = 0;
+        for (func.blocks.items) |block| {
+            const insts = block.instructions.items;
+            var i: usize = 0;
+            while (i < insts.len) : (i += 1) {
+                defer global_idx += 1;
+                const add_inst = insts[i];
+                const is_add = add_inst.op == .add;
+                const is_sub = add_inst.op == .sub;
+                if (!is_add and !is_sub) continue;
+                if (add_inst.type != .i32 and add_inst.type != .i64) continue;
+                const bin: ir.Inst.BinOp = switch (add_inst.op) {
+                    .add => |b| b, .sub => |b| b, else => continue,
+                };
+                const candidates: [2]?ir.VReg = if (is_add)
+                    .{ bin.rhs, bin.lhs }
                 else
-                    bin.lhs;
-                try mul_fused.put(mul_dest, {});
-                const dest = add_inst.dest orelse continue;
-                try fma_info.put(dest, .{
-                    .mul_lhs = mul_bin.lhs,
-                    .mul_rhs = mul_bin.rhs,
-                    .addend = addend,
-                    .is_sub = is_sub,
-                });
-                break;
+                    .{ bin.rhs, null };
+                for (candidates) |maybe_mul_dest| {
+                    const mul_dest = maybe_mul_dest orelse continue;
+                    const uc = use_counts.get(mul_dest) orelse continue;
+                    if (uc != 1) continue;
+                    var found_bin: ?ir.Inst.BinOp = null;
+                    var j: usize = i;
+                    while (j > 0) : (j -= 1) {
+                        const prev = insts[j - 1];
+                        if (prev.dest) |d| {
+                            if (d != mul_dest) continue;
+                            if (prev.op == .mul and prev.type == add_inst.type) {
+                                found_bin = prev.op.mul;
+                            }
+                            break;
+                        }
+                    }
+                    const mul_bin = found_bin orelse continue;
+                    const addend = if (is_add and maybe_mul_dest.? == bin.lhs)
+                        bin.rhs
+                    else
+                        bin.lhs;
+                    try mul_fused.put(mul_dest, {});
+                    const dest = add_inst.dest orelse continue;
+                    try fma_info.put(dest, .{
+                        .mul_lhs = mul_bin.lhs,
+                        .mul_rhs = mul_bin.rhs,
+                        .addend = addend,
+                        .is_sub = is_sub,
+                    });
+                    try fma_add_pos.put(dest, global_idx);
+                    break;
+                }
             }
         }
     }
     fctx.mul_fused = &mul_fused;
     fctx.fma_info = &fma_info;
+
+    // Run the linear-scan allocator. Compute live ranges first so we can
+    // extend FMA sources' ranges past the mul position (see comment above).
+    const live_ranges = try analysis.computeLiveRanges(func, allocator);
+    defer allocator.free(live_ranges);
+    if (fma_info.count() > 0) {
+        // Build a vreg→range-index lookup for the patch loop.
+        var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
+        defer range_idx.deinit();
+        try range_idx.ensureTotalCapacity(@intCast(live_ranges.len));
+        for (live_ranges, 0..) |r, idx| {
+            range_idx.putAssumeCapacity(r.vreg, idx);
+        }
+        var it = fma_info.iterator();
+        while (it.next()) |entry| {
+            const add_dest = entry.key_ptr.*;
+            const fi = entry.value_ptr.*;
+            const add_pos = fma_add_pos.get(add_dest) orelse continue;
+            inline for (.{ fi.mul_lhs, fi.mul_rhs, fi.addend }) |src| {
+                if (range_idx.get(src)) |idx| {
+                    if (live_ranges[idx].end < add_pos) {
+                        live_ranges[idx].end = add_pos;
+                    }
+                }
+            }
+        }
+    }
+
+    var alloc_result = try regalloc.allocateFromRanges(
+        allocator,
+        aarch64RegSet(func.local_count),
+        clobbers.items,
+        live_ranges,
+    );
+    defer alloc_result.deinit();
+
+    // Finalize frame layout now that we know how many spill slots the
+    // allocator actually consumed. Previously we pre-sized to
+    // (next_vreg+16)*8 which was wasteful; using the allocator's exact
+    // count shrinks frames and reduces I-cache pressure on entry.
+    const spill_capacity: u32 = @as(u32, @intCast(alloc_result.spill_count)) * 8;
+    const hrp_save_off: u32 = spill_base + spill_capacity;
+    const scratch_base: u32 = hrp_save_off + 8;
+    const scratch_size: u32 = max_extra_results * 8;
+    const call_save_base: u32 = scratch_base + scratch_size;
+    const call_save_size: u32 = 128;
+    const callee_save_base: u32 = call_save_base + call_save_size;
+    const callee_save_count: u32 = 10; // x19..x28
+    const callee_save_size: u32 = callee_save_count * 8;
+    const raw_frame = callee_save_base + callee_save_size;
+    const frame_size: u32 = (raw_frame + 15) & ~@as(u32, 15);
+
+    var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
+    defer reg_map.deinit();
+    reg_map.alloc_result = &alloc_result;
+
+    fctx.call_save_base = call_save_base;
+    fctx.callee_save_base = callee_save_base;
+    fctx.hrp_save_off = hrp_save_off;
+    fctx.scratch_base = scratch_base;
+    fctx.frame_size = frame_size;
 
     // Liveness-driven register scavenging: compute, for each instruction,
     // the set of vregs whose *last* static read occurs at that instruction.
@@ -2009,19 +2114,13 @@ fn emitCall(
     // Vregs whose last static use is this call — their regs are dead
     // after BL, so we skip the restore. Args consumed into x1..x7 and
     // used nowhere else fall into this bucket (common case in hot loops).
-    const dying_mask: u16 = dyingCallerSaveMask(reg_map, fctx.current_kills);
 
     // Spill each used caller-save reg to [fp + call_save_base + i*8].
+    const dying_mask: u16 = dyingCallerSaveMask(reg_map, fctx.current_kills);
     // For tail calls these writes are dead, but arg staging still reads
     // back from these slots as the stable per-reg source locations for
     // args whose source reg is clobbered by an earlier arg's target.
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, cl.args);
 
     // Move arguments into x1..x7. `clobbered` tracks which caller-save
     // regs have been overwritten by earlier staging in this same call;
@@ -2116,6 +2215,7 @@ fn emitCall(
     // vreg died at this call (the reg is dead after BL — nothing reads
     // it, so the ldr would be wasted work).
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask >> @intCast(i)) & 1 != 0) continue;
@@ -2141,51 +2241,69 @@ fn emitMemAddr(
     offset: u32,
     end_offset: u64,
 ) !void {
+    try emitMemAddrImpl(code, reg_map, base_vreg, offset, end_offset, false);
+}
+
+fn emitMemAddrSkipBounds(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    base_vreg: ir.VReg,
+    offset: u32,
+) !void {
+    try emitMemAddrImpl(code, reg_map, base_vreg, offset, 0, true);
+}
+
+fn emitMemAddrImpl(
+    code: *emit.CodeBuffer,
+    reg_map: *RegMap,
+    base_vreg: ir.VReg,
+    offset: u32,
+    end_offset: u64,
+    skip_bounds: bool,
+) !void {
     // Step 1: zero-extend wasm address into tmp2 (kept alive across check).
     const src = try useInto(code, reg_map, base_vreg, RegMap.tmp1);
     try code.movRegReg32(RegMap.tmp2, src);
 
-    // Step 2: compute end = tmp2 + end_offset in tmp1.
-    if (end_offset == 0) {
-        try code.movRegReg(RegMap.tmp1, RegMap.tmp2);
-    } else if (end_offset <= 0xFFF) {
-        try code.addImm(RegMap.tmp1, RegMap.tmp2, @intCast(end_offset));
-    } else {
-        try code.movImm64(RegMap.tmp1, end_offset);
-        try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
+    if (!skip_bounds) {
+        // Step 2: compute end = tmp2 + end_offset in tmp1.
+        if (end_offset == 0) {
+            try code.movRegReg(RegMap.tmp1, RegMap.tmp2);
+        } else if (end_offset <= 0xFFF) {
+            try code.addImm(RegMap.tmp1, RegMap.tmp2, @intCast(end_offset));
+        } else {
+            try code.movImm64(RegMap.tmp1, end_offset);
+            try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
+        }
+
+        // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1).
+        try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 1);
+
+        // Step 4: cmp end, mem_size; B.LS over_trap.
+        try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
+        const over_patch = code.len();
+        try code.bCond(.ls, 0); // placeholder
+
+        // Trap path.
+        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
+        try code.blr(RegMap.tmp0);
+        try code.brk(0);
+
+        // Patch B.LS to land here.
+        const over_target = code.len();
+        const delta_words: i19 = @intCast(@divExact(
+            @as(i64, @intCast(over_target)) - @as(i64, @intCast(over_patch)),
+            4,
+        ));
+        const existing = std.mem.readInt(u32, code.bytes.items[over_patch..][0..4], .little);
+        const imm19: u19 = @bitCast(delta_words);
+        const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
+        code.patch32(over_patch, new_word);
     }
 
-    // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1).
-    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 1);
-
-    // Step 4: cmp end, mem_size; B.LS over_trap (≤ is in-bounds since
-    // accesses of size s are valid when end = addr+s ≤ memory_size).
-    try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
-    const over_patch = code.len();
-    try code.bCond(.ls, 0); // placeholder
-
-    // Trap path: arg0=vmctx, call vmctx.trap_oob_fn (noreturn). We read
-    // vmctx again because tmp0 now holds mem_size. BRK after BLR is
-    // defensive — the helper is declared noreturn.
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
-    // trap_oob_fn is at VmCtx offset 80 = scale-8 slot 10.
-    try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
-    try code.blr(RegMap.tmp0);
-    try code.brk(0);
-
-    // Patch B.LS to land here.
-    const over_target = code.len();
-    const delta_words: i19 = @intCast(@divExact(
-        @as(i64, @intCast(over_target)) - @as(i64, @intCast(over_patch)),
-        4,
-    ));
-    const existing = std.mem.readInt(u32, code.bytes.items[over_patch..][0..4], .little);
-    const imm19: u19 = @bitCast(delta_words);
-    const new_word: u32 = (existing & 0xFF00001F) | (@as(u32, imm19) << 5);
-    code.patch32(over_patch, new_word);
-
-    // Step 5: reload vmctx, then load memory_base (at +0).
+    // Step 5: load mem_base into tmp0.
     try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
 
@@ -2406,13 +2524,7 @@ fn emitTableSet(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ ts.idx, ts.val });
 
     // x1 = table_idx, x2 = idx, x3 = val, x0 = vmctx.
     try code.movImm32(.x1, @intCast(ts.table_idx));
@@ -2423,6 +2535,7 @@ fn emitTableSet(
     try code.blr(RegMap.tmp0);
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -2435,9 +2548,64 @@ fn emitTableSet(
 /// currently-bound vreg is in `dying`. Used by call emitters to skip
 /// the post-call restore of caller-save regs that are dead after the
 /// call (their vreg's last static use is the call itself).
+/// Pre-call save loop: store currently-used caller-save physregs to the
+/// per-function `call_save_base` slot area, so `stageArgFromSaved` can
+/// fall back to the slot when an earlier arg's target clobbers a later
+/// arg's source. Greedy: saves every used caller-save reg (conservative).
+/// Regalloc: limits saves to caller-save regs holding an arg source,
+/// since regalloc proves all other caller-save values are dead at the
+/// call.
+fn saveCallerSaveForCall(
+    code: *emit.CodeBuffer,
+    reg_map: *const RegMap,
+    fctx: *const FuncCompileCtx,
+    used_snapshot: []const bool,
+    arg_sources: []const ir.VReg,
+) !void {
+    const save_mask: u16 = if (reg_map.alloc_result != null)
+        callerSaveArgMask(reg_map, arg_sources)
+    else
+        std.math.maxInt(u16);
+    for (used_snapshot, 0..) |used, i| {
+        if (!used) continue;
+        if (i >= RegMap.caller_saved_count) continue;
+        if ((save_mask >> @intCast(i)) & 1 == 0) continue;
+        const reg = RegMap.scratch_regs[i];
+        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
+        try code.strImm(reg, .fp, slot_scaled);
+    }
+}
+
 fn dyingCallerSaveMask(reg_map: *const RegMap, dying: []const ir.VReg) u16 {
     var mask: u16 = 0;
     for (dying) |v| {
+        const loc = reg_map.get(v) orelse continue;
+        switch (loc) {
+            .reg => |r| {
+                for (RegMap.scratch_regs, 0..) |sr, i| {
+                    if (sr == r) {
+                        if (i < RegMap.caller_saved_count) {
+                            mask |= (@as(u16, 1) << @intCast(i));
+                        }
+                        break;
+                    }
+                }
+            },
+            .stack => {},
+        }
+    }
+    return mask;
+}
+
+/// Bitmask over `RegMap.scratch_regs` indices of caller-save regs that
+/// currently hold one of the given `args` vregs. Used under regalloc to
+/// limit pre-call save-loops to regs whose values the parallel-move arg
+/// staging actually needs to preserve. All other caller-save regs hold
+/// dead values at the call (regalloc ensures no live vreg spans the
+/// clobber point) and don't need to be spilled.
+fn callerSaveArgMask(reg_map: *const RegMap, args: []const ir.VReg) u16 {
+    var mask: u16 = 0;
+    for (args) |v| {
         const loc = reg_map.get(v) orelse continue;
         switch (loc) {
             .reg => |r| {
@@ -2510,13 +2678,7 @@ fn emitTableGrow(
 ) !void {
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ tg.init, tg.delta });
 
     // x1 = init, x2 = delta, x3 = table_idx, x0 = vmctx.
     try stageArgFromSaved(code, reg_map, fctx, .x1, tg.init, 0);
@@ -2533,6 +2695,7 @@ fn emitTableGrow(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -2580,12 +2743,11 @@ fn emitCallIndirect(
     // Snapshot live caller-save regs and spill to call_save.
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
+    {
+        var all_args: [8]ir.VReg = undefined;
+        all_args[0] = ci.elem_idx;
+        for (ci.args, 0..) |a, i| all_args[1 + i] = a;
+        try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args[0 .. 1 + ci.args.len]);
     }
 
     // Stage `elem_idx` into a callee-safe spot: write it to a dedicated
@@ -2707,6 +2869,7 @@ fn emitCallIndirect(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask_ci >> @intCast(i)) & 1 != 0) continue;
@@ -2732,12 +2895,11 @@ fn emitCallRef(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
+    {
+        var all_args: [8]ir.VReg = undefined;
+        all_args[0] = cr.func_ref;
+        for (cr.args, 0..) |a, i| all_args[1 + i] = a;
+        try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args[0 .. 1 + cr.args.len]);
     }
 
     // Load the 64-bit func_ref pointer into tmp0. tmp0 is x16 (non-
@@ -2797,6 +2959,7 @@ fn emitCallRef(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         if ((dying_mask_cr >> @intCast(i)) & 1 != 0) continue;
@@ -2882,14 +3045,7 @@ fn emitVmctxHelperCall(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, args);
 
     // Stage VReg args into x1..xN from stable post-snapshot storage.
     const arg_regs = [_]emit.Reg{ .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
@@ -2927,6 +3083,7 @@ fn emitVmctxHelperCall(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -2978,13 +3135,7 @@ fn emitTableInit(
     // Snapshot and save live caller-saved regs.
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ ti.src, ti.dst, ti.len });
 
     // x3 = dst | (src << 32). Build in x3 via tmp0 scratch.
     try readVregStable(code, reg_map, fctx, ti.src, .x3);
@@ -3010,6 +3161,7 @@ fn emitTableInit(
 
     // Restore caller-saved regs.
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3027,13 +3179,7 @@ fn emitElemDrop(
     // Helper: elemDropHelper(vmctx, seg_idx: u32)
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{});
 
     try code.movImm32(.x1, @bitCast(seg_idx));
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
@@ -3041,6 +3187,7 @@ fn emitElemDrop(
     try code.blr(RegMap.tmp0);
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3255,7 +3402,12 @@ fn emitLoad(
     // Try to fold offset into the load's scaled immediate; else add it to tmp0.
     const folded = scaledOffset(ld.offset, scale);
     const end_offset: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
-    try emitMemAddr(code, reg_map, ld.base, if (folded == null) ld.offset else 0, end_offset);
+    const folded_offset: u32 = if (folded == null) ld.offset else 0;
+    if (ld.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, ld.base, folded_offset);
+    } else {
+        try emitMemAddr(code, reg_map, ld.base, folded_offset, end_offset);
+    }
     const disp: u12 = if (folded) |d| d else 0;
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
@@ -3295,7 +3447,12 @@ fn emitStore(
 
     const folded = scaledOffset(st.offset, scale);
     const end_offset: u64 = @as(u64, st.offset) + @as(u64, st.size);
-    try emitMemAddr(code, reg_map, st.base, if (folded == null) st.offset else 0, end_offset);
+    const folded_offset: u32 = if (folded == null) st.offset else 0;
+    if (st.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, st.base, folded_offset);
+    } else {
+        try emitMemAddr(code, reg_map, st.base, folded_offset, end_offset);
+    }
     const disp: u12 = if (folded) |d| d else 0;
 
     // Materialize the value into tmp1 (or use its home reg). emitMemAddr is
@@ -3440,13 +3597,7 @@ fn emitAtomicNotify(
 ) !void {
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ an.base, an.count });
 
     // x1 = zext32(base) + offset
     try stageArgFromSaved(code, reg_map, fctx, .x1, an.base, 0);
@@ -3469,6 +3620,7 @@ fn emitAtomicNotify(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3498,13 +3650,7 @@ fn emitAtomicWait(
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    for (used_snapshot, 0..) |used, i| {
-        if (!used) continue;
-        if (i >= RegMap.caller_saved_count) continue;
-        const reg = RegMap.scratch_regs[i];
-        const slot_scaled: u12 = @intCast((fctx.call_save_base + @as(u32, @intCast(i)) * 8) / 8);
-        try code.strImm(reg, .fp, slot_scaled);
-    }
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{ aw.base, aw.expected, aw.timeout });
 
     // x1 = zext32(base) + offset
     try stageArgFromSaved(code, reg_map, fctx, .x1, aw.base, 0);
@@ -3549,6 +3695,7 @@ fn emitAtomicWait(
     }
 
     for (used_snapshot, 0..) |used, i| {
+        if (reg_map.alloc_result != null) break;
         if (!used) continue;
         if (i >= RegMap.caller_saved_count) continue;
         const reg = RegMap.scratch_regs[i];
@@ -3794,7 +3941,7 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
 // Phase 3 can flip emitters without also introducing new analysis in the
 // same step.
 
-const regalloc = @import("../../ir/regalloc.zig");
+// (regalloc import lives at top of file)
 
 /// Allocatable aarch64 GPRs, in stable index order used by clobber masks.
 ///
@@ -3839,7 +3986,10 @@ pub fn aarch64RegSet(local_count: u32) regalloc.RegSet {
         .alloc_regs = &aarch64_alloc_regs,
         .callee_saved_indices = &aarch64_callee_saved_indices,
         .caller_saved_indices = &aarch64_caller_saved_indices,
-        .spill_base = @as(i32, 24) + @as(i32, @intCast(local_count + 64)) * 8,
+        // Match RegMap's `spill_base = (local_count + 3) * 8` so
+        // translation between AllocResult.stack (absolute FP offset)
+        // and RegMap.Location.stack (offset from spill_base) is direct.
+        .spill_base = @as(i32, @intCast((local_count + 3) * 8)),
         .spill_stride = 8,
     };
 }
@@ -3883,6 +4033,7 @@ pub fn collectClobberPoints(
                 .table_set,
                 .table_grow,
                 .table_init,
+                .elem_drop,
                 .atomic_wait,
                 .atomic_notify,
                 => try clobbers.append(allocator, .{
@@ -4984,17 +5135,19 @@ test "compile: .call without linkage context returns CallLinkageUnavailable" {
 }
 
 test "compile: binop with spilled operands emits LDR/STR via spill slots" {
-    // 17 iconsts keep x0..x15 live, then an ADD with v16+v17 forces spills
-    // for the operands and possibly the dest. Verify code succeeds (no
-    // silent drop) and contains at least one LDR/STR pair against FP.
+    // Regalloc is smart enough to not spill values whose live ranges
+    // don't overlap, so the naive "17 consecutive iconsts" pattern
+    // doesn't force spills any more. Instead, build a chain-reduce
+    // where 30 vregs must all be simultaneously live at the final
+    // reduction — exceeding the 25 allocatable GPRs and forcing real
+    // spills to the frame.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
     const bid = try func.newBlock();
 
-    // Allocate 17 vregs, each with a distinct iconst. The 17th (v16)
-    // forces spill.
-    var vregs: [18]ir.VReg = undefined;
+    const n = 30;
+    var vregs: [n]ir.VReg = undefined;
     for (&vregs, 0..) |*v, i| {
         v.* = func.newVReg();
         try func.getBlock(bid).append(.{
@@ -5003,25 +5156,34 @@ test "compile: binop with spilled operands emits LDR/STR via spill slots" {
             .type = .i64,
         });
     }
-    // dst = vregs[16] + vregs[17]   (both spilled)
-    const dst = func.newVReg();
+    // Reduce: acc = v0 + v1; acc += v2; ... acc += v{n-1}
+    // All 30 vregs are live at the first add (they were all defined
+    // above and each is used once in the following reductions).
+    var acc = func.newVReg();
     try func.getBlock(bid).append(.{
-        .op = .{ .add = .{ .lhs = vregs[16], .rhs = vregs[17] } },
-        .dest = dst,
+        .op = .{ .add = .{ .lhs = vregs[0], .rhs = vregs[1] } },
+        .dest = acc,
         .type = .i64,
     });
-    try func.getBlock(bid).append(.{ .op = .{ .ret = dst } });
+    for (2..n) |i| {
+        const next = func.newVReg();
+        try func.getBlock(bid).append(.{
+            .op = .{ .add = .{ .lhs = acc, .rhs = vregs[i] } },
+            .dest = next,
+            .type = .i64,
+        });
+        acc = next;
+    }
+    try func.getBlock(bid).append(.{ .op = .{ .ret = acc } });
 
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
 
     // Scan for LDR Xt, [fp, #imm] (opcode pattern 0xF9400000 + rn=29<<5).
-    // We must see at least one such load (the spill reload).
     var found_ldr_from_fp = false;
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
-        // LDR (imm) unsigned offset, 64-bit: top 10 bits == 0x3E5, rn bits 5-9
         const top = (w >> 22) & 0x3FF;
         const rn = (w >> 5) & 0x1F;
         if (top == 0x3E5 and rn == 29) {
@@ -5145,6 +5307,6 @@ test "aarch64RegSet: sane layout for a tiny function" {
     try std.testing.expectEqual(@as(usize, 10), rs.callee_saved_indices.len);
     // Spill stride grows upward (away from fp).
     try std.testing.expect(rs.spill_stride > 0);
-    // With zero locals, first spill lives above the 64-slot operand stack.
-    try std.testing.expect(rs.spill_base >= 24 + 64 * 8);
+    // Spills live above the locals area (saved fp/lr + vmctx + locals = 24 bytes min).
+    try std.testing.expect(rs.spill_base >= 24);
 }

@@ -91,11 +91,23 @@ pub fn allocate(
     reg_set: RegSet,
     clobbers: []const ClobberPoint,
 ) !AllocResult {
-    std.debug.assert(reg_set.alloc_regs.len <= max_alloc_regs);
-
-    // Compute live ranges (sorted by start position)
     const ranges = try analysis.computeLiveRanges(func, allocator);
     defer allocator.free(ranges);
+    return allocateFromRanges(allocator, reg_set, clobbers, ranges);
+}
+
+/// Variant of `allocate` that takes pre-computed live ranges. Used by
+/// aarch64 to inject FMA-fusion awareness: the codegen's MADD/MSUB pre-pass
+/// reads a fused mul's sources at the following add instruction, so those
+/// vregs' live ranges must be extended past the mul before allocation.
+/// `ranges` must be sorted by `.start` (as returned by `computeLiveRanges`).
+pub fn allocateFromRanges(
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+) !AllocResult {
+    std.debug.assert(reg_set.alloc_regs.len <= max_alloc_regs);
 
     var assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator);
 

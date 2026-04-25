@@ -368,18 +368,35 @@ pub fn constantFold(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
                     try constants.put(d, v);
                 },
                 .add, .sub, .mul, .@"and", .@"or", .xor,
+                .shl, .shr_s, .shr_u, .rotl, .rotr,
                 .eq, .ne, .lt_s, .gt_s, .le_s, .ge_s,
+                .lt_u, .gt_u, .le_u, .ge_u,
+                .div_s, .div_u, .rem_s, .rem_u,
                 => |bin| {
-                    const lhs = constants.get(bin.lhs) orelse continue;
-                    const rhs = constants.get(bin.rhs) orelse continue;
-                    const result = evalBinOp(inst.op, lhs, rhs) orelse continue;
-                    if (inst.dest) |d| {
-                        try constants.put(d, result);
-                        if (inst.type == .i64) {
-                            inst.op = .{ .iconst_64 = result };
-                        } else {
-                            inst.op = .{ .iconst_32 = @truncate(result) };
+                    const dest = inst.dest orelse continue;
+                    const maybe_lhs = constants.get(bin.lhs);
+                    const maybe_rhs = constants.get(bin.rhs);
+
+                    // Try full constant folding first.
+                    if (maybe_lhs != null and maybe_rhs != null) {
+                        if (evalBinOp(inst.op, maybe_lhs.?, maybe_rhs.?, inst.type)) |result| {
+                            try constants.put(dest, result);
+                            if (inst.type == .i64) {
+                                inst.op = .{ .iconst_64 = result };
+                            } else {
+                                inst.op = .{ .iconst_32 = @truncate(result) };
+                            }
+                            changed = true;
+                            continue;
                         }
+                    }
+
+                    // Algebraic identities: reduce to a single-operand copy.
+                    if (algebraicIdentity(inst.op, maybe_lhs, maybe_rhs, inst.type, bin.lhs, bin.rhs)) |keep| {
+                        replaceVReg(func, dest, keep);
+                        // Turn into a dead iconst; DCE will remove it on the
+                        // next pipeline iteration.
+                        inst.op = .{ .iconst_32 = 0 };
                         changed = true;
                     }
                 },
@@ -392,6 +409,14 @@ pub fn constantFold(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
                         changed = true;
                     }
                 },
+                .select => |sel| {
+                    const dest = inst.dest orelse continue;
+                    const cond = constants.get(sel.cond) orelse continue;
+                    const pick = if (cond != 0) sel.if_true else sel.if_false;
+                    replaceVReg(func, dest, pick);
+                    inst.op = .{ .iconst_32 = 0 };
+                    changed = true;
+                },
                 else => {},
             }
         }
@@ -399,7 +424,46 @@ pub fn constantFold(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     return changed;
 }
 
-fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64) ?i64 {
+/// Return the operand to keep if this op simplifies to a copy of that
+/// operand (e.g., `v + 0` → `v`, `v * 1` → `v`, `v << 0` → `v`).
+fn algebraicIdentity(
+    op: ir.Inst.Op,
+    maybe_lhs: ?i64,
+    maybe_rhs: ?i64,
+    ty: ir.IrType,
+    lhs_reg: ir.VReg,
+    rhs_reg: ir.VReg,
+) ?ir.VReg {
+    const mask: u64 = if (ty == .i64) 63 else 31;
+    const ones: i64 = if (ty == .i64) -1 else @as(i64, @as(i32, -1));
+    // RHS-is-constant cases.
+    if (maybe_rhs) |r| {
+        switch (op) {
+            .add, .sub, .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr => {
+                if ((op == .shl or op == .shr_s or op == .shr_u or op == .rotl or op == .rotr)) {
+                    if ((@as(u64, @bitCast(r)) & mask) == 0) return lhs_reg;
+                } else if (r == 0) return lhs_reg;
+            },
+            .mul => if (r == 1) return lhs_reg,
+            .div_s, .div_u => if (r == 1) return lhs_reg,
+            .@"and" => if (r == ones) return lhs_reg,
+            else => {},
+        }
+    }
+    // LHS-is-constant cases (for commutative ops).
+    if (maybe_lhs) |l| {
+        switch (op) {
+            .add, .@"or", .xor => if (l == 0) return rhs_reg,
+            .mul => if (l == 1) return rhs_reg,
+            .@"and" => if (l == ones) return rhs_reg,
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64, ty: ir.IrType) ?i64 {
+    const mask: u64 = if (ty == .i64) 63 else 31;
     return switch (op) {
         .add => lhs +% rhs,
         .sub => lhs -% rhs,
@@ -407,12 +471,99 @@ fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64) ?i64 {
         .@"and" => lhs & rhs,
         .@"or" => lhs | rhs,
         .xor => lhs ^ rhs,
+        .shl => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            break :blk @bitCast(@as(u64, @bitCast(lhs)) << n);
+        },
+        .shr_s => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) break :blk lhs >> n;
+            const l32: i32 = @truncate(lhs);
+            break :blk @as(i64, l32 >> @as(u5, @intCast(n)));
+        },
+        .shr_u => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) {
+                break :blk @bitCast(@as(u64, @bitCast(lhs)) >> n);
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            break :blk @as(i64, l32 >> @as(u5, @intCast(n)));
+        },
+        .rotl => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) {
+                break :blk @bitCast(std.math.rotl(u64, @bitCast(lhs), n));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            break :blk @as(i64, std.math.rotl(u32, l32, n));
+        },
+        .rotr => blk: {
+            const n: u6 = @intCast(@as(u64, @bitCast(rhs)) & mask);
+            if (ty == .i64) {
+                break :blk @bitCast(std.math.rotr(u64, @bitCast(lhs), n));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            break :blk @as(i64, std.math.rotr(u32, l32, n));
+        },
         .eq => @intFromBool(lhs == rhs),
         .ne => @intFromBool(lhs != rhs),
-        .lt_s => @intFromBool(lhs < rhs),
-        .gt_s => @intFromBool(lhs > rhs),
-        .le_s => @intFromBool(lhs <= rhs),
-        .ge_s => @intFromBool(lhs >= rhs),
+        .lt_s => if (ty == .i64) @intFromBool(lhs < rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) < @as(i32, @truncate(rhs))),
+        .gt_s => if (ty == .i64) @intFromBool(lhs > rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) > @as(i32, @truncate(rhs))),
+        .le_s => if (ty == .i64) @intFromBool(lhs <= rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) <= @as(i32, @truncate(rhs))),
+        .ge_s => if (ty == .i64) @intFromBool(lhs >= rhs)
+            else @intFromBool(@as(i32, @truncate(lhs)) >= @as(i32, @truncate(rhs))),
+        .lt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) < @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) < @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .gt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) > @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) > @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .le_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) <= @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) <= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .ge_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) >= @as(u64, @bitCast(rhs)))
+            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) >= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .div_s => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                // i64 min / -1 traps; skip to be safe.
+                if (lhs == std.math.minInt(i64) and rhs == -1) break :blk null;
+                break :blk @divTrunc(lhs, rhs);
+            }
+            const l32: i32 = @truncate(lhs);
+            const r32: i32 = @truncate(rhs);
+            if (l32 == std.math.minInt(i32) and r32 == -1) break :blk null;
+            break :blk @as(i64, @divTrunc(l32, r32));
+        },
+        .div_u => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                break :blk @bitCast(@as(u64, @bitCast(lhs)) / @as(u64, @bitCast(rhs)));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            const r32: u32 = @truncate(@as(u64, @bitCast(rhs)));
+            break :blk @as(i64, l32 / r32);
+        },
+        .rem_s => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                if (lhs == std.math.minInt(i64) and rhs == -1) break :blk 0;
+                break :blk @rem(lhs, rhs);
+            }
+            const l32: i32 = @truncate(lhs);
+            const r32: i32 = @truncate(rhs);
+            if (l32 == std.math.minInt(i32) and r32 == -1) break :blk 0;
+            break :blk @as(i64, @rem(l32, r32));
+        },
+        .rem_u => blk: {
+            if (rhs == 0) break :blk null;
+            if (ty == .i64) {
+                break :blk @bitCast(@as(u64, @bitCast(lhs)) % @as(u64, @bitCast(rhs)));
+            }
+            const l32: u32 = @truncate(@as(u64, @bitCast(lhs)));
+            const r32: u32 = @truncate(@as(u64, @bitCast(rhs)));
+            break :blk @as(i64, l32 % r32);
+        },
         else => null,
     };
 }
@@ -691,11 +842,557 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
 pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
 
 /// Run a sequence of optimization passes on an IR module.
+/// Redundant bounds-check elimination within each basic block.
+///
+/// For every `.load` and `.store`, codegen emits an inline wasm-memory
+/// bounds check that verifies `zext(base) + offset + size <= memory_size`.
+/// When two accesses in the same block share the same `base` vreg, the
+/// first check already validates any subsequent access whose
+/// `offset + size` does not exceed the max previously validated end.
+///
+/// This pass marks such accesses with `bounds_known = true`; both backends
+/// skip emitting the check for those.
+///
+/// Safety conditions:
+/// - Same block only (no cross-block dominator walk — conservative).
+/// - Any call / atomic / `memory_grow` / `memory_copy` / `memory_fill`
+///   can change `memory_size`, so the tracker is cleared at those points.
+/// - IR is SSA, so a base vreg's value never changes once defined.
+pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var max_end = std.AutoHashMap(ir.VReg, u64).init(allocator);
+    defer max_end.deinit();
+
+    for (func.blocks.items) |block| {
+        max_end.clearRetainingCapacity();
+        for (block.instructions.items) |*inst| {
+            switch (inst.op) {
+                .load => |*ld| {
+                    const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+                    const prev = max_end.get(ld.base) orelse 0;
+                    if (end <= prev) {
+                        if (!ld.bounds_known) {
+                            ld.bounds_known = true;
+                            changed = true;
+                        }
+                    } else {
+                        try max_end.put(ld.base, end);
+                    }
+                },
+                .store => |*st| {
+                    const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
+                    const prev = max_end.get(st.base) orelse 0;
+                    if (end <= prev) {
+                        if (!st.bounds_known) {
+                            st.bounds_known = true;
+                            changed = true;
+                        }
+                    } else {
+                        try max_end.put(st.base, end);
+                    }
+                },
+                // Anything that can change memory_size, trap, or otherwise
+                // invalidate the "already checked" property: clear the
+                // tracker. (memory.grow can extend memory; calls can grow
+                // or shrink via imports; atomics/traps can't shrink but
+                // cost us nothing to be conservative.)
+                .memory_grow,
+                .call, .call_indirect, .call_ref,
+                .memory_copy, .memory_fill, .memory_init,
+                .table_grow, .table_init,
+                .atomic_notify, .atomic_wait,
+                => max_end.clearRetainingCapacity(),
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
+/// Forward `local_set K, val` → subsequent `local_get K` within the same
+/// block: rewrite consumers of the `local_get`'s dest to use `val` directly,
+/// turning the `local_get` into dead code that DCE then removes. This
+/// eliminates a STR/LDR round-trip (and an LDR on the initial get) for every
+/// such pair — common in induction-variable heavy loops like
+/// `i = i + 1; local.set i`.
+///
+/// Safety: wasm locals are modifiable only by the current function's
+/// local.set, so call instructions do not invalidate the map. Control-flow
+/// at the block end ends the map's scope. IR is SSA so `val` remains valid
+/// everywhere `local_get`'s dest was consumed.
+pub fn forwardLocalGet(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var last_set = std.AutoHashMap(u32, ir.VReg).init(allocator);
+    defer last_set.deinit();
+
+    for (func.blocks.items) |*block| {
+        last_set.clearRetainingCapacity();
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .local_set => |ls| try last_set.put(ls.idx, ls.val),
+                .local_get => |idx| {
+                    const dest = inst.dest orelse continue;
+                    if (last_set.get(idx)) |val| {
+                        replaceVReg(func, dest, val);
+                        changed = true;
+                    } else {
+                        // First read of this local in the block — remember
+                        // the new dest so subsequent reads of the same local
+                        // in this block can coalesce to this same vreg.
+                        try last_set.put(idx, dest);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
+/// Remove `local.set K, v` for any local K that is never read by a
+/// `local.get` anywhere in the function. This is intra-procedural and
+/// trivially sound: wasm locals are frame-scoped; calls never observe
+/// them. In practice this fires heavily after `forwardLocalGet` has
+/// rewritten all reads away.
+pub fn deadLocalSetElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var live_locals = std.AutoHashMap(u32, void).init(allocator);
+    defer live_locals.deinit();
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |inst| {
+            if (inst.op == .local_get) try live_locals.put(inst.op.local_get, {});
+        }
+    }
+
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            const inst = block.instructions.items[i];
+            if (inst.op == .local_set and !live_locals.contains(inst.op.local_set.idx)) {
+                _ = block.instructions.orderedRemove(i);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    return changed;
+}
+
+/// Constant-fold `br_if` whose condition is a known `iconst_32`. If the
+/// condition is zero, rewrite to `br else_block`; otherwise rewrite to
+/// `br then_block`. Uses a per-block iconst_32 map (conditions are
+/// always i32 in wasm). Unreachable successors are cleaned up later by
+/// DCE / block reordering. The fold opens up further straight-line
+/// optimizations.
+pub fn foldConstantBranches(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        var iconst32 = std.AutoHashMap(ir.VReg, i32).init(allocator);
+        defer iconst32.deinit();
+
+        for (block.instructions.items) |*inst| {
+            switch (inst.op) {
+                .iconst_32 => |c| {
+                    if (inst.dest) |d| try iconst32.put(d, c);
+                },
+                .br_if => |bi| {
+                    if (iconst32.get(bi.cond)) |c| {
+                        const target = if (c != 0) bi.then_block else bi.else_block;
+                        inst.* = .{ .op = .{ .br = target } };
+                        changed = true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
+// ── Function Inlining ───────────────────────────────────────────────────────
+
+/// Shift every VReg referenced by `inst` (reads and def) by `+offset`.
+/// Mirrors `replaceInInst` but applies a constant shift instead of a
+/// single rename.
+fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
+    if (inst.dest) |d| inst.dest = d + offset;
+    switch (inst.op) {
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64,
+        .local_get, .global_get, .br, .@"unreachable",
+        .memory_size, .table_size, .ref_func, .data_drop, .elem_drop,
+        .atomic_fence, .call_result,
+        => {},
+
+        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
+        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
+        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        => |*bin| {
+            bin.lhs += offset;
+            bin.rhs += offset;
+        },
+
+        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        => |*vreg| vreg.* += offset,
+
+        .local_set => |*ls| ls.val += offset,
+        .global_set => |*gs| gs.val += offset,
+        .load => |*ld| ld.base += offset,
+        .store => |*st| {
+            st.base += offset;
+            st.val += offset;
+        },
+        .br_if => |*bi| bi.cond += offset,
+        .br_table => |*bt| bt.index += offset,
+        .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { maybe_vreg.* = v + offset; },
+        .ret_multi => |vregs| {
+            for (@constCast(vregs)) |*v| v.* += offset;
+        },
+        .call => |cl| {
+            for (@constCast(cl.args)) |*arg| arg.* += offset;
+        },
+        .call_indirect => |*ci| {
+            ci.elem_idx += offset;
+            for (@constCast(ci.args)) |*arg| arg.* += offset;
+        },
+        .call_ref => |*cr| {
+            cr.func_ref += offset;
+            for (@constCast(cr.args)) |*arg| arg.* += offset;
+        },
+        .select => |*sel| {
+            sel.cond += offset;
+            sel.if_true += offset;
+            sel.if_false += offset;
+        },
+        .atomic_load => |*al| al.base += offset,
+        .atomic_store => |*ast| {
+            ast.base += offset;
+            ast.val += offset;
+        },
+        .atomic_rmw => |*ar| {
+            ar.base += offset;
+            ar.val += offset;
+        },
+        .atomic_cmpxchg => |*ac| {
+            ac.base += offset;
+            ac.expected += offset;
+            ac.replacement += offset;
+        },
+        .atomic_notify => |*an| {
+            an.base += offset;
+            an.count += offset;
+        },
+        .atomic_wait => |*aw| {
+            aw.base += offset;
+            aw.expected += offset;
+            aw.timeout += offset;
+        },
+        .memory_copy => |*mc| {
+            mc.dst += offset;
+            mc.src += offset;
+            mc.len += offset;
+        },
+        .memory_fill => |*mf| {
+            mf.dst += offset;
+            mf.val += offset;
+            mf.len += offset;
+        },
+        .memory_grow => |*pages| pages.* += offset,
+        .table_get => |*tg| tg.idx += offset,
+        .table_set => |*ts| {
+            ts.idx += offset;
+            ts.val += offset;
+        },
+        .table_grow => |*tg| {
+            tg.init += offset;
+            tg.delta += offset;
+        },
+        .memory_init => |*mi| {
+            mi.dst += offset;
+            mi.src += offset;
+            mi.len += offset;
+        },
+        .table_init => |*ti| {
+            ti.dst += offset;
+            ti.src += offset;
+            ti.len += offset;
+        },
+    }
+}
+
+/// Is this callee eligible for the inliner?
+///   - Non-empty, ≤ `max_blocks` blocks
+///   - Total instructions ≤ `max_insts`
+///   - No calls (direct/indirect/ref), no call_result
+///   - No memory_grow, no atomics, no bulk memory/table ops
+///   - No `br_table` (avoid cloning the targets slice)
+///   - No `ret_multi`
+///   - local_count == param_count (no extra declared locals)
+///   - No `local_set` anywhere (params aren't mutated)
+///   - Every `local_get` targets a param (idx < param_count)
+///   - `result_count` ∈ {0, 1}
+///   - If result_count == 1: exactly one `ret` (so the returned value
+///     is unambiguous; phi would be required otherwise)
+///   - If result_count == 0: ≥ 1 `ret` (so the continuation block is
+///     reachable after inlining)
+fn isInlinable(callee: *const ir.IrFunction, max_insts: u32, max_blocks: u32) bool {
+    const nblocks = callee.blocks.items.len;
+    if (nblocks == 0) return false;
+    if (nblocks > max_blocks) return false;
+    if (callee.result_count > 1) return false;
+    if (callee.local_count != callee.param_count) return false;
+
+    var total_insts: u32 = 0;
+    var ret_count: u32 = 0;
+
+    for (callee.blocks.items) |blk| {
+        if (blk.instructions.items.len == 0) return false;
+        total_insts +|= @intCast(blk.instructions.items.len);
+        if (total_insts > max_insts) return false;
+
+        for (blk.instructions.items) |inst| {
+            switch (inst.op) {
+                .call, .call_indirect, .call_ref, .call_result,
+                .memory_grow,
+                .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw,
+                .atomic_cmpxchg, .atomic_notify, .atomic_wait,
+                .memory_copy, .memory_fill, .memory_init, .table_init,
+                .table_grow, .data_drop, .elem_drop,
+                .br_table,
+                .ret_multi,
+                .local_set,
+                => return false,
+                .local_get => |idx| if (idx >= callee.param_count) return false,
+                .ret => ret_count += 1,
+                else => {},
+            }
+        }
+    }
+
+    if (callee.result_count == 1) {
+        if (ret_count != 1) return false;
+    } else {
+        if (ret_count == 0) return false;
+    }
+    return true;
+}
+
+/// Shift every `BlockId` referenced by `inst` (br / br_if targets) by
+/// `+offset`. br_table is excluded by `isInlinable` so we don't handle
+/// it here.
+fn shiftBlockIdsInInst(inst: *ir.Inst, offset: ir.BlockId) void {
+    switch (inst.op) {
+        .br => |*t| t.* += offset,
+        .br_if => |*bi| {
+            bi.then_block += offset;
+            bi.else_block += offset;
+        },
+        else => {},
+    }
+}
+
+/// Module-level pass: replace direct calls to small callees (including
+/// multi-block ones) with a clone of the callee's body. Returns whether
+/// any call site was inlined.
+///
+/// Layout at each call site:
+///   caller block B  [pre..., call, post..., terminator]
+/// becomes:
+///   B (unchanged id)     [pre..., br clone_entry]
+///   clone_block[0..M]    shifted copy of callee.blocks[0..M] with every
+///                        `ret` rewritten to `br B_after`
+///   B_after (new id)     [post..., terminator]
+///
+/// Every VReg in the clone is shifted by `vreg_offset = caller.next_vreg`
+/// (then caller.next_vreg += callee.next_vreg). Every BlockId in the
+/// clone is shifted by `clone_offset = b_after_id + 1`. `local_get`
+/// instructions are dropped and their shifted dests rewired to the
+/// corresponding call-site argument vreg. If the callee produces a
+/// result, its (single) `ret` value is translated through local renames
+/// (to cover the `local.get; ret` identity case) and the call's dest is
+/// rewritten to it.
+pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) !bool {
+    const max_blocks: u32 = 8;
+    const max_insts: u32 = 32;
+
+    var eligible = try allocator.alloc(bool, module.functions.items.len);
+    defer allocator.free(eligible);
+    for (module.functions.items, 0..) |*f, i| eligible[i] = isInlinable(f, max_insts, max_blocks);
+
+    var any_inlined = false;
+    for (module.functions.items, 0..) |*caller, caller_idx| {
+        // Only scan blocks that existed at the start of this pass. Newly
+        // created clone blocks can't contain eligible calls (isInlinable
+        // excludes all calls), and B_after inherits only post-call IR
+        // from the caller which the fixpoint loop will revisit.
+        const original_block_count = caller.blocks.items.len;
+        var b: usize = 0;
+        while (b < original_block_count) : (b += 1) {
+            // Find the first inlinable call in this block.
+            var call_idx: ?usize = null;
+            {
+                const block = &caller.blocks.items[b];
+                var i: usize = 0;
+                while (i < block.instructions.items.len) : (i += 1) {
+                    const inst = block.instructions.items[i];
+                    const call = switch (inst.op) {
+                        .call => |c| c,
+                        else => continue,
+                    };
+                    if (call.tail) continue;
+                    if (call.extra_results != 0) continue;
+                    if (call.func_idx < module.import_count) continue;
+                    const c_idx: usize = @intCast(call.func_idx - module.import_count);
+                    if (c_idx == caller_idx) continue;
+                    if (c_idx >= module.functions.items.len) continue;
+                    if (!eligible[c_idx]) continue;
+                    const callee = &module.functions.items[c_idx];
+                    if (call.args.len != callee.param_count) continue;
+                    call_idx = i;
+                    break;
+                }
+            }
+            if (call_idx == null) continue;
+
+            const ci = call_idx.?;
+            const call_inst = caller.blocks.items[b].instructions.items[ci];
+            const call = call_inst.op.call;
+            const call_dest = call_inst.dest;
+            const call_args = call.args;
+            const callee_ref_idx: usize = @intCast(call.func_idx - module.import_count);
+            const callee = &module.functions.items[callee_ref_idx];
+
+            const vreg_offset: ir.VReg = caller.next_vreg;
+            caller.next_vreg += callee.next_vreg;
+
+            // Allocate clone blocks, then B_after last, so storage order
+            // matches execution order (B → clones → B_after). `computeLiveRanges`
+            // numbers instructions by storage-order traversal; placing B_after
+            // after the clones is essential for cross-block live ranges of the
+            // inlined ret value to be computed correctly.
+            const clone_offset = try caller.newBlock();
+            var kb: usize = 1;
+            while (kb < callee.blocks.items.len) : (kb += 1) {
+                _ = try caller.newBlock();
+            }
+            const b_after_id = try caller.newBlock();
+            // Caller.blocks may have re-allocated; all block pointers
+            // taken before now are invalid. Always index via
+            // `caller.blocks.items[...]` from here on.
+
+            // Move post-call instructions into B_after, truncate B,
+            // and append `br clone_offset` as B's new terminator.
+            {
+                const post_start = ci + 1;
+                const src_len = caller.blocks.items[b].instructions.items.len;
+                var k = post_start;
+                while (k < src_len) : (k += 1) {
+                    const moved = caller.blocks.items[b].instructions.items[k];
+                    try caller.blocks.items[b_after_id].instructions.append(caller.allocator, moved);
+                }
+                caller.blocks.items[b].instructions.shrinkRetainingCapacity(ci);
+                try caller.blocks.items[b].instructions.append(caller.allocator, .{ .op = .{ .br = clone_offset } });
+            }
+
+            // Clone callee blocks, shifting vregs and block ids.
+            var local_renames = std.ArrayList(struct { from: ir.VReg, to: ir.VReg }).empty;
+            defer local_renames.deinit(allocator);
+            var ret_val_shifted: ?ir.VReg = null;
+
+            for (callee.blocks.items, 0..) |callee_block, cidx| {
+                const clone_id: ir.BlockId = clone_offset + @as(ir.BlockId, @intCast(cidx));
+                for (callee_block.instructions.items) |citem| {
+                    switch (citem.op) {
+                        .local_get => |idx| {
+                            const shifted_dest = (citem.dest orelse continue) + vreg_offset;
+                            try local_renames.append(allocator, .{
+                                .from = shifted_dest,
+                                .to = call_args[idx],
+                            });
+                        },
+                        .ret => |maybe_v| {
+                            if (maybe_v) |v| {
+                                // Only one ret is allowed when result_count==1,
+                                // so this is the single ret value.
+                                ret_val_shifted = v + vreg_offset;
+                            }
+                            try caller.blocks.items[clone_id].instructions.append(
+                                caller.allocator,
+                                .{ .op = .{ .br = b_after_id } },
+                            );
+                        },
+                        else => {
+                            var cloned = citem;
+                            shiftVRegsInInst(&cloned, vreg_offset);
+                            shiftBlockIdsInInst(&cloned, clone_offset);
+                            try caller.blocks.items[clone_id].instructions.append(caller.allocator, cloned);
+                        },
+                    }
+                }
+            }
+
+            // Apply local_get renames across the whole caller.
+            for (local_renames.items) |r| {
+                replaceVReg(caller, r.from, r.to);
+            }
+
+            // Translate ret value through local renames: covers the case
+            // where the callee's ret references a local_get's dest that
+            // was never emitted (`local.get 0; ret`).
+            if (ret_val_shifted) |rv| {
+                for (local_renames.items) |r| {
+                    if (rv == r.from) {
+                        ret_val_shifted = r.to;
+                        break;
+                    }
+                }
+            }
+
+            // Rewrite the call's dest (now only present in the copied
+            // B_after) to the shifted ret value.
+            if (call_dest) |d| {
+                if (ret_val_shifted) |rv| {
+                    replaceVReg(caller, d, rv);
+                }
+            }
+
+            any_inlined = true;
+        }
+    }
+    return any_inlined;
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
+    // Module-level: inline small leaf callees before per-function passes.
+    // Iterate to fixpoint so callers of callers also benefit.
+    var inline_iter: u32 = 0;
+    while (inline_iter < 4) : (inline_iter += 1) {
+        if (!(try inlineSmallFunctions(module, allocator))) break;
+        total_changes += 1;
+    }
     for (module.functions.items) |*func| {
-        for (passes) |pass| {
-            if (try pass(func, allocator)) total_changes += 1;
+        // Iterate the pipeline until fixpoint so that passes can re-expose
+        // opportunities for each other (e.g. constantFold → CSE → DCE →
+        // more constantFold). Cap iterations as a safety net.
+        var iter: u32 = 0;
+        while (iter < 8) : (iter += 1) {
+            var any_changed = false;
+            for (passes) |pass| {
+                if (try pass(func, allocator)) {
+                    any_changed = true;
+                    total_changes += 1;
+                }
+            }
+            if (!any_changed) break;
         }
     }
     return total_changes;
@@ -703,10 +1400,14 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 
 /// The default optimization pipeline.
 pub const default_passes: []const PassFn = &.{
+    &forwardLocalGet,
     &constantFold,
     &strengthReduceMul,
+    &foldConstantBranches,
     &commonSubexprElimination,
     &deadCodeElimination,
+    &deadLocalSetElimination,
+    &elideRedundantBoundsChecks,
 };
 
 // ── Block Reordering ────────────────────────────────────────────────────────
@@ -1316,4 +2017,418 @@ test "strengthReduceMul: i32 does not rewrite shift >= 32" {
     const changed = try strengthReduceMul(&func, allocator);
     try std.testing.expect(changed);
     try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 31 }, block.instructions.items[1].op);
+}
+
+test "elideRedundantBoundsChecks: back-to-back loads on same base" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_a, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_c } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    // First load establishes end=4. Second load end=8 > 4, so it sets new max
+    // and is NOT elided. Third load end=8 == max, IS elided.
+    try std.testing.expect(!block.instructions.items[1].op.load.bounds_known);
+    try std.testing.expect(!block.instructions.items[2].op.load.bounds_known);
+    try std.testing.expect(block.instructions.items[3].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: call invalidates tracker" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try block.append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_b } });
+
+    _ = try elideRedundantBoundsChecks(&func, allocator);
+    // Post-call load cannot be elided because memory_size may have changed.
+    try std.testing.expect(!block.instructions.items[3].op.load.bounds_known);
+}
+
+test "forwardLocalGet: set then get within block forwards vreg" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1); // 1 local
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_c = func.newVReg();
+    const v_g = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_g, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_g, .rhs = v_c } }, .dest = v_r, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try forwardLocalGet(&func, allocator);
+    try std.testing.expect(changed);
+    // The add should now use v_c (the forwarded val) on both sides.
+    try std.testing.expectEqual(v_c, block.instructions.items[3].op.add.lhs);
+    try std.testing.expectEqual(v_c, block.instructions.items[3].op.add.rhs);
+}
+
+test "forwardLocalGet: repeated gets without set share the first dest" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_a, .type = .i32 });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_r, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try forwardLocalGet(&func, allocator);
+    try std.testing.expect(changed);
+    // Both adds' operands should coalesce to v_a (the first get's dest).
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.lhs);
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.rhs);
+}
+
+test "deadLocalSetElimination: removes set of never-read local" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2); // 2 locals
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_c = func.newVReg();
+    const v_g = func.newVReg();
+    // local 0 is set but never read; local 1 is set and read.
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_get = 1 }, .dest = v_g, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_g } });
+
+    const changed = try deadLocalSetElimination(&func, allocator);
+    try std.testing.expect(changed);
+    // Only the set for local 0 should be removed.
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    // Verify the remaining set is for local 1.
+    try std.testing.expectEqual(@as(u32, 1), block.instructions.items[1].op.local_set.idx);
+}
+
+test "deadLocalSetElimination: keeps set when local is read" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_c = func.newVReg();
+    const v_g = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c } } });
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_g, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_g } });
+
+    const changed = try deadLocalSetElimination(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+}
+
+test "constantFold: shl of constants" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const va = func.newVReg();
+    const vb = func.newVReg();
+    const vr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = va, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = vb, .type = .i32 });
+    try block.append(.{ .op = .{ .shl = .{ .lhs = va, .rhs = vb } }, .dest = vr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = vr } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(i64, 40), block.instructions.items[2].op.iconst_32);
+}
+
+test "constantFold: unsigned compare lt_u" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const va = func.newVReg();
+    const vb = func.newVReg();
+    const vr = func.newVReg();
+    // -1 as i32 (0xFFFFFFFF) < 1 unsigned? No: 0xFFFFFFFF > 1.
+    try block.append(.{ .op = .{ .iconst_32 = -1 }, .dest = va, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = vb, .type = .i32 });
+    try block.append(.{ .op = .{ .lt_u = .{ .lhs = va, .rhs = vb } }, .dest = vr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = vr } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(i64, 0), block.instructions.items[2].op.iconst_32);
+}
+
+test "constantFold: algebraic identity add zero" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const v_param = func.newVReg(); // vreg 0, param
+    const v_zero = func.newVReg();
+    const v_r = func.newVReg();
+    const v_ret = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_param, .rhs = v_zero } }, .dest = v_r, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_r, .rhs = v_r } }, .dest = v_ret, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ret } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    // After identity rewrite, the second add should use v_param directly on both sides.
+    try std.testing.expectEqual(v_param, block.instructions.items[2].op.add.lhs);
+    try std.testing.expectEqual(v_param, block.instructions.items[2].op.add.rhs);
+}
+
+test "constantFold: select with constant cond picks branch" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 1, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    var block = &func.blocks.items[b];
+    const v_a = func.newVReg(); // param 0
+    const v_b = func.newVReg(); // param 1
+    const v_cond = func.newVReg();
+    const v_sel = func.newVReg();
+    const v_ret = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_cond, .if_true = v_a, .if_false = v_b } }, .dest = v_sel, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_sel, .rhs = v_sel } }, .dest = v_ret, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ret } });
+
+    const changed = try constantFold(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.lhs);
+    try std.testing.expectEqual(v_a, block.instructions.items[2].op.add.rhs);
+}
+
+test "inlineSmallFunctions: leaf with param-return is inlined" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // Callee: fn id(x) -> x   { local.get 0; return }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    {
+        const callee = &module.functions.items[0];
+        const cb = try callee.newBlock();
+        _ = callee.newVReg(); // param 0 placeholder
+        const v_get = callee.newVReg();
+        try callee.getBlock(cb).append(.{ .op = .{ .local_get = 0 }, .dest = v_get, .type = .i32 });
+        try callee.getBlock(cb).append(.{ .op = .{ .ret = v_get } });
+    }
+
+    // Caller: fn main() -> i32   { i32.const 42; call 0; return }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+    {
+        const caller = &module.functions.items[1];
+        const mb = try caller.newBlock();
+        const v_arg = caller.newVReg();
+        const v_ret = caller.newVReg();
+        try caller.getBlock(mb).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_arg, .type = .i32 });
+        args[0] = v_arg;
+        try caller.getBlock(mb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_ret, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    const inlined = try inlineSmallFunctions(&module, allocator);
+    try std.testing.expect(inlined);
+
+    const caller = &module.functions.items[1];
+    // V2 layout: B0 keeps [iconst_32, br clone_entry]; B1 = clone_entry [br B_after];
+    // B2 = B_after [ret].
+    try std.testing.expectEqual(@as(usize, 3), caller.blocks.items.len);
+    const b0 = caller.blocks.items[0].instructions.items;
+    try std.testing.expect(b0[0].op == .iconst_32);
+    try std.testing.expect(b0[1].op == .br);
+    try std.testing.expectEqual(@as(ir.BlockId, 1), b0[1].op.br);
+    const clone_entry = caller.blocks.items[1].instructions.items;
+    try std.testing.expect(clone_entry[0].op == .br);
+    try std.testing.expectEqual(@as(ir.BlockId, 2), clone_entry[0].op.br);
+    const b_after = caller.blocks.items[2].instructions.items;
+    try std.testing.expect(b_after[0].op == .ret);
+    // After local rename, the ret value should be the caller's iconst dest.
+    try std.testing.expectEqual(b0[0].dest.?, b_after[0].op.ret.?);
+}
+
+test "inlineSmallFunctions: multi-block if/else callee is inlined" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // Callee: fn cond(p, a, b) -> i32   { if p then a else b }
+    //   entry: local_get 0; br_if t, e
+    //   t:     local_get 1; ret
+    //   e:     local_get 2; ret
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 3, 1, 3));
+    {
+        const callee = &module.functions.items[0];
+        const c_entry = try callee.newBlock();
+        const c_then = try callee.newBlock();
+        const c_else = try callee.newBlock();
+        _ = callee.newVReg(); // param 0 placeholder
+        _ = callee.newVReg(); // param 1 placeholder
+        _ = callee.newVReg(); // param 2 placeholder
+        const v_p = callee.newVReg();
+        const v_a = callee.newVReg();
+        const v_b = callee.newVReg();
+        try callee.getBlock(c_entry).append(.{ .op = .{ .local_get = 0 }, .dest = v_p, .type = .i32 });
+        try callee.getBlock(c_entry).append(.{ .op = .{ .br_if = .{ .cond = v_p, .then_block = c_then, .else_block = c_else } } });
+        try callee.getBlock(c_then).append(.{ .op = .{ .local_get = 1 }, .dest = v_a, .type = .i32 });
+        try callee.getBlock(c_then).append(.{ .op = .{ .ret = v_a } });
+        try callee.getBlock(c_else).append(.{ .op = .{ .local_get = 2 }, .dest = v_b, .type = .i32 });
+        try callee.getBlock(c_else).append(.{ .op = .{ .ret = v_b } });
+    }
+    // Test only hits the "result_count=1 requires exactly 1 ret" branch:
+    // two rets means this callee is ineligible. Confirm that path, then
+    // rewrite with a single-ret variant.
+    try std.testing.expect(!isInlinable(&module.functions.items[0], 32, 8));
+
+    // Now build a single-ret if/else: merge via br to a common tail.
+    module.functions.items[0].deinit();
+    module.functions.items[0] = ir.IrFunction.init(allocator, 3, 1, 3);
+    {
+        const callee = &module.functions.items[0];
+        const c_entry = try callee.newBlock();
+        const c_then = try callee.newBlock();
+        const c_else = try callee.newBlock();
+        const c_tail = try callee.newBlock();
+        _ = callee.newVReg();
+        _ = callee.newVReg();
+        _ = callee.newVReg();
+        const v_p = callee.newVReg();
+        const v_a = callee.newVReg();
+        const v_b = callee.newVReg();
+        const v_x = callee.newVReg();
+        // Not truly phi-safe (both branches def different vregs for v_x,
+        // real IR would use a local_set), but this module-level inliner
+        // just clones blocks verbatim. For test we just check that
+        // multi-block callees with a single ret get inlined structurally.
+        try callee.getBlock(c_entry).append(.{ .op = .{ .local_get = 0 }, .dest = v_p, .type = .i32 });
+        try callee.getBlock(c_entry).append(.{ .op = .{ .br_if = .{ .cond = v_p, .then_block = c_then, .else_block = c_else } } });
+        try callee.getBlock(c_then).append(.{ .op = .{ .local_get = 1 }, .dest = v_a, .type = .i32 });
+        try callee.getBlock(c_then).append(.{ .op = .{ .br = c_tail } });
+        try callee.getBlock(c_else).append(.{ .op = .{ .local_get = 2 }, .dest = v_b, .type = .i32 });
+        try callee.getBlock(c_else).append(.{ .op = .{ .br = c_tail } });
+        try callee.getBlock(c_tail).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_x, .type = .i32 });
+        try callee.getBlock(c_tail).append(.{ .op = .{ .ret = v_x } });
+    }
+    try std.testing.expect(isInlinable(&module.functions.items[0], 32, 8));
+
+    // Caller: fn main(p, a, b) -> i32  { call 0(p, a, b); return }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 3, 1, 3));
+    const args = try allocator.alloc(ir.VReg, 3);
+    defer allocator.free(args);
+    {
+        const caller = &module.functions.items[1];
+        const mb = try caller.newBlock();
+        _ = caller.newVReg();
+        _ = caller.newVReg();
+        _ = caller.newVReg();
+        const v_p = caller.newVReg();
+        const v_a = caller.newVReg();
+        const v_b = caller.newVReg();
+        const v_r = caller.newVReg();
+        try caller.getBlock(mb).append(.{ .op = .{ .local_get = 0 }, .dest = v_p, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .local_get = 1 }, .dest = v_a, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .local_get = 2 }, .dest = v_b, .type = .i32 });
+        args[0] = v_p;
+        args[1] = v_a;
+        args[2] = v_b;
+        try caller.getBlock(mb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_r, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .ret = v_r } });
+    }
+
+    const inlined = try inlineSmallFunctions(&module, allocator);
+    try std.testing.expect(inlined);
+
+    const caller = &module.functions.items[1];
+    // Before inlining: 1 block. After: 1 (B) + 1 (B_after) + 4 (clones) = 6.
+    try std.testing.expectEqual(@as(usize, 6), caller.blocks.items.len);
+    // B ends with `br clone_entry`.
+    const b0 = caller.blocks.items[0].instructions.items;
+    try std.testing.expect(b0[b0.len - 1].op == .br);
+    // No remaining `.call` instructions anywhere.
+    for (caller.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| try std.testing.expect(inst.op != .call);
+    }
+}
+
+test "foldConstantBranches: zero cond picks else block" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldConstantBranches(&func, allocator);
+    try std.testing.expect(changed);
+    const last = func.getBlock(b0).instructions.items[1];
+    try std.testing.expect(last.op == .br);
+    try std.testing.expectEqual(b2, last.op.br);
+}
+
+test "foldConstantBranches: nonzero cond picks then block" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldConstantBranches(&func, allocator);
+    try std.testing.expect(changed);
+    const last = func.getBlock(b0).instructions.items[1];
+    try std.testing.expect(last.op == .br);
+    try std.testing.expectEqual(b1, last.op.br);
 }
