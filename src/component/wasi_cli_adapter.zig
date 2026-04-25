@@ -390,6 +390,14 @@ pub const ResponseOutparam = struct {
     set: bool = false,
 };
 
+/// `(string, string)` pair forwarded to `wasi:cli/environment.get-environment`.
+/// The slices are borrowed by the adapter — the caller is responsible for
+/// keeping them alive across the run.
+pub const EnvVar = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
@@ -399,10 +407,17 @@ pub const WasiCliAdapter = struct {
     /// borrowed — keep it alive for as long as the component runs.
     stdin: streams.InputStream = .{ .source = .closed },
 
-    /// Set by `wasi:cli/exit.exit` (or `exit-with-code`). The host fn
+    /// `wasi:cli/exit.exit` (or `exit-with-code`). The host fn
     /// also returns `error.Trap`; `runLoadedComponent` checks this
     /// field to translate the trap into a normal `RunOutcome`.
     exit_code: ?u32 = null,
+
+    /// argv passed to the component via `wasi:cli/environment.get-arguments`.
+    /// Borrowed — caller keeps slice alive for the run. Default empty.
+    argv: []const []const u8 = &.{},
+    /// envvars passed to the component via `wasi:cli/environment.get-environment`.
+    /// Borrowed — caller keeps slices alive for the run. Default empty.
+    env: []const EnvVar = &.{},
 
     /// `HostInstance` registered for the simple test interface name
     /// (e.g. `"wasi:hello/world"`). Stored inline so the adapter owns its
@@ -654,6 +669,18 @@ pub const WasiCliAdapter = struct {
     /// borrowed — caller must keep it alive for the run.
     pub fn setStdinBytes(self: *WasiCliAdapter, bytes: []const u8) void {
         self.stdin = streams.InputStream.fromBuffer(bytes);
+    }
+
+    /// Forward argv to `wasi:cli/environment.get-arguments`. The slices
+    /// are borrowed — caller must keep them alive for the run.
+    pub fn setArguments(self: *WasiCliAdapter, argv: []const []const u8) void {
+        self.argv = argv;
+    }
+
+    /// Forward env to `wasi:cli/environment.get-environment`. The slices
+    /// are borrowed — caller must keep them alive for the run.
+    pub fn setEnvironment(self: *WasiCliAdapter, env: []const EnvVar) void {
+        self.env = env;
     }
 
     /// Captured stdout bytes (valid for buffer-backed sinks).
@@ -1352,26 +1379,73 @@ pub const WasiCliAdapter = struct {
     /// `wasi:cli/environment.get-environment: () -> list<tuple<string,string>>`.
     /// Returns an empty list (canonical pair `ptr=0, len=0`).
     fn getEnvironment(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
         _: []const InterfaceValue,
         results: []InterfaceValue,
-        _: Allocator,
+        allocator: Allocator,
     ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
-        results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
+
+        const n = self.env.len;
+        if (n == 0) {
+            results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
+            return;
+        }
+
+        // Each tuple<string, string>: name.ptr@0:u32, name.len@4:u32,
+        // value.ptr@8:u32, value.len@12:u32. Stride = 16, align = 4.
+        const stride: usize = 16;
+        const scratch = try allocator.alloc(u8, n * stride);
+        defer allocator.free(scratch);
+
+        for (self.env, 0..) |e, i| {
+            const name_ptr = ci.hostAllocAndWrite(e.name) orelse return error.IoError;
+            const value_ptr = ci.hostAllocAndWrite(e.value) orelse return error.IoError;
+            const off = i * stride;
+            std.mem.writeInt(u32, scratch[off..][0..4], name_ptr, .little);
+            std.mem.writeInt(u32, scratch[off + 4 ..][0..4], @intCast(e.name.len), .little);
+            std.mem.writeInt(u32, scratch[off + 8 ..][0..4], value_ptr, .little);
+            std.mem.writeInt(u32, scratch[off + 12 ..][0..4], @intCast(e.value.len), .little);
+        }
+
+        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.IoError;
+        results[0] = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
     }
 
-    /// `wasi:cli/environment.get-arguments: () -> list<string>`. Empty.
+    /// `wasi:cli/environment.get-arguments: () -> list<string>`. Forwards
+    /// `self.argv`; empty when no caller invoked `setArguments`.
     fn getArguments(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
         _: []const InterfaceValue,
         results: []InterfaceValue,
-        _: Allocator,
+        allocator: Allocator,
     ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
-        results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
+
+        const n = self.argv.len;
+        if (n == 0) {
+            results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
+            return;
+        }
+
+        // Each string element: ptr@0:u32, len@4:u32. Stride = 8, align = 4.
+        const stride: usize = 8;
+        const scratch = try allocator.alloc(u8, n * stride);
+        defer allocator.free(scratch);
+
+        for (self.argv, 0..) |s, i| {
+            const s_ptr = ci.hostAllocAndWrite(s) orelse return error.IoError;
+            const off = i * stride;
+            std.mem.writeInt(u32, scratch[off..][0..4], s_ptr, .little);
+            std.mem.writeInt(u32, scratch[off + 4 ..][0..4], @intCast(s.len), .little);
+        }
+
+        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.IoError;
+        results[0] = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
     }
 
     /// `wasi:cli/environment.initial-cwd: () -> option<string>`. None.
