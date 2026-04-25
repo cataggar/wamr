@@ -76,16 +76,6 @@ pub const WasiCliAdapter = struct {
         };
     }
 
-    /// Initialize with stdout backed by a host file descriptor (typically
-    /// `std.posix.STDOUT_FILENO`). For the production CLI path; tests
-    /// continue to use `init` with the captured-buffer sink.
-    pub fn initWithStdoutFd(allocator: Allocator, fd: std.posix.fd_t) WasiCliAdapter {
-        return .{
-            .allocator = allocator,
-            .stdout = streams.OutputStream.toFd(fd),
-        };
-    }
-
     pub fn deinit(self: *WasiCliAdapter) void {
         self.stdout.deinit(self.allocator);
         self.write_iface.deinit(self.allocator);

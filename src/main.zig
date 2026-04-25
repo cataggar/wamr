@@ -81,7 +81,7 @@ pub fn main(init: std.process.Init) !void {
     if (wasm_data.len >= 8 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.wasm_magic) {
         const version = std.mem.readInt(u32, wasm_data[4..8], .little);
         if (version == wamr.types.component_version) {
-            runComponent(wasm_data, allocator);
+            runComponent(wasm_data, allocator, io);
             return;
         }
     }
@@ -90,9 +90,9 @@ pub fn main(init: std.process.Init) !void {
     runWasm(wasm_data, stack_size, &wasm_args, allocator);
 }
 
-fn runComponent(data: []const u8, allocator: std.mem.Allocator) void {
+fn runComponent(data: []const u8, allocator: std.mem.Allocator, io: std.Io) void {
     const adapter_mod = wamr.wasi_cli_adapter;
-    var adapter = adapter_mod.WasiCliAdapter.initWithStdoutFd(allocator, std.posix.STDOUT_FILENO);
+    var adapter = adapter_mod.WasiCliAdapter.init(allocator);
     defer adapter.deinit();
 
     const outcome = adapter_mod.runComponentBytes(data, allocator, &adapter) catch |err| {
@@ -114,6 +114,15 @@ fn runComponent(data: []const u8, allocator: std.mem.Allocator) void {
         }
         std.process.exit(1);
     };
+
+    // Flush captured stdout to the host. Buffered + flush at end is the
+    // simplest cross-platform path; streaming output is deferred until
+    // the io/poll-aware adapter lands (#154).
+    const captured = adapter.getStdoutBytes();
+    if (captured.len > 0) {
+        var stdout_file = std.Io.File.stdout();
+        stdout_file.writeStreamingAll(io, captured) catch {};
+    }
 
     std.process.exit(if (outcome.is_ok) 0 else 1);
 }
