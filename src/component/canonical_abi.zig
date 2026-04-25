@@ -316,6 +316,7 @@ fn alignOfTypeDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
             break :blk @max(1, payload_align);
         },
         .resource => 4,
+        .val => |v| @max(1, alignOfType(reg, v)),
         else => 4,
     };
 }
@@ -397,6 +398,7 @@ fn sizeOfTypeDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
             break :blk alignUp(payload_offset + payload_size, total_align);
         },
         .resource => 4,
+        .val => |v| sizeOfType(reg, v),
         else => 4,
     };
 }
@@ -507,6 +509,7 @@ pub fn flattenCountDef(reg: TypeRegistry, td: ctypes.TypeDef) u32 {
             break :blk 1 + max_payload;
         },
         .resource => 1,
+        .list => 2,
         else => 1,
     };
 }
@@ -658,6 +661,13 @@ pub fn loadValReg(memory: []const u8, ptr: u32, t: ctypes.ValType, reg: TypeRegi
 
 fn loadValFromDef(memory: []const u8, ptr: u32, td: ctypes.TypeDef, reg: TypeRegistry, alloc: Allocator) LoadError!InterfaceValue {
     return switch (td) {
+        // `(type (val <vt>))` — re-dispatch on the inner ValType.
+        .val => |v| try loadValReg(memory, ptr, v, reg, alloc),
+        // `(type (list T))` — list is laid out in linear memory as (ptr, len).
+        .list => .{ .list = .{
+            .ptr = loadU32(memory, ptr),
+            .len = loadU32(memory, ptr + 4),
+        } },
         .record => |r| blk: {
             const vals = try alloc.alloc(InterfaceValue, r.fields.len);
             var offset: u32 = ptr;
@@ -892,6 +902,13 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
 
 fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceValue, reg: TypeRegistry) StoreError!void {
     switch (td) {
+        // `(type (val <vt>))` — re-dispatch on the inner ValType.
+        .val => |v| try storeValReg(memory, ptr, v, val, reg),
+        // `(type (list T))` — store as (ptr, len) pair in linear memory.
+        .list => {
+            storeU32(memory, ptr, val.list.ptr);
+            storeU32(memory, ptr + 4, val.list.len);
+        },
         .record => |r| {
             var offset: u32 = ptr;
             for (r.fields, 0..) |f, i| {
