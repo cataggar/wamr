@@ -902,7 +902,18 @@ pub const ComponentTrampolineCtx = struct {
     pub fn deinit(self: *ComponentTrampolineCtx, allocator: Allocator) void {
         allocator.free(self.param_types);
         allocator.free(self.result_types);
-        if (self.extended_types.len > 0) allocator.free(self.extended_types);
+        if (self.extended_types.len > 0) {
+            // The extension TypeDefs are deep-copies built by the
+            // trampoline construction site (instance.zig); record /
+            // tuple / variant payloads have their own allocations.
+            for (self.extended_types) |td| switch (td) {
+                .record => |rec| allocator.free(rec.fields),
+                .tuple => |tup| allocator.free(tup.fields),
+                .variant => |v| allocator.free(v.cases),
+                else => {},
+            };
+            allocator.free(self.extended_types);
+        }
         if (self.extended_indexspace.len > 0) allocator.free(self.extended_indexspace);
     }
 };
