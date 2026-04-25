@@ -891,9 +891,19 @@ pub const ComponentTrampolineCtx = struct {
     result_types: []const ctypes.ValType,
     lower_opts: LowerOptions,
 
+    /// Per-trampoline extension to the component's type indexspace, used
+    /// to resolve param/result `.type_idx` references that point into an
+    /// instance-type body's local type space. Empty when the FuncType
+    /// for this trampoline came from the component-level type indexspace
+    /// directly (e.g. hand-authored fixtures).
+    extended_types: []const ctypes.TypeDef = &.{},
+    extended_indexspace: []const ?u32 = &.{},
+
     pub fn deinit(self: *ComponentTrampolineCtx, allocator: Allocator) void {
         allocator.free(self.param_types);
         allocator.free(self.result_types);
+        if (self.extended_types.len > 0) allocator.free(self.extended_types);
+        if (self.extended_indexspace.len > 0) allocator.free(self.extended_indexspace);
     }
 };
 
@@ -927,7 +937,10 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const ctx: *ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
     const allocator = ctx.comp_inst.allocator;
-    const registry = TypeRegistry.init(ctx.comp_inst.component);
+    const registry = if (ctx.extended_types.len > 0)
+        TypeRegistry.fromExtended(ctx.comp_inst.component, ctx.extended_types, ctx.extended_indexspace)
+    else
+        TypeRegistry.init(ctx.comp_inst.component);
     std.debug.print("\nTRAMP-ENTRY comp_func={} comp.core_instances.len={} ci.core_instances.len={}\n", .{
         ctx.component_func_idx,
         ctx.comp_inst.component.core_instances.len,
