@@ -3359,6 +3359,221 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
     return any_inlined;
 }
 
+// ── Loop-Invariant Code Motion (pure ops) ───────────────────────────────────
+
+fn isHoistableOp(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64 => true,
+        .add, .sub, .mul,
+        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
+        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        => true,
+        .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        => true,
+        .clz, .ctz, .popcnt, .eqz,
+        .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u,
+        .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        => true,
+        .select => true,
+        // Excluded:
+        // - div_s/div_u/rem_s/rem_u: trap on /0
+        // - trunc_f32_s/u, trunc_f64_s/u (non-saturating): trap on NaN/overflow
+        // - load: may trap on bounds
+        // - all stores/atomics/calls/branches/phi/local_*/global_*/mem_*/table_*: side effects
+        else => false,
+    };
+}
+
+/// Collect operand vregs of a hoistable instruction into `buf`.
+/// Caller must ensure `isHoistableOp(inst.op)`. Returns the populated slice.
+fn collectHoistableOperands(inst: ir.Inst, buf: *[3]ir.VReg) []ir.VReg {
+    var n: usize = 0;
+    switch (inst.op) {
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64 => {},
+        .add, .sub, .mul,
+        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
+        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        => |bin| {
+            buf[n] = bin.lhs; n += 1;
+            buf[n] = bin.rhs; n += 1;
+        },
+        .clz, .ctz, .popcnt, .eqz,
+        .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u,
+        .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        => |v| {
+            buf[n] = v; n += 1;
+        },
+        .select => |sel| {
+            buf[n] = sel.cond; n += 1;
+            buf[n] = sel.if_true; n += 1;
+            buf[n] = sel.if_false; n += 1;
+        },
+        else => unreachable,
+    }
+    return buf[0..n];
+}
+
+/// Hoist loop-invariant pure instructions out of natural loops to their
+/// preheader. A "pure" instruction is one without observable side effects
+/// or traps (see `isHoistableOp`). An instruction is loop-invariant when
+/// all of its operands are defined outside the loop's block set.
+///
+/// Conservative restrictions (each can be relaxed later):
+///   - Skip loops without a unique preheader: we don't insert one.
+///     A preheader is the only predecessor of `loop.header` not in the
+///     loop's blocks.
+///   - Skip loops where `preheader.id >= min(loop.blocks)`: the codegen
+///     iterates blocks in raw block-id order and requires `id(def) ≤
+///     id(use)`. Hoisting moves a def earlier in id-space; this guard
+///     ensures the new def-block id is < every existing in-loop use-block
+///     id. (Loop-output uses have id ≥ min(loop.blocks) ≥ existing
+///     in-loop def, so they remain consistent too.)
+///   - Stop scanning a block at its first terminator: the wasm frontend
+///     can emit dead instructions after a terminator; including those
+///     would make us reason about code outside the executable CFG (and
+///     `buildSuccessors` already ignores them).
+///
+/// Loop nesting: we process loops in ascending `blocks.len` order
+/// (innermost-ish first). Outer loops that become hoistable after an
+/// inner-loop hoist are picked up by the `runPasses` fixpoint loop.
+///
+/// Soundness summary:
+///   - Pure ops have no observable side effects; changing execution
+///     count from N (per iteration) to 1 (per loop entry) is safe.
+///   - Wasm has no observable FP status flags or rounding-mode side
+///     channels, so hoisting f_* ops doesn't change observable behavior.
+///   - For zero-trip loops, hoisting adds one extra execution of the op,
+///     which is OK because the result is unused and the op cannot trap.
+///   - SSA dominance: in a reachable natural loop with a unique
+///     preheader, every operand defined outside the loop already
+///     dominates the original in-loop use; therefore it dominates the
+///     preheader too (every path to the loop goes through the preheader).
+///   - Phi handling: hoisting changes WHERE a vreg is defined, not its
+///     value or vreg id. Phi incoming `(pred, vreg)` selects by edge
+///     identity; the def now in the preheader still dominates every
+///     latch (header dominates latches, preheader dominates header).
+pub fn licmPureOps(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len < 2) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    var loops = try analysis.computeLoops(func, &dom, allocator);
+    defer loops.deinit();
+
+    if (loops.loops.len == 0) return false;
+
+    var preds = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var pit = preds.iterator();
+        while (pit.next()) |e| allocator.free(e.value_ptr.*);
+        preds.deinit();
+    }
+
+    // Process loops innermost-ish first (smaller block sets first). Outer
+    // loops are revisited by the runPasses fixpoint loop.
+    const order = try allocator.alloc(u32, loops.loops.len);
+    defer allocator.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    const Ctx = struct {
+        forest: *const analysis.LoopForest,
+        fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+            return ctx.forest.loops[a].blocks.len < ctx.forest.loops[b].blocks.len;
+        }
+    };
+    std.sort.pdq(u32, order, Ctx{ .forest = &loops }, Ctx.lessThan);
+
+    var changed = false;
+
+    for (order) |loop_idx| {
+        const loop = &loops.loops[loop_idx];
+
+        // Find unique preheader.
+        const header_preds = preds.get(loop.header) orelse continue;
+        var preheader: ?ir.BlockId = null;
+        var preheader_count: u32 = 0;
+        for (header_preds) |p| {
+            if (loop.containsBlock(p)) continue;
+            preheader = p;
+            preheader_count += 1;
+        }
+        if (preheader_count != 1) continue;
+        const ph = preheader.?;
+
+        // Block-id-order safety: preheader id must precede every loop
+        // block id (loop.blocks is sorted ascending).
+        if (loop.blocks.len == 0) continue;
+        if (ph >= loop.blocks[0]) continue;
+
+        // Build loop_defs: every dest defined in the loop, scanning each
+        // block only up to its first terminator (frontend may emit dead
+        // instructions after a terminator).
+        var loop_defs = std.AutoHashMap(ir.VReg, void).init(allocator);
+        defer loop_defs.deinit();
+        for (loop.blocks) |bid| {
+            const blk = &func.blocks.items[bid];
+            for (blk.instructions.items) |inst| {
+                if (inst.dest) |d| try loop_defs.put(d, {});
+                if (isTerminatorOp(inst.op)) break;
+            }
+        }
+
+        // Insertion point in preheader: just before its first terminator.
+        var insert_idx: usize = func.blocks.items[ph].instructions.items.len;
+        for (func.blocks.items[ph].instructions.items, 0..) |inst, i| {
+            if (isTerminatorOp(inst.op)) { insert_idx = i; break; }
+        }
+
+        // Walk loop blocks, hoisting candidates into the preheader.
+        for (loop.blocks) |bid| {
+            const blk = &func.blocks.items[bid];
+            var i: usize = 0;
+            while (i < blk.instructions.items.len) {
+                const inst = blk.instructions.items[i];
+                if (isTerminatorOp(inst.op)) break; // ignore dead tail
+                if (!isHoistableOp(inst.op)) { i += 1; continue; }
+
+                var op_buf: [3]ir.VReg = undefined;
+                const ops = collectHoistableOperands(inst, &op_buf);
+                var invariant = true;
+                for (ops) |op| {
+                    if (loop_defs.contains(op)) { invariant = false; break; }
+                }
+                if (!invariant) { i += 1; continue; }
+
+                // Hoist: remove from current block, insert before preheader's
+                // terminator. Preserve relative ordering by appending at the
+                // current insert_idx and advancing it.
+                const removed = blk.instructions.orderedRemove(i);
+                try func.blocks.items[ph].instructions.insert(
+                    func.blocks.items[ph].allocator,
+                    insert_idx,
+                    removed,
+                );
+                insert_idx += 1;
+
+                if (removed.dest) |d| _ = loop_defs.remove(d);
+
+                changed = true;
+                // Don't advance `i`: the next instruction shifted into i.
+            }
+        }
+    }
+
+    return changed;
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
     // Module-level: inline small leaf callees before per-function passes.
@@ -3417,6 +3632,7 @@ pub const default_passes: []const PassFn = &.{
     &foldWrapOfExtend,
     &foldLoadStoreOffset,
     &commonSubexprElimination,
+    &licmPureOps,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &elideRedundantBoundsChecks,
@@ -6554,4 +6770,248 @@ test "foldLoadStoreOffset: preserves bounds_known" {
     const ld = func.getBlock(b0).instructions.items[3].op.load;
     try std.testing.expect(ld.bounds_known);
     try std.testing.expectEqual(@as(u32, 4), ld.offset);
+}
+
+test "licmPureOps: hoists invariant add out of single-block loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    // CFG: b0 (preheader) -> b1 (header+latch) -> b2 (exit)
+    //                       ^---- back-edge ----+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_y = func.newVReg();
+    const v_inv = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_x, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_y, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // Header is a self-looping single block.
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_x, .rhs = v_y } }, .dest = v_inv, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_inv }, .type = .i32 });
+
+    const changed = try licmPureOps(&func, allocator);
+    try std.testing.expect(changed);
+
+    // The add should now be in b0 (preheader); b1 should no longer contain it.
+    var found_in_ph = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .add and inst.dest == v_inv) found_in_ph = true;
+    }
+    try std.testing.expect(found_in_ph);
+
+    for (func.getBlock(b1).instructions.items) |inst| {
+        try std.testing.expect(!(inst.op == .add and inst.dest == v_inv));
+    }
+}
+
+test "licmPureOps: skips when operand is loop-defined" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_loaded = func.newVReg();   // loop-defined via load (non-hoistable)
+    const v_use = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_x, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // v_loaded is a non-hoistable load; v_use depends on it -> NOT invariant.
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_x, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_x, .rhs = v_loaded } }, .dest = v_use, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_x, .offset = 4, .size = 4 } }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_use }, .type = .i32 });
+
+    _ = try licmPureOps(&func, allocator);
+
+    // The add depending on v_loaded must NOT be hoisted.
+    var add_in_b1 = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .add and inst.dest == v_use) add_in_b1 = true;
+    }
+    try std.testing.expect(add_in_b1);
+}
+
+test "licmPureOps: does not hoist trapping div" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_y = func.newVReg();
+    const v_div = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_x, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 1 }, .dest = v_y, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // div_s would trap if v_y == 0 — must NOT speculatively hoist into preheader
+    // because the loop might never execute.
+    try func.getBlock(b1).append(.{ .op = .{ .div_s = .{ .lhs = v_x, .rhs = v_y } }, .dest = v_div, .type = .i32 });
+    // Use a load for the cond so it isn't itself hoisted (would be a noisy
+    // signal; we want to assert specifically about div_s).
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_x, .offset = 0, .size = 4 } }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_div }, .type = .i32 });
+
+    _ = try licmPureOps(&func, allocator);
+
+    // div_s must remain in b1.
+    var div_in_b1 = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .div_s and inst.dest == v_div) div_in_b1 = true;
+    }
+    try std.testing.expect(div_in_b1);
+    for (func.getBlock(b0).instructions.items) |inst| {
+        try std.testing.expect(!(inst.op == .div_s));
+    }
+}
+
+test "licmPureOps: skips loop without unique preheader" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 -> b1 (header), b2 -> b1 (header). Two preheaders.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_inv = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_a, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 2 }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_inv, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b3 } } });
+
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_inv }, .type = .i32 });
+
+    const changed = try licmPureOps(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "licmPureOps: nested loop — single call hoists from inner to outer preheader" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    // CFG (block ids ascending so preheader<header):
+    //   b0 (entry/outer-preheader) -> b1 (outer-header)
+    //   b1 -> b2 (inner-preheader)
+    //   b2 -> b3 (inner-header+latch self-loop) -> b4 (outer-latch)
+    //   b4 -> b1 (outer back-edge), b4 -> b5 (function exit)
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+    const b5 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_inner_inv = func.newVReg();
+    const v_one = func.newVReg();
+    const v_cond_inner = func.newVReg();
+    const v_cond_outer = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_x, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+
+    // Inner-loop body (b3): an add of v_x + 1 — invariant w.r.t. both loops.
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v_x, .rhs = v_one } }, .dest = v_inner_inv, .type = .i32 });
+    // Use a load (non-hoistable) for the inner cond so the test isolates
+    // the visible motion of the add.
+    try func.getBlock(b3).append(.{ .op = .{ .load = .{ .base = v_x, .offset = 0, .size = 4 } }, .dest = v_cond_inner, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .br_if = .{ .cond = v_cond_inner, .then_block = b3, .else_block = b4 } } });
+
+    try func.getBlock(b4).append(.{ .op = .{ .load = .{ .base = v_x, .offset = 4, .size = 4 } }, .dest = v_cond_outer, .type = .i32 });
+    try func.getBlock(b4).append(.{ .op = .{ .br_if = .{ .cond = v_cond_outer, .then_block = b1, .else_block = b5 } } });
+
+    try func.getBlock(b5).append(.{ .op = .{ .ret = v_inner_inv }, .type = .i32 });
+
+    // Single call: innermost-first ordering hoists b3→b2 then b2→b0.
+    const c1 = try licmPureOps(&func, allocator);
+    try std.testing.expect(c1);
+
+    // After hoisting, the add must live in b0 (outer preheader).
+    var add_in_b0 = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .add and inst.dest == v_inner_inv) add_in_b0 = true;
+    }
+    try std.testing.expect(add_in_b0);
+
+    // ...and not in b3.
+    for (func.getBlock(b3).instructions.items) |inst| {
+        try std.testing.expect(!(inst.op == .add and inst.dest == v_inner_inv));
+    }
+}
+
+test "licmPureOps: leaves non-pure load in loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_loaded = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_loaded }, .type = .i32 });
+
+    _ = try licmPureOps(&func, allocator);
+
+    // The load must remain in b1.
+    var load_in_b1 = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .load and inst.dest == v_loaded) load_in_b1 = true;
+    }
+    try std.testing.expect(load_in_b1);
+    // ...and not in b0.
+    for (func.getBlock(b0).instructions.items) |inst| {
+        try std.testing.expect(!(inst.op == .load and inst.dest == v_loaded));
+    }
 }
