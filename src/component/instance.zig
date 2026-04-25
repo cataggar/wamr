@@ -646,34 +646,71 @@ pub fn instantiate(
                                 defer imp_mem_idx += 1;
                                 if (source_inst_idx == std.math.maxInt(u32)) continue;
                                 if (source_inst_idx >= ci_idx) continue;
-                                const src_mi = cis[source_inst_idx].module_inst orelse continue;
-                                const exp = src_mi.module.findExport(imp.field_name, .memory) orelse continue;
-                                if (exp.index >= src_mi.memories.len) continue;
-                                mems_buf[imp_mem_idx] = src_mi.memories[exp.index];
-                                if (first_cross_src == null) first_cross_src = src_mi;
-                                has_imports_resolved = true;
+                                const source_entry = cis[source_inst_idx];
+                                if (source_entry.module_inst) |src_mi| {
+                                    const exp = src_mi.module.findExport(imp.field_name, .memory) orelse continue;
+                                    if (exp.index >= src_mi.memories.len) continue;
+                                    mems_buf[imp_mem_idx] = src_mi.memories[exp.index];
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
+                                // Inline-exports source: member references a
+                                // top-level core memory contributed by an
+                                // `alias core export` decl. Follow the alias
+                                // back to the original module instance.
+                                for (source_entry.inline_exports) |mem| {
+                                    if (!std.mem.eql(u8, mem.name, imp.field_name)) continue;
+                                    if (mem.sort_idx.sort != .memory) break;
+                                    const mi_ptr = resolveCoreMemoryToMI(inst, component, mem.sort_idx.idx) orelse break;
+                                    mems_buf[imp_mem_idx] = mi_ptr;
+                                    has_imports_resolved = true;
+                                    break;
+                                }
                             },
                             .table => {
                                 defer imp_tbl_idx += 1;
                                 if (source_inst_idx == std.math.maxInt(u32)) continue;
                                 if (source_inst_idx >= ci_idx) continue;
-                                const src_mi = cis[source_inst_idx].module_inst orelse continue;
-                                const exp = src_mi.module.findExport(imp.field_name, .table) orelse continue;
-                                if (exp.index >= src_mi.tables.len) continue;
-                                tbls_buf[imp_tbl_idx] = src_mi.tables[exp.index];
-                                if (first_cross_src == null) first_cross_src = src_mi;
-                                has_imports_resolved = true;
+                                const source_entry = cis[source_inst_idx];
+                                if (source_entry.module_inst) |src_mi| {
+                                    const exp = src_mi.module.findExport(imp.field_name, .table) orelse continue;
+                                    if (exp.index >= src_mi.tables.len) continue;
+                                    tbls_buf[imp_tbl_idx] = src_mi.tables[exp.index];
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
+                                for (source_entry.inline_exports) |mem| {
+                                    if (!std.mem.eql(u8, mem.name, imp.field_name)) continue;
+                                    if (mem.sort_idx.sort != .table) break;
+                                    const t_ptr = resolveCoreTableToMI(inst, component, mem.sort_idx.idx) orelse break;
+                                    tbls_buf[imp_tbl_idx] = t_ptr;
+                                    has_imports_resolved = true;
+                                    break;
+                                }
                             },
                             .global => {
                                 defer imp_glob_idx += 1;
                                 if (source_inst_idx == std.math.maxInt(u32)) continue;
                                 if (source_inst_idx >= ci_idx) continue;
-                                const src_mi = cis[source_inst_idx].module_inst orelse continue;
-                                const exp = src_mi.module.findExport(imp.field_name, .global) orelse continue;
-                                if (exp.index >= src_mi.globals.len) continue;
-                                globs_buf[imp_glob_idx] = src_mi.globals[exp.index];
-                                if (first_cross_src == null) first_cross_src = src_mi;
-                                has_imports_resolved = true;
+                                const source_entry = cis[source_inst_idx];
+                                if (source_entry.module_inst) |src_mi| {
+                                    const exp = src_mi.module.findExport(imp.field_name, .global) orelse continue;
+                                    if (exp.index >= src_mi.globals.len) continue;
+                                    globs_buf[imp_glob_idx] = src_mi.globals[exp.index];
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
+                                for (source_entry.inline_exports) |mem| {
+                                    if (!std.mem.eql(u8, mem.name, imp.field_name)) continue;
+                                    if (mem.sort_idx.sort != .global) break;
+                                    const g_ptr = resolveCoreGlobalToMI(inst, component, mem.sort_idx.idx) orelse break;
+                                    globs_buf[imp_glob_idx] = g_ptr;
+                                    has_imports_resolved = true;
+                                    break;
+                                }
                             },
                             else => {},
                         }
@@ -917,6 +954,51 @@ fn resolveCoreFuncToInstance(component: *const ctypes.Component, core_func_idx: 
         }
     }
     return null;
+}
+
+/// Resolve a top-level core memory index to the underlying source
+/// `MemoryInstance` it aliases. Only `alias core export` is currently
+/// modeled.
+fn resolveCoreMemoryToMI(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    core_mem_idx: u32,
+) ?*core_types.MemoryInstance {
+    const ref = indexspace.resolveCoreMemory(component, core_mem_idx) orelse return null;
+    const ie = component.aliases[ref.aliased].instance_export;
+    if (ie.instance_idx >= inst.core_instances.len) return null;
+    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
+    const exp = src_mi.module.findExport(ie.name, .memory) orelse return null;
+    if (exp.index >= src_mi.memories.len) return null;
+    return src_mi.memories[exp.index];
+}
+
+fn resolveCoreTableToMI(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    core_tbl_idx: u32,
+) ?*core_types.TableInstance {
+    const ref = indexspace.resolveCoreTable(component, core_tbl_idx) orelse return null;
+    const ie = component.aliases[ref.aliased].instance_export;
+    if (ie.instance_idx >= inst.core_instances.len) return null;
+    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
+    const exp = src_mi.module.findExport(ie.name, .table) orelse return null;
+    if (exp.index >= src_mi.tables.len) return null;
+    return src_mi.tables[exp.index];
+}
+
+fn resolveCoreGlobalToMI(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    core_glob_idx: u32,
+) ?*core_types.GlobalInstance {
+    const ref = indexspace.resolveCoreGlobal(component, core_glob_idx) orelse return null;
+    const ie = component.aliases[ref.aliased].instance_export;
+    if (ie.instance_idx >= inst.core_instances.len) return null;
+    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
+    const exp = src_mi.module.findExport(ie.name, .global) orelse return null;
+    if (exp.index >= src_mi.globals.len) return null;
+    return src_mi.globals[exp.index];
 }
 
 /// Resolve a `canon.lift.core_func_idx` (component core-func-index-space) to
@@ -1595,6 +1677,58 @@ test "instantiate: H1.2 micro-fixture — cross-instance memory wiring (#156 H1.
     var results: [1]abi_mod.InterfaceValue = undefined;
     try executor.callComponentFunc(inst, "g", &args, &results, std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 42), results[0].u32);
+}
+
+test "instantiate: H1.3 micro-fixture — alias core export of memory through inline-exports (#156 H1.3)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Three-step composition (see fixtures/h1-alias.wat):
+    //   $A exports memory "mem" and func "init" (writes 7 at addr 99).
+    //   `(alias core export $a "mem" (core memory))` → top-level core mem 0.
+    //   `(core instance $args (export "mem" (memory 0)))` — inline-exports
+    //   bundle that re-exports the aliased memory via the SortIdx path.
+    //   $B imports "src"."mem" and exports "read" (loads addr 99).
+    //   $b instantiated `(with "src" (instance $args))`.
+    // Exercises:
+    //   * `aliasContributesTo` for `.core_memory`.
+    //   * `resolveCoreMemory` ordering.
+    //   * Memory import resolution against an inline-exports source whose
+    //     member's SortIdx points at a top-level core memory contributed by
+    //     an alias-core-export — the path stdio-echo's `$fixup` takes for
+    //     the lifted `$main.memory`.
+    const data = @embedFile("fixtures/h1-alias.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try inst.linkImports(providers);
+
+    // Both real module instances must see the same MemoryInstance even
+    // though the wiring goes through an inline-exports bundle.
+    try std.testing.expect(inst.core_instances.len >= 3);
+    const mi_a = inst.core_instances[0].module_inst orelse return error.TestFailed;
+    // core_instances[1] is the inline-exports `$args` bundle (no module_inst).
+    const mi_b = inst.core_instances[2].module_inst orelse return error.TestFailed;
+    try std.testing.expect(mi_a.memories.len >= 1);
+    try std.testing.expect(mi_b.memories.len >= 1);
+    try std.testing.expectEqual(mi_a.memories[0], mi_b.memories[0]);
+
+    // Run init via $A so memory has 7 at offset 99, then read via $B.
+    var no_args: [0]abi_mod.InterfaceValue = .{};
+    var no_results: [0]abi_mod.InterfaceValue = .{};
+    try executor.callComponentFunc(inst, "init", &no_args, &no_results, std.testing.allocator);
+
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "read", &no_args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 7), results[0].u32);
 }
 
 test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)" {

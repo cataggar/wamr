@@ -165,6 +165,46 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
     return null;
 }
 
+// ── Top-level core table / memory / global index spaces ──────────────────
+//
+// Contributors today: only `alias core export ... (core {table,memory,global})`.
+// Real-world wit-component output uses these to lift `$main`'s memory and
+// `$shim`'s table to the component scope so a later inline-exports core
+// instance can bundle them and pass them into a third core module
+// (`$fixup` in stdio-echo). A future slice can add core imports and core
+// instance defs once those use cases appear.
+
+pub const CoreItemAliasRef = struct {
+    /// Index into `component.aliases`.
+    aliased: u32,
+};
+
+fn resolveCoreItem(
+    component: *const ctypes.Component,
+    idx: u32,
+    target: AliasTarget,
+) ?CoreItemAliasRef {
+    var n: u32 = 0;
+    for (component.aliases, 0..) |a, i| {
+        if (!aliasContributesTo(a, target)) continue;
+        if (n == idx) return .{ .aliased = @intCast(i) };
+        n += 1;
+    }
+    return null;
+}
+
+pub fn resolveCoreTable(component: *const ctypes.Component, idx: u32) ?CoreItemAliasRef {
+    return resolveCoreItem(component, idx, .core_table);
+}
+
+pub fn resolveCoreMemory(component: *const ctypes.Component, idx: u32) ?CoreItemAliasRef {
+    return resolveCoreItem(component, idx, .core_memory);
+}
+
+pub fn resolveCoreGlobal(component: *const ctypes.Component, idx: u32) ?CoreItemAliasRef {
+    return resolveCoreItem(component, idx, .core_global);
+}
+
 // ── Member lookup ─────────────────────────────────────────────────────────
 
 /// Look up a named member in a locally-instantiated `from_exports`-style
@@ -195,7 +235,17 @@ pub fn lookupLocalInstanceMember(
 
 // ── Internal: "which index space does this alias contribute to?" ─────────
 
-const AliasTarget = enum { comp_func, comp_instance, core_func, core_instance, type_x, value };
+const AliasTarget = enum {
+    comp_func,
+    comp_instance,
+    core_func,
+    core_instance,
+    core_table,
+    core_memory,
+    core_global,
+    type_x,
+    value,
+};
 
 fn aliasContributesTo(a: ctypes.Alias, target: AliasTarget) bool {
     return switch (a) {
@@ -206,7 +256,10 @@ fn aliasContributesTo(a: ctypes.Alias, target: AliasTarget) bool {
                 .func => target == .core_func,
                 .instance => target == .core_instance,
                 .type => target == .type_x,
-                .table, .memory, .global, .tag, .module => false,
+                .table => target == .core_table,
+                .memory => target == .core_memory,
+                .global => target == .core_global,
+                .tag, .module => false,
             },
             .type => target == .type_x,
             .value => target == .value,
