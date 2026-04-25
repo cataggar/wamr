@@ -299,7 +299,6 @@ fn typeSize(registry: TypeRegistry, t: ctypes.ValType) u32 {
 // ── Helper: push/pop interface values as core stack values ──────────────────
 
 fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !void {
-    _ = registry;
     switch (t) {
         .bool => try env.pushI32(if (val.bool) 1 else 0),
         .s8 => try env.pushI32(@as(i32, val.s8)),
@@ -321,15 +320,28 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
             try env.pushI32(@bitCast(val.list.ptr));
             try env.pushI32(@bitCast(val.list.len));
         },
-        // Compound types that need flattening are handled by the spill path
-        .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => {
+        // result<no-payload, no-payload>: flat repr is just the i32
+        // discriminant. WASI commonly returns this from `wasi:cli/run.run`
+        // and `wasi:io/streams.[method]output-stream.blocking-write-and-flush`,
+        // so the trampoline+lift paths support it directly. Result variants
+        // with payloads still go through the registry-aware spill path.
+        .result => |idx| {
+            const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
+            const r = switch (td) {
+                .result => |rt| rt,
+                else => return error.CompoundNeedsRegistry,
+            };
+            if (r.ok != null or r.err != null) return error.CompoundNeedsRegistry;
+            const disc: i32 = if (val.result_val.is_ok) 0 else 1;
+            try env.pushI32(disc);
+        },
+        .record, .variant, .tuple, .flags, .enum_, .option, .type_idx => {
             return error.CompoundNeedsRegistry;
         },
     }
 }
 
 fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
-    _ = registry;
     _ = allocator;
     return switch (t) {
         .bool => .{ .bool = (try env.popI32()) != 0 },
@@ -366,7 +378,19 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             .len = @bitCast(try env.popI32()),
             .ptr = @bitCast(try env.popI32()),
         } },
-        .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => error.CompoundNeedsRegistry,
+        // result<no-payload, no-payload>: pop one i32 discriminant.
+        // See pushInterfaceValue rationale.
+        .result => |idx| blk: {
+            const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
+            const r = switch (td) {
+                .result => |rt| rt,
+                else => return error.CompoundNeedsRegistry,
+            };
+            if (r.ok != null or r.err != null) return error.CompoundNeedsRegistry;
+            const disc = try env.popI32();
+            break :blk .{ .result_val = .{ .is_ok = disc == 0, .payload = null } };
+        },
+        .record, .variant, .tuple, .flags, .enum_, .option, .type_idx => error.CompoundNeedsRegistry,
     };
 }
 
