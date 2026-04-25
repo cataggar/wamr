@@ -876,6 +876,161 @@ pub fn computeLoops(
     };
 }
 
+// ── Dominance frontier ──────────────────────────────────────────────────
+
+/// Per-block dominance frontier sets. `frontier[b]` is the (sorted, dedup'd)
+/// set of blocks where `b` is the closest dominator that does NOT strictly
+/// dominate them. This is the canonical phi-insertion target set used by
+/// SSA construction.
+///
+/// Unreachable blocks contribute nothing and have an empty frontier.
+pub const DominanceFrontier = struct {
+    frontier: [][]ir.BlockId,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DominanceFrontier) void {
+        for (self.frontier) |row| self.allocator.free(row);
+        self.allocator.free(self.frontier);
+    }
+};
+
+/// Compute the dominance frontier of every block via the standard
+/// Cytron / Cooper-Harvey-Kennedy "join-point" walk: for each block X
+/// with ≥ 2 predecessors, walk each predecessor P upward through idom
+/// until reaching idom(X), adding X to the frontier of each intermediate
+/// block. Skips unreachable blocks.
+pub fn computeDominanceFrontier(
+    func: *const ir.IrFunction,
+    dom: *const DomTree,
+    allocator: std.mem.Allocator,
+) !DominanceFrontier {
+    const nblocks = func.blocks.items.len;
+
+    var predecessors = try buildPredecessors(func, allocator);
+    defer {
+        var pit = predecessors.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    // Per-block dense membership bitset, walked into sorted slices at the end.
+    // `present[b * nblocks + x] == true` ⇔ x ∈ DF(b). Block IDs are dense and
+    // small; this is simpler than per-block hashmaps and gives O(N) emit.
+    if (nblocks == 0) {
+        return .{
+            .frontier = try allocator.alloc([]ir.BlockId, 0),
+            .allocator = allocator,
+        };
+    }
+    const present = try allocator.alloc(bool, nblocks * nblocks);
+    defer allocator.free(present);
+    @memset(present, false);
+
+    var bi: usize = 0;
+    while (bi < nblocks) : (bi += 1) {
+        const x: ir.BlockId = @intCast(bi);
+        if (dom.idom[x] == null) continue;
+        const preds = predecessors.get(x) orelse continue;
+        if (preds.len < 2) continue;
+
+        const idom_x = dom.idom[x].?;
+        for (preds) |p| {
+            if (dom.idom[p] == null) continue;
+            var runner: ir.BlockId = p;
+            while (runner != idom_x) {
+                present[@as(usize, runner) * nblocks + @as(usize, x)] = true;
+                const next = dom.idom[runner] orelse break;
+                if (next == runner) break; // entry's idom is itself; stop.
+                runner = next;
+            }
+        }
+    }
+
+    const frontier = try allocator.alloc([]ir.BlockId, nblocks);
+    errdefer {
+        for (frontier) |row| allocator.free(row);
+        allocator.free(frontier);
+    }
+    for (frontier, 0..) |*row, idx| {
+        const base = idx * nblocks;
+        var count: usize = 0;
+        for (0..nblocks) |x| if (present[base + x]) {
+            count += 1;
+        };
+        const slice = try allocator.alloc(ir.BlockId, count);
+        errdefer allocator.free(slice);
+        var i: usize = 0;
+        for (0..nblocks) |x| {
+            if (present[base + x]) {
+                slice[i] = @intCast(x);
+                i += 1;
+            }
+        }
+        // Already sorted ascending by construction.
+        row.* = slice;
+    }
+
+    return .{ .frontier = frontier, .allocator = allocator };
+}
+
+/// Compute the iterated dominance frontier `DF+(S)` of a set of "def" blocks
+/// `def_blocks`. This is the fixpoint of `DF` applied repeatedly: the set
+/// of blocks where phis must be placed for a value defined in any block
+/// of `def_blocks`, accounting for the phis themselves becoming new defs.
+///
+/// Standard worklist algorithm; result is sorted ascending. Caller owns
+/// the returned slice.
+pub fn iteratedDominanceFrontier(
+    df: *const DominanceFrontier,
+    def_blocks: []const ir.BlockId,
+    allocator: std.mem.Allocator,
+) ![]ir.BlockId {
+    const nblocks = df.frontier.len;
+    if (nblocks == 0) return try allocator.alloc(ir.BlockId, 0);
+
+    const in_idf = try allocator.alloc(bool, nblocks);
+    defer allocator.free(in_idf);
+    @memset(in_idf, false);
+    const on_worklist = try allocator.alloc(bool, nblocks);
+    defer allocator.free(on_worklist);
+    @memset(on_worklist, false);
+    var worklist: std.ArrayList(ir.BlockId) = .empty;
+    defer worklist.deinit(allocator);
+
+    for (def_blocks) |b| {
+        if (b < nblocks and !on_worklist[b]) {
+            on_worklist[b] = true;
+            try worklist.append(allocator, b);
+        }
+    }
+
+    while (worklist.pop()) |x| {
+        if (x >= nblocks) continue;
+        for (df.frontier[x]) |y| {
+            if (in_idf[y]) continue;
+            in_idf[y] = true;
+            if (!on_worklist[y]) {
+                on_worklist[y] = true;
+                try worklist.append(allocator, y);
+            }
+        }
+    }
+
+    var count: usize = 0;
+    for (in_idf) |b| if (b) {
+        count += 1;
+    };
+    const out = try allocator.alloc(ir.BlockId, count);
+    var i: usize = 0;
+    for (in_idf, 0..) |b, idx| {
+        if (b) {
+            out[i] = @intCast(idx);
+            i += 1;
+        }
+    }
+    return out;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "buildSuccessors: linear block" {
@@ -1413,4 +1568,200 @@ test "computeLoops: irreducible-ish (no back-edge without dominator) produces no
     try std.testing.expectEqual(@as(usize, 1), lf.loops.len);
     try std.testing.expectEqual(b0, lf.loops[0].header);
     try std.testing.expectEqual(@as(usize, 3), lf.loops[0].blocks.len);
+}
+
+test "computeDominanceFrontier: linear chain has empty frontier" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var df = try computeDominanceFrontier(&func, &dom, allocator);
+    defer df.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b0].len);
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b1].len);
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b2].len);
+}
+
+test "computeDominanceFrontier: diamond merge is in DF of both arms" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var df = try computeDominanceFrontier(&func, &dom, allocator);
+    defer df.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b0].len);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b3}, df.frontier[b1]);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b3}, df.frontier[b2]);
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b3].len);
+}
+
+test "computeDominanceFrontier: loop header is in its own frontier" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 → b1; b1 ⇄ b1 (self-loop) | → b2
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var df = try computeDominanceFrontier(&func, &dom, allocator);
+    defer df.deinit();
+
+    // b1 has 2 preds (b0, b1); for the b1→b1 back-edge, runner = b1, idom_x = b0,
+    // so b1 is added to its own frontier. b0 is the immediate dominator of b1 so
+    // not added.
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b1}, df.frontier[b1]);
+}
+
+test "computeDominanceFrontier: nested loop frontier" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 → b1 (outer header) → b2 (inner header) → (back to b2 or b3)
+    // b3 → (back to b1 or b4); b4 = exit.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b2).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b2, .else_block = b3 } } });
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v1 });
+    try func.getBlock(b3).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = b1, .else_block = b4 } } });
+    try func.getBlock(b4).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v2 });
+    try func.getBlock(b4).append(.{ .op = .{ .ret = v2 } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var df = try computeDominanceFrontier(&func, &dom, allocator);
+    defer df.deinit();
+
+    // b3→b1 back-edge: runner walks b3→b2→b1→(stop at idom(b1)=b0). So b1 is
+    // added to DF(b3), DF(b2), and DF(b1) (b1 is in its own frontier — the
+    // outer-loop header phi site).
+    // b2→b2 self-loop: runner=b2, idom_x=b1, so b2 is added to DF(b2).
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b1}, df.frontier[b3]);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{ b1, b2 }, df.frontier[b2]);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b1}, df.frontier[b1]);
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b4].len);
+}
+
+test "computeDominanceFrontier: unreachable block has empty frontier" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock(); // unreachable
+    try func.getBlock(b0).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var df = try computeDominanceFrontier(&func, &dom, allocator);
+    defer df.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b0].len);
+    try std.testing.expectEqual(@as(usize, 0), df.frontier[b1].len);
+}
+
+test "iteratedDominanceFrontier: diamond defs converge to merge" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var df = try computeDominanceFrontier(&func, &dom, allocator);
+    defer df.deinit();
+
+    // Defs in {b1, b2} → IDF = {b3}.
+    const idf = try iteratedDominanceFrontier(&df, &.{ b1, b2 }, allocator);
+    defer allocator.free(idf);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b3}, idf);
+}
+
+test "iteratedDominanceFrontier: loop def needs phi at header" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // b0 → b1 (header); b1 ⇄ b1 | → b2.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var df = try computeDominanceFrontier(&func, &dom, allocator);
+    defer df.deinit();
+
+    // A def in entry b0 alone → IDF empty (b0's DF is empty).
+    const idf_entry = try iteratedDominanceFrontier(&df, &.{b0}, allocator);
+    defer allocator.free(idf_entry);
+    try std.testing.expectEqual(@as(usize, 0), idf_entry.len);
+
+    // A def in b1 (loop body) → IDF includes b1 itself (loop-header phi site).
+    const idf_loop = try iteratedDominanceFrontier(&df, &.{b1}, allocator);
+    defer allocator.free(idf_loop);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b1}, idf_loop);
+
+    // A def in {b0, b1} → IDF still {b1} (since DF(b0) is empty and DF(b1) = {b1}).
+    const idf_both = try iteratedDominanceFrontier(&df, &.{ b0, b1 }, allocator);
+    defer allocator.free(idf_both);
+    try std.testing.expectEqualSlices(ir.BlockId, &.{b1}, idf_both);
 }
