@@ -110,18 +110,51 @@ pub fn resolveCompInstance(component: *const ctypes.Component, idx: u32) ?CompIn
 // ── Core-func index space ─────────────────────────────────────────────────
 //
 // Contributors, in section order:
-//   1. `canon.lower` entries (the bridge from component func to core func).
+//   1. Canon entries that produce a core func — `canon.lower` plus the
+//      `canon.resource.{new,drop,rep}` family. Each contributes one slot.
 //   2. `alias` decls with `sort = .core(.func)` (exposing a core instance's
 //      core func export under a top-level core-func index).
+//
+// The component-model spec is explicit that `canon.lower` and the resource
+// canons all produce core functions and are counted in the same indexspace
+// in the order they appear in `canons[]`. Real wit-component output (e.g.
+// the stdio-echo binary) interleaves them with abandon: if we miscount
+// resource.drop slots, every later alias resolves to the wrong target.
 
 pub const CoreFuncRef = union(enum) {
-    /// Index into `component.canons`.
+    /// Index into `component.canons` for a `.lower` entry.
     lowered: u32,
+    /// Index into `component.canons` for a `.resource_drop` entry.
+    resource_drop: u32,
+    /// Index into `component.canons` for a `.resource_new` entry.
+    resource_new: u32,
+    /// Index into `component.canons` for a `.resource_rep` entry.
+    resource_rep: u32,
     /// Index into `component.aliases`.
     aliased: u32,
 };
 
 pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRef {
+    // Prefer the loader-provided binary-order indexspace when present
+    // (real components from wit-component / wasm-tools). Hand-authored
+    // fixtures that bypass the loader fall back to the section-order
+    // heuristic below.
+    if (component.core_func_indexspace.len > 0) {
+        if (idx >= component.core_func_indexspace.len) return null;
+        const c = component.core_func_indexspace[idx];
+        return switch (c) {
+            .alias => |a| .{ .aliased = a },
+            .canon => |canon_idx| switch (component.canons[canon_idx]) {
+                .lower => .{ .lowered = canon_idx },
+                .resource_drop => .{ .resource_drop = canon_idx },
+                .resource_new => .{ .resource_new = canon_idx },
+                .resource_rep => .{ .resource_rep = canon_idx },
+                .lift => null, // lift never contributes to core-func indexspace
+            },
+        };
+    }
+    // Fallback (hand-authored fixtures, no loader): assume canon
+    // entries declared first, aliases second.
     var n: u32 = 0;
     for (component.canons, 0..) |c, i| {
         switch (c) {
@@ -129,7 +162,19 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
                 if (n == idx) return .{ .lowered = @intCast(i) };
                 n += 1;
             },
-            else => {},
+            .resource_drop => {
+                if (n == idx) return .{ .resource_drop = @intCast(i) };
+                n += 1;
+            },
+            .resource_new => {
+                if (n == idx) return .{ .resource_new = @intCast(i) };
+                n += 1;
+            },
+            .resource_rep => {
+                if (n == idx) return .{ .resource_rep = @intCast(i) };
+                n += 1;
+            },
+            .lift => {},
         }
     }
     for (component.aliases, 0..) |a, i| {
@@ -138,6 +183,46 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
         n += 1;
     }
     return null;
+}
+
+// ── Top-level core table / memory / global index spaces ──────────────────
+//
+// Contributors today: only `alias core export ... (core {table,memory,global})`.
+// Real-world wit-component output uses these to lift `$main`'s memory and
+// `$shim`'s table to the component scope so a later inline-exports core
+// instance can bundle them and pass them into a third core module
+// (`$fixup` in stdio-echo). A future slice can add core imports and core
+// instance defs once those use cases appear.
+
+pub const CoreItemAliasRef = struct {
+    /// Index into `component.aliases`.
+    aliased: u32,
+};
+
+fn resolveCoreItem(
+    component: *const ctypes.Component,
+    idx: u32,
+    target: AliasTarget,
+) ?CoreItemAliasRef {
+    var n: u32 = 0;
+    for (component.aliases, 0..) |a, i| {
+        if (!aliasContributesTo(a, target)) continue;
+        if (n == idx) return .{ .aliased = @intCast(i) };
+        n += 1;
+    }
+    return null;
+}
+
+pub fn resolveCoreTable(component: *const ctypes.Component, idx: u32) ?CoreItemAliasRef {
+    return resolveCoreItem(component, idx, .core_table);
+}
+
+pub fn resolveCoreMemory(component: *const ctypes.Component, idx: u32) ?CoreItemAliasRef {
+    return resolveCoreItem(component, idx, .core_memory);
+}
+
+pub fn resolveCoreGlobal(component: *const ctypes.Component, idx: u32) ?CoreItemAliasRef {
+    return resolveCoreItem(component, idx, .core_global);
 }
 
 // ── Member lookup ─────────────────────────────────────────────────────────
@@ -170,7 +255,17 @@ pub fn lookupLocalInstanceMember(
 
 // ── Internal: "which index space does this alias contribute to?" ─────────
 
-const AliasTarget = enum { comp_func, comp_instance, core_func, core_instance, type_x, value };
+const AliasTarget = enum {
+    comp_func,
+    comp_instance,
+    core_func,
+    core_instance,
+    core_table,
+    core_memory,
+    core_global,
+    type_x,
+    value,
+};
 
 fn aliasContributesTo(a: ctypes.Alias, target: AliasTarget) bool {
     return switch (a) {
@@ -181,7 +276,10 @@ fn aliasContributesTo(a: ctypes.Alias, target: AliasTarget) bool {
                 .func => target == .core_func,
                 .instance => target == .core_instance,
                 .type => target == .type_x,
-                .table, .memory, .global, .tag, .module => false,
+                .table => target == .core_table,
+                .memory => target == .core_memory,
+                .global => target == .core_global,
+                .tag, .module => false,
             },
             .type => target == .type_x,
             .value => target == .value,

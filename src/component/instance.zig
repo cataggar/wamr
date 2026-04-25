@@ -237,6 +237,54 @@ pub const ComponentInstance = struct {
         return null;
     }
 
+    /// Resolve a top-level core memory indexspace index to the underlying
+    /// `*MemoryInstance`. Used by `componentTrampoline` and host-side
+    /// helpers to find the memory referenced by a `(memory N)` canonical
+    /// option, where `N` is the component-level core memory index — which
+    /// may be contributed by an `alias core export` decl pointing at a
+    /// memory exported by a different core instance than the "first" one.
+    ///
+    /// Resolution order:
+    ///   1. If `N` is contributed by an `alias core export`, follow it
+    ///      through the source core instance to the underlying memory.
+    ///   2. Otherwise, fall back to `firstModuleInst().getMemory(N)` —
+    ///      preserves behavior for hand-authored fixtures with a single
+    ///      core module (where the local memory idx matches N).
+    pub fn resolveTopLevelMemory(self: *const ComponentInstance, idx: u32) ?*core_types.MemoryInstance {
+        const ref = indexspace.resolveCoreMemory(self.component, idx) orelse {
+            const mi = self.firstModuleInst() orelse return null;
+            return mi.getMemory(idx);
+        };
+        const ie = self.component.aliases[ref.aliased].instance_export;
+        if (ie.instance_idx >= self.core_instances.len) return null;
+        const src_mi = self.core_instances[ie.instance_idx].module_inst orelse return null;
+        const exp = src_mi.module.findExport(ie.name, .memory) orelse return null;
+        if (exp.index >= src_mi.memories.len) return null;
+        return src_mi.memories[exp.index];
+    }
+
+    /// Resolve a top-level core func indexspace index to a callable
+    /// `(*ModuleInstance, local_func_idx)` pair, suitable for invoking
+    /// from a host context (e.g. calling `cabi_realloc`). Only the
+    /// alias-core-export contributors yield a directly-callable function;
+    /// canon.lower / resource.* canons are imports and return null.
+    pub fn resolveTopLevelCoreFunc(
+        self: *const ComponentInstance,
+        idx: u32,
+    ) ?struct { mi: *core_types.ModuleInstance, local_idx: u32 } {
+        const ref = indexspace.resolveCoreFunc(self.component, idx) orelse return null;
+        switch (ref) {
+            .lowered, .resource_drop, .resource_new, .resource_rep => return null,
+            .aliased => |alias_idx| {
+                const ie = self.component.aliases[alias_idx].instance_export;
+                if (ie.instance_idx >= self.core_instances.len) return null;
+                const mi = self.core_instances[ie.instance_idx].module_inst orelse return null;
+                const local = mi.getExportFunc(ie.name) orelse return null;
+                return .{ .mi = mi, .local_idx = local };
+            },
+        }
+    }
+
     /// Read `len` bytes starting at guest linear-memory offset `ptr` from the
     /// canonical memory of this component. Used by host adapter callbacks
     /// invoked from `componentTrampoline` to materialize `list<u8>` /
@@ -248,11 +296,37 @@ pub const ComponentInstance = struct {
     /// Returns null if no such instance is present, the memory is missing,
     /// or the slice is out of bounds.
     pub fn readGuestBytes(self: *const ComponentInstance, ptr: u32, len: u32) ?[]const u8 {
-        const mi = self.firstModuleInst() orelse return null;
-        const mem = mi.getMemory(0) orelse return null;
+        const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);
         if (end > mem.data.len) return null;
         return mem.data[ptr..end];
+    }
+
+    /// Return the "canonical" guest memory: the one that
+    /// `cabi_realloc` allocates into and that lift/lower of compound
+    /// types reads/writes through. Prefers a top-level core memory 0
+    /// (which under wit-component output is `alias core export $main
+    /// "memory"`); falls back to the first module instance's memory[0]
+    /// for legacy hand-authored fixtures.
+    pub fn canonicalMemory(self: *const ComponentInstance) ?*core_types.MemoryInstance {
+        if (self.resolveTopLevelMemory(0)) |m| return m;
+        const mi = self.firstModuleInst() orelse return null;
+        return mi.getMemory(0);
+    }
+
+    /// Locate the module instance that owns `cabi_realloc`. wit-component
+    /// emits `cabi_realloc` on the same core module that owns the
+    /// canonical memory (`$main` in stdio-echo); legacy fixtures put it
+    /// on the only module instance.
+    fn reallocOwner(self: *const ComponentInstance) ?*core_types.ModuleInstance {
+        // First try: walk all core instances looking for one that exports
+        // `cabi_realloc`. This is robust regardless of which instance the
+        // canonical memory aliases through.
+        for (self.core_instances) |entry| {
+            const mi = entry.module_inst orelse continue;
+            if (mi.getExportFunc("cabi_realloc") != null) return mi;
+        }
+        return null;
     }
 
     /// Allocate `len` bytes inside the canonical guest linear memory and
@@ -268,14 +342,14 @@ pub const ComponentInstance = struct {
     /// the main core module; we call it with `(0, 0, align=1, len)` to
     /// allocate fresh space.
     pub fn hostAllocAndWrite(self: *ComponentInstance, bytes: []const u8) ?u32 {
-        const mi = self.firstModuleInst() orelse return null;
-        const realloc_local = mi.getExportFunc("cabi_realloc") orelse return null;
+        const realloc_owner = self.reallocOwner() orelse return null;
+        const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
         const executor = @import("executor.zig");
-        const env = ExecEnv.create(mi, 4096, self.allocator) catch return null;
+        const env = ExecEnv.create(realloc_owner, 4096, self.allocator) catch return null;
         defer env.destroy();
         const ptr = executor.callRealloc(env, realloc_local, 0, 0, 1, @intCast(bytes.len)) catch return null;
-        const mem = mi.getMemory(0) orelse return null;
+        const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + bytes.len;
         if (end > mem.data.len) return null;
         @memcpy(mem.data[ptr..end], bytes);
@@ -332,6 +406,9 @@ pub const ComponentInstance = struct {
         for (self.trampoline_ctxs.items) |ctx| {
             if (resolveComponentFuncToHostFunc(self, self.component, ctx.component_func_idx)) |hf| {
                 ctx.host_func = hf;
+                std.debug.print("LINK comp_func={} -> host_func.call={any}\n", .{ ctx.component_func_idx, hf.call != null });
+            } else {
+                std.debug.print("LINK comp_func={} -> NULL\n", .{ctx.component_func_idx});
             }
         }
     }
@@ -454,129 +531,372 @@ pub fn instantiate(
                     const loaded = loader.load(core_mod.data, mod_alloc) catch continue;
                     const module_ptr = mod_alloc.create(core_types.WasmModule) catch continue;
                     module_ptr.* = loaded;
-                    const mi = inst_mod.instantiate(module_ptr, allocator) catch continue;
-                    cis[ci_idx] = .{ .module_inst = mi };
 
-                    // Build per-import host_func_entries by resolving each
-                    // core import against the named arg → prior inline
-                    // instance exports. For function imports backed by a
-                    // canon.lower, install a componentTrampoline.
-                    if (module_ptr.import_function_count == 0) continue;
+                    // Resolve every import against `with` args BEFORE
+                    // instantiation. Three backends:
+                    //   * Cross-instance: the source `with`-arg is a real core
+                    //     module instance; wire the appropriate per-kind slot
+                    //     (`import_functions` / `memories` / `tables` /
+                    //     `globals`) so the interpreter dispatches into the
+                    //     source's body / shares the same MemoryInstance etc.
+                    //   * Canon.lower (function-only): the source is an
+                    //     inline-exports bundle pointing at a `canon lower`
+                    //     core func; install a `componentTrampoline` on
+                    //     `host_func_entries[i]`.
+                    //   * Unresolved: function slots fall through to a no-op
+                    //     stub; non-function unresolved imports trap at
+                    //     instantiation (current `instantiateWithImports`
+                    //     contract — caller must satisfy them).
+                    const import_func_count = module_ptr.import_function_count;
+                    const import_mem_count = module_ptr.import_memory_count;
+                    const import_tbl_count = module_ptr.import_table_count;
+                    const import_glob_count = module_ptr.import_global_count;
+                    var entries: []?core_types.HostFnEntry = &.{};
+                    var imps_buf: []core_types.ImportedFunction = &.{};
+                    var is_cross: []bool = &.{};
+                    var mems_buf: []*core_types.MemoryInstance = &.{};
+                    var tbls_buf: []*core_types.TableInstance = &.{};
+                    var globs_buf: []*core_types.GlobalInstance = &.{};
+                    var first_cross_src: ?*core_types.ModuleInstance = null;
+                    var has_imports_resolved = false;
+                    if (import_func_count > 0) {
+                        entries = allocator.alloc(?core_types.HostFnEntry, import_func_count) catch continue;
+                        @memset(entries, null);
+                        imps_buf = allocator.alloc(core_types.ImportedFunction, import_func_count) catch {
+                            allocator.free(entries);
+                            continue;
+                        };
+                        is_cross = allocator.alloc(bool, import_func_count) catch {
+                            allocator.free(entries);
+                            allocator.free(imps_buf);
+                            continue;
+                        };
+                        @memset(is_cross, false);
+                    }
+                    // Per-kind resolution buffers; allocated lazily so a module
+                    // with e.g. zero memory imports never touches the allocator.
+                    if (import_mem_count > 0) {
+                        mems_buf = allocator.alloc(*core_types.MemoryInstance, import_mem_count) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            continue;
+                        };
+                    }
+                    if (import_tbl_count > 0) {
+                        tbls_buf = allocator.alloc(*core_types.TableInstance, import_tbl_count) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            if (mems_buf.len > 0) allocator.free(mems_buf);
+                            continue;
+                        };
+                    }
+                    if (import_glob_count > 0) {
+                        globs_buf = allocator.alloc(*core_types.GlobalInstance, import_glob_count) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            if (mems_buf.len > 0) allocator.free(mems_buf);
+                            if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                            continue;
+                        };
+                    }
 
-                    const entries = allocator.alloc(?core_types.HostFnEntry, module_ptr.import_function_count) catch continue;
-                    @memset(entries, null);
-
+                    // Walk imports once, dispatching by kind. Per-kind running
+                    // index counters track the position within the per-kind
+                    // import sequence — the interpreter's `ImportContext`
+                    // fields are indexed by these (not by the global import
+                    // index).
                     var imp_func_idx: u32 = 0;
+                    var imp_mem_idx: u32 = 0;
+                    var imp_tbl_idx: u32 = 0;
+                    var imp_glob_idx: u32 = 0;
                     for (module_ptr.imports) |imp| {
-                        if (imp.kind != .function) continue;
-                        defer imp_func_idx += 1;
-
-                        // Find arg with matching core-module-import "module name".
+                        // Find the `with` arg whose name matches this import's
+                        // wasm "module" string (component-model `with` keys).
                         const source_inst_idx: u32 = arg_blk: {
                             for (ie.args) |arg| {
                                 if (std.mem.eql(u8, arg.name, imp.module_name)) break :arg_blk arg.instance_idx;
                             }
                             break :arg_blk std.math.maxInt(u32);
                         };
-                        if (source_inst_idx == std.math.maxInt(u32)) continue;
-                        if (source_inst_idx >= ci_idx) continue;
-                        const source_entry = cis[source_inst_idx];
 
-                        // Find matching named member in the source instance's inline exports.
-                        var member_sort_idx: ?ctypes.CoreSort = null;
-                        var member_idx: u32 = 0;
-                        for (source_entry.inline_exports) |mem| {
-                            if (std.mem.eql(u8, mem.name, imp.field_name)) {
-                                member_sort_idx = mem.sort_idx.sort;
-                                member_idx = mem.sort_idx.idx;
-                                break;
-                            }
-                        }
-                        if (member_sort_idx == null) continue;
-                        if (member_sort_idx.? != .func) continue;
+                        switch (imp.kind) {
+                            .function => {
+                                defer imp_func_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const source_entry = cis[source_inst_idx];
 
-                        // Resolve member_idx in core-func-index-space back to
-                        // a canon.lower. Simplified layout: we assume the
-                        // space is populated exclusively by canon.lower
-                        // entries in canons[] order (no core aliases, no
-                        // module-import funcs at top level). This covers the
-                        // hand-authored 2A.2b fixture and common Rust emit
-                        // patterns; the full resolver lands in a later slice.
-                        const canon_idx = resolveCoreFuncLower(component, member_idx) orelse continue;
-                        const canon = component.canons[canon_idx];
-                        const lower = switch (canon) {
-                            .lower => |l| l,
-                            else => continue,
-                        };
+                                if (source_entry.module_inst) |src_mi| {
+                                    const target_func_idx = src_mi.getExportFunc(imp.field_name) orelse continue;
+                                    imps_buf[imp_func_idx] = .{ .module_inst = src_mi, .func_idx = target_func_idx };
+                                    is_cross[imp_func_idx] = true;
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
 
-                        // Build and own the trampoline context. The actual
-                        // `HostFunc.call` is resolved later by `linkImports`
-                        // when the caller supplies the import providers;
-                        // here we just record which component func index
-                        // this trampoline is lowering.
-                        const ctx_ptr = allocator.create(executor_mod.ComponentTrampolineCtx) catch continue;
-                        if (lower.func_idx >= component.types.len) {
-                            allocator.destroy(ctx_ptr);
-                            continue;
-                        }
-                        const ft = switch (component.types[lower.func_idx]) {
-                            .func => |ft_v| ft_v,
-                            else => {
-                                allocator.destroy(ctx_ptr);
-                                continue;
-                            },
-                        };
-                        const params = allocator.alloc(ctypes.ValType, ft.params.len) catch {
-                            allocator.destroy(ctx_ptr);
-                            continue;
-                        };
-                        for (ft.params, 0..) |p, i| params[i] = p.type;
-                        const results = switch (ft.results) {
-                            .none => allocator.alloc(ctypes.ValType, 0) catch {
-                                allocator.free(params);
-                                allocator.destroy(ctx_ptr);
-                                continue;
-                            },
-                            .unnamed => |t| blk: {
-                                const r = allocator.alloc(ctypes.ValType, 1) catch {
-                                    allocator.free(params);
+                                // Inline-exports source — member is a core func that is either:
+                                //   (a) a `canon.lower` (host trampoline), or
+                                //   (b) an `alias core export` of another core instance's
+                                //       func (cross-instance wiring, e.g. shim's exports
+                                //       routed into $main via wit-component's shim/fixup
+                                //       pattern).
+                                var member_sort_idx: ?ctypes.CoreSort = null;
+                                var member_idx: u32 = 0;
+                                for (source_entry.inline_exports) |mem| {
+                                    if (std.mem.eql(u8, mem.name, imp.field_name)) {
+                                        member_sort_idx = mem.sort_idx.sort;
+                                        member_idx = mem.sort_idx.idx;
+                                        break;
+                                    }
+                                }
+                                if (member_sort_idx == null) continue;
+                                if (member_sort_idx.? != .func) continue;
+
+                                const cfref = indexspace.resolveCoreFunc(component, member_idx) orelse continue;
+                                std.debug.print("IMPORT-RES ci={} imp_func={} field={s} cfref={s}\n", .{ ci_idx, imp_func_idx, imp.field_name, @tagName(cfref) });
+                                // Aliased core func — resolve to the underlying
+                                // {module_inst, func_idx} pair from a previously
+                                // instantiated core instance.
+                                switch (cfref) {
+                                    .aliased => |alias_idx| {
+                                        const al = component.aliases[alias_idx];
+                                        const ie_al = switch (al) {
+                                            .instance_export => |x| x,
+                                            else => continue,
+                                        };
+                                        if (ie_al.instance_idx >= ci_idx) continue;
+                                        const al_src = cis[ie_al.instance_idx];
+                                        const al_mi = al_src.module_inst orelse continue;
+                                        const al_func_idx = al_mi.getExportFunc(ie_al.name) orelse continue;
+                                        std.debug.print("  ALIASED-WIRED src_ci={} name={s} func_idx={}\n", .{ ie_al.instance_idx, ie_al.name, al_func_idx });
+                                        imps_buf[imp_func_idx] = .{ .module_inst = al_mi, .func_idx = al_func_idx };
+                                        is_cross[imp_func_idx] = true;
+                                        if (first_cross_src == null) first_cross_src = al_mi;
+                                        has_imports_resolved = true;
+                                        continue;
+                                    },
+                                    .lowered => {},
+                                    else => continue,
+                                }
+                                const canon_idx = cfref.lowered;
+                                const canon = component.canons[canon_idx];
+                                const lower = switch (canon) {
+                                    .lower => |l| l,
+                                    else => continue,
+                                };
+
+                                std.debug.print("  LOWERED canon_idx={} lower.func_idx={} types.len={}\n", .{ canon_idx, lower.func_idx, component.types.len });
+                                const ctx_ptr = allocator.create(executor_mod.ComponentTrampolineCtx) catch continue;
+                                // Prefer name-based lookup (correct for real components).
+                                // Fall back to direct types[lower.func_idx] indexing for
+                                // hand-authored fixtures that put the FuncType at that
+                                // top-level type slot without a nested instance-type body.
+                                const rft_opt: ?ResolvedFuncType = resolveCompFuncType(component, lower.func_idx) orelse blk: {
+                                    if (lower.func_idx >= component.types.len) break :blk null;
+                                    break :blk switch (component.types[lower.func_idx]) {
+                                        .func => |f| ResolvedFuncType{ .ft = f },
+                                        else => null,
+                                    };
+                                };
+                                const rft = rft_opt orelse {
+                                    std.debug.print("  LOWERED-NO-TYPE func_idx={}\n", .{lower.func_idx});
                                     allocator.destroy(ctx_ptr);
                                     continue;
                                 };
-                                r[0] = t;
-                                break :blk r;
-                            },
-                            .named => |named| blk: {
-                                const r = allocator.alloc(ctypes.ValType, named.len) catch {
-                                    allocator.free(params);
+                                // When the FuncType came from an instance-type body, its
+                                // param/result `.type_idx` references are local to that
+                                // body. Rewrite them to concrete forms (or leave as
+                                // .type_idx fallback) so the trampoline param/result
+                                // walk doesn't misinterpret sizes.
+                                const ft: ctypes.FuncType = if (rft.decls) |decls|
+                                    rewriteInstanceFuncType(allocator, decls, rft.ft) catch {
+                                        allocator.destroy(ctx_ptr);
+                                        continue;
+                                    }
+                                else
+                                    rft.ft;
+                                const params = allocator.alloc(ctypes.ValType, ft.params.len) catch {
                                     allocator.destroy(ctx_ptr);
                                     continue;
                                 };
-                                for (named, 0..) |n, i| r[i] = n.type;
-                                break :blk r;
-                            },
-                        };
-                        ctx_ptr.* = .{
-                            .comp_inst = inst,
-                            .host_func = .{}, // filled in by linkImports
-                            .component_func_idx = lower.func_idx,
-                            .param_types = params,
-                            .result_types = results,
-                            .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
-                        };
-                        inst.trampoline_ctxs.append(allocator, ctx_ptr) catch {
-                            ctx_ptr.deinit(allocator);
-                            allocator.destroy(ctx_ptr);
-                            continue;
-                        };
+                                for (ft.params, 0..) |p, i| params[i] = p.type;
+                                const results = switch (ft.results) {
+                                    .none => allocator.alloc(ctypes.ValType, 0) catch {
+                                        allocator.free(params);
+                                        allocator.destroy(ctx_ptr);
+                                        continue;
+                                    },
+                                    .unnamed => |t| blk2: {
+                                        const r = allocator.alloc(ctypes.ValType, 1) catch {
+                                            allocator.free(params);
+                                            allocator.destroy(ctx_ptr);
+                                            continue;
+                                        };
+                                        r[0] = t;
+                                        break :blk2 r;
+                                    },
+                                    .named => |named| blk2: {
+                                        const r = allocator.alloc(ctypes.ValType, named.len) catch {
+                                            allocator.free(params);
+                                            allocator.destroy(ctx_ptr);
+                                            continue;
+                                        };
+                                        for (named, 0..) |n, i| r[i] = n.type;
+                                        break :blk2 r;
+                                    },
+                                };
+                                ctx_ptr.* = .{
+                                    .comp_inst = inst,
+                                    .host_func = .{},
+                                    .component_func_idx = lower.func_idx,
+                                    .param_types = params,
+                                    .result_types = results,
+                                    .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
+                                };
+                                inst.trampoline_ctxs.append(allocator, ctx_ptr) catch {
+                                    ctx_ptr.deinit(allocator);
+                                    allocator.destroy(ctx_ptr);
+                                    continue;
+                                };
 
-                        entries[imp_func_idx] = .{
-                            .func = &executor_mod.componentTrampoline,
-                            .ctx = @ptrCast(ctx_ptr),
-                        };
+                                entries[imp_func_idx] = .{
+                                    .func = &executor_mod.componentTrampoline,
+                                    .ctx = @ptrCast(ctx_ptr),
+                                };
+                            },
+                            .memory => {
+                                defer imp_mem_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const source_entry = cis[source_inst_idx];
+                                if (source_entry.module_inst) |src_mi| {
+                                    const exp = src_mi.module.findExport(imp.field_name, .memory) orelse continue;
+                                    if (exp.index >= src_mi.memories.len) continue;
+                                    mems_buf[imp_mem_idx] = src_mi.memories[exp.index];
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
+                                // Inline-exports source: member references a
+                                // top-level core memory contributed by an
+                                // `alias core export` decl. Follow the alias
+                                // back to the original module instance.
+                                for (source_entry.inline_exports) |mem| {
+                                    if (!std.mem.eql(u8, mem.name, imp.field_name)) continue;
+                                    if (mem.sort_idx.sort != .memory) break;
+                                    const mi_ptr = resolveCoreMemoryToMI(inst, component, mem.sort_idx.idx) orelse break;
+                                    mems_buf[imp_mem_idx] = mi_ptr;
+                                    has_imports_resolved = true;
+                                    break;
+                                }
+                            },
+                            .table => {
+                                defer imp_tbl_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const source_entry = cis[source_inst_idx];
+                                if (source_entry.module_inst) |src_mi| {
+                                    const exp = src_mi.module.findExport(imp.field_name, .table) orelse continue;
+                                    if (exp.index >= src_mi.tables.len) continue;
+                                    tbls_buf[imp_tbl_idx] = src_mi.tables[exp.index];
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
+                                for (source_entry.inline_exports) |mem| {
+                                    if (!std.mem.eql(u8, mem.name, imp.field_name)) continue;
+                                    if (mem.sort_idx.sort != .table) break;
+                                    const t_ptr = resolveCoreTableToMI(inst, component, mem.sort_idx.idx) orelse break;
+                                    tbls_buf[imp_tbl_idx] = t_ptr;
+                                    has_imports_resolved = true;
+                                    break;
+                                }
+                            },
+                            .global => {
+                                defer imp_glob_idx += 1;
+                                if (source_inst_idx == std.math.maxInt(u32)) continue;
+                                if (source_inst_idx >= ci_idx) continue;
+                                const source_entry = cis[source_inst_idx];
+                                if (source_entry.module_inst) |src_mi| {
+                                    const exp = src_mi.module.findExport(imp.field_name, .global) orelse continue;
+                                    if (exp.index >= src_mi.globals.len) continue;
+                                    globs_buf[imp_glob_idx] = src_mi.globals[exp.index];
+                                    if (first_cross_src == null) first_cross_src = src_mi;
+                                    has_imports_resolved = true;
+                                    continue;
+                                }
+                                for (source_entry.inline_exports) |mem| {
+                                    if (!std.mem.eql(u8, mem.name, imp.field_name)) continue;
+                                    if (mem.sort_idx.sort != .global) break;
+                                    const g_ptr = resolveCoreGlobalToMI(inst, component, mem.sort_idx.idx) orelse break;
+                                    globs_buf[imp_glob_idx] = g_ptr;
+                                    has_imports_resolved = true;
+                                    break;
+                                }
+                            },
+                            else => {},
+                        }
                     }
 
-                    inst_mod.attachHostFuncEntries(mi, entries);
+                    // Instantiate, optionally seeding `import_functions` for
+                    // cross-instance wiring. Slots that aren't cross-instance
+                    // get a safe placeholder pointing at any cross-source we
+                    // saw — interp dispatch never reaches them because their
+                    // `host_func_entries[i]` is non-null (canon.lower) or the
+                    // import is unresolved (caught by the no-op stub before
+                    // `import_functions` is consulted).
+                    const mi = blk: {
+                        if (has_imports_resolved or first_cross_src != null) {
+                            if (first_cross_src) |placeholder| {
+                                for (imps_buf, 0..) |*slot, i| {
+                                    if (!is_cross[i]) {
+                                        slot.* = .{ .module_inst = placeholder, .func_idx = 0 };
+                                    }
+                                }
+                            }
+                            const ctx = inst_mod.ImportContext{
+                                .functions = imps_buf,
+                                .memories = mems_buf,
+                                .tables = tbls_buf,
+                                .globals = globs_buf,
+                            };
+                            break :blk inst_mod.instantiateWithImports(module_ptr, allocator, ctx) catch {
+                                if (entries.len > 0) allocator.free(entries);
+                                if (imps_buf.len > 0) allocator.free(imps_buf);
+                                if (is_cross.len > 0) allocator.free(is_cross);
+                                if (mems_buf.len > 0) allocator.free(mems_buf);
+                                if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                                if (globs_buf.len > 0) allocator.free(globs_buf);
+                                continue;
+                            };
+                        }
+                        break :blk inst_mod.instantiate(module_ptr, allocator) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            if (mems_buf.len > 0) allocator.free(mems_buf);
+                            if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                            if (globs_buf.len > 0) allocator.free(globs_buf);
+                            continue;
+                        };
+                    };
+                    cis[ci_idx] = .{ .module_inst = mi };
+
+                    if (entries.len > 0) inst_mod.attachHostFuncEntries(mi, entries);
+                    {
+                        var nset: u32 = 0;
+                        for (entries) |e| if (e != null) { nset += 1; };
+                        std.debug.print("ATTACH ci={} entries.len={} nset={} import_func_count={}\n", .{ ci_idx, entries.len, nset, import_func_count });
+                    }
+                    if (imps_buf.len > 0) allocator.free(imps_buf);
+                    if (is_cross.len > 0) allocator.free(is_cross);
+                    if (mems_buf.len > 0) allocator.free(mems_buf);
+                    if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                    if (globs_buf.len > 0) allocator.free(globs_buf);
                 },
             }
         }
@@ -742,7 +1062,7 @@ fn isWasiCliRunName(name: []const u8) bool {
 fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) ?u32 {
     return switch (indexspace.resolveCoreFunc(component, core_func_idx) orelse return null) {
         .lowered => |i| i,
-        .aliased => null,
+        .resource_drop, .resource_new, .resource_rep, .aliased => null,
     };
 }
 
@@ -767,6 +1087,243 @@ fn resolveCoreFuncToInstance(component: *const ctypes.Component, core_func_idx: 
     return null;
 }
 
+/// Resolve a top-level core memory index to the underlying source
+/// `MemoryInstance` it aliases. Only `alias core export` is currently
+/// modeled.
+fn resolveCoreMemoryToMI(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    core_mem_idx: u32,
+) ?*core_types.MemoryInstance {
+    const ref = indexspace.resolveCoreMemory(component, core_mem_idx) orelse return null;
+    const ie = component.aliases[ref.aliased].instance_export;
+    if (ie.instance_idx >= inst.core_instances.len) return null;
+    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
+    const exp = src_mi.module.findExport(ie.name, .memory) orelse return null;
+    if (exp.index >= src_mi.memories.len) return null;
+    return src_mi.memories[exp.index];
+}
+
+fn resolveCoreTableToMI(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    core_tbl_idx: u32,
+) ?*core_types.TableInstance {
+    const ref = indexspace.resolveCoreTable(component, core_tbl_idx) orelse return null;
+    const ie = component.aliases[ref.aliased].instance_export;
+    if (ie.instance_idx >= inst.core_instances.len) return null;
+    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
+    const exp = src_mi.module.findExport(ie.name, .table) orelse return null;
+    if (exp.index >= src_mi.tables.len) return null;
+    return src_mi.tables[exp.index];
+}
+
+fn resolveCoreGlobalToMI(
+    inst: *const ComponentInstance,
+    component: *const ctypes.Component,
+    core_glob_idx: u32,
+) ?*core_types.GlobalInstance {
+    const ref = indexspace.resolveCoreGlobal(component, core_glob_idx) orelse return null;
+    const ie = component.aliases[ref.aliased].instance_export;
+    if (ie.instance_idx >= inst.core_instances.len) return null;
+    const src_mi = inst.core_instances[ie.instance_idx].module_inst orelse return null;
+    const exp = src_mi.module.findExport(ie.name, .global) orelse return null;
+    if (exp.index >= src_mi.globals.len) return null;
+    return src_mi.globals[exp.index];
+}
+
+/// Walk `component.type_indexspace[idx]` (loader-populated) to find the
+/// local entry in `component.types`. Falls back to direct indexing for
+/// hand-authored fixtures that bypass the loader.
+fn resolveTypeDef(component: *const ctypes.Component, type_idx: u32) ?ctypes.TypeDef {
+    if (component.type_indexspace.len > 0) {
+        if (type_idx >= component.type_indexspace.len) return null;
+        const local = component.type_indexspace[type_idx] orelse return null;
+        if (local >= component.types.len) return null;
+        return component.types[local];
+    }
+    if (type_idx >= component.types.len) return null;
+    return component.types[type_idx];
+}
+
+/// Resolve a component-func index to its function type. Handles imports,
+/// aliases of imported-instance members, and `canon.lift` entries.
+/// Inside an instance-type body, type indices are local. This helper
+/// walks decls in order, resolving the Nth type-producing declarator
+/// to its concrete `TypeDef`. Used by the canonical-ABI trampoline to
+/// dereference param/result `.type_idx` references.
+fn resolveInstanceTypeLocal(decls: []const ctypes.Decl, idx: u32) ?ctypes.TypeDef {
+    var n: u32 = 0;
+    for (decls) |d| switch (d) {
+        .type => |td| {
+            if (n == idx) return td;
+            n += 1;
+        },
+        .alias => {
+            // Aliases of types produce a binding but we don't track the
+            // outer-resolved type here; return null to surface a fallback.
+            if (n == idx) return null;
+            n += 1;
+        },
+        .@"export" => |e| {
+            if (e.desc == .type) {
+                // Resource exports / type-eq exports — caller treats as
+                // an opaque resource handle.
+                if (n == idx) return null;
+                n += 1;
+            }
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Lower a possibly-local `ValType` referring into an instance-type body
+/// to a `ValType` that the trampoline can lower without a TypeRegistry.
+/// Handles unwrapping `.type_idx` chains to `.own` / `.borrow` /
+/// primitive forms.
+fn rewriteInstanceTypeValType(decls: []const ctypes.Decl, vt: ctypes.ValType) ctypes.ValType {
+    switch (vt) {
+        .type_idx => |i| {
+            const td = resolveInstanceTypeLocal(decls, i) orelse return vt;
+            return switch (td) {
+                .val => |inner| rewriteInstanceTypeValType(decls, inner),
+                else => vt,
+            };
+        },
+        else => return vt,
+    }
+}
+
+/// Same as `rewriteInstanceTypeValType` but rewrites the params and
+/// results of a `FuncType` and allocates a fresh slice via `allocator`.
+fn rewriteInstanceFuncType(
+    allocator: std.mem.Allocator,
+    decls: []const ctypes.Decl,
+    ft: ctypes.FuncType,
+) !ctypes.FuncType {
+    const new_params = try allocator.alloc(ctypes.NamedValType, ft.params.len);
+    for (ft.params, 0..) |p, i| {
+        new_params[i] = .{ .name = p.name, .type = rewriteInstanceTypeValType(decls, p.type) };
+    }
+    const new_results: ctypes.FuncType.ResultList = switch (ft.results) {
+        .none => .none,
+        .unnamed => |v| .{ .unnamed = rewriteInstanceTypeValType(decls, v) },
+        .named => |list| blk: {
+            const new_list = try allocator.alloc(ctypes.NamedValType, list.len);
+            for (list, 0..) |p, i| new_list[i] = .{ .name = p.name, .type = rewriteInstanceTypeValType(decls, p.type) };
+            break :blk .{ .named = new_list };
+        },
+    };
+    return .{ .params = new_params, .results = new_results };
+}
+
+const ResolvedFuncType = struct {
+    ft: ctypes.FuncType,
+    /// When the FuncType came from an instance-type body, its
+    /// param/result `.type_idx` references are local to that body's
+    /// type space. Callers must rewrite via `rewriteInstanceTypeValType`
+    /// using this `decls` list before consuming the types.
+    decls: ?[]const ctypes.Decl = null,
+};
+
+fn resolveCompFuncType(component: *const ctypes.Component, func_idx: u32) ?ResolvedFuncType {
+    const ref = indexspace.resolveCompFunc(component, func_idx) orelse {
+        std.debug.print("    rcft({}) -> null (no compfunc ref)\n", .{func_idx});
+        return null;
+    };
+    switch (ref) {
+        .imported => |imp_idx| {
+            const imp = component.imports[imp_idx];
+            const tidx = switch (imp.desc) {
+                .func => |t| t,
+                else => return null,
+            };
+            const td = resolveTypeDef(component, tidx) orelse return null;
+            return switch (td) {
+                .func => |ft| .{ .ft = ft },
+                else => null,
+            };
+        },
+        .aliased => |alias_idx| {
+            const ie = component.aliases[alias_idx].instance_export;
+            const inst_ref = indexspace.resolveCompInstance(component, ie.instance_idx) orelse {
+                std.debug.print("    rcft({}) aliased -> no compinst ref idx={}\n", .{ func_idx, ie.instance_idx });
+                return null;
+            };
+            const inst_type_idx: u32 = switch (inst_ref) {
+                .imported => |i| switch (component.imports[i].desc) {
+                    .instance => |t| t,
+                    else => return null,
+                },
+                else => {
+                    std.debug.print("    rcft({}) aliased -> inst_ref={s} (not imported)\n", .{ func_idx, @tagName(inst_ref) });
+                    return null;
+                },
+            };
+            const inst_td = resolveTypeDef(component, inst_type_idx) orelse {
+                std.debug.print("    rcft({}) aliased -> no typedef inst_type_idx={}\n", .{ func_idx, inst_type_idx });
+                return null;
+            };
+            const decls = switch (inst_td) {
+                .instance => |it| it.decls,
+                else => |t| {
+                    std.debug.print("    rcft({}) aliased -> inst_td not instance: {s}\n", .{ func_idx, @tagName(t) });
+                    return null;
+                },
+            };
+            for (decls) |d| switch (d) {
+                .@"export" => |e| {
+                    if (!std.mem.eql(u8, e.name, ie.name)) continue;
+                    const tidx = switch (e.desc) {
+                        .func => |t| t,
+                        else => return null,
+                    };
+                    var n: u32 = 0;
+                    var found: ?ctypes.FuncType = null;
+                    for (decls) |d2| {
+                        switch (d2) {
+                            .type => |td2| {
+                                if (n == tidx) {
+                                    found = switch (td2) {
+                                        .func => |ft| ft,
+                                        else => null,
+                                    };
+                                }
+                                n += 1;
+                            },
+                            .alias => n += 1,
+                            .@"export" => |e2| {
+                                if (e2.desc == .type) n += 1;
+                            },
+                            else => {},
+                        }
+                        if (found != null) break;
+                    }
+                    if (found) |ft| return .{ .ft = ft, .decls = decls };
+                    std.debug.print("    rcft({}) aliased -> export found name={s} but type tidx={} not in decls (total={})\n", .{ func_idx, ie.name, tidx, decls.len });
+                    for (decls, 0..) |dd, di| std.debug.print("      [{}]={s}\n", .{ di, @tagName(dd) });
+                    return null;
+                },
+                else => {},
+            };
+            std.debug.print("    rcft({}) aliased -> export name={s} not found in {} decls\n", .{ func_idx, ie.name, decls.len });
+            return null;
+        },
+        .lifted => |canon_idx| {
+            const lift = switch (component.canons[canon_idx]) {
+                .lift => |l| l,
+                else => return null,
+            };
+            const td = resolveTypeDef(component, lift.type_idx) orelse return null;
+            return switch (td) {
+                .func => |ft| .{ .ft = ft },
+                else => null,
+            };
+        },
+    }
+}
+
 /// Resolve a `canon.lift.core_func_idx` (component core-func-index-space) to
 /// the (core_instance_idx, local_func_idx) pair where the function actually
 /// lives, so the executor can call it via `interp.executeFunction` with the
@@ -783,9 +1340,10 @@ fn resolveLiftedCoreFunc(
 ) ?struct { core_instance_idx: u32, local_func_idx: u32 } {
     const ref = indexspace.resolveCoreFunc(component, core_func_idx) orelse return null;
     switch (ref) {
-        // canon.lowers are imports into core modules — not callable as
-        // exports — so a canon.lift pointing at one is malformed.
-        .lowered => return null,
+        // Canon entries (lowers and resource.{new,drop,rep}) all produce
+        // imports/host-bound core funcs — not exported callables — so a
+        // canon.lift pointing at one is malformed.
+        .lowered, .resource_drop, .resource_new, .resource_rep => return null,
         .aliased => |alias_idx| {
             const a = component.aliases[alias_idx];
             const ie = a.instance_export;
@@ -1366,6 +1924,187 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
     var results: [1]abi_mod.InterfaceValue = undefined;
     try executor.callComponentFunc(inst, "run", &args, &results, std.testing.allocator);
     try std.testing.expectEqual(@as(i32, 5), results[0].s32);
+}
+
+test "instantiate: H1 micro-fixture — multi-core-module composition with cross-instance call (#156 H1)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Two-module composition (see fixtures/h1-compose.wat):
+    //   $A exports func "f" returning 7.
+    //   $B imports "a"."f", exports "g" returning f()+1 (==8).
+    //   The component aliases $b's "g" and lifts it as export "g" : u32.
+    // Exercises:
+    //   * `(core instance (instantiate $B (with "a" (instance $a))))` where
+    //     the source instance is a real module_inst, not an inline-exports
+    //     bundle — currently the resolver only consults inline_exports.
+    //   * `(alias core export $b "g")` driving the lifted export through
+    //     the second core instance.
+    const data = @embedFile("fixtures/h1-compose.wasm");
+    // The loader has no Component.deinit yet (see #142 Phase 1B); allocate
+    // its small slices into an arena so the test doesn't leak.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    // No host imports needed — both core modules are self-contained.
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try inst.linkImports(providers);
+
+    var args: [0]abi_mod.InterfaceValue = .{};
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "g", &args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 8), results[0].u32);
+}
+
+test "instantiate: H1.2 micro-fixture — cross-instance memory wiring (#156 H1.2)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Two-module composition (see fixtures/h1-mem.wat):
+    //   $A exports memory "mem".
+    //   $B imports "a"."mem", stores 42 at offset 0 then loads it.
+    //   Component lifts $b's "g" as export "g" : u32 → must be 42.
+    // Exercises `(with NAME (instance N))` matching against a real source
+    // instance's *memory* export, populating ImportContext.memories so the
+    // shared MemoryInstance is seen by both core modules.
+    const data = @embedFile("fixtures/h1-mem.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try inst.linkImports(providers);
+
+    // Both core instances must share the same MemoryInstance.
+    try std.testing.expect(inst.core_instances.len == 2);
+    const mi_a = inst.core_instances[0].module_inst orelse return error.TestFailed;
+    const mi_b = inst.core_instances[1].module_inst orelse return error.TestFailed;
+    try std.testing.expect(mi_a.memories.len >= 1);
+    try std.testing.expect(mi_b.memories.len >= 1);
+    try std.testing.expectEqual(mi_a.memories[0], mi_b.memories[0]);
+
+    var args: [0]abi_mod.InterfaceValue = .{};
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "g", &args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 42), results[0].u32);
+}
+
+test "instantiate: H1.3 micro-fixture — alias core export of memory through inline-exports (#156 H1.3)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Three-step composition (see fixtures/h1-alias.wat):
+    //   $A exports memory "mem" and func "init" (writes 7 at addr 99).
+    //   `(alias core export $a "mem" (core memory))` → top-level core mem 0.
+    //   `(core instance $args (export "mem" (memory 0)))` — inline-exports
+    //   bundle that re-exports the aliased memory via the SortIdx path.
+    //   $B imports "src"."mem" and exports "read" (loads addr 99).
+    //   $b instantiated `(with "src" (instance $args))`.
+    // Exercises:
+    //   * `aliasContributesTo` for `.core_memory`.
+    //   * `resolveCoreMemory` ordering.
+    //   * Memory import resolution against an inline-exports source whose
+    //     member's SortIdx points at a top-level core memory contributed by
+    //     an alias-core-export — the path stdio-echo's `$fixup` takes for
+    //     the lifted `$main.memory`.
+    const data = @embedFile("fixtures/h1-alias.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try inst.linkImports(providers);
+
+    // Both real module instances must see the same MemoryInstance even
+    // though the wiring goes through an inline-exports bundle.
+    try std.testing.expect(inst.core_instances.len >= 3);
+    const mi_a = inst.core_instances[0].module_inst orelse return error.TestFailed;
+    // core_instances[1] is the inline-exports `$args` bundle (no module_inst).
+    const mi_b = inst.core_instances[2].module_inst orelse return error.TestFailed;
+    try std.testing.expect(mi_a.memories.len >= 1);
+    try std.testing.expect(mi_b.memories.len >= 1);
+    try std.testing.expectEqual(mi_a.memories[0], mi_b.memories[0]);
+
+    // Run init via $A so memory has 7 at offset 99, then read via $B.
+    var no_args: [0]abi_mod.InterfaceValue = .{};
+    var no_results: [0]abi_mod.InterfaceValue = .{};
+    try executor.callComponentFunc(inst, "init", &no_args, &no_results, std.testing.allocator);
+
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "read", &no_args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 7), results[0].u32);
+}
+
+test "instantiate: H2 micro-fixture — table.set + call_indirect via canon.lower trampoline (#156 H2)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Three-module composition (see fixtures/h2-trampoline.wat):
+    //   $A exports table "t" (1 funcref) and func "call0" which call_indirect's
+    //     element 0 with the i32 arg passed in.
+    //   `(alias core export $a "t" (core table))` → top-level core table 0.
+    //   `(canon lower (func $dbl))` produces a core func bound via trampoline
+    //     to host_func host:double (HostFunc.call doubles its u32 arg).
+    //   `(core instance $args (export "t" (table 0)) (export "f" (func ...)))`
+    //   $B imports the table and the lowered func; its `start` runs
+    //     `i32.const 0  ref.func $f  table.set 0`, i.e. installs the
+    //     trampoline-backed funcref into the imported table at offset 0.
+    // After instantiation the lifted `call0(x)` exercises:
+    //   * cross-module call_indirect against an imported, post-instantiation
+    //     populated table;
+    //   * funcref dispatch into a host_func_entries[]-backed canon.lower
+    //     trampoline;
+    //   * host return-value lift back into the calling core module.
+    const data = @embedFile("fixtures/h2-trampoline.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    const Host = struct {
+        fn double(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            args: []const abi_mod.InterfaceValue,
+            results: []abi_mod.InterfaceValue,
+            _: std.mem.Allocator,
+        ) anyerror!void {
+            results[0] = .{ .u32 = args[0].u32 *% 2 };
+        }
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try providers.put(std.testing.allocator, "my:host/double", .{ .host_func = .{ .call = &Host.double } });
+    try inst.linkImports(providers);
+
+    var args: [1]abi_mod.InterfaceValue = .{.{ .u32 = 21 }};
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "call0", &args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 42), results[0].u32);
 }
 
 test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)" {

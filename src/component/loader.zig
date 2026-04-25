@@ -140,6 +140,10 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
     // target type def we don't materialize. Required to resolve real
     // wasm32-wasip2 components where types and aliases interleave.
     var type_indexspace: std.ArrayListUnmanaged(?u32) = .empty;
+    // Core-func index space contributors in binary declaration order.
+    // Each canon that produces a core func and each `core(.func)` alias
+    // appends one entry as it is parsed.
+    var core_func_indexspace: std.ArrayListUnmanaged(ctypes.CoreFuncContributor) = .empty;
 
     while (reader.remaining() > 0) {
         const section_id_byte = try reader.readByte();
@@ -196,6 +200,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
                     const a = try parseAlias(&reader);
+                    const local_idx: u32 = @intCast(aliases.items.len);
                     try aliases.append(allocator, a);
                     // Aliases of sort .type contribute a slot to the
                     // type indexspace (target unresolved here → null).
@@ -204,6 +209,13 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                         .outer => |o| o.sort,
                     };
                     if (sort == .type) try type_indexspace.append(allocator, null);
+                    // Aliases of sort .core(.func) contribute to the
+                    // core-func indexspace.
+                    const is_core_func = switch (sort) {
+                        .core => |cs| cs == .func,
+                        else => false,
+                    };
+                    if (is_core_func) try core_func_indexspace.append(allocator, .{ .alias = local_idx });
                 }
             },
             .type => {
@@ -219,7 +231,16 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
-                    try canons.append(allocator, try parseCanon(&reader, allocator));
+                    const local_idx: u32 = @intCast(canons.items.len);
+                    const c = try parseCanon(&reader, allocator);
+                    try canons.append(allocator, c);
+                    // Every canon kind except `.lift` contributes a slot
+                    // to the core-func indexspace.
+                    const contributes = switch (c) {
+                        .lower, .resource_drop, .resource_new, .resource_rep => true,
+                        .lift => false,
+                    };
+                    if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
                 }
             },
             .start => {
@@ -265,6 +286,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         .start = start,
         .imports = try imports.toOwnedSlice(allocator),
         .exports = try exports.toOwnedSlice(allocator),
+        .core_func_indexspace = try core_func_indexspace.toOwnedSlice(allocator),
     };
 }
 

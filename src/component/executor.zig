@@ -16,6 +16,7 @@ const instance_mod = @import("instance.zig");
 const core_types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
 const interp = @import("../runtime/interpreter/interp.zig");
+const indexspace = @import("indexspace.zig");
 const Allocator = std.mem.Allocator;
 
 const ComponentInstance = instance_mod.ComponentInstance;
@@ -927,6 +928,11 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     const ctx: *ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
     const allocator = ctx.comp_inst.allocator;
     const registry = TypeRegistry.init(ctx.comp_inst.component);
+    std.debug.print("\nTRAMP-ENTRY comp_func={} comp.core_instances.len={} ci.core_instances.len={}\n", .{
+        ctx.component_func_idx,
+        ctx.comp_inst.component.core_instances.len,
+        ctx.comp_inst.core_instances.len,
+    });
 
     const flat_params = countFlatTypes(registry, ctx.param_types);
     const flat_results = countFlatTypes(registry, ctx.result_types);
@@ -954,8 +960,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     if (params_spill) {
         const params_ptr: u32 = @bitCast(env.popI32() catch return error.Trap);
         const mem_idx = ctx.lower_opts.memory_idx.?;
-        const mi = ctx.comp_inst.firstModuleInst() orelse return error.Trap;
-        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.Trap;
         var offset: u32 = params_ptr;
         for (ctx.param_types, 0..) |pt, i| {
             const al = typeAlign(registry, pt);
@@ -981,14 +986,48 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         for (results) |r| r.deinit(allocator);
         allocator.free(results);
     }
-    const call = ctx.host_func.call orelse return error.Trap;
-    call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch return error.Trap;
+    const call = ctx.host_func.call orelse {
+        std.debug.print("TRAMP-TRAP no-call cf={}\n", .{ctx.component_func_idx});
+        return error.Trap;
+    };
+    std.debug.print("TRAMP cf={} flat_p={} flat_r={} args.len={} pre-call\n", .{ ctx.component_func_idx, flat_params, flat_results, args.len });
+    call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch {
+        std.debug.print("TRAMP-TRAP host-call cf={}\n", .{ctx.component_func_idx});
+        return error.Trap;
+    };
+    std.debug.print("TRAMP cf={} post-call results.len={}\n", .{ ctx.component_func_idx, results.len });
 
     // Lower results.
     if (results_spill) {
         const mem_idx = ctx.lower_opts.memory_idx.?;
-        const mi = ctx.comp_inst.firstModuleInst() orelse return error.Trap;
-        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        const mem_via_resolve = ctx.comp_inst.resolveTopLevelMemory(mem_idx);
+        const ref_dbg = indexspace.resolveCoreMemory(ctx.comp_inst.component, mem_idx);
+        std.debug.print("\nTRAMP-DBG comp_func={} mem_idx={} resolved={} alias_ref={any} num_core_inst={}\n", .{
+            ctx.component_func_idx, mem_idx, mem_via_resolve != null, ref_dbg, ctx.comp_inst.core_instances.len,
+        });
+        if (ref_dbg) |r| {
+            const a = ctx.comp_inst.component.aliases[r.aliased];
+            std.debug.print("  alias[{}] = {any}\n", .{ r.aliased, a });
+        }
+        for (ctx.comp_inst.core_instances, 0..) |ci, i| {
+            if (ci.module_inst) |mi| {
+                std.debug.print("  core_inst[{}] mod_inst nmemories={} ", .{ i, mi.memories.len });
+                for (mi.memories, 0..) |m, k| std.debug.print("mem[{}].len=0x{x} ", .{ k, m.data.len });
+                std.debug.print("\n", .{});
+            } else {
+                std.debug.print("  core_inst[{}] inline-exports\n", .{i});
+            }
+        }
+        const mem = mem_via_resolve orelse return error.Trap;
+        std.debug.print("\nTRAMP-LOW comp_func={} dest_ptr=0x{x} mem_idx={} mem_len=0x{x} flat_p={} flat_r={} n_args={} n_res={}\n", .{
+            ctx.component_func_idx, result_dest_ptr, mem_idx, mem.data.len, flat_params, flat_results, args.len, results.len,
+        });
+        for (args, ctx.param_types, 0..) |a, pt, i| {
+            std.debug.print("  arg[{}] type={s} val={any}\n", .{ i, @tagName(pt), a });
+        }
+        for (results, ctx.result_types, 0..) |r, t, i| {
+            std.debug.print("  res[{}] type={s} val={any}\n", .{ i, @tagName(t), r });
+        }
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
             const al = typeAlign(registry, t);
@@ -996,10 +1035,19 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
             storeInterfaceValue(mem.data, offset, r, t, registry);
             offset += typeSize(registry, t);
         }
+        std.debug.print("  AFTER-STORE bytes@0x{x}: ", .{result_dest_ptr});
+        const dump_n = @min(@as(usize, 16), mem.data.len - result_dest_ptr);
+        for (0..dump_n) |k| std.debug.print("{x:0>2} ", .{mem.data[result_dest_ptr + k]});
+        std.debug.print("\n", .{});
     } else {
         for (results, ctx.result_types) |r, t| {
-            pushInterfaceValue(env, r, t, registry) catch return error.Trap;
+            std.debug.print("TRAMP cf={} push res tag={s} type={s}\n", .{ ctx.component_func_idx, @tagName(r), @tagName(t) });
+            pushInterfaceValue(env, r, t, registry) catch |e| {
+                std.debug.print("TRAMP-TRAP push cf={} err={s}\n", .{ ctx.component_func_idx, @errorName(e) });
+                return error.Trap;
+            };
         }
+        std.debug.print("TRAMP cf={} done\n", .{ctx.component_func_idx});
     }
 }
 

@@ -998,6 +998,14 @@ pub fn runComponentBytes(
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
+    std.debug.print("\nSTDIO-ECHO-LOADED core_modules={} core_instances={} aliases={} canons={} imports={} exports={}\n", .{
+        component_storage.core_modules.len,
+        component_storage.core_instances.len,
+        component_storage.aliases.len,
+        component_storage.canons.len,
+        component_storage.imports.len,
+        component_storage.exports.len,
+    });
     return runLoadedComponent(component_storage, allocator, adapter);
 }
 
@@ -1630,6 +1638,7 @@ test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
 
 test "stdio-echo: end-to-end real wasi-p2 component (#156, disabled body)" {
     if (true) return error.SkipZigTest;
+    // PROBE-skip
     const testing = std.testing;
     const data = @embedFile("fixtures/stdio-echo.wasm");
 
