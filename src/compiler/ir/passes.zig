@@ -1872,7 +1872,10 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
         }
 
         // 4b. Walk non-phi instructions, rename uses of local_get and push
-        //     defs of local_set.
+        //     defs of local_set. Stop after the first terminator op so
+        //     unreachable code emitted by the wasm frontend (e.g. dead
+        //     `br`/`local_set` after a real terminator within the same
+        //     block) doesn't pollute the rename stacks.
         for (block_ptr.instructions.items, 0..) |*inst, iidx| {
             switch (inst.op) {
                 .phi => continue,
@@ -1894,6 +1897,7 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
                 },
                 else => {},
             }
+            if (isTerminatorOp(inst.op)) break;
         }
 
         // 4c. For each successor S, fill its phis' incoming entry for B.
@@ -3276,6 +3280,8 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
         if (false) {
             if (try splitCriticalEdges(func, allocator)) total_changes += 1;
             if (try ssaPromoteLocals(func, allocator)) total_changes += 1;
+            if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
+            if (try fixCrossBlockLiveness(func, allocator)) total_changes += 1;
         }
         // Iterate the pipeline until fixpoint so that passes can re-expose
         // opportunities for each other (e.g. constantFold → CSE → DCE →
@@ -3290,10 +3296,6 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
                 }
             }
             if (!any_changed) break;
-        }
-        if (false) {
-            if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
-            if (try fixCrossBlockLiveness(func, allocator)) total_changes += 1;
         }
     }
     return total_changes;
