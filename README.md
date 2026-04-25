@@ -72,23 +72,28 @@ What works today:
 - Loading + instantiating a single-module component.
 - Canonical ABI lift/lower for primitive numerics, strings (`list<u8>`),
   and `result<_, _>` returns.
-- WASI host adapter for **`wasi:cli/stdout`** + **`wasi:io/streams`**
-  (`get-stdout`, `[method]output-stream.blocking-write-and-flush`,
-  `[resource-drop]output-stream`). Versioned and unversioned interface
-  names are both accepted (e.g. `wasi:cli/stdout@0.2.6`).
-- Top-level `run` export → process exit code (0 = ok, 1 = err / trap).
+- Top-level `run` export → process exit code (0 = ok, 1 = err / trap),
+  including `run` nested inside an exported `wasi:cli/run` instance.
+- WASI Preview 2 host adapters covering the full proxy + cli surface.
+  Versioned and unversioned interface names are both accepted (e.g.
+  `wasi:cli/stdout@0.2.6`):
+  - `wasi:cli/{stdin,stdout,stderr,exit,environment,terminal-*}`
+  - `wasi:io/{streams,poll,error}`
+  - `wasi:clocks/{wall-clock,monotonic-clock}`
+  - `wasi:random/{random,insecure,insecure-seed}`
+  - `wasi:filesystem/{types,preopens}` — `open-at`, `read-via-stream`,
+    `write-via-stream`, `append-via-stream`, `stat`, `get-type`,
+    sandboxed path validation, configurable preopens
+  - `wasi:sockets/{network,instance-network,tcp,tcp-create-socket,udp,
+    udp-create-socket,ip-name-lookup}` — resource binding + handle
+    allocation; outbound I/O default-deny pending capability allow-list
+  - `wasi:http/{types,outgoing-handler,incoming-handler}` — all 11
+    resource types registered; outbound handler default-deny pending
+    real `std.http.Client` integration
 
-Not yet supported (tracked in [#142]):
-
-- `run` nested inside an exported `wasi:cli/run` instance — real Rust
-  components hit this. Needs the indexspace resolver.
-- `wasi:cli/stdin`, `wasi:cli/stderr`, `wasi:cli/exit`, args, env.
-- `wasi:filesystem`, `wasi:clocks`, `wasi:random`, `wasi:sockets`,
-  `wasi:http`.
-- Multi-memory components.
-- Compound `result<T, E>` payload encoding beyond the empty arms.
-
-[#142]: https://github.com/cataggar/wamr/issues/142
+Deferred follow-ups (not blocking preview-2 component loading) are
+tracked individually: real outbound HTTP+TLS, sockets capability
+allow-list, real TCP/UDP I/O, real DNS, real filesystem timestamps.
 
 ## License
 
