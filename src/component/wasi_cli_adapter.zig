@@ -46,6 +46,108 @@ const wasi_p2_core = @import("../wasi/preview2/core.zig");
 /// retains the adapter until any `ComponentInstance` whose imports point
 /// at the registered `HostInstance` is destroyed. `deinit` releases the
 /// buffer and member maps.
+/// `wasi:filesystem/types.descriptor` resource — slot in the descriptor
+/// table. Indices in `WasiCliAdapter.fs_descriptor_table` are guest
+/// handles. Slots are nulled on `[resource-drop]descriptor`, except
+/// `.preopen` slots which are persistent (a guest dropping a preopen
+/// handle is treated as a no-op so subsequent calls to
+/// `preopens.get-directories` and `descriptor.open-at` keep working).
+pub const FsDescriptor = union(enum) {
+    /// Regular file or any other non-directory descriptor opened via
+    /// `descriptor.open-at`. Owned — closed on resource-drop.
+    file: std.Io.File,
+    /// Directory descriptor opened via `descriptor.open-at` with the
+    /// `directory` open-flag. Owned — closed on resource-drop.
+    dir: std.Io.Dir,
+    /// Preopen sandbox root — adapter-owned. Resource-drop is a no-op
+    /// for preopens; the adapter closes them in `deinit`.
+    preopen: std.Io.Dir,
+};
+
+pub const FsPreopen = struct {
+    name: []const u8,
+    dir_handle: u32,
+};
+
+/// Close a descriptor's underlying handle. Used by both
+/// `[resource-drop]descriptor` (for `.file` / `.dir`) and adapter
+/// `deinit` (which also closes preopens).
+fn closeFsDescriptor(d: FsDescriptor) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    switch (d) {
+        .file => |f| f.close(io),
+        .dir => |dir| dir.close(io),
+        .preopen => |dir| dir.close(io),
+    }
+}
+
+/// `wasi:filesystem/types.error-code` discriminant indices, in the order
+/// the WIT spec declares them. Used as `.variant_val.discriminant` for
+/// the `result<_, error-code>` err arm.
+const FsErrorCode = enum(u32) {
+    access = 0,
+    would_block = 1,
+    already = 2,
+    bad_descriptor = 3,
+    busy = 4,
+    deadlock = 5,
+    quota = 6,
+    exist = 7,
+    file_too_large = 8,
+    illegal_byte_sequence = 9,
+    in_progress = 10,
+    interrupted = 11,
+    invalid = 12,
+    io = 13,
+    is_directory = 14,
+    loop = 15,
+    too_many_links = 16,
+    message_size = 17,
+    name_too_long = 18,
+    no_device = 19,
+    no_entry = 20,
+    no_lock = 21,
+    insufficient_memory = 22,
+    insufficient_space = 23,
+    not_directory = 24,
+    not_empty = 25,
+    not_recoverable = 26,
+    unsupported = 27,
+    no_tty = 28,
+    no_such_device = 29,
+    overflow = 30,
+    not_permitted = 31,
+    pipe = 32,
+    read_only = 33,
+    invalid_seek = 34,
+    text_file_busy = 35,
+    cross_device = 36,
+};
+
+/// Map a Zig std.fs / std.posix error to the closest `error-code` variant.
+/// Errors not represented map to `.io` so the guest still sees a
+/// well-typed result rather than a host trap.
+fn mapFsError(err: anyerror) FsErrorCode {
+    return switch (err) {
+        error.AccessDenied, error.PermissionDenied => .access,
+        error.FileNotFound => .no_entry,
+        error.NotDir => .not_directory,
+        error.PathAlreadyExists => .exist,
+        error.IsDir => .is_directory,
+        error.NameTooLong => .name_too_long,
+        error.SymLinkLoop => .loop,
+        error.FileTooBig => .file_too_large,
+        error.NoSpaceLeft => .insufficient_space,
+        error.OutOfMemory => .insufficient_memory,
+        error.DeviceBusy => .busy,
+        error.WouldBlock => .would_block,
+        error.BrokenPipe => .pipe,
+        error.ReadOnlyFileSystem => .read_only,
+        error.InvalidUtf8 => .illegal_byte_sequence,
+        else => .io,
+    };
+}
+
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
@@ -82,9 +184,26 @@ pub const WasiCliAdapter = struct {
     random_iface: HostInstance = .{},
     random_insecure_iface: HostInstance = .{},
     random_insecure_seed_iface: HostInstance = .{},
+    fs_types_iface: HostInstance = .{},
+    fs_preopens_iface: HostInstance = .{},
 
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
+    /// Heap-allocated input streams created by `descriptor.read-via-stream`.
+    /// Owned by the adapter; freed in `deinit`. The indices in this list
+    /// are unrelated to guest handles — guest handles live in
+    /// `input_stream_table`. Same arrangement for `owned_output_streams`.
+    owned_input_streams: std.ArrayListUnmanaged(*streams.InputStream) = .empty,
+    owned_output_streams: std.ArrayListUnmanaged(*streams.OutputStream) = .empty,
+
+    /// `wasi:filesystem` descriptor table. Slot index = guest handle.
+    /// Slots are nulled on `[resource-drop]descriptor` (except `.preopen`
+    /// slots, which are persistent — see `dropFsDescriptor`).
+    fs_descriptor_table: std.ArrayListUnmanaged(?FsDescriptor) = .empty,
+    /// Names of the preopen slots, in `get-directories` order. Each entry's
+    /// `dir_handle` indexes into `fs_descriptor_table`. The string is owned
+    /// by the adapter and freed in `deinit`.
+    fs_preopens: std.ArrayListUnmanaged(FsPreopen) = .empty,
 
     /// Optional deterministic-clock injection. When set, `wasi:clocks/wall-clock.now`
     /// returns this datetime instead of reading the host wall clock — used by
@@ -139,8 +258,34 @@ pub const WasiCliAdapter = struct {
         self.random_iface.deinit(self.allocator);
         self.random_insecure_iface.deinit(self.allocator);
         self.random_insecure_seed_iface.deinit(self.allocator);
+        self.fs_types_iface.deinit(self.allocator);
+        self.fs_preopens_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
+
+        // Own-streams created by `read-via-stream`/`write-via-stream` —
+        // close any underlying borrowed file refs and free the heap stream
+        // structs. The streams' `host_file` variant only borrows the
+        // descriptor's File handle, so we don't close it here (the
+        // descriptor's slot owns it).
+        for (self.owned_input_streams.items) |s| {
+            s.* = undefined;
+            self.allocator.destroy(s);
+        }
+        self.owned_input_streams.deinit(self.allocator);
+        for (self.owned_output_streams.items) |s| {
+            s.deinit(self.allocator);
+            self.allocator.destroy(s);
+        }
+        self.owned_output_streams.deinit(self.allocator);
+
+        // Close every owning descriptor in the table (including preopens).
+        for (self.fs_descriptor_table.items) |slot| {
+            if (slot) |d| closeFsDescriptor(d);
+        }
+        self.fs_descriptor_table.deinit(self.allocator);
+        for (self.fs_preopens.items) |p| self.allocator.free(p.name);
+        self.fs_preopens.deinit(self.allocator);
     }
 
     /// Captured stderr bytes (separate buffer from stdout).
@@ -1141,6 +1286,508 @@ pub const WasiCliAdapter = struct {
             self.input_stream_table.items[handle] = null;
         }
     }
+
+    // ── wasi:filesystem (#145) ─────────────────────────────────────────────
+
+    /// Append `dir` to the descriptor table as a `.preopen` slot and
+    /// register it in `fs_preopens` under `name`. Returns the descriptor
+    /// handle (slot index) so callers can pre-bake guest expectations.
+    /// The adapter takes ownership of `dir` (closed in `deinit`); `name`
+    /// is duplicated.
+    pub fn addPreopen(self: *WasiCliAdapter, name: []const u8, dir: std.Io.Dir) !u32 {
+        const slot_idx: u32 = @intCast(self.fs_descriptor_table.items.len);
+        try self.fs_descriptor_table.append(self.allocator, .{ .preopen = dir });
+        const dup_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(dup_name);
+        try self.fs_preopens.append(self.allocator, .{ .name = dup_name, .dir_handle = slot_idx });
+        return slot_idx;
+    }
+
+    /// Register `wasi:filesystem/preopens` (#145).
+    ///
+    /// Single member `get-directories: () -> list<tuple<own<descriptor>, string>>`.
+    /// Each tuple element is laid out in guest memory as 12 bytes:
+    ///   +0  handle: u32
+    ///   +4  string-ptr: u32
+    ///   +8  string-len: u32
+    /// (`record max-align = 4`, see `canonical_abi.zig:336-343`.)
+    pub fn populateWasiFilesystemPreopens(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.fs_preopens_iface.members.put(self.allocator, "get-directories", .{
+            .func = .{ .context = self, .call = &fsGetDirectories },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.fs_preopens_iface,
+        });
+    }
+
+    /// Register `wasi:filesystem/types` (#145).
+    pub fn populateWasiFilesystemTypes(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]M{
+            .{ .name = "[method]descriptor.get-type", .call = &fsDescriptorGetType },
+            .{ .name = "[method]descriptor.stat", .call = &fsDescriptorStat },
+            .{ .name = "[method]descriptor.open-at", .call = &fsDescriptorOpenAt },
+            .{ .name = "[method]descriptor.read-via-stream", .call = &fsDescriptorReadViaStream },
+            .{ .name = "[method]descriptor.write-via-stream", .call = &fsDescriptorWriteViaStream },
+            .{ .name = "[method]descriptor.append-via-stream", .call = &fsDescriptorAppendViaStream },
+            .{ .name = "[resource-drop]descriptor", .call = &fsDescriptorDrop },
+        };
+        for (members) |m| {
+            try self.fs_types_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.fs_types_iface,
+        });
+    }
+
+    /// Reject paths that would escape the preopen sandbox: any `..` path
+    /// component, any `\\` separator, any `:` (Windows drive prefix), or
+    /// a leading `/` (absolute). Returns `.access` on rejection.
+    fn validateSandboxPath(path: []const u8) ?FsErrorCode {
+        if (path.len == 0) return null;
+        if (path[0] == '/') return .access;
+        for (path) |c| {
+            if (c == '\\' or c == ':') return .access;
+        }
+        var it = std.mem.splitScalar(u8, path, '/');
+        while (it.next()) |comp| {
+            if (std.mem.eql(u8, comp, "..")) return .access;
+        }
+        return null;
+    }
+
+    fn lookupFsDescriptor(self: *WasiCliAdapter, handle: u32) ?*FsDescriptor {
+        if (handle >= self.fs_descriptor_table.items.len) return null;
+        if (self.fs_descriptor_table.items[handle]) |*d| return d;
+        return null;
+    }
+
+    /// Append a new descriptor slot, returning the handle. Reuses null
+    /// slots if any.
+    fn pushFsDescriptor(self: *WasiCliAdapter, d: FsDescriptor) !u32 {
+        for (self.fs_descriptor_table.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.fs_descriptor_table.items[i] = d;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.fs_descriptor_table.items.len);
+        try self.fs_descriptor_table.append(self.allocator, d);
+        return idx;
+    }
+
+    /// Build a `result<X, error-code>` lift where the err arm carries the
+    /// `error-code` variant `code`. Caller-owned via `allocator`.
+    fn fsResultErr(allocator: Allocator, code: FsErrorCode) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+    }
+
+    /// Build a `result<X, error-code>` ok lift. `value` is moved into a
+    /// fresh `*InterfaceValue` payload.
+    fn fsResultOk(allocator: Allocator, value: InterfaceValue) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = value;
+        return .{ .result_val = .{ .is_ok = true, .payload = payload } };
+    }
+
+    /// `wasi:filesystem/preopens.get-directories: () -> list<tuple<own<descriptor>, string>>`.
+    fn fsGetDirectories(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+
+        const n = self.fs_preopens.items.len;
+        if (n == 0) {
+            results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
+            return;
+        }
+
+        // Each tuple<own<descriptor>, string>: handle@0:u32, ptr@4:u32, len@8:u32.
+        const stride: usize = 12;
+        const scratch = try allocator.alloc(u8, n * stride);
+        defer allocator.free(scratch);
+
+        for (self.fs_preopens.items, 0..) |p, i| {
+            const name_ptr = ci.hostAllocAndWrite(p.name) orelse return error.IoError;
+            const off = i * stride;
+            std.mem.writeInt(u32, scratch[off..][0..4], p.dir_handle, .little);
+            std.mem.writeInt(u32, scratch[off + 4 ..][0..4], name_ptr, .little);
+            std.mem.writeInt(u32, scratch[off + 8 ..][0..4], @intCast(p.name.len), .little);
+        }
+
+        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.IoError;
+        results[0] = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
+    }
+
+    /// `wasi:filesystem/types.descriptor-type` discriminants in WIT order.
+    const DescType = enum(u32) {
+        unknown = 0,
+        block_device = 1,
+        character_device = 2,
+        directory = 3,
+        fifo = 4,
+        symbolic_link = 5,
+        regular_file = 6,
+        socket = 7,
+    };
+
+    /// `[method]descriptor.get-type: (borrow<descriptor>) -> result<descriptor-type, error-code>`.
+    fn fsDescriptorGetType(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const dt: DescType = switch (d.*) {
+            .preopen, .dir => .directory,
+            .file => .regular_file,
+        };
+        const variant = InterfaceValue{ .variant_val = .{
+            .discriminant = @intFromEnum(dt),
+            .payload = null,
+        } };
+        results[0] = try fsResultOk(allocator, variant);
+    }
+
+    /// `[method]descriptor.stat: (borrow<descriptor>) -> result<descriptor-stat, error-code>`.
+    /// The record fields are `(type, link-count, size, atime?, mtime?, ctime?)`.
+    /// Timestamps are reported as `none` to keep the implementation portable
+    /// across the std.Io vtable (whose `Timestamp` shape changed between
+    /// 0.15 and 0.16); a dedicated atime/mtime adapter is deferred.
+    fn fsDescriptorStat(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var dt: DescType = .unknown;
+        var size: u64 = 0;
+        var nlink: u64 = 1;
+
+        switch (d.*) {
+            .preopen, .dir => {
+                dt = .directory;
+            },
+            .file => |f| {
+                dt = .regular_file;
+                if (f.stat(io)) |st| {
+                    size = st.size;
+                    nlink = @intCast(st.nlink);
+                    dt = switch (st.kind) {
+                        .directory => .directory,
+                        .file => .regular_file,
+                        .block_device => .block_device,
+                        .character_device => .character_device,
+                        .named_pipe => .fifo,
+                        .sym_link => .symbolic_link,
+                        .unix_domain_socket => .socket,
+                        else => .unknown,
+                    };
+                } else |err| {
+                    results[0] = try fsResultErr(allocator, mapFsError(err));
+                    return;
+                }
+            },
+        }
+
+        const fields = try allocator.alloc(InterfaceValue, 6);
+        fields[0] = .{ .variant_val = .{ .discriminant = @intFromEnum(dt), .payload = null } };
+        fields[1] = .{ .u64 = nlink };
+        fields[2] = .{ .u64 = size };
+        fields[3] = .{ .option_val = .{ .is_some = false, .payload = null } };
+        fields[4] = .{ .option_val = .{ .is_some = false, .payload = null } };
+        fields[5] = .{ .option_val = .{ .is_some = false, .payload = null } };
+        results[0] = try fsResultOk(allocator, .{ .record_val = fields });
+    }
+
+    /// `[method]descriptor.open-at: (borrow<descriptor>, path-flags, string,
+    ///   open-flags, descriptor-flags) -> result<own<descriptor>, error-code>`.
+    fn fsDescriptorOpenAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 5 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        // path-flags (args[1]): currently advisory; we always follow symlinks.
+        const path_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const open_flags: u32 = switch (args[3]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
+        const desc_flags: u32 = switch (args[4]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = switch (d.*) {
+            .preopen => |dir| dir,
+            .dir => |dir| dir,
+            .file => {
+                results[0] = try fsResultErr(allocator, .not_directory);
+                return;
+            },
+        };
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        // open-flags bits per WIT order: 0=create, 1=directory, 2=exclusive, 3=truncate.
+        const want_create = (open_flags & 0b0001) != 0;
+        const want_directory = (open_flags & 0b0010) != 0;
+        const want_exclusive = (open_flags & 0b0100) != 0;
+        const want_truncate = (open_flags & 0b1000) != 0;
+        // descriptor-flags bits: 0=read, 1=write.
+        const want_read = (desc_flags & 0b01) != 0;
+        const want_write = (desc_flags & 0b10) != 0;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        if (want_directory) {
+            const new_dir = base_dir.openDir(io, path_bytes, .{}) catch |err| {
+                results[0] = try fsResultErr(allocator, mapFsError(err));
+                return;
+            };
+            const new_handle = self.pushFsDescriptor(.{ .dir = new_dir }) catch {
+                new_dir.close(io);
+                results[0] = try fsResultErr(allocator, .insufficient_memory);
+                return;
+            };
+            results[0] = try fsResultOk(allocator, .{ .handle = new_handle });
+            return;
+        }
+
+        const new_file = if (want_create) base_dir.createFile(io, path_bytes, .{
+            .read = want_read,
+            .truncate = want_truncate,
+            .exclusive = want_exclusive,
+        }) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        } else base_dir.openFile(io, path_bytes, .{
+            .mode = if (want_write and want_read)
+                .read_write
+            else if (want_write)
+                .write_only
+            else
+                .read_only,
+        }) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const new_handle = self.pushFsDescriptor(.{ .file = new_file }) catch {
+            new_file.close(io);
+            results[0] = try fsResultErr(allocator, .insufficient_memory);
+            return;
+        };
+        results[0] = try fsResultOk(allocator, .{ .handle = new_handle });
+    }
+
+    /// `[method]descriptor.read-via-stream: (borrow<descriptor>, u64) -> result<own<input-stream>, error-code>`.
+    fn fsDescriptorReadViaStream(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const offset = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const file = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                results[0] = try fsResultErr(allocator, .is_directory);
+                return;
+            },
+        };
+        const stream = self.allocator.create(streams.InputStream) catch {
+            results[0] = try fsResultErr(allocator, .insufficient_memory);
+            return;
+        };
+        stream.* = streams.InputStream.fromHostFile(file, offset);
+        try self.owned_input_streams.append(self.allocator, stream);
+        const stream_handle = try self.allocInputStreamHandle(stream);
+        results[0] = try fsResultOk(allocator, .{ .handle = stream_handle });
+    }
+
+    /// `[method]descriptor.write-via-stream: (borrow<descriptor>, u64) -> result<own<output-stream>, error-code>`.
+    fn fsDescriptorWriteViaStream(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const offset = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const stream_handle = try self.fsAllocOutputFileStream(handle, offset, false, allocator, results);
+        if (stream_handle) |h| {
+            results[0] = try fsResultOk(allocator, .{ .handle = h });
+        }
+    }
+
+    /// `[method]descriptor.append-via-stream: (borrow<descriptor>) -> result<own<output-stream>, error-code>`.
+    fn fsDescriptorAppendViaStream(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const stream_handle = try self.fsAllocOutputFileStream(handle, 0, true, allocator, results);
+        if (stream_handle) |h| {
+            results[0] = try fsResultOk(allocator, .{ .handle = h });
+        }
+    }
+
+    /// Common helper for `write-via-stream` / `append-via-stream`.
+    /// On error, writes the err-arm `result_val` into `results[0]` and
+    /// returns `null`. On success, returns the new stream handle and
+    /// leaves `results[0]` untouched (caller wraps).
+    fn fsAllocOutputFileStream(
+        self: *WasiCliAdapter,
+        handle: u32,
+        offset: u64,
+        append: bool,
+        allocator: Allocator,
+        results: []InterfaceValue,
+    ) !?u32 {
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return null;
+        };
+        const file = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                results[0] = try fsResultErr(allocator, .is_directory);
+                return null;
+            },
+        };
+        const stream = self.allocator.create(streams.OutputStream) catch {
+            results[0] = try fsResultErr(allocator, .insufficient_memory);
+            return null;
+        };
+        stream.* = streams.OutputStream.toHostFile(file, offset, append);
+        try self.owned_output_streams.append(self.allocator, stream);
+        return try self.allocStreamHandle(stream);
+    }
+
+    /// `wasi:filesystem/types.[resource-drop]descriptor: (own<descriptor>) -> ()`.
+    /// Preopen slots are persistent — drop is a no-op so subsequent calls
+    /// to `preopens.get-directories` and `descriptor.open-at` continue
+    /// to work.
+    fn fsDescriptorDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.fs_descriptor_table.items.len) return;
+        const slot = self.fs_descriptor_table.items[handle] orelse return;
+        switch (slot) {
+            .preopen => {}, // persistent — keep the slot live.
+            else => {
+                closeFsDescriptor(slot);
+                self.fs_descriptor_table.items[handle] = null;
+            },
+        }
+    }
 };
 
 /// `wasi:clocks/wall-clock.datetime`: a record of `(seconds: u64, nanoseconds: u32)`.
@@ -1260,6 +1907,8 @@ pub fn populateWasiProviders(
     var matched_random: ?[]const u8 = null;
     var matched_random_insecure: ?[]const u8 = null;
     var matched_random_insecure_seed: ?[]const u8 = null;
+    var matched_fs_types: ?[]const u8 = null;
+    var matched_fs_preopens: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
@@ -1303,6 +1952,10 @@ pub fn populateWasiProviders(
             matched_random_insecure = imp.name;
         if (matched_random == null and matchesWasiPrefix(imp.name, "wasi:random/random"))
             matched_random = imp.name;
+        if (matched_fs_types == null and matchesWasiPrefix(imp.name, "wasi:filesystem/types"))
+            matched_fs_types = imp.name;
+        if (matched_fs_preopens == null and matchesWasiPrefix(imp.name, "wasi:filesystem/preopens"))
+            matched_fs_preopens = imp.name;
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -1391,6 +2044,18 @@ pub fn populateWasiProviders(
         matched_random_insecure_seed orelse "wasi:random/insecure-seed",
     );
     if (matched_random_insecure_seed == null) _ = providers.remove("wasi:random/insecure-seed");
+
+    try adapter.populateWasiFilesystemTypes(
+        providers,
+        matched_fs_types orelse "wasi:filesystem/types",
+    );
+    if (matched_fs_types == null) _ = providers.remove("wasi:filesystem/types");
+
+    try adapter.populateWasiFilesystemPreopens(
+        providers,
+        matched_fs_preopens orelse "wasi:filesystem/preopens",
+    );
+    if (matched_fs_preopens == null) _ = providers.remove("wasi:filesystem/preopens");
 }
 
 /// Run an already-loaded component. See `runComponentBytes` for the
@@ -2272,4 +2937,85 @@ test "wasi:random secure helpers fill a host buffer (#147)" {
     var any_nonzero = false;
     for (buf) |b| if (b != 0) { any_nonzero = true; break; };
     try testing.expect(any_nonzero);
+}
+
+test "populateWasiProviders: binds wasi:filesystem/types + preopens (#145)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:filesystem/types@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:filesystem/preopens@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:filesystem/types@0.2.6"));
+    try testing.expect(providers.contains("wasi:filesystem/preopens@0.2.6"));
+    try testing.expect(!providers.contains("wasi:filesystem/types"));
+    try testing.expect(!providers.contains("wasi:filesystem/preopens"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.get-type"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.stat"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.open-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.read-via-stream"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.write-via-stream"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.append-via-stream"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[resource-drop]descriptor"));
+    try testing.expect(adapter.fs_preopens_iface.members.contains("get-directories"));
+}
+
+test "filesystem: get-directories returns empty list when no preopens configured (#145)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsGetDirectories(&adapter, &ci, &.{}, &results, testing.allocator);
+
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, 0), results[0].list.len);
+}
+
+test "filesystem: addPreopen registers descriptor + name (#145)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const handle = try adapter.addPreopen("/tmp", tmp.dir);
+    // tmp.cleanup() will close tmp.dir, which is the same handle the
+    // adapter now owns. Replace the slot with a null so adapter.deinit
+    // doesn't double-close.
+    adapter.fs_descriptor_table.items[handle] = null;
+
+    try testing.expectEqual(@as(u32, 0), handle);
+    try testing.expectEqual(@as(usize, 1), adapter.fs_preopens.items.len);
+    try testing.expectEqualStrings("/tmp", adapter.fs_preopens.items[0].name);
+    try testing.expectEqual(@as(u32, 0), adapter.fs_preopens.items[0].dir_handle);
+}
+
+test "filesystem: open-at sandbox rejects .. and absolute paths (#145)" {
+    const testing = std.testing;
+
+    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("/etc/passwd"));
+    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("../escape"));
+    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("a/../b"));
+    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("a\\b"));
+    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("C:foo"));
+    try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath("a/b/c.txt"));
+    try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath(""));
+    try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath("..foo"));
 }
