@@ -17,17 +17,26 @@ pub fn buildSuccessors(
 
     for (func.blocks.items, 0..) |block, idx| {
         var succs: std.ArrayList(ir.BlockId) = .empty;
+        // Only the FIRST terminator in a block executes at runtime; any
+        // br/br_if/br_table/ret/unreachable that follows is dead code emitted
+        // by the wasm frontend. Tracking dead edges as real CFG edges
+        // confuses downstream analysis (notably ssaPromoteLocals' rename
+        // pass: a dead edge from B → S can make a non-dominator B appear as
+        // a predecessor of S in raw block-id order).
         for (block.instructions.items) |inst| {
             switch (inst.op) {
-                .br => |target| try succs.append(allocator, target),
+                .br => |target| { try succs.append(allocator, target); break; },
                 .br_if => |bi| {
                     try succs.append(allocator, bi.then_block);
                     try succs.append(allocator, bi.else_block);
+                    break;
                 },
                 .br_table => |bt| {
                     for (bt.targets) |t| try succs.append(allocator, t);
                     try succs.append(allocator, bt.default);
+                    break;
                 },
+                .ret, .ret_multi, .@"unreachable" => break,
                 else => {},
             }
         }

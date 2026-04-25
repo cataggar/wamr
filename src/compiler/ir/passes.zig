@@ -73,6 +73,13 @@ pub fn buildUseDef(func: *const ir.IrFunction, allocator: std.mem.Allocator) !st
                         entry.value_ptr.use_count += 1;
                     }
                 },
+                .phi => |incoming| {
+                    for (incoming) |inc| {
+                        const entry = try info.getOrPut(inc.value);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
                 else => {},
             }
         }
@@ -239,6 +246,93 @@ pub fn countUsesOfVReg(func: *const ir.IrFunction, vreg: ir.VReg) u32 {
         }
     }
     return count;
+}
+
+/// Whether an instruction reads `vreg` as one of its operands. Mirrors
+/// the structure of `replaceInInst` so call/call_indirect/call_ref/
+/// ret_multi (which `getUsedVRegs` doesn't enumerate) are also covered.
+fn isTerminatorOp(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => true,
+        else => false,
+    };
+}
+
+fn instUsesVReg(inst: ir.Inst, vreg: ir.VReg) bool {
+    switch (inst.op) {
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64,
+        .local_get, .global_get, .br, .@"unreachable",
+        => return false,
+
+        .phi => |incoming| {
+            for (incoming) |inc| if (inc.value == vreg) return true;
+            return false;
+        },
+
+        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
+        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
+        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
+        .f_min, .f_max, .f_copysign,
+        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        => |bin| return bin.lhs == vreg or bin.rhs == vreg,
+
+        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
+        .extend8_s, .extend16_s, .extend32_s,
+        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
+        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        => |v| return v == vreg,
+
+        .local_set => |ls| return ls.val == vreg,
+        .global_set => |gs| return gs.val == vreg,
+        .load => |ld| return ld.base == vreg,
+        .store => |st| return st.base == vreg or st.val == vreg,
+        .br_if => |bi| return bi.cond == vreg,
+        .br_table => |bt| return bt.index == vreg,
+        .ret => |maybe_vreg| return if (maybe_vreg) |v| v == vreg else false,
+        .ret_multi => |vregs| {
+            for (vregs) |v| if (v == vreg) return true;
+            return false;
+        },
+        .call_result => return false,
+        .call => |cl| {
+            for (cl.args) |a| if (a == vreg) return true;
+            return false;
+        },
+        .call_indirect => |ci| {
+            if (ci.elem_idx == vreg) return true;
+            for (ci.args) |a| if (a == vreg) return true;
+            return false;
+        },
+        .call_ref => |cr| {
+            if (cr.func_ref == vreg) return true;
+            for (cr.args) |a| if (a == vreg) return true;
+            return false;
+        },
+        .select => |sel| return sel.cond == vreg or sel.if_true == vreg or sel.if_false == vreg,
+
+        .atomic_fence => return false,
+        .atomic_load => |al| return al.base == vreg,
+        .atomic_store => |ast| return ast.base == vreg or ast.val == vreg,
+        .atomic_rmw => |ar| return ar.base == vreg or ar.val == vreg,
+        .atomic_cmpxchg => |ac| return ac.base == vreg or ac.expected == vreg or ac.replacement == vreg,
+        .atomic_notify => |an| return an.base == vreg or an.count == vreg,
+        .atomic_wait => |aw| return aw.base == vreg or aw.expected == vreg or aw.timeout == vreg,
+        .memory_copy => |mc| return mc.dst == vreg or mc.src == vreg or mc.len == vreg,
+        .memory_fill => |mf| return mf.dst == vreg or mf.val == vreg or mf.len == vreg,
+        .memory_init => |mi| return mi.dst == vreg or mi.src == vreg or mi.len == vreg,
+        .data_drop => return false,
+        .memory_size => return false,
+        .memory_grow => |pages| return pages == vreg,
+        .table_size => return false,
+        .table_get => |tg| return tg.idx == vreg,
+        .table_set => |ts| return ts.idx == vreg or ts.val == vreg,
+        .table_grow => |tg| return tg.init == vreg or tg.delta == vreg,
+        .table_init => |ti| return ti.dst == vreg or ti.src == vreg or ti.len == vreg,
+        .elem_drop => return false,
+        .ref_func => return false,
+    }
 }
 
 fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
@@ -1538,6 +1632,13 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
     @memset(init_vreg, std.math.maxInt(ir.VReg));
 
     const param_count = func.param_count;
+    // Param promotions are recorded separately and their materialising
+    // `local_get → v_init` is inserted AFTER the rename DFS — otherwise
+    // step 4b would see them as ordinary `local_get`s and mark them for
+    // deletion, leaving v_init undefined.
+    const ParamInit = struct { local: u32, dest: ir.VReg, ty: ir.IrType };
+    var param_inits: std.ArrayList(ParamInit) = .empty;
+    defer param_inits.deinit(allocator);
     {
         var entry_block = func.getBlock(0);
         // Build the prefix as a separate buffer to insert atomically at index 0.
@@ -1546,8 +1647,10 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
 
         for (promotable.items) |L| {
             if (L < param_count) {
-                // Implicit param VReg — no instruction; seed stack later.
-                init_vreg[L] = L;
+                const t = local_type[L].?;
+                const v = func.newVReg();
+                try param_inits.append(allocator, .{ .local = L, .dest = v, .ty = t });
+                init_vreg[L] = v;
                 continue;
             }
             const t = local_type[L].?;
@@ -1585,11 +1688,36 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
     }
     for (phis_per_block) |*list| list.* = .empty;
 
-    // Cache deduped predecessor count per block (for sizing phi incoming).
-    const pred_count = try allocator.alloc(usize, nblocks);
-    defer allocator.free(pred_count);
+    // Cache deduped, reachability-filtered predecessor list per block.
+    // The phi's incoming array is sized to and indexed by this list, so
+    // that unreachable predecessors don't leave uninitialized slots
+    // after the DFS rename pass (the DFS only visits reachable blocks).
+    const reach_preds = try allocator.alloc([]ir.BlockId, nblocks);
+    defer {
+        for (reach_preds) |p| allocator.free(p);
+        allocator.free(reach_preds);
+    }
     for (0..nblocks) |i| {
-        pred_count[i] = if (preds.get(@intCast(i))) |p| p.len else 0;
+        const all = preds.get(@intCast(i)) orelse &[_]ir.BlockId{};
+        var n: usize = 0;
+        for (all) |p| {
+            if (p < nblocks and dom.idom[p] != null) n += 1;
+        }
+        // Entry block is reachable by definition; idom[0] is null but
+        // it's still reachable. (We bail earlier if entry has any preds.)
+        if (i == 0 and all.len > 0) {
+            // Defensive: counted as zero above (idom[0] is null), but the
+            // top-of-function bail-out should have already returned false.
+        }
+        const filtered = try allocator.alloc(ir.BlockId, n);
+        var k: usize = 0;
+        for (all) |p| {
+            if (p < nblocks and dom.idom[p] != null) {
+                filtered[k] = p;
+                k += 1;
+            }
+        }
+        reach_preds[i] = filtered;
     }
 
     for (promotable.items) |L| {
@@ -1618,7 +1746,7 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
             // phi placement at entry would be vacuous; defensive).
             if (B == 0) continue;
 
-            const npreds = pred_count[B];
+            const npreds = reach_preds[B].len;
             if (npreds == 0) continue;
             const incoming = try allocator.alloc(ir.Inst.PhiIncoming, npreds);
             // Fill with sentinels; renaming fills real values.
@@ -1773,8 +1901,8 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
             for (succ_list) |S| {
                 if (S >= nblocks) continue;
                 if (dom.idom[S] == null) continue; // unreachable; should be unreachable from us
-                // Find pred-index of B in preds(S).
-                const pred_list = preds.get(S) orelse continue;
+                // Find pred-index of B in reach_preds(S).
+                const pred_list = reach_preds[S];
                 var pi: ?usize = null;
                 for (pred_list, 0..) |p, k| {
                     if (p == B) { pi = k; break; }
@@ -1812,6 +1940,26 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
             k -= 1;
             _ = block.instructions.orderedRemove(marks.items[k]);
         }
+    }
+
+    // ── 6. Materialise param initial-values via `local_get` at entry. ────
+    // We do this AFTER step 5 so the rename DFS can't mark these
+    // freshly-inserted local_gets for deletion (they didn't exist when
+    // step 4b walked the entry block). The aarch64 backend keeps params
+    // in frame slots, not in v0..v(param_count-1), so we need a real
+    // `local_get` instruction to materialise the value as a VReg.
+    if (param_inits.items.len > 0) {
+        var entry_block = func.getBlock(0);
+        var prefix2: std.ArrayList(ir.Inst) = .empty;
+        defer prefix2.deinit(allocator);
+        for (param_inits.items) |pi| {
+            try prefix2.append(allocator, .{
+                .op = .{ .local_get = pi.local },
+                .dest = pi.dest,
+                .type = pi.ty,
+            });
+        }
+        try entry_block.instructions.insertSlice(entry_block.allocator, 0, prefix2.items);
     }
 
     // The phi insertions and zero-init insertions also count as "changes",
@@ -1926,51 +2074,275 @@ pub fn splitCriticalEdges(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     return changed;
 }
 
-/// Lower phi instructions back to wasm-style local_set / local_get pairs:
-/// for each `phi(...)` in some block B with destination D and type T,
-/// allocate a fresh local L, replace the phi inst with `local_get L → D`,
-/// and append `local_set L = incoming.value` before the terminator of
-/// each incoming.block.
-///
-/// Requires that critical edges have been split (see `splitCriticalEdges`),
-/// otherwise the inserted `local_set` could execute on a path that does
-/// not reach B.
+/// Lower phi instructions back to wasm-style local_set / local_get pairs.
+/// For each `phi(...)` at block B with destination D and type T:
+///   1. Allocate a fresh local L.
+///   2. Insert `local_set L = incoming.value` before the terminator of
+///      each incoming block (these must be split critical edges — see
+///      `splitCriticalEdges`, or the set would execute on paths that
+///      don't reach B).
+///   3. For every USE of D anywhere in the function, insert a fresh
+///      `local_get L → V'` immediately before the using instruction and
+///      rewrite that operand from D to V'. This rebinding is required
+///      because the AArch64 codegen iterates blocks in raw block-id
+///      order: a use of D in a block whose id is less than B's would
+///      otherwise reach codegen before D's def, producing
+///      `error.UnboundVReg`. Per-use rebinding ensures every def lives
+///      in the same block as its use.
+///   4. Replace the phi inst with `local_get L → D` (D is now dead but
+///      keeping it keeps inst-shapes simple; DCE will remove the
+///      unused def).
 pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    _ = allocator;
-    var changed = false;
-    for (func.blocks.items) |*block| {
-        for (block.instructions.items) |*inst| {
-            if (inst.op != .phi) continue;
+    const PhiSiteRec = struct {
+        block: ir.BlockId,
+        dest: ir.VReg,
+        ty: ir.IrType,
+        local: u32,
+        incoming: []const ir.Inst.PhiIncoming,
+    };
+    var sites: std.ArrayList(PhiSiteRec) = .empty;
+    defer sites.deinit(allocator);
 
-            const incoming = inst.op.phi;
-            const dest = inst.dest.?;
-            const ty = inst.type;
+    for (func.blocks.items, 0..) |block, bidx| {
+        for (block.instructions.items) |inst| {
+            if (inst.op != .phi) continue;
             const l = func.local_count;
             func.local_count += 1;
-
-            for (incoming) |inc| {
-                const pblock = func.getBlock(inc.block);
-                const pset = ir.Inst{
-                    .op = .{ .local_set = .{ .idx = l, .val = inc.value } },
-                    .type = ty,
-                };
-                // Insert before the terminator (always the last inst).
-                std.debug.assert(pblock.instructions.items.len > 0);
-                const last = pblock.instructions.items.len - 1;
-                try pblock.instructions.insert(pblock.allocator, last, pset);
-            }
-
-            // Replace the phi inst in place. Free the incoming slice now
-            // because BasicBlock.deinit only frees phi-tagged ops.
-            block.allocator.free(incoming);
-            inst.* = .{
-                .op = .{ .local_get = l },
-                .dest = dest,
-                .type = ty,
-            };
-            changed = true;
+            try sites.append(allocator, .{
+                .block = @intCast(bidx),
+                .dest = inst.dest.?,
+                .ty = inst.type,
+                .local = l,
+                .incoming = inst.op.phi,
+            });
         }
     }
+    if (sites.items.len == 0) return false;
+
+    // Build dest→site lookup so we can detect phi-of-phi incoming refs.
+    var dest_to_site: std.AutoHashMap(ir.VReg, usize) = .init(allocator);
+    defer dest_to_site.deinit();
+    for (sites.items, 0..) |site, idx| {
+        try dest_to_site.put(site.dest, idx);
+    }
+
+    // Step 2: insert local_set on each incoming edge, before its FIRST
+    // terminator. (The wasm frontend can emit unreachable instructions after
+    // a terminator within the same block; we must insert before the first
+    // executed control-flow instruction.)
+    //
+    // If `inc.value` is itself another phi's dest (phi-of-phi), the source
+    // value is no longer live as a VReg in the predecessor block — it's
+    // carried via `source_site.local`. Emit a `local_get → fresh_vreg`
+    // first, then set our local from that fresh vreg.
+    for (sites.items) |site| {
+        for (site.incoming) |inc| {
+            const pblock = func.getBlock(inc.block);
+            std.debug.assert(pblock.instructions.items.len > 0);
+            var insert_at: usize = pblock.instructions.items.len;
+            for (pblock.instructions.items, 0..) |pinst, idx| {
+                if (isTerminatorOp(pinst.op)) { insert_at = idx; break; }
+            }
+            var src_val: ir.VReg = inc.value;
+            if (dest_to_site.get(inc.value)) |src_idx| {
+                const src_site = sites.items[src_idx];
+                const fresh = func.newVReg();
+                try pblock.instructions.insert(pblock.allocator, insert_at, .{
+                    .op = .{ .local_get = src_site.local },
+                    .type = src_site.ty,
+                    .dest = fresh,
+                });
+                insert_at += 1;
+                src_val = fresh;
+            }
+            try pblock.instructions.insert(pblock.allocator, insert_at, .{
+                .op = .{ .local_set = .{ .idx = site.local, .val = src_val } },
+                .type = site.ty,
+            });
+        }
+    }
+
+    // Step 3: rebind every use of each phi.dest to a per-use local_get.
+    // Walking is per-site so the inst-uses helper handles one VReg at a time.
+    for (sites.items) |site| {
+        for (func.blocks.items) |*block| {
+            var i: usize = 0;
+            while (i < block.instructions.items.len) {
+                const inst = &block.instructions.items[i];
+                // Skip phi: never observed to use vregs by getUsedVRegs,
+                // and we'd rewrite its incoming via replaceInInst on a
+                // per-block basis — but phis at OTHER blocks may have
+                // incoming.value == site.dest (referring to phi-of-phi).
+                // Handle that explicitly here.
+                if (inst.op == .phi) {
+                    const incoming = @constCast(inst.op.phi);
+                    var any_phi_use = false;
+                    for (incoming) |inc| {
+                        if (inc.value == site.dest) { any_phi_use = true; break; }
+                    }
+                    if (any_phi_use) {
+                        // This is rare (a phi feeds another phi). The
+                        // straightforward rebind is: the local_set on
+                        // the edge feeding *this* phi already wrote
+                        // site.local with the right value, so the
+                        // operand from site.dest needs a fresh local_get
+                        // emitted in the predecessor block. Doing so
+                        // here is awkward; instead, we leave the phi
+                        // operand alone — its `incoming.value` is a
+                        // VReg ref that codegen never sees (phis are
+                        // already lowered for THIS site, but other
+                        // phis are still pending). This works because
+                        // the OTHER phi's lowering will run its own
+                        // step 2 from inc.block, where site.local was
+                        // also set (transitively, if site.dest was
+                        // forwarded via stack-rename through that
+                        // pred). In practice, a phi-of-phi is the
+                        // edge case; for now require the caller's
+                        // pipeline to lower phis in a single sweep,
+                        // which this function does. Just continue.
+                    }
+                    i += 1;
+                    continue;
+                }
+                const used_dest = instUsesVReg(inst.*, site.dest);
+                if (used_dest) {
+                    const fresh = func.newVReg();
+                    try block.instructions.insert(block.allocator, i, .{
+                        .op = .{ .local_get = site.local },
+                        .dest = fresh,
+                        .type = site.ty,
+                    });
+                    // The instruction we want to rewrite is now at i+1.
+                    replaceInInst(&block.instructions.items[i + 1], site.dest, fresh);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    // Step 4: replace each phi inst with `local_get L → dest`. Indices
+    // have shifted because of the local_set inserts at predecessors and
+    // local_get inserts at use sites, so locate phis by scanning each
+    // block fresh and matching on (dest, op == phi).
+    for (sites.items) |site| {
+        const block_ptr = func.getBlock(site.block);
+        for (block_ptr.instructions.items) |*inst| {
+            if (inst.op != .phi) continue;
+            if (inst.dest.? != site.dest) continue;
+            // Free the incoming slice we own (BasicBlock.deinit only
+            // frees still-tagged phi ops, and we're about to retag).
+            block_ptr.allocator.free(@constCast(inst.op.phi));
+            inst.* = .{
+                .op = .{ .local_get = site.local },
+                .dest = site.dest,
+                .type = site.ty,
+            };
+            break;
+        }
+    }
+    return true;
+}
+
+/// Fix block-id-order liveness violations introduced by ssaPromoteLocals.
+///
+/// The aarch64 backend iterates `func.blocks.items` in raw block-id order
+/// when binding vregs to physical registers/stack slots. A vreg defined in
+/// block W and used in block U requires `id(W) <= id(U)`. SSA promotion
+/// removes the `local_set/local_get` round-trips that previously masked
+/// violations, so any def→use pair that violates the order surfaces as
+/// `error.UnboundVReg` at codegen time.
+///
+/// For each violating (V, use-site U), we:
+///   1. Allocate a synthetic local L_V (once per V).
+///   2. Insert `local_set L_V, V` immediately after V's def in W.
+///   3. Replace the violating use with a fresh `local_get L_V → fresh`
+///      inserted immediately before the using instruction.
+///
+/// Param vregs (0..param_count) are bound by the codegen prologue and
+/// always available; we treat them as defined at block 0.
+pub fn fixCrossBlockLiveness(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    const N = func.next_vreg;
+    if (N == 0) return false;
+
+    const def_block = try allocator.alloc(?ir.BlockId, N);
+    defer allocator.free(def_block);
+    @memset(def_block, null);
+    const def_type = try allocator.alloc(ir.IrType, N);
+    defer allocator.free(def_type);
+
+    var p: u32 = 0;
+    while (p < func.param_count and p < N) : (p += 1) def_block[p] = 0;
+
+    for (func.blocks.items, 0..) |block, bidx| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                if (d < N) {
+                    def_block[d] = @intCast(bidx);
+                    def_type[d] = inst.type;
+                }
+            }
+        }
+    }
+
+    var local_for: std.AutoHashMap(ir.VReg, u32) = .init(allocator);
+    defer local_for.deinit();
+
+    var changed = false;
+
+    for (func.blocks.items, 0..) |*ublock, ubidx| {
+        const u_id: ir.BlockId = @intCast(ubidx);
+        var i: usize = 0;
+        while (i < ublock.instructions.items.len) {
+            const inst = &ublock.instructions.items[i];
+            var advanced = false;
+            var v: ir.VReg = 0;
+            while (v < N) : (v += 1) {
+                const w_opt = def_block[v];
+                if (w_opt == null) continue;
+                const w = w_opt.?;
+                if (w <= u_id) continue;
+                if (!instUsesVReg(inst.*, v)) continue;
+
+                const l = blk: {
+                    if (local_for.get(v)) |existing| break :blk existing;
+                    const new_l = func.local_count;
+                    func.local_count += 1;
+                    try local_for.put(v, new_l);
+                    const def_blk = func.getBlock(w);
+                    var ins_at: usize = def_blk.instructions.items.len;
+                    for (def_blk.instructions.items, 0..) |dinst, di| {
+                        if (dinst.dest) |dd| {
+                            if (dd == v) {
+                                ins_at = di + 1;
+                                break;
+                            }
+                        }
+                    }
+                    try def_blk.instructions.insert(def_blk.allocator, ins_at, .{
+                        .op = .{ .local_set = .{ .idx = new_l, .val = v } },
+                        .type = def_type[v],
+                    });
+                    break :blk new_l;
+                };
+
+                const fresh = func.newVReg();
+                try ublock.instructions.insert(ublock.allocator, i, .{
+                    .op = .{ .local_get = l },
+                    .dest = fresh,
+                    .type = def_type[v],
+                });
+                replaceInInst(&ublock.instructions.items[i + 1], v, fresh);
+                i += 1;
+                advanced = true;
+                changed = true;
+                break;
+            }
+            if (!advanced) i += 1;
+        }
+    }
+
     return changed;
 }
 
@@ -2894,6 +3266,17 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
         total_changes += 1;
     }
     for (module.functions.items) |*func| {
+        // SSA-form pipeline integration is staged but disabled pending a
+        // soundness fix: enabling `splitCriticalEdges → ssaPromoteLocals →
+        // ... → lowerPhisToLocals → fixCrossBlockLiveness` produces the
+        // expected register-promoted IR and passes all unit/differential
+        // tests, but CoreMark observes wrong CRCs. The infrastructure is
+        // kept as `pub` functions for individual reuse and unit testing.
+        // Re-enable once the CRC mismatch is root-caused.
+        if (false) {
+            if (try splitCriticalEdges(func, allocator)) total_changes += 1;
+            if (try ssaPromoteLocals(func, allocator)) total_changes += 1;
+        }
         // Iterate the pipeline until fixpoint so that passes can re-expose
         // opportunities for each other (e.g. constantFold → CSE → DCE →
         // more constantFold). Cap iterations as a safety net.
@@ -2907,6 +3290,10 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
                 }
             }
             if (!any_changed) break;
+        }
+        if (false) {
+            if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
+            if (try fixCrossBlockLiveness(func, allocator)) total_changes += 1;
         }
     }
     return total_changes;
@@ -5548,7 +5935,7 @@ fn countOp(func: *const ir.IrFunction, want: std.meta.Tag(ir.Inst.Op)) usize {
     return n;
 }
 
-test "ssaPromoteLocals: single-block param read removes local_get" {
+test "ssaPromoteLocals: single-block param read materialises one local_get" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 1, 1, 1);
     defer func.deinit();
@@ -5564,10 +5951,15 @@ test "ssaPromoteLocals: single-block param read removes local_get" {
     const changed = try ssaPromoteLocals(&func, allocator);
     try std.testing.expect(changed);
 
-    // local_get should be gone; ret should now reference param VReg 0.
-    try std.testing.expectEqual(@as(usize, 0), countOp(&func, .local_get));
-    const ret_inst = func.getBlock(0).instructions.items[func.getBlock(0).instructions.items.len - 1];
-    try std.testing.expectEqual(@as(?ir.VReg, 0), ret_inst.op.ret);
+    // After SSA promotion, the param's value is materialised once via a
+    // single entry `local_get` whose dest is reused by the renamed body.
+    // The original body `local_get` is removed.
+    try std.testing.expectEqual(@as(usize, 1), countOp(&func, .local_get));
+    const block = func.getBlock(0);
+    try std.testing.expect(block.instructions.items[0].op == .local_get);
+    const param_init_dest = block.instructions.items[0].dest.?;
+    const ret_inst = block.instructions.items[block.instructions.items.len - 1];
+    try std.testing.expectEqual(@as(?ir.VReg, param_init_dest), ret_inst.op.ret);
     // No phi inserted (no merge points).
     try std.testing.expectEqual(@as(usize, 0), countOp(&func, .phi));
 }
@@ -5609,10 +6001,10 @@ test "ssaPromoteLocals: diamond merge inserts phi" {
     const changed = try ssaPromoteLocals(&func, allocator);
     try std.testing.expect(changed);
 
-    // local_get / local_set for local 1 should be gone.
+    // local_set should be gone; one entry `local_get` remains for the param's
+    // initial value (aarch64 backend keeps params in frame slots).
     try std.testing.expectEqual(@as(usize, 0), countOp(&func, .local_set));
-    // local_get for param 0 in b0 also removed.
-    try std.testing.expectEqual(@as(usize, 0), countOp(&func, .local_get));
+    try std.testing.expectEqual(@as(usize, 1), countOp(&func, .local_get));
 
     // Exactly one phi inserted at b3.
     try std.testing.expectEqual(@as(usize, 1), countOp(&func, .phi));
@@ -5751,10 +6143,13 @@ test "ssaPromoteLocals: idempotent on already-promoted IR" {
     try func.getBlock(b0).append(.{ .op = .{ .ret = v_get }, .type = .i32 });
 
     _ = try ssaPromoteLocals(&func, allocator);
-    const second = try ssaPromoteLocals(&func, allocator);
-    // After first run there are no local_get/set left, so second run should
-    // see no promotable locals (no local_get observed) and return false.
-    try std.testing.expect(!second);
+    const get_count_after_first = countOp(&func, .local_get);
+    _ = try ssaPromoteLocals(&func, allocator);
+    // The pass may report further changes on a second run (re-materialising
+    // the entry param-init `local_get`), but the resulting IR shape should
+    // be stable: the count of `local_get` does not grow indefinitely.
+    try std.testing.expectEqual(get_count_after_first, countOp(&func, .local_get));
+    try std.testing.expectEqual(@as(usize, 0), countOp(&func, .local_set));
 }
 
 // ── splitCriticalEdges / lowerPhisToLocals tests ───────────────────────────
