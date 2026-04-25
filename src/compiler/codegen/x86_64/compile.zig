@@ -1215,6 +1215,9 @@ fn compileInst(
             try code.movRegMem(.rax, .r10, @as(i32, @intCast(fidx * 8)));
             try stack.push(code, .rax);
         },
+        // SSA phi nodes are lowered to synthetic local round-trips before
+        // codegen runs (lowerPhisToLocals). Reaching here is a bug.
+        .phi => unreachable,
     }
 }
 

@@ -88,6 +88,11 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .local_get, .global_get => {},
         .br, .@"unreachable" => {},
 
+        // Phi has unbounded incoming list. Callers that need to walk
+        // phi uses must special-case `.phi`; this helper returns empty
+        // (mirrors how `call`/`call_indirect`/`ret_multi` are handled).
+        .phi => {},
+
         // Binary ops
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
@@ -241,6 +246,12 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .iconst_32, .iconst_64, .fconst_32, .fconst_64,
         .local_get, .global_get, .br, .@"unreachable",
         => {},
+
+        .phi => |incoming| {
+            for (@constCast(incoming)) |*inc| {
+                if (inc.value == old) inc.value = new;
+            }
+        },
 
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
@@ -1978,6 +1989,10 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .memory_size, .table_size, .ref_func, .data_drop, .elem_drop,
         .atomic_fence, .call_result,
         => {},
+
+        .phi => |incoming| {
+            for (@constCast(incoming)) |*inc| inc.value += offset;
+        },
 
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,

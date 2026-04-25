@@ -34,6 +34,14 @@ pub const Inst = struct {
         fconst_32: f32,
         fconst_64: f64,
 
+        // SSA phi: `dest` receives the value `incoming[i].value` when
+        // control reaches this block from `incoming[i].block`. Phi
+        // instructions must appear at the head of a block, before any
+        // non-phi instruction. Codegen never sees a phi in practice — the
+        // SSA-promotion pipeline lowers all phis back to synthetic locals
+        // before any backend runs.
+        phi: []const PhiIncoming,
+
         // Binary arithmetic (dest = lhs op rhs)
         add: BinOp,
         sub: BinOp,
@@ -194,6 +202,11 @@ pub const Inst = struct {
     pub const BinOp = struct {
         lhs: VReg,
         rhs: VReg,
+    };
+
+    pub const PhiIncoming = struct {
+        block: BlockId,
+        value: VReg,
     };
 
     pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };

@@ -137,6 +137,9 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .local_get, .global_get => {},
         .br, .@"unreachable", .atomic_fence => {},
 
+        // Phi must be lowered before liveness analysis runs (regalloc).
+        .phi => unreachable,
+
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
         .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
@@ -345,6 +348,9 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .iconst_32, .iconst_64, .fconst_32, .fconst_64 => {},
         .local_get, .global_get => {},
         .br, .@"unreachable", .atomic_fence => {},
+
+        // Phi must be lowered before live-range analysis (regalloc).
+        .phi => unreachable,
 
         .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
         .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
