@@ -126,14 +126,11 @@ pub fn callComponentFunc(
 
     // Resolve the function type
     const func_type = blk: {
-        if (exported.func_type_idx < comp_inst.component.types.len) {
-            const td = comp_inst.component.types[exported.func_type_idx];
-            switch (td) {
-                .func => |ft| break :blk ft,
-                else => return error.InvalidFuncType,
-            }
+        const td = registry.get(exported.func_type_idx) orelse return error.InvalidFuncType;
+        switch (td) {
+            .func => |ft| break :blk ft,
+            else => return error.InvalidFuncType,
         }
-        return error.InvalidFuncType;
     };
 
     // 2. Compute flat counts for params and results
@@ -550,8 +547,8 @@ pub fn callComponentFuncAsync(
 
     // Get function type for result count
     const result_count: usize = blk: {
-        if (exported.func_type_idx < comp_inst.component.types.len) {
-            const td = comp_inst.component.types[exported.func_type_idx];
+        const reg = TypeRegistry.init(comp_inst.component);
+        if (reg.get(exported.func_type_idx)) |td| {
             switch (td) {
                 .func => |ft| {
                     switch (ft.results) {

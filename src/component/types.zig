@@ -444,6 +444,13 @@ pub const Component = struct {
     aliases: []const Alias,
     /// Component-level type definitions.
     types: []const TypeDef,
+    /// Type index-space → local `types[]` mapping. Each entry is the
+    /// local idx into `types` for slots produced by a `(type ...)` def,
+    /// or null for slots produced by a `(import ... (type ...))` /
+    /// `(alias ... (type ...))` whose target def isn't materialized
+    /// in `types`. When empty (hand-authored fixtures), callers fall
+    /// back to direct indexing of `types`.
+    type_indexspace: []const ?u32 = &.{},
     /// Canonical function definitions.
     canons: []const Canon,
     /// Start function.

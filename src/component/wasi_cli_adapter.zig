@@ -1605,3 +1605,45 @@ test "populateWasiProviders: binds full cli surface (#153)" {
     try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.subscribe"));
     try testing.expect(adapter.io_streams_iface.members.contains("[method]input-stream.subscribe"));
 }
+
+test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
+    // The stdio-echo fixture (Rust → wasm32-wasip2 via wit-component) uses
+    // composition machinery this runtime doesn't yet implement:
+    //   * three core modules (`$main`, `$wit-component-shim-module`,
+    //     `$wit-component-fixup`) wired via `(core instance (instantiate
+    //     $m (with ...)))` with cross-instance export aliases;
+    //   * an indirect-call trampoline table patched by `$fixup` after
+    //     `$main` is instantiated;
+    //   * `(canon resource.drop ...)` core funcs and full resource
+    //     indexspace plumbing;
+    //   * `(canon lower ...)` of host-instance methods sourced from
+    //     aliased imported instance exports rather than direct imports.
+    //
+    // The host-side WASI surface (#150–#155) is in place, and the loader
+    // / TypeRegistry now handle the type indexspace correctly so the run
+    // export resolves through the wit-bindgen 0.2.0 shim. Lighting up
+    // execution requires a follow-up slice that extends the core-side
+    // resolver; tracked alongside #156. Once that lands, drop the skip
+    // and the body below becomes the regression gate.
+    return error.SkipZigTest;
+}
+
+test "stdio-echo: end-to-end real wasi-p2 component (#156, disabled body)" {
+    if (true) return error.SkipZigTest;
+    const testing = std.testing;
+    const data = @embedFile("fixtures/stdio-echo.wasm");
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setStdinBytes("hello\n");
+
+    const outcome = runComponentBytes(data, testing.allocator, &adapter) catch |err| {
+        std.debug.print("stdio-echo run failed: {s}\n", .{@errorName(err)});
+        std.debug.print("stdout so far: {s}\n", .{adapter.getStdoutBytes()});
+        std.debug.print("stderr so far: {s}\n", .{adapter.getStderrBytes()});
+        return err;
+    };
+
+    try testing.expect(outcome.is_ok);
+    try testing.expectEqualStrings("echo: hello\n", adapter.getStdoutBytes());
+}

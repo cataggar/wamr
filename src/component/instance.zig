@@ -660,22 +660,63 @@ fn registerInstanceExport(
     };
     if (local_idx >= component.instances.len) return;
     const expr = component.instances[local_idx];
-    const inline_exports = switch (expr) {
-        .exports => |e| e,
-        // An `instantiate`-form local instance would require resolving
-        // exports of another component definition; not yet supported.
-        .instantiate => return,
-    };
-
     const expose_bare = isWasiCliRunName(instance_name);
 
-    for (inline_exports) |mem| {
-        if (mem.sort_idx.sort != .func) continue;
-        const dotted = std.fmt.allocPrint(inst.module_arena.allocator(), "{s}/{s}", .{ instance_name, mem.name }) catch continue;
-        registerLiftedExport(inst, component, allocator, dotted, mem.sort_idx.idx);
-        if (expose_bare and std.mem.eql(u8, mem.name, "run")) {
-            registerLiftedExport(inst, component, allocator, "run", mem.sort_idx.idx);
-        }
+    switch (expr) {
+        .exports => |inline_exports| {
+            for (inline_exports) |mem| {
+                if (mem.sort_idx.sort != .func) continue;
+                const dotted = std.fmt.allocPrint(inst.module_arena.allocator(), "{s}/{s}", .{ instance_name, mem.name }) catch continue;
+                registerLiftedExport(inst, component, allocator, dotted, mem.sort_idx.idx);
+                if (expose_bare and std.mem.eql(u8, mem.name, "run")) {
+                    registerLiftedExport(inst, component, allocator, "run", mem.sort_idx.idx);
+                }
+            }
+        },
+        .instantiate => |inst_expr| {
+            // The wit-bindgen "0.2.0-shim" pattern: the wasi:cli/run
+            // export is an instance produced by instantiating a tiny
+            // sub-component whose only purpose is to re-export an
+            // imported func ("import-func-run") under the canonical
+            // member name "run". We resolve such an instance member by:
+            //   1. looking up the sub-component's named export,
+            //   2. mapping its func sort_idx into the sub-component's
+            //      func index space (it must be an imported func),
+            //   3. matching that import's name against the parent
+            //      `with` arg list, and
+            //   4. resolving the parent's argument through the parent's
+            //      indexspace. The parent func ref is the one we
+            //      register under `<instance>/<member>`.
+            if (inst_expr.component_idx >= component.components.len) return;
+            const subcomp = component.components[inst_expr.component_idx];
+            for (subcomp.exports) |sub_exp| {
+                if (sub_exp.desc != .func) continue;
+                const sub_si = sub_exp.sort_idx orelse continue;
+                if (sub_si.sort != .func) continue;
+                const sub_ref = indexspace.resolveCompFunc(subcomp, sub_si.idx) orelse continue;
+                const sub_imp_idx: u32 = switch (sub_ref) {
+                    .imported => |i| i,
+                    else => continue,
+                };
+                if (sub_imp_idx >= subcomp.imports.len) continue;
+                const import_name = subcomp.imports[sub_imp_idx].name;
+                // Find matching `with` arg in the parent instantiate.
+                const parent_func_idx: u32 = blk: {
+                    for (inst_expr.args) |arg| {
+                        if (arg.sort_idx.sort != .func) continue;
+                        if (std.mem.eql(u8, arg.name, import_name)) {
+                            break :blk arg.sort_idx.idx;
+                        }
+                    }
+                    continue;
+                };
+                const dotted = std.fmt.allocPrint(inst.module_arena.allocator(), "{s}/{s}", .{ instance_name, sub_exp.name }) catch continue;
+                registerLiftedExport(inst, component, allocator, dotted, parent_func_idx);
+                if (expose_bare and std.mem.eql(u8, sub_exp.name, "run")) {
+                    registerLiftedExport(inst, component, allocator, "run", parent_func_idx);
+                }
+            }
+        },
     }
 }
 
