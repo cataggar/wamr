@@ -118,6 +118,9 @@ pub const component_async = @import("component/async.zig");
 /// Component composition and linking.
 pub const component_compose = @import("component/compose.zig");
 
+/// Minimal WASI cli/run-style host adapter for component instances.
+pub const wasi_cli_adapter = @import("component/wasi_cli_adapter.zig");
+
 /// WASI Preview 2 core interfaces (clocks, random, CLI, filesystem).
 pub const wasi_p2_core = @import("wasi/preview2/core.zig");
 

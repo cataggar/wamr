@@ -224,6 +224,36 @@ pub const ComponentInstance = struct {
         return gop.value_ptr;
     }
 
+    /// Find the first core instance entry with a real `ModuleInstance`.
+    /// The component's "canonical" memory always lives on a real
+    /// instance — the inline-exports entries used to wire imports never
+    /// own a module. This is the lookup both `componentTrampoline` and
+    /// `readGuestBytes` use to resolve guest memory.
+    pub fn firstModuleInst(self: *const ComponentInstance) ?*core_types.ModuleInstance {
+        for (self.core_instances) |entry| {
+            if (entry.module_inst) |mi| return mi;
+        }
+        return null;
+    }
+
+    /// Read `len` bytes starting at guest linear-memory offset `ptr` from the
+    /// canonical memory of this component. Used by host adapter callbacks
+    /// invoked from `componentTrampoline` to materialize `list<u8>` /
+    /// `string` arguments whose flat representation is `(ptr, len)` into
+    /// guest memory.
+    ///
+    /// Phase 2B narrow assumption: the canonical memory lives on the
+    /// first core instance with a real `module_inst` at memory index 0.
+    /// Returns null if no such instance is present, the memory is missing,
+    /// or the slice is out of bounds.
+    pub fn readGuestBytes(self: *const ComponentInstance, ptr: u32, len: u32) ?[]const u8 {
+        const mi = self.firstModuleInst() orelse return null;
+        const mem = mi.getMemory(0) orelse return null;
+        const end = @as(usize, ptr) + @as(usize, len);
+        if (end > mem.data.len) return null;
+        return mem.data[ptr..end];
+    }
+
     /// Kind-classify a top-level component import. Pure-type imports (those
     /// whose sole purpose is to introduce a type index) do not need a runtime
     /// binding; every other kind must be satisfied by `linkImports`.
@@ -666,13 +696,23 @@ fn resolveLiftedCoreFunc(
     return null;
 }
 
-/// Resolve a component-level func index to a bound `HostFunc` by walking
+/// Resolve a component-level func index to a bound `HostFunc`.
+///
+/// The component-level func index space is contributed to by, in section
+/// order: `import (kind=func)` decls, then component-level aliases of
+/// `Sort.func` exports of imported component instances, then canon.lifts,
+/// and so on. Phase 2B narrow assumption: the prefix we care about is
+/// `imports (kind=func)` followed by `aliases (Sort.func, instance_export)`
+/// pointing into imported component instances. canon.lifts come later in
+/// the index space and are not host-bound.
 fn resolveComponentFuncToHostFunc(
     inst: *const ComponentInstance,
     component: *const ctypes.Component,
     func_idx: u32,
 ) ?HostFunc {
     var n: u32 = 0;
+
+    // 1) Direct top-level func imports.
     for (component.imports) |imp| {
         switch (imp.desc) {
             .func => {
@@ -683,6 +723,61 @@ fn resolveComponentFuncToHostFunc(
                         else => null,
                     };
                 }
+                n += 1;
+            },
+            else => {},
+        }
+    }
+
+    // 2) Aliases that name a component-level func member of an imported
+    //    component instance.
+    for (component.aliases) |a| {
+        switch (a) {
+            .instance_export => |ie| {
+                const is_comp_func = switch (ie.sort) {
+                    .func => true,
+                    else => false,
+                };
+                if (!is_comp_func) continue;
+                if (n == func_idx) {
+                    const imp_decl = resolveImportedInstance(component, ie.instance_idx) orelse return null;
+                    const binding = inst.imports.get(imp_decl.name) orelse return null;
+                    const host_inst = switch (binding) {
+                        .host_instance => |hi| hi,
+                        else => return null,
+                    };
+                    const member = host_inst.members.get(ie.name) orelse return null;
+                    return switch (member) {
+                        .func => |hf| hf,
+                        .resource_type => null,
+                    };
+                }
+                n += 1;
+            },
+            else => {},
+        }
+    }
+
+    return null;
+}
+
+/// Resolve a component-level instance index to its `ImportDecl` if it
+/// refers to an imported component instance.
+///
+/// The component instance index space is contributed by: imports of kind
+/// `instance`, then locally instantiated component instances
+/// (`component.instances`), then aliases of `Sort.instance` (rare).
+/// Phase 2B narrow assumption: only the imported-instance prefix is
+/// supported. Returns null for indices past the imported region.
+fn resolveImportedInstance(
+    component: *const ctypes.Component,
+    instance_idx: u32,
+) ?ctypes.ImportDecl {
+    var n: u32 = 0;
+    for (component.imports) |imp| {
+        switch (imp.desc) {
+            .instance => {
+                if (n == instance_idx) return imp;
                 n += 1;
             },
             else => {},
