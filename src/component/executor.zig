@@ -346,14 +346,35 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
                 try env.pushI32(0);
             }
         },
-        .record, .variant, .tuple, .flags, .enum_, .option, .type_idx => {
+        .record, .variant, .tuple, .flags, .enum_, .option => {
             return error.CompoundNeedsRegistry;
+        },
+        // Resolve `.type_idx` through the registry and re-dispatch on
+        // the reified ValType. The registry may have been extended with
+        // an instance-type body's local types (#156 H4a/H4b), so the
+        // index can land on a `.val v` wrapper, a resource definition,
+        // or any compound TypeDef.
+        .type_idx => |idx| {
+            const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |inner| inner,
+                .list => .{ .list = idx },
+                .record => .{ .record = idx },
+                .tuple => .{ .tuple = idx },
+                .variant => .{ .variant = idx },
+                .flags => .{ .flags = idx },
+                .enum_ => .{ .enum_ = idx },
+                .option => .{ .option = idx },
+                .result => .{ .result = idx },
+                .resource => .{ .own = idx },
+                else => return error.CompoundNeedsRegistry,
+            };
+            try pushInterfaceValue(env, val, reified, registry);
         },
     }
 }
 
 fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
-    _ = allocator;
     return switch (t) {
         .bool => .{ .bool = (try env.popI32()) != 0 },
         .s8 => .{ .s8 = @truncate(try env.popI32()) },
@@ -408,7 +429,26 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             const disc = try env.popI32();
             break :blk .{ .result_val = .{ .is_ok = disc == 0, .payload = null } };
         },
-        .record, .variant, .tuple, .flags, .enum_, .option, .type_idx => error.CompoundNeedsRegistry,
+        .record, .variant, .tuple, .flags, .enum_, .option => error.CompoundNeedsRegistry,
+        // Mirror `pushInterfaceValue`: resolve `.type_idx` and re-pop on
+        // the reified ValType.
+        .type_idx => |idx| blk: {
+            const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |inner| inner,
+                .list => .{ .list = idx },
+                .record => .{ .record = idx },
+                .tuple => .{ .tuple = idx },
+                .variant => .{ .variant = idx },
+                .flags => .{ .flags = idx },
+                .enum_ => .{ .enum_ = idx },
+                .option => .{ .option = idx },
+                .result => .{ .result = idx },
+                .resource => .{ .own = idx },
+                else => return error.CompoundNeedsRegistry,
+            };
+            break :blk try popInterfaceValue(env, reified, registry, allocator);
+        },
     };
 }
 
