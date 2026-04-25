@@ -406,9 +406,7 @@ pub const ComponentInstance = struct {
         for (self.trampoline_ctxs.items) |ctx| {
             if (resolveComponentFuncToHostFunc(self, self.component, ctx.component_func_idx)) |hf| {
                 ctx.host_func = hf;
-                std.debug.print("LINK comp_func={} -> host_func.call={any}\n", .{ ctx.component_func_idx, hf.call != null });
             } else {
-                std.debug.print("LINK comp_func={} -> NULL\n", .{ctx.component_func_idx});
             }
         }
     }
@@ -657,7 +655,6 @@ pub fn instantiate(
                                 if (member_sort_idx.? != .func) continue;
 
                                 const cfref = indexspace.resolveCoreFunc(component, member_idx) orelse continue;
-                                std.debug.print("IMPORT-RES ci={} imp_func={} field={s} cfref={s}\n", .{ ci_idx, imp_func_idx, imp.field_name, @tagName(cfref) });
                                 // Aliased core func — resolve to the underlying
                                 // {module_inst, func_idx} pair from a previously
                                 // instantiated core instance.
@@ -672,7 +669,6 @@ pub fn instantiate(
                                         const al_src = cis[ie_al.instance_idx];
                                         const al_mi = al_src.module_inst orelse continue;
                                         const al_func_idx = al_mi.getExportFunc(ie_al.name) orelse continue;
-                                        std.debug.print("  ALIASED-WIRED src_ci={} name={s} func_idx={}\n", .{ ie_al.instance_idx, ie_al.name, al_func_idx });
                                         imps_buf[imp_func_idx] = .{ .module_inst = al_mi, .func_idx = al_func_idx };
                                         is_cross[imp_func_idx] = true;
                                         if (first_cross_src == null) first_cross_src = al_mi;
@@ -689,7 +685,6 @@ pub fn instantiate(
                                     else => continue,
                                 };
 
-                                std.debug.print("  LOWERED canon_idx={} lower.func_idx={} types.len={}\n", .{ canon_idx, lower.func_idx, component.types.len });
                                 const ctx_ptr = allocator.create(executor_mod.ComponentTrampolineCtx) catch continue;
                                 // Prefer name-based lookup (correct for real components).
                                 // Fall back to direct types[lower.func_idx] indexing for
@@ -703,7 +698,6 @@ pub fn instantiate(
                                     };
                                 };
                                 const rft = rft_opt orelse {
-                                    std.debug.print("  LOWERED-NO-TYPE func_idx={}\n", .{lower.func_idx});
                                     allocator.destroy(ctx_ptr);
                                     continue;
                                 };
@@ -913,7 +907,6 @@ pub fn instantiate(
                     {
                         var nset: u32 = 0;
                         for (entries) |e| if (e != null) { nset += 1; };
-                        std.debug.print("ATTACH ci={} entries.len={} nset={} import_func_count={}\n", .{ ci_idx, entries.len, nset, import_func_count });
                     }
                     if (imps_buf.len > 0) allocator.free(imps_buf);
                     if (is_cross.len > 0) allocator.free(is_cross);
@@ -1411,7 +1404,6 @@ const ResolvedFuncType = struct {
 
 fn resolveCompFuncType(component: *const ctypes.Component, func_idx: u32) ?ResolvedFuncType {
     const ref = indexspace.resolveCompFunc(component, func_idx) orelse {
-        std.debug.print("    rcft({}) -> null (no compfunc ref)\n", .{func_idx});
         return null;
     };
     switch (ref) {
@@ -1430,7 +1422,6 @@ fn resolveCompFuncType(component: *const ctypes.Component, func_idx: u32) ?Resol
         .aliased => |alias_idx| {
             const ie = component.aliases[alias_idx].instance_export;
             const inst_ref = indexspace.resolveCompInstance(component, ie.instance_idx) orelse {
-                std.debug.print("    rcft({}) aliased -> no compinst ref idx={}\n", .{ func_idx, ie.instance_idx });
                 return null;
             };
             const inst_type_idx: u32 = switch (inst_ref) {
@@ -1439,20 +1430,15 @@ fn resolveCompFuncType(component: *const ctypes.Component, func_idx: u32) ?Resol
                     else => return null,
                 },
                 else => {
-                    std.debug.print("    rcft({}) aliased -> inst_ref={s} (not imported)\n", .{ func_idx, @tagName(inst_ref) });
                     return null;
                 },
             };
             const inst_td = resolveTypeDef(component, inst_type_idx) orelse {
-                std.debug.print("    rcft({}) aliased -> no typedef inst_type_idx={}\n", .{ func_idx, inst_type_idx });
                 return null;
             };
             const decls = switch (inst_td) {
                 .instance => |it| it.decls,
-                else => |t| {
-                    std.debug.print("    rcft({}) aliased -> inst_td not instance: {s}\n", .{ func_idx, @tagName(t) });
-                    return null;
-                },
+                else => return null,
             };
             for (decls) |d| switch (d) {
                 .@"export" => |e| {
@@ -1483,13 +1469,10 @@ fn resolveCompFuncType(component: *const ctypes.Component, func_idx: u32) ?Resol
                         if (found != null) break;
                     }
                     if (found) |ft| return .{ .ft = ft, .decls = decls };
-                    std.debug.print("    rcft({}) aliased -> export found name={s} but type tidx={} not in decls (total={})\n", .{ func_idx, ie.name, tidx, decls.len });
-                    for (decls, 0..) |dd, di| std.debug.print("      [{}]={s}\n", .{ di, @tagName(dd) });
                     return null;
                 },
                 else => {},
             };
-            std.debug.print("    rcft({}) aliased -> export name={s} not found in {} decls\n", .{ func_idx, ie.name, decls.len });
             return null;
         },
         .lifted => |canon_idx| {

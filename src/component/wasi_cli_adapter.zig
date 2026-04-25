@@ -953,7 +953,11 @@ pub fn runLoadedComponent(
     defer inst.deinit();
 
     var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
-    defer providers.deinit(allocator);
+    // The provider populators allocate hashmap entries via `self.allocator`
+    // (the adapter's allocator) — keep the deinit consistent with that so
+    // hand-rolled callers like `runComponentBytes` (which pass an arena)
+    // don't leak the underlying hashmap storage.
+    defer providers.deinit(adapter.allocator);
 
     populateWasiProviders(adapter, component, &providers) catch return error.OutOfMemory;
     inst.linkImports(providers) catch return error.LinkFailed;
@@ -998,14 +1002,6 @@ pub fn runComponentBytes(
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
-    std.debug.print("\nSTDIO-ECHO-LOADED core_modules={} core_instances={} aliases={} canons={} imports={} exports={}\n", .{
-        component_storage.core_modules.len,
-        component_storage.core_instances.len,
-        component_storage.aliases.len,
-        component_storage.canons.len,
-        component_storage.imports.len,
-        component_storage.exports.len,
-    });
     return runLoadedComponent(component_storage, allocator, adapter);
 }
 
@@ -1615,38 +1611,21 @@ test "populateWasiProviders: binds full cli surface (#153)" {
 }
 
 test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
-    // The stdio-echo fixture (Rust → wasm32-wasip2 via wit-component) uses
-    // composition machinery this runtime doesn't yet implement:
-    //   * three core modules (`$main`, `$wit-component-shim-module`,
-    //     `$wit-component-fixup`) wired via `(core instance (instantiate
-    //     $m (with ...)))` with cross-instance export aliases;
-    //   * an indirect-call trampoline table patched by `$fixup` after
-    //     `$main` is instantiated;
-    //   * `(canon resource.drop ...)` core funcs and full resource
-    //     indexspace plumbing;
-    //   * `(canon lower ...)` of host-instance methods sourced from
-    //     aliased imported instance exports rather than direct imports.
-    //
-    // The host-side WASI surface (#150–#155) is in place, and the loader
-    // / TypeRegistry now handle the type indexspace correctly so the run
-    // export resolves through the wit-bindgen 0.2.0 shim. Lighting up
-    // execution requires a follow-up slice that extends the core-side
-    // resolver; tracked alongside #156. Once that lands, drop the skip
-    // and the body below becomes the regression gate.
-    return error.SkipZigTest;
-}
-
-test "stdio-echo: end-to-end real wasi-p2 component (#156, disabled body)" {
-    if (true) return error.SkipZigTest;
-    // PROBE-skip
     const testing = std.testing;
     const data = @embedFile("fixtures/stdio-echo.wasm");
+
+    // The loader has no `Component.deinit` yet (#142 Phase 1B); use an
+    // arena so the test doesn't leak. Mirrors the pattern used by the
+    // other end-to-end component tests in this codebase.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
 
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     adapter.setStdinBytes("hello\n");
 
-    const outcome = runComponentBytes(data, testing.allocator, &adapter) catch |err| {
+    const outcome = runComponentBytes(data, arena_alloc, &adapter) catch |err| {
         std.debug.print("stdio-echo run failed: {s}\n", .{@errorName(err)});
         std.debug.print("stdout so far: {s}\n", .{adapter.getStdoutBytes()});
         std.debug.print("stderr so far: {s}\n", .{adapter.getStderrBytes()});

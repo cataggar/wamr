@@ -979,7 +979,6 @@ test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
             }
         }
         std.testing.expect(found) catch |err| {
-            std.debug.print("missing expected import: {s}\n", .{name});
             return err;
         };
     }
