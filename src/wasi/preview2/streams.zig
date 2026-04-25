@@ -70,8 +70,29 @@ pub const OutputStream = struct {
                 b.appendSlice(allocator, data) catch return .{ .err = .would_block };
                 return .{ .ok = data.len };
             },
-            .fd => {
-                return .{ .ok = data.len };
+            .fd => |fd| {
+                // Loop over partial writes; treat EINTR as retryable. A
+                // signal mid-write would otherwise drop bytes silently.
+                // Note: zig 0.16 removed `std.posix.write`, so we go
+                // straight to the linux syscall. This module is only
+                // built on linux today (other targets don't reach here).
+                var written: usize = 0;
+                while (written < data.len) {
+                    const remaining = data[written..];
+                    const rc = std.os.linux.write(@intCast(fd), remaining.ptr, remaining.len);
+                    switch (std.os.linux.errno(rc)) {
+                        .SUCCESS => {
+                            const n: usize = @intCast(rc);
+                            if (n == 0) return .{ .closed = {} };
+                            written += n;
+                        },
+                        .INTR => continue,
+                        .AGAIN => return .{ .err = .would_block },
+                        .PIPE => return .{ .closed = {} },
+                        else => return .{ .err = .would_block },
+                    }
+                }
+                return .{ .ok = written };
             },
             .closed => return .{ .closed = {} },
         }
@@ -80,6 +101,13 @@ pub const OutputStream = struct {
     /// Create an output stream backed by a growable buffer.
     pub fn toBuffer() OutputStream {
         return .{ .sink = .{ .buffer = .empty } };
+    }
+
+    /// Create an output stream that writes to a host file descriptor
+    /// (e.g. real stdout/stderr). The fd is borrowed; the stream does
+    /// not close it on `deinit`.
+    pub fn toFd(fd: std.posix.fd_t) OutputStream {
+        return .{ .sink = .{ .fd = fd } };
     }
 
     /// Get the buffer contents (only valid for buffer-backed streams).

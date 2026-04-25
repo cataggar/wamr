@@ -76,6 +76,16 @@ pub const WasiCliAdapter = struct {
         };
     }
 
+    /// Initialize with stdout backed by a host file descriptor (typically
+    /// `std.posix.STDOUT_FILENO`). For the production CLI path; tests
+    /// continue to use `init` with the captured-buffer sink.
+    pub fn initWithStdoutFd(allocator: Allocator, fd: std.posix.fd_t) WasiCliAdapter {
+        return .{
+            .allocator = allocator,
+            .stdout = streams.OutputStream.toFd(fd),
+        };
+    }
+
     pub fn deinit(self: *WasiCliAdapter) void {
         self.stdout.deinit(self.allocator);
         self.write_iface.deinit(self.allocator);
@@ -263,6 +273,123 @@ pub const WasiCliAdapter = struct {
         }
     }
 };
+
+// ── Top-level CLI dispatch ─────────────────────────────────────────────────
+
+const ctypes_root = @import("types.zig");
+const component_loader = @import("loader.zig");
+const executor_root = @import("executor.zig");
+const abi_root = @import("canonical_abi.zig");
+
+pub const RunComponentError = error{
+    LoadFailed,
+    InstantiateFailed,
+    LinkFailed,
+    NoRunExport,
+    Trap,
+    OutOfMemory,
+};
+
+pub const RunOutcome = struct {
+    /// The component exited normally. `is_ok=true` means run returned ok;
+    /// false means the component returned `result::error(_)`.
+    is_ok: bool,
+};
+
+/// Whether a component import name matches a WASI interface prefix,
+/// allowing a trailing `@<version>` (e.g. `@0.2.6`).
+fn matchesWasiPrefix(import_name: []const u8, prefix: []const u8) bool {
+    if (!std.mem.startsWith(u8, import_name, prefix)) return false;
+    const rest = import_name[prefix.len..];
+    return rest.len == 0 or rest[0] == '@';
+}
+
+/// Bind WASI cli/run-style imports for `component` against `adapter`.
+///
+/// Walks every top-level instance import and, for each name that
+/// matches a known WASI interface (with or without a `@<version>`
+/// suffix), binds the corresponding `HostInstance` from the adapter.
+/// Imports that don't match are left for the caller to wire (and will
+/// cause `linkImports` to fail with `MissingImport` — by design).
+pub fn populateWasiProviders(
+    adapter: *WasiCliAdapter,
+    component: *const ctypes_root.Component,
+    providers: *std.StringHashMapUnmanaged(ImportBinding),
+) !void {
+    var matched_stdout: ?[]const u8 = null;
+    var matched_streams: ?[]const u8 = null;
+    for (component.imports) |imp| {
+        if (imp.desc != .instance) continue;
+        if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
+            matched_stdout = imp.name;
+        if (matched_streams == null and matchesWasiPrefix(imp.name, "wasi:io/streams"))
+            matched_streams = imp.name;
+    }
+    // Always populate both interfaces' members; only register
+    // providers for the names the component actually imports so
+    // `linkImports` strict-checking surfaces unrelated misses.
+    try adapter.populateWasiCliRun(
+        providers,
+        matched_stdout orelse "wasi:cli/stdout",
+        matched_streams orelse "wasi:io/streams",
+    );
+    if (matched_stdout == null) _ = providers.remove("wasi:cli/stdout");
+    if (matched_streams == null) _ = providers.remove("wasi:io/streams");
+}
+
+/// Run an already-loaded component. See `runComponentBytes` for the
+/// byte-level entry point and the policy notes that apply equally here.
+pub fn runLoadedComponent(
+    component: *const ctypes_root.Component,
+    allocator: Allocator,
+    adapter: *WasiCliAdapter,
+) RunComponentError!RunOutcome {
+    const inst = instance_mod.instantiate(component, allocator) catch return error.InstantiateFailed;
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(allocator);
+
+    populateWasiProviders(adapter, component, &providers) catch return error.OutOfMemory;
+    inst.linkImports(providers) catch return error.LinkFailed;
+
+    if (inst.getExport("run") == null) return error.NoRunExport;
+
+    var results: [1]abi_root.InterfaceValue = undefined;
+    executor_root.callComponentFunc(inst, "run", &.{}, &results, allocator) catch return error.Trap;
+
+    return .{ .is_ok = switch (results[0]) {
+        .result_val => |rv| rv.is_ok,
+        else => true,
+    } };
+}
+
+/// Load + instantiate + run a component binary, mapping its `run` export
+/// to a normalized outcome the CLI can turn into an exit code.
+///
+/// Phase 3 narrow scope:
+///   - Recognizes the run entrypoint as a top-level component export
+///     named exactly `"run"` (matching the hand-authored 2B-hello fixture).
+///     Real WASI components nest `run` inside an exported
+///     `wasi:cli/run` *instance*; lifting that into our `exported_funcs`
+///     map requires the indexspace work tracked under `142-1b-indexspaces`
+///     and is deferred. Until then, real Rust components are rejected
+///     with `error.NoRunExport` rather than silently mis-exiting.
+///   - Binds WASI imports against `adapter`'s `wasi:cli/stdout` +
+///     `wasi:io/streams` interfaces; any other instance import will
+///     surface as `error.LinkFailed` from `linkImports`.
+///   - The `run` export must return `result<_,_>`. Trapping inside `run`
+///     surfaces as `error.Trap` from this function.
+pub fn runComponentBytes(
+    data: []const u8,
+    allocator: Allocator,
+    adapter: *WasiCliAdapter,
+) RunComponentError!RunOutcome {
+    const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
+    defer allocator.destroy(component_storage);
+    component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
+    return runLoadedComponent(component_storage, allocator, adapter);
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -604,4 +731,144 @@ test "WasiCliAdapter: hello-world fixture (cli/stdout + io/streams + run)" {
     // Stream handle should now be dropped (slot is null).
     try testing.expect(adapter.stream_table.items.len >= 1);
     try testing.expect(adapter.stream_table.items[0] == null);
+}
+
+test "matchesWasiPrefix: exact and version-suffixed names" {
+    const testing = std.testing;
+    try testing.expect(matchesWasiPrefix("wasi:cli/stdout", "wasi:cli/stdout"));
+    try testing.expect(matchesWasiPrefix("wasi:cli/stdout@0.2.6", "wasi:cli/stdout"));
+    try testing.expect(matchesWasiPrefix("wasi:io/streams@0.2", "wasi:io/streams"));
+    try testing.expect(!matchesWasiPrefix("wasi:cli/stdout-extra", "wasi:cli/stdout"));
+    try testing.expect(!matchesWasiPrefix("other:cli/stdout", "wasi:cli/stdout"));
+    try testing.expect(!matchesWasiPrefix("wasi:cli/std", "wasi:cli/stdout"));
+}
+
+test "runLoadedComponent: matches versioned WASI import names" {
+    // Same hand-authored fixture as the "hello-world fixture" test, but
+    // with versioned import names (`@0.2.6`) and dispatched through the
+    // CLI's `runLoadedComponent` helper. This exercises the full
+    // populateWasiProviders → linkImports → callComponentFunc path.
+    const ctypes = @import("types.zig");
+    const testing = std.testing;
+
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x10, 0x03,
+        0x60, 0x00, 0x01, 0x7f,
+        0x60, 0x03, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+        0x60, 0x01, 0x7f, 0x00,
+        0x02, 0x39, 0x03,
+        0x04, 'h', 'o', 's', 't', 0x0a, 'g', 'e', 't', '_', 's', 't', 'd', 'o', 'u', 't', 0x00, 0x00,
+        0x04, 'h', 'o', 's', 't', 0x0b, 'w', 'r', 'i', 't', 'e', '_', 'f', 'l', 'u', 's', 'h', 0x00, 0x01,
+        0x04, 'h', 'o', 's', 't', 0x0b, 'd', 'r', 'o', 'p', '_', 's', 't', 'r', 'e', 'a', 'm', 0x00, 0x02,
+        0x03, 0x02, 0x01, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x07, 0x01,
+        0x03, 'r', 'u', 'n',
+        0x00, 0x03,
+        0x0a, 0x17, 0x01,
+        0x15,
+        0x01, 0x01, 0x7f,
+        0x10, 0x00,
+        0x22, 0x00,
+        0x41, 0x10,
+        0x41, 0x0e,
+        0x10, 0x01,
+        0x1a,
+        0x20, 0x00,
+        0x10, 0x02,
+        0x41, 0x00,
+        0x0b,
+        0x0b, 0x14, 0x01,
+        0x00,
+        0x41, 0x10, 0x0b,
+        0x0e,
+        'h', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!', '\n',
+    };
+    const core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+
+    const RES_TYPE_IDX: u32 = 100;
+    const t1_params = [_]ctypes.NamedValType{
+        .{ .name = "this", .type = .{ .own = RES_TYPE_IDX } },
+        .{ .name = "data", .type = .{ .list = 4 } },
+    };
+    const t2_params = [_]ctypes.NamedValType{
+        .{ .name = "this", .type = .{ .own = RES_TYPE_IDX } },
+    };
+
+    const inst_stdout_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{ .name = "get-stdout", .desc = .{ .func = 0 } } },
+    };
+    const inst_streams_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{ .name = "[method]output-stream.blocking-write-and-flush", .desc = .{ .func = 1 } } },
+        .{ .@"export" = .{ .name = "[resource-drop]output-stream", .desc = .{ .func = 2 } } },
+    };
+
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &.{}, .results = .{ .unnamed = .{ .own = RES_TYPE_IDX } } } },
+        .{ .func = .{ .params = &t1_params, .results = .{ .unnamed = .{ .result = 5 } } } },
+        .{ .func = .{ .params = &t2_params, .results = .none } },
+        .{ .func = .{ .params = &.{}, .results = .{ .unnamed = .{ .result = 5 } } } },
+        .{ .list = .{ .element = .u8 } },
+        .{ .result = .{ .ok = null, .err = null } },
+        .{ .instance = .{ .decls = &inst_stdout_decls } },
+        .{ .instance = .{ .decls = &inst_streams_decls } },
+    };
+
+    // Versioned import names — the CLI must still match these.
+    const imports_decl = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:cli/stdout@0.2.6", .desc = .{ .instance = 6 } },
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 7 } },
+    };
+
+    const aliases_decl = [_]ctypes.Alias{
+        .{ .instance_export = .{ .sort = .func, .instance_idx = 0, .name = "get-stdout" } },
+        .{ .instance_export = .{ .sort = .func, .instance_idx = 1, .name = "[method]output-stream.blocking-write-and-flush" } },
+        .{ .instance_export = .{ .sort = .func, .instance_idx = 1, .name = "[resource-drop]output-stream" } },
+        .{ .instance_export = .{ .sort = .{ .core = .func }, .instance_idx = 1, .name = "run" } },
+    };
+
+    const canons = [_]ctypes.Canon{
+        .{ .lower = .{ .func_idx = 0, .opts = &.{} } },
+        .{ .lower = .{ .func_idx = 1, .opts = &.{} } },
+        .{ .lower = .{ .func_idx = 2, .opts = &.{} } },
+        .{ .lift = .{ .core_func_idx = 3, .type_idx = 3, .opts = &.{} } },
+    };
+
+    const inline_exports = [_]ctypes.CoreInlineExport{
+        .{ .name = "get_stdout", .sort_idx = .{ .sort = .func, .idx = 0 } },
+        .{ .name = "write_flush", .sort_idx = .{ .sort = .func, .idx = 1 } },
+        .{ .name = "drop_stream", .sort_idx = .{ .sort = .func, .idx = 2 } },
+    };
+    const inst_args = [_]ctypes.CoreInstantiateArg{
+        .{ .name = "host", .instance_idx = 0 },
+    };
+    const core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .exports = &inline_exports },
+        .{ .instantiate = .{ .module_idx = 0, .args = &inst_args } },
+    };
+
+    const exports_decl = [_]ctypes.ExportDecl{
+        .{ .name = "run", .desc = .{ .func = 3 } },
+    };
+
+    const component = ctypes.Component{
+        .core_modules = &core_modules,
+        .core_instances = &core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases_decl,
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &imports_decl,
+        .exports = &exports_decl,
+    };
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const outcome = try runLoadedComponent(&component, testing.allocator, &adapter);
+    try testing.expect(outcome.is_ok);
+    try testing.expectEqualStrings("hello, world!\n", adapter.getStdoutBytes());
 }
