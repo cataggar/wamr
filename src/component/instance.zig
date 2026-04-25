@@ -1731,6 +1731,59 @@ test "instantiate: H1.3 micro-fixture — alias core export of memory through in
     try std.testing.expectEqual(@as(u32, 7), results[0].u32);
 }
 
+test "instantiate: H2 micro-fixture — table.set + call_indirect via canon.lower trampoline (#156 H2)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Three-module composition (see fixtures/h2-trampoline.wat):
+    //   $A exports table "t" (1 funcref) and func "call0" which call_indirect's
+    //     element 0 with the i32 arg passed in.
+    //   `(alias core export $a "t" (core table))` → top-level core table 0.
+    //   `(canon lower (func $dbl))` produces a core func bound via trampoline
+    //     to host_func host:double (HostFunc.call doubles its u32 arg).
+    //   `(core instance $args (export "t" (table 0)) (export "f" (func ...)))`
+    //   $B imports the table and the lowered func; its `start` runs
+    //     `i32.const 0  ref.func $f  table.set 0`, i.e. installs the
+    //     trampoline-backed funcref into the imported table at offset 0.
+    // After instantiation the lifted `call0(x)` exercises:
+    //   * cross-module call_indirect against an imported, post-instantiation
+    //     populated table;
+    //   * funcref dispatch into a host_func_entries[]-backed canon.lower
+    //     trampoline;
+    //   * host return-value lift back into the calling core module.
+    const data = @embedFile("fixtures/h2-trampoline.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    const Host = struct {
+        fn double(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            args: []const abi_mod.InterfaceValue,
+            results: []abi_mod.InterfaceValue,
+            _: std.mem.Allocator,
+        ) anyerror!void {
+            results[0] = .{ .u32 = args[0].u32 *% 2 };
+        }
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try providers.put(std.testing.allocator, "my:host/double", .{ .host_func = .{ .call = &Host.double } });
+    try inst.linkImports(providers);
+
+    var args: [1]abi_mod.InterfaceValue = .{.{ .u32 = 21 }};
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "call0", &args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 42), results[0].u32);
+}
+
 test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)" {
     // Hand-authored component:
     //   - 1 core module exporting "run" (no imports, no host calls)
