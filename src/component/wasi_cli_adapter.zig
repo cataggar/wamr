@@ -214,6 +214,182 @@ fn mapFsError(err: anyerror) FsErrorCode {
     };
 }
 
+/// `wasi:http/types.error-code` discriminant indices in WIT-declaration
+/// order. Used as `.variant_val.discriminant` for `result<_, error-code>`
+/// returns. Several variants carry payloads in the WIT (option<u64>,
+/// option<string>, etc.); the adapter only ever returns no-payload
+/// codes from default-deny stubs, so payload handling is deferred.
+const HttpErrorCode = enum(u32) {
+    DNS_timeout = 0,
+    DNS_error = 1,
+    destination_not_found = 2,
+    destination_unavailable = 3,
+    destination_IP_prohibited = 4,
+    destination_IP_unroutable = 5,
+    connection_refused = 6,
+    connection_terminated = 7,
+    connection_timeout = 8,
+    connection_read_timeout = 9,
+    connection_write_timeout = 10,
+    connection_limit_reached = 11,
+    TLS_protocol_error = 12,
+    TLS_certificate_error = 13,
+    TLS_alert_received = 14,
+    HTTP_request_denied = 15,
+    HTTP_request_length_required = 16,
+    HTTP_request_body_size = 17,
+    HTTP_request_method_invalid = 18,
+    HTTP_request_URI_invalid = 19,
+    HTTP_request_URI_too_long = 20,
+    HTTP_request_header_section_size = 21,
+    HTTP_request_header_size = 22,
+    HTTP_request_trailer_section_size = 23,
+    HTTP_request_trailer_size = 24,
+    HTTP_response_incomplete = 25,
+    HTTP_response_header_section_size = 26,
+    HTTP_response_header_size = 27,
+    HTTP_response_body_size = 28,
+    HTTP_response_trailer_section_size = 29,
+    HTTP_response_trailer_size = 30,
+    HTTP_response_transfer_coding = 31,
+    HTTP_response_content_coding = 32,
+    HTTP_response_timeout = 33,
+    HTTP_upgrade_failed = 34,
+    HTTP_protocol_error = 35,
+    loop_detected = 36,
+    configuration_error = 37,
+    internal_error = 38,
+};
+
+/// `wasi:http/types.fields`: a multi-map of header name -> value bytes.
+/// Each entry's name and value are owned host-allocated slices, freed
+/// when the slot is dropped or the adapter deinits.
+pub const HttpFieldEntry = struct {
+    name: []u8,
+    value: []u8,
+};
+
+pub const HttpFields = struct {
+    entries: std.ArrayListUnmanaged(HttpFieldEntry) = .empty,
+    /// `[static]fields.from-list` returns mutable fields per WIT; the
+    /// flag exists so a future implementation of header-immutability
+    /// (e.g. fields owned by an incoming-request) has somewhere to
+    /// record it. Default-deny stubs ignore it.
+    immutable: bool = false,
+
+    pub fn deinit(self: *HttpFields, allocator: Allocator) void {
+        for (self.entries.items) |e| {
+            allocator.free(e.name);
+            allocator.free(e.value);
+        }
+        self.entries.deinit(allocator);
+    }
+};
+
+/// `wasi:http/types.outgoing-request`. The constructor borrows a
+/// `fields` handle for headers; mutation goes through `set-*` methods
+/// which the default-deny adapter accepts as ok no-ops (real header
+/// validation is deferred). String fields are owned host slices.
+pub const OutgoingRequest = struct {
+    method_disc: u32 = 0, // .get
+    method_other: ?[]u8 = null,
+    path_with_query: ?[]u8 = null,
+    scheme_disc: ?u32 = null,
+    scheme_other: ?[]u8 = null,
+    authority: ?[]u8 = null,
+    headers_handle: u32,
+    body_consumed: bool = false,
+
+    pub fn deinit(self: *OutgoingRequest, allocator: Allocator) void {
+        if (self.method_other) |s| allocator.free(s);
+        if (self.path_with_query) |s| allocator.free(s);
+        if (self.scheme_other) |s| allocator.free(s);
+        if (self.authority) |s| allocator.free(s);
+    }
+};
+
+/// `wasi:http/types.incoming-request`. The adapter never produces one
+/// on its own (it is only constructed by an inbound HTTP server, which
+/// is out of scope); the rep exists so resource-drop and the getter
+/// stubs link cleanly.
+pub const IncomingRequest = struct {
+    headers_handle: u32 = 0,
+    body_consumed: bool = false,
+};
+
+/// `wasi:http/types.incoming-response`. Used by the
+/// `future-incoming-response.get` happy path once #149 follow-up wires
+/// real outbound HTTP. For default-deny, no incoming-response is ever
+/// produced.
+pub const IncomingResponse = struct {
+    status: u16 = 0,
+    headers_handle: u32 = 0,
+    body_consumed: bool = false,
+};
+
+/// `wasi:http/types.outgoing-response`.
+pub const OutgoingResponse = struct {
+    status: u16 = 200,
+    headers_handle: u32,
+    body_consumed: bool = false,
+};
+
+/// `wasi:http/types.incoming-body`. Placeholder rep — the adapter
+/// returns `error` from `incoming-body.stream` on the default-deny
+/// path, so the only operation that touches a slot is resource-drop.
+pub const IncomingBody = struct {};
+
+/// `wasi:http/types.outgoing-body`.
+pub const OutgoingBody = struct {
+    /// Set by `[method]outgoing-body.write` to ensure a second call
+    /// returns err per WIT contract. Default-deny errs on first call
+    /// too, but the field still tracks state for symmetry.
+    stream_taken: bool = false,
+};
+
+/// `wasi:http/types.future-incoming-response`. Default-deny resolves
+/// every future immediately to `error-code.HTTP-request-denied`.
+///
+/// TODO(#149 follow-up): replace `state` with an actual async result
+/// once `std.http.Client` (with TLS) is wired through a capability
+/// allow-list.
+pub const FutureIncomingResponse = struct {
+    pub const State = union(enum) {
+        pending,
+        ready_ok: u32, // incoming-response handle
+        ready_err: u32, // HttpErrorCode discriminant
+    };
+
+    state: State,
+
+    /// True on the second `.get()` call — the WIT says a future must
+    /// return `err(())` (the outer result-of-result) once it has been
+    /// consumed.
+    polled: bool = false,
+};
+
+/// `wasi:http/types.future-trailers`. Default-deny resolves to
+/// `some(ok(ok(none)))` (no trailers).
+pub const FutureTrailers = struct {
+    polled: bool = false,
+};
+
+/// `wasi:http/types.request-options`. Pure record of optional
+/// timeouts; the constructor returns a fresh slot, getters return
+/// option-none, setters store values.
+pub const RequestOptions = struct {
+    connect_timeout_ns: ?u64 = null,
+    first_byte_timeout_ns: ?u64 = null,
+    between_bytes_timeout_ns: ?u64 = null,
+};
+
+/// `wasi:http/types.response-outparam`. Server-side handoff slot;
+/// `[static]response-outparam.set` records that the guest produced a
+/// response. The host never inspects it on the default-deny path.
+pub const ResponseOutparam = struct {
+    set: bool = false,
+};
+
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
@@ -259,6 +435,9 @@ pub const WasiCliAdapter = struct {
     sockets_udp_iface: HostInstance = .{},
     sockets_udp_create_iface: HostInstance = .{},
     sockets_ip_name_lookup_iface: HostInstance = .{},
+    http_types_iface: HostInstance = .{},
+    http_outgoing_handler_iface: HostInstance = .{},
+    http_incoming_handler_iface: HostInstance = .{},
 
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
@@ -289,6 +468,22 @@ pub const WasiCliAdapter = struct {
     /// `wasi:sockets/ip-name-lookup.resolve-address-stream` table. Slots
     /// own the heap-allocated stream struct; nulled on resource-drop.
     resolve_streams: std.ArrayListUnmanaged(?*ResolveAddressStream) = .empty,
+
+    /// `wasi:http/types` resource tables (#149). Each slot owns a
+    /// heap-allocated rep struct; resource-drop nulls the slot and
+    /// frees the underlying allocation. `deinit` mops up any slots
+    /// the guest leaked.
+    http_fields_table: std.ArrayListUnmanaged(?*HttpFields) = .empty,
+    http_outgoing_requests: std.ArrayListUnmanaged(?*OutgoingRequest) = .empty,
+    http_incoming_requests: std.ArrayListUnmanaged(?*IncomingRequest) = .empty,
+    http_outgoing_responses: std.ArrayListUnmanaged(?*OutgoingResponse) = .empty,
+    http_incoming_responses: std.ArrayListUnmanaged(?*IncomingResponse) = .empty,
+    http_request_options: std.ArrayListUnmanaged(?*RequestOptions) = .empty,
+    http_response_outparams: std.ArrayListUnmanaged(?*ResponseOutparam) = .empty,
+    http_incoming_bodies: std.ArrayListUnmanaged(?*IncomingBody) = .empty,
+    http_outgoing_bodies: std.ArrayListUnmanaged(?*OutgoingBody) = .empty,
+    http_future_responses: std.ArrayListUnmanaged(?*FutureIncomingResponse) = .empty,
+    http_future_trailers: std.ArrayListUnmanaged(?*FutureTrailers) = .empty,
 
     /// Optional deterministic-clock injection. When set, `wasi:clocks/wall-clock.now`
     /// returns this datetime instead of reading the host wall clock — used by
@@ -352,6 +547,9 @@ pub const WasiCliAdapter = struct {
         self.sockets_udp_iface.deinit(self.allocator);
         self.sockets_udp_create_iface.deinit(self.allocator);
         self.sockets_ip_name_lookup_iface.deinit(self.allocator);
+        self.http_types_iface.deinit(self.allocator);
+        self.http_outgoing_handler_iface.deinit(self.allocator);
+        self.http_incoming_handler_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -391,6 +589,60 @@ pub const WasiCliAdapter = struct {
             }
         }
         self.resolve_streams.deinit(self.allocator);
+
+        // wasi:http resource tables (#149). Each slot owns its heap
+        // rep; HttpFields and OutgoingRequest also own inner string
+        // slices that need recursive cleanup.
+        for (self.http_fields_table.items) |maybe| {
+            if (maybe) |f| {
+                f.deinit(self.allocator);
+                self.allocator.destroy(f);
+            }
+        }
+        self.http_fields_table.deinit(self.allocator);
+        for (self.http_outgoing_requests.items) |maybe| {
+            if (maybe) |r| {
+                r.deinit(self.allocator);
+                self.allocator.destroy(r);
+            }
+        }
+        self.http_outgoing_requests.deinit(self.allocator);
+        for (self.http_incoming_requests.items) |maybe| {
+            if (maybe) |r| self.allocator.destroy(r);
+        }
+        self.http_incoming_requests.deinit(self.allocator);
+        for (self.http_outgoing_responses.items) |maybe| {
+            if (maybe) |r| self.allocator.destroy(r);
+        }
+        self.http_outgoing_responses.deinit(self.allocator);
+        for (self.http_incoming_responses.items) |maybe| {
+            if (maybe) |r| self.allocator.destroy(r);
+        }
+        self.http_incoming_responses.deinit(self.allocator);
+        for (self.http_request_options.items) |maybe| {
+            if (maybe) |r| self.allocator.destroy(r);
+        }
+        self.http_request_options.deinit(self.allocator);
+        for (self.http_response_outparams.items) |maybe| {
+            if (maybe) |r| self.allocator.destroy(r);
+        }
+        self.http_response_outparams.deinit(self.allocator);
+        for (self.http_incoming_bodies.items) |maybe| {
+            if (maybe) |b| self.allocator.destroy(b);
+        }
+        self.http_incoming_bodies.deinit(self.allocator);
+        for (self.http_outgoing_bodies.items) |maybe| {
+            if (maybe) |b| self.allocator.destroy(b);
+        }
+        self.http_outgoing_bodies.deinit(self.allocator);
+        for (self.http_future_responses.items) |maybe| {
+            if (maybe) |f| self.allocator.destroy(f);
+        }
+        self.http_future_responses.deinit(self.allocator);
+        for (self.http_future_trailers.items) |maybe| {
+            if (maybe) |f| self.allocator.destroy(f);
+        }
+        self.http_future_trailers.deinit(self.allocator);
     }
 
     /// Captured stderr bytes (separate buffer from stdout).
@@ -2388,6 +2640,1204 @@ pub const WasiCliAdapter = struct {
             .host_instance = &self.sockets_ip_name_lookup_iface,
         });
     }
+
+    // ----- wasi:http (#149) -----
+
+    /// Build a `result<X, http error-code>` err InterfaceValue.
+    fn httpResultErr(allocator: Allocator, code: HttpErrorCode) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+    }
+
+    fn httpResultOk(allocator: Allocator, value: InterfaceValue) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = value;
+        return .{ .result_val = .{ .is_ok = true, .payload = payload } };
+    }
+
+    // Generic table push/lookup helpers for http resources. We reuse
+    // the slot-reuse pattern from sockets so the table doesn't grow
+    // unbounded as guests churn handles.
+    fn pushHttpFields(self: *WasiCliAdapter, f: *HttpFields) !u32 {
+        for (self.http_fields_table.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_fields_table.items[i] = f;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_fields_table.items.len);
+        try self.http_fields_table.append(self.allocator, f);
+        return idx;
+    }
+    fn lookupHttpFields(self: *WasiCliAdapter, h: u32) ?*HttpFields {
+        if (h >= self.http_fields_table.items.len) return null;
+        return self.http_fields_table.items[h];
+    }
+    fn pushOutgoingRequest(self: *WasiCliAdapter, r: *OutgoingRequest) !u32 {
+        for (self.http_outgoing_requests.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_outgoing_requests.items[i] = r;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_outgoing_requests.items.len);
+        try self.http_outgoing_requests.append(self.allocator, r);
+        return idx;
+    }
+    fn lookupOutgoingRequest(self: *WasiCliAdapter, h: u32) ?*OutgoingRequest {
+        if (h >= self.http_outgoing_requests.items.len) return null;
+        return self.http_outgoing_requests.items[h];
+    }
+    fn pushOutgoingResponse(self: *WasiCliAdapter, r: *OutgoingResponse) !u32 {
+        for (self.http_outgoing_responses.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_outgoing_responses.items[i] = r;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_outgoing_responses.items.len);
+        try self.http_outgoing_responses.append(self.allocator, r);
+        return idx;
+    }
+    fn pushOutgoingBody(self: *WasiCliAdapter, b: *OutgoingBody) !u32 {
+        for (self.http_outgoing_bodies.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_outgoing_bodies.items[i] = b;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_outgoing_bodies.items.len);
+        try self.http_outgoing_bodies.append(self.allocator, b);
+        return idx;
+    }
+    fn pushFutureResponse(self: *WasiCliAdapter, f: *FutureIncomingResponse) !u32 {
+        for (self.http_future_responses.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_future_responses.items[i] = f;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_future_responses.items.len);
+        try self.http_future_responses.append(self.allocator, f);
+        return idx;
+    }
+    fn lookupFutureResponse(self: *WasiCliAdapter, h: u32) ?*FutureIncomingResponse {
+        if (h >= self.http_future_responses.items.len) return null;
+        return self.http_future_responses.items[h];
+    }
+    fn pushFutureTrailers(self: *WasiCliAdapter, f: *FutureTrailers) !u32 {
+        for (self.http_future_trailers.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_future_trailers.items[i] = f;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_future_trailers.items.len);
+        try self.http_future_trailers.append(self.allocator, f);
+        return idx;
+    }
+    fn pushRequestOptions(self: *WasiCliAdapter, r: *RequestOptions) !u32 {
+        for (self.http_request_options.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_request_options.items[i] = r;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_request_options.items.len);
+        try self.http_request_options.append(self.allocator, r);
+        return idx;
+    }
+
+    // --- fields ---
+
+    /// `[constructor]fields() -> own<fields>`.
+    fn httpFieldsConstructor(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const f = try self.allocator.create(HttpFields);
+        f.* = .{};
+        const h = try self.pushHttpFields(f);
+        results[0] = .{ .handle = h };
+    }
+
+    /// `[static]fields.from-list(list<tuple<field-name, field-value>>)
+    ///   -> result<own<fields>, header-error>`.
+    ///
+    /// The argument is a guest-memory list of name/value tuples;
+    /// reading and copying each entry would require recursive lifting
+    /// that the canonical-ABI layer doesn't yet hand to host fns in a
+    /// uniform shape. The default-deny adapter therefore allocates an
+    /// empty fields rep and returns ok — guests that rely on
+    /// `from-list` populating headers should instead call
+    /// `[constructor]fields` + `append` once that path is fully wired.
+    /// TODO(#149 follow-up): copy entries when ABI exposes lifted
+    /// list<tuple<string,string>> values.
+    fn httpFieldsFromList(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const f = try self.allocator.create(HttpFields);
+        f.* = .{};
+        const h = try self.pushHttpFields(f);
+        results[0] = try httpResultOk(allocator, .{ .handle = h });
+    }
+
+    /// `[method]fields.entries(borrow<fields>)
+    ///   -> list<tuple<field-name, field-value>>`. Returns an empty
+    /// list on the default-deny path; allocator-owned 0-len slice so
+    /// the result deinit shape is correct.
+    fn httpFieldsEntries(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        const empty = try allocator.alloc(InterfaceValue, 0);
+        results[0] = .{ .list_val = empty };
+    }
+
+    /// `[method]fields.get(borrow<fields>, field-name)
+    ///   -> list<field-value>`.
+    fn httpFieldsGet(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        const empty = try allocator.alloc(InterfaceValue, 0);
+        results[0] = .{ .list_val = empty };
+    }
+
+    /// `[method]fields.has(borrow<fields>, field-name) -> bool`.
+    fn httpFieldsHas(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .bool = false };
+    }
+
+    /// `[method]fields.set/append/delete -> result<_, header-error>`.
+    /// Default-deny accepts the operation as ok (no entries actually
+    /// stored — see `httpFieldsFromList` rationale).
+    fn httpFieldsSetlikeOk(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        // result<_, header-error> ok arm has no payload.
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]fields.clone(borrow<fields>) -> own<fields>`.
+    fn httpFieldsClone(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const f = try self.allocator.create(HttpFields);
+        f.* = .{};
+        const h = try self.pushHttpFields(f);
+        results[0] = .{ .handle = h };
+    }
+
+    /// `[resource-drop]fields`.
+    fn httpFieldsDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_fields_table.items.len) return;
+        if (self.http_fields_table.items[handle]) |f| {
+            f.deinit(self.allocator);
+            self.allocator.destroy(f);
+            self.http_fields_table.items[handle] = null;
+        }
+    }
+
+    // --- outgoing-request ---
+
+    /// `[constructor]outgoing-request(headers: own<fields>)
+    ///   -> outgoing-request`.
+    fn httpOutgoingRequestConstructor(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const headers_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => 0,
+        };
+        const r = try self.allocator.create(OutgoingRequest);
+        r.* = .{ .headers_handle = headers_handle };
+        const h = try self.pushOutgoingRequest(r);
+        results[0] = .{ .handle = h };
+    }
+
+    /// `[method]outgoing-request.method(borrow) -> method`. Returns a
+    /// variant value; the variant has 9 cases, the last (`other`)
+    /// carries a string payload. Default rep is `.get` (no payload).
+    fn httpOutgoingRequestMethod(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .variant_val = .{ .discriminant = 0, .payload = null } };
+            return;
+        };
+        results[0] = .{ .variant_val = .{ .discriminant = r.method_disc, .payload = null } };
+    }
+
+    /// `[method]outgoing-request.set-method(borrow, method)
+    ///   -> result<_, _>`.
+    fn httpOutgoingRequestSetMethod(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// Generic `(borrow) -> option<string>` getter that always returns
+    /// `none` on the default-deny path.
+    fn httpReturnOptionNone(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+    }
+
+    /// Generic `(borrow, ...) -> result<_, _>` setter that returns ok.
+    fn httpReturnResultOkUnit(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]outgoing-request.headers(borrow) -> own<fields>`.
+    /// The WIT contract is that this returns a mutable child handle
+    /// that aliases the request's headers; we hand back the stored
+    /// handle. Real implementations would clone or refcount; the
+    /// default-deny adapter trusts the guest not to drop the alias
+    /// before the request itself.
+    fn httpOutgoingRequestHeaders(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .handle = 0 };
+            return;
+        };
+        results[0] = .{ .handle = r.headers_handle };
+    }
+
+    /// `[method]outgoing-request.body(borrow)
+    ///   -> result<own<outgoing-body>, _>`. First call allocates a
+    /// body slot; second call errs.
+    fn httpOutgoingRequestBody(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        };
+        if (r.body_consumed) {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        }
+        r.body_consumed = true;
+        const body = try self.allocator.create(OutgoingBody);
+        body.* = .{};
+        const bh = try self.pushOutgoingBody(body);
+        results[0] = try httpResultOk(allocator, .{ .handle = bh });
+    }
+
+    /// `[resource-drop]outgoing-request`.
+    fn httpOutgoingRequestDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_outgoing_requests.items.len) return;
+        if (self.http_outgoing_requests.items[handle]) |r| {
+            r.deinit(self.allocator);
+            self.allocator.destroy(r);
+            self.http_outgoing_requests.items[handle] = null;
+        }
+    }
+
+    // --- outgoing-response ---
+
+    /// `[constructor]outgoing-response(headers: own<fields>)
+    ///   -> outgoing-response`.
+    fn httpOutgoingResponseConstructor(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const headers_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => 0,
+        };
+        const r = try self.allocator.create(OutgoingResponse);
+        r.* = .{ .headers_handle = headers_handle };
+        const h = try self.pushOutgoingResponse(r);
+        results[0] = .{ .handle = h };
+    }
+
+    /// `[method]outgoing-response.status-code(borrow) -> status-code`
+    /// (status-code is an alias for u16).
+    fn httpOutgoingResponseStatusCode(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_outgoing_responses.items.len or
+            self.http_outgoing_responses.items[handle] == null)
+        {
+            results[0] = .{ .u16 = 0 };
+            return;
+        }
+        const r = self.http_outgoing_responses.items[handle].?;
+        results[0] = .{ .u16 = r.status };
+    }
+
+    /// `[method]outgoing-response.set-status-code(borrow, status-code)
+    ///   -> result<_, _>`.
+    fn httpOutgoingResponseSetStatusCode(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const status: u16 = switch (args[1]) {
+            .u16 => |v| v,
+            .u32 => |v| @intCast(v & 0xFFFF),
+            else => 0,
+        };
+        if (handle < self.http_outgoing_responses.items.len) {
+            if (self.http_outgoing_responses.items[handle]) |r| r.status = status;
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]outgoing-response.headers(borrow) -> own<fields>`.
+    fn httpOutgoingResponseHeaders(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_outgoing_responses.items.len or
+            self.http_outgoing_responses.items[handle] == null)
+        {
+            results[0] = .{ .handle = 0 };
+            return;
+        }
+        results[0] = .{ .handle = self.http_outgoing_responses.items[handle].?.headers_handle };
+    }
+
+    /// `[method]outgoing-response.body(borrow)
+    ///   -> result<own<outgoing-body>, _>`.
+    fn httpOutgoingResponseBody(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_outgoing_responses.items.len or
+            self.http_outgoing_responses.items[handle] == null)
+        {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        }
+        const r = self.http_outgoing_responses.items[handle].?;
+        if (r.body_consumed) {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        }
+        r.body_consumed = true;
+        const body = try self.allocator.create(OutgoingBody);
+        body.* = .{};
+        const bh = try self.pushOutgoingBody(body);
+        results[0] = try httpResultOk(allocator, .{ .handle = bh });
+    }
+
+    /// `[resource-drop]outgoing-response`.
+    fn httpOutgoingResponseDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_outgoing_responses.items.len) return;
+        if (self.http_outgoing_responses.items[handle]) |r| {
+            self.allocator.destroy(r);
+            self.http_outgoing_responses.items[handle] = null;
+        }
+    }
+
+    // --- incoming-request / incoming-response (stubs) ---
+
+    /// `[method]incoming-request.method/path-with-query/scheme/authority
+    ///   /headers/consume`. The default-deny adapter never produces an
+    /// incoming-request handle, so any call hits a missing slot and we
+    /// return safe defaults.
+    fn httpIncomingRequestMethod(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .variant_val = .{ .discriminant = 0, .payload = null } };
+    }
+
+    fn httpIncomingRequestHeaders(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        // Mint an empty fields slot so the borrow points somewhere live.
+        const f = try self.allocator.create(HttpFields);
+        f.* = .{};
+        const h = try self.pushHttpFields(f);
+        results[0] = .{ .handle = h };
+    }
+
+    fn httpIncomingRequestConsume(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+    }
+
+    fn httpIncomingRequestDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_incoming_requests.items.len) return;
+        if (self.http_incoming_requests.items[handle]) |r| {
+            self.allocator.destroy(r);
+            self.http_incoming_requests.items[handle] = null;
+        }
+    }
+
+    /// `[method]incoming-response.status(borrow) -> status-code`.
+    fn httpIncomingResponseStatus(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_incoming_responses.items.len or
+            self.http_incoming_responses.items[handle] == null)
+        {
+            results[0] = .{ .u16 = 0 };
+            return;
+        }
+        results[0] = .{ .u16 = self.http_incoming_responses.items[handle].?.status };
+    }
+
+    fn httpIncomingResponseHeaders(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_incoming_responses.items.len or
+            self.http_incoming_responses.items[handle] == null)
+        {
+            // Mint an empty fields slot to keep the call total.
+            const f = try self.allocator.create(HttpFields);
+            f.* = .{};
+            const fh = try self.pushHttpFields(f);
+            results[0] = .{ .handle = fh };
+            return;
+        }
+        results[0] = .{ .handle = self.http_incoming_responses.items[handle].?.headers_handle };
+    }
+
+    fn httpIncomingResponseConsume(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+    }
+
+    fn httpIncomingResponseDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_incoming_responses.items.len) return;
+        if (self.http_incoming_responses.items[handle]) |r| {
+            self.allocator.destroy(r);
+            self.http_incoming_responses.items[handle] = null;
+        }
+    }
+
+    // --- bodies ---
+
+    /// `[method]incoming-body.stream(borrow)
+    ///   -> result<own<input-stream>, _>`. Default-deny errs because
+    /// no real wire-stream exists yet.
+    fn httpIncomingBodyStream(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+    }
+
+    /// `[static]incoming-body.finish(own<incoming-body>)
+    ///   -> own<future-trailers>`.
+    fn httpIncomingBodyFinish(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const ft = try self.allocator.create(FutureTrailers);
+        ft.* = .{};
+        const h = try self.pushFutureTrailers(ft);
+        results[0] = .{ .handle = h };
+    }
+
+    fn httpIncomingBodyDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_incoming_bodies.items.len) return;
+        if (self.http_incoming_bodies.items[handle]) |b| {
+            self.allocator.destroy(b);
+            self.http_incoming_bodies.items[handle] = null;
+        }
+    }
+
+    /// `[method]outgoing-body.write(borrow)
+    ///   -> result<own<output-stream>, _>`. Default-deny errs.
+    fn httpOutgoingBodyWrite(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+    }
+
+    /// `[static]outgoing-body.finish(own<outgoing-body>,
+    ///   option<own<trailers>>) -> result<_, error-code>`.
+    fn httpOutgoingBodyFinish(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpOutgoingBodyDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_outgoing_bodies.items.len) return;
+        if (self.http_outgoing_bodies.items[handle]) |b| {
+            self.allocator.destroy(b);
+            self.http_outgoing_bodies.items[handle] = null;
+        }
+    }
+
+    // --- futures ---
+
+    /// `[method]future-incoming-response.subscribe(borrow)
+    ///   -> own<pollable>`. Stub always-ready pollable, same handle
+    /// minting as the sockets adapter.
+    fn httpFutureSubscribe(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const h = self.next_pollable_handle;
+        self.next_pollable_handle += 1;
+        results[0] = .{ .handle = h };
+    }
+
+    /// `[method]future-incoming-response.get(borrow)
+    ///   -> option<result<result<own<incoming-response>, error-code>,
+    ///                    _>>`.
+    ///
+    /// Decoding the triple-nest:
+    /// - outer `option`: `none` while pending; `some(...)` once ready.
+    /// - middle `result<_, _>` outer arm: `err(())` if `.get` was
+    ///   already polled (per WIT — a future is single-shot).
+    /// - inner `result<incoming-response, error-code>`: actual outcome.
+    ///
+    /// Default-deny path: ready_err — `some(ok(err(HTTP_request_denied)))`.
+    fn httpFutureGet(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const fut = self.lookupFutureResponse(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        if (fut.polled) {
+            // some(err(())) — already consumed.
+            const inner = try allocator.create(InterfaceValue);
+            inner.* = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
+            return;
+        }
+        switch (fut.state) {
+            .pending => {
+                results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+                return;
+            },
+            .ready_ok => |ir_handle| {
+                fut.polled = true;
+                const inner_ok = try allocator.create(InterfaceValue);
+                inner_ok.* = .{ .handle = ir_handle };
+                const middle = try allocator.create(InterfaceValue);
+                middle.* = .{ .result_val = .{ .is_ok = true, .payload = inner_ok } };
+                const outer = try allocator.create(InterfaceValue);
+                outer.* = .{ .result_val = .{ .is_ok = true, .payload = middle } };
+                results[0] = .{ .option_val = .{ .is_some = true, .payload = outer } };
+            },
+            .ready_err => |err_disc| {
+                fut.polled = true;
+                const err_payload = try allocator.create(InterfaceValue);
+                err_payload.* = .{ .variant_val = .{ .discriminant = err_disc, .payload = null } };
+                const middle = try allocator.create(InterfaceValue);
+                middle.* = .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+                const outer = try allocator.create(InterfaceValue);
+                outer.* = .{ .result_val = .{ .is_ok = true, .payload = middle } };
+                results[0] = .{ .option_val = .{ .is_some = true, .payload = outer } };
+            },
+        }
+    }
+
+    fn httpFutureDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_future_responses.items.len) return;
+        if (self.http_future_responses.items[handle]) |f| {
+            self.allocator.destroy(f);
+            self.http_future_responses.items[handle] = null;
+        }
+    }
+
+    /// `[method]future-trailers.get(borrow)
+    ///   -> option<result<result<option<own<trailers>>, error-code>, _>>`.
+    /// Default-deny: `some(ok(ok(none)))` (no trailers).
+    fn httpFutureTrailersGet(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_future_trailers.items.len or
+            self.http_future_trailers.items[handle] == null)
+        {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        }
+        const ft = self.http_future_trailers.items[handle].?;
+        if (ft.polled) {
+            const inner = try allocator.create(InterfaceValue);
+            inner.* = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
+            return;
+        }
+        ft.polled = true;
+        // inner: option<own<trailers>> = none
+        const inner_opt = try allocator.create(InterfaceValue);
+        inner_opt.* = .{ .option_val = .{ .is_some = false, .payload = null } };
+        // middle: result<option<own<trailers>>, error-code> = ok(none)
+        const middle = try allocator.create(InterfaceValue);
+        middle.* = .{ .result_val = .{ .is_ok = true, .payload = inner_opt } };
+        // outer: result<middle, _> = ok(middle)
+        const outer = try allocator.create(InterfaceValue);
+        outer.* = .{ .result_val = .{ .is_ok = true, .payload = middle } };
+        results[0] = .{ .option_val = .{ .is_some = true, .payload = outer } };
+    }
+
+    fn httpFutureTrailersDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_future_trailers.items.len) return;
+        if (self.http_future_trailers.items[handle]) |f| {
+            self.allocator.destroy(f);
+            self.http_future_trailers.items[handle] = null;
+        }
+    }
+
+    // --- request-options / response-outparam ---
+
+    /// `[constructor]request-options() -> request-options`.
+    fn httpRequestOptionsConstructor(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const r = try self.allocator.create(RequestOptions);
+        r.* = .{};
+        const h = try self.pushRequestOptions(r);
+        results[0] = .{ .handle = h };
+    }
+
+    fn httpRequestOptionsDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_request_options.items.len) return;
+        if (self.http_request_options.items[handle]) |r| {
+            self.allocator.destroy(r);
+            self.http_request_options.items[handle] = null;
+        }
+    }
+
+    /// `[static]response-outparam.set(own<response-outparam>,
+    ///   result<own<outgoing-response>, error-code>)`. No-op: the
+    /// host never inspects the outparam on the default-deny path.
+    fn httpResponseOutparamSet(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {}
+
+    fn httpResponseOutparamDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.http_response_outparams.items.len) return;
+        if (self.http_response_outparams.items[handle]) |r| {
+            self.allocator.destroy(r);
+            self.http_response_outparams.items[handle] = null;
+        }
+    }
+
+    // --- outgoing-handler ---
+
+    /// `wasi:http/outgoing-handler.handle(own<outgoing-request>,
+    ///   option<own<request-options>>)
+    ///   -> result<own<future-incoming-response>, error-code>`.
+    ///
+    /// Default-deny: allocate a future-incoming-response in
+    /// `ready_err(HTTP_request_denied)` and return ok wrapping the
+    /// handle. The guest gets back a well-typed future that, when
+    /// polled, yields the denial error — so neither the synchronous
+    /// outer nor the eventual inner nesting traps.
+    ///
+    /// TODO(#149 follow-up): replace with a real `std.http.Client`
+    /// integration gated by an outbound-allow capability list.
+    /// Until then we never open a host socket, never speak TLS, and
+    /// never dispatch a request; the deny path keeps wasi:http
+    /// usable for components that gracefully handle denial.
+    fn httpOutgoingHandlerHandle(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const fut = try self.allocator.create(FutureIncomingResponse);
+        fut.* = .{ .state = .{ .ready_err = @intFromEnum(HttpErrorCode.HTTP_request_denied) } };
+        const h = try self.pushFutureResponse(fut);
+        results[0] = try httpResultOk(allocator, .{ .handle = h });
+    }
+
+    // --- incoming-handler ---
+
+    /// `wasi:http/incoming-handler.handle(own<incoming-request>,
+    ///   own<response-outparam>)`. Servers normally export this; the
+    /// host providing it as an import is unusual but legal. No-op.
+    fn httpIncomingHandlerHandle(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {}
+
+    /// Register `wasi:http/types` (#149).
+    pub fn populateWasiHttpTypes(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]M{
+            // fields
+            .{ .name = "[constructor]fields", .call = &httpFieldsConstructor },
+            .{ .name = "[static]fields.from-list", .call = &httpFieldsFromList },
+            .{ .name = "[method]fields.entries", .call = &httpFieldsEntries },
+            .{ .name = "[method]fields.get", .call = &httpFieldsGet },
+            .{ .name = "[method]fields.has", .call = &httpFieldsHas },
+            .{ .name = "[method]fields.set", .call = &httpFieldsSetlikeOk },
+            .{ .name = "[method]fields.append", .call = &httpFieldsSetlikeOk },
+            .{ .name = "[method]fields.delete", .call = &httpFieldsSetlikeOk },
+            .{ .name = "[method]fields.clone", .call = &httpFieldsClone },
+            .{ .name = "[resource-drop]fields", .call = &httpFieldsDrop },
+            // outgoing-request
+            .{ .name = "[constructor]outgoing-request", .call = &httpOutgoingRequestConstructor },
+            .{ .name = "[method]outgoing-request.method", .call = &httpOutgoingRequestMethod },
+            .{ .name = "[method]outgoing-request.set-method", .call = &httpOutgoingRequestSetMethod },
+            .{ .name = "[method]outgoing-request.path-with-query", .call = &httpReturnOptionNone },
+            .{ .name = "[method]outgoing-request.set-path-with-query", .call = &httpReturnResultOkUnit },
+            .{ .name = "[method]outgoing-request.scheme", .call = &httpReturnOptionNone },
+            .{ .name = "[method]outgoing-request.set-scheme", .call = &httpReturnResultOkUnit },
+            .{ .name = "[method]outgoing-request.authority", .call = &httpReturnOptionNone },
+            .{ .name = "[method]outgoing-request.set-authority", .call = &httpReturnResultOkUnit },
+            .{ .name = "[method]outgoing-request.headers", .call = &httpOutgoingRequestHeaders },
+            .{ .name = "[method]outgoing-request.body", .call = &httpOutgoingRequestBody },
+            .{ .name = "[resource-drop]outgoing-request", .call = &httpOutgoingRequestDrop },
+            // outgoing-response
+            .{ .name = "[constructor]outgoing-response", .call = &httpOutgoingResponseConstructor },
+            .{ .name = "[method]outgoing-response.status-code", .call = &httpOutgoingResponseStatusCode },
+            .{ .name = "[method]outgoing-response.set-status-code", .call = &httpOutgoingResponseSetStatusCode },
+            .{ .name = "[method]outgoing-response.headers", .call = &httpOutgoingResponseHeaders },
+            .{ .name = "[method]outgoing-response.body", .call = &httpOutgoingResponseBody },
+            .{ .name = "[resource-drop]outgoing-response", .call = &httpOutgoingResponseDrop },
+            // incoming-request
+            .{ .name = "[method]incoming-request.method", .call = &httpIncomingRequestMethod },
+            .{ .name = "[method]incoming-request.path-with-query", .call = &httpReturnOptionNone },
+            .{ .name = "[method]incoming-request.scheme", .call = &httpReturnOptionNone },
+            .{ .name = "[method]incoming-request.authority", .call = &httpReturnOptionNone },
+            .{ .name = "[method]incoming-request.headers", .call = &httpIncomingRequestHeaders },
+            .{ .name = "[method]incoming-request.consume", .call = &httpIncomingRequestConsume },
+            .{ .name = "[resource-drop]incoming-request", .call = &httpIncomingRequestDrop },
+            // incoming-response
+            .{ .name = "[method]incoming-response.status", .call = &httpIncomingResponseStatus },
+            .{ .name = "[method]incoming-response.headers", .call = &httpIncomingResponseHeaders },
+            .{ .name = "[method]incoming-response.consume", .call = &httpIncomingResponseConsume },
+            .{ .name = "[resource-drop]incoming-response", .call = &httpIncomingResponseDrop },
+            // bodies
+            .{ .name = "[method]incoming-body.stream", .call = &httpIncomingBodyStream },
+            .{ .name = "[static]incoming-body.finish", .call = &httpIncomingBodyFinish },
+            .{ .name = "[resource-drop]incoming-body", .call = &httpIncomingBodyDrop },
+            .{ .name = "[method]outgoing-body.write", .call = &httpOutgoingBodyWrite },
+            .{ .name = "[static]outgoing-body.finish", .call = &httpOutgoingBodyFinish },
+            .{ .name = "[resource-drop]outgoing-body", .call = &httpOutgoingBodyDrop },
+            // futures
+            .{ .name = "[method]future-incoming-response.subscribe", .call = &httpFutureSubscribe },
+            .{ .name = "[method]future-incoming-response.get", .call = &httpFutureGet },
+            .{ .name = "[resource-drop]future-incoming-response", .call = &httpFutureDrop },
+            .{ .name = "[method]future-trailers.subscribe", .call = &httpFutureSubscribe },
+            .{ .name = "[method]future-trailers.get", .call = &httpFutureTrailersGet },
+            .{ .name = "[resource-drop]future-trailers", .call = &httpFutureTrailersDrop },
+            // request-options / response-outparam
+            .{ .name = "[constructor]request-options", .call = &httpRequestOptionsConstructor },
+            .{ .name = "[resource-drop]request-options", .call = &httpRequestOptionsDrop },
+            .{ .name = "[static]response-outparam.set", .call = &httpResponseOutparamSet },
+            .{ .name = "[resource-drop]response-outparam", .call = &httpResponseOutparamDrop },
+        };
+        for (members) |m| {
+            try self.http_types_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.http_types_iface,
+        });
+    }
+
+    /// Register `wasi:http/outgoing-handler` (#149). Default-deny:
+    /// `handle` resolves the future to `HTTP-request-denied`.
+    pub fn populateWasiHttpOutgoingHandler(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.http_outgoing_handler_iface.members.put(self.allocator, "handle", .{
+            .func = .{ .context = self, .call = &httpOutgoingHandlerHandle },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.http_outgoing_handler_iface,
+        });
+    }
+
+    /// Register `wasi:http/incoming-handler` (#149). The host
+    /// implementation is a no-op — components are expected to *export*
+    /// this interface (they are HTTP servers); a host-side import
+    /// stub exists only so that components which incidentally import
+    /// it (e.g. for adapter-style composition) link cleanly.
+    pub fn populateWasiHttpIncomingHandler(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.http_incoming_handler_iface.members.put(self.allocator, "handle", .{
+            .func = .{ .context = self, .call = &httpIncomingHandlerHandle },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.http_incoming_handler_iface,
+        });
+    }
 };
 
 /// `wasi:clocks/wall-clock.datetime`: a record of `(seconds: u64, nanoseconds: u32)`.
@@ -2516,6 +3966,9 @@ pub fn populateWasiProviders(
     var matched_sockets_udp: ?[]const u8 = null;
     var matched_sockets_udp_create: ?[]const u8 = null;
     var matched_sockets_ip_name_lookup: ?[]const u8 = null;
+    var matched_http_types: ?[]const u8 = null;
+    var matched_http_outgoing_handler: ?[]const u8 = null;
+    var matched_http_incoming_handler: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
@@ -2580,6 +4033,15 @@ pub fn populateWasiProviders(
             matched_sockets_udp = imp.name;
         if (matched_sockets_network == null and matchesWasiPrefix(imp.name, "wasi:sockets/network"))
             matched_sockets_network = imp.name;
+        // wasi:http/* (#149). `outgoing-handler` and `incoming-handler`
+        // share the `wasi:http/` prefix with `types`, but `matchesWasiPrefix`
+        // matches at interface-name granularity so order doesn't matter.
+        if (matched_http_outgoing_handler == null and matchesWasiPrefix(imp.name, "wasi:http/outgoing-handler"))
+            matched_http_outgoing_handler = imp.name;
+        if (matched_http_incoming_handler == null and matchesWasiPrefix(imp.name, "wasi:http/incoming-handler"))
+            matched_http_incoming_handler = imp.name;
+        if (matched_http_types == null and matchesWasiPrefix(imp.name, "wasi:http/types"))
+            matched_http_types = imp.name;
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -2722,6 +4184,24 @@ pub fn populateWasiProviders(
         matched_sockets_ip_name_lookup orelse "wasi:sockets/ip-name-lookup",
     );
     if (matched_sockets_ip_name_lookup == null) _ = providers.remove("wasi:sockets/ip-name-lookup");
+
+    try adapter.populateWasiHttpTypes(
+        providers,
+        matched_http_types orelse "wasi:http/types",
+    );
+    if (matched_http_types == null) _ = providers.remove("wasi:http/types");
+
+    try adapter.populateWasiHttpOutgoingHandler(
+        providers,
+        matched_http_outgoing_handler orelse "wasi:http/outgoing-handler",
+    );
+    if (matched_http_outgoing_handler == null) _ = providers.remove("wasi:http/outgoing-handler");
+
+    try adapter.populateWasiHttpIncomingHandler(
+        providers,
+        matched_http_incoming_handler orelse "wasi:http/incoming-handler",
+    );
+    if (matched_http_incoming_handler == null) _ = providers.remove("wasi:http/incoming-handler");
 }
 
 /// Run an already-loaded component. See `runComponentBytes` for the
@@ -3857,4 +5337,183 @@ test "sockets: ip-name-lookup smoke (#148)" {
         @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
         err.variant_val.discriminant,
     );
+}
+
+test "populateWasiProviders: binds wasi:http/* (#149)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:http/types@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:http/outgoing-handler@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:http/incoming-handler@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:http/types@0.2.6"));
+    try testing.expect(providers.contains("wasi:http/outgoing-handler@0.2.6"));
+    try testing.expect(providers.contains("wasi:http/incoming-handler@0.2.6"));
+    // Bare names (no @-suffix) must NOT linger when only versioned
+    // imports were declared.
+    try testing.expect(!providers.contains("wasi:http/types"));
+    try testing.expect(!providers.contains("wasi:http/outgoing-handler"));
+
+    // Spot-check key methods.
+    try testing.expect(adapter.http_types_iface.members.contains("[constructor]fields"));
+    try testing.expect(adapter.http_types_iface.members.contains("[static]fields.from-list"));
+    try testing.expect(adapter.http_types_iface.members.contains("[constructor]outgoing-request"));
+    try testing.expect(adapter.http_types_iface.members.contains("[constructor]outgoing-response"));
+    try testing.expect(adapter.http_types_iface.members.contains("[constructor]request-options"));
+    try testing.expect(adapter.http_types_iface.members.contains("[static]response-outparam.set"));
+    try testing.expect(adapter.http_types_iface.members.contains("[method]future-incoming-response.get"));
+    try testing.expect(adapter.http_types_iface.members.contains("[resource-drop]fields"));
+    try testing.expect(adapter.http_types_iface.members.contains("[resource-drop]outgoing-request"));
+    try testing.expect(adapter.http_types_iface.members.contains("[resource-drop]future-incoming-response"));
+    try testing.expect(adapter.http_outgoing_handler_iface.members.contains("handle"));
+    try testing.expect(adapter.http_incoming_handler_iface.members.contains("handle"));
+}
+
+test "http: fields constructor + drop roundtrip (#149)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    const handle = results[0].handle;
+    try testing.expectEqual(@as(usize, 1), adapter.http_fields_table.items.len);
+    try testing.expect(adapter.http_fields_table.items[handle] != null);
+
+    // entries returns an empty list_val.
+    var entries_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    const entries_args = [_]InterfaceValue{.{ .handle = handle }};
+    try WasiCliAdapter.httpFieldsEntries(&adapter, &ci, &entries_args, &entries_results, testing.allocator);
+    try testing.expect(entries_results[0] == .list_val);
+    try testing.expectEqual(@as(usize, 0), entries_results[0].list_val.len);
+    entries_results[0].deinit(testing.allocator);
+
+    // Drop frees the slot.
+    const drop_args = [_]InterfaceValue{.{ .handle = handle }};
+    try WasiCliAdapter.httpFieldsDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
+    try testing.expect(adapter.http_fields_table.items[handle] == null);
+}
+
+test "http: fields.from-list returns ok with fresh handle (#149)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Pass an empty list-of-tuples — the adapter ignores the contents
+    // anyway on the default-deny path.
+    var ci: ComponentInstance = undefined;
+    const empty_list = try testing.allocator.alloc(InterfaceValue, 0);
+    defer testing.allocator.free(empty_list);
+    const args = [_]InterfaceValue{.{ .list_val = empty_list }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsFromList(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expect(results[0].result_val.payload.?.* == .handle);
+    try testing.expectEqual(@as(usize, 1), adapter.http_fields_table.items.len);
+}
+
+test "http: outgoing-request constructor allocates slot (#149)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    // First make a fields slot; its handle becomes the request's
+    // headers_handle.
+    var f_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &f_results, testing.allocator);
+    const fh = f_results[0].handle;
+
+    const args = [_]InterfaceValue{.{ .handle = fh }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestConstructor(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    try testing.expectEqual(@as(usize, 1), adapter.http_outgoing_requests.items.len);
+    const slot = adapter.http_outgoing_requests.items[0].?;
+    try testing.expectEqual(fh, slot.headers_handle);
+
+    // headers() should round-trip the same handle.
+    const hdr_args = [_]InterfaceValue{.{ .handle = results[0].handle }};
+    var hdr_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestHeaders(&adapter, &ci, &hdr_args, &hdr_results, testing.allocator);
+    try testing.expectEqual(fh, hdr_results[0].handle);
+}
+
+test "http: outgoing-handler.handle returns ready future with denied (#149)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    // Outer call: result<own<future-incoming-response>, error-code>.
+    const args = [_]InterfaceValue{
+        .{ .handle = 0 }, // own<outgoing-request>
+        .{ .option_val = .{ .is_some = false, .payload = null } }, // option<own<request-options>>
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const fut_handle = results[0].result_val.payload.?.handle;
+
+    // Future must be in ready_err state pre-poll.
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    try testing.expect(fut.state == .ready_err);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        fut.state.ready_err,
+    );
+
+    // Polling .get() yields some(ok(err(HTTP_request_denied))).
+    const get_args = [_]InterfaceValue{.{ .handle = fut_handle }};
+    var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFutureGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+    defer get_results[0].deinit(testing.allocator);
+
+    try testing.expect(get_results[0] == .option_val);
+    try testing.expect(get_results[0].option_val.is_some);
+    const outer = get_results[0].option_val.payload.?.*;
+    try testing.expect(outer == .result_val);
+    try testing.expect(outer.result_val.is_ok); // outer ok = future was not yet polled
+    const middle = outer.result_val.payload.?.*;
+    try testing.expect(middle == .result_val);
+    try testing.expect(!middle.result_val.is_ok); // inner err = the actual error
+    const err_variant = middle.result_val.payload.?.*;
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        err_variant.variant_val.discriminant,
+    );
+
+    // Future is now polled — second .get() must return some(err(())).
+    var get2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFutureGet(&adapter, &ci, &get_args, &get2_results, testing.allocator);
+    defer get2_results[0].deinit(testing.allocator);
+
+    try testing.expect(get2_results[0].option_val.is_some);
+    const outer2 = get2_results[0].option_val.payload.?.*;
+    try testing.expect(!outer2.result_val.is_ok);
 }
