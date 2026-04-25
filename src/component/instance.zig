@@ -255,6 +255,33 @@ pub const ComponentInstance = struct {
         return mem.data[ptr..end];
     }
 
+    /// Allocate `len` bytes inside the canonical guest linear memory and
+    /// copy `bytes` into them. Returns the guest-side pointer or null on
+    /// failure (no `cabi_realloc` export, OOM, or invocation error).
+    ///
+    /// Used by host-side callbacks (e.g. `wasi:io/streams.[method]
+    /// input-stream.blocking-read`) that must materialize a `list<u8>`
+    /// or `string` value into guest memory before the canonical ABI
+    /// stores its `(ptr, len)` representation in a spilled result tuple.
+    ///
+    /// Convention: wit-bindgen emits a single `cabi_realloc` export on
+    /// the main core module; we call it with `(0, 0, align=1, len)` to
+    /// allocate fresh space.
+    pub fn hostAllocAndWrite(self: *ComponentInstance, bytes: []const u8) ?u32 {
+        const mi = self.firstModuleInst() orelse return null;
+        const realloc_local = mi.getExportFunc("cabi_realloc") orelse return null;
+        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+        const executor = @import("executor.zig");
+        const env = ExecEnv.create(mi, 4096, self.allocator) catch return null;
+        defer env.destroy();
+        const ptr = executor.callRealloc(env, realloc_local, 0, 0, 1, @intCast(bytes.len)) catch return null;
+        const mem = mi.getMemory(0) orelse return null;
+        const end = @as(usize, ptr) + bytes.len;
+        if (end > mem.data.len) return null;
+        @memcpy(mem.data[ptr..end], bytes);
+        return ptr;
+    }
+
     /// Kind-classify a top-level component import. Pure-type imports (those
     /// whose sole purpose is to introduce a type index) do not need a runtime
     /// binding; every other kind must be satisfied by `linkImports`.

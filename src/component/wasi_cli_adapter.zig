@@ -48,12 +48,18 @@ const streams = @import("../wasi/preview2/streams.zig");
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
+    /// Captured stdin buffer. Defaults to empty; callers populate via
+    /// `setStdinBytes` before running the component. The slice is
+    /// borrowed — keep it alive for as long as the component runs.
+    stdin: streams.InputStream = .{ .source = .closed },
     /// `HostInstance` registered for the simple test interface name
     /// (e.g. `"wasi:hello/world"`). Stored inline so the adapter owns its
     /// lifetime; callers pass a stable pointer to `linkImports`.
     write_iface: HostInstance = .{},
     /// `HostInstance` for `wasi:cli/stdout` (member: `get-stdout`).
     cli_stdout_iface: HostInstance = .{},
+    /// `HostInstance` for `wasi:cli/stdin` (member: `get-stdin`).
+    cli_stdin_iface: HostInstance = .{},
     /// `HostInstance` for `wasi:io/streams` (members:
     /// `[method]output-stream.blocking-write-and-flush`,
     /// `[resource-drop]output-stream`).
@@ -76,6 +82,9 @@ pub const WasiCliAdapter = struct {
     /// "stdout"; future handle types (stderr, files) will get distinct
     /// non-zero values.
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
+    /// Adapter-internal input-stream handles, parallel to `stream_table`.
+    /// Same handle-vs-resource-table rationale.
+    input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
 
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
     /// after the component runs to inspect captured output.
@@ -90,10 +99,18 @@ pub const WasiCliAdapter = struct {
         self.stdout.deinit(self.allocator);
         self.write_iface.deinit(self.allocator);
         self.cli_stdout_iface.deinit(self.allocator);
+        self.cli_stdin_iface.deinit(self.allocator);
         self.io_streams_iface.deinit(self.allocator);
         self.io_poll_iface.deinit(self.allocator);
         self.io_error_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
+        self.input_stream_table.deinit(self.allocator);
+    }
+
+    /// Set the captured stdin to read from `bytes`. The slice is
+    /// borrowed — caller must keep it alive for the run.
+    pub fn setStdinBytes(self: *WasiCliAdapter, bytes: []const u8) void {
+        self.stdin = streams.InputStream.fromBuffer(bytes);
     }
 
     /// Captured stdout bytes (valid for buffer-backed sinks).
@@ -155,8 +172,35 @@ pub const WasiCliAdapter = struct {
             "[resource-drop]output-stream",
             .{ .func = .{ .context = self, .call = &dropOutputStream } },
         );
+        // Input-stream member surface used by stdio-echo via stdin reads.
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]input-stream.blocking-read",
+            .{ .func = .{ .context = self, .call = &blockingRead } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[resource-drop]input-stream",
+            .{ .func = .{ .context = self, .call = &dropInputStream } },
+        );
         try providers.put(self.allocator, io_streams_name, .{
             .host_instance = &self.io_streams_iface,
+        });
+    }
+
+    /// Register `wasi:cli/stdin` host binding. Members:
+    ///   - `get-stdin: () -> own<input-stream>` returns a handle into
+    ///     `self.input_stream_table` pointing at the captured stdin.
+    pub fn populateWasiCliStdin(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        cli_stdin_name: []const u8,
+    ) !void {
+        try self.cli_stdin_iface.members.put(self.allocator, "get-stdin", .{
+            .func = .{ .context = self, .call = &getStdinHandle },
+        });
+        try providers.put(self.allocator, cli_stdin_name, .{
+            .host_instance = &self.cli_stdin_iface,
         });
     }
 
@@ -312,6 +356,108 @@ pub const WasiCliAdapter = struct {
             self.stream_table.items[handle] = null;
         }
     }
+
+    fn allocInputStreamHandle(self: *WasiCliAdapter, stream: *streams.InputStream) !u32 {
+        for (self.input_stream_table.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.input_stream_table.items[i] = stream;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.input_stream_table.items.len);
+        try self.input_stream_table.append(self.allocator, stream);
+        return idx;
+    }
+
+    fn lookupInputStream(self: *WasiCliAdapter, handle: u32) ?*streams.InputStream {
+        if (handle >= self.input_stream_table.items.len) return null;
+        return self.input_stream_table.items[handle];
+    }
+
+    /// `wasi:cli/stdin.get-stdin: () -> own<input-stream>`.
+    fn getStdinHandle(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const handle = try self.allocInputStreamHandle(&self.stdin);
+        results[0] = .{ .handle = handle };
+    }
+
+    /// `wasi:io/streams.[method]input-stream.blocking-read:
+    ///   (borrow<input-stream>, u64) -> result<list<u8>, stream-error>`.
+    /// Reads up to `len` bytes from the captured stdin into a freshly
+    /// guest-allocated buffer (via `cabi_realloc`) and returns the list
+    /// in the ok arm. End-of-stream surfaces as the closed variant in
+    /// the err arm with payload omitted (caller's `result_val.payload`
+    /// is `null` — the canonical-ABI store path zero-fills the payload
+    /// slots that aren't populated).
+    fn blockingRead(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const want_u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const stream = self.lookupInputStream(handle) orelse return error.InvalidHandle;
+
+        const want: usize = @min(want_u64, std.math.maxInt(usize));
+        // Cap at a sane upper bound so an unbounded request from the guest
+        // (Rust's read_line passes 0xFFFF_FFFF_FFFF_FFFF) doesn't allocate
+        // a multi-exabyte host buffer. 64 KiB matches the canonical-ABI
+        // chunk used by wit-bindgen.
+        const capped: usize = @min(want, 64 * 1024);
+
+        const buf = try allocator.alloc(u8, capped);
+        defer allocator.free(buf);
+
+        switch (stream.read(buf)) {
+            .ok => |n| {
+                const guest_ptr = ci.hostAllocAndWrite(buf[0..n]) orelse return error.IoError;
+                const list_val = try allocator.create(InterfaceValue);
+                list_val.* = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(n) } };
+                results[0] = .{ .result_val = .{ .is_ok = true, .payload = list_val } };
+            },
+            .closed => {
+                // err arm; payload (stream-error variant) zero-fills.
+                results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            },
+            .err => return error.IoError,
+        }
+    }
+
+    /// `wasi:io/streams.[resource-drop]input-stream: (own<input-stream>) -> ()`.
+    fn dropInputStream(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle < self.input_stream_table.items.len) {
+            self.input_stream_table.items[handle] = null;
+        }
+    }
 };
 
 // ── Top-level CLI dispatch ─────────────────────────────────────────────────
@@ -357,6 +503,7 @@ pub fn populateWasiProviders(
     providers: *std.StringHashMapUnmanaged(ImportBinding),
 ) !void {
     var matched_stdout: ?[]const u8 = null;
+    var matched_stdin: ?[]const u8 = null;
     var matched_streams: ?[]const u8 = null;
     var matched_poll: ?[]const u8 = null;
     var matched_error: ?[]const u8 = null;
@@ -364,6 +511,8 @@ pub fn populateWasiProviders(
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
             matched_stdout = imp.name;
+        if (matched_stdin == null and matchesWasiPrefix(imp.name, "wasi:cli/stdin"))
+            matched_stdin = imp.name;
         if (matched_streams == null and matchesWasiPrefix(imp.name, "wasi:io/streams"))
             matched_streams = imp.name;
         if (matched_poll == null and matchesWasiPrefix(imp.name, "wasi:io/poll"))
@@ -382,6 +531,12 @@ pub fn populateWasiProviders(
     );
     if (matched_stdout == null) _ = providers.remove("wasi:cli/stdout");
     if (matched_streams == null) _ = providers.remove("wasi:io/streams");
+
+    try adapter.populateWasiCliStdin(
+        providers,
+        matched_stdin orelse "wasi:cli/stdin",
+    );
+    if (matched_stdin == null) _ = providers.remove("wasi:cli/stdin");
 
     try adapter.populateWasiIoPollError(
         providers,
@@ -960,4 +1115,41 @@ test "populateWasiProviders: binds wasi:io/poll and wasi:io/error (#154)" {
     // Resource-drop members are wired so the guest can drop pollables/errors.
     try testing.expect(adapter.io_poll_iface.members.contains("[resource-drop]pollable"));
     try testing.expect(adapter.io_error_iface.members.contains("[resource-drop]error"));
+}
+
+test "populateWasiProviders: binds wasi:cli/stdin (#152)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setStdinBytes("hello\n");
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:cli/stdin@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:cli/stdin@0.2.6"));
+    try testing.expect(!providers.contains("wasi:cli/stdin"));
+    try testing.expect(adapter.cli_stdin_iface.members.contains("get-stdin"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]input-stream.blocking-read"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[resource-drop]input-stream"));
+
+    // The captured stdin buffer is reachable as an InputStream.
+    var buf: [16]u8 = undefined;
+    const r = adapter.stdin.read(&buf);
+    switch (r) {
+        .ok => |n| try testing.expectEqualStrings("hello\n", buf[0..n]),
+        else => try testing.expect(false),
+    }
 }

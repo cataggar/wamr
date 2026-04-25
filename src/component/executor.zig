@@ -977,9 +977,13 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     }
 
     // Invoke host. Host owns allocation of any compound result values via
-    // `allocator`; simple values need no cleanup.
+    // `allocator`; we deinit each result after lowering so payloads
+    // (e.g. `.result_val.payload` for input-stream.blocking-read) don't leak.
     const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch return error.Trap;
-    defer allocator.free(results);
+    defer {
+        for (results) |r| r.deinit(allocator);
+        allocator.free(results);
+    }
     const call = ctx.host_func.call orelse return error.Trap;
     call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch return error.Trap;
 
