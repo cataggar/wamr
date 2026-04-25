@@ -1823,6 +1823,157 @@ pub fn ssaPromoteLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !boo
     return changed;
 }
 
+/// Split critical edges: for every CFG edge B→S where B has multiple
+/// successors and S has multiple predecessors, insert a new empty block
+/// N with a single `br S` terminator and retarget the B→S edge to B→N.
+///
+/// This is a prerequisite for `lowerPhisToLocals`: the lowering of a
+/// phi(...) at S inserts `local_set` instructions at the end of each
+/// predecessor of S. If a predecessor B has multiple successors, those
+/// `local_set`s would also execute on the path that doesn't reach S,
+/// clobbering values used along the other branch.
+///
+/// Also rewrites any existing phi incoming entries at S that reference
+/// B to reference the new edge-block N, so the pass is safe to run
+/// either before or after `ssaPromoteLocals`.
+pub fn splitCriticalEdges(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var successors = try analysis.buildSuccessors(func, allocator);
+    defer {
+        var sit = successors.iterator();
+        while (sit.next()) |e| allocator.free(e.value_ptr.*);
+        successors.deinit();
+    }
+    var preds = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var pit = preds.iterator();
+        while (pit.next()) |e| allocator.free(e.value_ptr.*);
+        preds.deinit();
+    }
+
+    var changed = false;
+    const orig_len = func.blocks.items.len;
+    var b_idx: u32 = 0;
+    while (b_idx < orig_len) : (b_idx += 1) {
+        const succs_b = successors.get(b_idx) orelse continue;
+        if (succs_b.len < 2) continue;
+
+        // Deduplicate target list while preserving uniqueness, since
+        // br_if with then==else (already a non-critical edge in practice)
+        // and br_table with duplicates shouldn't be split twice.
+        var seen_target = std.AutoHashMap(ir.BlockId, ir.BlockId).init(allocator);
+        defer seen_target.deinit();
+
+        for (succs_b) |s| {
+            if (seen_target.contains(s)) continue;
+            const preds_s = preds.get(s) orelse continue;
+            // preds_s is deduped by buildPredecessors; "multiple preds"
+            // means strictly > 1 distinct predecessor blocks.
+            if (preds_s.len < 2) continue;
+
+            // Critical edge B→S: insert N.
+            const n_id = try func.newBlock();
+            try func.getBlock(n_id).append(.{ .op = .{ .br = s } });
+            try seen_target.put(s, n_id);
+            changed = true;
+        }
+
+        if (seen_target.count() == 0) continue;
+
+        // Retarget B's terminator: rewrite any successor field whose
+        // value matches a key in seen_target to the corresponding new
+        // block. The terminator is the last instruction.
+        const block = func.getBlock(b_idx);
+        const term = &block.instructions.items[block.instructions.items.len - 1];
+        switch (term.op) {
+            .br => |t| if (seen_target.get(t)) |n| {
+                term.op = .{ .br = n };
+            },
+            .br_if => |bi| {
+                var nthen = bi.then_block;
+                var nelse = bi.else_block;
+                if (seen_target.get(bi.then_block)) |n| nthen = n;
+                if (seen_target.get(bi.else_block)) |n| nelse = n;
+                term.op = .{ .br_if = .{ .cond = bi.cond, .then_block = nthen, .else_block = nelse } };
+            },
+            .br_table => |bt| {
+                const new_targets = try allocator.alloc(ir.BlockId, bt.targets.len);
+                for (bt.targets, 0..) |t, i| {
+                    new_targets[i] = if (seen_target.get(t)) |n| n else t;
+                }
+                const new_default = if (seen_target.get(bt.default)) |n| n else bt.default;
+                allocator.free(@constCast(bt.targets));
+                term.op = .{ .br_table = .{ .index = bt.index, .targets = new_targets, .default = new_default } };
+            },
+            else => {},
+        }
+
+        // Rewrite phi incoming entries at S that referenced B → now
+        // reference N. (No-op when ssaPromoteLocals hasn't run yet.)
+        var sit = seen_target.iterator();
+        while (sit.next()) |entry| {
+            const s = entry.key_ptr.*;
+            const n = entry.value_ptr.*;
+            const sblock = func.getBlock(s);
+            for (sblock.instructions.items) |*inst| {
+                if (inst.op != .phi) continue;
+                const incoming = @constCast(inst.op.phi);
+                for (incoming) |*inc| {
+                    if (inc.block == b_idx) inc.block = n;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
+/// Lower phi instructions back to wasm-style local_set / local_get pairs:
+/// for each `phi(...)` in some block B with destination D and type T,
+/// allocate a fresh local L, replace the phi inst with `local_get L → D`,
+/// and append `local_set L = incoming.value` before the terminator of
+/// each incoming.block.
+///
+/// Requires that critical edges have been split (see `splitCriticalEdges`),
+/// otherwise the inserted `local_set` could execute on a path that does
+/// not reach B.
+pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    _ = allocator;
+    var changed = false;
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |*inst| {
+            if (inst.op != .phi) continue;
+
+            const incoming = inst.op.phi;
+            const dest = inst.dest.?;
+            const ty = inst.type;
+            const l = func.local_count;
+            func.local_count += 1;
+
+            for (incoming) |inc| {
+                const pblock = func.getBlock(inc.block);
+                const pset = ir.Inst{
+                    .op = .{ .local_set = .{ .idx = l, .val = inc.value } },
+                    .type = ty,
+                };
+                // Insert before the terminator (always the last inst).
+                std.debug.assert(pblock.instructions.items.len > 0);
+                const last = pblock.instructions.items.len - 1;
+                try pblock.instructions.insert(pblock.allocator, last, pset);
+            }
+
+            // Replace the phi inst in place. Free the incoming slice now
+            // because BasicBlock.deinit only frees phi-tagged ops.
+            block.allocator.free(incoming);
+            inst.* = .{
+                .op = .{ .local_get = l },
+                .dest = dest,
+                .type = ty,
+            };
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 /// Constant-fold `br_if` whose condition is a known `iconst_32`. If the
 /// condition is zero, rewrite to `br else_block`; otherwise rewrite to
 /// `br then_block`. Uses a per-block iconst_32 map (conditions are
@@ -5604,4 +5755,197 @@ test "ssaPromoteLocals: idempotent on already-promoted IR" {
     // After first run there are no local_get/set left, so second run should
     // see no promotable locals (no local_get observed) and return false.
     try std.testing.expect(!second);
+}
+
+// ── splitCriticalEdges / lowerPhisToLocals tests ───────────────────────────
+
+test "splitCriticalEdges: diamond has no critical edges (single-pred branches)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    _ = func.newVReg();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v_cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null }, .type = .i32 });
+
+    const before = func.blocks.items.len;
+    const changed = try splitCriticalEdges(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(before, func.blocks.items.len);
+}
+
+test "splitCriticalEdges: br_if to a multi-pred target splits the edge" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // CFG:
+    //   b0 -br-> b3
+    //   b1 -br_if-> {b2, b3}     ← b1→b3 is critical (b3 has 2 preds, b1 has 2 succs)
+    //   b2 -br-> b3
+    //   b3 -ret
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b3 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    const before = func.blocks.items.len;
+    const changed = try splitCriticalEdges(&func, allocator);
+    try std.testing.expect(changed);
+    // b1→b3 is critical (b1 has 2 succs, b3 has 2 preds). Inserted 1 block.
+    try std.testing.expectEqual(before + 1, func.blocks.items.len);
+
+    // b1's terminator should now point to b2 + new block (not b3 directly).
+    const term = func.getBlock(b1).instructions.items[func.getBlock(b1).instructions.items.len - 1];
+    try std.testing.expect(term.op == .br_if);
+    try std.testing.expect(term.op.br_if.then_block != b3 and term.op.br_if.else_block != b3);
+    // The else target should be the new block, which jumps to b3.
+    const new_id = term.op.br_if.else_block;
+    const new_block = func.getBlock(new_id);
+    try std.testing.expectEqual(@as(usize, 1), new_block.instructions.items.len);
+    try std.testing.expectEqual(b3, new_block.instructions.items[0].op.br);
+}
+
+test "lowerPhisToLocals: round-trips a diamond phi back to local_set/get" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 2);
+    defer func.deinit();
+    _ = func.newVReg();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v_cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .local_get = 0 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    const v_c100 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_c100, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_c100 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    const v_c200 = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_c200, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_c200 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    const v_get = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .local_get = 1 }, .dest = v_get, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_get }, .type = .i32 });
+
+    _ = try ssaPromoteLocals(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 1), countOp(&func, .phi));
+
+    // Split critical edges before lowering. Diamond is not critical
+    // (b1, b2 each have a single successor), so this is a no-op here.
+    _ = try splitCriticalEdges(&func, allocator);
+
+    const local_count_before = func.local_count;
+    const changed = try lowerPhisToLocals(&func, allocator);
+    try std.testing.expect(changed);
+
+    // No phi remains; one new local was allocated.
+    try std.testing.expectEqual(@as(usize, 0), countOp(&func, .phi));
+    try std.testing.expectEqual(local_count_before + 1, func.local_count);
+    const new_local = local_count_before;
+
+    // b3 starts with `local_get new_local → phi.dest`.
+    const b3_first = func.getBlock(b3).instructions.items[0];
+    try std.testing.expect(b3_first.op == .local_get);
+    try std.testing.expectEqual(new_local, b3_first.op.local_get);
+
+    // b1, b2 each have a `local_set new_local = const` before their terminator.
+    var found_b1_set = false;
+    var found_b2_set = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .local_set and inst.op.local_set.idx == new_local) {
+            try std.testing.expectEqual(v_c100, inst.op.local_set.val);
+            found_b1_set = true;
+        }
+    }
+    for (func.getBlock(b2).instructions.items) |inst| {
+        if (inst.op == .local_set and inst.op.local_set.idx == new_local) {
+            try std.testing.expectEqual(v_c200, inst.op.local_set.val);
+            found_b2_set = true;
+        }
+    }
+    try std.testing.expect(found_b1_set and found_b2_set);
+
+    // Last instruction in b1, b2 is still the br terminator.
+    const b1_last = func.getBlock(b1).instructions.items[func.getBlock(b1).instructions.items.len - 1];
+    const b2_last = func.getBlock(b2).instructions.items[func.getBlock(b2).instructions.items.len - 1];
+    try std.testing.expect(b1_last.op == .br);
+    try std.testing.expect(b2_last.op == .br);
+}
+
+test "splitCriticalEdges + lowerPhisToLocals: round-trip on critical-edge CFG" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+
+    // CFG with a critical edge b1→b3:
+    //   b0 -br-> b1
+    //   b1 -br_if cond-> {b2, b3}    (critical: b1→b3)
+    //   b2 -br-> b3
+    //   b3 -ret get(0)
+    // Set local 0 along both paths so b3 gets a phi.
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_zero_b0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero_b0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero_b0 } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b3 } } });
+
+    const v_c200 = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_c200, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_c200 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+
+    const v_final = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .local_get = 0 }, .dest = v_final, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_final }, .type = .i32 });
+
+    // Run the full pipeline: split → promote → lower.
+    const split_changed = try splitCriticalEdges(&func, allocator);
+    try std.testing.expect(split_changed);
+
+    _ = try ssaPromoteLocals(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 1), countOp(&func, .phi));
+
+    _ = try lowerPhisToLocals(&func, allocator);
+    try std.testing.expectEqual(@as(usize, 0), countOp(&func, .phi));
+
+    // The local_set carrying the phi value must NOT be in b1: that would
+    // execute on the b1→b2 path too. It must be in the inserted edge
+    // block. Find b3's preds.
+    var preds = try analysis.buildPredecessors(&func, allocator);
+    defer {
+        var pit = preds.iterator();
+        while (pit.next()) |e| allocator.free(e.value_ptr.*);
+        preds.deinit();
+    }
+    const b3_preds = preds.get(b3).?;
+    // After splitting + lowering: b3's preds are {b2, edge_block_from_b1}
+    // and neither should be b1 itself.
+    for (b3_preds) |p| try std.testing.expect(p != b1);
 }
