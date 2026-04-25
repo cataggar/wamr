@@ -37,6 +37,7 @@ const ImportBinding = instance_mod.ImportBinding;
 const InterfaceValue = instance_mod.InterfaceValue;
 
 const streams = @import("../wasi/preview2/streams.zig");
+const wasi_p2_core = @import("../wasi/preview2/core.zig");
 
 /// Captured stdout adapter. Owns its `OutputStream` and the `HostInstance`
 /// objects exposed to the runtime via `populateProviders`.
@@ -78,6 +79,9 @@ pub const WasiCliAdapter = struct {
     io_error_iface: HostInstance = .{},
     clocks_wall_iface: HostInstance = .{},
     clocks_monotonic_iface: HostInstance = .{},
+    random_iface: HostInstance = .{},
+    random_insecure_iface: HostInstance = .{},
+    random_insecure_seed_iface: HostInstance = .{},
 
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
@@ -97,6 +101,11 @@ pub const WasiCliAdapter = struct {
     /// clocks adapter is treated as immediately ready (same simplification
     /// as the existing `wasi:io/poll` stub). Resource-drop is a no-op.
     next_pollable_handle: u32 = 1,
+
+    /// State for the insecure PRNG. When `null`, init-time auto-seed runs
+    /// on first use. Tests can overwrite this before invoking the component
+    /// to get deterministic output.
+    insecure_prng: ?std.Random.DefaultPrng = null,
 
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
     /// after the component runs to inspect captured output.
@@ -127,6 +136,9 @@ pub const WasiCliAdapter = struct {
         self.io_error_iface.deinit(self.allocator);
         self.clocks_wall_iface.deinit(self.allocator);
         self.clocks_monotonic_iface.deinit(self.allocator);
+        self.random_iface.deinit(self.allocator);
+        self.random_insecure_iface.deinit(self.allocator);
+        self.random_insecure_seed_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
     }
@@ -456,6 +468,68 @@ pub const WasiCliAdapter = struct {
         });
     }
 
+    /// Register `wasi:random/random` (#147).
+    ///
+    /// Members:
+    ///   - `get-random-bytes: (len: u64) -> list<u8>` — secure random bytes
+    ///     from the OS (linux: `getrandom(2)`; windows: `ProcessPrng`;
+    ///     other: `arc4random_buf`). The returned `list<u8>` is allocated
+    ///     into guest linear memory via `cabi_realloc` and lifted as the
+    ///     canonical `(ptr, len)` pair.
+    ///   - `get-random-u64: () -> u64`.
+    pub fn populateWasiRandomRandom(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        random_name: []const u8,
+    ) !void {
+        try self.random_iface.members.put(self.allocator, "get-random-bytes", .{
+            .func = .{ .context = self, .call = &getRandomBytes },
+        });
+        try self.random_iface.members.put(self.allocator, "get-random-u64", .{
+            .func = .{ .context = self, .call = &getRandomU64 },
+        });
+        try providers.put(self.allocator, random_name, .{
+            .host_instance = &self.random_iface,
+        });
+    }
+
+    /// Register `wasi:random/insecure` (#147). Backed by
+    /// `std.Random.DefaultPrng` (Xoshiro256), lazily auto-seeded from the
+    /// secure source. Tests can overwrite `self.insecure_prng` for
+    /// determinism.
+    pub fn populateWasiRandomInsecure(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        insecure_name: []const u8,
+    ) !void {
+        try self.random_insecure_iface.members.put(self.allocator, "get-insecure-random-bytes", .{
+            .func = .{ .context = self, .call = &getInsecureRandomBytes },
+        });
+        try self.random_insecure_iface.members.put(self.allocator, "get-insecure-random-u64", .{
+            .func = .{ .context = self, .call = &getInsecureRandomU64 },
+        });
+        try providers.put(self.allocator, insecure_name, .{
+            .host_instance = &self.random_insecure_iface,
+        });
+    }
+
+    /// Register `wasi:random/insecure-seed` (#147). `insecure-seed: () ->
+    /// tuple<u64, u64>` returns 128 bits of *secure* entropy that the
+    /// guest can use to seed its own PRNG. The "insecure" label refers to
+    /// the *guest's* responsibility, not the host source quality.
+    pub fn populateWasiRandomInsecureSeed(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        insecure_seed_name: []const u8,
+    ) !void {
+        try self.random_insecure_seed_iface.members.put(self.allocator, "insecure-seed", .{
+            .func = .{ .context = self, .call = &insecureSeed },
+        });
+        try providers.put(self.allocator, insecure_seed_name, .{
+            .host_instance = &self.random_insecure_seed_iface,
+        });
+    }
+
     /// `(own<R>) -> ()` no-op — the host never produces non-stream
     /// resources on the happy path, so dropping one is purely guest-side
     /// bookkeeping that we can swallow.
@@ -466,6 +540,106 @@ pub const WasiCliAdapter = struct {
         _: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {}
+
+    /// `wasi:random/random.get-random-bytes: (u64) -> list<u8>` (#147).
+    fn getRandomBytes(
+        _: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const want_u64 = switch (args[0]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const want: usize = @min(want_u64, std.math.maxInt(usize));
+        // Cap at 64 KiB — same cap `blockingRead` uses, prevents a hostile
+        // guest from forcing a multi-exabyte host allocation.
+        const capped: usize = @min(want, 64 * 1024);
+        const buf = try allocator.alloc(u8, capped);
+        defer allocator.free(buf);
+        wasi_p2_core.Random.getRandomBytes(buf);
+        const guest_ptr = ci.hostAllocAndWrite(buf) orelse return error.IoError;
+        results[0] = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(capped) } };
+    }
+
+    /// `wasi:random/random.get-random-u64: () -> u64` (#147).
+    fn getRandomU64(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .u64 = wasi_p2_core.Random.getRandomU64() };
+    }
+
+    /// `wasi:random/insecure.get-insecure-random-bytes: (u64) -> list<u8>` (#147).
+    fn getInsecureRandomBytes(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const want_u64 = switch (args[0]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const want: usize = @min(want_u64, std.math.maxInt(usize));
+        const capped: usize = @min(want, 64 * 1024);
+        const buf = try allocator.alloc(u8, capped);
+        defer allocator.free(buf);
+        self.ensureInsecurePrng().bytes(buf);
+        const guest_ptr = ci.hostAllocAndWrite(buf) orelse return error.IoError;
+        results[0] = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(capped) } };
+    }
+
+    /// `wasi:random/insecure.get-insecure-random-u64: () -> u64` (#147).
+    fn getInsecureRandomU64(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .u64 = self.ensureInsecurePrng().int(u64) };
+    }
+
+    /// `wasi:random/insecure-seed.insecure-seed: () -> tuple<u64, u64>` (#147).
+    fn insecureSeed(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        const fields = try allocator.alloc(InterfaceValue, 2);
+        fields[0] = .{ .u64 = wasi_p2_core.Random.getRandomU64() };
+        fields[1] = .{ .u64 = wasi_p2_core.Random.getRandomU64() };
+        results[0] = .{ .tuple_val = fields };
+    }
+
+    /// Lazy-init view onto the adapter's insecure PRNG. Auto-seeds from
+    /// the OS on first call; tests can pin a deterministic seed by
+    /// writing `self.insecure_prng` directly first.
+    fn ensureInsecurePrng(self: *WasiCliAdapter) std.Random {
+        if (self.insecure_prng == null) {
+            var seed_bytes: [8]u8 = undefined;
+            wasi_p2_core.Random.getRandomBytes(&seed_bytes);
+            const seed = std.mem.readInt(u64, &seed_bytes, .little);
+            self.insecure_prng = std.Random.DefaultPrng.init(seed);
+        }
+        return self.insecure_prng.?.random();
+    }
 
     /// `wasi:clocks/wall-clock.now: () -> datetime` (#146).
     /// Lifts UNIX-epoch nanos into `record { seconds: u64, nanoseconds: u32 }`.
@@ -1083,6 +1257,9 @@ pub fn populateWasiProviders(
     var matched_error: ?[]const u8 = null;
     var matched_wall_clock: ?[]const u8 = null;
     var matched_monotonic_clock: ?[]const u8 = null;
+    var matched_random: ?[]const u8 = null;
+    var matched_random_insecure: ?[]const u8 = null;
+    var matched_random_insecure_seed: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
@@ -1115,6 +1292,17 @@ pub fn populateWasiProviders(
             matched_wall_clock = imp.name;
         if (matched_monotonic_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/monotonic-clock"))
             matched_monotonic_clock = imp.name;
+        // `wasi:random/insecure-seed` shares the `wasi:random/insecure`
+        // prefix, so test the more-specific name first.
+        if (matched_random_insecure_seed == null and matchesWasiPrefix(imp.name, "wasi:random/insecure-seed"))
+            matched_random_insecure_seed = imp.name;
+        if (matched_random_insecure == null and
+            !(matched_random_insecure_seed != null and
+                std.mem.eql(u8, matched_random_insecure_seed.?, imp.name)) and
+            matchesWasiPrefix(imp.name, "wasi:random/insecure"))
+            matched_random_insecure = imp.name;
+        if (matched_random == null and matchesWasiPrefix(imp.name, "wasi:random/random"))
+            matched_random = imp.name;
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -1185,6 +1373,24 @@ pub fn populateWasiProviders(
         matched_monotonic_clock orelse "wasi:clocks/monotonic-clock",
     );
     if (matched_monotonic_clock == null) _ = providers.remove("wasi:clocks/monotonic-clock");
+
+    try adapter.populateWasiRandomRandom(
+        providers,
+        matched_random orelse "wasi:random/random",
+    );
+    if (matched_random == null) _ = providers.remove("wasi:random/random");
+
+    try adapter.populateWasiRandomInsecure(
+        providers,
+        matched_random_insecure orelse "wasi:random/insecure",
+    );
+    if (matched_random_insecure == null) _ = providers.remove("wasi:random/insecure");
+
+    try adapter.populateWasiRandomInsecureSeed(
+        providers,
+        matched_random_insecure_seed orelse "wasi:random/insecure-seed",
+    );
+    if (matched_random_insecure_seed == null) _ = providers.remove("wasi:random/insecure-seed");
 }
 
 /// Run an already-loaded component. See `runComponentBytes` for the
@@ -1975,4 +2181,95 @@ test "wasi:clocks/monotonic-clock.subscribe-instant mints unique pollable handle
     try WasiCliAdapter.monotonicSubscribe(&adapter, &ci, &args, &r2, testing.allocator);
 
     try testing.expect(r1[0].handle != r2[0].handle);
+}
+
+test "populateWasiProviders: binds wasi:random/random + insecure + insecure-seed (#147)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:random/random@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:random/insecure@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:random/insecure-seed@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &.{},        .canons = &.{},
+        .imports = &imports,  .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:random/random@0.2.6"));
+    try testing.expect(providers.contains("wasi:random/insecure@0.2.6"));
+    try testing.expect(providers.contains("wasi:random/insecure-seed@0.2.6"));
+    try testing.expect(!providers.contains("wasi:random/random"));
+    try testing.expect(!providers.contains("wasi:random/insecure"));
+    try testing.expect(!providers.contains("wasi:random/insecure-seed"));
+    try testing.expect(adapter.random_iface.members.contains("get-random-bytes"));
+    try testing.expect(adapter.random_iface.members.contains("get-random-u64"));
+    try testing.expect(adapter.random_insecure_iface.members.contains("get-insecure-random-bytes"));
+    try testing.expect(adapter.random_insecure_iface.members.contains("get-insecure-random-u64"));
+    try testing.expect(adapter.random_insecure_seed_iface.members.contains("insecure-seed"));
+}
+
+test "wasi:random/random.get-random-u64 returns a u64 lift (#147)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.getRandomU64(null, &ci, &.{}, &results, testing.allocator);
+
+    try testing.expect(results[0] == .u64);
+}
+
+test "wasi:random/insecure-seed lifts tuple<u64, u64> via tuple_val (#147)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.insecureSeed(null, &ci, &.{}, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .tuple_val);
+    try testing.expectEqual(@as(usize, 2), results[0].tuple_val.len);
+    try testing.expect(results[0].tuple_val[0] == .u64);
+    try testing.expect(results[0].tuple_val[1] == .u64);
+}
+
+test "wasi:random/insecure: deterministic seed produces reproducible output (#147)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    adapter.insecure_prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const a = adapter.ensureInsecurePrng().int(u64);
+    const b = adapter.ensureInsecurePrng().int(u64);
+
+    adapter.insecure_prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const a2 = adapter.ensureInsecurePrng().int(u64);
+    const b2 = adapter.ensureInsecurePrng().int(u64);
+
+    try testing.expectEqual(a, a2);
+    try testing.expectEqual(b, b2);
+    try testing.expect(a != b);
+}
+
+test "wasi:random secure helpers fill a host buffer (#147)" {
+    const testing = std.testing;
+    var buf: [32]u8 = @splat(0);
+    wasi_p2_core.Random.getRandomBytes(&buf);
+
+    var any_nonzero = false;
+    for (buf) |b| if (b != 0) { any_nonzero = true; break; };
+    try testing.expect(any_nonzero);
 }
