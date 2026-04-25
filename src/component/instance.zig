@@ -454,24 +454,43 @@ pub fn instantiate(
                     const loaded = loader.load(core_mod.data, mod_alloc) catch continue;
                     const module_ptr = mod_alloc.create(core_types.WasmModule) catch continue;
                     module_ptr.* = loaded;
-                    const mi = inst_mod.instantiate(module_ptr, allocator) catch continue;
-                    cis[ci_idx] = .{ .module_inst = mi };
 
-                    // Build per-import host_func_entries by resolving each
-                    // core import against the named arg → prior inline
-                    // instance exports. For function imports backed by a
-                    // canon.lower, install a componentTrampoline.
-                    if (module_ptr.import_function_count == 0) continue;
-
-                    const entries = allocator.alloc(?core_types.HostFnEntry, module_ptr.import_function_count) catch continue;
-                    @memset(entries, null);
+                    // Resolve every function import against `with` args BEFORE
+                    // instantiation. Two backends:
+                    //   * Cross-instance: the source `with`-arg is a real core
+                    //     module instance; wire `import_functions[i]` so the
+                    //     interpreter dispatches into the source's body
+                    //     (interp.executeFunction switches `env.module_inst`).
+                    //   * Canon.lower: the source is an inline-exports bundle
+                    //     pointing at a `canon lower` core func; install a
+                    //     `componentTrampoline` on `host_func_entries[i]`.
+                    // Slots not satisfied by either backend remain unresolved
+                    // (interp falls through to a no-op stub).
+                    const import_func_count = module_ptr.import_function_count;
+                    var entries: []?core_types.HostFnEntry = &.{};
+                    var imps_buf: []core_types.ImportedFunction = &.{};
+                    var is_cross: []bool = &.{};
+                    var first_cross_src: ?*core_types.ModuleInstance = null;
+                    if (import_func_count > 0) {
+                        entries = allocator.alloc(?core_types.HostFnEntry, import_func_count) catch continue;
+                        @memset(entries, null);
+                        imps_buf = allocator.alloc(core_types.ImportedFunction, import_func_count) catch {
+                            allocator.free(entries);
+                            continue;
+                        };
+                        is_cross = allocator.alloc(bool, import_func_count) catch {
+                            allocator.free(entries);
+                            allocator.free(imps_buf);
+                            continue;
+                        };
+                        @memset(is_cross, false);
+                    }
 
                     var imp_func_idx: u32 = 0;
                     for (module_ptr.imports) |imp| {
                         if (imp.kind != .function) continue;
                         defer imp_func_idx += 1;
 
-                        // Find arg with matching core-module-import "module name".
                         const source_inst_idx: u32 = arg_blk: {
                             for (ie.args) |arg| {
                                 if (std.mem.eql(u8, arg.name, imp.module_name)) break :arg_blk arg.instance_idx;
@@ -482,7 +501,17 @@ pub fn instantiate(
                         if (source_inst_idx >= ci_idx) continue;
                         const source_entry = cis[source_inst_idx];
 
-                        // Find matching named member in the source instance's inline exports.
+                        if (source_entry.module_inst) |src_mi| {
+                            // Cross-instance core wiring: look up the named
+                            // export in the source module instance.
+                            const target_func_idx = src_mi.getExportFunc(imp.field_name) orelse continue;
+                            imps_buf[imp_func_idx] = .{ .module_inst = src_mi, .func_idx = target_func_idx };
+                            is_cross[imp_func_idx] = true;
+                            if (first_cross_src == null) first_cross_src = src_mi;
+                            continue;
+                        }
+
+                        // Inline-exports source — existing canon.lower path.
                         var member_sort_idx: ?ctypes.CoreSort = null;
                         var member_idx: u32 = 0;
                         for (source_entry.inline_exports) |mem| {
@@ -576,7 +605,40 @@ pub fn instantiate(
                         };
                     }
 
-                    inst_mod.attachHostFuncEntries(mi, entries);
+                    // Instantiate, optionally seeding `import_functions` for
+                    // cross-instance wiring. Slots that aren't cross-instance
+                    // get a safe placeholder pointing at any cross-source we
+                    // saw — interp dispatch never reaches them because their
+                    // `host_func_entries[i]` is non-null (canon.lower) or the
+                    // import is unresolved (caught by the no-op stub before
+                    // `import_functions` is consulted).
+                    const mi = blk: {
+                        if (first_cross_src) |placeholder| {
+                            for (imps_buf, 0..) |*slot, i| {
+                                if (!is_cross[i]) {
+                                    slot.* = .{ .module_inst = placeholder, .func_idx = 0 };
+                                }
+                            }
+                            const ctx = inst_mod.ImportContext{ .functions = imps_buf };
+                            break :blk inst_mod.instantiateWithImports(module_ptr, allocator, ctx) catch {
+                                if (entries.len > 0) allocator.free(entries);
+                                if (imps_buf.len > 0) allocator.free(imps_buf);
+                                if (is_cross.len > 0) allocator.free(is_cross);
+                                continue;
+                            };
+                        }
+                        break :blk inst_mod.instantiate(module_ptr, allocator) catch {
+                            if (entries.len > 0) allocator.free(entries);
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            continue;
+                        };
+                    };
+                    cis[ci_idx] = .{ .module_inst = mi };
+
+                    if (entries.len > 0) inst_mod.attachHostFuncEntries(mi, entries);
+                    if (imps_buf.len > 0) allocator.free(imps_buf);
+                    if (is_cross.len > 0) allocator.free(is_cross);
                 },
             }
         }
@@ -1366,6 +1428,43 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
     var results: [1]abi_mod.InterfaceValue = undefined;
     try executor.callComponentFunc(inst, "run", &args, &results, std.testing.allocator);
     try std.testing.expectEqual(@as(i32, 5), results[0].s32);
+}
+
+test "instantiate: H1 micro-fixture — multi-core-module composition with cross-instance call (#156 H1)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Two-module composition (see fixtures/h1-compose.wat):
+    //   $A exports func "f" returning 7.
+    //   $B imports "a"."f", exports "g" returning f()+1 (==8).
+    //   The component aliases $b's "g" and lifts it as export "g" : u32.
+    // Exercises:
+    //   * `(core instance (instantiate $B (with "a" (instance $a))))` where
+    //     the source instance is a real module_inst, not an inline-exports
+    //     bundle — currently the resolver only consults inline_exports.
+    //   * `(alias core export $b "g")` driving the lifted export through
+    //     the second core instance.
+    const data = @embedFile("fixtures/h1-compose.wasm");
+    // The loader has no Component.deinit yet (see #142 Phase 1B); allocate
+    // its small slices into an arena so the test doesn't leak.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    // No host imports needed — both core modules are self-contained.
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try inst.linkImports(providers);
+
+    var args: [0]abi_mod.InterfaceValue = .{};
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "g", &args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 8), results[0].u32);
 }
 
 test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)" {
