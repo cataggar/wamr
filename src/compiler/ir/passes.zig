@@ -220,6 +220,22 @@ pub fn replaceVReg(func: *ir.IrFunction, old: ir.VReg, new: ir.VReg) void {
     }
 }
 
+/// Count the number of operand slots in `func` that currently reference
+/// `vreg`. Cheap O(N) scan; used by passes that need to detect whether
+/// a rewrite would actually change anything (for idempotent fixpoint
+/// reporting).
+pub fn countUsesOfVReg(func: *const ir.IrFunction, vreg: ir.VReg) u32 {
+    var count: u32 = 0;
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            for (getUsedVRegs(inst).slice()) |u| {
+                if (u == vreg) count += 1;
+            }
+        }
+    }
+    return count;
+}
+
 fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
     switch (inst.op) {
         .iconst_32, .iconst_64, .fconst_32, .fconst_64,
@@ -678,7 +694,252 @@ pub fn strengthReduceMul(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
     return changed;
 }
 
+/// Classification of a constant multiplier that reduces to a single
+/// shift plus an add (or subtract) of the multiplicand.
+const ShiftAddKind = struct { k: u6, is_plus: bool };
+
+/// Return `{ k, is_plus }` if `c` is `2^k + 1` (is_plus=true) or
+/// `2^k - 1` (is_plus=false) with `k` in the legal shift range for
+/// `ir_type`. Used to recognise multipliers that reduce to
+/// `(x << k) + x` or `(x << k) - x` rather than a single shift.
+///
+/// `k == 0` (for the plus form: C == 2) is excluded so this helper
+/// does not poach cases already handled by `powerOfTwoShift`
+/// (`mul x, 2` → `shl x, 1`). `k == 1` for the minus form (C == 1)
+/// is a no-op multiply handled by `constantFold`.
+fn shiftPlusMinusOne(c: i64, ir_type: ir.IrType) ?ShiftAddKind {
+    const u: u64 = switch (ir_type) {
+        .i32 => @as(u32, @truncate(@as(u64, @bitCast(c)))),
+        .i64 => @bitCast(c),
+        else => return null,
+    };
+    if (u < 3) return null;
+    const max: u6 = if (ir_type == .i32) 31 else 63;
+
+    // 2^k + 1: `u - 1` is a non-zero power of two, k = ctz(u-1), k >= 1.
+    const p = u - 1;
+    if (p != 0 and (p & (p - 1)) == 0) {
+        const k: u6 = @intCast(@ctz(p));
+        if (k >= 1 and k <= max) return .{ .k = k, .is_plus = true };
+    }
+
+    // 2^k - 1: `u + 1` is a non-zero power of two, k = ctz(u+1), k >= 2.
+    // Skip when `u + 1` wraps to 0 in u64 (i.e. u == 2^64 - 1, i64 case).
+    const q = u +% 1;
+    if (q != 0 and (q & (q -% 1)) == 0) {
+        const k: u6 = @intCast(@ctz(q));
+        if (k >= 2 and k <= max) return .{ .k = k, .is_plus = false };
+    }
+
+    return null;
+}
+
+/// Rewrite `mul(x, 2^k + 1)` → `add(shl(x, k), x)` and
+/// `mul(x, 2^k - 1)` → `sub(shl(x, k), x)`. This covers the common
+/// small-integer multipliers — 3, 5, 7, 9, 15, 17, 31, 33, ... — that
+/// turn into a single latency-1 shift + add/sub on AArch64 and x86-64
+/// instead of the 3–4 cycle integer multiplier. Array indexing with
+/// element sizes like 3, 5, 6 (2*3), 9, 12 is the dominant source in
+/// real workloads; the pow2-only `strengthReduceMul` misses these
+/// entirely.
+///
+/// Matches only when the constant operand of `.mul` is defined by an
+/// `iconst_32` / `iconst_64` in the same block (matching
+/// `strengthReduceMul`'s block-local lowering assumption). Does not
+/// fire when the constant is a power of two — those are left to
+/// `strengthReduceMul`.
+///
+/// Cost: replaces 1 mul with 2 arithmetic instructions (plus a shift
+/// amount iconst that DCE / backend constant-folding will coalesce).
+/// On both target backends `shl` + `add`/`sub` decode to the
+/// `add x, x, x, lsl #k` style fused AArch64 instruction or an
+/// `lea`/shift-add sequence on x86-64, so the net is usually a strict
+/// win vs `imul`.
+pub fn strengthReduceMulShiftAdd(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer constants.deinit();
+
+    for (func.blocks.items) |*block| {
+        constants.clearRetainingCapacity();
+
+        var i: usize = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const inst = block.instructions.items[i];
+            switch (inst.op) {
+                .iconst_32 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .iconst_64 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .mul => |bin| {
+                    const dest = inst.dest orelse continue;
+                    const lhs_const = constants.get(bin.lhs);
+                    const rhs_const = constants.get(bin.rhs);
+
+                    // Skip if either operand is already a power of two —
+                    // `strengthReduceMul` handles that pattern and will
+                    // convert it to a single `shl` which dominates this
+                    // two-instruction form.
+                    if (rhs_const) |rc| if (powerOfTwoShift(rc, inst.type) != null) continue;
+                    if (lhs_const) |lc| if (powerOfTwoShift(lc, inst.type) != null) continue;
+
+                    var x_vreg: ir.VReg = undefined;
+                    var info: ShiftAddKind = undefined;
+                    if (rhs_const) |c| {
+                        if (shiftPlusMinusOne(c, inst.type)) |r| {
+                            x_vreg = bin.lhs;
+                            info = r;
+                        } else if (lhs_const) |lc| {
+                            if (shiftPlusMinusOne(lc, inst.type)) |r| {
+                                x_vreg = bin.rhs;
+                                info = r;
+                            } else continue;
+                        } else continue;
+                    } else if (lhs_const) |c| {
+                        if (shiftPlusMinusOne(c, inst.type)) |r| {
+                            x_vreg = bin.rhs;
+                            info = r;
+                        } else continue;
+                    } else continue;
+
+                    // Splice in two instructions *before* the mul at index i:
+                    //   [i]   iconst shift_vreg = k
+                    //   [i+1] shl    shl_vreg   = x << shift_vreg
+                    // and rewrite the mul (now at index i+2) to add/sub.
+                    const shift_vreg = func.newVReg();
+                    const shl_vreg = func.newVReg();
+                    const shift_op: ir.Inst.Op = if (inst.type == .i64)
+                        .{ .iconst_64 = @intCast(info.k) }
+                    else
+                        .{ .iconst_32 = @intCast(info.k) };
+                    try block.instructions.insert(
+                        block.allocator,
+                        i,
+                        .{ .op = shift_op, .dest = shift_vreg, .type = inst.type },
+                    );
+                    try block.instructions.insert(
+                        block.allocator,
+                        i + 1,
+                        .{ .op = .{ .shl = .{ .lhs = x_vreg, .rhs = shift_vreg } }, .dest = shl_vreg, .type = inst.type },
+                    );
+                    if (info.is_plus) {
+                        block.instructions.items[i + 2].op = .{ .add = .{ .lhs = shl_vreg, .rhs = x_vreg } };
+                    } else {
+                        block.instructions.items[i + 2].op = .{ .sub = .{ .lhs = shl_vreg, .rhs = x_vreg } };
+                    }
+                    block.instructions.items[i + 2].dest = dest;
+
+                    try constants.put(shift_vreg, @intCast(info.k));
+                    changed = true;
+                    i += 2; // skip over the two newly-inserted instructions
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
+
 // ── Dead Code Elimination ───────────────────────────────────────────────────
+
+/// Rewrite `div_u(x, 2^k)` → `shr_u(x, k)` and `rem_u(x, 2^k)` → `and(x, 2^k - 1)`.
+/// Unsigned integer division and modulo by a power-of-two constant
+/// divisor are equivalent to a shift and a mask, which are ~5-10× faster
+/// than the hardware divider on both x86-64 and AArch64 and avoid the
+/// microarchitectural div-unit pressure.
+///
+/// Only rewrites when the rhs is produced by an `iconst_32` /
+/// `iconst_64` defined earlier in the same block (matches
+/// `strengthReduceMul`'s straight-line lowering assumption). Signed
+/// `div_s`/`rem_s` are intentionally NOT handled here — they require
+/// rounding-toward-zero bias adjustment for negative dividends which is
+/// several additional ops; those patterns are better left to a dedicated
+/// magic-number pass.
+///
+/// Safety: `powerOfTwoShift` rejects c == 0, so we never rewrite a
+/// division that could trap at runtime; c == 1 is also rejected (the
+/// result would be `x` / `0` which the existing `constantFold` handles
+/// algebraically if it fires). Float div/rem are unchanged (not
+/// integer, `powerOfTwoShift` returns null).
+pub fn strengthReduceDivRem(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var constants = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    defer constants.deinit();
+
+    for (func.blocks.items) |*block| {
+        constants.clearRetainingCapacity();
+
+        var i: usize = 0;
+        while (i < block.instructions.items.len) : (i += 1) {
+            const inst = block.instructions.items[i];
+            switch (inst.op) {
+                .iconst_32 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .iconst_64 => |v| if (inst.dest) |d| {
+                    try constants.put(d, v);
+                },
+                .div_u => |bin| {
+                    const dest = inst.dest orelse continue;
+                    if (inst.type != .i32 and inst.type != .i64) continue;
+                    const rhs_const = constants.get(bin.rhs) orelse continue;
+                    const k = powerOfTwoShift(rhs_const, inst.type) orelse continue;
+
+                    const shift_vreg = func.newVReg();
+                    const shift_op: ir.Inst.Op = if (inst.type == .i64)
+                        .{ .iconst_64 = @intCast(k) }
+                    else
+                        .{ .iconst_32 = @intCast(k) };
+                    try block.instructions.insert(
+                        block.allocator,
+                        i,
+                        .{ .op = shift_op, .dest = shift_vreg, .type = inst.type },
+                    );
+                    block.instructions.items[i + 1].op = .{ .shr_u = .{
+                        .lhs = bin.lhs,
+                        .rhs = shift_vreg,
+                    } };
+                    block.instructions.items[i + 1].dest = dest;
+                    try constants.put(shift_vreg, @intCast(k));
+                    changed = true;
+                    i += 1; // skip over the newly-inserted iconst
+                },
+                .rem_u => |bin| {
+                    const dest = inst.dest orelse continue;
+                    if (inst.type != .i32 and inst.type != .i64) continue;
+                    const rhs_const = constants.get(bin.rhs) orelse continue;
+                    const k = powerOfTwoShift(rhs_const, inst.type) orelse continue;
+
+                    // mask = 2^k - 1. Compute in u64 to avoid sign-shift
+                    // edge cases; truncate for the i32 iconst.
+                    const mask_u: u64 = (@as(u64, 1) << k) - 1;
+                    const mask_vreg = func.newVReg();
+                    const mask_op: ir.Inst.Op = if (inst.type == .i64)
+                        .{ .iconst_64 = @bitCast(mask_u) }
+                    else
+                        .{ .iconst_32 = @bitCast(@as(u32, @truncate(mask_u))) };
+                    try block.instructions.insert(
+                        block.allocator,
+                        i,
+                        .{ .op = mask_op, .dest = mask_vreg, .type = inst.type },
+                    );
+                    block.instructions.items[i + 1].op = .{ .@"and" = .{
+                        .lhs = bin.lhs,
+                        .rhs = mask_vreg,
+                    } };
+                    block.instructions.items[i + 1].dest = dest;
+                    try constants.put(mask_vreg, @as(i64, @bitCast(mask_u)));
+                    changed = true;
+                    i += 1;
+                },
+                else => {},
+            }
+        }
+    }
+    return changed;
+}
 
 /// Remove instructions whose dest VReg is never used.
 pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
@@ -711,6 +972,89 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
     return changed;
 }
 
+/// Value-independent algebraic simplifications. Complements
+/// `constantFold` (which only fires when a concrete constant operand
+/// is visible) by exploiting the fact that `x op x` often reduces to
+/// a constant or to `x` itself, regardless of `x`'s value:
+///
+///   sub x, x        -> 0
+///   xor x, x        -> 0
+///   and x, x        -> x
+///   or  x, x        -> x
+///   eq  x, x        -> 1
+///   ne  x, x        -> 0
+///   lt_s/lt_u x, x  -> 0
+///   gt_s/gt_u x, x  -> 0
+///   le_s/le_u x, x  -> 1
+///   ge_s/ge_u x, x  -> 1
+///
+/// These patterns appear after `forwardLocalGet` or `commonSubexprElimination`
+/// coalesce two vregs into one (e.g. a loop guard that was already
+/// proven earlier). They are all sound without value knowledge:
+///
+/// - None of the integer operations above trap (div/rem are deliberately
+///   excluded — `x/x` traps when x == 0).
+/// - Float compares are deliberately excluded — `NaN == NaN` is false,
+///   so `f_eq x, x` does not reduce to 1.
+/// - Operations that reduce to a constant leave the original dest in
+///   place (now produced by an `iconst_*`); users see the new value.
+/// - Operations that reduce to `x` rewrite uses via `replaceVReg` and
+///   leave an `iconst_32 = 0` placeholder for `deadCodeElimination` to
+///   sweep, matching the convention used by `constantFold`.
+pub fn algebraicSimplify(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    _ = allocator;
+    var changed = false;
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |*inst| {
+            const dest = inst.dest orelse continue;
+            const is_int = inst.type == .i32 or inst.type == .i64;
+            if (!is_int) continue;
+
+            switch (inst.op) {
+                .sub, .xor => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    if (inst.type == .i64) {
+                        inst.op = .{ .iconst_64 = 0 };
+                    } else {
+                        inst.op = .{ .iconst_32 = 0 };
+                    }
+                    changed = true;
+                },
+                .@"and", .@"or" => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    const keep = bin.lhs;
+                    replaceVReg(func, dest, keep);
+                    inst.op = .{ .iconst_32 = 0 };
+                    changed = true;
+                },
+                .eq, .le_s, .le_u, .ge_s, .ge_u => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    // Match `constantFold` convention: width is `inst.type`.
+                    if (inst.type == .i64) {
+                        inst.op = .{ .iconst_64 = 1 };
+                    } else {
+                        inst.op = .{ .iconst_32 = 1 };
+                    }
+                    changed = true;
+                },
+                .ne, .lt_s, .lt_u, .gt_s, .gt_u => |bin| {
+                    if (bin.lhs != bin.rhs) continue;
+                    if (inst.type == .i64) {
+                        inst.op = .{ .iconst_64 = 0 };
+                    } else {
+                        inst.op = .{ .iconst_32 = 0 };
+                    }
+                    changed = true;
+                },
+                else => {},
+            }
+        }
+    }
+
+    return changed;
+}
+
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
         .store, .local_set, .global_set, .call, .call_indirect, .call_ref, .ret, .ret_multi, .br, .br_if, .br_table, .@"unreachable",
@@ -731,7 +1075,31 @@ fn hasSideEffect(inst: ir.Inst) bool {
 
 // ── Common Subexpression Elimination ────────────────────────────────────────
 
-/// Deduplicate identical pure operations.
+/// Block-local CSE: deduplicate identical pure, non-trapping
+/// instructions within a basic block.
+///
+/// **Why block-local only:** A previous iteration of this pass walked
+/// the dominator tree to extend CSE across blocks. That version was
+/// reverted because it was unsound against the AArch64 codegen, which
+/// iterates `func.blocks.items` in raw block-id order rather than RPO
+/// or dom-tree order. Cross-block CSE picks a canonical def in some
+/// dominator block; if that block has a higher block-id than the
+/// blocks where the (formerly redundant) def's uses live, codegen
+/// observes the use before the def and fails with `error.UnboundVReg`.
+/// CoreMark hits this on a `iconst_32 1` deduplicated across many
+/// blocks whose def-block id is far higher than its use-blocks'.
+///
+/// Re-enabling cross-block CSE requires either:
+///   1. Teaching codegen to iterate blocks in dom-tree / RPO order; or
+///   2. Restricting CSE to pick a representative whose block-id is
+///      ≤ all candidate use blocks.
+/// Tracked under issue #136. The dom/loop analysis code in
+/// `analysis.zig` is independent and remains in place for future use
+/// (LICM, GVN, etc.).
+///
+/// Replacement is via `replaceVReg`; the now-redundant instruction is
+/// left in place with its uses rewritten and `deadCodeElimination`
+/// removes it.
 pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     _ = allocator;
     var changed = false;
@@ -745,12 +1113,14 @@ pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocat
                 continue;
             }
 
-            // Look backwards for a matching instruction
+            // Look backwards within the same block for a matching def.
+            // Type check guards against same-tag-different-type aliasing
+            // (e.g. f32.convert_i32_s vs f64.convert_i32_s lower to the
+            // same IR tag).
             var j: usize = 0;
             while (j < i) : (j += 1) {
                 const earlier = block.instructions.items[j];
-                if (earlier.dest != null and sameOp(earlier, inst.*)) {
-                    // Replace all uses of inst.dest with earlier.dest
+                if (earlier.dest != null and earlier.type == inst.type and sameOp(earlier, inst.*)) {
                     replaceVReg(func, inst.dest.?, earlier.dest.?);
                     changed = true;
                     break;
@@ -842,70 +1212,138 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
 pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
 
 /// Run a sequence of optimization passes on an IR module.
-/// Redundant bounds-check elimination within each basic block.
+/// Redundant bounds-check elimination, dominator-scoped.
 ///
 /// For every `.load` and `.store`, codegen emits an inline wasm-memory
 /// bounds check that verifies `zext(base) + offset + size <= memory_size`.
-/// When two accesses in the same block share the same `base` vreg, the
-/// first check already validates any subsequent access whose
+/// When an access is dominated by a prior access sharing the same `base`
+/// vreg, the first check already validates any later access whose
 /// `offset + size` does not exceed the max previously validated end.
 ///
 /// This pass marks such accesses with `bounds_known = true`; both backends
 /// skip emitting the check for those.
 ///
-/// Safety conditions:
-/// - Same block only (no cross-block dominator walk — conservative).
-/// - Any call / atomic / `memory_grow` / `memory_copy` / `memory_fill`
-///   can change `memory_size`, so the tracker is cleared at those points.
+/// Soundness / scope:
+/// - Walks the dominator tree in DFS order. Entries produced in a
+///   dominator block are visible to all its dom-tree descendants. This
+///   generalises the earlier block-local version and catches the typical
+///   loop-body pattern where the header or preheader dominates every
+///   access in the loop.
+/// - Wasm memory grows monotonically (there is no `memory.shrink`; all
+///   mutations only extend it), so `zext(base) + offset + size <=
+///   memory_size_old` implies `... <= memory_size_new`. A prior check
+///   therefore stays valid across calls / memory.grow / memory.copy /
+///   memory.fill / table mutations / atomics. We still clear the active
+///   entries on those opcodes as a conservative guard against future IR
+///   operations that could shrink memory.
 /// - IR is SSA, so a base vreg's value never changes once defined.
+/// - `valid_start` is the index into `table` below which entries are
+///   shadowed by a fence on the current dominator path. Siblings in the
+///   dom-tree are unaffected because we restore `valid_start` on block
+///   exit.
 pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    var changed = false;
-    var max_end = std.AutoHashMap(ir.VReg, u64).init(allocator);
-    defer max_end.deinit();
+    if (func.blocks.items.len == 0) return false;
 
-    for (func.blocks.items) |block| {
-        max_end.clearRetainingCapacity();
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    const nblocks = func.blocks.items.len;
+    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer {
+        for (children) |*list| list.deinit(allocator);
+        allocator.free(children);
+    }
+    for (children) |*list| list.* = .empty;
+    for (0..nblocks) |i| {
+        const bid: ir.BlockId = @intCast(i);
+        const idom = dom.idom[bid] orelse continue;
+        if (idom == bid) continue;
+        try children[idom].append(allocator, bid);
+    }
+
+    const Entry = struct { base: ir.VReg, max_end: u64 };
+    var table: std.ArrayList(Entry) = .empty;
+    defer table.deinit(allocator);
+    var valid_start: usize = 0;
+
+    const Frame = struct {
+        bid: ir.BlockId,
+        phase: u1,
+        snap_len: usize,
+        snap_valid_start: usize,
+    };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+
+    if (dom.idom[0] == null) return false;
+    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+
+    var changed = false;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.phase == 1) {
+            table.shrinkRetainingCapacity(top.snap_len);
+            valid_start = top.snap_valid_start;
+            _ = stack.pop();
+            continue;
+        }
+        const bid = top.bid;
+        top.phase = 1;
+        top.snap_len = table.items.len;
+        top.snap_valid_start = valid_start;
+
+        const block = &func.blocks.items[bid];
         for (block.instructions.items) |*inst| {
             switch (inst.op) {
                 .load => |*ld| {
                     const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
-                    const prev = max_end.get(ld.base) orelse 0;
+                    var prev: u64 = 0;
+                    for (table.items[valid_start..]) |e| {
+                        if (e.base == ld.base and e.max_end > prev) prev = e.max_end;
+                    }
                     if (end <= prev) {
                         if (!ld.bounds_known) {
                             ld.bounds_known = true;
                             changed = true;
                         }
                     } else {
-                        try max_end.put(ld.base, end);
+                        try table.append(allocator, .{ .base = ld.base, .max_end = end });
                     }
                 },
                 .store => |*st| {
                     const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
-                    const prev = max_end.get(st.base) orelse 0;
+                    var prev: u64 = 0;
+                    for (table.items[valid_start..]) |e| {
+                        if (e.base == st.base and e.max_end > prev) prev = e.max_end;
+                    }
                     if (end <= prev) {
                         if (!st.bounds_known) {
                             st.bounds_known = true;
                             changed = true;
                         }
                     } else {
-                        try max_end.put(st.base, end);
+                        try table.append(allocator, .{ .base = st.base, .max_end = end });
                     }
                 },
-                // Anything that can change memory_size, trap, or otherwise
-                // invalidate the "already checked" property: clear the
-                // tracker. (memory.grow can extend memory; calls can grow
-                // or shrink via imports; atomics/traps can't shrink but
-                // cost us nothing to be conservative.)
+                // Fences: conservatively hide entries from upstream scope
+                // for the remainder of this block and its dom-tree
+                // descendants. (See header comment on why this is
+                // strictly defensive given wasm memory semantics.)
                 .memory_grow,
                 .call, .call_indirect, .call_ref,
                 .memory_copy, .memory_fill, .memory_init,
                 .table_grow, .table_init,
                 .atomic_notify, .atomic_wait,
-                => max_end.clearRetainingCapacity(),
+                => valid_start = table.items.len,
                 else => {},
             }
         }
+
+        for (children[bid].items) |c| {
+            try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+        }
     }
+
     return changed;
 }
 
@@ -1007,6 +1445,522 @@ pub fn foldConstantBranches(func: *ir.IrFunction, allocator: std.mem.Allocator) 
                 else => {},
             }
         }
+    }
+    return changed;
+}
+
+// ── Branch-on-Eqz folding ───────────────────────────────────────────────────
+
+/// Collapse `br_if(cond=eqz(x), then=A, else=B)` into
+/// `br_if(cond=x, then=B, else=A)`.
+///
+/// This removes a redundant `eqz` whose only use is the branch and flips
+/// the target polarity. On aarch64 this turns `cmp ... ; cbz` into
+/// `cbnz`, saving an instruction; on x86-64 the eqz lowers to a
+/// `test/sete` + jump that becomes a single `test + jnz`.
+///
+/// Soundness:
+///   - The rewrite is semantics-preserving: `eqz(x) != 0` iff `x == 0`,
+///     so swapping the branch targets inverts the condition back.
+///   - We only rewrite when the `eqz`'s single use is this br_if (so the
+///     eqz becomes dead and DCE reaps it next iteration). If the eqz has
+///     other uses we can still flip the branch, but we'd leave the eqz
+///     live with no saving — skip to avoid churning `runPasses`.
+pub fn foldBranchOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    // Build a vreg -> defining-instruction index so we can identify
+    // producers that may be in a different block from the terminator.
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    for (func.blocks.items) |*block| {
+        if (block.instructions.items.len == 0) continue;
+        const term = &block.instructions.items[block.instructions.items.len - 1];
+        switch (term.op) {
+            .br_if => |bi| {
+                const producer_block = def_block.get(bi.cond) orelse continue;
+                const producer_ii = def_idx.get(bi.cond) orelse continue;
+                const producer = &func.blocks.items[producer_block].instructions.items[producer_ii];
+                const inner = switch (producer.op) {
+                    .eqz => |v| v,
+                    else => continue,
+                };
+                if (countUsesOfVReg(func, bi.cond) != 1) continue;
+                term.op = .{ .br_if = .{
+                    .cond = inner,
+                    .then_block = bi.else_block,
+                    .else_block = bi.then_block,
+                } };
+                changed = true;
+            },
+            else => {},
+        }
+    }
+    return changed;
+}
+
+// ── Wrap-of-extend cancellation ────────────────────────────────────────────
+
+/// Eliminate `wrap_i64(extend_i32_s(x))` and `wrap_i64(extend_i32_u(x))`
+/// — both compose to the identity on the original i32 value.
+///
+/// The frontend (and inliner / function-merging passes) sometimes
+/// produce these chains when an i32 is briefly widened to i64 to
+/// participate in a helper or comparison and then narrowed back.
+///
+/// Soundness:
+///   - `extend_i32_s(x)` places the low 32 bits of the result equal to
+///     x's bit pattern (and sign-extends the upper 32 from x's sign
+///     bit). `extend_i32_u(x)` places x in the low 32 and zeros the
+///     upper. In both cases `wrap_i64` returns the low 32, recovering
+///     x exactly.
+///
+/// We always rewrite when the pattern matches; the inner extend is
+/// left in place (it may have other uses) and DCE drops it later if
+/// it ends up unused.
+pub fn foldWrapOfExtend(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    const Rewrite = struct {
+        blk: ir.BlockId,
+        ii: u32,
+        wrap_dest: ir.VReg,
+        inner_src: ir.VReg,
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const wrap_dest = inst.dest orelse continue;
+            const wrap_src = switch (inst.op) {
+                .wrap_i64 => |v| v,
+                else => continue,
+            };
+            const pb = def_block.get(wrap_src) orelse continue;
+            const pi = def_idx.get(wrap_src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const inner_src = switch (producer.op) {
+                .extend_i32_s, .extend_i32_u => |v| v,
+                else => continue,
+            };
+            try rewrites.append(allocator, .{
+                .blk = @intCast(bi),
+                .ii = @intCast(ii),
+                .wrap_dest = wrap_dest,
+                .inner_src = inner_src,
+            });
+        }
+    }
+
+    for (rewrites.items) |r| {
+        replaceVReg(func, r.wrap_dest, r.inner_src);
+        const inst = &func.blocks.items[r.blk].instructions.items[r.ii];
+        inst.op = .{ .iconst_32 = 0 };
+        changed = true;
+    }
+    return changed;
+}
+
+// ── Float unary idempotents ────────────────────────────────────────────────
+
+/// Simplify chained unary float operations:
+///   f_neg(f_neg(x)) -> x        (involution)
+///   f_abs(f_abs(x)) -> f_abs(x) (idempotent)
+///   f_abs(f_neg(x)) -> f_abs(x) (|-x| = |x|)
+///
+/// Soundness on IEEE-754 floats:
+///   - f_neg only flips the sign bit and otherwise preserves the bit
+///     pattern (including NaN payloads), so f_neg(f_neg(x)) bit-for-bit
+///     equals x. -0.0 round-trips back to -0.0.
+///   - f_abs clears the sign bit; clearing twice is the same as
+///     clearing once, so f_abs is idempotent.
+///   - f_abs(f_neg(x)) clears the sign bit no matter what f_neg
+///     produced, matching f_abs(x).
+///
+/// We always rewrite without checking the inner producer's use count:
+/// even if the inner f_neg/f_abs has other uses it stays alive, and
+/// our rewrite still removes one outer instruction. DCE will drop the
+/// inner if it later becomes dead.
+pub fn foldFloatUnaryIdempotents(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    const Action = enum { replace_with_inner_src, replace_with_inner_dest, rewrite_operand };
+    const Rewrite = struct {
+        action: Action,
+        outer_blk: ir.BlockId,
+        outer_ii: u32,
+        outer_dest: ir.VReg,
+        new_vreg: ir.VReg, // replacement / new operand
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const outer_dest = inst.dest orelse continue;
+            const outer_src: ir.VReg = switch (inst.op) {
+                .f_neg, .f_abs => |v| v,
+                else => continue,
+            };
+            const pb = def_block.get(outer_src) orelse continue;
+            const pi = def_idx.get(outer_src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const producer_dest = producer.dest orelse continue;
+
+            switch (inst.op) {
+                .f_neg => {
+                    // f_neg(f_neg(x)) -> x
+                    if (producer.op == .f_neg) {
+                        const inner_src = producer.op.f_neg;
+                        try rewrites.append(allocator, .{
+                            .action = .replace_with_inner_src,
+                            .outer_blk = @intCast(bi),
+                            .outer_ii = @intCast(ii),
+                            .outer_dest = outer_dest,
+                            .new_vreg = inner_src,
+                        });
+                    }
+                },
+                .f_abs => {
+                    if (producer.op == .f_abs) {
+                        // f_abs(f_abs(x)) -> f_abs(x): same value as
+                        // inner; redirect consumers of outer to inner.
+                        try rewrites.append(allocator, .{
+                            .action = .replace_with_inner_dest,
+                            .outer_blk = @intCast(bi),
+                            .outer_ii = @intCast(ii),
+                            .outer_dest = outer_dest,
+                            .new_vreg = producer_dest,
+                        });
+                    } else if (producer.op == .f_neg) {
+                        // f_abs(f_neg(x)) -> f_abs(x): rewrite this
+                        // f_abs's operand to skip the inner f_neg.
+                        const inner_src = producer.op.f_neg;
+                        try rewrites.append(allocator, .{
+                            .action = .rewrite_operand,
+                            .outer_blk = @intCast(bi),
+                            .outer_ii = @intCast(ii),
+                            .outer_dest = outer_dest,
+                            .new_vreg = inner_src,
+                        });
+                    }
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    for (rewrites.items) |r| {
+        const inst = &func.blocks.items[r.outer_blk].instructions.items[r.outer_ii];
+        switch (r.action) {
+            .replace_with_inner_src, .replace_with_inner_dest => {
+                replaceVReg(func, r.outer_dest, r.new_vreg);
+                // Neutralise the outer; DCE drops it.
+                inst.op = .{ .iconst_32 = 0 };
+            },
+            .rewrite_operand => {
+                inst.op = .{ .f_abs = r.new_vreg };
+            },
+        }
+        changed = true;
+    }
+    return changed;
+}
+
+// ── Sign-extending load fold ────────────────────────────────────────────────
+
+/// Fold `extend{8,16,32}_s(load size=N, sign_extend=false)` into the
+/// load itself by setting `sign_extend = true` and dropping the extend.
+///
+/// This collapses the wasm pattern `i32.load8_u; i32.extend8_s` (and
+/// matching i64/16/32 variants) into a single sign-extending load,
+/// which is the same machine instruction either way (`ldrsb` /
+/// `movsx` etc.) — saving one IR instruction per occurrence.
+///
+/// Soundness:
+///   - `load size=1 sign_extend=false type=i32` produces zero-extended
+///     low byte of the loaded value; `extend8_s` re-interprets the low
+///     byte as signed and sign-extends. The composition is exactly the
+///     semantics of `load size=1 sign_extend=true type=i32`.
+///   - We require the load result to have exactly one use (this
+///     extend). Otherwise other consumers depend on the zero-extended
+///     value and changing the load would corrupt them.
+///   - load.type and extend.type must match (we never bridge i32↔i64
+///     here; that requires an explicit `extend_i32_s/u`).
+///   - extend32_s is only meaningful on i64, matching the wasm
+///     `i64.load32_s` pattern.
+pub fn foldSignExtendingLoad(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    const Rewrite = struct {
+        ext_blk: ir.BlockId,
+        ext_ii: u32,
+        load_blk: ir.BlockId,
+        load_ii: u32,
+        ext_dest: ir.VReg,
+        load_dest: ir.VReg,
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const ext_dest = inst.dest orelse continue;
+            const ext_type = inst.type;
+            const want_size: u8 = switch (inst.op) {
+                .extend8_s => 1,
+                .extend16_s => 2,
+                .extend32_s => blk: {
+                    if (ext_type != .i64) continue;
+                    break :blk 4;
+                },
+                else => continue,
+            };
+            const src = switch (inst.op) {
+                .extend8_s, .extend16_s, .extend32_s => |v| v,
+                else => unreachable,
+            };
+            const pb = def_block.get(src) orelse continue;
+            const pi = def_idx.get(src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const ld = switch (producer.op) {
+                .load => |l| l,
+                else => continue,
+            };
+            if (ld.size != want_size) continue;
+            if (ld.sign_extend) continue;
+            if (producer.type != ext_type) continue;
+            if (countUsesOfVReg(func, src) != 1) continue;
+            const load_dest = producer.dest orelse continue;
+            try rewrites.append(allocator, .{
+                .ext_blk = @intCast(bi),
+                .ext_ii = @intCast(ii),
+                .load_blk = pb,
+                .load_ii = pi,
+                .ext_dest = ext_dest,
+                .load_dest = load_dest,
+            });
+        }
+    }
+
+    for (rewrites.items) |r| {
+        // Flip the load to sign-extending.
+        const load_inst = &func.blocks.items[r.load_blk].instructions.items[r.load_ii];
+        switch (load_inst.op) {
+            .load => |*ld| ld.sign_extend = true,
+            else => continue,
+        }
+        // Redirect consumers of the extend's dest to the load's dest.
+        replaceVReg(func, r.ext_dest, r.load_dest);
+        // Neutralise the extend instruction so DCE removes it.
+        const ext_inst = &func.blocks.items[r.ext_blk].instructions.items[r.ext_ii];
+        ext_inst.op = .{ .iconst_32 = 0 };
+        changed = true;
+    }
+    return changed;
+}
+
+// ── Select-on-Eqz folding ──────────────────────────────────────────────────
+
+/// Collapse `select(cond=eqz(x), if_true=a, if_false=b)` into
+/// `select(cond=x, if_true=b, if_false=a)`.
+///
+/// Mirror of `foldBranchOnEqz` for the non-terminator case. Removes a
+/// redundant `eqz` whose only use is the select and swaps the chosen
+/// arms. On aarch64 this maps `cmp; cset` style sequences to a single
+/// `csel` with the inverse condition.
+///
+/// Soundness: `eqz(x) != 0 ⇔ x == 0`, so swapping if_true/if_false
+/// inverts the condition back. Skipped unless the eqz has exactly this
+/// one use (otherwise rewriting would leave the eqz live and waste a
+/// `runPasses` iteration on a no-op fixpoint check).
+pub fn foldSelectOnEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items) |*inst| {
+            const sel = switch (inst.op) {
+                .select => |s| s,
+                else => continue,
+            };
+            const pb = def_block.get(sel.cond) orelse continue;
+            const pi = def_idx.get(sel.cond) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const inner = switch (producer.op) {
+                .eqz => |v| v,
+                else => continue,
+            };
+            if (countUsesOfVReg(func, sel.cond) != 1) continue;
+            inst.op = .{ .select = .{
+                .cond = inner,
+                .if_true = sel.if_false,
+                .if_false = sel.if_true,
+            } };
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// ── Inverse-compare / eqz fusion ───────────────────────────────────────────
+
+/// Rewrite `eqz(cmp(a, b))` as the inverse comparison on `(a, b)`, where
+/// `cmp` is any integer relational op. The original `eqz` instruction is
+/// rewritten in place to hold the inverse comparison, preserving its dest
+/// VReg. The original comparison may become dead and will be reaped by
+/// `deadCodeElimination`.
+///
+/// Mappings:
+///   eqz(eq)   → ne     eqz(ne)   → eq
+///   eqz(lt_s) → ge_s   eqz(ge_s) → lt_s
+///   eqz(le_s) → gt_s   eqz(gt_s) → le_s
+///   eqz(lt_u) → ge_u   eqz(ge_u) → lt_u
+///   eqz(le_u) → gt_u   eqz(gt_u) → le_u
+///
+/// Soundness:
+///   - Integer relops produce exactly 0 or 1 (wasm semantics), so their
+///     logical negation IS the inverse comparison. eqz(1) = 0 = !(1);
+///     eqz(0) = 1 = !(0).
+///   - Skipped for float compares: eqz is integer-only and the IR
+///     doesn't emit `eqz(f_eq)` etc.
+///
+/// Why bother with this in addition to `foldBranchOnEqz`:
+///   - Covers cases where the eqz result is used by `select`, stored to
+///     a local, or used as an operand to another op — not just by a
+///     terminator br_if.
+///   - Removes a compare + eqz sequence; backend emits a single compare
+///     with the inverse condition code.
+pub fn foldInverseCompareEqz(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    var def_idx = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_idx.deinit();
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| {
+                try def_block.put(d, @intCast(bi));
+                try def_idx.put(d, @intCast(ii));
+            }
+        }
+    }
+
+    // Rewrites must be applied after the scan so that iteration doesn't
+    // see a half-mutated instruction stream.
+    const Rewrite = struct {
+        blk: ir.BlockId,
+        ii: u32,
+        new_op: ir.Inst.Op,
+    };
+    var rewrites = std.ArrayList(Rewrite).empty;
+    defer rewrites.deinit(allocator);
+
+    for (func.blocks.items, 0..) |block, bi| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            const src = switch (inst.op) {
+                .eqz => |v| v,
+                else => continue,
+            };
+            const pb = def_block.get(src) orelse continue;
+            const pi = def_idx.get(src) orelse continue;
+            const producer = func.blocks.items[pb].instructions.items[pi];
+            const new_op: ?ir.Inst.Op = switch (producer.op) {
+                .eq => |b| .{ .ne = b },
+                .ne => |b| .{ .eq = b },
+                .lt_s => |b| .{ .ge_s = b },
+                .ge_s => |b| .{ .lt_s = b },
+                .le_s => |b| .{ .gt_s = b },
+                .gt_s => |b| .{ .le_s = b },
+                .lt_u => |b| .{ .ge_u = b },
+                .ge_u => |b| .{ .lt_u = b },
+                .le_u => |b| .{ .gt_u = b },
+                .gt_u => |b| .{ .le_u = b },
+                else => null,
+            };
+            if (new_op) |op| {
+                try rewrites.append(allocator, .{
+                    .blk = @intCast(bi),
+                    .ii = @intCast(ii),
+                    .new_op = op,
+                });
+            }
+        }
+    }
+
+    for (rewrites.items) |r| {
+        func.blocks.items[r.blk].instructions.items[r.ii].op = r.new_op;
+        changed = true;
     }
     return changed;
 }
@@ -1402,8 +2356,17 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
 pub const default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
+    &algebraicSimplify,
     &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
     &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &foldBranchOnEqz,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
     &commonSubexprElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
@@ -1703,6 +2666,203 @@ test "CSE: deduplicates identical add" {
 
     // The ret should now reference v2 instead of v3
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v2 }, block.instructions.items[4].op);
+}
+
+test "CSE: cross-block CSE intentionally not performed" {
+    // Block-local CSE only — see commonSubexprElimination doc comment for
+    // why cross-block CSE was reverted (codegen iterates by raw block-id,
+    // not RPO, breaking dominator-based rewrites in CoreMark).
+    // b0 defines add(v0, v1) = v2; b0 branches to b1; b1 recomputes the
+    // same add into v3. The current pass must NOT rewrite v3 to v2.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v3 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v3 } });
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(!changed);
+
+    // b1's add is preserved as a fresh def of v3, and ret still uses v3.
+    try std.testing.expectEqual(@as(?ir.VReg, v3), func.getBlock(b1).instructions.items[0].dest);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v3 }, func.getBlock(b1).instructions.items[1].op);
+}
+
+test "CSE: sibling defs do not match at merge" {
+    // b0 → {b1, b2} → b3. b1 and b2 each compute add(v0, v1) independently;
+    // b3 recomputes it. Neither b1 nor b2 dominates b3 (b0 does), so neither
+    // sibling def is visible when b3 is processed — b3's add must remain a
+    // new def, NOT rewritten to a sibling's VReg.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const v_b1 = func.newVReg();
+    const v_b2 = func.newVReg();
+    const v_b3 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_b1 });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_b2 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_b3 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_b3 } });
+
+    _ = try commonSubexprElimination(&func, allocator);
+
+    // b3's add must still produce v_b3 (not have been rewritten away), and
+    // the ret must still reference v_b3.
+    try std.testing.expectEqual(
+        @as(?ir.VReg, v_b3),
+        func.getBlock(b3).instructions.items[0].dest,
+    );
+    try std.testing.expectEqual(
+        ir.Inst.Op{ .ret = v_b3 },
+        func.getBlock(b3).instructions.items[1].op,
+    );
+    // Neither sibling should have been rewritten by the other.
+    try std.testing.expectEqual(@as(?ir.VReg, v_b1), func.getBlock(b1).instructions.items[0].dest);
+    try std.testing.expectEqual(@as(?ir.VReg, v_b2), func.getBlock(b2).instructions.items[0].dest);
+}
+
+test "CSE: type-sensitive — convert_i32_s to f32 vs f64 do not merge" {
+    // Two `convert_i32_s` insts with the same source VReg but different
+    // inst.type must NOT be CSE'd, because the frontend lowers
+    // f32.convert_i32_s and f64.convert_i32_s to the same IR tag with
+    // different types.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const src = func.newVReg();
+    const v_f32 = func.newVReg();
+    const v_f64 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = src });
+    try block.append(.{ .op = .{ .convert_i32_s = src }, .dest = v_f32, .type = .f32 });
+    try block.append(.{ .op = .{ .convert_i32_s = src }, .dest = v_f64, .type = .f64 });
+    try block.append(.{ .op = .{ .ret = v_f64 } });
+
+    _ = try commonSubexprElimination(&func, allocator);
+
+    // v_f64 must not have been rewritten to v_f32.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_f64 }, block.instructions.items[3].op);
+    try std.testing.expectEqual(@as(?ir.VReg, v_f64), block.instructions.items[2].dest);
+}
+
+test "CSE: trapping int div_s is not deduplicated" {
+    // Two identical i32 div_s must NOT be CSE'd because div_s traps on
+    // zero divisor (hasSideEffect returns true for integer div_s). Both
+    // defs must remain so both traps happen.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1 });
+    try block.append(.{ .op = .{ .div_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .div_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v3, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v3 } });
+
+    _ = try commonSubexprElimination(&func, allocator);
+
+    // v3 must remain — ret still points to v3 and v3's def is still div_s.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v3 }, block.instructions.items[4].op);
+    try std.testing.expectEqual(@as(?ir.VReg, v3), block.instructions.items[3].dest);
+}
+
+test "CSE: loop header def not rewritten in body (block-local only)" {
+    // Block-local CSE only — see commonSubexprElimination doc comment.
+    // The loop body's redundant add is NOT rewritten to the header's def.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const h = try func.newBlock();
+    const body = try func.newBlock();
+    const exit = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_h = func.newVReg();
+    const cond = func.newVReg();
+    const v_body = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = h } });
+
+    try func.getBlock(h).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_h });
+    try func.getBlock(h).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(h).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = body, .else_block = exit } } });
+
+    try func.getBlock(body).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_body });
+    try func.getBlock(body).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_body } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = h } });
+
+    try func.getBlock(exit).append(.{ .op = .{ .ret = v_h } });
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(!changed);
+
+    // local_set still references v_body (no cross-block rewrite).
+    try std.testing.expectEqual(
+        ir.Inst.Op{ .local_set = .{ .idx = 0, .val = v_body } },
+        func.getBlock(body).instructions.items[1].op,
+    );
+}
+
+test "CSE: unreachable block is skipped" {
+    // b0 → ret; b1 is unreachable and has an add that matches nothing.
+    // Running CSE must not crash and must not touch b1.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v2 } });
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(!changed);
+
+    // b1's add is untouched.
+    try std.testing.expectEqual(@as(?ir.VReg, v2), func.getBlock(b1).instructions.items[2].dest);
 }
 
 test "combined pipeline: fold + DCE" {
@@ -2431,4 +3591,1387 @@ test "foldConstantBranches: nonzero cond picks then block" {
     const last = func.getBlock(b0).instructions.items[1];
     try std.testing.expect(last.op == .br);
     try std.testing.expectEqual(b1, last.op.br);
+}
+
+test "strengthReduceDivRem: div_u(x, 8) → shr_u(x, 3)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Block: iconst_32=8, iconst_32=3, shr_u(v_x, shift_vreg), ret.
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 3 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .shr_u => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+            try std.testing.expectEqual(block.instructions.items[1].dest.?, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(v_r, block.instructions.items[2].dest.?);
+}
+
+test "strengthReduceDivRem: rem_u(x, 16) → and(x, 15)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_c });
+    try block.append(.{ .op = .{ .rem_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Block: iconst_32=16, iconst_32=15, and(v_x, mask_vreg), ret.
+    try std.testing.expectEqual(@as(usize, 4), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 15 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .@"and" => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+            try std.testing.expectEqual(block.instructions.items[1].dest.?, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(v_r, block.instructions.items[2].dest.?);
+}
+
+test "strengthReduceDivRem: i64 div_u by 2^32" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 1 << 32 }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = 32 }, block.instructions.items[1].op);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[1].type);
+    switch (block.instructions.items[2].op) {
+        .shr_u => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "strengthReduceDivRem: rem_u i64 by 2^63 uses full mask" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    const divisor: i64 = @bitCast(@as(u64, 1) << 63); // interpreted as 2^63 unsigned
+    try block.append(.{ .op = .{ .iconst_64 = divisor }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .rem_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Mask for rem_u by 2^63 is 2^63 - 1 == 0x7FFF_FFFF_FFFF_FFFF.
+    const expected_mask: i64 = @bitCast((@as(u64, 1) << 63) - 1);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = expected_mask }, block.instructions.items[1].op);
+}
+
+test "strengthReduceDivRem: does not rewrite non-power-of-two divisor" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(!changed);
+    // Original div_u still present.
+    try std.testing.expectEqual(@as(usize, 3), block.instructions.items.len);
+    try std.testing.expect(block.instructions.items[1].op == .div_u);
+}
+
+test "strengthReduceDivRem: does not rewrite div_s / rem_s (signed left alone)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_s = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .div_s);
+}
+
+test "strengthReduceDivRem: does not rewrite div_u by 1" {
+    // c == 1 is rejected by powerOfTwoShift (shift amount 0 disallowed).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c });
+    try block.append(.{ .op = .{ .div_u = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceDivRem(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .div_u);
+}
+
+test "elideRedundantBoundsChecks: cross-block via dominator" {
+    // b0: load base+0 size=8 (establishes end=8).
+    // b0 -> b1: load base+0 size=4 (end=4 <= 8, should be elided).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_b } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: sibling does not dominate" {
+    // b0 -> {b1, b2} -> b3. b1 establishes a bounds check. b2 does NOT,
+    // because b1 does not dominate b2. b3 is dominated only by b0, so it
+    // also gets NO free bounds_known from either sibling.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_1 = func.newVReg();
+    const v_2 = func.newVReg();
+    const v_3 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_1, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_2, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_3, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_3 } });
+
+    _ = try elideRedundantBoundsChecks(&func, allocator);
+    // Neither b1's nor b2's load is dominated by the other, so neither
+    // can elide; b3 is not dominated by either of them either.
+    try std.testing.expect(!func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+    try std.testing.expect(!func.getBlock(b2).instructions.items[0].op.load.bounds_known);
+    try std.testing.expect(!func.getBlock(b3).instructions.items[0].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: loop body inherits from preheader" {
+    // preheader(b0) dominates header(b1) dominates body(b2). preheader does
+    // a wide load establishing max_end=8; body does a narrower load, must
+    // be elided.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    // b0 (preheader): establishes bounds for base [0,8).
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    // b1 (header): branches to body or exit.
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b2, .else_block = b3 } } });
+    // b2 (body): load base+4 size=4.
+    try func.getBlock(b2).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_a } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    // Body load must inherit bounds_known from preheader via dom.
+    try std.testing.expect(func.getBlock(b2).instructions.items[0].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: fence in dominator hides upstream entries" {
+    // b0 loads base+0 size=8; b0 then calls (fence) and branches to b1.
+    // b1's load must NOT be elided because the fence conservatively hides
+    // the earlier bounds check for the remainder of b0 and its dom subtree.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 8 } }, .dest = v_a, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_b } });
+
+    _ = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(!func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+}
+
+test "algebraicSimplify: sub x, x -> iconst 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .sub = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[1].op);
+    try std.testing.expectEqual(@as(?ir.VReg, v_r), func.getBlock(b0).instructions.items[1].dest);
+}
+
+test "algebraicSimplify: sub x, x i64 -> iconst_64 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_64 = 42 }, .dest = v_x, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .sub = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r, .type = .i64 });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = 0 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: xor x, x -> iconst 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .xor = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: and x, x -> x (users rewritten)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .@"and" = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    // ret must now reference v_x directly.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, func.getBlock(b0).instructions.items[2].op);
+}
+
+test "algebraicSimplify: or x, x -> x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .@"or" = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, func.getBlock(b0).instructions.items[2].op);
+}
+
+test "algebraicSimplify: eq x, x -> iconst 1" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .eq = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 1 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: ne x, x -> iconst 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .ne = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[1].op);
+}
+
+test "algebraicSimplify: le_u x, x -> 1; lt_u x, x -> 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_le = func.newVReg();
+    const v_lt = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .le_u = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_le });
+    try func.getBlock(b0).append(.{ .op = .{ .lt_u = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_lt });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_le } });
+
+    _ = try algebraicSimplify(&func, allocator);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 1 }, func.getBlock(b0).instructions.items[1].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 0 }, func.getBlock(b0).instructions.items[2].op);
+}
+
+test "algebraicSimplify: sub with distinct operands is unchanged" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_a });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = v_b });
+    try func.getBlock(b0).append(.{ .op = .{ .sub = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(func.getBlock(b0).instructions.items[2].op == .sub);
+}
+
+test "algebraicSimplify: is idempotent (no spin after first fire)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .xor = .{ .lhs = v_x, .rhs = v_x } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v_r } });
+
+    const first = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(first);
+    const second = try algebraicSimplify(&func, allocator);
+    try std.testing.expect(!second);
+}
+
+test "strengthReduceMulShiftAdd: mul(x, 3) -> (x << 1) + x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Expected block: iconst=3, iconst=1, shl(v_x, shift), add(shl_res, v_x), ret.
+    try std.testing.expectEqual(@as(usize, 5), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 1 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .shl => |bin| {
+            try std.testing.expectEqual(v_x, bin.lhs);
+            try std.testing.expectEqual(block.instructions.items[1].dest.?, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    switch (block.instructions.items[3].op) {
+        .add => |bin| {
+            try std.testing.expectEqual(block.instructions.items[2].dest.?, bin.lhs);
+            try std.testing.expectEqual(v_x, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expectEqual(v_r, block.instructions.items[3].dest.?);
+}
+
+test "strengthReduceMulShiftAdd: mul(x, 7) -> (x << 3) - x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 3 }, block.instructions.items[1].op);
+    try std.testing.expect(block.instructions.items[2].op == .shl);
+    switch (block.instructions.items[3].op) {
+        .sub => |bin| {
+            try std.testing.expectEqual(block.instructions.items[2].dest.?, bin.lhs);
+            try std.testing.expectEqual(v_x, bin.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "strengthReduceMulShiftAdd: mul(x, 5) commutative" {
+    // Constant on the LHS; x on the RHS.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_c, .rhs = v_x } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    // shift amount = 2, op = add, the non-constant multiplicand is v_x.
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 2 }, block.instructions.items[1].op);
+    switch (block.instructions.items[2].op) {
+        .shl => |bin| try std.testing.expectEqual(v_x, bin.lhs),
+        else => try std.testing.expect(false),
+    }
+    switch (block.instructions.items[3].op) {
+        .add => |bin| try std.testing.expectEqual(v_x, bin.rhs),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "strengthReduceMulShiftAdd: i64 mul by 9 -> (x << 3) + x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 9 }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(changed);
+
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_64 = 3 }, block.instructions.items[1].op);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[1].type);
+    try std.testing.expect(block.instructions.items[2].op == .shl);
+    try std.testing.expectEqual(ir.IrType.i64, block.instructions.items[2].type);
+    try std.testing.expect(block.instructions.items[3].op == .add);
+}
+
+test "strengthReduceMulShiftAdd: does not touch power-of-two multiplier" {
+    // mul by 8 is pow2 — `strengthReduceMul` handles it; this pass must skip.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .mul);
+}
+
+test "strengthReduceMulShiftAdd: does not touch mul by 10 (neither 2^k+/-1)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_c });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try strengthReduceMulShiftAdd(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .mul);
+}
+
+test "strengthReduceMulShiftAdd: pipeline composition with strengthReduceMul" {
+    // Feed both multipliers into the default pipeline order and verify each
+    // selects the appropriate pass.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_c8 = func.newVReg();
+    const v_c3 = func.newVReg();
+    const v_r1 = func.newVReg();
+    const v_r2 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c8 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_c3 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c8 } }, .dest = v_r1 });
+    try block.append(.{ .op = .{ .mul = .{ .lhs = v_x, .rhs = v_c3 } }, .dest = v_r2 });
+    try block.append(.{ .op = .{ .ret = v_r2 } });
+
+    _ = try strengthReduceMul(&func, allocator);
+    _ = try strengthReduceMulShiftAdd(&func, allocator);
+
+    // Expect: no remaining `.mul` instructions.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .mul);
+    }
+}
+
+test "foldBranchOnEqz: swaps targets and drops eqz use" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(changed);
+
+    const term = func.getBlock(b0).instructions.items[1];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_x, bi.cond);
+            try std.testing.expectEqual(b2, bi.then_block);
+            try std.testing.expectEqual(b1, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldBranchOnEqz: skips when eqz has multiple uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    // second use of v_c
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v_c, .rhs = v_c } }, .dest = v_r });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(!changed);
+
+    const term = func.getBlock(b0).instructions.items[2];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_c, bi.cond);
+            try std.testing.expectEqual(b1, bi.then_block);
+            try std.testing.expectEqual(b2, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldBranchOnEqz: no-op when br_if cond is not eqz" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_a });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_b });
+    try func.getBlock(b0).append(.{ .op = .{ .eq = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_c });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldBranchOnEqz: cross-block eqz producer" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const mid = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try func.getBlock(entry).append(.{ .op = .{ .br = mid } });
+    try func.getBlock(mid).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldBranchOnEqz(&func, allocator);
+    try std.testing.expect(changed);
+    const term = func.getBlock(mid).instructions.items[0];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_x, bi.cond);
+            try std.testing.expectEqual(b2, bi.then_block);
+            try std.testing.expectEqual(b1, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldBranchOnEqz: pipeline drops dead eqz after DCE" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_x = func.newVReg();
+    const v_c = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    _ = try foldBranchOnEqz(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // eqz should be gone; only the br_if remains.
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b0).instructions.items.len);
+    try std.testing.expect(func.getBlock(b0).instructions.items[0].op == .br_if);
+}
+
+test "foldInverseCompareEqz: eqz(eq) becomes ne" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_neg = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = v1 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp });
+    try block.append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+    try block.append(.{ .op = .{ .ret = v_neg } });
+
+    const changed = try foldInverseCompareEqz(&func, allocator);
+    try std.testing.expect(changed);
+
+    // The eqz instruction (index 3) should now be .ne on v0, v1.
+    switch (block.instructions.items[3].op) {
+        .ne => |b| {
+            try std.testing.expectEqual(v0, b.lhs);
+            try std.testing.expectEqual(v1, b.rhs);
+        },
+        else => try std.testing.expect(false),
+    }
+    // dest preserved.
+    try std.testing.expectEqual(@as(?ir.VReg, v_neg), block.instructions.items[3].dest);
+}
+
+test "foldInverseCompareEqz: all 10 mappings" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        src: ir.Inst.Op,
+        expect_tag: std.meta.Tag(ir.Inst.Op),
+    }{
+        .{ .src = .{ .eq   = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ne   },
+        .{ .src = .{ .ne   = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .eq   },
+        .{ .src = .{ .lt_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ge_s },
+        .{ .src = .{ .ge_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .lt_s },
+        .{ .src = .{ .le_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .gt_s },
+        .{ .src = .{ .gt_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .le_s },
+        .{ .src = .{ .lt_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ge_u },
+        .{ .src = .{ .ge_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .lt_u },
+        .{ .src = .{ .le_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .gt_u },
+        .{ .src = .{ .gt_u = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .le_u },
+    };
+    for (cases) |c| {
+        var func = ir.IrFunction.init(allocator, 2, 2, 0);
+        defer func.deinit();
+        const b0 = try func.newBlock();
+        var block = &func.blocks.items[b0];
+        const v0 = func.newVReg();
+        const v1 = func.newVReg();
+        const v_cmp = func.newVReg();
+        const v_neg = func.newVReg();
+        var src = c.src;
+        switch (src) {
+            .eq, .ne, .lt_s, .ge_s, .le_s, .gt_s,
+            .lt_u, .ge_u, .le_u, .gt_u,
+            => |*b| {
+                b.lhs = v0;
+                b.rhs = v1;
+            },
+            else => unreachable,
+        }
+        try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+        try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1 });
+        try block.append(.{ .op = src, .dest = v_cmp });
+        try block.append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+        try block.append(.{ .op = .{ .ret = v_neg } });
+
+        _ = try foldInverseCompareEqz(&func, allocator);
+        try std.testing.expectEqual(c.expect_tag, std.meta.activeTag(block.instructions.items[3].op));
+    }
+}
+
+test "foldInverseCompareEqz: non-compare producer is skipped" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v0 = func.newVReg();
+    const v_neg = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v0 });
+    try block.append(.{ .op = .{ .eqz = v0 }, .dest = v_neg });
+    try block.append(.{ .op = .{ .ret = v_neg } });
+
+    const changed = try foldInverseCompareEqz(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(block.instructions.items[1].op == .eqz);
+}
+
+test "foldInverseCompareEqz: cross-block producer" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_neg = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .lt_s = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_neg } });
+
+    const changed = try foldInverseCompareEqz(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(std.meta.Tag(ir.Inst.Op).ge_s, std.meta.activeTag(func.getBlock(b1).instructions.items[0].op));
+}
+
+test "foldInverseCompareEqz: composes with DCE to drop dead compare" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 2, 2, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_cmp = func.newVReg();
+    const v_neg = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0 });
+    try block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = v1 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = v0, .rhs = v1 } }, .dest = v_cmp });
+    try block.append(.{ .op = .{ .eqz = v_cmp }, .dest = v_neg });
+    try block.append(.{ .op = .{ .ret = v_neg } });
+
+    _ = try foldInverseCompareEqz(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // The original eq producing v_cmp is now unused and should be gone.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .eq);
+    }
+}
+
+test "foldSelectOnEqz: swaps if_true/if_false and drops eqz use" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 3, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_a });
+    try block.append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_b });
+    try block.append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_c, .if_true = v_a, .if_false = v_b } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try foldSelectOnEqz(&func, allocator);
+    try std.testing.expect(changed);
+
+    switch (block.instructions.items[4].op) {
+        .select => |s| {
+            try std.testing.expectEqual(v_x, s.cond);
+            try std.testing.expectEqual(v_b, s.if_true);
+            try std.testing.expectEqual(v_a, s.if_false);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldSelectOnEqz: skip when eqz has multiple uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 3, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    const v_q = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_a });
+    try block.append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_b });
+    try block.append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_c, .rhs = v_c } }, .dest = v_q });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_c, .if_true = v_a, .if_false = v_b } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    const changed = try foldSelectOnEqz(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSelectOnEqz: composes with DCE to drop dead eqz" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 3, 3, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_r = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_x });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_a });
+    try block.append(.{ .op = .{ .iconst_32 = 200 }, .dest = v_b });
+    try block.append(.{ .op = .{ .eqz = v_x }, .dest = v_c });
+    try block.append(.{ .op = .{ .select = .{ .cond = v_c, .if_true = v_a, .if_false = v_b } }, .dest = v_r });
+    try block.append(.{ .op = .{ .ret = v_r } });
+
+    _ = try foldSelectOnEqz(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .eqz);
+    }
+}
+
+test "foldSignExtendingLoad: extend8_s of i32 load size=1 sign_extend=false" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = false } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Load should now be sign-extending.
+    switch (block.instructions.items[1].op) {
+        .load => |ld| try std.testing.expect(ld.sign_extend),
+        else => try std.testing.expect(false),
+    }
+    // ret should now reference v_byte (load's dest), not v_ext.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_byte }, block.instructions.items[3].op);
+}
+
+test "foldSignExtendingLoad: extend16_s + size=2 i64 load" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_half = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 2, .sign_extend = false } },
+        .dest = v_half,
+        .type = .i64,
+    });
+    try block.append(.{ .op = .{ .extend16_s = v_half }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(changed);
+    switch (block.instructions.items[1].op) {
+        .load => |ld| try std.testing.expect(ld.sign_extend),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldSignExtendingLoad: extend32_s + size=4 i64 load" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_word = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4, .sign_extend = false } },
+        .dest = v_word,
+        .type = .i64,
+    });
+    try block.append(.{ .op = .{ .extend32_s = v_word }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(changed);
+    switch (block.instructions.items[1].op) {
+        .load => |ld| try std.testing.expect(ld.sign_extend),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldSignExtendingLoad: skip when load already sign-extends" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = true } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSignExtendingLoad: skip when load size mismatches extend width" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_word = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    // size=2 load with extend8_s (mismatched)
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 2, .sign_extend = false } },
+        .dest = v_word,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_word }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSignExtendingLoad: skip when load result has multiple uses" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_sum = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = false } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    // Second use of v_byte (zero-extended consumer).
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_byte, .rhs = v_byte } }, .dest = v_sum });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    const changed = try foldSignExtendingLoad(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldSignExtendingLoad: composes with DCE to drop the extend" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_addr = func.newVReg();
+    const v_byte = func.newVReg();
+    const v_ext = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_addr });
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 1, .sign_extend = false } },
+        .dest = v_byte,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .extend8_s = v_byte }, .dest = v_ext, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_ext } });
+
+    _ = try foldSignExtendingLoad(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // No remaining extend8_s instruction.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .extend8_s);
+    }
+}
+
+test "foldFloatUnaryIdempotents: f_neg(f_neg(x)) becomes x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_n1 = func.newVReg();
+    const v_n2 = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = 1.5 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_x }, .dest = v_n1, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_n1 }, .dest = v_n2, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_n2 } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(changed);
+
+    // ret should now reference v_x directly.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, block.instructions.items[3].op);
+}
+
+test "foldFloatUnaryIdempotents: f_abs(f_abs(x)) becomes f_abs(x)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_a1 = func.newVReg();
+    const v_a2 = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = -1.5 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_abs = v_x }, .dest = v_a1, .type = .f32 });
+    try block.append(.{ .op = .{ .f_abs = v_a1 }, .dest = v_a2, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_a2 } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(changed);
+
+    // ret should now reference v_a1 (inner f_abs's dest).
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_a1 }, block.instructions.items[3].op);
+}
+
+test "foldFloatUnaryIdempotents: f_abs(f_neg(x)) becomes f_abs(x)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_n = func.newVReg();
+    const v_a = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_64 = 1.5 }, .dest = v_x, .type = .f64 });
+    try block.append(.{ .op = .{ .f_neg = v_x }, .dest = v_n, .type = .f64 });
+    try block.append(.{ .op = .{ .f_abs = v_n }, .dest = v_a, .type = .f64 });
+    try block.append(.{ .op = .{ .ret = v_a } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(changed);
+
+    // The f_abs at index 2 should now read v_x directly.
+    switch (block.instructions.items[2].op) {
+        .f_abs => |v| try std.testing.expectEqual(v_x, v),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "foldFloatUnaryIdempotents: no-op on unrelated unary (e.g., f_sqrt)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_s = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = 4.0 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_sqrt = v_x }, .dest = v_s, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_s } });
+
+    const changed = try foldFloatUnaryIdempotents(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldFloatUnaryIdempotents: composes with DCE" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_n1 = func.newVReg();
+    const v_n2 = func.newVReg();
+    try block.append(.{ .op = .{ .fconst_32 = 7.0 }, .dest = v_x, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_x }, .dest = v_n1, .type = .f32 });
+    try block.append(.{ .op = .{ .f_neg = v_n1 }, .dest = v_n2, .type = .f32 });
+    try block.append(.{ .op = .{ .ret = v_n2 } });
+
+    _ = try foldFloatUnaryIdempotents(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    // Both f_negs should now be gone.
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .f_neg);
+    }
+}
+
+test "foldWrapOfExtend: wrap_i64(extend_i32_s(x)) reduces to x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_x, .type = .i32 });
+    try block.append(.{ .op = .{ .extend_i32_s = v_x }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_ext }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    const changed = try foldWrapOfExtend(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, block.instructions.items[3].op);
+}
+
+test "foldWrapOfExtend: wrap_i64(extend_i32_u(x)) reduces to x" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_x, .type = .i32 });
+    try block.append(.{ .op = .{ .extend_i32_u = v_x }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_ext }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    const changed = try foldWrapOfExtend(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_x }, block.instructions.items[3].op);
+}
+
+test "foldWrapOfExtend: skip when wrap source is not an extend" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_y = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_64 = 0xDEADBEEFCAFE }, .dest = v_y, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_y }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    const changed = try foldWrapOfExtend(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "foldWrapOfExtend: composes with DCE to drop the extend" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_x = func.newVReg();
+    const v_ext = func.newVReg();
+    const v_wr = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_x, .type = .i32 });
+    try block.append(.{ .op = .{ .extend_i32_s = v_x }, .dest = v_ext, .type = .i64 });
+    try block.append(.{ .op = .{ .wrap_i64 = v_ext }, .dest = v_wr, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_wr } });
+
+    _ = try foldWrapOfExtend(&func, allocator);
+    _ = try deadCodeElimination(&func, allocator);
+
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .extend_i32_s);
+        try std.testing.expect(inst.op != .wrap_i64);
+    }
 }
