@@ -894,7 +894,7 @@ fn isWasiCliRunName(name: []const u8) bool {
 fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) ?u32 {
     return switch (indexspace.resolveCoreFunc(component, core_func_idx) orelse return null) {
         .lowered => |i| i,
-        .aliased => null,
+        .resource_drop, .resource_new, .resource_rep, .aliased => null,
     };
 }
 
@@ -935,9 +935,10 @@ fn resolveLiftedCoreFunc(
 ) ?struct { core_instance_idx: u32, local_func_idx: u32 } {
     const ref = indexspace.resolveCoreFunc(component, core_func_idx) orelse return null;
     switch (ref) {
-        // canon.lowers are imports into core modules — not callable as
-        // exports — so a canon.lift pointing at one is malformed.
-        .lowered => return null,
+        // Canon entries (lowers and resource.{new,drop,rep}) all produce
+        // imports/host-bound core funcs — not exported callables — so a
+        // canon.lift pointing at one is malformed.
+        .lowered, .resource_drop, .resource_new, .resource_rep => return null,
         .aliased => |alias_idx| {
             const a = component.aliases[alias_idx];
             const ie = a.instance_export;

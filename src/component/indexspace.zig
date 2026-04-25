@@ -110,13 +110,26 @@ pub fn resolveCompInstance(component: *const ctypes.Component, idx: u32) ?CompIn
 // ── Core-func index space ─────────────────────────────────────────────────
 //
 // Contributors, in section order:
-//   1. `canon.lower` entries (the bridge from component func to core func).
+//   1. Canon entries that produce a core func — `canon.lower` plus the
+//      `canon.resource.{new,drop,rep}` family. Each contributes one slot.
 //   2. `alias` decls with `sort = .core(.func)` (exposing a core instance's
 //      core func export under a top-level core-func index).
+//
+// The component-model spec is explicit that `canon.lower` and the resource
+// canons all produce core functions and are counted in the same indexspace
+// in the order they appear in `canons[]`. Real wit-component output (e.g.
+// the stdio-echo binary) interleaves them with abandon: if we miscount
+// resource.drop slots, every later alias resolves to the wrong target.
 
 pub const CoreFuncRef = union(enum) {
-    /// Index into `component.canons`.
+    /// Index into `component.canons` for a `.lower` entry.
     lowered: u32,
+    /// Index into `component.canons` for a `.resource_drop` entry.
+    resource_drop: u32,
+    /// Index into `component.canons` for a `.resource_new` entry.
+    resource_new: u32,
+    /// Index into `component.canons` for a `.resource_rep` entry.
+    resource_rep: u32,
     /// Index into `component.aliases`.
     aliased: u32,
 };
@@ -129,7 +142,19 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
                 if (n == idx) return .{ .lowered = @intCast(i) };
                 n += 1;
             },
-            else => {},
+            .resource_drop => {
+                if (n == idx) return .{ .resource_drop = @intCast(i) };
+                n += 1;
+            },
+            .resource_new => {
+                if (n == idx) return .{ .resource_new = @intCast(i) };
+                n += 1;
+            },
+            .resource_rep => {
+                if (n == idx) return .{ .resource_rep = @intCast(i) };
+                n += 1;
+            },
+            .lift => {}, // contributes to component-func indexspace, not core-func
         }
     }
     for (component.aliases, 0..) |a, i| {
