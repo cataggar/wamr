@@ -1,0 +1,104 @@
+name: CoreMark (aarch64)
+
+# Per-PR CoreMark comparison on the self-hosted aarch64 runner.
+# Runs `scripts/bench_coremark.py` against the PR base, posts a delta table.
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Baseline git ref"
+        required: false
+        default: "origin/main"
+      target:
+        description: "Target git ref"
+        required: false
+        default: "HEAD"
+      runs:
+        description: "Runs per ref"
+        required: false
+        default: "3"
+  pull_request:
+    paths:
+      - src/compiler/**
+      - src/runtime/**
+      - tests/benchmarks/coremark/**
+      - scripts/bench_coremark.py
+      - .github/workflows/coremark-aarch64.yml
+
+concurrency:
+  # Serialize on the self-hosted runner: parallel CoreMark invocations would
+  # contend on cores and skew results.
+  group: coremark-aarch64
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  coremark:
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Need the base commit to compare against, so deepen the checkout.
+          fetch-depth: 0
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+
+      - name: Resolve refs
+        id: refs
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          INPUT_BASELINE: ${{ github.event.inputs.baseline }}
+          INPUT_TARGET: ${{ github.event.inputs.target }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "baseline=$BASE_SHA" >> "$GITHUB_OUTPUT"
+            echo "target=$HEAD_SHA"   >> "$GITHUB_OUTPUT"
+          else
+            echo "baseline=${INPUT_BASELINE:-origin/main}" >> "$GITHUB_OUTPUT"
+            echo "target=${INPUT_TARGET:-HEAD}"            >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run CoreMark comparison
+        id: bench
+        env:
+          BASELINE: ${{ steps.refs.outputs.baseline }}
+          TARGET: ${{ steps.refs.outputs.target }}
+          RUNS: ${{ github.event.inputs.runs || '3' }}
+        run: |
+          python3 scripts/bench_coremark.py \
+            --baseline "$BASELINE" \
+            --target   "$TARGET" \
+            --runs     "$RUNS" \
+            --out      coremark-table.md \
+            --emit     github
+
+      - name: Upload table
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coremark-aarch64-${{ github.sha }}
+          path: coremark-table.md
+          retention-days: 90
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('coremark-table.md', 'utf8');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
