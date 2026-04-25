@@ -58,6 +58,38 @@ $ zig build
 $ ./zig-out/bin/spec-test-runner tests/spec-json
 ```
 
+## Component Model (preview)
+
+Experimental support for the [WebAssembly Component Model][cm] and
+[WASI Preview 2][p2]. Run a component with `wamr component.wasm`; it is
+auto-detected by the binary's version word.
+
+[cm]: https://component-model.bytecodealliance.org/
+[p2]: https://github.com/WebAssembly/WASI/blob/main/wasip2/README.md
+
+What works today:
+
+- Loading + instantiating a single-module component.
+- Canonical ABI lift/lower for primitive numerics, strings (`list<u8>`),
+  and `result<_, _>` returns.
+- WASI host adapter for **`wasi:cli/stdout`** + **`wasi:io/streams`**
+  (`get-stdout`, `[method]output-stream.blocking-write-and-flush`,
+  `[resource-drop]output-stream`). Versioned and unversioned interface
+  names are both accepted (e.g. `wasi:cli/stdout@0.2.6`).
+- Top-level `run` export → process exit code (0 = ok, 1 = err / trap).
+
+Not yet supported (tracked in [#142]):
+
+- `run` nested inside an exported `wasi:cli/run` instance — real Rust
+  components hit this. Needs the indexspace resolver.
+- `wasi:cli/stdin`, `wasi:cli/stderr`, `wasi:cli/exit`, args, env.
+- `wasi:filesystem`, `wasi:clocks`, `wasi:random`, `wasi:sockets`,
+  `wasi:http`.
+- Multi-memory components.
+- Compound `result<T, E>` payload encoding beyond the empty arms.
+
+[#142]: https://github.com/cataggar/wamr/issues/142
+
 ## License
 
 [Apache 2.0](LICENSE)

@@ -777,7 +777,14 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
     while (true) {
         const module = env.module_inst.module;
         if (current_func_idx < module.import_function_count) {
-            // Check for native host functions first
+            // Prefer context-carrying host entries when present.
+            if (current_func_idx < env.module_inst.host_func_entries.len) {
+                if (env.module_inst.host_func_entries[current_func_idx]) |entry| {
+                    entry.func(@ptrCast(env), entry.ctx) catch return error.Unreachable;
+                    return;
+                }
+            }
+            // Fall back to legacy context-less host functions.
             if (current_func_idx < env.module_inst.host_functions.len) {
                 if (env.module_inst.host_functions[current_func_idx]) |host_fn| {
                     host_fn(@ptrCast(env)) catch return error.Unreachable;

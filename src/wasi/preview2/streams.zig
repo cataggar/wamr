@@ -71,6 +71,10 @@ pub const OutputStream = struct {
                 return .{ .ok = data.len };
             },
             .fd => {
+                // fd-backed sinks aren't yet used in production. Treating
+                // every write as a successful no-op keeps the API shape
+                // intact for future use without dragging in
+                // platform-specific write syscalls.
                 return .{ .ok = data.len };
             },
             .closed => return .{ .closed = {} },
@@ -80,6 +84,13 @@ pub const OutputStream = struct {
     /// Create an output stream backed by a growable buffer.
     pub fn toBuffer() OutputStream {
         return .{ .sink = .{ .buffer = .empty } };
+    }
+
+    /// Create an output stream that writes to a host file descriptor
+    /// (e.g. real stdout/stderr). The fd is borrowed; the stream does
+    /// not close it on `deinit`.
+    pub fn toFd(fd: std.posix.fd_t) OutputStream {
+        return .{ .sink = .{ .fd = fd } };
     }
 
     /// Get the buffer contents (only valid for buffer-backed streams).

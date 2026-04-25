@@ -76,8 +76,55 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Wasm module (core or component)
+    // Distinguish core wasm from a component by the version word
+    // (both share `\0asm`). Core wasm = 0x0000_0001, component = 0x0001_000d.
+    if (wasm_data.len >= 8 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.wasm_magic) {
+        const version = std.mem.readInt(u32, wasm_data[4..8], .little);
+        if (version == wamr.types.component_version) {
+            runComponent(wasm_data, allocator, io);
+            return;
+        }
+    }
+
+    // Wasm module (core)
     runWasm(wasm_data, stack_size, &wasm_args, allocator);
+}
+
+fn runComponent(data: []const u8, allocator: std.mem.Allocator, io: std.Io) void {
+    const adapter_mod = wamr.wasi_cli_adapter;
+    var adapter = adapter_mod.WasiCliAdapter.init(allocator);
+    defer adapter.deinit();
+
+    const outcome = adapter_mod.runComponentBytes(data, allocator, &adapter) catch |err| {
+        switch (err) {
+            error.NoRunExport => std.debug.print(
+                "Error: component does not expose a top-level `run` export. " ++
+                    "Real wasi:cli/run instance exports are not yet wired (issue #142).\n",
+                .{},
+            ),
+            error.LinkFailed => std.debug.print(
+                "Error: component imports something other than wasi:cli/stdout + wasi:io/streams " ++
+                    "(only those are wired in this build).\n",
+                .{},
+            ),
+            error.LoadFailed => std.debug.print("Error: failed to load component\n", .{}),
+            error.InstantiateFailed => std.debug.print("Error: failed to instantiate component\n", .{}),
+            error.Trap => std.debug.print("Error: component trapped during run\n", .{}),
+            else => std.debug.print("Error: component run failed: {}\n", .{err}),
+        }
+        std.process.exit(1);
+    };
+
+    // Flush captured stdout to the host. Buffered + flush at end is the
+    // simplest cross-platform path; streaming output is deferred until
+    // the io/poll-aware adapter lands (#154).
+    const captured = adapter.getStdoutBytes();
+    if (captured.len > 0) {
+        var stdout_file = std.Io.File.stdout();
+        stdout_file.writeStreamingAll(io, captured) catch {};
+    }
+
+    std.process.exit(if (outcome.is_ok) 0 else 1);
 }
 
 fn runAot(data: []const u8, allocator: std.mem.Allocator) void {

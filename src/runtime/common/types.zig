@@ -762,6 +762,18 @@ pub const ImportedFunction = struct {
 /// must cast: `const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));`
 pub const HostFn = *const fn (env_opaque: *anyopaque) HostFnError!void;
 
+/// Host function variant that carries a per-slot context pointer. Used by
+/// higher layers (e.g. the component-model canon-lower trampoline) that need
+/// to associate state with a specific import slot. The legacy `HostFn`
+/// dispatch path is preserved; see `ModuleInstance.host_func_entries` for the
+/// context-carrying path.
+pub const HostFnWithCtx = *const fn (env_opaque: *anyopaque, ctx: ?*anyopaque) HostFnError!void;
+
+pub const HostFnEntry = struct {
+    func: HostFnWithCtx,
+    ctx: ?*anyopaque = null,
+};
+
 pub const HostFnError = error{
     Trap,
     StackOverflow,
@@ -787,6 +799,13 @@ pub const ModuleInstance = struct {
     host_functions: []const ?HostFn = &.{},
     /// Whether host_functions was allocated by this instance (vs shared from parent).
     owns_host_functions: bool = false,
+    /// Context-carrying host function entries, parallel to `host_functions`.
+    /// When both slots are populated, `host_func_entries[i]` takes priority
+    /// and receives the per-slot `ctx` pointer. Used by the component-model
+    /// canon-lower trampoline and by any caller that needs per-import state.
+    host_func_entries: []const ?HostFnEntry = &.{},
+    /// Whether host_func_entries was allocated by this instance.
+    owns_host_func_entries: bool = false,
     tags: []*TagInstance = &.{},
     allocator: std.mem.Allocator,
     /// Thread manager (shared across all instances in a thread group).
@@ -825,6 +844,8 @@ pub const ModuleInstance = struct {
             .import_functions = self.import_functions,
             .host_functions = self.host_functions, // shared, not owned
             .owns_host_functions = false,
+            .host_func_entries = self.host_func_entries, // shared, not owned
+            .owns_host_func_entries = false,
             .thread_manager = self.thread_manager,
             .allocator = allocator,
         };

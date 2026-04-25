@@ -235,6 +235,7 @@ fn getParamValTypes(ft: ctypes.FuncType, allocator: Allocator) ![]ctypes.ValType
 
 fn getResultValTypes(ft: ctypes.FuncType, allocator: Allocator) ![]ctypes.ValType {
     return switch (ft.results) {
+        .none => try allocator.alloc(ctypes.ValType, 0),
         .unnamed => |t| {
             const types = try allocator.alloc(ctypes.ValType, 1);
             types[0] = t;
@@ -298,7 +299,6 @@ fn typeSize(registry: TypeRegistry, t: ctypes.ValType) u32 {
 // ── Helper: push/pop interface values as core stack values ──────────────────
 
 fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, registry: TypeRegistry) !void {
-    _ = registry;
     switch (t) {
         .bool => try env.pushI32(if (val.bool) 1 else 0),
         .s8 => try env.pushI32(@as(i32, val.s8)),
@@ -320,15 +320,28 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
             try env.pushI32(@bitCast(val.list.ptr));
             try env.pushI32(@bitCast(val.list.len));
         },
-        // Compound types that need flattening are handled by the spill path
-        .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => {
+        // result<no-payload, no-payload>: flat repr is just the i32
+        // discriminant. WASI commonly returns this from `wasi:cli/run.run`
+        // and `wasi:io/streams.[method]output-stream.blocking-write-and-flush`,
+        // so the trampoline+lift paths support it directly. Result variants
+        // with payloads still go through the registry-aware spill path.
+        .result => |idx| {
+            const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
+            const r = switch (td) {
+                .result => |rt| rt,
+                else => return error.CompoundNeedsRegistry,
+            };
+            if (r.ok != null or r.err != null) return error.CompoundNeedsRegistry;
+            const disc: i32 = if (val.result_val.is_ok) 0 else 1;
+            try env.pushI32(disc);
+        },
+        .record, .variant, .tuple, .flags, .enum_, .option, .type_idx => {
             return error.CompoundNeedsRegistry;
         },
     }
 }
 
 fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
-    _ = registry;
     _ = allocator;
     return switch (t) {
         .bool => .{ .bool = (try env.popI32()) != 0 },
@@ -365,7 +378,19 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             .len = @bitCast(try env.popI32()),
             .ptr = @bitCast(try env.popI32()),
         } },
-        .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => error.CompoundNeedsRegistry,
+        // result<no-payload, no-payload>: pop one i32 discriminant.
+        // See pushInterfaceValue rationale.
+        .result => |idx| blk: {
+            const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
+            const r = switch (td) {
+                .result => |rt| rt,
+                else => return error.CompoundNeedsRegistry,
+            };
+            if (r.ok != null or r.err != null) return error.CompoundNeedsRegistry;
+            const disc = try env.popI32();
+            break :blk .{ .result_val = .{ .is_ok = disc == 0, .payload = null } };
+        },
+        .record, .variant, .tuple, .flags, .enum_, .option, .type_idx => error.CompoundNeedsRegistry,
     };
 }
 
@@ -443,34 +468,23 @@ pub fn dispatchCanonBuiltin(
 ) ExecutionError!void {
     switch (canon) {
         .resource_new => |resource_idx| {
-            if (resource_idx >= comp_inst.resource_tables.len)
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
                 return error.FunctionNotFound;
             const rep_val: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const handle = try canonResourceNew(
-                &comp_inst.resource_tables[resource_idx],
-                rep_val,
-                allocator,
-            );
+            const handle = try canonResourceNew(rt, rep_val, allocator);
             env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
         },
         .resource_drop => |resource_idx| {
-            if (resource_idx >= comp_inst.resource_tables.len)
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
                 return error.FunctionNotFound;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            _ = canonResourceDrop(
-                &comp_inst.resource_tables[resource_idx],
-                handle,
-                allocator,
-            );
+            _ = canonResourceDrop(rt, handle, allocator);
         },
         .resource_rep => |resource_idx| {
-            if (resource_idx >= comp_inst.resource_tables.len)
+            const rt = comp_inst.getOrCreateResourceTable(resource_idx) catch
                 return error.FunctionNotFound;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            const rep_val = canonResourceRep(
-                &comp_inst.resource_tables[resource_idx],
-                handle,
-            ) orelse 0;
+            const rep_val = canonResourceRep(rt, handle) orelse 0;
             env.pushI32(@bitCast(rep_val)) catch return error.StackOverflow;
         },
         .lift, .lower => {}, // Handled by callComponentFunc
@@ -521,6 +535,7 @@ pub fn callComponentFuncAsync(
             switch (td) {
                 .func => |ft| {
                     switch (ft.results) {
+                        .none => break :blk 0,
                         .unnamed => break :blk 1,
                         .named => |named| break :blk named.len,
                     }
@@ -812,4 +827,481 @@ test "async waitable set: multiple subtasks" {
     var vals2 = [_]u32{20};
     async_canon.asyncReturn(&tm, r2.subtask_handle, &vals2);
     try std.testing.expect(async_canon.asyncPollResult(&tm, r2.subtask_handle) != null);
+}
+
+// ── Canon-lower host trampoline ─────────────────────────────────────────────
+
+const core_runtime_types = @import("../runtime/common/types.zig");
+const HostFunc = instance_mod.HostFunc;
+
+/// Lower options carved out of the canon.lower opts array. Mirrors
+/// `LiftOptions` but is owned by the trampoline context so it's cheap to
+/// resolve once at instantiation time instead of on every call.
+pub const LowerOptions = struct {
+    memory_idx: ?u32 = null,
+    realloc_idx: ?u32 = null,
+    string_encoding: ctypes.StringEncoding = .utf8,
+
+    pub fn fromOpts(opts: []const ctypes.CanonOpt) LowerOptions {
+        var lo = LowerOptions{};
+        for (opts) |opt| {
+            switch (opt) {
+                .memory => |idx| lo.memory_idx = idx,
+                .realloc => |idx| lo.realloc_idx = idx,
+                .post_return => {},
+                .string_encoding => |enc| lo.string_encoding = enc,
+            }
+        }
+        return lo;
+    }
+};
+
+/// Per-import-slot context for the canon-lower trampoline. Owned by the
+/// `ComponentInstance` that installs the trampoline onto a core
+/// ModuleInstance's `host_func_entries`.
+pub const ComponentTrampolineCtx = struct {
+    comp_inst: *ComponentInstance,
+    host_func: HostFunc,
+    /// Component-level function index this trampoline is lowering. Kept so
+    /// `ComponentInstance.linkImports` can re-bind the host_func after the
+    /// caller supplies providers.
+    component_func_idx: u32 = 0,
+    /// Component-level parameter types, cached so `trampoline` doesn't have
+    /// to re-walk the FuncType on every call.
+    param_types: []const ctypes.ValType,
+    /// Component-level result types, same rationale.
+    result_types: []const ctypes.ValType,
+    lower_opts: LowerOptions,
+
+    pub fn deinit(self: *ComponentTrampolineCtx, allocator: Allocator) void {
+        allocator.free(self.param_types);
+        allocator.free(self.result_types);
+    }
+};
+
+/// Shared trampoline entry point installed on every lowered core import.
+/// Reads the core arguments off the ExecEnv stack, lifts them into
+/// `InterfaceValue`s, invokes the bound `HostFunc`, and lowers the result
+/// values back onto the core stack.
+///
+/// Trampoline executed when a core wasm function imported by `canon.lower`
+/// is called. Pops args from the core stack, lifts them to component-level
+/// `InterfaceValue`s, invokes the bound `HostFunc`, and lowers the result
+/// values back onto the core stack.
+///
+/// Stack discipline mirrors the rest of the interpreter: args were pushed
+/// in natural order by the caller, so the last flat core value is on top.
+///
+/// Param/result spill follows the canon ABI for `lower`:
+/// - `flat_params <= MAX_FLAT_PARAMS`: each param is on the stack as flat
+///   core values (back-to-front pop order).
+/// - `flat_params > MAX_FLAT_PARAMS`: a single i32 ptr on the stack points
+///   at a tuple of params laid out per the canon ABI.
+/// - `flat_results <= MAX_FLAT_RESULTS`: results are pushed back as flat
+///   core values.
+/// - `flat_results > MAX_FLAT_RESULTS`: an additional i32 ptr was pushed by
+///   the caller (after the params or param-ptr) into which results must be
+///   stored. The trampoline returns nothing.
+///
+/// Either spill path requires `lower_opts.memory_idx` to resolve the linear
+/// memory; if absent the trampoline traps.
+pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const ctx: *ComponentTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
+    const allocator = ctx.comp_inst.allocator;
+    const registry = TypeRegistry.init(ctx.comp_inst.component);
+
+    const flat_params = countFlatTypes(registry, ctx.param_types);
+    const flat_results = countFlatTypes(registry, ctx.result_types);
+    const params_spill = flat_params > MAX_FLAT_PARAMS;
+    const results_spill = flat_results > MAX_FLAT_RESULTS;
+
+    // Resolve linear memory for either spill path. The memory option is
+    // mandatory whenever spilling occurs, and we need a non-empty
+    // core_instances list to actually own a memory.
+    if (params_spill or results_spill) {
+        if (ctx.lower_opts.memory_idx == null) return error.Trap;
+        if (ctx.comp_inst.core_instances.len == 0) return error.Trap;
+    }
+
+    // Pop result-destination pointer first if results spill (it was pushed
+    // last by the caller).
+    var result_dest_ptr: u32 = 0;
+    if (results_spill) {
+        result_dest_ptr = @bitCast(env.popI32() catch return error.Trap);
+    }
+
+    // Lift args.
+    const args = allocator.alloc(InterfaceValue, ctx.param_types.len) catch return error.Trap;
+    defer allocator.free(args);
+    if (params_spill) {
+        const params_ptr: u32 = @bitCast(env.popI32() catch return error.Trap);
+        const mem_idx = ctx.lower_opts.memory_idx.?;
+        const mi = ctx.comp_inst.firstModuleInst() orelse return error.Trap;
+        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        var offset: u32 = params_ptr;
+        for (ctx.param_types, 0..) |pt, i| {
+            const al = typeAlign(registry, pt);
+            offset = abi.alignUp(offset, al);
+            args[i] = loadInterfaceValue(mem.data, offset, pt, registry, allocator) catch return error.Trap;
+            offset += typeSize(registry, pt);
+        }
+    } else {
+        // Walk param_types back-to-front so the last flat core value
+        // (which is on top of stack) becomes the last arg.
+        var i: usize = ctx.param_types.len;
+        while (i > 0) {
+            i -= 1;
+            args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch return error.Trap;
+        }
+    }
+
+    // Invoke host. Host owns allocation of any compound result values via
+    // `allocator`; simple values need no cleanup.
+    const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch return error.Trap;
+    defer allocator.free(results);
+    const call = ctx.host_func.call orelse return error.Trap;
+    call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch return error.Trap;
+
+    // Lower results.
+    if (results_spill) {
+        const mem_idx = ctx.lower_opts.memory_idx.?;
+        const mi = ctx.comp_inst.firstModuleInst() orelse return error.Trap;
+        const mem = mi.getMemory(mem_idx) orelse return error.Trap;
+        var offset: u32 = result_dest_ptr;
+        for (results, ctx.result_types) |r, t| {
+            const al = typeAlign(registry, t);
+            offset = abi.alignUp(offset, al);
+            storeInterfaceValue(mem.data, offset, r, t, registry);
+            offset += typeSize(registry, t);
+        }
+    } else {
+        for (results, ctx.result_types) |r, t| {
+            pushInterfaceValue(env, r, t, registry) catch return error.Trap;
+        }
+    }
+}
+
+// ── Trampoline tests ────────────────────────────────────────────────────────
+
+test "componentTrampoline: flat i32 host func with per-slot ctx" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Fake a minimal core module with one imported function (i32, i32) -> i32.
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "sub", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{ .i32, .i32 }, .results = &.{.i32} },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+
+    // Build a minimal component whose HostFunc computes a - b (non-commutative).
+    const Component = ctypes.Component;
+    var component = Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const Host = struct {
+        fn sub(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            in: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            out[0] = .{ .s32 = in[0].s32 - in[1].s32 };
+        }
+    };
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 2);
+    param_types[0] = .s32;
+    param_types[1] = .s32;
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 1);
+    result_types[0] = .s32;
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.sub },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{},
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 1);
+    entries[0] = .{ .func = &componentTrampoline, .ctx = @ptrCast(&tctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, entries);
+
+    // Call via the interpreter's normal dispatch path: push args (7, 2),
+    // executeFunction on import slot 0, expect 7 - 2 = 5.
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    try env.pushI32(7);
+    try env.pushI32(2);
+    try @import("../runtime/interpreter/interp.zig").executeFunction(env, 0);
+    try testing.expectEqual(@as(i32, 5), try env.popI32());
+}
+
+test "componentTrampoline: traps on spill without memory option" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Build a core module with one import taking 17 i32 params (1 over MAX).
+    var param_kinds: [17]core_types_mod.ValType = undefined;
+    for (&param_kinds) |*p| p.* = .i32;
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "many", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &param_kinds, .results = &.{} },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+
+    var component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const Host = struct {
+        fn noop(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            _: []const InterfaceValue,
+            _: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {}
+    };
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 17);
+    for (param_types) |*p| p.* = .s32;
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 0);
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.noop },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{},
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const entries = try testing.allocator.alloc(?core_types_mod.HostFnEntry, 1);
+    entries[0] = .{ .func = &componentTrampoline, .ctx = @ptrCast(&tctx) };
+    inst_mod_core.attachHostFuncEntries(core_inst, entries);
+
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    var n: i32 = 0;
+    while (n < 17) : (n += 1) try env.pushI32(n);
+    // executeFunction wraps HostFnError -> error.Unreachable for the trap.
+    try std.testing.expectError(error.Unreachable, @import("../runtime/interpreter/interp.zig").executeFunction(env, 0));
+}
+
+test "componentTrampoline: param spill loads tuple from memory" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Core module with one memory and a host import that takes a single i32
+    // (the spilled-params ptr) and returns nothing.
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "many", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{.i32}, .results = &.{} },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    // ownership of core_inst is transferred to comp_inst.core_instances[0]
+    // below; comp_inst.deinit will destroy it.
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    // Inject the core instance into core_instances[0] so the trampoline can
+    // find the memory through it.
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    // Host fn: capture args into a buffer the test owns.
+    const Captured = struct {
+        var seen: [17]i32 = undefined;
+        var count: usize = 0;
+        fn cb(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            in: []const InterfaceValue,
+            _: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            count = in.len;
+            for (in, 0..) |v, i| seen[i] = v.s32;
+        }
+    };
+    Captured.count = 0;
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 17);
+    for (param_types) |*p| p.* = .s32;
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 0);
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Captured.cb },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{ .memory_idx = 0 },
+    };
+    defer tctx.deinit(testing.allocator);
+
+    // Layout 17 s32 args at offset 64 in linear memory.
+    const mem = core_inst.getMemory(0).?;
+    const base: u32 = 64;
+    var k: u32 = 0;
+    while (k < 17) : (k += 1) {
+        const off = base + k * 4;
+        const v: i32 = @as(i32, @intCast(k)) + 100;
+        std.mem.writeInt(i32, mem.data[off..][0..4], v, .little);
+    }
+
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    try env.pushI32(@intCast(base));
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    try testing.expectEqual(@as(usize, 17), Captured.count);
+    var j: usize = 0;
+    while (j < 17) : (j += 1) {
+        try testing.expectEqual(@as(i32, @intCast(j)) + 100, Captured.seen[j]);
+    }
+}
+
+test "componentTrampoline: result spill stores tuple into memory" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // Imported host fn signature for canon.lower with results spill: takes
+    // an i32 dest_ptr (no params) and returns nothing.
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "many_results", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{.i32}, .results = &.{} },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    // ownership transferred to comp_inst.core_instances[0] below.
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    // Host fn: produce two s32 results.
+    const Host = struct {
+        fn pair(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            _: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            out[0] = .{ .s32 = 0xCAFE };
+            out[1] = .{ .s32 = 0xBEEF };
+        }
+    };
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 0);
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 2);
+    result_types[0] = .s32;
+    result_types[1] = .s32;
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.pair },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{ .memory_idx = 0 },
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const dest_ptr: u32 = 128;
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    try env.pushI32(@intCast(dest_ptr));
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    const mem = core_inst.getMemory(0).?;
+    const r0 = std.mem.readInt(i32, mem.data[dest_ptr..][0..4], .little);
+    const r1 = std.mem.readInt(i32, mem.data[dest_ptr + 4 ..][0..4], .little);
+    try testing.expectEqual(@as(i32, 0xCAFE), r0);
+    try testing.expectEqual(@as(i32, 0xBEEF), r1);
 }
