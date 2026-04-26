@@ -46,22 +46,96 @@ const wasi_p2_core = @import("../wasi/preview2/core.zig");
 /// retains the adapter until any `ComponentInstance` whose imports point
 /// at the registered `HostInstance` is destroyed. `deinit` releases the
 /// buffer and member maps.
+/// `wasi:filesystem/types.descriptor-flags` (#181). Carries the access
+/// + sync intent that the guest passed to `descriptor.open-at` and that
+/// `descriptor.get-flags` reads back. Bit positions match the WIT order.
+pub const FsDescriptorFlags = packed struct(u8) {
+    read: bool = false,
+    write: bool = false,
+    file_integrity_sync: bool = false,
+    data_integrity_sync: bool = false,
+    requested_write_sync: bool = false,
+    mutate_directory: bool = false,
+    _pad: u2 = 0,
+
+    pub fn fromBits(bits: u32) FsDescriptorFlags {
+        return .{
+            .read = (bits & 0b000001) != 0,
+            .write = (bits & 0b000010) != 0,
+            .file_integrity_sync = (bits & 0b000100) != 0,
+            .data_integrity_sync = (bits & 0b001000) != 0,
+            .requested_write_sync = (bits & 0b010000) != 0,
+            .mutate_directory = (bits & 0b100000) != 0,
+        };
+    }
+
+    pub fn toBits(self: FsDescriptorFlags) u32 {
+        var out: u32 = 0;
+        if (self.read) out |= 0b000001;
+        if (self.write) out |= 0b000010;
+        if (self.file_integrity_sync) out |= 0b000100;
+        if (self.data_integrity_sync) out |= 0b001000;
+        if (self.requested_write_sync) out |= 0b010000;
+        if (self.mutate_directory) out |= 0b100000;
+        return out;
+    }
+
+    /// Whether host writes against this descriptor must be flushed to
+    /// stable storage (i.e. `file.sync()` after each flush boundary).
+    /// Matches POSIX `O_SYNC`/`O_DSYNC`. `requested-write-sync`
+    /// (`O_RSYNC`) is **read-side** in POSIX and not a write-sync trigger.
+    pub fn needsWriteSync(self: FsDescriptorFlags) bool {
+        return self.file_integrity_sync or self.data_integrity_sync;
+    }
+};
+
 /// `wasi:filesystem/types.descriptor` resource — slot in the descriptor
 /// table. Indices in `WasiCliAdapter.fs_descriptor_table` are guest
 /// handles. Slots are nulled on `[resource-drop]descriptor`, except
 /// `.preopen` slots which are persistent (a guest dropping a preopen
 /// handle is treated as a no-op so subsequent calls to
 /// `preopens.get-directories` and `descriptor.open-at` keep working).
+///
+/// Each variant carries the `descriptor-flags` the guest requested at
+/// open time (#181). Preopens default to `read|write|mutate_directory`
+/// so that `open-at` from a preopen retains its pre-#181 capabilities.
 pub const FsDescriptor = union(enum) {
     /// Regular file or any other non-directory descriptor opened via
     /// `descriptor.open-at`. Owned — closed on resource-drop.
-    file: std.Io.File,
+    file: FsFile,
     /// Directory descriptor opened via `descriptor.open-at` with the
     /// `directory` open-flag. Owned — closed on resource-drop.
-    dir: std.Io.Dir,
+    dir: FsDir,
     /// Preopen sandbox root — adapter-owned. Resource-drop is a no-op
     /// for preopens; the adapter closes them in `deinit`.
-    preopen: std.Io.Dir,
+    preopen: FsDir,
+
+    pub const FsFile = struct {
+        file: std.Io.File,
+        flags: FsDescriptorFlags = .{},
+    };
+    pub const FsDir = struct {
+        dir: std.Io.Dir,
+        flags: FsDescriptorFlags = .{},
+    };
+
+    pub fn flags(self: FsDescriptor) FsDescriptorFlags {
+        return switch (self) {
+            .file => |f| f.flags,
+            .dir => |d| d.flags,
+            .preopen => |d| d.flags,
+        };
+    }
+
+    /// Underlying directory handle for any directory-shaped descriptor
+    /// (`.dir` or `.preopen`). Returns null for `.file`.
+    pub fn asDir(self: FsDescriptor) ?std.Io.Dir {
+        return switch (self) {
+            .dir => |d| d.dir,
+            .preopen => |d| d.dir,
+            .file => null,
+        };
+    }
 };
 
 pub const FsPreopen = struct {
@@ -75,9 +149,9 @@ pub const FsPreopen = struct {
 fn closeFsDescriptor(d: FsDescriptor) void {
     const io = std.Io.Threaded.global_single_threaded.io();
     switch (d) {
-        .file => |f| f.close(io),
-        .dir => |dir| dir.close(io),
-        .preopen => |dir| dir.close(io),
+        .file => |f| f.file.close(io),
+        .dir => |d2| d2.dir.close(io),
+        .preopen => |d2| d2.dir.close(io),
     }
 }
 
@@ -1504,6 +1578,12 @@ pub const WasiCliAdapter = struct {
             .ok => {},
             .err, .closed => return error.IoError,
         }
+        // `blocking-write-and-flush` semantically includes a flush.
+        // Honor `descriptor-flags` sync bits for host-file sinks (#181).
+        switch (stream.flush()) {
+            .ok => {},
+            .err, .closed => return error.IoError,
+        }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
@@ -1555,15 +1635,28 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]output-stream.blocking-flush: (borrow<output-stream>)
-    ///   -> result<_, stream-error>`. Captured buffer is unbuffered; ok.
+    ///   -> result<_, stream-error>`. For captured buffers, fd-backed,
+    /// or non-sync host-file streams this is a no-op. Host-file streams
+    /// opened with `file-integrity-sync` / `data-integrity-sync` (#181)
+    /// issue `file.sync()` here so writes reach stable storage.
     fn outputStreamBlockingFlush(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const stream = self.lookupStream(handle) orelse return error.InvalidHandle;
+        switch (stream.flush()) {
+            .ok => {},
+            .err, .closed => return error.IoError,
+        }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
@@ -1727,7 +1820,13 @@ pub const WasiCliAdapter = struct {
     /// is duplicated.
     pub fn addPreopen(self: *WasiCliAdapter, name: []const u8, dir: std.Io.Dir) !u32 {
         const slot_idx: u32 = @intCast(self.fs_descriptor_table.items.len);
-        try self.fs_descriptor_table.append(self.allocator, .{ .preopen = dir });
+        try self.fs_descriptor_table.append(self.allocator, .{ .preopen = .{
+            .dir = dir,
+            // Preopens are full-capability roots: read+write+mutate so
+            // pre-#181 callers (e.g. `open-at` of a writable child) keep
+            // working without each embedder having to opt in.
+            .flags = .{ .read = true, .write = true, .mutate_directory = true },
+        } });
         const dup_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(dup_name);
         try self.fs_preopens.append(self.allocator, .{ .name = dup_name, .dir_handle = slot_idx });
@@ -1764,6 +1863,7 @@ pub const WasiCliAdapter = struct {
         const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
         const members = [_]M{
             .{ .name = "[method]descriptor.get-type", .call = &fsDescriptorGetType },
+            .{ .name = "[method]descriptor.get-flags", .call = &fsDescriptorGetFlags },
             .{ .name = "[method]descriptor.stat", .call = &fsDescriptorStat },
             .{ .name = "[method]descriptor.stat-at", .call = &fsDescriptorStatAt },
             .{ .name = "[method]descriptor.set-times", .call = &fsDescriptorSetTimes },
@@ -1911,6 +2011,31 @@ pub const WasiCliAdapter = struct {
         results[0] = try fsResultOk(allocator, variant);
     }
 
+    /// `[method]descriptor.get-flags: (borrow<descriptor>) -> result<descriptor-flags, error-code>` (#181).
+    /// Returns the `descriptor-flags` the guest passed when this
+    /// descriptor was opened (preopens always read|write|mutate).
+    fn fsDescriptorGetFlags(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const words = try allocator.alloc(u32, 1);
+        words[0] = d.flags().toBits();
+        results[0] = try fsResultOk(allocator, .{ .flags_val = words });
+    }
+
     /// `[method]descriptor.stat: (borrow<descriptor>) -> result<descriptor-stat, error-code>`.
     /// The record fields are `(type, link-count, size, atime?, mtime?, ctime?)`.
     /// Timestamps are reported as `none` to keep the implementation portable
@@ -1937,9 +2062,9 @@ pub const WasiCliAdapter = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
 
         const stat_result: ?std.Io.File.Stat = switch (d.*) {
-            .preopen => |dir| dir.stat(io) catch null,
-            .dir => |dir| dir.stat(io) catch null,
-            .file => |f| f.stat(io) catch |err| {
+            .preopen => |dir| dir.dir.stat(io) catch null,
+            .dir => |dir| dir.dir.stat(io) catch null,
+            .file => |f| f.file.stat(io) catch |err| {
                 results[0] = try fsResultErr(allocator, mapFsError(err));
                 return;
             },
@@ -1978,7 +2103,13 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        // path-flags (args[1]): advisory; we always follow symlinks today.
+        // `path-flags` (#181): bit 0 = symlink-follow.
+        const path_flags: u32 = switch (args[1]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
+        const follow_symlinks = (path_flags & 0b1) != 0;
         const path_pl = switch (args[2]) {
             .string => |pl| pl,
             else => return error.InvalidArgs,
@@ -1988,13 +2119,9 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, .bad_descriptor);
             return;
         };
-        const base_dir: std.Io.Dir = switch (d.*) {
-            .preopen => |dir| dir,
-            .dir => |dir| dir,
-            .file => {
-                results[0] = try fsResultErr(allocator, .not_directory);
-                return;
-            },
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
         };
 
         const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
@@ -2006,7 +2133,9 @@ pub const WasiCliAdapter = struct {
         }
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        const st = base_dir.statFile(io, path_bytes, .{}) catch |err| {
+        const st = base_dir.statFile(io, path_bytes, .{
+            .follow_symlinks = follow_symlinks,
+        }) catch |err| {
             results[0] = try fsResultErr(allocator, mapFsError(err));
             return;
         };
@@ -2041,7 +2170,7 @@ pub const WasiCliAdapter = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         switch (d.*) {
             .file => |f| {
-                f.setTimestamps(io, .{
+                f.file.setTimestamps(io, .{
                     .access_timestamp = ats,
                     .modify_timestamp = mts,
                 }) catch |err| {
@@ -2095,13 +2224,9 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, .bad_descriptor);
             return;
         };
-        const base_dir: std.Io.Dir = switch (d.*) {
-            .preopen => |dir| dir,
-            .dir => |dir| dir,
-            .file => {
-                results[0] = try fsResultErr(allocator, .not_directory);
-                return;
-            },
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
         };
 
         const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
@@ -2132,6 +2257,19 @@ pub const WasiCliAdapter = struct {
 
     /// `[method]descriptor.open-at: (borrow<descriptor>, path-flags, string,
     ///   open-flags, descriptor-flags) -> result<own<descriptor>, error-code>`.
+    ///
+    /// Honors all six descriptor-flags bits (#181):
+    /// - `read`/`write` map to Zig open-mode.
+    /// - `file-integrity-sync`/`data-integrity-sync` are recorded on the
+    ///   new descriptor so blocking-flush calls `file.sync()`.
+    /// - `requested-write-sync` is stored (POSIX `O_RSYNC`, read-side)
+    ///   but not enforceable today; reported via `get-flags`.
+    /// - `mutate-directory` is only valid on directory descriptors and
+    ///   is required on the *base* directory for any `open-at` that
+    ///   would create, truncate, or open with write access.
+    /// `path-flags.symlink-follow` is plumbed into both `openDir` and
+    /// `openFile`. `createFile` ignores it because Zig 0.16's
+    /// `CreateFileOptions` has no `follow_symlinks` field.
     fn fsDescriptorOpenAt(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -2146,7 +2284,11 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        // path-flags (args[1]): currently advisory; we always follow symlinks.
+        const path_flags: u32 = switch (args[1]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
         const path_pl = switch (args[2]) {
             .string => |pl| pl,
             else => return error.InvalidArgs,
@@ -2156,24 +2298,42 @@ pub const WasiCliAdapter = struct {
             .u32 => |v| v,
             else => 0,
         };
-        const desc_flags: u32 = switch (args[4]) {
+        const desc_flags_bits: u32 = switch (args[4]) {
             .flags_val => |w| if (w.len == 0) 0 else w[0],
             .u32 => |v| v,
             else => 0,
         };
+        const child_flags = FsDescriptorFlags.fromBits(desc_flags_bits);
 
         const d = self.lookupFsDescriptor(handle) orelse {
             results[0] = try fsResultErr(allocator, .bad_descriptor);
             return;
         };
-        const base_dir: std.Io.Dir = switch (d.*) {
-            .preopen => |dir| dir,
-            .dir => |dir| dir,
-            .file => {
-                results[0] = try fsResultErr(allocator, .not_directory);
-                return;
-            },
+        const base_flags = d.flags();
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
         };
+
+        // open-flags bits per WIT order: 0=create, 1=directory, 2=exclusive, 3=truncate.
+        const want_create = (open_flags & 0b0001) != 0;
+        const want_directory = (open_flags & 0b0010) != 0;
+        const want_exclusive = (open_flags & 0b0100) != 0;
+        const want_truncate = (open_flags & 0b1000) != 0;
+        const want_read = child_flags.read;
+        const want_write = child_flags.write;
+        const follow_symlinks = (path_flags & 0b1) != 0;
+
+        // Spec (#181): if the base directory was opened without
+        // `mutate-directory`, any child open that would mutate (create,
+        // truncate, or any write access) must be denied with read-only.
+        // Cheap check before we touch guest memory.
+        const wants_mutate = want_create or want_truncate or want_write or
+            child_flags.mutate_directory;
+        if (wants_mutate and !base_flags.mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
 
         const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
             return error.OutOfBoundsMemory;
@@ -2183,23 +2343,24 @@ pub const WasiCliAdapter = struct {
             return;
         }
 
-        // open-flags bits per WIT order: 0=create, 1=directory, 2=exclusive, 3=truncate.
-        const want_create = (open_flags & 0b0001) != 0;
-        const want_directory = (open_flags & 0b0010) != 0;
-        const want_exclusive = (open_flags & 0b0100) != 0;
-        const want_truncate = (open_flags & 0b1000) != 0;
-        // descriptor-flags bits: 0=read, 1=write.
-        const want_read = (desc_flags & 0b01) != 0;
-        const want_write = (desc_flags & 0b10) != 0;
+        // `mutate-directory` is only meaningful on directory descriptors;
+        // strip it from the file-shaped child to keep `get-flags` honest.
+        var stored_flags = child_flags;
+        if (!want_directory) stored_flags.mutate_directory = false;
 
         const io = std.Io.Threaded.global_single_threaded.io();
 
         if (want_directory) {
-            const new_dir = base_dir.openDir(io, path_bytes, .{}) catch |err| {
+            const new_dir = base_dir.openDir(io, path_bytes, .{
+                .follow_symlinks = follow_symlinks,
+            }) catch |err| {
                 results[0] = try fsResultErr(allocator, mapFsError(err));
                 return;
             };
-            const new_handle = self.pushFsDescriptor(.{ .dir = new_dir }) catch {
+            const new_handle = self.pushFsDescriptor(.{ .dir = .{
+                .dir = new_dir,
+                .flags = stored_flags,
+            } }) catch {
                 new_dir.close(io);
                 results[0] = try fsResultErr(allocator, .insufficient_memory);
                 return;
@@ -2222,12 +2383,16 @@ pub const WasiCliAdapter = struct {
                 .write_only
             else
                 .read_only,
+            .follow_symlinks = follow_symlinks,
         }) catch |err| {
             results[0] = try fsResultErr(allocator, mapFsError(err));
             return;
         };
 
-        const new_handle = self.pushFsDescriptor(.{ .file = new_file }) catch {
+        const new_handle = self.pushFsDescriptor(.{ .file = .{
+            .file = new_file,
+            .flags = stored_flags,
+        } }) catch {
             new_file.close(io);
             results[0] = try fsResultErr(allocator, .insufficient_memory);
             return;
@@ -2257,8 +2422,8 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, .bad_descriptor);
             return;
         };
-        const file = switch (d.*) {
-            .file => |f| f,
+        const file: std.Io.File = switch (d.*) {
+            .file => |f| f.file,
             .dir, .preopen => {
                 results[0] = try fsResultErr(allocator, .is_directory);
                 return;
@@ -2334,7 +2499,7 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, .bad_descriptor);
             return null;
         };
-        const file = switch (d.*) {
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
             .file => |f| f,
             .dir, .preopen => {
                 results[0] = try fsResultErr(allocator, .is_directory);
@@ -2345,7 +2510,12 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, .insufficient_memory);
             return null;
         };
-        stream.* = streams.OutputStream.toHostFile(file, offset, append);
+        stream.* = streams.OutputStream.toHostFile(
+            fs_file.file,
+            offset,
+            append,
+            fs_file.flags.needsWriteSync(),
+        );
         try self.owned_output_streams.append(self.allocator, stream);
         return try self.allocStreamHandle(stream);
     }
@@ -5544,7 +5714,7 @@ test "filesystem: stat returns mtime/ctime as option::some (#177)" {
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "hello" });
 
     const file = try tmp.dir.openFile(io, "f.txt", .{ .mode = .read_only });
-    const handle = try adapter.pushFsDescriptor(.{ .file = file });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file } });
 
     var args = [_]InterfaceValue{.{ .handle = handle }};
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -5578,7 +5748,7 @@ test "filesystem: set-times round-trips a known timestamp (#177)" {
     const io = std.Io.Threaded.global_single_threaded.io();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
     const file = try tmp.dir.openFile(io, "f.txt", .{ .mode = .read_write });
-    const handle = try adapter.pushFsDescriptor(.{ .file = file });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file } });
 
     var dt_fields = [_]InterfaceValue{
         .{ .u64 = 1_700_000_000 },
@@ -5626,7 +5796,7 @@ test "filesystem: set-times on dir descriptor returns not_permitted (#177)" {
     const handle = try adapter.addPreopen("/tmp", tmp.dir);
     // Avoid double-close: tmp.cleanup() owns tmp.dir.
     adapter.fs_descriptor_table.items[handle] = null;
-    const reused = try adapter.pushFsDescriptor(.{ .preopen = tmp.dir });
+    const reused = try adapter.pushFsDescriptor(.{ .preopen = .{ .dir = tmp.dir, .flags = .{ .read = true, .write = true, .mutate_directory = true } } });
 
     const ts_arg = InterfaceValue{ .variant_val = .{ .discriminant = 0, .payload = null } };
     var args = [_]InterfaceValue{
@@ -6000,4 +6170,162 @@ test "http: outgoing-handler.handle returns ready future with denied (#149)" {
     try testing.expect(get2_results[0].option_val.is_some);
     const outer2 = get2_results[0].option_val.payload.?.*;
     try testing.expect(!outer2.result_val.is_ok);
+}
+
+// ── #181: open-flags / descriptor-flags / path-flags fidelity ────────────────
+
+test "filesystem: FsDescriptorFlags.fromBits / toBits round-trip (#181)" {
+    const testing = std.testing;
+    inline for (.{
+        @as(u32, 0),
+        @as(u32, 0b000011), // read | write
+        @as(u32, 0b100010), // write | mutate_directory
+        @as(u32, 0b011100), // f-i-sync | d-i-sync | r-w-sync
+        @as(u32, 0b111111), // all
+    }) |bits| {
+        const f = FsDescriptorFlags.fromBits(bits);
+        try testing.expectEqual(bits, f.toBits());
+    }
+
+    // needsWriteSync covers exactly file/data integrity sync.
+    try testing.expect(!FsDescriptorFlags.fromBits(0b010000).needsWriteSync()); // requested-write-sync alone (read-side)
+    try testing.expect(FsDescriptorFlags.fromBits(0b000100).needsWriteSync()); // file-integrity-sync
+    try testing.expect(FsDescriptorFlags.fromBits(0b001000).needsWriteSync()); // data-integrity-sync
+}
+
+test "filesystem: get-flags returns the bits stored on the descriptor (#181)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
+    const file = try tmp.dir.openFile(io, "f.txt", .{ .mode = .read_only });
+
+    // file-integrity-sync + data-integrity-sync + read.
+    const stored: u32 = 0b001101;
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = FsDescriptorFlags.fromBits(stored),
+    } });
+
+    var args = [_]InterfaceValue{.{ .handle = handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.fsDescriptorGetFlags(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const inner = results[0].result_val.payload.?.*;
+    try testing.expect(inner == .flags_val);
+    try testing.expectEqual(@as(usize, 1), inner.flags_val.len);
+    try testing.expectEqual(stored, inner.flags_val[0]);
+}
+
+test "filesystem: open-at threads sync flags into output stream (#181)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "x" });
+
+    // descriptor-flags = read | write | data-integrity-sync.
+    const desc_flags_bits: u32 = 0b001011;
+    const file = try tmp.dir.openFile(io, "f.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = FsDescriptorFlags.fromBits(desc_flags_bits),
+    } });
+
+    var write_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    const stream_handle = try adapter.fsAllocOutputFileStream(handle, 0, false, testing.allocator, &write_results);
+    try testing.expect(stream_handle != null);
+    const stream = adapter.lookupStream(stream_handle.?).?;
+    try testing.expect(stream.sink == .host_file);
+    try testing.expect(stream.sink.host_file.sync_on_flush);
+}
+
+test "filesystem: open-at without mutate-directory denies writable child (#181)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Push a base directory that *lacks* mutate-directory — read-only root.
+    try adapter.fs_descriptor_table.append(adapter.allocator, .{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .mutate_directory = false },
+    } });
+    const read_only_dir: u32 = @intCast(adapter.fs_descriptor_table.items.len - 1);
+    defer adapter.fs_descriptor_table.items[read_only_dir] = null;
+
+    // The mutate-directory check fires before any guest memory is
+    // touched, so a stub ComponentInstance + dummy string is fine.
+    const path_pl = InterfaceValue{ .string = .{ .ptr = 0, .len = 0 } };
+    var args = [_]InterfaceValue{
+        .{ .handle = read_only_dir },
+        .{ .u32 = 0 }, // path-flags
+        path_pl,
+        .{ .u32 = 0 }, // open-flags
+        .{ .u32 = 0b10 }, // descriptor-flags = write
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.read_only)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem: blocking-flush calls file.sync for sync-flagged descriptor (#181)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "out.txt", .data = "" });
+    const file = try tmp.dir.openFile(io, "out.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true, .write = true, .data_integrity_sync = true },
+    } });
+
+    // Allocate the output stream; sync_on_flush must propagate.
+    var alloc_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    const stream_handle = (try adapter.fsAllocOutputFileStream(handle, 0, false, testing.allocator, &alloc_results)).?;
+    const stream = adapter.lookupStream(stream_handle).?;
+    try testing.expect(stream.sink.host_file.sync_on_flush);
+
+    // Drive blocking-flush — should succeed (real fsync on a tmp file).
+    var flush_args = [_]InterfaceValue{.{ .handle = stream_handle }};
+    var flush_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamBlockingFlush(&adapter, &ci, &flush_args, &flush_results, testing.allocator);
+    defer flush_results[0].deinit(testing.allocator);
+    try testing.expect(flush_results[0].result_val.is_ok);
+}
+
+test "filesystem: open-at strips mutate-directory from non-directory child (#181)" {
+    const testing = std.testing;
+    const stripped = blk: {
+        var f = FsDescriptorFlags.fromBits(0b100011); // read|write|mutate_directory
+        f.mutate_directory = false;
+        break :blk f;
+    };
+    try testing.expectEqual(@as(u32, 0b000011), stripped.toBits());
 }

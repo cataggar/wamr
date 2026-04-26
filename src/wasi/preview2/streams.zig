@@ -98,6 +98,11 @@ pub const OutputStream = struct {
         file: std.Io.File,
         offset: u64 = 0,
         append: bool = false,
+        /// When true, `flush` calls `file.sync(io)` after the most
+        /// recent write so any buffered host-side data is persisted.
+        /// Threaded from `wasi:filesystem` `descriptor-flags` bits
+        /// `file-integrity-sync` / `data-integrity-sync` (#181).
+        sync_on_flush: bool = false,
     };
 
     /// Write bytes to the stream. Returns number of bytes written.
@@ -144,9 +149,31 @@ pub const OutputStream = struct {
     /// Create an output stream that writes to a host file at the given
     /// offset. If `append` is true, each write seeks to end-of-file
     /// first. The `file` value is borrowed; the stream does not close
-    /// it on `deinit`.
-    pub fn toHostFile(file: std.Io.File, offset: u64, append: bool) OutputStream {
-        return .{ .sink = .{ .host_file = .{ .file = file, .offset = offset, .append = append } } };
+    /// it on `deinit`. When `sync_on_flush` is true, `flush()` calls
+    /// `file.sync()` to persist host-side buffers (#181).
+    pub fn toHostFile(file: std.Io.File, offset: u64, append: bool, sync_on_flush: bool) OutputStream {
+        return .{ .sink = .{ .host_file = .{
+            .file = file,
+            .offset = offset,
+            .append = append,
+            .sync_on_flush = sync_on_flush,
+        } } };
+    }
+
+    /// Flush any host-side buffering. For host-file sinks with
+    /// `sync_on_flush` set, this issues `file.sync()` so writes
+    /// reach stable storage. Buffer / fd / closed sinks are no-ops.
+    pub fn flush(self: *OutputStream) StreamResult {
+        switch (self.sink) {
+            .host_file => |*hf| {
+                if (!hf.sync_on_flush) return .{ .ok = 0 };
+                const io = std.Io.Threaded.global_single_threaded.io();
+                hf.file.sync(io) catch return .{ .err = .io_error };
+                return .{ .ok = 0 };
+            },
+            .closed => return .{ .closed = {} },
+            else => return .{ .ok = 0 },
+        }
     }
 
     /// Get the buffer contents (only valid for buffer-backed streams).
