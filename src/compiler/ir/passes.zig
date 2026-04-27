@@ -1241,6 +1241,13 @@ pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
 ///   shadowed by a fence on the current dominator path. Siblings in the
 ///   dom-tree are unaffected because we restore `valid_start` on block
 ///   exit.
+/// Dominator-table entry: records that `base` has been checked up to `max_end`.
+const BoundsEntry = struct { base: ir.VReg, max_end: u64 };
+
+/// Segment-local entry: the first un-elided access for a base and the
+/// running maximum end across all same-base accesses in the segment.
+const SegEntry = struct { inst: *ir.Inst, max_end: u64 };
+
 pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
@@ -1261,7 +1268,7 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
         try children[idom].append(allocator, bid);
     }
 
-    const Entry = struct { base: ir.VReg, max_end: u64 };
+    const Entry = BoundsEntry;
     var table: std.ArrayList(Entry) = .empty;
     defer table.deinit(allocator);
     var valid_start: usize = 0;
@@ -1278,6 +1285,15 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
     if (dom.idom[0] == null) return false;
     try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
 
+    // Per-segment state for widening: tracks the first un-elided access
+    // per base VReg within a fence-free segment, along with the maximum
+    // end (offset + size) seen for that base across all accesses in the
+    // segment. At segment end (fence or block boundary), the first
+    // access's checked_end is patched to the segment max so a single
+    // widened bounds check covers all subsequent same-base accesses.
+    var seg_first = std.AutoHashMap(ir.VReg, SegEntry).init(allocator);
+    defer seg_first.deinit();
+
     var changed = false;
     while (stack.items.len > 0) {
         const top = &stack.items[stack.items.len - 1];
@@ -1292,52 +1308,78 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
         top.snap_len = table.items.len;
         top.snap_valid_start = valid_start;
 
+        seg_first.clearRetainingCapacity();
+
         const block = &func.blocks.items[bid];
         for (block.instructions.items) |*inst| {
             switch (inst.op) {
                 .load => |*ld| {
                     const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
-                    var prev: u64 = 0;
-                    for (table.items[valid_start..]) |e| {
-                        if (e.base == ld.base and e.max_end > prev) prev = e.max_end;
-                    }
-                    if (end <= prev) {
+                    const dom_max = domMaxEnd(table.items, valid_start, ld.base);
+
+                    if (end <= dom_max) {
                         if (!ld.bounds_known) {
                             ld.bounds_known = true;
                             changed = true;
                         }
+                    } else if (seg_first.getPtr(ld.base)) |se| {
+                        // Covered by the widened first access in this segment.
+                        if (!ld.bounds_known) {
+                            ld.bounds_known = true;
+                            changed = true;
+                        }
+                        if (end > se.max_end) se.max_end = end;
                     } else {
-                        try table.append(allocator, .{ .base = ld.base, .max_end = end });
+                        // First un-elided access for this base in segment.
+                        try seg_first.put(ld.base, .{ .inst = inst, .max_end = end });
                     }
                 },
                 .store => |*st| {
                     const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
-                    var prev: u64 = 0;
-                    for (table.items[valid_start..]) |e| {
-                        if (e.base == st.base and e.max_end > prev) prev = e.max_end;
-                    }
-                    if (end <= prev) {
+                    const dom_max = domMaxEnd(table.items, valid_start, st.base);
+
+                    if (end <= dom_max) {
                         if (!st.bounds_known) {
                             st.bounds_known = true;
                             changed = true;
                         }
+                    } else if (seg_first.getPtr(st.base)) |se| {
+                        if (!st.bounds_known) {
+                            st.bounds_known = true;
+                            changed = true;
+                        }
+                        if (end > se.max_end) se.max_end = end;
                     } else {
-                        try table.append(allocator, .{ .base = st.base, .max_end = end });
+                        try seg_first.put(st.base, .{ .inst = inst, .max_end = end });
                     }
                 },
-                // Fences: conservatively hide entries from upstream scope
-                // for the remainder of this block and its dom-tree
-                // descendants. (See header comment on why this is
-                // strictly defensive given wasm memory semantics.)
+                // Fences: commit the current segment (patch checked_end
+                // on first accesses) then hide all dominator entries
+                // from post-fence instructions and dom-tree descendants.
                 .memory_grow,
                 .call, .call_indirect, .call_ref,
                 .memory_copy, .memory_fill, .memory_init,
                 .table_grow, .table_init,
                 .atomic_notify, .atomic_wait,
-                => valid_start = table.items.len,
+                => {
+                    changed = patchSegment(&seg_first) or changed;
+                    seg_first.clearRetainingCapacity();
+                    valid_start = table.items.len;
+                },
                 else => {},
             }
         }
+
+        // End of block: patch remaining segment and commit entries to
+        // the dominator table so dom-tree children can see them.
+        changed = patchSegment(&seg_first) or changed;
+        {
+            var it = seg_first.iterator();
+            while (it.next()) |kv| {
+                try table.append(allocator, .{ .base = kv.key_ptr.*, .max_end = kv.value_ptr.max_end });
+            }
+        }
+        seg_first.clearRetainingCapacity();
 
         for (children[bid].items) |c| {
             try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
@@ -1345,6 +1387,42 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
     }
 
     return changed;
+}
+
+/// Look up the maximum checked end for `base` in the visible portion
+/// of the dominator table (entries at indices >= valid_start).
+fn domMaxEnd(table: []const BoundsEntry, valid_start: usize, base: ir.VReg) u64 {
+    var best: u64 = 0;
+    for (table[valid_start..]) |e| {
+        if (e.base == base and e.max_end > best) best = e.max_end;
+    }
+    return best;
+}
+
+/// Patch the first un-elided access in each segment entry: set its
+/// `checked_end` to the segment's max end so the emitted bounds check
+/// covers all subsequent same-base accesses marked `bounds_known`.
+/// Returns true if any instruction was modified.
+fn patchSegment(seg_first: *std.AutoHashMap(ir.VReg, SegEntry)) bool {
+    var patched = false;
+    var it = seg_first.iterator();
+    while (it.next()) |kv| {
+        const se = kv.value_ptr;
+        const own_end: u64 = switch (se.inst.op) {
+            .load => |ld| @as(u64, ld.offset) + @as(u64, ld.size),
+            .store => |st| @as(u64, st.offset) + @as(u64, st.size),
+            else => unreachable,
+        };
+        if (se.max_end > own_end) {
+            switch (se.inst.op) {
+                .load => |*ld| ld.checked_end = se.max_end,
+                .store => |*st| st.checked_end = se.max_end,
+                else => unreachable,
+            }
+            patched = true;
+        }
+    }
+    return patched;
 }
 
 /// Forward `local_set K, val` → subsequent `local_get K` within the same
@@ -3198,10 +3276,11 @@ test "elideRedundantBoundsChecks: back-to-back loads on same base" {
 
     const changed = try elideRedundantBoundsChecks(&func, allocator);
     try std.testing.expect(changed);
-    // First load establishes end=4. Second load end=8 > 4, so it sets new max
-    // and is NOT elided. Third load end=8 == max, IS elided.
+    // With widening: first load (end=4) is widened to checked_end=8 covering
+    // all three. Second (end=8) and third (end=8) are both elided.
     try std.testing.expect(!block.instructions.items[1].op.load.bounds_known);
-    try std.testing.expect(!block.instructions.items[2].op.load.bounds_known);
+    try std.testing.expectEqual(@as(u64, 8), block.instructions.items[1].op.load.checked_end);
+    try std.testing.expect(block.instructions.items[2].op.load.bounds_known);
     try std.testing.expect(block.instructions.items[3].op.load.bounds_known);
 }
 
@@ -3877,6 +3956,89 @@ test "elideRedundantBoundsChecks: fence in dominator hides upstream entries" {
 
     _ = try elideRedundantBoundsChecks(&func, allocator);
     try std.testing.expect(!func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: widening three consecutive loads" {
+    // Three loads from the same base with increasing offsets: base+0 (4B),
+    // base+4 (4B), base+8 (4B). Only the first should emit a bounds check,
+    // widened to checked_end=12 to cover all three.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = v_base });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_a, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 8, .size = 4 } }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_c } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    // First load: not bounds_known, but checked_end widened to 12.
+    try std.testing.expect(!block.instructions.items[1].op.load.bounds_known);
+    try std.testing.expectEqual(@as(u64, 12), block.instructions.items[1].op.load.checked_end);
+    // Second and third loads: bounds_known = true (covered by widened first).
+    try std.testing.expect(block.instructions.items[2].op.load.bounds_known);
+    try std.testing.expect(block.instructions.items[3].op.load.bounds_known);
+}
+
+test "elideRedundantBoundsChecks: no widening across call fence" {
+    // load, call (fence), load — the second load must NOT be covered by
+    // the first load's widening because the call might change memory_size.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_base = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_a, .type = .i32 });
+    try block.append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_b } });
+
+    _ = try elideRedundantBoundsChecks(&func, allocator);
+    // First load: no widening (no subsequent same-base access in segment).
+    try std.testing.expectEqual(@as(u64, 0), block.instructions.items[1].op.load.checked_end);
+    // Post-call load: fresh segment, not elided.
+    try std.testing.expect(!block.instructions.items[3].op.load.bounds_known);
+    try std.testing.expectEqual(@as(u64, 0), block.instructions.items[3].op.load.checked_end);
+}
+
+test "elideRedundantBoundsChecks: mixed load and store same base" {
+    // load base+0 (4B), store base+8 (4B) → first load widened to
+    // checked_end=12, store elided.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_base = func.newVReg();
+    const v_loaded = func.newVReg();
+    const v_val = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0x2000 }, .dest = v_base });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_val });
+    try block.append(.{ .op = .{ .store = .{ .base = v_base, .offset = 8, .size = 4, .val = v_val } } });
+    try block.append(.{ .op = .{ .ret = v_loaded } });
+
+    const changed = try elideRedundantBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+    // Load widened to checked_end=12.
+    try std.testing.expect(!block.instructions.items[1].op.load.bounds_known);
+    try std.testing.expectEqual(@as(u64, 12), block.instructions.items[1].op.load.checked_end);
+    // Store elided.
+    try std.testing.expect(block.instructions.items[3].op.store.bounds_known);
 }
 
 test "algebraicSimplify: sub x, x -> iconst 0" {
