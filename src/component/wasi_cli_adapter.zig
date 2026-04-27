@@ -392,6 +392,64 @@ pub const ResolveAddressStream = struct {
     allocator: Allocator,
 };
 
+/// Map a `std.Io.net.HostName.LookupError` to the closest
+/// `wasi:sockets/network.error-code` variant. Most parse / nameserver
+/// failures funnel into `permanent-resolver-failure`; transient errors
+/// (cancelation, would-block) become `temporary-resolver-failure`;
+/// "no such host" maps to `name-unresolvable`.
+fn mapDnsError(err: anyerror) SocketErrorCode {
+    return switch (err) {
+        error.UnknownHostName, error.NoAddressReturned => .name_unresolvable,
+        error.Canceled, error.WouldBlock => .temporary_resolver_failure,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.NameServerFailure,
+        error.DetectingNetworkConfigurationFailed,
+        => .permanent_resolver_failure,
+        else => .permanent_resolver_failure,
+    };
+}
+
+/// Lower a Zig `std.Io.net.IpAddress` into the wasi:sockets
+/// `ip-address` variant: `variant { ipv4(tuple<u8 x 4>), ipv6(tuple<u16 x 8>) }`.
+/// Caller owns the returned `InterfaceValue` (free via `deinit`).
+fn lowerIpAddress(allocator: Allocator, addr: std.Io.net.IpAddress) !InterfaceValue {
+    switch (addr) {
+        .ip4 => |v4| {
+            const bytes = v4.bytes;
+            const octets = try allocator.alloc(InterfaceValue, 4);
+            errdefer allocator.free(octets);
+            inline for (0..4) |i| octets[i] = .{ .u8 = bytes[i] };
+            const tup = try allocator.create(InterfaceValue);
+            errdefer allocator.destroy(tup);
+            tup.* = .{ .tuple_val = octets };
+            return .{ .variant_val = .{
+                .discriminant = @intFromEnum(IpAddressFamily.ipv4),
+                .payload = tup,
+            } };
+        },
+        .ip6 => |v6| {
+            const bytes = v6.bytes;
+            const groups = try allocator.alloc(InterfaceValue, 8);
+            errdefer allocator.free(groups);
+            inline for (0..8) |i| {
+                const hi: u16 = bytes[i * 2];
+                const lo: u16 = bytes[i * 2 + 1];
+                groups[i] = .{ .u16 = (hi << 8) | lo };
+            }
+            const tup = try allocator.create(InterfaceValue);
+            errdefer allocator.destroy(tup);
+            tup.* = .{ .tuple_val = groups };
+            return .{ .variant_val = .{
+                .discriminant = @intFromEnum(IpAddressFamily.ipv6),
+                .payload = tup,
+            } };
+        },
+    }
+}
+
 /// Map a Zig std.fs / std.posix error to the closest `error-code` variant.
 /// Errors not represented map to `.io` so the guest still sees a
 /// well-typed result rather than a host trap.
@@ -2971,20 +3029,87 @@ pub const WasiCliAdapter = struct {
 
     /// `wasi:sockets/ip-name-lookup.resolve-addresses:
     ///   (borrow<network>, string) -> result<own<resolve-address-stream>,
-    ///                                        error-code>`.
+    ///                                        error-code>` (#179).
     ///
-    /// Default-deny: always returns `error-code.name-unresolvable`. A
-    /// real `std.Io.net.HostName.lookup` integration is deferred until
-    /// the allow-list capability lands (see #148 follow-up).
+    /// DNS is gated by the borrowed network's CIDR allow-list (#180): an
+    /// empty allow-list (the default) means the embedder has not opted
+    /// into network access, so resolution returns `name-unresolvable`
+    /// rather than leaking host DNS to the guest. When the allow-list is
+    /// non-empty we run a real `std.Io.net.HostName.lookup` via the
+    /// global single-threaded `Io` and snapshot its results into a
+    /// `ResolveAddressStream`. Canonical-name results are dropped — only
+    /// `LookupResult.address` entries are visible to the guest.
     fn resolveAddresses(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
-        _: []const InterfaceValue,
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        results[0] = try socketResultErr(allocator, .name_unresolvable);
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const net_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const name_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        // Allow-list opt-in gate. Default deny-all keeps the guest from
+        // observing the host's DNS configuration even on names that
+        // would resolve via /etc/hosts.
+        const net = if (net_handle < self.network_table.items.len)
+            self.network_table.items[net_handle]
+        else
+            null;
+        if (net == null or net.?.allow_list.len == 0) {
+            results[0] = try socketResultErr(allocator, .name_unresolvable);
+            return;
+        }
+
+        // Lift the hostname. Empty / out-of-bounds / RFC1123-invalid
+        // input → name-unresolvable per WIT.
+        const name_bytes: []const u8 = if (name_pl.len == 0) "" else (ci.readGuestBytes(name_pl.ptr, name_pl.len) orelse {
+            results[0] = try socketResultErr(allocator, .name_unresolvable);
+            return;
+        });
+        const host = std.Io.net.HostName.init(name_bytes) catch {
+            results[0] = try socketResultErr(allocator, .name_unresolvable);
+            return;
+        };
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var queue_buf: [32]std.Io.net.HostName.LookupResult = undefined;
+        var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&queue_buf);
+        host.lookup(io, &queue, .{ .port = 0 }) catch |err| {
+            results[0] = try socketResultErr(allocator, mapDnsError(err));
+            return;
+        };
+
+        // Drain. `lookup` closes the queue before return, so this loop
+        // terminates with `error.Closed` once the buffer is empty.
+        var addrs: std.ArrayListUnmanaged(std.Io.net.IpAddress) = .empty;
+        errdefer addrs.deinit(self.allocator);
+        while (queue.getOneUncancelable(io)) |item| {
+            switch (item) {
+                .address => |a| try addrs.append(self.allocator, a),
+                .canonical_name => {},
+            }
+        } else |drain_err| switch (drain_err) {
+            error.Closed => {},
+        }
+
+        const slice = try addrs.toOwnedSlice(self.allocator);
+        errdefer self.allocator.free(slice);
+
+        const stream = try self.allocator.create(ResolveAddressStream);
+        errdefer self.allocator.destroy(stream);
+        stream.* = .{ .results = slice, .pos = 0, .allocator = self.allocator };
+
+        const h = try self.pushResolveStream(stream);
+        results[0] = try socketResultOk(allocator, .{ .handle = h });
     }
 
     /// `[method]resolve-address-stream.resolve-next-address:
@@ -3010,10 +3135,21 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErr(allocator, .invalid_state);
             return;
         };
-        // Always exhausted on the default-deny path — return ok(none).
-        _ = stream;
-        const none_val = InterfaceValue{ .option_val = .{ .is_some = false, .payload = null } };
-        results[0] = try socketResultOk(allocator, none_val);
+        if (stream.pos >= stream.results.len) {
+            const none_val = InterfaceValue{ .option_val = .{ .is_some = false, .payload = null } };
+            results[0] = try socketResultOk(allocator, none_val);
+            return;
+        }
+        const addr = stream.results[stream.pos];
+        stream.pos += 1;
+
+        const ip_val = try lowerIpAddress(allocator, addr);
+        errdefer ip_val.deinit(allocator);
+        const some_payload = try allocator.create(InterfaceValue);
+        errdefer allocator.destroy(some_payload);
+        some_payload.* = ip_val;
+        const some_val = InterfaceValue{ .option_val = .{ .is_some = true, .payload = some_payload } };
+        results[0] = try socketResultOk(allocator, some_val);
     }
 
     /// `[resource-drop]resolve-address-stream`.
@@ -6176,6 +6312,246 @@ test "sockets: ip-name-lookup smoke (#148)" {
         @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
         err.variant_val.discriminant,
     );
+}
+
+test "sockets DNS: lowerIpAddress lowers IPv4 as variant of tuple<u8 x 4> (#179)" {
+    const testing = std.testing;
+    const v4: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 5 }, .port = 0 } };
+    const lifted = try lowerIpAddress(testing.allocator, v4);
+    defer lifted.deinit(testing.allocator);
+
+    try testing.expect(lifted == .variant_val);
+    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv4)), lifted.variant_val.discriminant);
+    const tup = lifted.variant_val.payload.?.*;
+    try testing.expect(tup == .tuple_val);
+    try testing.expectEqual(@as(usize, 4), tup.tuple_val.len);
+    try testing.expectEqual(@as(u8, 192), tup.tuple_val[0].u8);
+    try testing.expectEqual(@as(u8, 0), tup.tuple_val[1].u8);
+    try testing.expectEqual(@as(u8, 2), tup.tuple_val[2].u8);
+    try testing.expectEqual(@as(u8, 5), tup.tuple_val[3].u8);
+}
+
+test "sockets DNS: lowerIpAddress lowers IPv6 as variant of tuple<u16 x 8> (#179)" {
+    const testing = std.testing;
+    // ::1 (loopback) -> seven zero groups + 0x0001.
+    const v6: std.Io.net.IpAddress = .{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .port = 0,
+    } };
+    const lifted = try lowerIpAddress(testing.allocator, v6);
+    defer lifted.deinit(testing.allocator);
+
+    try testing.expect(lifted == .variant_val);
+    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv6)), lifted.variant_val.discriminant);
+    const tup = lifted.variant_val.payload.?.*;
+    try testing.expect(tup == .tuple_val);
+    try testing.expectEqual(@as(usize, 8), tup.tuple_val.len);
+    inline for (0..7) |i| try testing.expectEqual(@as(u16, 0), tup.tuple_val[i].u16);
+    try testing.expectEqual(@as(u16, 1), tup.tuple_val[7].u16);
+}
+
+test "sockets DNS: lowerIpAddress preserves IPv6 byte order (#179)" {
+    const testing = std.testing;
+    // 2001:db8::1 -> groups: 0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0001
+    const v6: std.Io.net.IpAddress = .{ .ip6 = .{
+        .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01 },
+        .port = 0,
+    } };
+    const lifted = try lowerIpAddress(testing.allocator, v6);
+    defer lifted.deinit(testing.allocator);
+    const tup = lifted.variant_val.payload.?.*;
+    try testing.expectEqual(@as(u16, 0x2001), tup.tuple_val[0].u16);
+    try testing.expectEqual(@as(u16, 0x0db8), tup.tuple_val[1].u16);
+    try testing.expectEqual(@as(u16, 0x0001), tup.tuple_val[7].u16);
+}
+
+test "sockets DNS: resolve-next-address on empty stream returns ok(none) (#179)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const stream = try testing.allocator.create(ResolveAddressStream);
+    stream.* = .{ .results = &.{}, .pos = 0, .allocator = testing.allocator };
+    const h = try adapter.pushResolveStream(stream);
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .handle = h }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    const ok_payload = results[0].result_val.payload.?.*;
+    try testing.expect(ok_payload == .option_val);
+    try testing.expect(!ok_payload.option_val.is_some);
+}
+
+test "sockets DNS: resolve-next-address pops IPv4 then exhausts (#179)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const slot = try testing.allocator.alloc(std.Io.net.IpAddress, 1);
+    slot[0] = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    const stream = try testing.allocator.create(ResolveAddressStream);
+    stream.* = .{ .results = slot, .pos = 0, .allocator = testing.allocator };
+    const h = try adapter.pushResolveStream(stream);
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .handle = h }};
+
+    // First call: ok(some(ipv4(127,0,0,1))).
+    var r1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &r1, testing.allocator);
+    defer r1[0].deinit(testing.allocator);
+    try testing.expect(r1[0].result_val.is_ok);
+    const opt = r1[0].result_val.payload.?.*;
+    try testing.expect(opt.option_val.is_some);
+    const variant = opt.option_val.payload.?.*;
+    try testing.expectEqual(@as(u32, @intFromEnum(IpAddressFamily.ipv4)), variant.variant_val.discriminant);
+    const tup = variant.variant_val.payload.?.*;
+    try testing.expectEqual(@as(u8, 127), tup.tuple_val[0].u8);
+    try testing.expectEqual(@as(u8, 1), tup.tuple_val[3].u8);
+
+    // Second call: ok(none).
+    var r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &r2, testing.allocator);
+    defer r2[0].deinit(testing.allocator);
+    try testing.expect(r2[0].result_val.is_ok);
+    try testing.expect(!r2[0].result_val.payload.?.option_val.is_some);
+}
+
+test "sockets DNS: resolve-next-address mixed v4/v6 sequence (#179)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const slot = try testing.allocator.alloc(std.Io.net.IpAddress, 2);
+    slot[0] = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 0 } };
+    slot[1] = .{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .port = 0,
+    } };
+    const stream = try testing.allocator.create(ResolveAddressStream);
+    stream.* = .{ .results = slot, .pos = 0, .allocator = testing.allocator };
+    const h = try adapter.pushResolveStream(stream);
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .handle = h }};
+
+    var r1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &r1, testing.allocator);
+    defer r1[0].deinit(testing.allocator);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(IpAddressFamily.ipv4)),
+        r1[0].result_val.payload.?.option_val.payload.?.variant_val.discriminant,
+    );
+
+    var r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &r2, testing.allocator);
+    defer r2[0].deinit(testing.allocator);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(IpAddressFamily.ipv6)),
+        r2[0].result_val.payload.?.option_val.payload.?.variant_val.discriminant,
+    );
+
+    var r3: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &r3, testing.allocator);
+    defer r3[0].deinit(testing.allocator);
+    try testing.expect(!r3[0].result_val.payload.?.option_val.is_some);
+}
+
+test "sockets DNS: resolve-next-address rejects unknown handle (#179)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .handle = 99 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveNextAddress(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets DNS: resolve-addresses denies invalid hostname even when allow-list set (#179)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
+
+    // Build a network so the borrow lookup succeeds.
+    var ci: ComponentInstance = undefined;
+    var net_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &net_results, testing.allocator);
+    const net_handle = net_results[0].handle;
+
+    // Hostname with an invalid character ('_') -> RFC1123 rejects it ->
+    // name-unresolvable, no DNS round-trip attempted.
+    const args = [_]InterfaceValue{
+        .{ .handle = net_handle },
+        .{ .string = .{ .ptr = 0, .len = 0 } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveAddresses(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets DNS: resolve-addresses denies unknown network handle (#179)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setSocketsAllowList(&.{"0.0.0.0/0"});
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{
+        .{ .handle = 7 }, // never minted
+        .{ .string = .{ .ptr = 0, .len = 0 } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.resolveAddresses(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets DNS: resource-drop frees a populated resolve-stream (#179)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const slot = try testing.allocator.alloc(std.Io.net.IpAddress, 3);
+    slot[0] = .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 0 } };
+    slot[1] = .{ .ip4 = .{ .bytes = .{ 5, 6, 7, 8 }, .port = 0 } };
+    slot[2] = .{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .port = 0,
+    } };
+    const stream = try testing.allocator.create(ResolveAddressStream);
+    stream.* = .{ .results = slot, .pos = 1, .allocator = testing.allocator };
+    const h = try adapter.pushResolveStream(stream);
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .handle = h }};
+    var results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.resolveStreamDrop(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(adapter.resolve_streams.items[h] == null);
 }
 
 test "sockets allow-list: parseCidr accepts canonical IPv4 (#180)" {
