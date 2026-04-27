@@ -546,6 +546,57 @@ pub const HttpFields = struct {
     }
 };
 
+/// Lift a `list<tuple<string, string>>` from guest memory into a fresh
+/// allocator-owned slice of `HttpFieldEntry`. Used by
+/// `[static]fields.from-list` (#174). Each list element is laid out as
+/// four little-endian u32s — name.ptr, name.len, value.ptr, value.len —
+/// for a 16-byte stride and 4-byte alignment, matching the canonical
+/// ABI lowering used by `getEnvironment`.
+///
+/// On any out-of-bounds read the partially-allocated entries are freed
+/// and `error.OutOfBoundsMemory` is returned, leaving no leaks.
+fn liftFieldEntries(
+    allocator: Allocator,
+    mem: []const u8,
+    list_ptr: u32,
+    count: u32,
+) ![]HttpFieldEntry {
+    const stride: u32 = 16;
+    const total = std.math.mul(u32, count, stride) catch return error.OutOfBoundsMemory;
+    const list_end = std.math.add(u32, list_ptr, total) catch return error.OutOfBoundsMemory;
+    if (list_end > mem.len) return error.OutOfBoundsMemory;
+
+    const entries = try allocator.alloc(HttpFieldEntry, count);
+    var filled: usize = 0;
+    errdefer {
+        for (entries[0..filled]) |e| {
+            allocator.free(e.name);
+            allocator.free(e.value);
+        }
+        allocator.free(entries);
+    }
+
+    while (filled < count) : (filled += 1) {
+        const off = list_ptr + @as(u32, @intCast(filled)) * stride;
+        const name_ptr = std.mem.readInt(u32, mem[off..][0..4], .little);
+        const name_len = std.mem.readInt(u32, mem[off + 4 ..][0..4], .little);
+        const val_ptr = std.mem.readInt(u32, mem[off + 8 ..][0..4], .little);
+        const val_len = std.mem.readInt(u32, mem[off + 12 ..][0..4], .little);
+
+        const name_end = std.math.add(u32, name_ptr, name_len) catch return error.OutOfBoundsMemory;
+        if (name_end > mem.len) return error.OutOfBoundsMemory;
+        const val_end = std.math.add(u32, val_ptr, val_len) catch return error.OutOfBoundsMemory;
+        if (val_end > mem.len) return error.OutOfBoundsMemory;
+
+        const name_copy = try allocator.dupe(u8, mem[name_ptr..name_end]);
+        errdefer allocator.free(name_copy);
+        const val_copy = try allocator.dupe(u8, mem[val_ptr..val_end]);
+        entries[filled] = .{ .name = name_copy, .value = val_copy };
+    }
+
+    return entries;
+}
+
 /// `wasi:http/types.outgoing-request`. The constructor borrows a
 /// `fields` handle for headers; mutation goes through `set-*` methods
 /// which the default-deny adapter accepts as ok no-ops (real header
@@ -3493,26 +3544,41 @@ pub const WasiCliAdapter = struct {
     /// `[static]fields.from-list(list<tuple<field-name, field-value>>)
     ///   -> result<own<fields>, header-error>`.
     ///
-    /// The argument is a guest-memory list of name/value tuples;
-    /// reading and copying each entry would require recursive lifting
-    /// that the canonical-ABI layer doesn't yet hand to host fns in a
-    /// uniform shape. The default-deny adapter therefore allocates an
-    /// empty fields rep and returns ok — guests that rely on
-    /// `from-list` populating headers should instead call
-    /// `[constructor]fields` + `append` once that path is fully wired.
-    /// TODO(#149 follow-up): copy entries when ABI exposes lifted
-    /// list<tuple<string,string>> values.
+    /// The argument is a guest-memory list of `tuple<string, string>`
+    /// records. Each element is laid out as four u32s — name.ptr,
+    /// name.len, value.ptr, value.len — for a 16-byte stride. We lift
+    /// each tuple, copy both strings into adapter-owned heap, and
+    /// populate the new `HttpFields.entries`. No header validation is
+    /// performed today (a follow-up may reject `.invalid_syntax` per
+    /// RFC 7230); guests that round-trip through `entries` get back
+    /// what they passed in.
     fn httpFieldsFromList(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
-        _: []const InterfaceValue,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
-        if (results.len == 0) return error.InvalidArgs;
+        if (args.len == 0 or results.len == 0) return error.InvalidArgs;
+        const list = switch (args[0]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
         const f = try self.allocator.create(HttpFields);
         f.* = .{};
+        errdefer {
+            f.deinit(self.allocator);
+            self.allocator.destroy(f);
+        }
+
+        if (list.len > 0) {
+            const mem = ci.canonicalMemory() orelse return error.OutOfBoundsMemory;
+            const lifted = try liftFieldEntries(self.allocator, mem.data, list.ptr, list.len);
+            f.entries = .{ .items = lifted, .capacity = lifted.len };
+        }
+
         const h = try self.pushHttpFields(f);
         results[0] = try httpResultOk(allocator, .{ .handle = h });
     }
@@ -6773,6 +6839,132 @@ test "sockets allow-list: resource-drop frees snapshot (#180)" {
     // testing.allocator's leak detector flags us if the snapshot wasn't freed.
 }
 
+test "http: liftFieldEntries lifts canonical layout (#174)" {
+    const testing = std.testing;
+
+    // Memory layout:
+    //   [0..16)   : tuple #0 = (16, 11, 27, 13)  → "content-type" / "text/plain"
+    //   wait — recompute. We'll place name at 32 ("foo"), value at 40 ("bar"),
+    //   and a single tuple at offset 0.
+    var mem: [64]u8 = @splat(0);
+    @memcpy(mem[16..19], "foo");
+    @memcpy(mem[24..27], "bar");
+    std.mem.writeInt(u32, mem[0..4], 16, .little); // name.ptr
+    std.mem.writeInt(u32, mem[4..8], 3, .little); // name.len
+    std.mem.writeInt(u32, mem[8..12], 24, .little); // value.ptr
+    std.mem.writeInt(u32, mem[12..16], 3, .little); // value.len
+
+    const entries = try liftFieldEntries(testing.allocator, &mem, 0, 1);
+    defer {
+        for (entries) |e| {
+            testing.allocator.free(e.name);
+            testing.allocator.free(e.value);
+        }
+        testing.allocator.free(entries);
+    }
+
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("foo", entries[0].name);
+    try testing.expectEqualStrings("bar", entries[0].value);
+}
+
+test "http: liftFieldEntries handles multiple entries (#174)" {
+    const testing = std.testing;
+
+    // Two tuples at offsets 0 and 16 (stride 16). String pool starts at 64.
+    var mem: [128]u8 = @splat(0);
+    const pool: u32 = 64;
+    @memcpy(mem[pool .. pool + 12], "content-type");
+    @memcpy(mem[pool + 12 .. pool + 22], "text/plain");
+    @memcpy(mem[pool + 22 .. pool + 30], "x-custom");
+    @memcpy(mem[pool + 30 .. pool + 35], "value");
+
+    // tuple #0
+    std.mem.writeInt(u32, mem[0..4], pool, .little);
+    std.mem.writeInt(u32, mem[4..8], 12, .little);
+    std.mem.writeInt(u32, mem[8..12], pool + 12, .little);
+    std.mem.writeInt(u32, mem[12..16], 10, .little);
+    // tuple #1
+    std.mem.writeInt(u32, mem[16..20], pool + 22, .little);
+    std.mem.writeInt(u32, mem[20..24], 8, .little);
+    std.mem.writeInt(u32, mem[24..28], pool + 30, .little);
+    std.mem.writeInt(u32, mem[28..32], 5, .little);
+
+    const entries = try liftFieldEntries(testing.allocator, &mem, 0, 2);
+    defer {
+        for (entries) |e| {
+            testing.allocator.free(e.name);
+            testing.allocator.free(e.value);
+        }
+        testing.allocator.free(entries);
+    }
+
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("content-type", entries[0].name);
+    try testing.expectEqualStrings("text/plain", entries[0].value);
+    try testing.expectEqualStrings("x-custom", entries[1].name);
+    try testing.expectEqualStrings("value", entries[1].value);
+}
+
+test "http: liftFieldEntries handles empty strings (#174)" {
+    const testing = std.testing;
+    // tuple of (empty, empty) — ptrs ignored, lens are 0.
+    var mem: [16]u8 = @splat(0);
+    // All zeros: name.ptr=0, name.len=0, value.ptr=0, value.len=0.
+    const entries = try liftFieldEntries(testing.allocator, &mem, 0, 1);
+    defer {
+        for (entries) |e| {
+            testing.allocator.free(e.name);
+            testing.allocator.free(e.value);
+        }
+        testing.allocator.free(entries);
+    }
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("", entries[0].name);
+    try testing.expectEqualStrings("", entries[0].value);
+}
+
+test "http: liftFieldEntries rejects out-of-bounds list (#174)" {
+    const testing = std.testing;
+    var mem: [16]u8 = @splat(0);
+    // count=1 needs 16 bytes; list_ptr=8 → list_end=24 > 16.
+    try testing.expectError(error.OutOfBoundsMemory, liftFieldEntries(testing.allocator, &mem, 8, 1));
+    // list_ptr=0xfffffff0 + count=1*16 overflows u32.
+    try testing.expectError(error.OutOfBoundsMemory, liftFieldEntries(testing.allocator, &mem, 0xfffffff0, 2));
+}
+
+test "http: liftFieldEntries rejects out-of-bounds string (#174)" {
+    const testing = std.testing;
+    var mem: [32]u8 = @splat(0);
+    // tuple at 0: name.ptr=24, name.len=100 → 124 > 32.
+    std.mem.writeInt(u32, mem[0..4], 24, .little);
+    std.mem.writeInt(u32, mem[4..8], 100, .little);
+    std.mem.writeInt(u32, mem[8..12], 0, .little);
+    std.mem.writeInt(u32, mem[12..16], 0, .little);
+    try testing.expectError(error.OutOfBoundsMemory, liftFieldEntries(testing.allocator, &mem, 0, 1));
+}
+
+test "http: liftFieldEntries no leak on partial-fill failure (#174)" {
+    const testing = std.testing;
+    var mem: [48]u8 = @splat(0);
+    // Two tuples: #0 valid ("ok" pair), #1 has bad value pointer.
+    @memcpy(mem[32..34], "ok");
+    // tuple #0
+    std.mem.writeInt(u32, mem[0..4], 32, .little);
+    std.mem.writeInt(u32, mem[4..8], 2, .little);
+    std.mem.writeInt(u32, mem[8..12], 32, .little);
+    std.mem.writeInt(u32, mem[12..16], 2, .little);
+    // tuple #1 — value points past memory.
+    std.mem.writeInt(u32, mem[16..20], 32, .little);
+    std.mem.writeInt(u32, mem[20..24], 2, .little);
+    std.mem.writeInt(u32, mem[24..28], 100, .little);
+    std.mem.writeInt(u32, mem[28..32], 50, .little);
+
+    // testing.allocator's leak detector flags us if entry #0's strings
+    // weren't freed when #1 failed.
+    try testing.expectError(error.OutOfBoundsMemory, liftFieldEntries(testing.allocator, &mem, 0, 2));
+}
+
 test "populateWasiProviders: binds wasi:http/* (#149)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
@@ -6846,17 +7038,13 @@ test "http: fields constructor + drop roundtrip (#149)" {
     try testing.expect(adapter.http_fields_table.items[handle] == null);
 }
 
-test "http: fields.from-list returns ok with fresh handle (#149)" {
+test "http: fields.from-list returns ok with empty list (#149, #174)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
 
-    // Pass an empty list-of-tuples — the adapter ignores the contents
-    // anyway on the default-deny path.
     var ci: ComponentInstance = undefined;
-    const empty_list = try testing.allocator.alloc(InterfaceValue, 0);
-    defer testing.allocator.free(empty_list);
-    const args = [_]InterfaceValue{.{ .list_val = empty_list }};
+    const args = [_]InterfaceValue{.{ .list = .{ .ptr = 0, .len = 0 } }};
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpFieldsFromList(&adapter, &ci, &args, &results, testing.allocator);
     defer results[0].deinit(testing.allocator);
@@ -6865,6 +7053,8 @@ test "http: fields.from-list returns ok with fresh handle (#149)" {
     try testing.expect(results[0].result_val.is_ok);
     try testing.expect(results[0].result_val.payload.?.* == .handle);
     try testing.expectEqual(@as(usize, 1), adapter.http_fields_table.items.len);
+    const f = adapter.http_fields_table.items[0].?;
+    try testing.expectEqual(@as(usize, 0), f.entries.items.len);
 }
 
 test "http: outgoing-request constructor allocates slot (#149)" {
