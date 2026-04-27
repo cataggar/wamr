@@ -248,10 +248,138 @@ pub const Socket = struct {
     state: SocketState = .unbound,
 };
 
-/// Adapter-side `network` rep. Currently empty — the WIT declares zero
-/// methods on `network`, and the default-deny capability model means the
-/// rep does not need to carry an allow-list yet.
-pub const Network = struct {};
+/// CIDR block for the per-`network` allow-list (#180). Stored canonical:
+/// host bits below the prefix are zeroed at parse time.
+pub const IpCidr = union(enum) {
+    ip4: struct { bytes: [4]u8, prefix: u6 },
+    ip6: struct { bytes: [16]u8, prefix: u8 },
+
+    pub const ParseError = error{
+        InvalidCidr,
+        InvalidPrefix,
+        InvalidAddress,
+    };
+
+    /// Parse `"<addr>/<prefix>"`. The address half is parsed with port=0 by
+    /// `Ip4Address.parse` / `Ip6Address.parse`; v4 is tried first. Prefix
+    /// must be plain decimal (no leading `+`/`-`/zero-padding) within
+    /// 0..=32 (v4) or 0..=128 (v6). Host bits are masked to zero so two
+    /// textual variants of the same network compare equal.
+    pub fn parse(text: []const u8) ParseError!IpCidr {
+        const slash = std.mem.indexOfScalar(u8, text, '/') orelse return error.InvalidCidr;
+        const addr_text = text[0..slash];
+        const prefix_text = text[slash + 1 ..];
+        if (addr_text.len == 0 or prefix_text.len == 0) return error.InvalidCidr;
+        // Reject leading zeros / signs in prefix to keep canonical text.
+        if (prefix_text[0] == '+' or prefix_text[0] == '-') return error.InvalidPrefix;
+        if (prefix_text.len > 1 and prefix_text[0] == '0') return error.InvalidPrefix;
+        for (prefix_text) |c| if (c < '0' or c > '9') return error.InvalidPrefix;
+        // Reject bracketed IPv6 (`[::]/128`) — CIDR text is bare.
+        if (addr_text[0] == '[') return error.InvalidAddress;
+
+        if (std.Io.net.Ip4Address.parse(addr_text, 0)) |v4| {
+            const p = std.fmt.parseInt(u8, prefix_text, 10) catch return error.InvalidPrefix;
+            if (p > 32) return error.InvalidPrefix;
+            var bytes = v4.bytes;
+            maskV4(&bytes, @intCast(p));
+            return .{ .ip4 = .{ .bytes = bytes, .prefix = @intCast(p) } };
+        } else |_| {}
+        if (std.Io.net.Ip6Address.parse(addr_text, 0)) |v6| {
+            const p = std.fmt.parseInt(u8, prefix_text, 10) catch return error.InvalidPrefix;
+            if (p > 128) return error.InvalidPrefix;
+            var bytes = v6.bytes;
+            maskV6(&bytes, p);
+            return .{ .ip6 = .{ .bytes = bytes, .prefix = p } };
+        } else |_| {}
+        return error.InvalidAddress;
+    }
+
+    /// Same-family bit-prefix match. Mixed families never match — IPv4-
+    /// mapped IPv6 addresses are matched as IPv6 only (callers receive an
+    /// `IpAddress` already discriminated by the wasi:sockets layer).
+    pub fn containsAddr(self: IpCidr, addr: std.Io.net.IpAddress) bool {
+        return switch (self) {
+            .ip4 => |c| switch (addr) {
+                .ip4 => |a| matchPrefix(&c.bytes, &a.bytes, c.prefix),
+                .ip6 => false,
+            },
+            .ip6 => |c| switch (addr) {
+                .ip6 => |a| matchPrefix(&c.bytes, &a.bytes, c.prefix),
+                .ip4 => false,
+            },
+        };
+    }
+};
+
+fn maskV4(bytes: *[4]u8, prefix: u6) void {
+    if (prefix >= 32) return;
+    var i: usize = 0;
+    var remaining: u8 = prefix;
+    while (i < 4) : (i += 1) {
+        if (remaining >= 8) {
+            remaining -= 8;
+        } else if (remaining == 0) {
+            bytes[i] = 0;
+        } else {
+            const keep: u8 = @as(u8, 0xff) << @intCast(8 - remaining);
+            bytes[i] &= keep;
+            remaining = 0;
+        }
+    }
+}
+
+fn maskV6(bytes: *[16]u8, prefix: u8) void {
+    if (prefix >= 128) return;
+    var i: usize = 0;
+    var remaining: u8 = prefix;
+    while (i < 16) : (i += 1) {
+        if (remaining >= 8) {
+            remaining -= 8;
+        } else if (remaining == 0) {
+            bytes[i] = 0;
+        } else {
+            const keep: u8 = @as(u8, 0xff) << @intCast(8 - remaining);
+            bytes[i] &= keep;
+            remaining = 0;
+        }
+    }
+}
+
+fn matchPrefix(cidr_bytes: []const u8, addr_bytes: []const u8, prefix: u8) bool {
+    var remaining: u8 = prefix;
+    var i: usize = 0;
+    while (remaining >= 8) : (i += 1) {
+        if (cidr_bytes[i] != addr_bytes[i]) return false;
+        remaining -= 8;
+    }
+    if (remaining == 0) return true;
+    const mask: u8 = @as(u8, 0xff) << @intCast(8 - remaining);
+    return (cidr_bytes[i] & mask) == (addr_bytes[i] & mask);
+}
+
+/// Adapter-side `network` rep (#180). Carries a per-instance allow-list of
+/// CIDR blocks snapshotted from `WasiCliAdapter.sockets_allow_list_template`
+/// at `instance-network` time; the snapshot is owned by the Network and
+/// freed in `[resource-drop]network` / adapter `deinit`. Empty list = the
+/// default deny-all capability.
+///
+/// TODO(#178): bind/connect handlers will call `allows()` before issuing
+/// real `std.Io.net.Socket` I/O. Today the handlers are still
+/// default-deny stubs, so the allow-list is stored but not yet consulted
+/// from the WIT call sites.
+pub const Network = struct {
+    allow_list: []const IpCidr = &.{},
+
+    pub fn allows(self: Network, addr: std.Io.net.IpAddress) bool {
+        for (self.allow_list) |c| if (c.containsAddr(addr)) return true;
+        return false;
+    }
+
+    fn deinit(self: *Network, allocator: Allocator) void {
+        if (self.allow_list.len != 0) allocator.free(self.allow_list);
+        self.allow_list = &.{};
+    }
+};
 
 /// Adapter-side `resolve-address-stream` rep. `pos` advances on each
 /// `resolve-next-address` until `pos == results.len`, after which the
@@ -549,6 +677,11 @@ pub const WasiCliAdapter = struct {
     /// `wasi:sockets/network` resource table. Slot index = guest handle.
     /// Slots are nulled on `[resource-drop]network`.
     network_table: std.ArrayListUnmanaged(?Network) = .empty,
+    /// Adapter-level template for the per-`network` CIDR allow-list (#180).
+    /// Each `instance-network` snapshots this slice into the new
+    /// `Network.allow_list`. Empty = deny-all (the default). Owned by the
+    /// adapter and replaced atomically by `setSocketsAllowList`.
+    sockets_allow_list_template: []IpCidr = &.{},
     /// `wasi:sockets/{tcp,udp}` socket resource table. Slot index = guest
     /// handle (shared across both kinds — `Socket.kind` discriminates).
     /// Slots are nulled on `[resource-drop]tcp-socket` /
@@ -666,10 +799,16 @@ pub const WasiCliAdapter = struct {
         for (self.fs_preopens.items) |p| self.allocator.free(p.name);
         self.fs_preopens.deinit(self.allocator);
 
-        // wasi:sockets resource tables. Sockets and networks are POD, so
-        // dropping a slot simply discards it. Resolve streams own their
-        // result slice + the heap struct itself.
+        // wasi:sockets resource tables. Sockets are POD; networks own a
+        // copy of the per-instance CIDR allow-list (#180) and free it on
+        // drop. Resolve streams own their result slice + the heap struct
+        // itself.
+        for (self.network_table.items) |*maybe| {
+            if (maybe.* != null) maybe.*.?.deinit(self.allocator);
+        }
         self.network_table.deinit(self.allocator);
+        if (self.sockets_allow_list_template.len != 0)
+            self.allocator.free(self.sockets_allow_list_template);
         self.socket_table.deinit(self.allocator);
         for (self.resolve_streams.items) |maybe| {
             if (maybe) |s| {
@@ -755,6 +894,38 @@ pub const WasiCliAdapter = struct {
     /// are borrowed — caller must keep them alive for the run.
     pub fn setEnvironment(self: *WasiCliAdapter, env: []const EnvVar) void {
         self.env = env;
+    }
+
+    /// Configure the per-`network` CIDR allow-list (#180). Each entry is
+    /// parsed by `IpCidr.parse` (e.g. `"127.0.0.0/8"`, `"::1/128"`,
+    /// `"fe80::/10"`). The slice is snapshotted into every `Network`
+    /// returned by `instance-network` from this point onward; previously
+    /// created `Network` resources keep their own snapshot.
+    ///
+    /// Default is deny-all (empty list). Calling with an empty slice
+    /// resets to deny-all. Replaces (and frees) any prior template.
+    /// On parse failure the previous template is preserved.
+    ///
+    /// TODO(#178): once `tcp-socket.start-bind` / `start-connect` issue
+    /// real `std.Io.net.Socket` calls, they will gate destinations via
+    /// `Network.allows()` before performing I/O. Today the bind/connect
+    /// handlers remain default-deny stubs.
+    pub fn setSocketsAllowList(self: *WasiCliAdapter, cidrs: []const []const u8) !void {
+        if (cidrs.len == 0) {
+            if (self.sockets_allow_list_template.len != 0)
+                self.allocator.free(self.sockets_allow_list_template);
+            self.sockets_allow_list_template = &.{};
+            return;
+        }
+        const parsed = try self.allocator.alloc(IpCidr, cidrs.len);
+        var filled: usize = 0;
+        errdefer self.allocator.free(parsed);
+        while (filled < cidrs.len) : (filled += 1) {
+            parsed[filled] = try IpCidr.parse(cidrs[filled]);
+        }
+        if (self.sockets_allow_list_template.len != 0)
+            self.allocator.free(self.sockets_allow_list_template);
+        self.sockets_allow_list_template = parsed;
     }
 
     /// Captured stdout bytes (valid for buffer-backed sinks).
@@ -2662,11 +2833,17 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         if (handle < self.network_table.items.len) {
+            if (self.network_table.items[handle] != null) {
+                self.network_table.items[handle].?.deinit(self.allocator);
+            }
             self.network_table.items[handle] = null;
         }
     }
 
     /// `wasi:sockets/instance-network.instance-network: () -> own<network>`.
+    /// Snapshots the adapter's CIDR allow-list template (#180) into the new
+    /// Network. The snapshot is independent: subsequent
+    /// `setSocketsAllowList` calls do not mutate already-issued Networks.
     fn instanceNetwork(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
@@ -2676,7 +2853,15 @@ pub const WasiCliAdapter = struct {
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
-        const h = try self.pushNetwork(.{});
+        const snapshot: []IpCidr = if (self.sockets_allow_list_template.len == 0)
+            &.{}
+        else blk: {
+            const buf = try self.allocator.alloc(IpCidr, self.sockets_allow_list_template.len);
+            @memcpy(buf, self.sockets_allow_list_template);
+            break :blk buf;
+        };
+        errdefer if (snapshot.len != 0) self.allocator.free(snapshot);
+        const h = try self.pushNetwork(.{ .allow_list = snapshot });
         results[0] = .{ .handle = h };
     }
 
@@ -5991,6 +6176,225 @@ test "sockets: ip-name-lookup smoke (#148)" {
         @as(u32, @intFromEnum(SocketErrorCode.name_unresolvable)),
         err.variant_val.discriminant,
     );
+}
+
+test "sockets allow-list: parseCidr accepts canonical IPv4 (#180)" {
+    const testing = std.testing;
+    const c = try IpCidr.parse("10.0.0.0/8");
+    try testing.expect(c == .ip4);
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0 }, &c.ip4.bytes);
+    try testing.expectEqual(@as(u6, 8), c.ip4.prefix);
+
+    const c2 = try IpCidr.parse("0.0.0.0/0");
+    try testing.expectEqual(@as(u6, 0), c2.ip4.prefix);
+
+    const c3 = try IpCidr.parse("127.0.0.1/32");
+    try testing.expectEqual(@as(u6, 32), c3.ip4.prefix);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &c3.ip4.bytes);
+}
+
+test "sockets allow-list: parseCidr canonicalizes host bits (#180)" {
+    const testing = std.testing;
+    // Non-canonical input → host bits zeroed.
+    const c = try IpCidr.parse("10.5.5.5/8");
+    try testing.expectEqualSlices(u8, &.{ 10, 0, 0, 0 }, &c.ip4.bytes);
+
+    const c2 = try IpCidr.parse("192.168.1.255/24");
+    try testing.expectEqualSlices(u8, &.{ 192, 168, 1, 0 }, &c2.ip4.bytes);
+
+    const c3 = try IpCidr.parse("2001:db8:abcd:1234::1/32");
+    try testing.expect(c3 == .ip6);
+    var expected: [16]u8 = @splat(0);
+    expected[0] = 0x20;
+    expected[1] = 0x01;
+    expected[2] = 0x0d;
+    expected[3] = 0xb8;
+    try testing.expectEqualSlices(u8, &expected, &c3.ip6.bytes);
+}
+
+test "sockets allow-list: parseCidr accepts IPv6 forms (#180)" {
+    const testing = std.testing;
+    const c1 = try IpCidr.parse("::/0");
+    try testing.expect(c1 == .ip6);
+    try testing.expectEqual(@as(u8, 0), c1.ip6.prefix);
+
+    const c2 = try IpCidr.parse("::1/128");
+    try testing.expectEqual(@as(u8, 128), c2.ip6.prefix);
+    var loopback: [16]u8 = @splat(0);
+    loopback[15] = 1;
+    try testing.expectEqualSlices(u8, &loopback, &c2.ip6.bytes);
+
+    const c3 = try IpCidr.parse("fe80::/10");
+    try testing.expectEqual(@as(u8, 10), c3.ip6.prefix);
+    // First 10 bits = 0xfe80 → first byte 0xfe, second byte top-2 = 0x80.
+    try testing.expectEqual(@as(u8, 0xfe), c3.ip6.bytes[0]);
+    try testing.expectEqual(@as(u8, 0x80), c3.ip6.bytes[1]);
+}
+
+test "sockets allow-list: parseCidr rejects malformed inputs (#180)" {
+    const testing = std.testing;
+    try testing.expectError(error.InvalidCidr, IpCidr.parse("10.0.0.0"));
+    try testing.expectError(error.InvalidCidr, IpCidr.parse("10.0.0.0/"));
+    try testing.expectError(error.InvalidCidr, IpCidr.parse("/24"));
+    try testing.expectError(error.InvalidCidr, IpCidr.parse("/"));
+    try testing.expectError(error.InvalidPrefix, IpCidr.parse("10.0.0.0/33"));
+    try testing.expectError(error.InvalidPrefix, IpCidr.parse("::1/129"));
+    try testing.expectError(error.InvalidPrefix, IpCidr.parse("10.0.0.0/-1"));
+    try testing.expectError(error.InvalidPrefix, IpCidr.parse("10.0.0.0/+8"));
+    try testing.expectError(error.InvalidPrefix, IpCidr.parse("10.0.0.0/08"));
+    try testing.expectError(error.InvalidAddress, IpCidr.parse("garbage/32"));
+    try testing.expectError(error.InvalidAddress, IpCidr.parse("[::]/128"));
+}
+
+test "sockets allow-list: containsAddr matches IPv4 prefix (#180)" {
+    const testing = std.testing;
+    const c = try IpCidr.parse("10.0.0.0/8");
+    try testing.expect(c.containsAddr(.{ .ip4 = .{ .bytes = .{ 10, 5, 5, 5 }, .port = 0 } }));
+    try testing.expect(c.containsAddr(.{ .ip4 = .{ .bytes = .{ 10, 0, 0, 0 }, .port = 0 } }));
+    try testing.expect(c.containsAddr(.{ .ip4 = .{ .bytes = .{ 10, 255, 255, 255 }, .port = 0 } }));
+    try testing.expect(!c.containsAddr(.{ .ip4 = .{ .bytes = .{ 11, 0, 0, 1 }, .port = 0 } }));
+    try testing.expect(!c.containsAddr(.{ .ip4 = .{ .bytes = .{ 9, 255, 255, 255 }, .port = 0 } }));
+
+    const all = try IpCidr.parse("0.0.0.0/0");
+    try testing.expect(all.containsAddr(.{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 0 } }));
+    try testing.expect(all.containsAddr(.{ .ip4 = .{ .bytes = .{ 255, 255, 255, 255 }, .port = 0 } }));
+}
+
+test "sockets allow-list: containsAddr matches IPv6 prefix (#180)" {
+    const testing = std.testing;
+    const loop = try IpCidr.parse("::1/128");
+    var ones: [16]u8 = @splat(0);
+    ones[15] = 1;
+    try testing.expect(loop.containsAddr(.{ .ip6 = .{ .port = 0, .bytes = ones } }));
+    var twos: [16]u8 = @splat(0);
+    twos[15] = 2;
+    try testing.expect(!loop.containsAddr(.{ .ip6 = .{ .port = 0, .bytes = twos } }));
+
+    const all = try IpCidr.parse("::/0");
+    var rand: [16]u8 = @splat(0);
+    rand[0] = 0xde;
+    rand[3] = 0xad;
+    try testing.expect(all.containsAddr(.{ .ip6 = .{ .port = 0, .bytes = rand } }));
+
+    const link_local = try IpCidr.parse("fe80::/10");
+    var fe80: [16]u8 = @splat(0);
+    fe80[0] = 0xfe;
+    fe80[1] = 0x80;
+    fe80[15] = 0x42;
+    try testing.expect(link_local.containsAddr(.{ .ip6 = .{ .port = 0, .bytes = fe80 } }));
+    var feC0: [16]u8 = @splat(0);
+    feC0[0] = 0xfe;
+    feC0[1] = 0xc0;
+    try testing.expect(!link_local.containsAddr(.{ .ip6 = .{ .port = 0, .bytes = feC0 } }));
+}
+
+test "sockets allow-list: containsAddr rejects mixed family (#180)" {
+    const testing = std.testing;
+    const v4 = try IpCidr.parse("0.0.0.0/0");
+    const any6: [16]u8 = @splat(0);
+    try testing.expect(!v4.containsAddr(.{ .ip6 = .{ .port = 0, .bytes = any6 } }));
+
+    const v6 = try IpCidr.parse("::/0");
+    try testing.expect(!v6.containsAddr(.{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 0 } }));
+
+    // IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is matched as IPv6, not as
+    // IPv4 — the wasi:sockets layer hands us already-discriminated values.
+    var mapped: [16]u8 = @splat(0);
+    mapped[10] = 0xff;
+    mapped[11] = 0xff;
+    mapped[12] = 127;
+    mapped[15] = 1;
+    const v4_loop = try IpCidr.parse("127.0.0.0/8");
+    try testing.expect(!v4_loop.containsAddr(.{ .ip6 = .{ .port = 0, .bytes = mapped } }));
+}
+
+test "sockets allow-list: Network.allows defaults to deny-all (#180)" {
+    const testing = std.testing;
+    const n: Network = .{};
+    try testing.expect(!n.allows(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }));
+    const any6: [16]u8 = @splat(0);
+    try testing.expect(!n.allows(.{ .ip6 = .{ .port = 0, .bytes = any6 } }));
+}
+
+test "sockets allow-list: setSocketsAllowList parses + replaces (#180)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    try testing.expectEqual(@as(usize, 0), adapter.sockets_allow_list_template.len);
+
+    try adapter.setSocketsAllowList(&.{ "127.0.0.0/8", "::1/128" });
+    try testing.expectEqual(@as(usize, 2), adapter.sockets_allow_list_template.len);
+    try testing.expect(adapter.sockets_allow_list_template[0] == .ip4);
+    try testing.expect(adapter.sockets_allow_list_template[1] == .ip6);
+
+    // Replace; old slice is freed.
+    try adapter.setSocketsAllowList(&.{"10.0.0.0/8"});
+    try testing.expectEqual(@as(usize, 1), adapter.sockets_allow_list_template.len);
+    try testing.expectEqual(@as(u6, 8), adapter.sockets_allow_list_template[0].ip4.prefix);
+
+    // Reset to deny-all.
+    try adapter.setSocketsAllowList(&.{});
+    try testing.expectEqual(@as(usize, 0), adapter.sockets_allow_list_template.len);
+}
+
+test "sockets allow-list: setSocketsAllowList preserves prior on parse failure (#180)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
+    try testing.expectEqual(@as(usize, 1), adapter.sockets_allow_list_template.len);
+
+    // Second entry has a bad prefix → whole call fails, prior list intact.
+    try testing.expectError(
+        error.InvalidPrefix,
+        adapter.setSocketsAllowList(&.{ "10.0.0.0/8", "10.0.0.0/99" }),
+    );
+    try testing.expectEqual(@as(usize, 1), adapter.sockets_allow_list_template.len);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 0 }, &adapter.sockets_allow_list_template[0].ip4.bytes);
+}
+
+test "sockets allow-list: instance-network snapshots template (#180)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    try adapter.setSocketsAllowList(&.{ "10.0.0.0/8", "::1/128" });
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &results, testing.allocator);
+
+    const handle = results[0].handle;
+    const n = adapter.network_table.items[handle].?;
+    try testing.expectEqual(@as(usize, 2), n.allow_list.len);
+    try testing.expect(n.allows(.{ .ip4 = .{ .bytes = .{ 10, 5, 5, 5 }, .port = 0 } }));
+    try testing.expect(!n.allows(.{ .ip4 = .{ .bytes = .{ 11, 0, 0, 1 }, .port = 0 } }));
+
+    // Reconfiguring after must not mutate the existing Network.
+    try adapter.setSocketsAllowList(&.{});
+    const n_after = adapter.network_table.items[handle].?;
+    try testing.expectEqual(@as(usize, 2), n_after.allow_list.len);
+}
+
+test "sockets allow-list: resource-drop frees snapshot (#180)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    try adapter.setSocketsAllowList(&.{"10.0.0.0/8"});
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &results, testing.allocator);
+    const handle = results[0].handle;
+
+    const drop_args = [_]InterfaceValue{.{ .handle = handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.networkResourceDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+    try testing.expect(adapter.network_table.items[handle] == null);
+    // testing.allocator's leak detector flags us if the snapshot wasn't freed.
 }
 
 test "populateWasiProviders: binds wasi:http/* (#149)" {
