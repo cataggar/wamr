@@ -3401,7 +3401,7 @@ fn emitLoad(
 
     // Try to fold offset into the load's scaled immediate; else add it to tmp0.
     const folded = scaledOffset(ld.offset, scale);
-    const end_offset: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+    const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
     const folded_offset: u32 = if (folded == null) ld.offset else 0;
     if (ld.bounds_known) {
         try emitMemAddrSkipBounds(code, reg_map, ld.base, folded_offset);
@@ -3446,7 +3446,7 @@ fn emitStore(
     };
 
     const folded = scaledOffset(st.offset, scale);
-    const end_offset: u64 = @as(u64, st.offset) + @as(u64, st.size);
+    const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
     const folded_offset: u32 = if (folded == null) st.offset else 0;
     if (st.bounds_known) {
         try emitMemAddrSkipBounds(code, reg_map, st.base, folded_offset);

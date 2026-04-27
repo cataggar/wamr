@@ -2561,7 +2561,10 @@ fn compileInstRA(
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
-            if (!ld.bounds_known) try emitMemBoundsCheck(code, @as(u64, ld.offset) + @as(u64, ld.size));
+            if (!ld.bounds_known) {
+                const end_offset = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
+                try emitMemBoundsCheck(code, end_offset);
+            }
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             // Fold wasm offset into mov displacement when it fits in i32.
@@ -2604,7 +2607,10 @@ fn compileInstRA(
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
-            if (!st.bounds_known) try emitMemBoundsCheck(code, @as(u64, st.offset) + @as(u64, st.size));
+            if (!st.bounds_known) {
+                const end_offset = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
+                try emitMemBoundsCheck(code, end_offset);
+            }
             try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
             try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
             // Load value into rcx (not allocatable — safe to clobber).

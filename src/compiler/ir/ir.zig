@@ -74,8 +74,11 @@ pub const Inst = struct {
         local_set: struct { idx: u32, val: VReg },
 
         // Memory
-        load: struct { base: VReg, offset: u32, size: u8, sign_extend: bool = false, bounds_known: bool = false },
-        store: struct { base: VReg, offset: u32, size: u8, val: VReg, bounds_known: bool = false },
+        // checked_end: when non-zero, codegen uses this (instead of offset+size)
+        // for the bounds check, enabling a single widened check to cover multiple
+        // accesses sharing the same base within a basic block segment.
+        load: struct { base: VReg, offset: u32, size: u8, sign_extend: bool = false, bounds_known: bool = false, checked_end: u64 = 0 },
+        store: struct { base: VReg, offset: u32, size: u8, val: VReg, bounds_known: bool = false, checked_end: u64 = 0 },
 
         // Control flow
         br: BlockId,

@@ -218,6 +218,21 @@ fn bodyMulByPow2(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = result } }) catch unreachable;
 }
 
+/// Three consecutive loads from the same base at offsets 0, 4, 8 (each i32).
+/// With `elideRedundantBoundsChecks` the first load's check is widened to
+/// end=12 and the second/third loads skip their checks entirely.
+fn bodyConsecutiveLoads(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const base = func.newVReg();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } }, .dest = v0, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = base, .offset = 4, .size = 4 } }, .dest = v1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = base, .offset = 8, .size = 4 } }, .dest = v2, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = v2 } }) catch unreachable;
+}
+
 fn runBenchWithPasses(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -309,6 +324,13 @@ pub fn main() !void {
         mul_result.name,
         mul_result.cyclesPerOp(),
         mul_result.code_size,
+    });
+
+    const loads_result = try runBenchWithPasses(allocator, "3× load same base (hoisted)", &bodyConsecutiveLoads);
+    std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{
+        loads_result.name,
+        loads_result.cyclesPerOp(),
+        loads_result.code_size,
     });
 
     std.debug.print("\n", .{});
