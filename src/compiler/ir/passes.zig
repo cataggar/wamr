@@ -2446,6 +2446,20 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
         for (block.instructions.items, 0..) |inst, idx| {
             switch (inst.op) {
                 .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
+                    if (idx + 1 < block.instructions.items.len)
+                        block.instructions.shrinkRetainingCapacity(idx + 1);
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Strip dead code after the first terminator in each block.
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items, 0..) |inst, idx| {
+            switch (inst.op) {
+                .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
                     if (idx + 1 < block.instructions.items.len) {
                         block.instructions.shrinkRetainingCapacity(idx + 1);
                     }
@@ -2636,6 +2650,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
         bid: ir.BlockId,
         phase: u1,
         stack_heights: []u32, // per-local stack height on entry (for restore)
+        rename_snap: u32, // rename_keys length on entry (for restore)
     };
     var rename_stack: std.ArrayList(RenameFrame) = .empty;
     defer {
@@ -2644,10 +2659,15 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     }
 
     // Map from old local_get dest VReg → SSA replacement VReg.
-    // Built incrementally during the DFS walk; applied to operands
-    // as each instruction is visited (scoped rename, not global).
+    // Entries are scoped to the dominator subtree: when the DFS backtracks,
+    // entries added by the leaving block are removed to prevent stale
+    // rewrites in non-dominated sibling blocks.
     var rename_map = std.AutoHashMap(ir.VReg, ir.VReg).init(allocator);
     defer rename_map.deinit();
+
+    // Track keys added to rename_map for each DFS level so we can undo them.
+    var rename_keys: std.ArrayList(ir.VReg) = .empty;
+    defer rename_keys.deinit(allocator);
 
     const entry_heights = try allocator.alloc(u32, nlocals);
     for (0..nlocals) |i| entry_heights[i] = @intCast(stacks[i].items.len);
@@ -2655,6 +2675,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
         .bid = 0,
         .phase = 0,
         .stack_heights = entry_heights,
+        .rename_snap = 0,
     });
 
     var changed = false;
@@ -2665,6 +2686,11 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
             // Restore stacks.
             for (0..nlocals) |i| {
                 stacks[i].shrinkRetainingCapacity(top.stack_heights[i]);
+            }
+            // Restore rename_map: remove entries added by this block.
+            while (rename_keys.items.len > top.rename_snap) {
+                const key = rename_keys.pop().?;
+                _ = rename_map.remove(key);
             }
             allocator.free(top.stack_heights);
             _ = rename_stack.pop();
@@ -2727,8 +2753,9 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                 },
                 .local_set => |ls| {
                     if (ls.idx < nlocals) {
-                        // Rewrite the value operand if it's in the rename map.
-                        const val = if (rename_map.get(ls.val)) |r| r else ls.val;
+                        // Rewrite the value operand, chasing rename chains.
+                        var val = ls.val;
+                        while (rename_map.get(val)) |r| { if (r == val) break; val = r; }
                         try stacks[ls.idx].append(allocator, val);
                         inst.op = .{ .iconst_32 = 0 };
                         inst.dest = null;
@@ -2745,6 +2772,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                                 // parameter value — keep it alive.
                             } else {
                                 try rename_map.put(dest, current_val);
+                                try rename_keys.append(allocator, dest);
                                 inst.op = .{ .iconst_32 = 0 };
                                 inst.dest = null;
                                 changed = true;
@@ -2790,6 +2818,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                 .bid = child,
                 .phase = 0,
                 .stack_heights = heights,
+                .rename_snap = @intCast(rename_keys.items.len),
             });
         }
     }
