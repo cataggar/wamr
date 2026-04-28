@@ -756,7 +756,7 @@ const TCP_KEEPIDLE_OPT: u32 = switch (@import("builtin").os.tag) {
 /// `std.posix.IP`/`std.posix.IPV6` may be void on some platforms.
 const IP_TTL_OPT: u32 = switch (@import("builtin").os.tag) {
     .linux => 2,
-    .macos, .ios, .tvos, .watchos => 2,
+    .macos, .ios, .tvos, .watchos => 4,
     .windows => 4,
     else => 2,
 };
