@@ -2628,6 +2628,12 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
         rename_stack.deinit(allocator);
     }
 
+    // Map from old local_get dest VReg → SSA replacement VReg.
+    // Built incrementally during the DFS walk; applied to operands
+    // as each instruction is visited (scoped rename, not global).
+    var rename_map = std.AutoHashMap(ir.VReg, ir.VReg).init(allocator);
+    defer rename_map.deinit();
+
     const entry_heights = try allocator.alloc(u32, nlocals);
     for (0..nlocals) |i| entry_heights[i] = @intCast(stacks[i].items.len);
     try rename_stack.append(allocator, .{
@@ -2655,10 +2661,45 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
         // Process instructions in this block.
         const block = &func.blocks.items[bid];
         for (block.instructions.items) |*inst| {
+            // Rewrite operands: any VReg in the rename map gets replaced.
+            // This handles uses of local_get dests that were renamed.
+            switch (inst.op) {
+                .phi, .local_set, .local_get => {},
+                else => {
+                    const used = getUsedVRegs(inst.*);
+                    for (used.slice()) |u| {
+                        if (rename_map.get(u)) |replacement| {
+                            replaceInInst(inst, u, replacement);
+                        }
+                    }
+                    // Also handle unbounded operand lists.
+                    switch (inst.op) {
+                        .call => |cl| for (@constCast(cl.args)) |*a| {
+                            if (rename_map.get(a.*)) |r| a.* = r;
+                        },
+                        .call_indirect => |ci| {
+                            if (rename_map.get(ci.elem_idx)) |r| @constCast(&ci.elem_idx).* = r;
+                            for (@constCast(ci.args)) |*a| {
+                                if (rename_map.get(a.*)) |r| a.* = r;
+                            }
+                        },
+                        .call_ref => |cr| {
+                            if (rename_map.get(cr.func_ref)) |r| @constCast(&cr.func_ref).* = r;
+                            for (@constCast(cr.args)) |*a| {
+                                if (rename_map.get(a.*)) |r| a.* = r;
+                            }
+                        },
+                        .ret_multi => |vregs| for (@constCast(vregs)) |*v| {
+                            if (rename_map.get(v.*)) |r| v.* = r;
+                        },
+                        else => {},
+                    }
+                },
+            }
+
             switch (inst.op) {
                 .phi => {
                     // Push phi dest onto the local's stack.
-                    // Find which local this phi belongs to.
                     const dest = inst.dest orelse continue;
                     for (0..nlocals) |local_idx| {
                         if (has_phi[local_idx].get(bid)) |phi_vreg| {
@@ -2671,8 +2712,9 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                 },
                 .local_set => |ls| {
                     if (ls.idx < nlocals) {
-                        try stacks[ls.idx].append(allocator, ls.val);
-                        // Mark for DCE by making it a nop (iconst with no uses).
+                        // Rewrite the value operand if it's in the rename map.
+                        const val = if (rename_map.get(ls.val)) |r| r else ls.val;
+                        try stacks[ls.idx].append(allocator, val);
                         inst.op = .{ .iconst_32 = 0 };
                         inst.dest = null;
                         changed = true;
@@ -2682,15 +2724,16 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                     if (idx < nlocals and stacks[idx].items.len > 0) {
                         const current_val = stacks[idx].items[stacks[idx].items.len - 1];
                         if (inst.dest) |dest| {
-                            // Rewrite the local_get into a local_get from a
-                            // synthetic local that receives the SSA value.
-                            // This keeps the value flowing through frame slots
-                            // (which the regalloc handles) rather than
-                            // introducing cross-block VReg references.
-                            replaceVReg(func, dest, current_val);
-                            inst.op = .{ .iconst_32 = 0 };
-                            inst.dest = null;
-                            changed = true;
+                            if (dest == current_val and idx < func.param_count) {
+                                // Seeded parameter local_get: this instruction
+                                // IS the definition of the SSA VReg for the
+                                // parameter value — keep it alive.
+                            } else {
+                                try rename_map.put(dest, current_val);
+                                inst.op = .{ .iconst_32 = 0 };
+                                inst.dest = null;
+                                changed = true;
+                            }
                         }
                     }
                 },
@@ -2759,15 +2802,18 @@ pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
     for (func.blocks.items) |*block| {
         var i: usize = 0;
         while (i < block.instructions.items.len) {
-            const inst = &block.instructions.items[i];
-            if (inst.op != .phi) { i += 1; continue; }
+            if (block.instructions.items[i].op != .phi) { i += 1; continue; }
 
-            const dest = inst.dest orelse { i += 1; continue; };
-            const edges = inst.op.phi;
+            const dest = block.instructions.items[i].dest orelse { i += 1; continue; };
+            const edges = block.instructions.items[i].op.phi;
+            const phi_type = block.instructions.items[i].type;
             const synth_idx = next_synth_local;
             next_synth_local += 1;
 
             // Insert local_set in each predecessor before its terminator.
+            // NOTE: when a predecessor is this block (self-loop), the insert
+            // may reallocate block.instructions.items — do NOT hold a pointer
+            // into the instruction list across this loop.
             for (edges) |edge| {
                 const pred_block = &func.blocks.items[edge.block];
                 const term_idx = findTerminatorIndex(pred_block);
@@ -2776,13 +2822,11 @@ pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
                 });
             }
 
-            // Replace phi with local_get (edges freed by BasicBlock.deinit
-            // if phi survives, but we're replacing it here so free now).
             allocator.free(edges);
 
-            // Replace phi with local_get.
-            const phi_type = inst.type;
-            inst.* = .{
+            // Replace phi with local_get.  Re-index into the instruction list
+            // because inserts above may have reallocated the backing array.
+            block.instructions.items[i] = .{
                 .op = .{ .local_get = synth_idx },
                 .dest = dest,
                 .type = phi_type,
@@ -2825,14 +2869,11 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
         total_changes += 1;
     }
     for (module.functions.items) |*func| {
-        // SSA promotion: infrastructure is complete but disabled.
-        // The rename step uses global replaceVReg which can corrupt values
-        // on non-dominated paths in complex control flow. Needs a scoped
-        // rename that only rewrites within the dominated subtree.
-        // if (try promoteLocalsToSSA(func, allocator)) {
-        //     total_changes += 1;
-        //     if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
-        // }
+        // SSA promotion: run once before the fixpoint loop.
+        if (try promoteLocalsToSSA(func, allocator)) {
+            total_changes += 1;
+            if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
+        }
 
         // Iterate the pipeline until fixpoint so that passes can re-expose
         // opportunities for each other (e.g. constantFold → CSE → DCE →
@@ -5649,4 +5690,92 @@ test "promoteLocalsToSSA: simple countdown loop" {
     // The phi dest should still be used in block 1's eqz (or its replacement).
     // Check that the block 1 still has an eqz of the phi dest or its forwarded value.
     _ = phi_dest;
+}
+
+test "promoteLocalsToSSA + lowerPhis: two-local sum loop" {
+    // sum = 0; i = 3; while (i != 0) { sum += i; i--; } ret sum
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+
+    const lt = try allocator.alloc(ir.IrType, 2);
+    lt[0] = .i32;
+    lt[1] = .i32;
+    func.local_types = lt;
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    // Block 0: sum=0, i=3, br 1
+    const v_zero_init = func.newVReg();
+    const v_three_init = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero_init });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero_init } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_three_init });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_three_init } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // Block 1: i = local_get 1; if (i==0) goto exit else goto body
+    const v_i = func.newVReg();
+    const v_eqz = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 1 }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_i }, .dest = v_eqz });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_eqz, .then_block = b2, .else_block = b3 } } });
+
+    // Block 3: sum += i; i--; br 1
+    const v_sum = func.newVReg();
+    const v_new_sum = func.newVReg();
+    const v_one = func.newVReg();
+    const v_dec = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .local_get = 0 }, .dest = v_sum, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v_sum, .rhs = v_i } }, .dest = v_new_sum });
+    try func.getBlock(b3).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_new_sum } } });
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one });
+    try func.getBlock(b3).append(.{ .op = .{ .sub = .{ .lhs = v_i, .rhs = v_one } }, .dest = v_dec });
+    try func.getBlock(b3).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_dec } } });
+    try func.getBlock(b3).append(.{ .op = .{ .br = b1 } });
+
+    // Block 2: ret local_get 0
+    const v_result = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 0 }, .dest = v_result, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_result } });
+
+    // Run mem2reg + phi lowering.
+    const changed = try promoteLocalsToSSA(&func, allocator);
+    try std.testing.expect(changed);
+    _ = try lowerPhisToLocals(&func, allocator);
+
+    // After lowering, no phi should remain.
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            try std.testing.expect(inst.op != .phi);
+        }
+    }
+
+    // Dump the lowered IR for inspection.
+    for (func.blocks.items, 0..) |blk, bid| {
+        std.debug.print("Block {d}:\n", .{bid});
+        for (blk.instructions.items) |inst| {
+            if (inst.dest) |d| {
+                std.debug.print("  v{d} = {s}", .{ d, @tagName(inst.op) });
+            } else {
+                std.debug.print("  {s}", .{@tagName(inst.op)});
+            }
+            switch (inst.op) {
+                .local_get => |idx| std.debug.print(" local={d}", .{idx}),
+                .local_set => |ls| std.debug.print(" local={d} val=v{d}", .{ ls.idx, ls.val }),
+                .iconst_32 => |v| std.debug.print(" {d}", .{v}),
+                .br => |t| std.debug.print(" -> B{d}", .{t}),
+                .br_if => |bi| std.debug.print(" cond=v{d} then=B{d} else=B{d}", .{ bi.cond, bi.then_block, bi.else_block }),
+                .eqz => |v| std.debug.print(" v{d}", .{v}),
+                .add => |a| std.debug.print(" v{d} v{d}", .{ a.lhs, a.rhs }),
+                .sub => |s| std.debug.print(" v{d} v{d}", .{ s.lhs, s.rhs }),
+                .ret => |v| if (v) |rv| std.debug.print(" v{d}", .{rv}),
+                else => {},
+            }
+            std.debug.print("\n", .{});
+        }
+    }
 }
