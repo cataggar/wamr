@@ -728,7 +728,60 @@ fn socketGetU32Opt(fd: std.posix.fd_t, level: i32, optname: u32) ?u32 {
         );
         if (std.posix.errno(rc) != .SUCCESS) return null;
     } else if (native_os == .windows) {
-        return null; // not implemented
+        const windows = std.os.windows;
+        if (level == SOL_SOCKET_OPT and (optname == SO_RCVBUF_OPT or optname == SO_SNDBUF_OPT)) {
+            // Buffer sizes use AFD GET_INFORMATION with window-size info types
+            var info = windows.AFD.INFORMATION{
+                .InformationType = if (optname == SO_RCVBUF_OPT) .RECEIVE_WINDOW_SIZE else .SEND_WINDOW_SIZE,
+                .Information = .{ .Ulong = 0 },
+            };
+            var iosb: windows.IO_STATUS_BLOCK = undefined;
+            const status = windows.ntdll.NtDeviceIoControlFile(
+                fd,
+                null,
+                null,
+                null,
+                &iosb,
+                windows.IOCTL.AFD.GET_INFORMATION,
+                @ptrCast(&info),
+                @sizeOf(windows.AFD.INFORMATION),
+                @ptrCast(&info),
+                @sizeOf(windows.AFD.INFORMATION),
+            );
+            if (status == .PENDING) {
+                _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+                if (iosb.u.Status != .SUCCESS) return null;
+            } else if (status != .SUCCESS) {
+                return null;
+            }
+            return info.Information.Ulong;
+        }
+        var info = windows.AFD.SOCKOPT_INFO{
+            .mode = .get,
+            .level = level,
+            .optname = optname,
+            .optval = @ptrCast(std.mem.asBytes(&val)),
+            .optlen = @sizeOf(u32),
+        };
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        const status = windows.ntdll.NtDeviceIoControlFile(
+            fd,
+            null,
+            null,
+            null,
+            &iosb,
+            windows.IOCTL.AFD.SOCKOPT,
+            @ptrCast(&info),
+            @sizeOf(windows.AFD.SOCKOPT_INFO),
+            @ptrCast(std.mem.asBytes(&val)),
+            @sizeOf(u32),
+        );
+        if (status == .PENDING) {
+            _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+            if (iosb.u.Status != .SUCCESS) return null;
+        } else if (status != .SUCCESS) {
+            return null;
+        }
     } else {
         // macOS / other POSIX — use libc
         const rc = std.c.getsockopt(
@@ -748,7 +801,7 @@ fn socketGetU32Opt(fd: std.posix.fd_t, level: i32, optname: u32) ?u32 {
 const TCP_KEEPIDLE_OPT: u32 = switch (@import("builtin").os.tag) {
     .macos, .ios, .tvos, .watchos => 0x10, // TCP_KEEPALIVE
     .linux => 4,
-    .windows => 3, // not used (getsockopt returns null on Windows)
+    .windows => 3, // TCP_KEEPALIVE (same function as Linux TCP_KEEPIDLE)
     else => 4,
 };
 
@@ -806,7 +859,58 @@ fn socketSetU32Opt(fd: std.posix.fd_t, level: i32, optname: u32, value: u32) ?So
     const native_os = @import("builtin").os.tag;
     const bytes = std.mem.toBytes(value);
     if (native_os == .windows) {
-        return .not_supported;
+        const windows = std.os.windows;
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        if (level == SOL_SOCKET_OPT and (optname == SO_RCVBUF_OPT or optname == SO_SNDBUF_OPT)) {
+            // Buffer sizes use AFD SET_INFORMATION with window-size info types
+            const status = windows.ntdll.NtDeviceIoControlFile(
+                fd,
+                null,
+                null,
+                null,
+                &iosb,
+                windows.IOCTL.AFD.SET_INFORMATION,
+                @ptrCast(&windows.AFD.INFORMATION{
+                    .InformationType = if (optname == SO_RCVBUF_OPT) .RECEIVE_WINDOW_SIZE else .SEND_WINDOW_SIZE,
+                    .Information = .{ .Ulong = value },
+                }),
+                @sizeOf(windows.AFD.INFORMATION),
+                null,
+                0,
+            );
+            if (status == .PENDING) {
+                _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+                if (iosb.u.Status != .SUCCESS) return .unknown;
+            } else if (status != .SUCCESS) {
+                return .unknown;
+            }
+            return null;
+        }
+        const status = windows.ntdll.NtDeviceIoControlFile(
+            fd,
+            null,
+            null,
+            null,
+            &iosb,
+            windows.IOCTL.AFD.SOCKOPT,
+            @ptrCast(&windows.AFD.SOCKOPT_INFO{
+                .mode = .set,
+                .level = level,
+                .optname = optname,
+                .optval = @ptrCast(&bytes),
+                .optlen = @sizeOf(u32),
+            }),
+            @sizeOf(windows.AFD.SOCKOPT_INFO),
+            null,
+            0,
+        );
+        if (status == .PENDING) {
+            _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+            if (iosb.u.Status != .SUCCESS) return .unknown;
+        } else if (status != .SUCCESS) {
+            return .unknown;
+        }
+        return null;
     } else if (native_os == .linux) {
         const rc = std.os.linux.setsockopt(
             @intCast(fd),
