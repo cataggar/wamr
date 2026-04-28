@@ -812,11 +812,40 @@ pub fn compileFunctionImpl(
     defer allocator.free(block_offsets);
     @memset(block_offsets, 0);
 
+    // Emit blocks in RPO (Reverse Post-Order) so that dominator blocks
+    // are always processed before dominated blocks. This ensures VRegs
+    // defined in a dominating block are assigned before their uses in
+    // dominated blocks — required for cross-block SSA VReg flow after
+    // mem2reg.
+    const block_order = blk: {
+        var dom = try analysis.computeDominators(func, allocator);
+        defer dom.deinit();
+        const order = try allocator.alloc(ir.BlockId, func.blocks.items.len);
+        // DomTree.post_order lists reachable blocks in DFS post-order.
+        // Reverse it for RPO. Append unreachable blocks at the end.
+        const po_len = dom.post_order.len;
+        for (dom.post_order, 0..) |bid, i| {
+            order[po_len - 1 - i] = bid;
+        }
+        // Fill unreachable blocks (not in post_order) at the tail.
+        var tail: usize = po_len;
+        for (0..func.blocks.items.len) |idx| {
+            const bid: ir.BlockId = @intCast(idx);
+            if (dom.post_num[bid] == null) {
+                order[tail] = bid;
+                tail += 1;
+            }
+        }
+        break :blk order;
+    };
+    defer allocator.free(block_order);
+
     var patches: std.ArrayListUnmanaged(BranchPatch) = .empty;
     defer patches.deinit(allocator);
 
     var last_was_ret = false;
-    for (func.blocks.items, 0..) |block, bi| {
+    for (block_order) |bi| {
+        const block = func.blocks.items[bi];
         block_offsets[bi] = code.len();
         for (block.instructions.items, 0..) |inst, ii| {
             last_was_ret = isRet(inst.op);
