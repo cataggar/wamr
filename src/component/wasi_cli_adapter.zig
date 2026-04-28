@@ -235,17 +235,37 @@ const SocketKind = enum { tcp, udp };
 
 const SocketState = enum { unbound, bound, listening, connected, closed };
 
-/// Adapter-side `tcp-socket` / `udp-socket` rep. Default-deny: the adapter
-/// never actually binds a host socket; methods that would touch the network
-/// return `error-code.access-denied`. The slot exists so that
-/// `address-family` and the other pure getters have something to read.
-///
-/// TODO(#148): replace with a real `std.Io.net.Socket` once the capability
-/// allow-list lands. The shape is intentionally minimal.
+/// Pending lifecycle-op result. WIT splits each blocking op into a
+/// `start-X` / `finish-X` pair: `start` kicks off the work, `finish`
+/// reads the result. Our `start-X` runs synchronously (since
+/// `std.Io.net` is blocking) and stores the outcome here for the
+/// matching `finish-X` to consume. `idle` means no in-flight op.
+const PendingTcpOp = enum { idle, bind_done, listen_done };
+
+/// Adapter-side `tcp-socket` / `udp-socket` rep. TCP can hold a real
+/// `std.Io.net.Server` once `start-listen` succeeds (#178 PR A).
+/// `connect`/`accept`/`shutdown`/streams remain default-deny in this
+/// PR — see plan.md PR B.
 pub const Socket = struct {
     kind: SocketKind,
     family: IpAddressFamily,
     state: SocketState = .unbound,
+    /// Authorized local address recorded by `start-bind`. Refreshed
+    /// from the kernel after `start-listen` so guests observe the
+    /// ephemeral port when port=0 was requested.
+    local_addr: ?std.Io.net.IpAddress = null,
+    /// Active listening server. Owned by the rep; closed in
+    /// `closeAll`.
+    server: ?std.Io.net.Server = null,
+    /// Pending TCP lifecycle op. Always `.idle` for udp sockets.
+    pending: PendingTcpOp = .idle,
+
+    /// Release any held kernel resources. Idempotent. Called from
+    /// `[resource-drop]tcp-socket` and adapter `deinit`.
+    pub fn closeAll(self: *Socket, io: std.Io) void {
+        if (self.server) |*srv| srv.deinit(io);
+        self.server = null;
+    }
 };
 
 /// CIDR block for the per-`network` allow-list (#180). Stored canonical:
@@ -448,6 +468,161 @@ fn lowerIpAddress(allocator: Allocator, addr: std.Io.net.IpAddress) !InterfaceVa
             } };
         },
     }
+}
+
+/// Lift a wasi:sockets `ip-socket-address` variant value into a Zig
+/// `std.Io.net.IpAddress`. Validates the variant arm matches `family`
+/// (returns `error.FamilyMismatch`); rejects malformed records that
+/// don't match the WIT shape (returns `error.InvalidArgs`).
+///
+/// WIT (0.2.6):
+///   record ipv4-socket-address { port: u16, address: tuple<u8,u8,u8,u8> }
+///   record ipv6-socket-address { port: u16, flow-info: u32,
+///                                 address: tuple<u16,u16,u16,u16,u16,u16,u16,u16>,
+///                                 scope-id: u32 }
+fn liftIpSocketAddress(
+    val: InterfaceValue,
+    family: IpAddressFamily,
+) error{ InvalidArgs, FamilyMismatch }!std.Io.net.IpAddress {
+    const variant = switch (val) {
+        .variant_val => |v| v,
+        else => return error.InvalidArgs,
+    };
+    const arm: IpAddressFamily = if (variant.discriminant == 0) .ipv4 else .ipv6;
+    if (arm != family) return error.FamilyMismatch;
+    const payload = variant.payload orelse return error.InvalidArgs;
+    const fields = switch (payload.*) {
+        .record_val => |r| r,
+        else => return error.InvalidArgs,
+    };
+    switch (arm) {
+        .ipv4 => {
+            if (fields.len < 2) return error.InvalidArgs;
+            const port: u16 = switch (fields[0]) {
+                .u16 => |p| p,
+                else => return error.InvalidArgs,
+            };
+            const addr_tuple = switch (fields[1]) {
+                .tuple_val => |t| t,
+                else => return error.InvalidArgs,
+            };
+            if (addr_tuple.len != 4) return error.InvalidArgs;
+            var bytes: [4]u8 = undefined;
+            inline for (0..4) |i| {
+                bytes[i] = switch (addr_tuple[i]) {
+                    .u8 => |b| b,
+                    else => return error.InvalidArgs,
+                };
+            }
+            return .{ .ip4 = .{ .bytes = bytes, .port = port } };
+        },
+        .ipv6 => {
+            if (fields.len < 4) return error.InvalidArgs;
+            const port: u16 = switch (fields[0]) {
+                .u16 => |p| p,
+                else => return error.InvalidArgs,
+            };
+            const flow: u32 = switch (fields[1]) {
+                .u32 => |f| f,
+                else => return error.InvalidArgs,
+            };
+            const addr_tuple = switch (fields[2]) {
+                .tuple_val => |t| t,
+                else => return error.InvalidArgs,
+            };
+            if (addr_tuple.len != 8) return error.InvalidArgs;
+            // WIT scope-id is captured but the std type holds it as an
+            // Interface (none/index/name). PR A drops the scope id; it
+            // will round-trip as 0 in `lowerIpSocketAddress`. The
+            // listen/bind paths that PR A exposes don't need scoped
+            // addresses.
+            _ = fields[3];
+            var bytes: [16]u8 = undefined;
+            inline for (0..8) |i| {
+                const group: u16 = switch (addr_tuple[i]) {
+                    .u16 => |g| g,
+                    else => return error.InvalidArgs,
+                };
+                bytes[i * 2] = @intCast((group >> 8) & 0xff);
+                bytes[i * 2 + 1] = @intCast(group & 0xff);
+            }
+            return .{ .ip6 = .{ .port = port, .bytes = bytes, .flow = flow } };
+        },
+    }
+}
+
+/// Lower a `std.Io.net.IpAddress` into a wasi:sockets
+/// `ip-socket-address` variant. Caller owns the returned
+/// `InterfaceValue` (free via `.deinit(allocator)`).
+fn lowerIpSocketAddress(allocator: Allocator, addr: std.Io.net.IpAddress) !InterfaceValue {
+    switch (addr) {
+        .ip4 => |v4| {
+            const octets = try allocator.alloc(InterfaceValue, 4);
+            errdefer allocator.free(octets);
+            inline for (0..4) |i| octets[i] = .{ .u8 = v4.bytes[i] };
+            const fields = try allocator.alloc(InterfaceValue, 2);
+            errdefer allocator.free(fields);
+            fields[0] = .{ .u16 = v4.port };
+            fields[1] = .{ .tuple_val = octets };
+            const rec = try allocator.create(InterfaceValue);
+            errdefer allocator.destroy(rec);
+            rec.* = .{ .record_val = fields };
+            return .{ .variant_val = .{
+                .discriminant = @intFromEnum(IpAddressFamily.ipv4),
+                .payload = rec,
+            } };
+        },
+        .ip6 => |v6| {
+            const groups = try allocator.alloc(InterfaceValue, 8);
+            errdefer allocator.free(groups);
+            inline for (0..8) |i| {
+                const hi: u16 = v6.bytes[i * 2];
+                const lo: u16 = v6.bytes[i * 2 + 1];
+                groups[i] = .{ .u16 = (hi << 8) | lo };
+            }
+            const fields = try allocator.alloc(InterfaceValue, 4);
+            errdefer allocator.free(fields);
+            fields[0] = .{ .u16 = v6.port };
+            fields[1] = .{ .u32 = v6.flow };
+            fields[2] = .{ .tuple_val = groups };
+            // PR A elides scope-id (Interface enum doesn't carry an
+            // integer index in all variants); always lower as 0.
+            fields[3] = .{ .u32 = 0 };
+            const rec = try allocator.create(InterfaceValue);
+            errdefer allocator.destroy(rec);
+            rec.* = .{ .record_val = fields };
+            return .{ .variant_val = .{
+                .discriminant = @intFromEnum(IpAddressFamily.ipv6),
+                .payload = rec,
+            } };
+        },
+    }
+}
+
+/// Map an `IpAddress.BindError` to a `wasi:sockets/network.error-code`.
+fn mapSocketBindError(err: anyerror) SocketErrorCode {
+    return switch (err) {
+        error.AddressInUse => .address_in_use,
+        error.AddressUnavailable => .address_not_bindable,
+        error.AddressFamilyUnsupported => .invalid_argument,
+        error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => .new_socket_limit,
+        error.NetworkDown => .remote_unreachable,
+        error.AccessDenied => .access_denied,
+        else => .unknown,
+    };
+}
+
+/// Map an `IpAddress.ListenError` to a `wasi:sockets/network.error-code`.
+fn mapSocketListenError(err: anyerror) SocketErrorCode {
+    return switch (err) {
+        error.AddressInUse => .address_in_use,
+        error.AddressUnavailable => .address_not_bindable,
+        error.AddressFamilyUnsupported => .invalid_argument,
+        error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => .new_socket_limit,
+        error.NetworkDown => .remote_unreachable,
+        error.AccessDenied => .access_denied,
+        else => .unknown,
+    };
 }
 
 /// Map a Zig std.fs / std.posix error to the closest `error-code` variant.
@@ -918,6 +1093,12 @@ pub const WasiCliAdapter = struct {
         self.network_table.deinit(self.allocator);
         if (self.sockets_allow_list_template.len != 0)
             self.allocator.free(self.sockets_allow_list_template);
+        {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            for (self.socket_table.items) |*maybe| {
+                if (maybe.*) |*s| s.closeAll(io);
+            }
+        }
         self.socket_table.deinit(self.allocator);
         for (self.resolve_streams.items) |maybe| {
             if (maybe) |s| {
@@ -2924,6 +3105,10 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         if (handle < self.socket_table.items.len) {
+            if (self.socket_table.items[handle]) |*s| {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                s.closeAll(io);
+            }
             self.socket_table.items[handle] = null;
         }
     }
@@ -3060,6 +3245,188 @@ pub const WasiCliAdapter = struct {
             return;
         };
         results[0] = .{ .bool = s.state == .listening };
+    }
+
+    /// `[method]tcp-socket.start-bind:
+    ///   (borrow<tcp-socket>, borrow<network>, ip-socket-address)
+    ///     -> result<_, error-code>` (#178).
+    ///
+    /// PR A semantics: this is a *capability check + record* pass — no
+    /// kernel syscall. The adapter remembers the authorized address;
+    /// the matching `start-listen` (PR A) and `start-connect` (PR B)
+    /// pass it to `std.Io.net.IpAddress.{listen,connect}`. Doing the
+    /// real `IpAddress.bind` here would consume the port slot and
+    /// leave us unable to call `listen()` later — stdlib has no
+    /// listen-on-already-bound API.
+    fn tcpStartBind(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const sock_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const net_handle = switch (args[1]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(sock_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp or s.state != .unbound or s.pending != .idle) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const local = liftIpSocketAddress(args[2], s.family) catch |err| switch (err) {
+            error.FamilyMismatch => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+            error.InvalidArgs => return error.InvalidArgs,
+        };
+        const net = if (net_handle < self.network_table.items.len)
+            self.network_table.items[net_handle]
+        else
+            null;
+        if (net == null or !net.?.allows(local)) {
+            results[0] = try socketResultErr(allocator, .access_denied);
+            return;
+        }
+        s.local_addr = local;
+        s.pending = .bind_done;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.finish-bind: (borrow<tcp-socket>) ->
+    /// result<_, error-code>` (#178). Reads the outcome stashed by
+    /// `start-bind` and transitions to `bound`.
+    fn tcpFinishBind(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp or s.pending != .bind_done) {
+            results[0] = try socketResultErr(allocator, .not_in_progress);
+            return;
+        }
+        s.pending = .idle;
+        s.state = .bound;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.start-listen: (borrow<tcp-socket>) ->
+    /// result<_, error-code>` (#178). Calls
+    /// `std.Io.net.IpAddress.listen` with the address recorded by
+    /// `start-bind`; refreshes `local_addr` from the kernel-resolved
+    /// `Server.socket.address` so guests observe the assigned port
+    /// when port=0 was requested.
+    fn tcpStartListen(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp or s.state != .bound or s.pending != .idle) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const local = s.local_addr orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const server = std.Io.net.IpAddress.listen(&local, io, .{}) catch |err| {
+            results[0] = try socketResultErr(allocator, mapSocketListenError(err));
+            return;
+        };
+        s.server = server;
+        s.local_addr = server.socket.address;
+        s.pending = .listen_done;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.finish-listen: (borrow<tcp-socket>) ->
+    /// result<_, error-code>` (#178).
+    fn tcpFinishListen(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp or s.pending != .listen_done) {
+            results[0] = try socketResultErr(allocator, .not_in_progress);
+            return;
+        }
+        s.pending = .idle;
+        s.state = .listening;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.local-address: (borrow<tcp-socket>) ->
+    /// result<ip-socket-address, error-code>` (#178).
+    fn tcpLocalAddress(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const local = s.local_addr orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const lowered = try lowerIpSocketAddress(allocator, local);
+        results[0] = try socketResultOk(allocator, lowered);
     }
 
     /// `[method]X.subscribe: (borrow<X>) -> own<pollable>`. Mints a stub
@@ -3266,15 +3633,17 @@ pub const WasiCliAdapter = struct {
         // Per-method routing: most methods go to the default-deny stub;
         // a few have specific handlers.
         const members = [_]M{
-            // network IO — all access-denied.
-            .{ .name = "[method]tcp-socket.start-bind", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.finish-bind", .call = &socketDenyAccess },
+            // network IO — bind + listen + local-address are real
+            // (#178 PR A); connect/accept/streams/remote-address remain
+            // default-deny pending PR B.
+            .{ .name = "[method]tcp-socket.start-bind", .call = &tcpStartBind },
+            .{ .name = "[method]tcp-socket.finish-bind", .call = &tcpFinishBind },
             .{ .name = "[method]tcp-socket.start-connect", .call = &socketDenyAccess },
             .{ .name = "[method]tcp-socket.finish-connect", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.start-listen", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.finish-listen", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.start-listen", .call = &tcpStartListen },
+            .{ .name = "[method]tcp-socket.finish-listen", .call = &tcpFinishListen },
             .{ .name = "[method]tcp-socket.accept", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.local-address", .call = &socketDenyAccess },
+            .{ .name = "[method]tcp-socket.local-address", .call = &tcpLocalAddress },
             .{ .name = "[method]tcp-socket.remote-address", .call = &socketDenyAccess },
             .{ .name = "[method]tcp-socket.shutdown", .call = &socketDenyAccess },
             // setters that surface socket options — also access-denied.
@@ -7298,4 +7667,316 @@ test "filesystem: open-at strips mutate-directory from non-directory child (#181
         break :blk f;
     };
     try testing.expectEqual(@as(u32, 0b000011), stripped.toBits());
+}
+
+// ---------------------------------------------------------------------------
+// #178 PR A: TCP bind + listen + getters
+// ---------------------------------------------------------------------------
+
+/// Build an ip-socket-address InterfaceValue value pointing at heap-owned
+/// fields. Caller must free via `.deinit(allocator)`.
+fn testMakeIpv4SocketAddress(
+    allocator: Allocator,
+    octets: [4]u8,
+    port: u16,
+) !InterfaceValue {
+    const tup = try allocator.alloc(InterfaceValue, 4);
+    inline for (0..4) |i| tup[i] = .{ .u8 = octets[i] };
+    const fields = try allocator.alloc(InterfaceValue, 2);
+    fields[0] = .{ .u16 = port };
+    fields[1] = .{ .tuple_val = tup };
+    const rec = try allocator.create(InterfaceValue);
+    rec.* = .{ .record_val = fields };
+    return .{ .variant_val = .{ .discriminant = 0, .payload = rec } };
+}
+
+test "sockets #178: lift+lower ipv4 socket-address round-trips" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const v = try testMakeIpv4SocketAddress(a, .{ 127, 0, 0, 1 }, 4242);
+    defer v.deinit(a);
+    const lifted = try liftIpSocketAddress(v, .ipv4);
+    try testing.expect(lifted == .ip4);
+    try testing.expectEqual([_]u8{ 127, 0, 0, 1 }, lifted.ip4.bytes);
+    try testing.expectEqual(@as(u16, 4242), lifted.ip4.port);
+
+    const back = try lowerIpSocketAddress(a, lifted);
+    defer back.deinit(a);
+    try testing.expectEqual(@as(u32, 0), back.variant_val.discriminant);
+    const rec = back.variant_val.payload.?.record_val;
+    try testing.expectEqual(@as(u16, 4242), rec[0].u16);
+    try testing.expectEqual(@as(u8, 127), rec[1].tuple_val[0].u8);
+    try testing.expectEqual(@as(u8, 1), rec[1].tuple_val[3].u8);
+}
+
+test "sockets #178: liftIpSocketAddress rejects family mismatch" {
+    const testing = std.testing;
+    const a = testing.allocator;
+    const v = try testMakeIpv4SocketAddress(a, .{ 0, 0, 0, 0 }, 0);
+    defer v.deinit(a);
+    try testing.expectError(error.FamilyMismatch, liftIpSocketAddress(v, .ipv6));
+}
+
+test "sockets #178: tcp start-bind denies without allow-list" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &n_results, testing.allocator);
+
+    const local = try testMakeIpv4SocketAddress(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer local.deinit(testing.allocator);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpStartBind(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets #178: tcp start-bind family mismatch is invalid_argument" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.1/32"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            var ci: ComponentInstance = undefined;
+            // ipv6 socket
+            const c_args = [_]InterfaceValue{.{ .enum_val = 1 }};
+            var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.createTcpSocket(adapter, &ci, &c_args, &c_results, std.testing.allocator);
+            defer std.testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+            var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, std.testing.allocator);
+
+            const local = try testMakeIpv4SocketAddress(std.testing.allocator, .{ 127, 0, 0, 1 }, 0);
+            defer local.deinit(std.testing.allocator);
+            const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+            var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.tcpStartBind(adapter, &ci, &args, &results, std.testing.allocator);
+            defer std.testing.allocator.destroy(results[0].result_val.payload.?);
+
+            try std.testing.expect(!results[0].result_val.is_ok);
+            try std.testing.expectEqual(
+                @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                results[0].result_val.payload.?.variant_val.discriminant,
+            );
+        }
+    }.run);
+}
+
+const AdapterWithAllowList = struct { allow: []const []const u8 };
+
+fn adapter_with_allow_list(
+    cfg: AdapterWithAllowList,
+    comptime body: fn (*WasiCliAdapter) anyerror!void,
+) !void {
+    var adapter = WasiCliAdapter.init(std.testing.allocator);
+    defer adapter.deinit();
+    try adapter.setSocketsAllowList(cfg.allow);
+    try body(&adapter);
+}
+
+test "sockets #178: tcp finish-bind on idle socket is not_in_progress" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    const args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpFinishBind(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.not_in_progress)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets #178: tcp start-listen requires bound state" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    const args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpStartListen(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets #178: tcp local-address on unbound returns invalid_state" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    const args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpLocalAddress(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets #178: tcp full lifecycle bind+listen on 127.0.0.1:0 reports kernel port" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
+
+    var ci: ComponentInstance = undefined;
+    // ipv4 tcp socket
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+    var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &n_results, testing.allocator);
+
+    // start-bind 127.0.0.1:0
+    const local = try testMakeIpv4SocketAddress(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer local.deinit(testing.allocator);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpStartBind(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    // finish-bind
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpFinishBind(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    // start-listen — performs the actual syscall.
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpStartListen(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    // finish-listen
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpFinishListen(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    // is-listening = true.
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .bool = false }};
+        try WasiCliAdapter.tcpIsListening(&adapter, &ci, &args, &results, testing.allocator);
+        try testing.expect(results[0].bool);
+    }
+    // local-address: kernel-assigned port is non-zero.
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpLocalAddress(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        const v = results[0].result_val.payload.?.*;
+        try testing.expectEqual(@as(u32, 0), v.variant_val.discriminant);
+        const rec = v.variant_val.payload.?.record_val;
+        try testing.expect(rec[0].u16 != 0);
+        try testing.expectEqual(@as(u8, 127), rec[1].tuple_val[0].u8);
+    }
+}
+
+test "sockets #178: tcp wildcard bind allowed by 0.0.0.0/0" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setSocketsAllowList(&.{"0.0.0.0/0"});
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+    var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &n_results, testing.allocator);
+
+    const local = try testMakeIpv4SocketAddress(testing.allocator, .{ 0, 0, 0, 0 }, 0);
+    defer local.deinit(testing.allocator);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpStartBind(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(results[0].result_val.is_ok);
+}
+
+test "sockets #178: tcp resource-drop after listen frees server" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+    var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &n_results, testing.allocator);
+
+    const local = try testMakeIpv4SocketAddress(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer local.deinit(testing.allocator);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpStartBind(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpFinishBind(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpStartListen(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+
+    try testing.expect(adapter.socket_table.items[0].?.server != null);
+
+    const drop_args = [_]InterfaceValue{.{ .handle = 0 }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.socketResourceDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+    try testing.expect(adapter.socket_table.items[0] == null);
 }
