@@ -24,6 +24,10 @@ pub const InputStream = struct {
         /// is borrowed from a `wasi:filesystem` descriptor table slot —
         /// the stream does not close it on drop.
         host_file: HostFile,
+        /// Backed by a TCP connection. The fd is borrowed from a
+        /// `Socket.tcp_stream` — the stream does not close it on drop.
+        /// Only `Socket.closeAll` closes the underlying connection.
+        tcp_stream: std.posix.fd_t,
         /// Closed / exhausted.
         closed,
     };
@@ -56,6 +60,14 @@ pub const InputStream = struct {
                 hf.offset += n;
                 return .{ .ok = n };
             },
+            .tcp_stream => |fd| {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                var iovecs = [_][]u8{buf};
+                const n = io.vtable.netRead(io.userdata, fd, &iovecs) catch
+                    return .{ .err = .io_error };
+                if (n == 0) return .{ .closed = {} };
+                return .{ .ok = n };
+            },
             .closed => return .{ .closed = {} },
         }
     }
@@ -69,6 +81,12 @@ pub const InputStream = struct {
     /// The `file` value is borrowed; the stream does not close it.
     pub fn fromHostFile(file: std.Io.File, offset: u64) InputStream {
         return .{ .source = .{ .host_file = .{ .file = file, .offset = offset } } };
+    }
+
+    /// Create an input stream backed by a TCP connection fd.
+    /// The fd is borrowed; the stream does not close it.
+    pub fn fromTcpStream(fd: std.posix.fd_t) InputStream {
+        return .{ .source = .{ .tcp_stream = fd } };
     }
 };
 
@@ -90,6 +108,9 @@ pub const OutputStream = struct {
         /// `wasi:filesystem` descriptor table slot — the stream does not
         /// close it on drop.
         host_file: HostFile,
+        /// Backed by a TCP connection. The fd is borrowed from a
+        /// `Socket.tcp_stream` — the stream does not close it on drop.
+        tcp_stream: std.posix.fd_t,
         /// Closed.
         closed,
     };
@@ -130,6 +151,13 @@ pub const OutputStream = struct {
                 hf.offset += data.len;
                 return .{ .ok = data.len };
             },
+            .tcp_stream => |fd| {
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const slices = [_][]const u8{data};
+                _ = io.vtable.netWrite(io.userdata, fd, &.{}, &slices, 1) catch
+                    return .{ .err = .io_error };
+                return .{ .ok = data.len };
+            },
             .closed => return .{ .closed = {} },
         }
     }
@@ -158,6 +186,12 @@ pub const OutputStream = struct {
             .append = append,
             .sync_on_flush = sync_on_flush,
         } } };
+    }
+
+    /// Create an output stream backed by a TCP connection fd.
+    /// The fd is borrowed; the stream does not close it.
+    pub fn toTcpStream(fd: std.posix.fd_t) OutputStream {
+        return .{ .sink = .{ .tcp_stream = fd } };
     }
 
     /// Flush any host-side buffering. For host-file sinks with
