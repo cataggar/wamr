@@ -274,6 +274,19 @@ pub const Socket = struct {
     /// TCP connected stream. Owned by the rep; closed in `closeAll`.
     tcp_stream: ?std.Io.net.Stream = null,
 
+    /// Requested listen backlog size. Stored on the rep by
+    /// `set-listen-backlog-size` and consumed by `start-listen`.
+    listen_backlog: ?u31 = null,
+
+    /// Returns the kernel fd for this socket, or null if no underlying
+    /// socket exists yet (e.g., unbound state).
+    pub fn getKernelFd(self: *const Socket) ?std.posix.fd_t {
+        if (self.tcp_stream) |ts| return ts.socket.handle;
+        if (self.server) |srv| return srv.socket.handle;
+        if (self.host_socket) |hs| return hs.handle;
+        return null;
+    }
+
     /// Release any held kernel resources. Idempotent. Called from
     /// `[resource-drop]{tcp,udp}-socket` and adapter `deinit`.
     pub fn closeAll(self: *Socket, io: std.Io, allocator: Allocator) void {
@@ -697,6 +710,222 @@ fn mapSocketSendError(err: anyerror) SocketErrorCode {
         error.SystemResources => .out_of_memory,
         else => .unknown,
     };
+}
+
+/// Read a u32-valued socket option via `getsockopt(2)`. Returns the
+/// kernel value on success, or `null` on error / unsupported platform.
+fn socketGetU32Opt(fd: std.posix.fd_t, level: i32, optname: u32) ?u32 {
+    const native_os = @import("builtin").os.tag;
+    var val: u32 = 0;
+    var optlen: std.posix.socklen_t = @sizeOf(u32);
+    if (native_os == .linux) {
+        const rc = std.os.linux.getsockopt(
+            @intCast(fd),
+            level,
+            optname,
+            @ptrCast(std.mem.asBytes(&val)),
+            &optlen,
+        );
+        if (std.posix.errno(rc) != .SUCCESS) return null;
+    } else if (native_os == .windows) {
+        const windows = std.os.windows;
+        if (level == SOL_SOCKET_OPT and (optname == SO_RCVBUF_OPT or optname == SO_SNDBUF_OPT)) {
+            // Buffer sizes use AFD GET_INFORMATION with window-size info types
+            var info = windows.AFD.INFORMATION{
+                .InformationType = if (optname == SO_RCVBUF_OPT) .RECEIVE_WINDOW_SIZE else .SEND_WINDOW_SIZE,
+                .Information = .{ .Ulong = 0 },
+            };
+            var iosb: windows.IO_STATUS_BLOCK = undefined;
+            const status = windows.ntdll.NtDeviceIoControlFile(
+                fd,
+                null,
+                null,
+                null,
+                &iosb,
+                windows.IOCTL.AFD.GET_INFORMATION,
+                @ptrCast(&info),
+                @sizeOf(windows.AFD.INFORMATION),
+                @ptrCast(&info),
+                @sizeOf(windows.AFD.INFORMATION),
+            );
+            if (status == .PENDING) {
+                _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+                if (iosb.u.Status != .SUCCESS) return null;
+            } else if (status != .SUCCESS) {
+                return null;
+            }
+            return info.Information.Ulong;
+        }
+        var info = windows.AFD.SOCKOPT_INFO{
+            .mode = .get,
+            .level = level,
+            .optname = optname,
+            .optval = @ptrCast(std.mem.asBytes(&val)),
+            .optlen = @sizeOf(u32),
+        };
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        const status = windows.ntdll.NtDeviceIoControlFile(
+            fd,
+            null,
+            null,
+            null,
+            &iosb,
+            windows.IOCTL.AFD.SOCKOPT,
+            @ptrCast(&info),
+            @sizeOf(windows.AFD.SOCKOPT_INFO),
+            @ptrCast(std.mem.asBytes(&val)),
+            @sizeOf(u32),
+        );
+        if (status == .PENDING) {
+            _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+            if (iosb.u.Status != .SUCCESS) return null;
+        } else if (status != .SUCCESS) {
+            return null;
+        }
+    } else {
+        // macOS / other POSIX — use libc
+        const rc = std.c.getsockopt(
+            fd,
+            level,
+            optname,
+            @ptrCast(&val),
+            &optlen,
+        );
+        if (rc != 0) return null;
+    }
+    return val;
+}
+
+/// TCP keep-alive idle time socket option. macOS uses `TCP_KEEPALIVE`
+/// (0x10) instead of Linux's `TCP_KEEPIDLE`.
+const TCP_KEEPIDLE_OPT: u32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x10, // TCP_KEEPALIVE
+    .linux => 4,
+    .windows => 3, // TCP_KEEPALIVE (same function as Linux TCP_KEEPIDLE)
+    else => 4,
+};
+
+/// IP-level socket option constants, defined portably since
+/// `std.posix.IP`/`std.posix.IPV6` may be void on some platforms.
+const IP_TTL_OPT: u32 = switch (@import("builtin").os.tag) {
+    .linux => 2,
+    .macos, .ios, .tvos, .watchos => 4,
+    .windows => 4,
+    else => 2,
+};
+const IPV6_UNICAST_HOPS_OPT: u32 = switch (@import("builtin").os.tag) {
+    .linux => 16,
+    .macos, .ios, .tvos, .watchos => 4,
+    .windows => 4,
+    else => 16,
+};
+const IPPROTO_IP_OPT: i32 = 0;
+const IPPROTO_IPV6_OPT: i32 = 41;
+const IPPROTO_TCP_OPT: i32 = 6;
+const SOL_SOCKET_OPT: i32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0xffff,
+    .windows => 0xffff,
+    else => 1, // Linux
+};
+const SO_RCVBUF_OPT: u32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x1002,
+    .windows => 0x1002,
+    else => 8, // Linux
+};
+const SO_SNDBUF_OPT: u32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x1001,
+    .windows => 0x1001,
+    else => 7, // Linux
+};
+const SO_KEEPALIVE_OPT: u32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x0008,
+    .windows => 0x0008,
+    else => 9, // Linux
+};
+const TCP_KEEPINTVL_OPT: u32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x101,
+    .windows => 17,
+    else => 5, // Linux
+};
+const TCP_KEEPCNT_OPT: u32 = switch (@import("builtin").os.tag) {
+    .macos, .ios, .tvos, .watchos => 0x102,
+    .windows => 16,
+    else => 6, // Linux
+};
+
+/// Set a u32-valued socket option via `setsockopt(2)`. Returns `null`
+/// on success, or an error code on failure.
+fn socketSetU32Opt(fd: std.posix.fd_t, level: i32, optname: u32, value: u32) ?SocketErrorCode {
+    const native_os = @import("builtin").os.tag;
+    const bytes = std.mem.toBytes(value);
+    if (native_os == .windows) {
+        const windows = std.os.windows;
+        var iosb: windows.IO_STATUS_BLOCK = undefined;
+        if (level == SOL_SOCKET_OPT and (optname == SO_RCVBUF_OPT or optname == SO_SNDBUF_OPT)) {
+            // Buffer sizes use AFD SET_INFORMATION with window-size info types
+            const status = windows.ntdll.NtDeviceIoControlFile(
+                fd,
+                null,
+                null,
+                null,
+                &iosb,
+                windows.IOCTL.AFD.SET_INFORMATION,
+                @ptrCast(&windows.AFD.INFORMATION{
+                    .InformationType = if (optname == SO_RCVBUF_OPT) .RECEIVE_WINDOW_SIZE else .SEND_WINDOW_SIZE,
+                    .Information = .{ .Ulong = value },
+                }),
+                @sizeOf(windows.AFD.INFORMATION),
+                null,
+                0,
+            );
+            if (status == .PENDING) {
+                _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+                if (iosb.u.Status != .SUCCESS) return .unknown;
+            } else if (status != .SUCCESS) {
+                return .unknown;
+            }
+            return null;
+        }
+        const status = windows.ntdll.NtDeviceIoControlFile(
+            fd,
+            null,
+            null,
+            null,
+            &iosb,
+            windows.IOCTL.AFD.SOCKOPT,
+            @ptrCast(&windows.AFD.SOCKOPT_INFO{
+                .mode = .set,
+                .level = level,
+                .optname = optname,
+                .optval = @ptrCast(&bytes),
+                .optlen = @sizeOf(u32),
+            }),
+            @sizeOf(windows.AFD.SOCKOPT_INFO),
+            null,
+            0,
+        );
+        if (status == .PENDING) {
+            _ = windows.ntdll.NtWaitForSingleObject(fd, .FALSE, null);
+            if (iosb.u.Status != .SUCCESS) return .unknown;
+        } else if (status != .SUCCESS) {
+            return .unknown;
+        }
+        return null;
+    } else if (native_os == .linux) {
+        const rc = std.os.linux.setsockopt(
+            @intCast(fd),
+            level,
+            optname,
+            @ptrCast(&bytes),
+            @sizeOf(u32),
+        );
+        if (std.posix.errno(rc) != .SUCCESS) return .unknown;
+        return null;
+    } else {
+        // macOS / other POSIX — use std.posix.setsockopt
+        std.posix.setsockopt(fd, level, optname, &bytes) catch return .unknown;
+        return null;
+    }
 }
 
 /// Deep-copy a CIDR allow-list slice so the socket owns its own copy
@@ -3542,7 +3771,9 @@ pub const WasiCliAdapter = struct {
             return;
         };
         const io = std.Io.Threaded.global_single_threaded.io();
-        const server = std.Io.net.IpAddress.listen(&local, io, .{}) catch |err| {
+        const server = std.Io.net.IpAddress.listen(&local, io, .{
+            .kernel_backlog = s.listen_backlog orelse 128,
+        }) catch |err| {
             results[0] = try socketResultErr(allocator, mapSocketListenError(err));
             return;
         };
@@ -3894,6 +4125,581 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErr(allocator, mapConnectError(err));
             return;
         };
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    // ----- Socket option getters/setters (#200) -----
+
+    /// `[method]tcp-socket.set-listen-backlog-size:
+    ///   (borrow<tcp-socket>, u64) -> result<_, error-code>`.
+    /// Stores the requested backlog on the rep for use by start-listen.
+    /// Must be called before listen; already-listening sockets reject
+    /// with invalid_state.
+    fn tcpSetListenBacklogSize(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const size: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            .u32 => |v| @as(u64, v),
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        if (s.state == .listening) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        s.listen_backlog = @intCast(@min(size, std.math.maxInt(u31)));
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.keep-alive-enabled:
+    ///   (borrow<tcp-socket>) -> result<bool, error-code>`.
+    fn tcpGetKeepAliveEnabled(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const val = socketGetU32Opt(fd, SOL_SOCKET_OPT, SO_KEEPALIVE_OPT) orelse {
+            results[0] = try socketResultErr(allocator, .unknown);
+            return;
+        };
+        results[0] = try socketResultOk(allocator, .{ .bool = val != 0 });
+    }
+
+    /// `[method]tcp-socket.set-keep-alive-enabled:
+    ///   (borrow<tcp-socket>, bool) -> result<_, error-code>`.
+    fn tcpSetKeepAliveEnabled(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const enabled: bool = switch (args[1]) {
+            .bool => |b| b,
+            .u32 => |v| v != 0,
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (socketSetU32Opt(fd, SOL_SOCKET_OPT, SO_KEEPALIVE_OPT, if (enabled) 1 else 0)) |ec| {
+            results[0] = try socketResultErr(allocator, ec);
+            return;
+        }
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.keep-alive-idle-time:
+    ///   (borrow<tcp-socket>) -> result<duration, error-code>`.
+    /// Duration is nanoseconds (u64). Kernel uses seconds.
+    fn tcpGetKeepAliveIdleTime(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const secs = socketGetU32Opt(fd, IPPROTO_TCP_OPT, TCP_KEEPIDLE_OPT) orelse {
+            results[0] = try socketResultErr(allocator, .unknown);
+            return;
+        };
+        results[0] = try socketResultOk(allocator, .{ .u64 = @as(u64, secs) * 1_000_000_000 });
+    }
+
+    /// `[method]tcp-socket.set-keep-alive-idle-time:
+    ///   (borrow<tcp-socket>, duration) -> result<_, error-code>`.
+    fn tcpSetKeepAliveIdleTime(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const ns: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            .u32 => |v| @as(u64, v),
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const secs: u32 = @intCast(@min(ns / 1_000_000_000, std.math.maxInt(u32)));
+        if (secs == 0 and ns != 0) {
+            results[0] = try socketResultErr(allocator, .invalid_argument);
+            return;
+        }
+        if (socketSetU32Opt(fd, IPPROTO_TCP_OPT, TCP_KEEPIDLE_OPT, secs)) |ec| {
+            results[0] = try socketResultErr(allocator, ec);
+            return;
+        }
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.keep-alive-interval:
+    ///   (borrow<tcp-socket>) -> result<duration, error-code>`.
+    fn tcpGetKeepAliveInterval(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const secs = socketGetU32Opt(fd, IPPROTO_TCP_OPT, TCP_KEEPINTVL_OPT) orelse {
+            results[0] = try socketResultErr(allocator, .unknown);
+            return;
+        };
+        results[0] = try socketResultOk(allocator, .{ .u64 = @as(u64, secs) * 1_000_000_000 });
+    }
+
+    /// `[method]tcp-socket.set-keep-alive-interval:
+    ///   (borrow<tcp-socket>, duration) -> result<_, error-code>`.
+    fn tcpSetKeepAliveInterval(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const ns: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            .u32 => |v| @as(u64, v),
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const secs: u32 = @intCast(@min(ns / 1_000_000_000, std.math.maxInt(u32)));
+        if (secs == 0 and ns != 0) {
+            results[0] = try socketResultErr(allocator, .invalid_argument);
+            return;
+        }
+        if (socketSetU32Opt(fd, IPPROTO_TCP_OPT, TCP_KEEPINTVL_OPT, secs)) |ec| {
+            results[0] = try socketResultErr(allocator, ec);
+            return;
+        }
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]tcp-socket.keep-alive-count:
+    ///   (borrow<tcp-socket>) -> result<u32, error-code>`.
+    fn tcpGetKeepAliveCount(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const val = socketGetU32Opt(fd, IPPROTO_TCP_OPT, TCP_KEEPCNT_OPT) orelse {
+            results[0] = try socketResultErr(allocator, .unknown);
+            return;
+        };
+        results[0] = try socketResultOk(allocator, .{ .u32 = val });
+    }
+
+    /// `[method]tcp-socket.set-keep-alive-count:
+    ///   (borrow<tcp-socket>, u32) -> result<_, error-code>`.
+    fn tcpSetKeepAliveCount(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const count: u32 = switch (args[1]) {
+            .u32 => |v| v,
+            .u64 => |v| @intCast(@min(v, std.math.maxInt(u32))),
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (socketSetU32Opt(fd, IPPROTO_TCP_OPT, TCP_KEEPCNT_OPT, count)) |ec| {
+            results[0] = try socketResultErr(allocator, ec);
+            return;
+        }
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]{tcp,udp}-socket.hop-limit` / `unicast-hop-limit`:
+    ///   (borrow<socket>) -> result<u8, error-code>`.
+    /// Dispatches to IP_TTL (ipv4) or IPV6_UNICAST_HOPS (ipv6).
+    fn socketGetHopLimit(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const val = switch (s.family) {
+            .ipv4 => socketGetU32Opt(fd, IPPROTO_IP_OPT, IP_TTL_OPT),
+            .ipv6 => socketGetU32Opt(fd, IPPROTO_IPV6_OPT, IPV6_UNICAST_HOPS_OPT),
+        } orelse {
+            results[0] = try socketResultErr(allocator, .unknown);
+            return;
+        };
+        results[0] = try socketResultOk(allocator, .{ .u32 = @min(val, 255) });
+    }
+
+    /// `[method]{tcp,udp}-socket.set-hop-limit` / `set-unicast-hop-limit`:
+    ///   (borrow<socket>, u8) -> result<_, error-code>`.
+    fn socketSetHopLimit(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const hop: u32 = switch (args[1]) {
+            .u32 => |v| v,
+            .u64 => |v| @intCast(@min(v, 255)),
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        if (hop > 255) {
+            results[0] = try socketResultErr(allocator, .invalid_argument);
+            return;
+        }
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const ec = switch (s.family) {
+            .ipv4 => socketSetU32Opt(fd, IPPROTO_IP_OPT, IP_TTL_OPT, hop),
+            .ipv6 => socketSetU32Opt(fd, IPPROTO_IPV6_OPT, IPV6_UNICAST_HOPS_OPT, hop),
+        };
+        if (ec) |code| {
+            results[0] = try socketResultErr(allocator, code);
+            return;
+        }
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]{tcp,udp}-socket.receive-buffer-size:
+    ///   (borrow<socket>) -> result<u64, error-code>`.
+    fn socketGetReceiveBufferSize(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const val = socketGetU32Opt(fd, SOL_SOCKET_OPT, SO_RCVBUF_OPT) orelse {
+            results[0] = try socketResultErr(allocator, .unknown);
+            return;
+        };
+        results[0] = try socketResultOk(allocator, .{ .u64 = @as(u64, val) });
+    }
+
+    /// `[method]{tcp,udp}-socket.set-receive-buffer-size:
+    ///   (borrow<socket>, u64) -> result<_, error-code>`.
+    fn socketSetReceiveBufferSize(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const size: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            .u32 => |v| @as(u64, v),
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (socketSetU32Opt(fd, SOL_SOCKET_OPT, SO_RCVBUF_OPT, @intCast(@min(size, std.math.maxInt(u32))))) |ec| {
+            results[0] = try socketResultErr(allocator, ec);
+            return;
+        }
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]{tcp,udp}-socket.send-buffer-size:
+    ///   (borrow<socket>) -> result<u64, error-code>`.
+    fn socketGetSendBufferSize(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const val = socketGetU32Opt(fd, SOL_SOCKET_OPT, SO_SNDBUF_OPT) orelse {
+            results[0] = try socketResultErr(allocator, .unknown);
+            return;
+        };
+        results[0] = try socketResultOk(allocator, .{ .u64 = @as(u64, val) });
+    }
+
+    /// `[method]{tcp,udp}-socket.set-send-buffer-size:
+    ///   (borrow<socket>, u64) -> result<_, error-code>`.
+    fn socketSetSendBufferSize(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const size: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            .u32 => |v| @as(u64, v),
+            else => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const fd = s.getKernelFd() orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (socketSetU32Opt(fd, SOL_SOCKET_OPT, SO_SNDBUF_OPT, @intCast(@min(size, std.math.maxInt(u32))))) |ec| {
+            results[0] = try socketResultErr(allocator, ec);
+            return;
+        }
         results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
     }
 
@@ -4817,24 +5623,23 @@ pub const WasiCliAdapter = struct {
             .{ .name = "[method]tcp-socket.local-address", .call = &tcpLocalAddress },
             .{ .name = "[method]tcp-socket.remote-address", .call = &tcpRemoteAddress },
             .{ .name = "[method]tcp-socket.shutdown", .call = &tcpShutdown },
-            // setters that surface socket options — also access-denied.
-            .{ .name = "[method]tcp-socket.set-listen-backlog-size", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.set-keep-alive-enabled", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.set-keep-alive-idle-time", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.set-keep-alive-interval", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.set-keep-alive-count", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.set-hop-limit", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.set-receive-buffer-size", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.set-send-buffer-size", .call = &socketDenyAccess },
-            // getters that surface socket options. They return
-            // `result<X, error-code>` per WIT, so default-deny is well-typed.
-            .{ .name = "[method]tcp-socket.keep-alive-enabled", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.keep-alive-idle-time", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.keep-alive-interval", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.keep-alive-count", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.hop-limit", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.receive-buffer-size", .call = &socketDenyAccess },
-            .{ .name = "[method]tcp-socket.send-buffer-size", .call = &socketDenyAccess },
+            // setters that surface socket options (#200).
+            .{ .name = "[method]tcp-socket.set-listen-backlog-size", .call = &tcpSetListenBacklogSize },
+            .{ .name = "[method]tcp-socket.set-keep-alive-enabled", .call = &tcpSetKeepAliveEnabled },
+            .{ .name = "[method]tcp-socket.set-keep-alive-idle-time", .call = &tcpSetKeepAliveIdleTime },
+            .{ .name = "[method]tcp-socket.set-keep-alive-interval", .call = &tcpSetKeepAliveInterval },
+            .{ .name = "[method]tcp-socket.set-keep-alive-count", .call = &tcpSetKeepAliveCount },
+            .{ .name = "[method]tcp-socket.set-hop-limit", .call = &socketSetHopLimit },
+            .{ .name = "[method]tcp-socket.set-receive-buffer-size", .call = &socketSetReceiveBufferSize },
+            .{ .name = "[method]tcp-socket.set-send-buffer-size", .call = &socketSetSendBufferSize },
+            // getters that surface socket options (#200).
+            .{ .name = "[method]tcp-socket.keep-alive-enabled", .call = &tcpGetKeepAliveEnabled },
+            .{ .name = "[method]tcp-socket.keep-alive-idle-time", .call = &tcpGetKeepAliveIdleTime },
+            .{ .name = "[method]tcp-socket.keep-alive-interval", .call = &tcpGetKeepAliveInterval },
+            .{ .name = "[method]tcp-socket.keep-alive-count", .call = &tcpGetKeepAliveCount },
+            .{ .name = "[method]tcp-socket.hop-limit", .call = &socketGetHopLimit },
+            .{ .name = "[method]tcp-socket.receive-buffer-size", .call = &socketGetReceiveBufferSize },
+            .{ .name = "[method]tcp-socket.send-buffer-size", .call = &socketGetSendBufferSize },
             // pure getters answerable from the rep.
             .{ .name = "[method]tcp-socket.address-family", .call = &socketAddressFamily },
             .{ .name = "[method]tcp-socket.is-listening", .call = &tcpIsListening },
@@ -4867,9 +5672,9 @@ pub const WasiCliAdapter = struct {
     }
 
     /// Register `wasi:sockets/udp` (#178 PR C). Bind, stream,
-    /// local/remote-address, and datagram-stream methods are wired
-    /// to real handlers; socket-option getters/setters remain
-    /// default-deny. Subscribe is always-ready stub.
+    /// local/remote-address, datagram-stream methods, and socket-option
+    /// getters/setters (#200) are wired to real handlers. Subscribe is
+    /// always-ready stub.
     pub fn populateWasiSocketsUdp(
         self: *WasiCliAdapter,
         providers: *std.StringHashMapUnmanaged(ImportBinding),
@@ -4883,13 +5688,13 @@ pub const WasiCliAdapter = struct {
             .{ .name = "[method]udp-socket.stream", .call = &udpStream },
             .{ .name = "[method]udp-socket.local-address", .call = &udpLocalAddress },
             .{ .name = "[method]udp-socket.remote-address", .call = &udpRemoteAddress },
-            // Socket-option getters/setters — still access-denied.
-            .{ .name = "[method]udp-socket.unicast-hop-limit", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.set-unicast-hop-limit", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.receive-buffer-size", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.set-receive-buffer-size", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.send-buffer-size", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.set-send-buffer-size", .call = &socketDenyAccess },
+            // Socket-option getters/setters (#200).
+            .{ .name = "[method]udp-socket.unicast-hop-limit", .call = &socketGetHopLimit },
+            .{ .name = "[method]udp-socket.set-unicast-hop-limit", .call = &socketSetHopLimit },
+            .{ .name = "[method]udp-socket.receive-buffer-size", .call = &socketGetReceiveBufferSize },
+            .{ .name = "[method]udp-socket.set-receive-buffer-size", .call = &socketSetReceiveBufferSize },
+            .{ .name = "[method]udp-socket.send-buffer-size", .call = &socketGetSendBufferSize },
+            .{ .name = "[method]udp-socket.set-send-buffer-size", .call = &socketSetSendBufferSize },
             // Pure getters + subscribe + drop.
             .{ .name = "[method]udp-socket.address-family", .call = &socketAddressFamily },
             .{ .name = "[method]udp-socket.subscribe", .call = &socketSubscribe },
@@ -11360,6 +12165,224 @@ test "sockets #178 TCP-B: resource-drop after connect cleans up" {
             var drop_results: [0]InterfaceValue = .{};
             try WasiCliAdapter.socketResourceDrop(adapter, &ci, &drop_args, &drop_results, std.testing.allocator);
             try std.testing.expect(adapter.socket_table.items[conn_handle] == null);
+        }
+    }.run);
+}
+
+// ----- Socket option tests (#200) -----
+
+test "sockets #200: receive-buffer-size round-trip on bound UDP" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+
+            // Set receive buffer size to 65536
+            {
+                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .u64 = 65536 } };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.socketSetReceiveBufferSize(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+
+            // Get receive buffer size — kernel may double the value
+            {
+                const args = [_]InterfaceValue{.{ .handle = 0 }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.socketGetReceiveBufferSize(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+                const val = results[0].result_val.payload.?.u64;
+                try std.testing.expect(val >= 65536);
+            }
+        }
+    }.run);
+}
+
+test "sockets #200: send-buffer-size round-trip on bound UDP" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+
+            {
+                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .u64 = 32768 } };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.socketSetSendBufferSize(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+            {
+                const args = [_]InterfaceValue{.{ .handle = 0 }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.socketGetSendBufferSize(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+                const val = results[0].result_val.payload.?.u64;
+                try std.testing.expect(val >= 32768);
+            }
+        }
+    }.run);
+}
+
+test "sockets #200: hop-limit round-trip on bound UDP" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+
+            // Set hop limit to 42
+            {
+                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .u32 = 42 } };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.socketSetHopLimit(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+            // Read it back
+            {
+                const args = [_]InterfaceValue{.{ .handle = 0 }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.socketGetHopLimit(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+                try std.testing.expectEqual(@as(u32, 42), results[0].result_val.payload.?.u32);
+            }
+        }
+    }.run);
+}
+
+test "sockets #200: keep-alive-enabled round-trip on listening TCP" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            const a = std.testing.allocator;
+            var ci: ComponentInstance = undefined;
+            const port = try testSetupListener(adapter);
+            _ = port;
+            const handle: u32 = 0;
+
+            // Enable keep-alive
+            {
+                const args = [_]InterfaceValue{ .{ .handle = handle }, .{ .bool = true } };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.tcpSetKeepAliveEnabled(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+            // Read back
+            {
+                const args = [_]InterfaceValue{.{ .handle = handle }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.tcpGetKeepAliveEnabled(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+                try std.testing.expect(results[0].result_val.payload.?.bool);
+            }
+        }
+    }.run);
+}
+
+test "sockets #200: set-listen-backlog-size stores value on rep" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createTcpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    // Set backlog to 16
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .u64 = 16 } };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpSetListenBacklogSize(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+
+    // Verify on the rep
+    const s = adapter.lookupSocket(0).?;
+    try testing.expectEqual(@as(u31, 16), s.listen_backlog.?);
+}
+
+test "sockets #200: buffer-size on unbound socket returns invalid_state" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createUdpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    // get-receive-buffer-size on unbound → invalid_state
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.socketGetReceiveBufferSize(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+            results[0].result_val.payload.?.variant_val.discriminant,
+        );
+    }
+}
+
+test "sockets #200: keep-alive-count round-trip on listening TCP" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            const a = std.testing.allocator;
+            var ci: ComponentInstance = undefined;
+            _ = try testSetupListener(adapter);
+            const handle: u32 = 0;
+
+            // Set keep-alive count to 5
+            {
+                const args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u32 = 5 } };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.tcpSetKeepAliveCount(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+            // Read back
+            {
+                const args = [_]InterfaceValue{.{ .handle = handle }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.tcpGetKeepAliveCount(adapter, &ci, &args, &results, a);
+                defer a.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+                try std.testing.expectEqual(@as(u32, 5), results[0].result_val.payload.?.u32);
+            }
+        }
+    }.run);
+}
+
+test "sockets #200: set-listen-backlog-size on listening socket is invalid_state" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            const a = std.testing.allocator;
+            var ci: ComponentInstance = undefined;
+            _ = try testSetupListener(adapter);
+            const handle: u32 = 0;
+
+            // set-listen-backlog-size after listen → invalid_state
+            const args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 32 } };
+            var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.tcpSetListenBacklogSize(adapter, &ci, &args, &results, a);
+            defer a.destroy(results[0].result_val.payload.?);
+            try std.testing.expect(!results[0].result_val.is_ok);
+            try std.testing.expectEqual(
+                @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                results[0].result_val.payload.?.variant_val.discriminant,
+            );
         }
     }.run);
 }
