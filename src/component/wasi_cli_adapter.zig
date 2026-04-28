@@ -244,28 +244,66 @@ const PendingTcpOp = enum { idle, bind_done, listen_done };
 
 /// Adapter-side `tcp-socket` / `udp-socket` rep. TCP can hold a real
 /// `std.Io.net.Server` once `start-listen` succeeds (#178 PR A).
-/// `connect`/`accept`/`shutdown`/streams remain default-deny in this
-/// PR — see plan.md PR B.
+/// UDP holds a `host_socket` after `start-bind` succeeds (#178 PR C).
 pub const Socket = struct {
     kind: SocketKind,
     family: IpAddressFamily,
     state: SocketState = .unbound,
     /// Authorized local address recorded by `start-bind`. Refreshed
-    /// from the kernel after `start-listen` so guests observe the
+    /// from the kernel after `start-listen` (TCP) or immediately
+    /// after the real bind syscall (UDP) so guests observe the
     /// ephemeral port when port=0 was requested.
     local_addr: ?std.Io.net.IpAddress = null,
     /// Active listening server. Owned by the rep; closed in
-    /// `closeAll`.
+    /// `closeAll`. TCP only.
     server: ?std.Io.net.Server = null,
     /// Pending TCP lifecycle op. Always `.idle` for udp sockets.
     pending: PendingTcpOp = .idle,
+    /// UDP datagram socket. Owned by the rep; closed in `closeAll`.
+    host_socket: ?std.Io.net.Socket = null,
+    /// Deep-copied allow-list from the network rep at bind time.
+    /// Owned by the socket; freed in `closeAll`. Prevents UAF if
+    /// the network resource is dropped before the socket.
+    allow_list: []const IpCidr = &.{},
+    /// Connected remote address set by `stream(some(remote))`.
+    remote_addr: ?std.Io.net.IpAddress = null,
+    /// Generation counter for `stream()` — each call bumps this;
+    /// sub-resources record the value at creation. Stale streams
+    /// whose generation != socket's return `invalid-state`.
+    stream_generation: u32 = 0,
 
     /// Release any held kernel resources. Idempotent. Called from
-    /// `[resource-drop]tcp-socket` and adapter `deinit`.
-    pub fn closeAll(self: *Socket, io: std.Io) void {
+    /// `[resource-drop]{tcp,udp}-socket` and adapter `deinit`.
+    pub fn closeAll(self: *Socket, io: std.Io, allocator: Allocator) void {
         if (self.server) |*srv| srv.deinit(io);
         self.server = null;
+        if (self.host_socket) |*hs| hs.close(io);
+        self.host_socket = null;
+        if (self.allow_list.len != 0) allocator.free(self.allow_list);
+        self.allow_list = &.{};
+        self.remote_addr = null;
     }
+};
+
+/// Rep for `wasi:sockets/udp.incoming-datagram-stream`. Each instance
+/// is tied to a parent `Socket` via `parent_handle` and validated via
+/// `generation` — if the socket's `stream_generation` has advanced
+/// past this stream's, all operations return `invalid-state`.
+pub const UdpIncomingStream = struct {
+    parent_handle: u32,
+    generation: u32,
+    remote: ?std.Io.net.IpAddress,
+};
+
+/// Rep for `wasi:sockets/udp.outgoing-datagram-stream`. Tracks
+/// `send_credit` for the WIT-mandated `check-send` / `send`
+/// protocol: `send` traps if `check-send` was not called first
+/// or if `datagrams.len > send_credit`.
+pub const UdpOutgoingStream = struct {
+    parent_handle: u32,
+    generation: u32,
+    remote: ?std.Io.net.IpAddress,
+    send_credit: ?u64 = null,
 };
 
 /// CIDR block for the per-`network` allow-list (#180). Stored canonical:
@@ -623,6 +661,54 @@ fn mapSocketListenError(err: anyerror) SocketErrorCode {
         error.AccessDenied => .access_denied,
         else => .unknown,
     };
+}
+
+/// Map a `Socket.SendError` to a `wasi:sockets/network.error-code`.
+fn mapSocketSendError(err: anyerror) SocketErrorCode {
+    return switch (err) {
+        error.MessageOversize => .datagram_too_large,
+        error.NetworkUnreachable, error.NetworkDown => .remote_unreachable,
+        error.HostUnreachable => .remote_unreachable,
+        error.ConnectionRefused => .connection_refused,
+        error.ConnectionResetByPeer => .connection_reset,
+        error.AccessDenied => .access_denied,
+        error.AddressFamilyUnsupported => .invalid_argument,
+        error.SystemResources => .out_of_memory,
+        else => .unknown,
+    };
+}
+
+/// Deep-copy a CIDR allow-list slice so the socket owns its own copy
+/// (prevents UAF when the network resource is dropped first).
+fn cloneAllowList(allocator: Allocator, src: []const IpCidr) ![]IpCidr {
+    if (src.len == 0) return &.{};
+    const dst = try allocator.alloc(IpCidr, src.len);
+    @memcpy(dst, src);
+    return dst;
+}
+
+/// Validate that `addr` is suitable as a send destination for the
+/// given socket `family`. Returns `null` if valid, or the WIT
+/// `error-code` discriminant to return on failure.
+///
+/// Checks (in WIT-mandated order):
+///  1. family mismatch → `invalid-argument`
+///  2. wildcard IP (0.0.0.0 / ::) → `invalid-argument`
+///  3. port == 0 → `invalid-argument`
+fn validateRemoteForSend(addr: std.Io.net.IpAddress, family: IpAddressFamily) ?SocketErrorCode {
+    switch (addr) {
+        .ip4 => |v4| {
+            if (family != .ipv4) return .invalid_argument;
+            if (std.mem.eql(u8, &v4.bytes, &.{ 0, 0, 0, 0 })) return .invalid_argument;
+            if (v4.port == 0) return .invalid_argument;
+        },
+        .ip6 => |v6| {
+            if (family != .ipv6) return .invalid_argument;
+            if (std.mem.eql(u8, &v6.bytes, &(.{0} ** 16))) return .invalid_argument;
+            if (v6.port == 0) return .invalid_argument;
+        },
+    }
+    return null;
 }
 
 /// Map a Zig std.fs / std.posix error to the closest `error-code` variant.
@@ -989,6 +1075,11 @@ pub const WasiCliAdapter = struct {
     /// Slots are nulled on `[resource-drop]tcp-socket` /
     /// `[resource-drop]udp-socket`.
     socket_table: std.ArrayListUnmanaged(?Socket) = .empty,
+    /// `wasi:sockets/udp.incoming-datagram-stream` sub-resource table.
+    /// Each slot owns a heap-allocated rep; nulled on resource-drop.
+    udp_incoming_streams: std.ArrayListUnmanaged(?*UdpIncomingStream) = .empty,
+    /// `wasi:sockets/udp.outgoing-datagram-stream` sub-resource table.
+    udp_outgoing_streams: std.ArrayListUnmanaged(?*UdpOutgoingStream) = .empty,
     /// `wasi:sockets/ip-name-lookup.resolve-address-stream` table. Slots
     /// own the heap-allocated stream struct; nulled on resource-drop.
     resolve_streams: std.ArrayListUnmanaged(?*ResolveAddressStream) = .empty,
@@ -1114,10 +1205,18 @@ pub const WasiCliAdapter = struct {
         {
             const io = std.Io.Threaded.global_single_threaded.io();
             for (self.socket_table.items) |*maybe| {
-                if (maybe.*) |*s| s.closeAll(io);
+                if (maybe.*) |*s| s.closeAll(io, self.allocator);
             }
         }
         self.socket_table.deinit(self.allocator);
+        for (self.udp_incoming_streams.items) |maybe| {
+            if (maybe) |s| self.allocator.destroy(s);
+        }
+        self.udp_incoming_streams.deinit(self.allocator);
+        for (self.udp_outgoing_streams.items) |maybe| {
+            if (maybe) |s| self.allocator.destroy(s);
+        }
+        self.udp_outgoing_streams.deinit(self.allocator);
         for (self.resolve_streams.items) |maybe| {
             if (maybe) |s| {
                 self.allocator.free(s.results);
@@ -3100,6 +3199,40 @@ pub const WasiCliAdapter = struct {
         return idx;
     }
 
+    fn pushUdpIncomingStream(self: *WasiCliAdapter, s: *UdpIncomingStream) !u32 {
+        for (self.udp_incoming_streams.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.udp_incoming_streams.items[i] = s;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.udp_incoming_streams.items.len);
+        try self.udp_incoming_streams.append(self.allocator, s);
+        return idx;
+    }
+
+    fn lookupUdpIncomingStream(self: *WasiCliAdapter, h: u32) ?*UdpIncomingStream {
+        if (h >= self.udp_incoming_streams.items.len) return null;
+        return self.udp_incoming_streams.items[h];
+    }
+
+    fn pushUdpOutgoingStream(self: *WasiCliAdapter, s: *UdpOutgoingStream) !u32 {
+        for (self.udp_outgoing_streams.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.udp_outgoing_streams.items[i] = s;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.udp_outgoing_streams.items.len);
+        try self.udp_outgoing_streams.append(self.allocator, s);
+        return idx;
+    }
+
+    fn lookupUdpOutgoingStream(self: *WasiCliAdapter, h: u32) ?*UdpOutgoingStream {
+        if (h >= self.udp_outgoing_streams.items.len) return null;
+        return self.udp_outgoing_streams.items[h];
+    }
+
     /// Generic `(...) -> result<_, error-code>` access-denied stub. Used as
     /// the body of every default-deny socket method.
     fn socketDenyAccess(
@@ -3131,7 +3264,7 @@ pub const WasiCliAdapter = struct {
         if (handle < self.socket_table.items.len) {
             if (self.socket_table.items[handle]) |*s| {
                 const io = std.Io.Threaded.global_single_threaded.io();
-                s.closeAll(io);
+                s.closeAll(io, self.allocator);
             }
             self.socket_table.items[handle] = null;
         }
@@ -3453,6 +3586,710 @@ pub const WasiCliAdapter = struct {
         results[0] = try socketResultOk(allocator, lowered);
     }
 
+    // ----- UDP host functions (#178 PR C) -----
+
+    /// `[method]udp-socket.start-bind:
+    ///   (borrow<udp-socket>, borrow<network>, ip-socket-address)
+    ///     -> result<_, error-code>` (#178).
+    ///
+    /// Unlike TCP start-bind, UDP performs the real bind syscall
+    /// immediately (UDP has no listen step).
+    fn udpStartBind(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const sock_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const net_handle = switch (args[1]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(sock_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp or s.state != .unbound or s.pending != .idle) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const local = liftIpSocketAddress(args[2], s.family) catch |err| switch (err) {
+            error.FamilyMismatch => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+            error.InvalidArgs => return error.InvalidArgs,
+        };
+        const net = if (net_handle < self.network_table.items.len)
+            self.network_table.items[net_handle]
+        else
+            null;
+        if (net == null or !net.?.allows(local)) {
+            results[0] = try socketResultErr(allocator, .access_denied);
+            return;
+        }
+        // Deep-copy the allow-list onto the socket so it survives
+        // network resource-drop.
+        const owned_list = cloneAllowList(self.allocator, net.?.allow_list) catch {
+            results[0] = try socketResultErr(allocator, .out_of_memory);
+            return;
+        };
+        // Real bind syscall — UDP has no listen step.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const host_socket = std.Io.net.IpAddress.bind(&local, io, .{
+            .mode = .dgram,
+            .protocol = .udp,
+        }) catch |err| {
+            if (owned_list.len != 0) self.allocator.free(owned_list);
+            results[0] = try socketResultErr(allocator, mapSocketBindError(err));
+            return;
+        };
+        s.host_socket = host_socket;
+        s.local_addr = host_socket.address;
+        s.allow_list = owned_list;
+        s.pending = .bind_done;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]udp-socket.finish-bind: (borrow<udp-socket>) ->
+    /// result<_, error-code>` (#178).
+    fn udpFinishBind(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp or s.pending != .bind_done) {
+            results[0] = try socketResultErr(allocator, .not_in_progress);
+            return;
+        }
+        s.pending = .idle;
+        s.state = .bound;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]udp-socket.stream:
+    ///   (borrow<udp-socket>, option<ip-socket-address>)
+    ///     -> result<tuple<own<incoming-datagram-stream>,
+    ///                     own<outgoing-datagram-stream>>, error-code>`
+    /// (#178).
+    ///
+    /// Each call invalidates any previously-returned stream pair via a
+    /// generation counter on the socket.
+    fn udpStream(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const sock_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(sock_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp or s.state != .bound) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        // Parse optional remote address.
+        var remote: ?std.Io.net.IpAddress = null;
+        switch (args[1]) {
+            .variant_val => |v| {
+                // option<T> is variant { none(0), some(1) }
+                if (v.discriminant == 1) {
+                    if (v.payload) |payload| {
+                        const addr = liftIpSocketAddress(payload.*, s.family) catch |err| switch (err) {
+                            error.FamilyMismatch => {
+                                results[0] = try socketResultErr(allocator, .invalid_argument);
+                                return;
+                            },
+                            error.InvalidArgs => return error.InvalidArgs,
+                        };
+                        // WIT-mandated validation order before allow-list.
+                        if (validateRemoteForSend(addr, s.family)) |code| {
+                            results[0] = try socketResultErr(allocator, code);
+                            return;
+                        }
+                        // Allow-list check on the remote.
+                        if (s.allow_list.len > 0) {
+                            var allowed = false;
+                            for (s.allow_list) |c| {
+                                if (c.containsAddr(addr)) {
+                                    allowed = true;
+                                    break;
+                                }
+                            }
+                            if (!allowed) {
+                                results[0] = try socketResultErr(allocator, .access_denied);
+                                return;
+                            }
+                        } else {
+                            // Empty allow-list = deny-all.
+                            results[0] = try socketResultErr(allocator, .access_denied);
+                            return;
+                        }
+                        remote = addr;
+                    }
+                }
+            },
+            .option_val => |opt| {
+                if (opt.payload) |payload| {
+                    const addr = liftIpSocketAddress(payload.*, s.family) catch |err| switch (err) {
+                        error.FamilyMismatch => {
+                            results[0] = try socketResultErr(allocator, .invalid_argument);
+                            return;
+                        },
+                        error.InvalidArgs => return error.InvalidArgs,
+                    };
+                    if (validateRemoteForSend(addr, s.family)) |code| {
+                        results[0] = try socketResultErr(allocator, code);
+                        return;
+                    }
+                    if (s.allow_list.len > 0) {
+                        var allowed = false;
+                        for (s.allow_list) |c| {
+                            if (c.containsAddr(addr)) {
+                                allowed = true;
+                                break;
+                            }
+                        }
+                        if (!allowed) {
+                            results[0] = try socketResultErr(allocator, .access_denied);
+                            return;
+                        }
+                    } else {
+                        results[0] = try socketResultErr(allocator, .access_denied);
+                        return;
+                    }
+                    remote = addr;
+                }
+            },
+            else => {
+                // none case — unconnected stream.
+            },
+        }
+
+        // Bump generation to invalidate any prior stream pair.
+        s.stream_generation += 1;
+        s.remote_addr = remote;
+
+        // Allocate incoming stream rep.
+        const in_rep = self.allocator.create(UdpIncomingStream) catch {
+            results[0] = try socketResultErr(allocator, .out_of_memory);
+            return;
+        };
+        in_rep.* = .{
+            .parent_handle = sock_handle,
+            .generation = s.stream_generation,
+            .remote = remote,
+        };
+        const in_handle = self.pushUdpIncomingStream(in_rep) catch {
+            self.allocator.destroy(in_rep);
+            results[0] = try socketResultErr(allocator, .out_of_memory);
+            return;
+        };
+
+        // Allocate outgoing stream rep.
+        const out_rep = self.allocator.create(UdpOutgoingStream) catch {
+            // Clean up the incoming we already pushed.
+            self.udp_incoming_streams.items[in_handle] = null;
+            self.allocator.destroy(in_rep);
+            results[0] = try socketResultErr(allocator, .out_of_memory);
+            return;
+        };
+        out_rep.* = .{
+            .parent_handle = sock_handle,
+            .generation = s.stream_generation,
+            .remote = remote,
+        };
+        const out_handle = self.pushUdpOutgoingStream(out_rep) catch {
+            self.udp_incoming_streams.items[in_handle] = null;
+            self.allocator.destroy(in_rep);
+            self.allocator.destroy(out_rep);
+            results[0] = try socketResultErr(allocator, .out_of_memory);
+            return;
+        };
+
+        // Return ok(tuple(in_handle, out_handle)).
+        const pair = try allocator.alloc(InterfaceValue, 2);
+        pair[0] = .{ .handle = in_handle };
+        pair[1] = .{ .handle = out_handle };
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = pair });
+    }
+
+    /// `[method]udp-socket.local-address: (borrow<udp-socket>) ->
+    /// result<ip-socket-address, error-code>` (#178).
+    fn udpLocalAddress(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const local = s.local_addr orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const lowered = try lowerIpSocketAddress(allocator, local);
+        results[0] = try socketResultOk(allocator, lowered);
+    }
+
+    /// `[method]udp-socket.remote-address: (borrow<udp-socket>) ->
+    /// result<ip-socket-address, error-code>` (#178).
+    fn udpRemoteAddress(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const remote = s.remote_addr orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const lowered = try lowerIpSocketAddress(allocator, remote);
+        results[0] = try socketResultOk(allocator, lowered);
+    }
+
+    /// `[method]incoming-datagram-stream.receive:
+    ///   (borrow<incoming-datagram-stream>, u64) ->
+    ///     result<list<incoming-datagram>, error-code>` (#178).
+    ///
+    /// Non-blocking receive per WIT: never blocks, never returns
+    /// `would-block`. Uses a zero-duration timeout; Timeout maps to
+    /// "no data available, return list so far".
+    fn incomingDatagramReceive(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const stream_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const max_results: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            .u32 => |v| @as(u64, v),
+            else => return error.InvalidArgs,
+        };
+        const in_stream = self.lookupUdpIncomingStream(stream_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const s = self.lookupSocket(in_stream.parent_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        // Generation check — stale stream.
+        if (in_stream.generation != s.stream_generation) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        if (max_results == 0) {
+            // WIT: max_results==0 → ok([]).
+            const empty_list = try allocator.alloc(InterfaceValue, 0);
+            results[0] = try socketResultOk(allocator, .{ .list_val = empty_list });
+            return;
+        }
+        const host_socket = s.host_socket orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const cap: usize = @min(@as(usize, @intCast(@min(max_results, 16))), 16);
+        var collected: std.ArrayListUnmanaged(InterfaceValue) = .empty;
+        defer collected.deinit(allocator);
+        var discard_budget: usize = 32;
+        var buf: [65536]u8 = undefined;
+        while (collected.items.len < cap and discard_budget > 0) {
+            const msg = host_socket.receiveTimeout(io, &buf, .{
+                .duration = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake },
+            }) catch {
+                // Zero-duration timeout: any error (Timeout on Linux,
+                // WouldBlock/Canceled on Windows IOCP) means "no data
+                // available." WIT mandates receive never blocks and
+                // never returns would-block, so we stop accumulating.
+                break;
+            };
+            // Connected-receive filtering: drop datagrams not from
+            // the connected remote.
+            if (in_stream.remote) |expected_remote| {
+                const matches = switch (msg.from) {
+                    .ip4 => |from_v4| switch (expected_remote) {
+                        .ip4 => |exp_v4| std.mem.eql(u8, &from_v4.bytes, &exp_v4.bytes) and from_v4.port == exp_v4.port,
+                        .ip6 => false,
+                    },
+                    .ip6 => |from_v6| switch (expected_remote) {
+                        .ip6 => |exp_v6| std.mem.eql(u8, &from_v6.bytes, &exp_v6.bytes) and from_v6.port == exp_v6.port,
+                        .ip4 => false,
+                    },
+                };
+                if (!matches) {
+                    discard_budget -= 1;
+                    continue;
+                }
+            }
+            // Build incoming-datagram record: { data: list<u8>, remote-address: ip-socket-address }
+            const data_copy = try allocator.alloc(u8, msg.data.len);
+            @memcpy(data_copy, msg.data);
+            const data_iv = try allocator.alloc(InterfaceValue, msg.data.len);
+            for (data_copy, 0..) |b, i| data_iv[i] = .{ .u8 = b };
+            allocator.free(data_copy);
+            const remote_iv = try lowerIpSocketAddress(allocator, msg.from);
+            const rec = try allocator.alloc(InterfaceValue, 2);
+            rec[0] = .{ .list_val = data_iv };
+            rec[1] = remote_iv;
+            try collected.append(allocator, .{ .record_val = rec });
+        }
+        const list = try allocator.alloc(InterfaceValue, collected.items.len);
+        @memcpy(list, collected.items);
+        results[0] = try socketResultOk(allocator, .{ .list_val = list });
+    }
+
+    /// `[method]outgoing-datagram-stream.check-send:
+    ///   (borrow<outgoing-datagram-stream>) -> result<u64, error-code>`
+    /// (#178).
+    fn outgoingCheckSend(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const stream_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const out_stream = self.lookupUdpOutgoingStream(stream_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const s = self.lookupSocket(out_stream.parent_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (out_stream.generation != s.stream_generation) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        out_stream.send_credit = 8;
+        results[0] = try socketResultOk(allocator, .{ .u64 = 8 });
+    }
+
+    /// `[method]outgoing-datagram-stream.send:
+    ///   (borrow<outgoing-datagram-stream>, list<outgoing-datagram>)
+    ///     -> result<u64, error-code>` (#178).
+    ///
+    /// WIT-mandated invariants:
+    ///  - Traps if `check-send` was not called first (send_credit == null).
+    ///  - Traps if `datagrams.len > send_credit`.
+    ///  - Partial-success: failure at index `i` returns `err` if i==0,
+    ///    else `ok(i)`.
+    fn outgoingSend(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const stream_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const datagrams = switch (args[1]) {
+            .list_val => |l| l,
+            else => return error.InvalidArgs,
+        };
+        const out_stream = self.lookupUdpOutgoingStream(stream_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const s = self.lookupSocket(out_stream.parent_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (out_stream.generation != s.stream_generation) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        // WIT-mandated trap: check-send must precede send.
+        const credit = out_stream.send_credit orelse return error.Trap;
+        if (datagrams.len > credit) return error.Trap;
+        // Consume credit — every send re-requires a check.
+        out_stream.send_credit = null;
+
+        if (datagrams.len == 0) {
+            results[0] = try socketResultOk(allocator, .{ .u64 = 0 });
+            return;
+        }
+
+        const host_socket = s.host_socket orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        var sent: u64 = 0;
+        for (datagrams) |dg_iv| {
+            const dg_fields = switch (dg_iv) {
+                .record_val => |r| r,
+                else => {
+                    if (sent == 0) {
+                        results[0] = try socketResultErr(allocator, .invalid_argument);
+                        return;
+                    }
+                    results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                    return;
+                },
+            };
+            // WIT outgoing-datagram: { data: list<u8>, remote-address: option<ip-socket-address> }
+            if (dg_fields.len < 2) {
+                if (sent == 0) {
+                    results[0] = try socketResultErr(allocator, .invalid_argument);
+                    return;
+                }
+                results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                return;
+            }
+            // Extract data bytes.
+            const data_list = switch (dg_fields[0]) {
+                .list_val => |l| l,
+                else => {
+                    if (sent == 0) {
+                        results[0] = try socketResultErr(allocator, .invalid_argument);
+                        return;
+                    }
+                    results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                    return;
+                },
+            };
+            const data_buf = try allocator.alloc(u8, data_list.len);
+            defer allocator.free(data_buf);
+            for (data_list, 0..) |iv, i| {
+                data_buf[i] = switch (iv) {
+                    .u8 => |b| b,
+                    else => 0,
+                };
+            }
+
+            // Determine destination address.
+            var dest: std.Io.net.IpAddress = undefined;
+            var has_per_dg_remote = false;
+            switch (dg_fields[1]) {
+                .variant_val => |v| {
+                    if (v.discriminant == 1) {
+                        if (v.payload) |p| {
+                            dest = liftIpSocketAddress(p.*, s.family) catch {
+                                if (sent == 0) {
+                                    results[0] = try socketResultErr(allocator, .invalid_argument);
+                                    return;
+                                }
+                                results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                                return;
+                            };
+                            has_per_dg_remote = true;
+                        }
+                    }
+                },
+                .option_val => |opt| {
+                    if (opt.payload) |p| {
+                        dest = liftIpSocketAddress(p.*, s.family) catch {
+                            if (sent == 0) {
+                                results[0] = try socketResultErr(allocator, .invalid_argument);
+                                return;
+                            }
+                            results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                            return;
+                        };
+                        has_per_dg_remote = true;
+                    }
+                },
+                else => {},
+            }
+
+            if (out_stream.remote != null) {
+                // Connected mode: per-datagram remote must be none
+                // or exactly equal to the connected remote.
+                if (has_per_dg_remote) {
+                    const matches = switch (dest) {
+                        .ip4 => |dv4| switch (out_stream.remote.?) {
+                            .ip4 => |rv4| std.mem.eql(u8, &dv4.bytes, &rv4.bytes) and dv4.port == rv4.port,
+                            .ip6 => false,
+                        },
+                        .ip6 => |dv6| switch (out_stream.remote.?) {
+                            .ip6 => |rv6| std.mem.eql(u8, &dv6.bytes, &rv6.bytes) and dv6.port == rv6.port,
+                            .ip4 => false,
+                        },
+                    };
+                    if (!matches) {
+                        if (sent == 0) {
+                            results[0] = try socketResultErr(allocator, .invalid_argument);
+                            return;
+                        }
+                        results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                        return;
+                    }
+                }
+                dest = out_stream.remote.?;
+            } else {
+                // Unconnected mode: per-datagram remote is required.
+                if (!has_per_dg_remote) {
+                    if (sent == 0) {
+                        results[0] = try socketResultErr(allocator, .invalid_argument);
+                        return;
+                    }
+                    results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                    return;
+                }
+                // Validate the per-datagram remote.
+                if (validateRemoteForSend(dest, s.family)) |code| {
+                    if (sent == 0) {
+                        results[0] = try socketResultErr(allocator, code);
+                        return;
+                    }
+                    results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                    return;
+                }
+                // Allow-list check.
+                if (s.allow_list.len > 0) {
+                    var allowed = false;
+                    for (s.allow_list) |c| {
+                        if (c.containsAddr(dest)) {
+                            allowed = true;
+                            break;
+                        }
+                    }
+                    if (!allowed) {
+                        if (sent == 0) {
+                            results[0] = try socketResultErr(allocator, .access_denied);
+                            return;
+                        }
+                        results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                        return;
+                    }
+                } else {
+                    if (sent == 0) {
+                        results[0] = try socketResultErr(allocator, .access_denied);
+                        return;
+                    }
+                    results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                    return;
+                }
+            }
+
+            // Actual send.
+            host_socket.send(io, &dest, data_buf) catch |err| {
+                if (sent == 0) {
+                    results[0] = try socketResultErr(allocator, mapSocketSendError(err));
+                    return;
+                }
+                results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                return;
+            };
+            sent += 1;
+        }
+        results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+    }
+
+    /// `[resource-drop]incoming-datagram-stream` (#178).
+    fn udpIncomingStreamDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle < self.udp_incoming_streams.items.len) {
+            if (self.udp_incoming_streams.items[handle]) |s| self.allocator.destroy(s);
+            self.udp_incoming_streams.items[handle] = null;
+        }
+    }
+
+    /// `[resource-drop]outgoing-datagram-stream` (#178).
+    fn udpOutgoingStreamDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle < self.udp_outgoing_streams.items.len) {
+            if (self.udp_outgoing_streams.items[handle]) |s| self.allocator.destroy(s);
+            self.udp_outgoing_streams.items[handle] = null;
+        }
+    }
+
     /// `[method]X.subscribe: (borrow<X>) -> own<pollable>`. Mints a stub
     /// always-ready pollable — same simplification as the clocks adapter.
     fn socketSubscribe(
@@ -3719,10 +4556,10 @@ pub const WasiCliAdapter = struct {
         });
     }
 
-    /// Register `wasi:sockets/udp` (#148). Default-deny across all IO
-    /// methods. The two sub-resources `incoming-datagram-stream` and
-    /// `outgoing-datagram-stream` only have their resource-drops bound;
-    /// the host never produces handles for them on the default-deny path.
+    /// Register `wasi:sockets/udp` (#178 PR C). Bind, stream,
+    /// local/remote-address, and datagram-stream methods are wired
+    /// to real handlers; socket-option getters/setters remain
+    /// default-deny. Subscribe is always-ready stub.
     pub fn populateWasiSocketsUdp(
         self: *WasiCliAdapter,
         providers: *std.StringHashMapUnmanaged(ImportBinding),
@@ -3730,32 +4567,30 @@ pub const WasiCliAdapter = struct {
     ) !void {
         const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
         const members = [_]M{
-            .{ .name = "[method]udp-socket.start-bind", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.finish-bind", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.stream", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.local-address", .call = &socketDenyAccess },
-            .{ .name = "[method]udp-socket.remote-address", .call = &socketDenyAccess },
+            // Real UDP lifecycle handlers (#178 PR C).
+            .{ .name = "[method]udp-socket.start-bind", .call = &udpStartBind },
+            .{ .name = "[method]udp-socket.finish-bind", .call = &udpFinishBind },
+            .{ .name = "[method]udp-socket.stream", .call = &udpStream },
+            .{ .name = "[method]udp-socket.local-address", .call = &udpLocalAddress },
+            .{ .name = "[method]udp-socket.remote-address", .call = &udpRemoteAddress },
+            // Socket-option getters/setters — still access-denied.
             .{ .name = "[method]udp-socket.unicast-hop-limit", .call = &socketDenyAccess },
             .{ .name = "[method]udp-socket.set-unicast-hop-limit", .call = &socketDenyAccess },
             .{ .name = "[method]udp-socket.receive-buffer-size", .call = &socketDenyAccess },
             .{ .name = "[method]udp-socket.set-receive-buffer-size", .call = &socketDenyAccess },
             .{ .name = "[method]udp-socket.send-buffer-size", .call = &socketDenyAccess },
             .{ .name = "[method]udp-socket.set-send-buffer-size", .call = &socketDenyAccess },
+            // Pure getters + subscribe + drop.
             .{ .name = "[method]udp-socket.address-family", .call = &socketAddressFamily },
             .{ .name = "[method]udp-socket.subscribe", .call = &socketSubscribe },
             .{ .name = "[resource-drop]udp-socket", .call = &socketResourceDrop },
-            // Datagram-stream sub-resources. The host never returns a
-            // handle to one (because `udp-socket.stream` is access-denied),
-            // but a guest may still receive a guest-side wrapper that
-            // calls drop on dispose, so the drop must be linkable. The
-            // method bodies are wired to default-deny too in case a guest
-            // somehow constructs a synthetic handle.
-            .{ .name = "[resource-drop]incoming-datagram-stream", .call = &noopResourceDrop },
-            .{ .name = "[method]incoming-datagram-stream.receive", .call = &socketDenyAccess },
+            // Datagram-stream sub-resources — real handlers.
+            .{ .name = "[resource-drop]incoming-datagram-stream", .call = &udpIncomingStreamDrop },
+            .{ .name = "[method]incoming-datagram-stream.receive", .call = &incomingDatagramReceive },
             .{ .name = "[method]incoming-datagram-stream.subscribe", .call = &socketSubscribe },
-            .{ .name = "[resource-drop]outgoing-datagram-stream", .call = &noopResourceDrop },
-            .{ .name = "[method]outgoing-datagram-stream.check-send", .call = &socketDenyAccess },
-            .{ .name = "[method]outgoing-datagram-stream.send", .call = &socketDenyAccess },
+            .{ .name = "[resource-drop]outgoing-datagram-stream", .call = &udpOutgoingStreamDrop },
+            .{ .name = "[method]outgoing-datagram-stream.check-send", .call = &outgoingCheckSend },
+            .{ .name = "[method]outgoing-datagram-stream.send", .call = &outgoingSend },
             .{ .name = "[method]outgoing-datagram-stream.subscribe", .call = &socketSubscribe },
         };
         for (members) |m| {
@@ -9083,4 +9918,777 @@ test "http #176: incoming-response.consume transfers body data" {
     var cons_r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpIncomingResponseConsume(&adapter, &ci, &cons_args, &cons_r2, testing.allocator);
     try testing.expect(!cons_r2[0].result_val.is_ok);
+}
+
+// ---------- UDP tests (#178 PR C) ----------
+
+test "sockets #178 UDP: start-bind denied without allow-list" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createUdpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(&adapter, &ci, &.{}, &n_results, testing.allocator);
+
+    const local = try testMakeIpv4SocketAddress(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer local.deinit(testing.allocator);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpStartBind(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets #178 UDP: start-bind family mismatch is invalid_argument" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.1/32"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            var ci: ComponentInstance = undefined;
+            // ipv6 udp socket
+            const c_args = [_]InterfaceValue{.{ .enum_val = 1 }};
+            var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.createUdpSocket(adapter, &ci, &c_args, &c_results, std.testing.allocator);
+            defer std.testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+            var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, std.testing.allocator);
+
+            const local = try testMakeIpv4SocketAddress(std.testing.allocator, .{ 127, 0, 0, 1 }, 0);
+            defer local.deinit(std.testing.allocator);
+            const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+            var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, std.testing.allocator);
+            defer std.testing.allocator.destroy(results[0].result_val.payload.?);
+            try std.testing.expect(!results[0].result_val.is_ok);
+            try std.testing.expectEqual(
+                @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                results[0].result_val.payload.?.variant_val.discriminant,
+            );
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: start-bind second call is invalid_state" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            var ci: ComponentInstance = undefined;
+            const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+            var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.createUdpSocket(adapter, &ci, &c_args, &c_results, std.testing.allocator);
+            defer std.testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+            var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, std.testing.allocator);
+
+            const local = try testMakeIpv4SocketAddress(std.testing.allocator, .{ 127, 0, 0, 1 }, 0);
+            defer local.deinit(std.testing.allocator);
+            // First start-bind → ok.
+            {
+                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, std.testing.allocator);
+                defer std.testing.allocator.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+            // Second call → invalid-state (socket no longer unbound).
+            {
+                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, std.testing.allocator);
+                defer std.testing.allocator.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(!results[0].result_val.is_ok);
+                try std.testing.expectEqual(
+                    @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                    results[0].result_val.payload.?.variant_val.discriminant,
+                );
+            }
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: finish-bind on idle socket is not_in_progress" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createUdpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    const args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpFinishBind(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.not_in_progress)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets #178 UDP: local-address reports kernel port after bind on 127.0.0.1:0" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            var ci: ComponentInstance = undefined;
+            const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+            var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.createUdpSocket(adapter, &ci, &c_args, &c_results, std.testing.allocator);
+            defer std.testing.allocator.destroy(c_results[0].result_val.payload.?);
+            var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, std.testing.allocator);
+
+            const local = try testMakeIpv4SocketAddress(std.testing.allocator, .{ 127, 0, 0, 1 }, 0);
+            defer local.deinit(std.testing.allocator);
+            // start-bind
+            {
+                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, std.testing.allocator);
+                defer std.testing.allocator.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+            // finish-bind
+            {
+                const args = [_]InterfaceValue{.{ .handle = 0 }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpFinishBind(adapter, &ci, &args, &results, std.testing.allocator);
+                defer std.testing.allocator.destroy(results[0].result_val.payload.?);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+            // local-address
+            {
+                const args = [_]InterfaceValue{.{ .handle = 0 }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpLocalAddress(adapter, &ci, &args, &results, std.testing.allocator);
+                defer results[0].deinit(std.testing.allocator);
+                try std.testing.expect(results[0].result_val.is_ok);
+                const v = results[0].result_val.payload.?.*;
+                try std.testing.expectEqual(@as(u32, 0), v.variant_val.discriminant);
+                const rec = v.variant_val.payload.?.record_val;
+                // Kernel assigned a non-zero port.
+                try std.testing.expect(rec[0].u16 != 0);
+                try std.testing.expectEqual(@as(u8, 127), rec[1].tuple_val[0].u8);
+            }
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: stream on unbound socket is invalid_state" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createUdpSocket(&adapter, &ci, &c_args, &c_results, testing.allocator);
+    defer testing.allocator.destroy(c_results[0].result_val.payload.?);
+
+    // stream(none) on unbound socket.
+    const stream_args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .variant_val = .{ .discriminant = 0, .payload = null } } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpStream(&adapter, &ci, &stream_args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+/// Helper: bind a UDP socket to 127.0.0.1:0 and finish-bind. Returns
+/// the socket handle (always 0 when starting from a fresh adapter).
+fn testUdpBind(adapter: *WasiCliAdapter) !void {
+    var ci: ComponentInstance = undefined;
+    const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+    var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.createUdpSocket(adapter, &ci, &c_args, &c_results, std.testing.allocator);
+    c_results[0].deinit(std.testing.allocator);
+    var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, std.testing.allocator);
+    const local = try testMakeIpv4SocketAddress(std.testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer local.deinit(std.testing.allocator);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 0 }, local };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, std.testing.allocator);
+        results[0].deinit(std.testing.allocator);
+    }
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpFinishBind(adapter, &ci, &args, &results, std.testing.allocator);
+        results[0].deinit(std.testing.allocator);
+    }
+}
+
+test "sockets #178 UDP: receive on empty queue returns ok([])" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            // stream(none) — unconnected.
+            const stream_args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .variant_val = .{ .discriminant = 0, .payload = null } } };
+            var stream_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &stream_args, &stream_results, std.testing.allocator);
+            defer stream_results[0].deinit(std.testing.allocator);
+            try std.testing.expect(stream_results[0].result_val.is_ok);
+            const pair = stream_results[0].result_val.payload.?.tuple_val;
+            const in_handle = pair[0].handle;
+            // receive(max_results=10) on empty queue → ok([]).
+            const recv_args = [_]InterfaceValue{ .{ .handle = in_handle }, .{ .u64 = 10 } };
+            var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.incomingDatagramReceive(adapter, &ci, &recv_args, &recv_results, std.testing.allocator);
+            defer recv_results[0].deinit(std.testing.allocator);
+            try std.testing.expect(recv_results[0].result_val.is_ok);
+            try std.testing.expectEqual(@as(usize, 0), recv_results[0].result_val.payload.?.list_val.len);
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: check-send credit and send traps" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            // stream(none)
+            const stream_args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .variant_val = .{ .discriminant = 0, .payload = null } } };
+            var stream_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &stream_args, &stream_results, std.testing.allocator);
+            defer stream_results[0].deinit(std.testing.allocator);
+            const pair = stream_results[0].result_val.payload.?.tuple_val;
+            const out_handle = pair[1].handle;
+
+            // send without check-send → trap.
+            {
+                const empty_list = try std.testing.allocator.alloc(InterfaceValue, 0);
+                defer std.testing.allocator.free(empty_list);
+                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = empty_list } };
+                var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                const err = WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, std.testing.allocator);
+                try std.testing.expectError(error.Trap, err);
+            }
+
+            // check-send → ok(8)
+            {
+                const cs_args = [_]InterfaceValue{.{ .handle = out_handle }};
+                var cs_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.outgoingCheckSend(adapter, &ci, &cs_args, &cs_results, std.testing.allocator);
+                defer cs_results[0].deinit(std.testing.allocator);
+                try std.testing.expect(cs_results[0].result_val.is_ok);
+                try std.testing.expectEqual(@as(u64, 8), cs_results[0].result_val.payload.?.u64);
+            }
+
+            // send with too many datagrams → trap.
+            {
+                // credit is 8, send 9 → trap
+                const too_many = try std.testing.allocator.alloc(InterfaceValue, 9);
+                defer std.testing.allocator.free(too_many);
+                for (too_many) |*slot| slot.* = .{ .u32 = 0 };
+                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = too_many } };
+                var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                const err = WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, std.testing.allocator);
+                try std.testing.expectError(error.Trap, err);
+            }
+
+            // After trap, credit was consumed so next send also traps.
+            // Re-check first.
+            {
+                const cs_args = [_]InterfaceValue{.{ .handle = out_handle }};
+                var cs_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.outgoingCheckSend(adapter, &ci, &cs_args, &cs_results, std.testing.allocator);
+                defer cs_results[0].deinit(std.testing.allocator);
+                try std.testing.expect(cs_results[0].result_val.is_ok);
+            }
+
+            // send 0 datagrams → ok(0)
+            {
+                const empty_list = try std.testing.allocator.alloc(InterfaceValue, 0);
+                defer std.testing.allocator.free(empty_list);
+                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = empty_list } };
+                var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, std.testing.allocator);
+                defer send_results[0].deinit(std.testing.allocator);
+                try std.testing.expect(send_results[0].result_val.is_ok);
+                try std.testing.expectEqual(@as(u64, 0), send_results[0].result_val.payload.?.u64);
+            }
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: loopback send + receive round-trip" {
+    // Windows IOCP zero-duration receiveTimeout doesn't reliably
+    // deliver loopback UDP datagrams in CI; skip on Windows.
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            // Create + bind socket A on 127.0.0.1:0.
+            try testUdpBind(adapter);
+            // Get socket A's port.
+            var la_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpLocalAddress(adapter, &ci, &[_]InterfaceValue{.{ .handle = 0 }}, &la_results, a);
+            defer la_results[0].deinit(a);
+            const port_a = la_results[0].result_val.payload.?.variant_val.payload.?.record_val[0].u16;
+
+            // Create + bind socket B on 127.0.0.1:0.
+            {
+                const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+                var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.createUdpSocket(adapter, &ci, &c_args, &c_results, a);
+                c_results[0].deinit(a);
+            }
+            {
+                var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, a);
+            }
+            {
+                const local = try testMakeIpv4SocketAddress(a, .{ 127, 0, 0, 1 }, 0);
+                defer local.deinit(a);
+                // sock handle=1, net handle=1
+                const args = [_]InterfaceValue{ .{ .handle = 1 }, .{ .handle = 1 }, local };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, a);
+                results[0].deinit(a);
+            }
+            {
+                const args = [_]InterfaceValue{.{ .handle = 1 }};
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpFinishBind(adapter, &ci, &args, &results, a);
+                results[0].deinit(a);
+            }
+
+            // stream(none) on socket A (unconnected).
+            var stream_a_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &stream_a_results, a);
+            defer stream_a_results[0].deinit(a);
+            const pair_a = stream_a_results[0].result_val.payload.?.tuple_val;
+            const out_a = pair_a[1].handle;
+
+            // stream(none) on socket B (unconnected).
+            var stream_b_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 1 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &stream_b_results, a);
+            defer stream_b_results[0].deinit(a);
+            const pair_b = stream_b_results[0].result_val.payload.?.tuple_val;
+            const in_b = pair_b[0].handle;
+
+            // Send "hello" from A to B.
+            {
+                const cs_args = [_]InterfaceValue{.{ .handle = out_a }};
+                var cs_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.outgoingCheckSend(adapter, &ci, &cs_args, &cs_results, a);
+                cs_results[0].deinit(a);
+            }
+            // Build B's address for the datagram destination.
+            var lb_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpLocalAddress(adapter, &ci, &[_]InterfaceValue{.{ .handle = 1 }}, &lb_results, a);
+            defer lb_results[0].deinit(a);
+            const port_b = lb_results[0].result_val.payload.?.variant_val.payload.?.record_val[0].u16;
+            _ = port_a;
+
+            // Build outgoing-datagram { data: "hello", remote-address: some(B) }
+            const dest = try testMakeIpv4SocketAddress(a, .{ 127, 0, 0, 1 }, port_b);
+            defer dest.deinit(a);
+            const remote_opt = try a.create(InterfaceValue);
+            remote_opt.* = dest;
+            defer a.destroy(remote_opt);
+
+            const hello = "hello";
+            const data_iv = try a.alloc(InterfaceValue, hello.len);
+            defer a.free(data_iv);
+            for (hello, 0..) |b, i| data_iv[i] = .{ .u8 = b };
+            const dg_fields = try a.alloc(InterfaceValue, 2);
+            defer a.free(dg_fields);
+            dg_fields[0] = .{ .list_val = data_iv };
+            dg_fields[1] = .{ .variant_val = .{ .discriminant = 1, .payload = remote_opt } };
+            const dg_list = try a.alloc(InterfaceValue, 1);
+            defer a.free(dg_list);
+            dg_list[0] = .{ .record_val = dg_fields };
+
+            {
+                const send_args = [_]InterfaceValue{ .{ .handle = out_a }, .{ .list_val = dg_list } };
+                var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, a);
+                defer send_results[0].deinit(a);
+                try std.testing.expect(send_results[0].result_val.is_ok);
+                try std.testing.expectEqual(@as(u64, 1), send_results[0].result_val.payload.?.u64);
+            }
+
+            // Receive on B — retry loop to handle Windows IOCP latency.
+            {
+                const io_poll = std.Io.Threaded.global_single_threaded.io();
+                var received = false;
+                var attempt: usize = 0;
+                while (attempt < 50) : (attempt += 1) {
+                    const wait_dur: std.Io.Clock.Duration = .{ .raw = std.Io.Duration.fromMilliseconds(10), .clock = .awake };
+                    wait_dur.sleep(io_poll) catch {};
+                    const recv_args = [_]InterfaceValue{ .{ .handle = in_b }, .{ .u64 = 10 } };
+                    var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                    try WasiCliAdapter.incomingDatagramReceive(adapter, &ci, &recv_args, &recv_results, a);
+                    const is_ok = recv_results[0].result_val.is_ok;
+                    const list = if (is_ok) recv_results[0].result_val.payload.?.list_val else &[_]InterfaceValue{};
+                    if (is_ok and list.len >= 1) {
+                        defer recv_results[0].deinit(a);
+                        // Check received data.
+                        const dg0 = list[0].record_val;
+                        const received_data = dg0[0].list_val;
+                        try std.testing.expectEqual(@as(usize, 5), received_data.len);
+                        try std.testing.expectEqual(@as(u8, 'h'), received_data[0].u8);
+                        try std.testing.expectEqual(@as(u8, 'o'), received_data[4].u8);
+                        received = true;
+                        break;
+                    }
+                    recv_results[0].deinit(a);
+                }
+                try std.testing.expect(received);
+            }
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: send unconnected + per-datagram none is invalid_argument" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            // stream(none)
+            var stream_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &stream_results, a);
+            defer stream_results[0].deinit(a);
+            const out_handle = stream_results[0].result_val.payload.?.tuple_val[1].handle;
+            // check-send
+            {
+                const cs_args = [_]InterfaceValue{.{ .handle = out_handle }};
+                var cs_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.outgoingCheckSend(adapter, &ci, &cs_args, &cs_results, a);
+                cs_results[0].deinit(a);
+            }
+            // Build datagram with remote = none (variant discriminant 0, no payload).
+            const data_iv = try a.alloc(InterfaceValue, 1);
+            defer a.free(data_iv);
+            data_iv[0] = .{ .u8 = 42 };
+            const dg_fields = try a.alloc(InterfaceValue, 2);
+            defer a.free(dg_fields);
+            dg_fields[0] = .{ .list_val = data_iv };
+            dg_fields[1] = .{ .variant_val = .{ .discriminant = 0, .payload = null } };
+            const dg_list = try a.alloc(InterfaceValue, 1);
+            defer a.free(dg_list);
+            dg_list[0] = .{ .record_val = dg_fields };
+            // send → invalid_argument (unconnected requires per-datagram remote).
+            const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = dg_list } };
+            var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, a);
+            defer send_results[0].deinit(a);
+            try std.testing.expect(!send_results[0].result_val.is_ok);
+            try std.testing.expectEqual(
+                @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                send_results[0].result_val.payload.?.variant_val.discriminant,
+            );
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: network-drop survives via deep-copied allow_list" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            try testUdpBind(adapter);
+            // Drop the network resource.
+            {
+                const drop_args = [_]InterfaceValue{.{ .handle = 0 }};
+                var drop_results: [0]InterfaceValue = .{};
+                try WasiCliAdapter.networkResourceDrop(adapter, &ci, &drop_args, &drop_results, a);
+            }
+            // stream(none) still works — socket owns its allow_list.
+            var stream_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &stream_results, a);
+            defer stream_results[0].deinit(a);
+            try std.testing.expect(stream_results[0].result_val.is_ok);
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: fd-leak verification — rebind same port after drop" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            try testUdpBind(adapter);
+            // Get the kernel-assigned port.
+            var la_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpLocalAddress(adapter, &ci, &[_]InterfaceValue{.{ .handle = 0 }}, &la_results, a);
+            defer la_results[0].deinit(a);
+            const port = la_results[0].result_val.payload.?.variant_val.payload.?.record_val[0].u16;
+            // Drop socket 0 — should close the fd.
+            {
+                const drop_args = [_]InterfaceValue{.{ .handle = 0 }};
+                var drop_results: [0]InterfaceValue = .{};
+                try WasiCliAdapter.socketResourceDrop(adapter, &ci, &drop_args, &drop_results, a);
+            }
+            // Create a new socket and bind to the same port.
+            {
+                const c_args = [_]InterfaceValue{.{ .enum_val = 0 }};
+                var c_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.createUdpSocket(adapter, &ci, &c_args, &c_results, a);
+                c_results[0].deinit(a);
+            }
+            {
+                var n_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.instanceNetwork(adapter, &ci, &.{}, &n_results, a);
+            }
+            {
+                const local = try testMakeIpv4SocketAddress(a, .{ 127, 0, 0, 1 }, port);
+                defer local.deinit(a);
+                // socket=0 (reused slot), network=1 (new)
+                const args = [_]InterfaceValue{ .{ .handle = 0 }, .{ .handle = 1 }, local };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpStartBind(adapter, &ci, &args, &results, a);
+                defer results[0].deinit(a);
+                try std.testing.expect(results[0].result_val.is_ok);
+            }
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: generation invalidation — old stream returns invalid_state" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            // First stream(none) pair.
+            var s1_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &s1_results, a);
+            defer s1_results[0].deinit(a);
+            const old_in = s1_results[0].result_val.payload.?.tuple_val[0].handle;
+            const old_out = s1_results[0].result_val.payload.?.tuple_val[1].handle;
+            // Second stream(none) — invalidates the first pair.
+            var s2_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &s2_results, a);
+            defer s2_results[0].deinit(a);
+            // Old incoming receive → invalid_state.
+            {
+                const recv_args = [_]InterfaceValue{ .{ .handle = old_in }, .{ .u64 = 10 } };
+                var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.incomingDatagramReceive(adapter, &ci, &recv_args, &recv_results, a);
+                defer recv_results[0].deinit(a);
+                try std.testing.expect(!recv_results[0].result_val.is_ok);
+                try std.testing.expectEqual(
+                    @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                    recv_results[0].result_val.payload.?.variant_val.discriminant,
+                );
+            }
+            // Old outgoing check-send → invalid_state.
+            {
+                const cs_args = [_]InterfaceValue{.{ .handle = old_out }};
+                var cs_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.outgoingCheckSend(adapter, &ci, &cs_args, &cs_results, a);
+                defer cs_results[0].deinit(a);
+                try std.testing.expect(!cs_results[0].result_val.is_ok);
+                try std.testing.expectEqual(
+                    @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                    cs_results[0].result_val.payload.?.variant_val.discriminant,
+                );
+            }
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: remote-address returns invalid_state when unconnected" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            // stream(none) — no connected remote.
+            var stream_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &stream_results, a);
+            defer stream_results[0].deinit(a);
+            // remote-address → invalid_state.
+            const ra_args = [_]InterfaceValue{.{ .handle = 0 }};
+            var ra_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpRemoteAddress(adapter, &ci, &ra_args, &ra_results, a);
+            defer ra_results[0].deinit(a);
+            try std.testing.expect(!ra_results[0].result_val.is_ok);
+            try std.testing.expectEqual(
+                @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+                ra_results[0].result_val.payload.?.variant_val.discriminant,
+            );
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: stream(some(remote)) validates wildcard/port-0/family" {
+    try adapter_with_allow_list(.{ .allow = &.{ "127.0.0.0/8", "0.0.0.0/0" } }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            const Case = struct { octets: [4]u8, port: u16 };
+            const cases = [_]Case{
+                .{ .octets = .{ 0, 0, 0, 0 }, .port = 1234 }, // wildcard
+                .{ .octets = .{ 127, 0, 0, 1 }, .port = 0 }, // port-0
+            };
+            for (cases) |c| {
+                const remote = try testMakeIpv4SocketAddress(a, c.octets, c.port);
+                defer remote.deinit(a);
+                const payload_inner = try a.create(InterfaceValue);
+                payload_inner.* = remote;
+                defer a.destroy(payload_inner);
+                const stream_args = [_]InterfaceValue{
+                    .{ .handle = 0 },
+                    .{ .variant_val = .{ .discriminant = 1, .payload = payload_inner } },
+                };
+                var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+                try WasiCliAdapter.udpStream(adapter, &ci, &stream_args, &results, a);
+                defer results[0].deinit(a);
+                try std.testing.expect(!results[0].result_val.is_ok);
+                try std.testing.expectEqual(
+                    @as(u32, @intFromEnum(SocketErrorCode.invalid_argument)),
+                    results[0].result_val.payload.?.variant_val.discriminant,
+                );
+            }
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: stream(some(remote)) allow-list denied" {
+    // Allow-list only covers 127.0.0.0/8, so 10.x is denied.
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            const remote = try testMakeIpv4SocketAddress(a, .{ 10, 0, 0, 1 }, 5000);
+            defer remote.deinit(a);
+            const payload_inner = try a.create(InterfaceValue);
+            payload_inner.* = remote;
+            defer a.destroy(payload_inner);
+            const stream_args = [_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 1, .payload = payload_inner } },
+            };
+            var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &stream_args, &results, a);
+            defer results[0].deinit(a);
+            try std.testing.expect(!results[0].result_val.is_ok);
+            try std.testing.expectEqual(
+                @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+                results[0].result_val.payload.?.variant_val.discriminant,
+            );
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: receive max_results=0 returns ok([])" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            var stream_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.udpStream(adapter, &ci, &[_]InterfaceValue{
+                .{ .handle = 0 },
+                .{ .variant_val = .{ .discriminant = 0, .payload = null } },
+            }, &stream_results, a);
+            defer stream_results[0].deinit(a);
+            const in_handle = stream_results[0].result_val.payload.?.tuple_val[0].handle;
+            // receive(0) → ok([])
+            const recv_args = [_]InterfaceValue{ .{ .handle = in_handle }, .{ .u64 = 0 } };
+            var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+            try WasiCliAdapter.incomingDatagramReceive(adapter, &ci, &recv_args, &recv_results, a);
+            defer recv_results[0].deinit(a);
+            try std.testing.expect(recv_results[0].result_val.is_ok);
+            try std.testing.expectEqual(@as(usize, 0), recv_results[0].result_val.payload.?.list_val.len);
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: resource-drop frees host_socket and allow_list" {
+    try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
+        fn run(adapter: *WasiCliAdapter) !void {
+            try testUdpBind(adapter);
+            var ci: ComponentInstance = undefined;
+            const a = std.testing.allocator;
+            // Verify socket exists with host_socket and allow_list.
+            try std.testing.expect(adapter.socket_table.items[0].?.host_socket != null);
+            try std.testing.expect(adapter.socket_table.items[0].?.allow_list.len > 0);
+            // Drop.
+            const drop_args = [_]InterfaceValue{.{ .handle = 0 }};
+            var drop_results: [0]InterfaceValue = .{};
+            try WasiCliAdapter.socketResourceDrop(adapter, &ci, &drop_args, &drop_results, a);
+            try std.testing.expect(adapter.socket_table.items[0] == null);
+        }
+    }.run);
+}
+
+test "sockets #178 UDP: validateRemoteForSend rejects bad remotes" {
+    const Ip4 = std.Io.net.Ip4Address;
+    // Wildcard v4.
+    try std.testing.expectEqual(
+        @as(?SocketErrorCode, .invalid_argument),
+        validateRemoteForSend(
+            .{ .ip4 = Ip4{ .bytes = .{ 0, 0, 0, 0 }, .port = 1234 } },
+            .ipv4,
+        ),
+    );
+    // Port 0.
+    try std.testing.expectEqual(
+        @as(?SocketErrorCode, .invalid_argument),
+        validateRemoteForSend(
+            .{ .ip4 = Ip4{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } },
+            .ipv4,
+        ),
+    );
+    // Family mismatch.
+    try std.testing.expectEqual(
+        @as(?SocketErrorCode, .invalid_argument),
+        validateRemoteForSend(
+            .{ .ip4 = Ip4{ .bytes = .{ 127, 0, 0, 1 }, .port = 5000 } },
+            .ipv6,
+        ),
+    );
+    // Valid.
+    try std.testing.expectEqual(
+        @as(?SocketErrorCode, null),
+        validateRemoteForSend(
+            .{ .ip4 = Ip4{ .bytes = .{ 127, 0, 0, 1 }, .port = 5000 } },
+            .ipv4,
+        ),
+    );
 }
