@@ -692,6 +692,73 @@ pub fn computeDominators(
     };
 }
 
+// ── Dominance frontiers ─────────────────────────────────────────────────
+
+/// Compute the dominance frontier for every block in `func`.
+///
+/// DF(b) = { y | ∃ pred of y that b dominates, but b does not strictly
+///             dominate y }. Uses the efficient "bottom-up" algorithm
+/// from Cooper, Harvey & Kennedy (2001), §4.2.
+///
+/// Caller owns the returned slices; call `freeDominanceFrontiers` to release.
+pub fn computeDominanceFrontiers(
+    dom: *const DomTree,
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) ![][]const ir.BlockId {
+    const nblocks = func.blocks.items.len;
+
+    var preds = try buildPredecessors(func, allocator);
+    defer {
+        var pit = preds.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        preds.deinit();
+    }
+
+    // Accumulate DF sets as ArrayLists, then convert to owned slices.
+    var df_lists = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer allocator.free(df_lists);
+    for (df_lists) |*l| l.* = .empty;
+
+    for (0..nblocks) |idx| {
+        const b: ir.BlockId = @intCast(idx);
+        const pred_list = preds.get(b) orelse continue;
+        if (pred_list.len < 2) continue; // join point iff ≥2 preds
+
+        for (pred_list) |p| {
+            var runner = p;
+            while (runner != (dom.idom[b] orelse break)) {
+                // Add b to DF(runner) if not already present.
+                var dup = false;
+                for (df_lists[runner].items) |existing| {
+                    if (existing == b) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) try df_lists[runner].append(allocator, b);
+                const next = dom.idom[runner] orelse break;
+                if (next == runner) break;
+                runner = next;
+            }
+        }
+    }
+
+    // Convert to owned slices.
+    const result = try allocator.alloc([]const ir.BlockId, nblocks);
+    errdefer allocator.free(result);
+    for (df_lists, 0..) |*l, i| {
+        result[i] = try l.toOwnedSlice(allocator);
+    }
+    return result;
+}
+
+/// Free the slices returned by `computeDominanceFrontiers`.
+pub fn freeDominanceFrontiers(df: [][]const ir.BlockId, allocator: std.mem.Allocator) void {
+    for (df) |s| allocator.free(s);
+    allocator.free(df);
+}
+
 // ── Natural-loop detection ──────────────────────────────────────────────
 
 /// A natural loop identified by a single header and one or more latches
