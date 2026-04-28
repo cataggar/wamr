@@ -785,6 +785,7 @@ pub const OutgoingRequest = struct {
     authority: ?[]u8 = null,
     headers_handle: u32,
     body_consumed: bool = false,
+    body_handle: ?u32 = null,
 
     pub fn deinit(self: *OutgoingRequest, allocator: Allocator) void {
         if (self.method_other) |s| allocator.free(s);
@@ -805,12 +806,18 @@ pub const IncomingRequest = struct {
 
 /// `wasi:http/types.incoming-response`. Used by the
 /// `future-incoming-response.get` happy path once #149 follow-up wires
-/// real outbound HTTP. For default-deny, no incoming-response is ever
-/// produced.
+/// real outbound HTTP (#176).
 pub const IncomingResponse = struct {
     status: u16 = 0,
     headers_handle: u32 = 0,
     body_consumed: bool = false,
+    /// Response body bytes owned by the adapter. Transferred to
+    /// `IncomingBody` on `consume`, freed on drop if unconsumed.
+    body_data: ?[]u8 = null,
+
+    pub fn deinit(self: *IncomingResponse, allocator: Allocator) void {
+        if (self.body_data) |d| allocator.free(d);
+    }
 };
 
 /// `wasi:http/types.outgoing-response`.
@@ -820,17 +827,28 @@ pub const OutgoingResponse = struct {
     body_consumed: bool = false,
 };
 
-/// `wasi:http/types.incoming-body`. Placeholder rep — the adapter
-/// returns `error` from `incoming-body.stream` on the default-deny
-/// path, so the only operation that touches a slot is resource-drop.
-pub const IncomingBody = struct {};
+/// `wasi:http/types.incoming-body`. Holds readable body data
+/// transferred from `IncomingResponse` on `consume`.
+pub const IncomingBody = struct {
+    /// Owned body bytes. Freed on drop.
+    data: ?[]u8 = null,
+    stream_taken: bool = false,
+
+    pub fn deinit(self: *IncomingBody, allocator: Allocator) void {
+        if (self.data) |d| allocator.free(d);
+    }
+};
 
 /// `wasi:http/types.outgoing-body`.
 pub const OutgoingBody = struct {
     /// Set by `[method]outgoing-body.write` to ensure a second call
-    /// returns err per WIT contract. Default-deny errs on first call
-    /// too, but the field still tracks state for symmetry.
+    /// returns err per WIT contract.
     stream_taken: bool = false,
+    /// Heap-allocated output stream created by `write`. The stream's
+    /// buffer holds the body bytes written by the guest. The stream
+    /// is owned by `WasiCliAdapter.owned_output_streams` and freed
+    /// there; this pointer is only for reading the buffer contents.
+    stream: ?*streams.OutputStream = null,
 };
 
 /// `wasi:http/types.future-incoming-response`. Default-deny resolves
@@ -1134,7 +1152,10 @@ pub const WasiCliAdapter = struct {
         }
         self.http_outgoing_responses.deinit(self.allocator);
         for (self.http_incoming_responses.items) |maybe| {
-            if (maybe) |r| self.allocator.destroy(r);
+            if (maybe) |r| {
+                r.deinit(self.allocator);
+                self.allocator.destroy(r);
+            }
         }
         self.http_incoming_responses.deinit(self.allocator);
         for (self.http_request_options.items) |maybe| {
@@ -1146,7 +1167,10 @@ pub const WasiCliAdapter = struct {
         }
         self.http_response_outparams.deinit(self.allocator);
         for (self.http_incoming_bodies.items) |maybe| {
-            if (maybe) |b| self.allocator.destroy(b);
+            if (maybe) |b| {
+                b.deinit(self.allocator);
+                self.allocator.destroy(b);
+            }
         }
         self.http_incoming_bodies.deinit(self.allocator);
         for (self.http_outgoing_bodies.items) |maybe| {
@@ -3891,6 +3915,104 @@ pub const WasiCliAdapter = struct {
         try self.http_request_options.append(self.allocator, r);
         return idx;
     }
+    fn pushIncomingResponse(self: *WasiCliAdapter, r: *IncomingResponse) !u32 {
+        for (self.http_incoming_responses.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_incoming_responses.items[i] = r;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_incoming_responses.items.len);
+        try self.http_incoming_responses.append(self.allocator, r);
+        return idx;
+    }
+    fn lookupIncomingResponse(self: *WasiCliAdapter, h: u32) ?*IncomingResponse {
+        if (h >= self.http_incoming_responses.items.len) return null;
+        return self.http_incoming_responses.items[h];
+    }
+    fn pushIncomingBody(self: *WasiCliAdapter, b: *IncomingBody) !u32 {
+        for (self.http_incoming_bodies.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_incoming_bodies.items[i] = b;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_incoming_bodies.items.len);
+        try self.http_incoming_bodies.append(self.allocator, b);
+        return idx;
+    }
+    fn lookupIncomingBody(self: *WasiCliAdapter, h: u32) ?*IncomingBody {
+        if (h >= self.http_incoming_bodies.items.len) return null;
+        return self.http_incoming_bodies.items[h];
+    }
+    fn lookupOutgoingBody(self: *WasiCliAdapter, h: u32) ?*OutgoingBody {
+        if (h >= self.http_outgoing_bodies.items.len) return null;
+        return self.http_outgoing_bodies.items[h];
+    }
+
+    // --- helpers for extracting bytes from InterfaceValue args ---
+
+    /// Extract a byte slice from an InterfaceValue that is either a
+    /// `.string` PtrLen (from guest memory) or a `.list_val` of u8
+    /// InterfaceValues (from test / host calls). Returns null on
+    /// invalid encoding or out-of-bounds guest memory.
+    fn extractArgBytes(ci: *ComponentInstance, arg: InterfaceValue) ?[]const u8 {
+        switch (arg) {
+            .string => |pl| {
+                if (pl.len == 0) return "";
+                return ci.readGuestBytes(pl.ptr, pl.len);
+            },
+            .list_val => |elems| {
+                // For test calls: each element is .u8
+                // Return a pointer to a contiguous region by checking if the
+                // underlying slice of InterfaceValues can be reinterpreted.
+                // Actually, the u8 values are scattered in tagged unions, so
+                // we cannot get a contiguous []const u8 without copying.
+                // Return null and let the caller use extractArgBytesAlloc.
+                _ = elems;
+                return null;
+            },
+            .list => |pl| {
+                if (pl.len == 0) return "";
+                return ci.readGuestBytes(pl.ptr, pl.len);
+            },
+            else => return null,
+        }
+    }
+
+    /// Like `extractArgBytes` but allocates a copy for list_val of u8.
+    fn extractArgBytesAlloc(
+        alloc: Allocator,
+        ci: *ComponentInstance,
+        arg: InterfaceValue,
+    ) !?[]u8 {
+        switch (arg) {
+            .string => |pl| {
+                if (pl.len == 0) return try alloc.dupe(u8, "");
+                const src = ci.readGuestBytes(pl.ptr, pl.len) orelse return null;
+                return try alloc.dupe(u8, src);
+            },
+            .list_val => |elems| {
+                const buf = try alloc.alloc(u8, elems.len);
+                for (elems, 0..) |e, i| {
+                    buf[i] = switch (e) {
+                        .u8 => |b| b,
+                        else => {
+                            alloc.free(buf);
+                            return null;
+                        },
+                    };
+                }
+                return buf;
+            },
+            .list => |pl| {
+                if (pl.len == 0) return try alloc.dupe(u8, "");
+                const src = ci.readGuestBytes(pl.ptr, pl.len) orelse return null;
+                return try alloc.dupe(u8, src);
+            },
+            else => return null,
+        }
+    }
 
     // --- fields ---
 
@@ -3953,60 +4075,284 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]fields.entries(borrow<fields>)
-    ///   -> list<tuple<field-name, field-value>>`. Returns an empty
-    /// list on the default-deny path; allocator-owned 0-len slice so
-    /// the result deinit shape is correct.
+    ///   -> list<tuple<field-name, field-value>>`. Returns the stored
+    /// entries as InterfaceValue list of tuples, each tuple containing
+    /// a list_val of u8 for name and a list_val of u8 for value.
     fn httpFieldsEntries(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
-        const empty = try allocator.alloc(InterfaceValue, 0);
-        results[0] = .{ .list_val = empty };
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => {
+                const empty = try allocator.alloc(InterfaceValue, 0);
+                results[0] = .{ .list_val = empty };
+                return;
+            },
+        };
+
+        const f = self.lookupHttpFields(handle) orelse {
+            const empty = try allocator.alloc(InterfaceValue, 0);
+            results[0] = .{ .list_val = empty };
+            return;
+        };
+
+        const entries = try allocator.alloc(InterfaceValue, f.entries.items.len);
+        for (f.entries.items, 0..) |e, i| {
+            const name_ivs = try allocator.alloc(InterfaceValue, e.name.len);
+            for (e.name, 0..) |b, j| name_ivs[j] = .{ .u8 = b };
+            const val_ivs = try allocator.alloc(InterfaceValue, e.value.len);
+            for (e.value, 0..) |b, j| val_ivs[j] = .{ .u8 = b };
+            const tup = try allocator.alloc(InterfaceValue, 2);
+            tup[0] = .{ .list_val = name_ivs };
+            tup[1] = .{ .list_val = val_ivs };
+            entries[i] = .{ .tuple_val = tup };
+        }
+        results[0] = .{ .list_val = entries };
     }
 
     /// `[method]fields.get(borrow<fields>, field-name)
     ///   -> list<field-value>`.
     fn httpFieldsGet(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
-        _: []const InterfaceValue,
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        const empty = try allocator.alloc(InterfaceValue, 0);
-        results[0] = .{ .list_val = empty };
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const f = self.lookupHttpFields(handle) orelse {
+            const empty = try allocator.alloc(InterfaceValue, 0);
+            results[0] = .{ .list_val = empty };
+            return;
+        };
+
+        // Read name from arg
+        const name_bytes: ?[]const u8 = extractArgBytes(ci, args[1]);
+        const name_alloc = if (name_bytes == null) try extractArgBytesAlloc(self.allocator, ci, args[1]) else null;
+        defer if (name_alloc) |n| self.allocator.free(n);
+        const name = name_bytes orelse (name_alloc orelse {
+            const empty = try allocator.alloc(InterfaceValue, 0);
+            results[0] = .{ .list_val = empty };
+            return;
+        });
+
+        // Count matches
+        var count: usize = 0;
+        for (f.entries.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) count += 1;
+        }
+
+        const matches = try allocator.alloc(InterfaceValue, count);
+        var idx: usize = 0;
+        for (f.entries.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) {
+                const val_ivs = try allocator.alloc(InterfaceValue, e.value.len);
+                for (e.value, 0..) |b, j| val_ivs[j] = .{ .u8 = b };
+                matches[idx] = .{ .list_val = val_ivs };
+                idx += 1;
+            }
+        }
+        results[0] = .{ .list_val = matches };
     }
 
     /// `[method]fields.has(borrow<fields>, field-name) -> bool`.
     fn httpFieldsHas(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
-        _: []const InterfaceValue,
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const f = self.lookupHttpFields(handle) orelse {
+            results[0] = .{ .bool = false };
+            return;
+        };
+
+        const name_bytes: ?[]const u8 = extractArgBytes(ci, args[1]);
+        const name_alloc = if (name_bytes == null) try extractArgBytesAlloc(self.allocator, ci, args[1]) else null;
+        defer if (name_alloc) |n| self.allocator.free(n);
+        const name = name_bytes orelse (name_alloc orelse {
+            results[0] = .{ .bool = false };
+            return;
+        });
+
+        for (f.entries.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) {
+                results[0] = .{ .bool = true };
+                return;
+            }
+        }
         results[0] = .{ .bool = false };
     }
 
-    /// `[method]fields.set/append/delete -> result<_, header-error>`.
-    /// Default-deny accepts the operation as ok (no entries actually
-    /// stored — see `httpFieldsFromList` rationale).
-    fn httpFieldsSetlikeOk(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
-        _: []const InterfaceValue,
+    /// `[method]fields.append(borrow<fields>, field-name, field-value)
+    ///   -> result<_, header-error>`.
+    fn httpFieldsAppend(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        // result<_, header-error> ok arm has no payload.
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const f = self.lookupHttpFields(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+
+        const name_copy = try extractArgBytesAlloc(self.allocator, ci, args[1]) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        errdefer self.allocator.free(name_copy);
+        const val_copy = try extractArgBytesAlloc(self.allocator, ci, args[2]) orelse {
+            self.allocator.free(name_copy);
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        errdefer self.allocator.free(val_copy);
+
+        try f.entries.append(self.allocator, .{ .name = name_copy, .value = val_copy });
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]fields.set(borrow<fields>, field-name, list<field-value>)
+    ///   -> result<_, header-error>`.
+    fn httpFieldsSet(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const f = self.lookupHttpFields(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+
+        const name_bytes: ?[]const u8 = extractArgBytes(ci, args[1]);
+        const name_alloc = if (name_bytes == null) try extractArgBytesAlloc(self.allocator, ci, args[1]) else null;
+        defer if (name_alloc) |n| self.allocator.free(n);
+        const name = name_bytes orelse (name_alloc orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        });
+
+        // Remove existing entries with this name
+        httpFieldsRemoveByName(f, self.allocator, name);
+
+        // Add new entries from the list of values
+        const vals = switch (args[2]) {
+            .list_val => |l| l,
+            else => {
+                results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+                return;
+            },
+        };
+        for (vals) |v| {
+            const name_copy = try self.allocator.dupe(u8, name);
+            errdefer self.allocator.free(name_copy);
+
+            var val_copy: ?[]u8 = null;
+            switch (v) {
+                .list_val => |vbytes| {
+                    const buf = try self.allocator.alloc(u8, vbytes.len);
+                    for (vbytes, 0..) |b, j| {
+                        buf[j] = switch (b) {
+                            .u8 => |byte| byte,
+                            else => 0,
+                        };
+                    }
+                    val_copy = buf;
+                },
+                else => {
+                    val_copy = try extractArgBytesAlloc(self.allocator, ci, v);
+                },
+            }
+            const vc = val_copy orelse try self.allocator.dupe(u8, "");
+            try f.entries.append(self.allocator, .{ .name = name_copy, .value = vc });
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]fields.delete(borrow<fields>, field-name)
+    ///   -> result<_, header-error>`.
+    fn httpFieldsDelete(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const f = self.lookupHttpFields(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+
+        const name_bytes: ?[]const u8 = extractArgBytes(ci, args[1]);
+        const name_alloc = if (name_bytes == null) try extractArgBytesAlloc(self.allocator, ci, args[1]) else null;
+        defer if (name_alloc) |n| self.allocator.free(n);
+        const name = name_bytes orelse (name_alloc orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        });
+
+        httpFieldsRemoveByName(f, self.allocator, name);
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// Remove all entries with the given name from an HttpFields.
+    fn httpFieldsRemoveByName(f: *HttpFields, alloc: Allocator, name: []const u8) void {
+        var i: usize = 0;
+        while (i < f.entries.items.len) {
+            if (std.mem.eql(u8, f.entries.items[i].name, name)) {
+                alloc.free(f.entries.items[i].name);
+                alloc.free(f.entries.items[i].value);
+                _ = f.entries.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// `[method]fields.clone(borrow<fields>) -> own<fields>`.
@@ -4096,18 +4442,245 @@ pub const WasiCliAdapter = struct {
     /// `[method]outgoing-request.set-method(borrow, method)
     ///   -> result<_, _>`.
     fn httpOutgoingRequestSetMethod(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         _: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        const disc: u32 = switch (args[1]) {
+            .variant_val => |v| v.discriminant,
+            .enum_val => |d| d,
+            .u32 => |d| d,
+            else => 0,
+        };
+        r.method_disc = disc;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]outgoing-request.path-with-query(borrow)
+    ///   -> option<string>`.
+    fn httpOutgoingRequestGetPath(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        if (r.path_with_query) |p| {
+            const ivs = try allocator.alloc(InterfaceValue, p.len);
+            for (p, 0..) |b, i| ivs[i] = .{ .u8 = b };
+            const payload = try allocator.create(InterfaceValue);
+            payload.* = .{ .list_val = ivs };
+            results[0] = .{ .option_val = .{ .is_some = true, .payload = payload } };
+        } else {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+        }
+    }
+
+    /// `[method]outgoing-request.set-path-with-query(borrow,
+    ///   option<string>) -> result<_, _>`.
+    fn httpOutgoingRequestSetPath(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        // Free existing
+        if (r.path_with_query) |old| self.allocator.free(old);
+        r.path_with_query = null;
+
+        // Read option<string>
+        switch (args[1]) {
+            .option_val => |opt| {
+                if (opt.is_some) {
+                    if (opt.payload) |p| {
+                        r.path_with_query = try extractArgBytesAlloc(self.allocator, ci, p.*);
+                    }
+                }
+            },
+            else => {
+                // May be a direct string/list_val
+                r.path_with_query = try extractArgBytesAlloc(self.allocator, ci, args[1]);
+            },
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]outgoing-request.scheme(borrow) -> option<scheme>`.
+    fn httpOutgoingRequestGetScheme(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        if (r.scheme_disc) |d| {
+            const payload = try allocator.create(InterfaceValue);
+            payload.* = .{ .variant_val = .{ .discriminant = d, .payload = null } };
+            results[0] = .{ .option_val = .{ .is_some = true, .payload = payload } };
+        } else {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+        }
+    }
+
+    /// `[method]outgoing-request.set-scheme(borrow, option<scheme>)
+    ///   -> result<_, _>`.
+    fn httpOutgoingRequestSetScheme(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        switch (args[1]) {
+            .option_val => |opt| {
+                if (opt.is_some) {
+                    if (opt.payload) |p| {
+                        switch (p.*) {
+                            .variant_val => |v| {
+                                r.scheme_disc = v.discriminant;
+                            },
+                            .enum_val => |d| {
+                                r.scheme_disc = d;
+                            },
+                            .u32 => |d| {
+                                r.scheme_disc = d;
+                            },
+                            else => {},
+                        }
+                    }
+                } else {
+                    r.scheme_disc = null;
+                }
+            },
+            .variant_val => |v| {
+                r.scheme_disc = v.discriminant;
+            },
+            else => {},
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `[method]outgoing-request.authority(borrow) -> option<string>`.
+    fn httpOutgoingRequestGetAuthority(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        if (r.authority) |a| {
+            const ivs = try allocator.alloc(InterfaceValue, a.len);
+            for (a, 0..) |b, i| ivs[i] = .{ .u8 = b };
+            const payload = try allocator.create(InterfaceValue);
+            payload.* = .{ .list_val = ivs };
+            results[0] = .{ .option_val = .{ .is_some = true, .payload = payload } };
+        } else {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+        }
+    }
+
+    /// `[method]outgoing-request.set-authority(borrow,
+    ///   option<string>) -> result<_, _>`.
+    fn httpOutgoingRequestSetAuthority(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupOutgoingRequest(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        if (r.authority) |old| self.allocator.free(old);
+        r.authority = null;
+
+        switch (args[1]) {
+            .option_val => |opt| {
+                if (opt.is_some) {
+                    if (opt.payload) |p| {
+                        r.authority = try extractArgBytesAlloc(self.allocator, ci, p.*);
+                    }
+                }
+            },
+            else => {
+                r.authority = try extractArgBytesAlloc(self.allocator, ci, args[1]);
+            },
+        }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
     /// Generic `(borrow) -> option<string>` getter that always returns
-    /// `none` on the default-deny path.
+    /// `none` — used for incoming-request path/scheme/authority stubs.
     fn httpReturnOptionNone(
         _: ?*anyopaque,
         _: *ComponentInstance,
@@ -4117,18 +4690,6 @@ pub const WasiCliAdapter = struct {
     ) anyerror!void {
         if (results.len == 0) return error.InvalidArgs;
         results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
-    }
-
-    /// Generic `(borrow, ...) -> result<_, _>` setter that returns ok.
-    fn httpReturnResultOkUnit(
-        _: ?*anyopaque,
-        _: *ComponentInstance,
-        _: []const InterfaceValue,
-        results: []InterfaceValue,
-        _: Allocator,
-    ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
 
     /// `[method]outgoing-request.headers(borrow) -> own<fields>`.
@@ -4185,6 +4746,7 @@ pub const WasiCliAdapter = struct {
         const body = try self.allocator.create(OutgoingBody);
         body.* = .{};
         const bh = try self.pushOutgoingBody(body);
+        r.body_handle = bh;
         results[0] = try httpResultOk(allocator, .{ .handle = bh });
     }
 
@@ -4474,15 +5036,38 @@ pub const WasiCliAdapter = struct {
         results[0] = .{ .handle = self.http_incoming_responses.items[handle].?.headers_handle };
     }
 
+    /// `[method]incoming-response.consume(borrow)
+    ///   -> result<own<incoming-body>, _>`.
     fn httpIncomingResponseConsume(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
-        _: Allocator,
+        allocator: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const ir = self.lookupIncomingResponse(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        };
+        if (ir.body_consumed) {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        }
+        ir.body_consumed = true;
+
+        const body = try self.allocator.create(IncomingBody);
+        body.* = .{ .data = ir.body_data };
+        // Transfer ownership — IncomingResponse no longer owns the data.
+        ir.body_data = null;
+
+        const bh = try self.pushIncomingBody(body);
+        results[0] = try httpResultOk(allocator, .{ .handle = bh });
     }
 
     fn httpIncomingResponseDrop(
@@ -4500,6 +5085,7 @@ pub const WasiCliAdapter = struct {
         };
         if (handle >= self.http_incoming_responses.items.len) return;
         if (self.http_incoming_responses.items[handle]) |r| {
+            r.deinit(self.allocator);
             self.allocator.destroy(r);
             self.http_incoming_responses.items[handle] = null;
         }
@@ -4508,17 +5094,36 @@ pub const WasiCliAdapter = struct {
     // --- bodies ---
 
     /// `[method]incoming-body.stream(borrow)
-    ///   -> result<own<input-stream>, _>`. Default-deny errs because
-    /// no real wire-stream exists yet.
+    ///   -> result<own<input-stream>, _>`. Creates a buffer-backed
+    /// input stream from the body's data.
     fn httpIncomingBodyStream(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
-        _: Allocator,
+        allocator: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const body = self.lookupIncomingBody(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        };
+        if (body.stream_taken) {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        }
+        body.stream_taken = true;
+
+        const s = try self.allocator.create(streams.InputStream);
+        s.* = streams.InputStream.fromBuffer(body.data orelse "");
+        try self.owned_input_streams.append(self.allocator, s);
+        const sh = try self.allocInputStreamHandle(s);
+        results[0] = try httpResultOk(allocator, .{ .handle = sh });
     }
 
     /// `[static]incoming-body.finish(own<incoming-body>)
@@ -4553,22 +5158,44 @@ pub const WasiCliAdapter = struct {
         };
         if (handle >= self.http_incoming_bodies.items.len) return;
         if (self.http_incoming_bodies.items[handle]) |b| {
+            b.deinit(self.allocator);
             self.allocator.destroy(b);
             self.http_incoming_bodies.items[handle] = null;
         }
     }
 
     /// `[method]outgoing-body.write(borrow)
-    ///   -> result<own<output-stream>, _>`. Default-deny errs.
+    ///   -> result<own<output-stream>, _>`. Creates a buffer-backed
+    /// output stream and stores it on the body for later retrieval.
     fn httpOutgoingBodyWrite(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
-        _: Allocator,
+        allocator: Allocator,
     ) anyerror!void {
-        if (results.len == 0) return error.InvalidArgs;
-        results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const body = self.lookupOutgoingBody(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        };
+        if (body.stream_taken) {
+            results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            return;
+        }
+        body.stream_taken = true;
+
+        const s = try self.allocator.create(streams.OutputStream);
+        s.* = streams.OutputStream.toBuffer();
+        body.stream = s;
+        try self.owned_output_streams.append(self.allocator, s);
+        const sh = try self.allocStreamHandle(s);
+        results[0] = try httpResultOk(allocator, .{ .handle = sh });
     }
 
     /// `[static]outgoing-body.finish(own<outgoing-body>,
@@ -4843,28 +5470,173 @@ pub const WasiCliAdapter = struct {
     ///   option<own<request-options>>)
     ///   -> result<own<future-incoming-response>, error-code>`.
     ///
-    /// Default-deny: allocate a future-incoming-response in
-    /// `ready_err(HTTP_request_denied)` and return ok wrapping the
-    /// handle. The guest gets back a well-typed future that, when
-    /// polled, yields the denial error — so neither the synchronous
-    /// outer nor the eventual inner nesting traps.
-    ///
-    /// TODO(#149 follow-up): replace with a real `std.http.Client`
-    /// integration gated by an outbound-allow capability list.
-    /// Until then we never open a host socket, never speak TLS, and
-    /// never dispatch a request; the deny path keeps wasi:http
-    /// usable for components that gracefully handle denial.
+    /// When `sockets_allow_list_template` is non-empty, performs a real
+    /// outbound HTTP request via `std.http.Client` (#176). Otherwise
+    /// returns `HTTP_request_denied` as before.
     fn httpOutgoingHandlerHandle(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
-        _: []const InterfaceValue,
+        args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
+
+        // Extract request handle
+        const req_handle: u32 = if (args.len > 0) switch (args[0]) {
+            .handle => |h| h,
+            else => 0,
+        } else 0;
+
+        const req = self.lookupOutgoingRequest(req_handle);
+
+        // Deny when allow-list is empty
+        if (self.sockets_allow_list_template.len == 0) {
+            return httpHandlerDeny(self, results, allocator, .HTTP_request_denied);
+        }
+
+        const r = req orelse {
+            return httpHandlerDeny(self, results, allocator, .HTTP_request_denied);
+        };
+
+        // Build scheme string
+        const scheme: []const u8 = if (r.scheme_disc) |d| switch (d) {
+            0 => "http",
+            1 => "https",
+            else => if (r.scheme_other) |s| s else "https",
+        } else "https";
+
+        const authority = r.authority orelse {
+            return httpHandlerDeny(self, results, allocator, .HTTP_request_URI_invalid);
+        };
+        const path = r.path_with_query orelse "/";
+
+        // Build URL
+        const url = std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, path }) catch {
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+        defer self.allocator.free(url);
+
+        // Map WIT method discriminant to std.http.Method
+        const method: std.http.Method = switch (r.method_disc) {
+            0 => .GET,
+            1 => .HEAD,
+            2 => .POST,
+            3 => .PUT,
+            4 => .DELETE,
+            5 => .CONNECT,
+            6 => .OPTIONS,
+            7 => .TRACE,
+            8 => .PATCH,
+            else => .GET,
+        };
+
+        // Collect request headers
+        const headers_fields = self.lookupHttpFields(r.headers_handle);
+        var extra_hdrs: std.ArrayListUnmanaged(std.http.Header) = .empty;
+        defer extra_hdrs.deinit(self.allocator);
+        if (headers_fields) |hf| {
+            for (hf.entries.items) |e| {
+                extra_hdrs.append(self.allocator, .{
+                    .name = e.name,
+                    .value = e.value,
+                }) catch break;
+            }
+        }
+
+        // Get body payload bytes (if any)
+        var payload: ?[]const u8 = null;
+        if (r.body_handle) |bh| {
+            if (self.lookupOutgoingBody(bh)) |body| {
+                if (body.stream) |s| {
+                    const contents = s.getBufferContents();
+                    if (contents.len > 0) payload = contents;
+                }
+            }
+        }
+
+        // Perform the HTTP request
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var client: std.http.Client = .{
+            .allocator = self.allocator,
+            .io = io,
+        };
+        defer client.connection_pool.deinit(io);
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+
+        const fetch_result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = method,
+            .payload = payload,
+            .extra_headers = extra_hdrs.items,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        }) catch {
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+
+        // Extract response body
+        var resp_al = aw.toArrayList();
+        const resp_body = resp_al.toOwnedSlice(self.allocator) catch {
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+        errdefer self.allocator.free(resp_body);
+
+        // Create response headers (empty — std.http.Client.fetch
+        // does not expose response headers in FetchResult)
+        const resp_fields = self.allocator.create(HttpFields) catch {
+            self.allocator.free(resp_body);
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+        resp_fields.* = .{};
+        const resp_fields_handle = self.pushHttpFields(resp_fields) catch {
+            self.allocator.free(resp_body);
+            resp_fields.deinit(self.allocator);
+            self.allocator.destroy(resp_fields);
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+
+        // Create IncomingResponse
+        const ir = self.allocator.create(IncomingResponse) catch {
+            self.allocator.free(resp_body);
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+        ir.* = .{
+            .status = @intFromEnum(fetch_result.status),
+            .headers_handle = resp_fields_handle,
+            .body_data = resp_body,
+        };
+        const ir_handle = self.pushIncomingResponse(ir) catch {
+            self.allocator.free(resp_body);
+            ir.body_data = null;
+            self.allocator.destroy(ir);
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+
+        // Create FutureIncomingResponse in ready_ok state
+        const fut = self.allocator.create(FutureIncomingResponse) catch {
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+        fut.* = .{ .state = .{ .ready_ok = ir_handle } };
+        const fh = self.pushFutureResponse(fut) catch {
+            self.allocator.destroy(fut);
+            return httpHandlerDeny(self, results, allocator, .internal_error);
+        };
+        results[0] = try httpResultOk(allocator, .{ .handle = fh });
+    }
+
+    /// Helper: return a denied-style future from the outgoing handler.
+    fn httpHandlerDeny(
+        self: *WasiCliAdapter,
+        results: []InterfaceValue,
+        allocator: Allocator,
+        code: HttpErrorCode,
+    ) anyerror!void {
         const fut = try self.allocator.create(FutureIncomingResponse);
-        fut.* = .{ .state = .{ .ready_err = @intFromEnum(HttpErrorCode.HTTP_request_denied) } };
+        fut.* = .{ .state = .{ .ready_err = @intFromEnum(code) } };
         const h = try self.pushFutureResponse(fut);
         results[0] = try httpResultOk(allocator, .{ .handle = h });
     }
@@ -4896,21 +5668,21 @@ pub const WasiCliAdapter = struct {
             .{ .name = "[method]fields.entries", .call = &httpFieldsEntries },
             .{ .name = "[method]fields.get", .call = &httpFieldsGet },
             .{ .name = "[method]fields.has", .call = &httpFieldsHas },
-            .{ .name = "[method]fields.set", .call = &httpFieldsSetlikeOk },
-            .{ .name = "[method]fields.append", .call = &httpFieldsSetlikeOk },
-            .{ .name = "[method]fields.delete", .call = &httpFieldsSetlikeOk },
+            .{ .name = "[method]fields.set", .call = &httpFieldsSet },
+            .{ .name = "[method]fields.append", .call = &httpFieldsAppend },
+            .{ .name = "[method]fields.delete", .call = &httpFieldsDelete },
             .{ .name = "[method]fields.clone", .call = &httpFieldsClone },
             .{ .name = "[resource-drop]fields", .call = &httpFieldsDrop },
             // outgoing-request
             .{ .name = "[constructor]outgoing-request", .call = &httpOutgoingRequestConstructor },
             .{ .name = "[method]outgoing-request.method", .call = &httpOutgoingRequestMethod },
             .{ .name = "[method]outgoing-request.set-method", .call = &httpOutgoingRequestSetMethod },
-            .{ .name = "[method]outgoing-request.path-with-query", .call = &httpReturnOptionNone },
-            .{ .name = "[method]outgoing-request.set-path-with-query", .call = &httpReturnResultOkUnit },
-            .{ .name = "[method]outgoing-request.scheme", .call = &httpReturnOptionNone },
-            .{ .name = "[method]outgoing-request.set-scheme", .call = &httpReturnResultOkUnit },
-            .{ .name = "[method]outgoing-request.authority", .call = &httpReturnOptionNone },
-            .{ .name = "[method]outgoing-request.set-authority", .call = &httpReturnResultOkUnit },
+            .{ .name = "[method]outgoing-request.path-with-query", .call = &httpOutgoingRequestGetPath },
+            .{ .name = "[method]outgoing-request.set-path-with-query", .call = &httpOutgoingRequestSetPath },
+            .{ .name = "[method]outgoing-request.scheme", .call = &httpOutgoingRequestGetScheme },
+            .{ .name = "[method]outgoing-request.set-scheme", .call = &httpOutgoingRequestSetScheme },
+            .{ .name = "[method]outgoing-request.authority", .call = &httpOutgoingRequestGetAuthority },
+            .{ .name = "[method]outgoing-request.set-authority", .call = &httpOutgoingRequestSetAuthority },
             .{ .name = "[method]outgoing-request.headers", .call = &httpOutgoingRequestHeaders },
             .{ .name = "[method]outgoing-request.body", .call = &httpOutgoingRequestBody },
             .{ .name = "[resource-drop]outgoing-request", .call = &httpOutgoingRequestDrop },
@@ -7979,4 +8751,336 @@ test "sockets #178: tcp resource-drop after listen frees server" {
     var drop_results: [0]InterfaceValue = .{};
     try WasiCliAdapter.socketResourceDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
     try testing.expect(adapter.socket_table.items[0] == null);
+}
+
+// ── #176: real outbound HTTP client ─────────────────────────────────────────
+
+/// Helper: build a `list_val` of u8 InterfaceValues from a byte slice.
+/// Allocator-owned; caller frees via `deinit`.
+fn testMakeListVal(alloc: Allocator, bytes: []const u8) !InterfaceValue {
+    const ivs = try alloc.alloc(InterfaceValue, bytes.len);
+    for (bytes, 0..) |b, i| ivs[i] = .{ .u8 = b };
+    return .{ .list_val = ivs };
+}
+
+test "http #176: fields.append stores and entries returns entries" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Create fields
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const fh = ctor_results[0].handle;
+
+    // Append "content-type: text/plain"
+    const name1 = try testMakeListVal(testing.allocator, "content-type");
+    defer name1.deinit(testing.allocator);
+    const val1 = try testMakeListVal(testing.allocator, "text/plain");
+    defer val1.deinit(testing.allocator);
+    const app_args1 = [_]InterfaceValue{ .{ .handle = fh }, name1, val1 };
+    var app_results1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsAppend(&adapter, &ci, &app_args1, &app_results1, testing.allocator);
+    try testing.expect(app_results1[0].result_val.is_ok);
+
+    // Append "x-custom: hello"
+    const name2 = try testMakeListVal(testing.allocator, "x-custom");
+    defer name2.deinit(testing.allocator);
+    const val2 = try testMakeListVal(testing.allocator, "hello");
+    defer val2.deinit(testing.allocator);
+    const app_args2 = [_]InterfaceValue{ .{ .handle = fh }, name2, val2 };
+    var app_results2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsAppend(&adapter, &ci, &app_args2, &app_results2, testing.allocator);
+    try testing.expect(app_results2[0].result_val.is_ok);
+
+    // Call entries
+    const ent_args = [_]InterfaceValue{.{ .handle = fh }};
+    var ent_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsEntries(&adapter, &ci, &ent_args, &ent_results, testing.allocator);
+    defer ent_results[0].deinit(testing.allocator);
+
+    try testing.expect(ent_results[0] == .list_val);
+    try testing.expectEqual(@as(usize, 2), ent_results[0].list_val.len);
+}
+
+test "http #176: fields.get returns matching values" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const fh = ctor_results[0].handle;
+
+    // Append two entries with same name
+    const name = try testMakeListVal(testing.allocator, "accept");
+    defer name.deinit(testing.allocator);
+    const val_a = try testMakeListVal(testing.allocator, "text/html");
+    defer val_a.deinit(testing.allocator);
+    const val_b = try testMakeListVal(testing.allocator, "application/json");
+    defer val_b.deinit(testing.allocator);
+
+    const args_a = [_]InterfaceValue{ .{ .handle = fh }, name, val_a };
+    var r1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsAppend(&adapter, &ci, &args_a, &r1, testing.allocator);
+
+    const args_b = [_]InterfaceValue{ .{ .handle = fh }, name, val_b };
+    var r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsAppend(&adapter, &ci, &args_b, &r2, testing.allocator);
+
+    // Get by name
+    const get_args = [_]InterfaceValue{ .{ .handle = fh }, name };
+    var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
+    defer get_results[0].deinit(testing.allocator);
+
+    try testing.expect(get_results[0] == .list_val);
+    try testing.expectEqual(@as(usize, 2), get_results[0].list_val.len);
+}
+
+test "http #176: fields.has returns true for existing name" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const fh = ctor_results[0].handle;
+
+    // has() before append → false
+    const name = try testMakeListVal(testing.allocator, "x-test");
+    defer name.deinit(testing.allocator);
+    const has_args = [_]InterfaceValue{ .{ .handle = fh }, name };
+    var has_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsHas(&adapter, &ci, &has_args, &has_r, testing.allocator);
+    try testing.expect(!has_r[0].bool);
+
+    // Append
+    const val = try testMakeListVal(testing.allocator, "yes");
+    defer val.deinit(testing.allocator);
+    const app_args = [_]InterfaceValue{ .{ .handle = fh }, name, val };
+    var app_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsAppend(&adapter, &ci, &app_args, &app_r, testing.allocator);
+
+    // has() after append → true
+    try WasiCliAdapter.httpFieldsHas(&adapter, &ci, &has_args, &has_r, testing.allocator);
+    try testing.expect(has_r[0].bool);
+}
+
+test "http #176: fields.delete removes entries" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const fh = ctor_results[0].handle;
+
+    const name = try testMakeListVal(testing.allocator, "x-del");
+    defer name.deinit(testing.allocator);
+    const val = try testMakeListVal(testing.allocator, "gone");
+    defer val.deinit(testing.allocator);
+    const app_args = [_]InterfaceValue{ .{ .handle = fh }, name, val };
+    var app_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsAppend(&adapter, &ci, &app_args, &app_r, testing.allocator);
+
+    // Delete
+    const del_args = [_]InterfaceValue{ .{ .handle = fh }, name };
+    var del_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsDelete(&adapter, &ci, &del_args, &del_r, testing.allocator);
+    try testing.expect(del_r[0].result_val.is_ok);
+
+    // Entries should be empty
+    const ent_args = [_]InterfaceValue{.{ .handle = fh }};
+    var ent_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsEntries(&adapter, &ci, &ent_args, &ent_r, testing.allocator);
+    defer ent_r[0].deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ent_r[0].list_val.len);
+}
+
+test "http #176: outgoing-request set-method persists" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Create fields + request
+    var f_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &f_r, testing.allocator);
+    const req_args = [_]InterfaceValue{.{ .handle = f_r[0].handle }};
+    var req_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestConstructor(&adapter, &ci, &req_args, &req_r, testing.allocator);
+    const rh = req_r[0].handle;
+
+    // Default method = GET (0)
+    const m_args = [_]InterfaceValue{.{ .handle = rh }};
+    var m_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestMethod(&adapter, &ci, &m_args, &m_r, testing.allocator);
+    try testing.expectEqual(@as(u32, 0), m_r[0].variant_val.discriminant);
+
+    // Set to POST (2)
+    const sm_args = [_]InterfaceValue{ .{ .handle = rh }, .{ .variant_val = .{ .discriminant = 2, .payload = null } } };
+    var sm_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestSetMethod(&adapter, &ci, &sm_args, &sm_r, testing.allocator);
+    try testing.expect(sm_r[0].result_val.is_ok);
+
+    // Verify
+    try WasiCliAdapter.httpOutgoingRequestMethod(&adapter, &ci, &m_args, &m_r, testing.allocator);
+    try testing.expectEqual(@as(u32, 2), m_r[0].variant_val.discriminant);
+}
+
+test "http #176: outgoing-request set-path persists" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var f_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &f_r, testing.allocator);
+    const req_args = [_]InterfaceValue{.{ .handle = f_r[0].handle }};
+    var req_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestConstructor(&adapter, &ci, &req_args, &req_r, testing.allocator);
+    const rh = req_r[0].handle;
+
+    // Default path = none
+    const gp_args = [_]InterfaceValue{.{ .handle = rh }};
+    var gp_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestGetPath(&adapter, &ci, &gp_args, &gp_r, testing.allocator);
+    try testing.expect(!gp_r[0].option_val.is_some);
+
+    // Set path
+    const path_val = try testMakeListVal(testing.allocator, "/api/data");
+    defer path_val.deinit(testing.allocator);
+    const path_payload = try testing.allocator.create(InterfaceValue);
+    defer testing.allocator.destroy(path_payload);
+    path_payload.* = path_val;
+    const sp_args = [_]InterfaceValue{ .{ .handle = rh }, .{ .option_val = .{ .is_some = true, .payload = path_payload } } };
+    var sp_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestSetPath(&adapter, &ci, &sp_args, &sp_r, testing.allocator);
+    try testing.expect(sp_r[0].result_val.is_ok);
+
+    // Verify path getter
+    try WasiCliAdapter.httpOutgoingRequestGetPath(&adapter, &ci, &gp_args, &gp_r, testing.allocator);
+    defer gp_r[0].deinit(testing.allocator);
+    try testing.expect(gp_r[0].option_val.is_some);
+}
+
+test "http #176: outgoing-body write creates stream" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Create fields + request
+    var f_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &f_r, testing.allocator);
+    const req_args = [_]InterfaceValue{.{ .handle = f_r[0].handle }};
+    var req_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestConstructor(&adapter, &ci, &req_args, &req_r, testing.allocator);
+
+    // Get body
+    const body_args = [_]InterfaceValue{.{ .handle = req_r[0].handle }};
+    var body_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingRequestBody(&adapter, &ci, &body_args, &body_r, testing.allocator);
+    defer body_r[0].deinit(testing.allocator);
+    try testing.expect(body_r[0].result_val.is_ok);
+    const bh = body_r[0].result_val.payload.?.handle;
+
+    // Write to body → get an output-stream handle
+    const write_args = [_]InterfaceValue{.{ .handle = bh }};
+    var write_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingBodyWrite(&adapter, &ci, &write_args, &write_r, testing.allocator);
+    defer write_r[0].deinit(testing.allocator);
+    try testing.expect(write_r[0].result_val.is_ok);
+    const sh = write_r[0].result_val.payload.?.handle;
+
+    // Write some bytes to the stream
+    const s = adapter.lookupStream(sh).?;
+    const wr = s.write("hello world", testing.allocator);
+    try testing.expectEqual(@as(usize, 11), wr.ok);
+
+    // Verify body has the data
+    const body = adapter.lookupOutgoingBody(bh).?;
+    try testing.expectEqualStrings("hello world", body.stream.?.getBufferContents());
+
+    // Second write call should fail
+    var write_r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingBodyWrite(&adapter, &ci, &write_args, &write_r2, testing.allocator);
+    try testing.expect(!write_r2[0].result_val.is_ok);
+}
+
+test "http #176: handle returns denied when allow-list empty" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    try testing.expect(fut.state == .ready_err);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        fut.state.ready_err,
+    );
+}
+
+test "http #176: incoming-response.consume transfers body data" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Manually create an IncomingResponse with body data
+    const body_bytes = try testing.allocator.dupe(u8, "response body");
+    const resp_fields = try testing.allocator.create(HttpFields);
+    resp_fields.* = .{};
+    const fh = try adapter.pushHttpFields(resp_fields);
+
+    const ir = try testing.allocator.create(IncomingResponse);
+    ir.* = .{ .status = 200, .headers_handle = fh, .body_data = body_bytes };
+    const ir_handle = try adapter.pushIncomingResponse(ir);
+
+    // Call consume
+    const cons_args = [_]InterfaceValue{.{ .handle = ir_handle }};
+    var cons_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpIncomingResponseConsume(&adapter, &ci, &cons_args, &cons_r, testing.allocator);
+    defer cons_r[0].deinit(testing.allocator);
+    try testing.expect(cons_r[0].result_val.is_ok);
+    const body_handle = cons_r[0].result_val.payload.?.handle;
+
+    // Get body stream
+    const stream_args = [_]InterfaceValue{.{ .handle = body_handle }};
+    var stream_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpIncomingBodyStream(&adapter, &ci, &stream_args, &stream_r, testing.allocator);
+    defer stream_r[0].deinit(testing.allocator);
+    try testing.expect(stream_r[0].result_val.is_ok);
+    const sh = stream_r[0].result_val.payload.?.handle;
+
+    // Read from the stream
+    const is = adapter.lookupInputStream(sh).?;
+    var buf: [64]u8 = undefined;
+    const read_result = is.read(&buf);
+    switch (read_result) {
+        .ok => |n| try testing.expectEqualStrings("response body", buf[0..n]),
+        else => return error.UnexpectedResult,
+    }
+
+    // Second consume should fail
+    var cons_r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpIncomingResponseConsume(&adapter, &ci, &cons_args, &cons_r2, testing.allocator);
+    try testing.expect(!cons_r2[0].result_val.is_ok);
 }
