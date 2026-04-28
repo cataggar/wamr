@@ -2441,6 +2441,21 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
     if (func.blocks.items.len == 0) return false;
     if (func.local_count == 0) return false;
 
+    // Strip dead code after the first terminator in each block.
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items, 0..) |inst, idx| {
+            switch (inst.op) {
+                .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
+                    if (idx + 1 < block.instructions.items.len) {
+                        block.instructions.shrinkRetainingCapacity(idx + 1);
+                    }
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+
     var dom = try analysis.computeDominators(func, allocator);
     defer dom.deinit();
     if (dom.idom[0] == null) return false;
