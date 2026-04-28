@@ -248,10 +248,11 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(ti.len, {}) catch {};
         },
         .elem_drop => {},
+        .phi => |edges| {
+            for (edges) |edge| live.put(edge.val, {}) catch {};
+        },
     }
 }
-
-// ── Live range computation ──────────────────────────────────────────────
 
 /// A live range interval for a VReg.
 pub const LiveRange = struct {
@@ -457,6 +458,9 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(ti.len, pos) catch {};
         },
         .elem_drop => {},
+        .phi => |edges| {
+            for (edges) |edge| last_use.put(edge.val, pos) catch {};
+        },
     }
 }
 

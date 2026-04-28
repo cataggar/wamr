@@ -192,6 +192,10 @@ pub const Inst = struct {
         table_init: struct { seg_idx: u32, table_idx: u32, dst: VReg, src: VReg, len: VReg },
         elem_drop: u32, // element segment index
         ref_func: u32, // funcidx -> native pointer loaded from vmctx.func_table[idx]
+
+        // SSA phi: merges values from predecessor edges at join points.
+        // Inserted by mem2reg and lowered before codegen.
+        phi: []const PhiEdge,
     };
 
     pub const BinOp = struct {
@@ -200,6 +204,11 @@ pub const Inst = struct {
     };
 
     pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };
+
+    pub const PhiEdge = struct {
+        block: BlockId,
+        val: VReg,
+    };
 };
 
 /// A basic block — a sequence of instructions with a single entry point.
@@ -237,6 +246,9 @@ pub const IrFunction = struct {
     param_count: u32,
     result_count: u32,
     local_count: u32,
+    /// Per-local IR type (params first, then declared locals, then synthetic).
+    /// Populated by the frontend; used by mem2reg for typed-zero seeding.
+    local_types: ?[]const IrType = null,
     blocks: std.ArrayList(BasicBlock) = .empty,
     next_vreg: VReg = 0,
     allocator: std.mem.Allocator,
@@ -253,6 +265,7 @@ pub const IrFunction = struct {
     pub fn deinit(self: *IrFunction) void {
         for (self.blocks.items) |*block| block.deinit();
         self.blocks.deinit(self.allocator);
+        if (self.local_types) |lt| self.allocator.free(lt);
     }
 
     /// Allocate a new virtual register.

@@ -73,6 +73,13 @@ pub fn buildUseDef(func: *const ir.IrFunction, allocator: std.mem.Allocator) !st
                         entry.value_ptr.use_count += 1;
                     }
                 },
+                .phi => |edges| {
+                    for (edges) |edge| {
+                        const entry = try info.getOrPut(edge.val);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
                 else => {},
             }
         }
@@ -191,6 +198,8 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(ti.len);
         },
         .elem_drop => {},
+        // Phi operands handled separately (unbounded, like call args).
+        .phi => {},
     }
     return list;
 }
@@ -363,6 +372,11 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (ti.len == old) ti.len = new;
         },
         .elem_drop => {},
+        .phi => |edges| {
+            for (@constCast(edges)) |*edge| {
+                if (edge.val == old) edge.val = new;
+            }
+        },
     }
 }
 
@@ -2156,6 +2170,9 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             ti.dst += offset;
             ti.src += offset;
             ti.len += offset;
+        },
+        .phi => |edges| {
+            for (@constCast(edges)) |*edge| edge.val += offset;
         },
     }
 }

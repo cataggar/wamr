@@ -1249,6 +1249,8 @@ fn compileInst(
         .data_drop => {},
         .table_init => |ti| try emitTableInit(code, ti, reg_map, fctx),
         .elem_drop => |seg_idx| try emitElemDrop(code, seg_idx, reg_map, fctx),
+        // Phi must be lowered before codegen.
+        .phi => unreachable,
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
