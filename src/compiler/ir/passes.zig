@@ -2847,11 +2847,8 @@ pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
 /// Find the index of the terminator instruction in a block.
 /// Terminators are br, br_if, br_table, ret, ret_multi, unreachable.
 fn findTerminatorIndex(block: *const ir.BasicBlock) usize {
-    if (block.instructions.items.len == 0) return 0;
-    var idx = block.instructions.items.len;
-    while (idx > 0) {
-        idx -= 1;
-        switch (block.instructions.items[idx].op) {
+    for (block.instructions.items, 0..) |inst, idx| {
+        switch (inst.op) {
             .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => return idx,
             else => {},
         }
