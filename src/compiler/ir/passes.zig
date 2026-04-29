@@ -1393,7 +1393,190 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
 
 pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
 
-/// Run a sequence of optimization passes on an IR module.
+// ── Loop-invariant bounds-check hoisting ────────────────────────────────────
+
+/// Hoist loop-invariant bounds checks to the loop preheader.
+///
+/// For each natural loop, scans the **header block** for `load`/`store`
+/// instructions whose base VReg is loop-invariant (defined outside the
+/// loop). For each such base, inserts a single guard load in the
+/// preheader with `checked_end = max(offset + size)` across all
+/// header accesses with that base. The guard's bounds check runs once
+/// before the loop; all covered loop accesses are marked
+/// `bounds_known = true` so codegen skips their inline checks.
+///
+/// Soundness:
+///   - Only header accesses are considered. The header executes on
+///     every iteration, so a preheader trap is equivalent to a
+///     first-iteration trap.
+///   - Accesses after a fence (call, memory_grow, etc.) in the header
+///     are skipped: the fence could grow memory, making the preheader
+///     check invalid.
+///   - The preheader must be a dedicated single-successor block
+///     (`br header`), ensuring the guard runs only on paths entering
+///     the loop.
+///   - Wasm memory grows monotonically, so a passing preheader check
+///     remains valid for all subsequent iterations (even if memory
+///     grows inside the loop body).
+///   - Only loop-body accesses with `offset + size ≤ max_end` are
+///     marked `bounds_known`; the guard's widened check covers them.
+pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    var lf = try analysis.computeLoops(func, &dom, allocator);
+    defer lf.deinit();
+    if (lf.loops.len == 0) return false;
+
+    var predecessors = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var pit = predecessors.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    // Build def-block map: for each VReg, which block defines it?
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    for (func.blocks.items, 0..) |block, idx| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| try def_block.put(d, @intCast(idx));
+        }
+    }
+
+    // Per-base max-end accumulator, reused across loops.
+    var base_max = std.AutoHashMap(ir.VReg, u64).init(allocator);
+    defer base_max.deinit();
+
+    var changed = false;
+    for (lf.loops) |*loop| {
+        // ── Find dedicated preheader ──
+        // The unique non-loop predecessor of the header whose sole
+        // successor is the header (unconditional `br header`).
+        const header_preds = predecessors.get(loop.header) orelse continue;
+        var preheader: ?ir.BlockId = null;
+        for (header_preds) |p| {
+            if (!loop.containsBlock(p)) {
+                if (preheader != null) {
+                    preheader = null;
+                    break; // multiple outside predecessors → no unique preheader
+                }
+                preheader = p;
+            }
+        }
+        const ph = preheader orelse continue;
+
+        // Verify it's a dedicated preheader: sole successor = header.
+        const ph_block = &func.blocks.items[ph];
+        const ph_insts = ph_block.instructions.items;
+        if (ph_insts.len == 0) continue;
+        const ph_term = ph_insts[ph_insts.len - 1];
+        switch (ph_term.op) {
+            .br => |target| {
+                if (target != loop.header) continue;
+            },
+            else => continue, // br_if, br_table, ret, etc. → not dedicated
+        }
+
+        // Verify preheader dominates header (sanity).
+        if (!dom.dominates(ph, loop.header)) continue;
+
+        // ── Scan header for loop-invariant bases ──
+        // Stop at the first fence op (call, memory_grow, etc.) to avoid
+        // hoisting checks that could be invalidated by memory growth
+        // happening before the access on a later iteration.
+        base_max.clearRetainingCapacity();
+        const header_block = &func.blocks.items[loop.header];
+        for (header_block.instructions.items) |inst| {
+            // Fence: stop scanning.
+            switch (inst.op) {
+                .memory_grow,
+                .call, .call_indirect, .call_ref,
+                .memory_copy, .memory_fill, .memory_init,
+                .table_grow, .table_init,
+                .atomic_notify, .atomic_wait,
+                => break,
+                else => {},
+            }
+            switch (inst.op) {
+                .load => |ld| {
+                    if (ld.bounds_known) continue;
+                    const db = def_block.get(ld.base) orelse continue;
+                    if (loop.containsBlock(db)) continue; // not loop-invariant
+                    const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+                    const gop = try base_max.getOrPut(ld.base);
+                    if (!gop.found_existing) gop.value_ptr.* = end
+                    else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
+                },
+                .store => |st| {
+                    if (st.bounds_known) continue;
+                    const db = def_block.get(st.base) orelse continue;
+                    if (loop.containsBlock(db)) continue;
+                    const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
+                    const gop = try base_max.getOrPut(st.base);
+                    if (!gop.found_existing) gop.value_ptr.* = end
+                    else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
+                },
+                else => {},
+            }
+        }
+
+        if (base_max.count() == 0) continue;
+
+        // ── Insert guard loads in preheader + mark loop accesses ──
+        var bit = base_max.iterator();
+        while (bit.next()) |kv| {
+            const base = kv.key_ptr.*;
+            const max_end = kv.value_ptr.*;
+
+            // Insert guard load before the preheader's terminator.
+            const guard_dest = func.newVReg();
+            const guard_pos = ph_block.instructions.items.len - 1;
+            try ph_block.instructions.insert(ph_block.allocator, guard_pos, .{
+                .op = .{ .load = .{
+                    .base = base,
+                    .offset = 0,
+                    .size = 1,
+                    .checked_end = max_end,
+                } },
+                .dest = guard_dest,
+                .type = .i32,
+            });
+
+            // Mark all loop-body accesses with this base as bounds_known
+            // if their offset+size ≤ max_end.
+            for (loop.blocks) |bid| {
+                for (func.blocks.items[bid].instructions.items) |*inst| {
+                    switch (inst.op) {
+                        .load => |*ld| {
+                            if (ld.bounds_known) continue;
+                            if (ld.base != base) continue;
+                            const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+                            if (end <= max_end) {
+                                ld.bounds_known = true;
+                                changed = true;
+                            }
+                        },
+                        .store => |*st| {
+                            if (st.bounds_known) continue;
+                            if (st.base != base) continue;
+                            const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
+                            if (end <= max_end) {
+                                st.bounds_known = true;
+                                changed = true;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 /// Redundant bounds-check elimination, dominator-scoped.
 ///
 /// For every `.load` and `.store`, codegen emits an inline wasm-memory
@@ -3120,6 +3303,7 @@ pub const default_passes: []const PassFn = &.{
     &globalValueNumbering,
     &deadCodeElimination,
     &deadLocalSetElimination,
+    &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,
 };
 
@@ -4016,6 +4200,196 @@ test "strengthReduceMul: i32 does not rewrite shift >= 32" {
     const changed = try strengthReduceMul(&func, allocator);
     try std.testing.expect(changed);
     try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 31 }, block.instructions.items[1].op);
+}
+
+test "hoistLoopBoundsChecks: header load hoisted to preheader" {
+    // b0 (preheader) → b1 (header) → b2 (body) → b1, exit=b3.
+    // Header has a load with loop-invariant base. The pass should insert
+    // a guard load in b0 and mark the header's load as bounds_known.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_hdr = func.newVReg();
+    const v_body = func.newVReg();
+
+    // b0 (preheader): define base, unconditional br to header.
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // b1 (header): load base+0 size=4.
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_hdr, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b2, .else_block = b3 } } });
+
+    // b2 (body): load base+4 size=4, back-edge to header.
+    try func.getBlock(b2).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_body, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+
+    // b3 (exit).
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_hdr } });
+
+    const changed = try hoistLoopBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Preheader should now have 3 instructions: iconst, guard load, br.
+    try std.testing.expectEqual(@as(usize, 3), func.getBlock(b0).instructions.items.len);
+    // Guard load should have checked_end = 4 (from header's offset=0, size=4).
+    const guard = func.getBlock(b0).instructions.items[1];
+    try std.testing.expectEqual(@as(u64, 4), guard.op.load.checked_end);
+    try std.testing.expectEqual(v_base, guard.op.load.base);
+    // Header load should be marked bounds_known.
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+    // Body load should also be marked bounds_known (offset+size=8 > 4?).
+    // body offset=4, size=4 → end=8 > max_end=4 from header-only scan.
+    // So body load should NOT be marked bounds_known by hoistLoopBoundsChecks
+    // (the guard only covers header accesses' max_end).
+    // Wait — the pass marks ALL loop accesses with end ≤ max_end. end=8 > 4, so not covered.
+    try std.testing.expect(!func.getBlock(b2).instructions.items[0].op.load.bounds_known);
+}
+
+test "hoistLoopBoundsChecks: widens to cover multiple header accesses" {
+    // Header has two loads: base+0/4 and base+4/4. Guard should have
+    // checked_end = 8, covering both. Body load at base+2/2 (end=4 ≤ 8)
+    // should also be marked bounds_known.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_a, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 4, .size = 4 } }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b2, .else_block = b3 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 2, .size = 2 } }, .dest = v_c, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_a } });
+
+    const changed = try hoistLoopBoundsChecks(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Guard's checked_end should be max(0+4, 4+4) = 8.
+    const guard = func.getBlock(b0).instructions.items[1];
+    try std.testing.expectEqual(@as(u64, 8), guard.op.load.checked_end);
+    // Both header loads should be bounds_known.
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op.load.bounds_known);
+    try std.testing.expect(func.getBlock(b1).instructions.items[1].op.load.bounds_known);
+    // Body load end=4 ≤ 8, should be bounds_known.
+    try std.testing.expect(func.getBlock(b2).instructions.items[0].op.load.bounds_known);
+}
+
+test "hoistLoopBoundsChecks: non-invariant base skipped" {
+    // Header load's base is defined inside the loop → not loop-invariant.
+    // The pass should not hoist.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_ld = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // Base defined in header (inside loop).
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_ld, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_ld } });
+
+    const changed = try hoistLoopBoundsChecks(&func, allocator);
+    try std.testing.expect(!changed);
+    // Preheader unchanged (just the br).
+    try std.testing.expectEqual(@as(usize, 1), func.getBlock(b0).instructions.items.len);
+}
+
+test "hoistLoopBoundsChecks: call before load stops scan" {
+    // Header has a call before the load → fence stops scan.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_ld = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // Header: call first, then load.
+    try func.getBlock(b1).append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_ld, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_ld } });
+
+    const changed = try hoistLoopBoundsChecks(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+test "hoistLoopBoundsChecks: non-dedicated preheader skipped" {
+    // Preheader has br_if (two successors) → not dedicated → skip.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const cond2 = func.newVReg();
+    const v_ld = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    // br_if → header or skip: not a dedicated preheader.
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b3 } } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_ld, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond2 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond2, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_ld } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    const changed = try hoistLoopBoundsChecks(&func, allocator);
+    try std.testing.expect(!changed);
 }
 
 test "elideRedundantBoundsChecks: back-to-back loads on same base" {
