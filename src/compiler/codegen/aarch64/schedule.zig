@@ -227,6 +227,16 @@ pub fn metadata(inst: ir.Inst) Metadata {
     const def = inst.dest;
     const class: Class = switch (inst.op) {
         .iconst_32, .iconst_64 => if (def != null) .constant else .barrier,
+        // SIMD/v128 lowering is intentionally a barrier until the backend has
+        // explicit vector dependency/latency modeling.
+        .v128_const,
+        .v128_load,
+        .v128_store,
+        .v128_not,
+        .v128_bitwise,
+        .i32x4_binop,
+        .i32x4_extract_lane,
+        => .barrier,
 
         .mul => if (def != null and isIntegerType(inst.type)) .mul else .barrier,
 
@@ -455,6 +465,21 @@ pub fn forEachUse(
             try visit(context, tg.delta);
         },
         .phi => |edges| for (edges) |edge| try visit(context, edge.val),
+        .v128_not => |v| try visit(context, v),
+        .v128_load => |ld| try visit(context, ld.base),
+        .v128_store => |st| {
+            try visit(context, st.base);
+            try visit(context, st.val);
+        },
+        .v128_bitwise => |bin| {
+            try visit(context, bin.lhs);
+            try visit(context, bin.rhs);
+        },
+        .i32x4_binop => |bin| {
+            try visit(context, bin.lhs);
+            try visit(context, bin.rhs);
+        },
+        .i32x4_extract_lane => |lane| try visit(context, lane.vector),
         else => {},
     }
 }

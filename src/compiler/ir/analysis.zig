@@ -133,32 +133,105 @@ pub fn computeLiveness(
 /// Add all VReg uses of an instruction to a live set.
 fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
     switch (inst.op) {
-        .iconst_32, .iconst_64, .fconst_32, .fconst_64 => {},
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64, .v128_const => {},
         .local_get, .global_get => {},
         .br, .@"unreachable", .atomic_fence => {},
 
-        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
-        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
-        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
-        .f_min, .f_max, .f_copysign,
-        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
         => |bin| {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
         },
 
-        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
-        .extend8_s, .extend16_s, .extend32_s,
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
-        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        .v128_bitwise => |bin| {
+            live.put(bin.lhs, {}) catch {};
+            live.put(bin.rhs, {}) catch {};
+        },
+        .i32x4_binop => |bin| {
+            live.put(bin.lhs, {}) catch {};
+            live.put(bin.rhs, {}) catch {};
+        },
+
+        .clz,
+        .ctz,
+        .popcnt,
+        .eqz,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .reinterpret,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .v128_not,
         => |vreg| live.put(vreg, {}) catch {},
+        .i32x4_extract_lane => |lane| live.put(lane.vector, {}) catch {},
 
         .local_set => |ls| live.put(ls.val, {}) catch {},
         .global_set => |gs| live.put(gs.val, {}) catch {},
         .load => |ld| live.put(ld.base, {}) catch {},
+        .v128_load => |ld| live.put(ld.base, {}) catch {},
         .store => |st| {
+            live.put(st.base, {}) catch {};
+            live.put(st.val, {}) catch {};
+        },
+        .v128_store => |st| {
             live.put(st.base, {}) catch {};
             live.put(st.val, {}) catch {};
         },
@@ -259,6 +332,7 @@ pub const LiveRange = struct {
     vreg: ir.VReg,
     start: u32, // global instruction index of definition
     end: u32, // global instruction index of last use
+    type: ir.IrType,
 };
 
 /// Compute live ranges for all VRegs in a function.
@@ -292,6 +366,8 @@ pub fn computeLiveRangesWithOrder(
     // Global instruction numbering — follows block_order if provided.
     var def_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer def_pos.deinit();
+    var def_type = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer def_type.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
 
@@ -326,6 +402,7 @@ pub fn computeLiveRangesWithOrder(
             if (inst.dest) |dest| {
                 if (!def_pos.contains(dest)) {
                     try def_pos.put(dest, global_idx);
+                    try def_type.put(dest, inst.type);
                 }
             }
             // Record last use position
@@ -351,7 +428,12 @@ pub fn computeLiveRangesWithOrder(
         const vreg = entry.key_ptr.*;
         const start = entry.value_ptr.*;
         const end = last_use_pos.get(vreg) orelse start;
-        try ranges.append(allocator, .{ .vreg = vreg, .start = start, .end = @max(start, end) });
+        try ranges.append(allocator, .{
+            .vreg = vreg,
+            .start = start,
+            .end = @max(start, end),
+            .type = def_type.get(vreg) orelse .i32,
+        });
     }
 
     // Sort by start position
@@ -366,32 +448,105 @@ pub fn computeLiveRangesWithOrder(
 
 fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u32) void {
     switch (inst.op) {
-        .iconst_32, .iconst_64, .fconst_32, .fconst_64 => {},
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64, .v128_const => {},
         .local_get, .global_get => {},
         .br, .@"unreachable", .atomic_fence => {},
 
-        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
-        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
-        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
-        .f_min, .f_max, .f_copysign,
-        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
         => |bin| {
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
         },
 
-        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
-        .extend8_s, .extend16_s, .extend32_s,
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
-        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        .v128_bitwise => |bin| {
+            last_use.put(bin.lhs, pos) catch {};
+            last_use.put(bin.rhs, pos) catch {};
+        },
+        .i32x4_binop => |bin| {
+            last_use.put(bin.lhs, pos) catch {};
+            last_use.put(bin.rhs, pos) catch {};
+        },
+
+        .clz,
+        .ctz,
+        .popcnt,
+        .eqz,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .reinterpret,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .v128_not,
         => |vreg| last_use.put(vreg, pos) catch {},
+        .i32x4_extract_lane => |lane| last_use.put(lane.vector, pos) catch {},
 
         .local_set => |ls| last_use.put(ls.val, pos) catch {},
         .global_set => |gs| last_use.put(gs.val, pos) catch {},
         .load => |ld| last_use.put(ld.base, pos) catch {},
+        .v128_load => |ld| last_use.put(ld.base, pos) catch {},
         .store => |st| {
+            last_use.put(st.base, pos) catch {};
+            last_use.put(st.val, pos) catch {};
+        },
+        .v128_store => |st| {
             last_use.put(st.base, pos) catch {};
             last_use.put(st.val, pos) catch {};
         },
@@ -1075,6 +1230,32 @@ test "computeLiveRanges: basic ranges" {
     try std.testing.expectEqual(@as(u32, 2), ranges[1].end); // v1 used at pos 2 (add)
     try std.testing.expectEqual(@as(u32, 2), ranges[2].start);
     try std.testing.expectEqual(@as(u32, 3), ranges[2].end); // v2 used at pos 3 (ret)
+}
+
+test "computeLiveRanges: v128 ranges retain type" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block0.append(.{ .op = .{ .v128_const = 0xFFFF }, .dest = v0, .type = .v128 });
+    try block0.append(.{ .op = .{ .v128_not = v0 }, .dest = v1, .type = .v128 });
+    try block0.append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = v1, .lane = 0 } }, .dest = v2, .type = .i32 });
+    try block0.append(.{ .op = .{ .ret = v2 } });
+
+    const ranges = try computeLiveRanges(&func, allocator);
+    defer allocator.free(ranges);
+
+    try std.testing.expectEqual(@as(usize, 3), ranges.len);
+    try std.testing.expectEqual(ir.IrType.v128, ranges[0].type);
+    try std.testing.expectEqual(ir.IrType.v128, ranges[1].type);
+    try std.testing.expectEqual(ir.IrType.i32, ranges[2].type);
+    try std.testing.expectEqual(@as(u32, 1), ranges[0].end);
+    try std.testing.expectEqual(@as(u32, 2), ranges[1].end);
 }
 
 test "computeLiveRanges: call with explicit args" {

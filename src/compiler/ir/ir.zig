@@ -18,7 +18,35 @@ pub const IrType = enum {
     i64,
     f32,
     f64,
+    v128,
     void,
+
+    pub fn byteSize(self: IrType) u8 {
+        return switch (self) {
+            .i32, .f32 => 4,
+            .i64, .f64 => 8,
+            .v128 => 16,
+            .void => 0,
+        };
+    }
+
+    /// Number of 8-byte frame slots needed to spill this value.
+    pub fn spillSlots64(self: IrType) u8 {
+        return switch (self) {
+            .v128 => 2,
+            .void => 0,
+            else => 1,
+        };
+    }
+
+    /// Alignment required for stack storage, in 8-byte frame slots.
+    pub fn spillAlignSlots64(self: IrType) u8 {
+        return switch (self) {
+            .v128 => 2,
+            .void => 1,
+            else => 1,
+        };
+    }
 };
 
 /// An IR instruction.
@@ -33,6 +61,17 @@ pub const Inst = struct {
         iconst_64: i64,
         fconst_32: f32,
         fconst_64: f64,
+
+        // SIMD/v128 foundation. These IR forms are intentionally narrow:
+        // they cover the first AArch64 NEON slice without implying full
+        // wasm SIMD coverage or exported v128 ABI support.
+        v128_const: u128,
+        v128_load: V128Mem,
+        v128_store: V128Store,
+        v128_not: VReg,
+        v128_bitwise: V128Bitwise,
+        i32x4_binop: I32x4BinOp,
+        i32x4_extract_lane: I32x4ExtractLane,
 
         // Binary arithmetic (dest = lhs op rhs)
         add: BinOp,
@@ -205,6 +244,44 @@ pub const Inst = struct {
 
     pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };
 
+    pub const V128BitwiseOp = enum { @"and", andnot, @"or", xor };
+
+    pub const I32x4Op = enum { add, sub, eq };
+
+    pub const V128Mem = struct {
+        base: VReg,
+        offset: u32,
+        alignment: u32,
+        bounds_known: bool = false,
+        checked_end: u64 = 0,
+    };
+
+    pub const V128Store = struct {
+        base: VReg,
+        offset: u32,
+        alignment: u32,
+        val: VReg,
+        bounds_known: bool = false,
+        checked_end: u64 = 0,
+    };
+
+    pub const V128Bitwise = struct {
+        op: V128BitwiseOp,
+        lhs: VReg,
+        rhs: VReg,
+    };
+
+    pub const I32x4BinOp = struct {
+        op: I32x4Op,
+        lhs: VReg,
+        rhs: VReg,
+    };
+
+    pub const I32x4ExtractLane = struct {
+        vector: VReg,
+        lane: u2,
+    };
+
     pub const PhiEdge = struct {
         block: BlockId,
         val: VReg,
@@ -350,6 +427,34 @@ test "IrFunction: newVReg returns sequential values" {
     try std.testing.expectEqual(@as(VReg, 2), func.newVReg());
     try std.testing.expectEqual(@as(VReg, 3), func.newVReg());
     try std.testing.expectEqual(@as(VReg, 4), func.next_vreg);
+}
+
+test "IrType: v128 uses 16 bytes and two spill slots" {
+    try std.testing.expectEqual(@as(u8, 16), IrType.v128.byteSize());
+    try std.testing.expectEqual(@as(u8, 2), IrType.v128.spillSlots64());
+    try std.testing.expectEqual(@as(u8, 2), IrType.v128.spillAlignSlots64());
+    try std.testing.expectEqual(@as(u8, 1), IrType.i64.spillSlots64());
+}
+
+test "Inst: first v128 op family preserves operand shape" {
+    const c = Inst{ .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF }, .dest = 1, .type = .v128 };
+    try std.testing.expectEqual(IrType.v128, c.type);
+    try std.testing.expectEqual(@as(u128, 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF), c.op.v128_const);
+
+    const bit = Inst{
+        .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = 1, .rhs = 2 } },
+        .dest = 3,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.V128BitwiseOp.xor, bit.op.v128_bitwise.op);
+    try std.testing.expectEqual(@as(VReg, 1), bit.op.v128_bitwise.lhs);
+
+    const lane = Inst{
+        .op = .{ .i32x4_extract_lane = .{ .vector = 3, .lane = 2 } },
+        .dest = 4,
+        .type = .i32,
+    };
+    try std.testing.expectEqual(@as(u2, 2), lane.op.i32x4_extract_lane.lane);
 }
 
 test "IrModule: add multiple functions" {
