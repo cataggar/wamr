@@ -1221,6 +1221,87 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
     };
 }
 
+// ── Global Value Numbering (cross-block CSE) ────────────────────────────────
+
+/// Dominator-scoped GVN: deduplicate identical pure, non-trapping
+/// instructions across basic blocks using the dominator tree.
+///
+/// Walks the dom tree in DFS pre-order with a scoped expression table.
+/// When an instruction in block B matches an entry from a dominator of B,
+/// all uses of B's instruction are rewritten to the dominating def via
+/// `replaceVReg`. `deadCodeElimination` removes the now-unused original.
+///
+/// Subsumes block-local `commonSubexprElimination`.
+pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    if (dom.idom[0] == null) return false;
+
+    const nblocks = func.blocks.items.len;
+    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer {
+        for (children) |*list| list.deinit(allocator);
+        allocator.free(children);
+    }
+    for (children) |*list| list.* = .empty;
+    for (0..nblocks) |i| {
+        const bid: ir.BlockId = @intCast(i);
+        const idom = dom.idom[bid] orelse continue;
+        if (idom == bid) continue;
+        try children[idom].append(allocator, bid);
+    }
+
+    const GvnEntry = struct { inst: ir.Inst, vreg: ir.VReg };
+    var table: std.ArrayList(GvnEntry) = .empty;
+    defer table.deinit(allocator);
+
+    const Frame = struct { bid: ir.BlockId, phase: u1, snap_len: usize };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0 });
+
+    var changed = false;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.phase == 1) {
+            table.shrinkRetainingCapacity(top.snap_len);
+            _ = stack.pop();
+            continue;
+        }
+        const bid = top.bid;
+        top.phase = 1;
+        top.snap_len = table.items.len;
+
+        const block = &func.blocks.items[bid];
+        for (block.instructions.items) |*inst| {
+            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) continue;
+
+            var found: ?ir.VReg = null;
+            for (table.items) |entry| {
+                if (entry.inst.type == inst.type and sameOp(entry.inst, inst.*)) {
+                    found = entry.vreg;
+                    break;
+                }
+            }
+
+            if (found) |earlier_vreg| {
+                replaceVReg(func, inst.dest.?, earlier_vreg);
+                changed = true;
+            } else {
+                try table.append(allocator, .{ .inst = inst.*, .vreg = inst.dest.? });
+            }
+        }
+
+        for (children[bid].items) |child| {
+            try stack.append(allocator, .{ .bid = child, .phase = 0, .snap_len = 0 });
+        }
+    }
+
+    return changed;
+}
+
 // ── Pass Manager ────────────────────────────────────────────────────────────
 
 pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
@@ -2949,7 +3030,7 @@ pub const default_passes: []const PassFn = &.{
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
-    &commonSubexprElimination,
+    &globalValueNumbering,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &elideRedundantBoundsChecks,
