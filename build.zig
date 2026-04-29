@@ -21,7 +21,8 @@ pub fn build(b: *std.Build) void {
     // ── Build flags ────────────────────────────────────────────────────
     const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse false;
     const stack_protector = b.option(bool, "stack-protector", "Enable stack protector (requires libc)") orelse false;
-    const link_libc = b.option(bool, "link-libc", "Link libc") orelse stack_protector;
+    const link_libc = b.option(bool, "link-libc", "Link libc") orelse
+        (stack_protector or target.result.os.tag == .wasi);
     const version_string = b.option([]const u8, "version", "Version string") orelse "dev";
 
     // ── Feature flags ──────────────────────────────────────────────────
@@ -349,4 +350,3 @@ pub fn build(b: *std.Build) void {
         fuzz_step.dependOn(&install_fuzz.step);
     }
 }
-
