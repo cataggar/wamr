@@ -1577,6 +1577,90 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
     return changed;
 }
 
+/// Hoist loop-invariant pure instructions to the loop preheader.
+///
+/// An instruction is hoistable when `isPure` and `!hasSideEffect` and
+/// ALL operand VRegs are defined outside the loop body.  Iterates to
+/// a fixed point so cascading works (e.g. hoisting a constant exposes
+/// an add that depends on it).
+pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    var lf = try analysis.computeLoops(func, &dom, allocator);
+    defer lf.deinit();
+    if (lf.loops.len == 0) return false;
+
+    var predecessors = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var pit = predecessors.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    var def_block = std.AutoHashMap(ir.VReg, ir.BlockId).init(allocator);
+    defer def_block.deinit();
+    for (func.blocks.items, 0..) |block, idx| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |d| try def_block.put(d, @intCast(idx));
+        }
+    }
+
+    var changed = false;
+    for (lf.loops) |*loop| {
+        const header_preds = predecessors.get(loop.header) orelse continue;
+        var preheader: ?ir.BlockId = null;
+        for (header_preds) |p| {
+            if (!loop.containsBlock(p)) {
+                if (preheader != null) { preheader = null; break; }
+                preheader = p;
+            }
+        }
+        const ph = preheader orelse continue;
+        const ph_insts = func.blocks.items[ph].instructions.items;
+        if (ph_insts.len == 0) continue;
+        switch (ph_insts[ph_insts.len - 1].op) {
+            .br => |t| { if (t != loop.header) continue; },
+            else => continue,
+        }
+        if (!dom.dominates(ph, loop.header)) continue;
+
+        var any = true;
+        while (any) {
+            any = false;
+            for (loop.blocks) |bid| {
+                const block = &func.blocks.items[bid];
+                var i: usize = 0;
+                while (i < block.instructions.items.len) {
+                    const inst = block.instructions.items[i];
+                    if (inst.dest == null or !isPure(inst) or hasSideEffect(inst)) {
+                        i += 1;
+                        continue;
+                    }
+                    const used = getUsedVRegs(inst);
+                    var ok = true;
+                    for (used.slice()) |v| {
+                        if (def_block.get(v)) |db| {
+                            if (loop.containsBlock(db)) { ok = false; break; }
+                        }
+                    }
+                    if (!ok) { i += 1; continue; }
+
+                    const ph_block = &func.blocks.items[ph];
+                    try ph_block.instructions.insert(ph_block.allocator, ph_block.instructions.items.len - 1, inst);
+                    _ = block.instructions.orderedRemove(i);
+                    if (inst.dest) |d| try def_block.put(d, ph);
+                    any = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 /// Redundant bounds-check elimination, dominator-scoped.
 ///
 /// For every `.load` and `.store`, codegen emits an inline wasm-memory
@@ -3301,6 +3385,7 @@ pub const default_passes: []const PassFn = &.{
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
     &globalValueNumbering,
+    &hoistLoopInvariantCode,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
@@ -4417,6 +4502,97 @@ test "elideRedundantBoundsChecks: back-to-back loads on same base" {
     try std.testing.expectEqual(@as(u64, 8), block.instructions.items[1].op.load.checked_end);
     try std.testing.expect(block.instructions.items[2].op.load.bounds_known);
     try std.testing.expect(block.instructions.items[3].op.load.bounds_known);
+}
+
+test "hoistLoopInvariantCode: pure add with invariant operands hoisted" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v2 }, .dest = v3 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v3, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v2 } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+    var found_add = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .add) { found_add = true; break; }
+    }
+    try std.testing.expect(found_add);
+    var hdr_has_add = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .add) { hdr_has_add = true; break; }
+    }
+    try std.testing.expect(!hdr_has_add);
+}
+
+test "hoistLoopInvariantCode: cascading hoist" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v2 }, .dest = v3 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v3, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v2 } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+    var ph_has_add = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .add) { ph_has_add = true; break; }
+    }
+    try std.testing.expect(ph_has_add);
+}
+
+test "hoistLoopInvariantCode: trapping op not hoisted" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .div_u = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v2 }, .dest = v3 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v3, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v2 } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op == .div_u);
 }
 
 test "elideRedundantBoundsChecks: call invalidates tracker" {
