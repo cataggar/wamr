@@ -311,6 +311,29 @@ pub fn compileFunctionWithOptions(
     return compileFunctionImpl(func, .{ .allocator = allocator, .options = options }, allocator);
 }
 
+fn functionUsesV128(func: *const ir.IrFunction) bool {
+    if (func.local_types) |local_types| {
+        for (local_types) |ty| if (ty == .v128) return true;
+    }
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.type == .v128) return true;
+            switch (inst.op) {
+                .v128_const,
+                .v128_load,
+                .v128_store,
+                .v128_not,
+                .v128_bitwise,
+                .i32x4_binop,
+                .i32x4_extract_lane,
+                => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
 pub fn compileFunctionImpl(
     func: *const ir.IrFunction,
     ctx: FuncCompileCtx,
@@ -318,6 +341,7 @@ pub fn compileFunctionImpl(
 ) ![]u8 {
     // Phase 1b: stack args beyond x7 aren't supported yet.
     if (func.param_count > 7) return error.TooManyParams;
+    if (functionUsesV128(func)) return error.UnsupportedV128;
 
     // Phase 3 of regalloc adoption (issue #100): drive RegMap from a real
     // linear-scan allocation. `RegMap.assign` consults `alloc_result` first;
@@ -752,6 +776,8 @@ fn computeLiveRangesScheduled(
 
     var def_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer def_pos.deinit();
+    var def_type = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer def_type.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
 
@@ -768,7 +794,10 @@ fn computeLiveRangesScheduled(
 
         for (scheduled.instructions(bid)) |inst| {
             if (inst.dest) |dest| {
-                if (!def_pos.contains(dest)) try def_pos.put(dest, global_idx);
+                if (!def_pos.contains(dest)) {
+                    try def_pos.put(dest, global_idx);
+                    try def_type.put(dest, inst.type);
+                }
             }
             var use_ctx = LastUseCtx{
                 .last_use_pos = &last_use_pos,
@@ -799,6 +828,7 @@ fn computeLiveRangesScheduled(
             .vreg = vreg,
             .start = start,
             .end = @max(start, end),
+            .type = def_type.get(vreg) orelse .i32,
         });
     }
 

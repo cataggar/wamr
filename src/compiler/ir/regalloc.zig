@@ -28,7 +28,7 @@ pub const max_alloc_regs: usize = 64;
 /// Physical register or stack slot assignment.
 pub const Allocation = union(enum) {
     reg: PhysReg,
-    /// Byte offset of the spill slot from the frame pointer. Sign and
+    /// Byte offset of the first spill byte from the frame pointer. Sign and
     /// stride come from `RegSet.spill_base`/`spill_stride`.
     stack: i32,
 };
@@ -61,7 +61,8 @@ pub const RegSet = struct {
 pub const AllocResult = struct {
     /// VReg → physical location mapping.
     assignments: std.AutoHashMap(ir.VReg, Allocation),
-    /// Number of spill slots used.
+    /// Number of 8-byte spill slots used. v128 values consume two slots and
+    /// are aligned to a 16-byte FP-relative offset.
     spill_count: u32,
 
     pub fn deinit(self: *AllocResult) void {
@@ -122,7 +123,7 @@ pub fn allocateFromRanges(
     var active: std.ArrayList(ActiveInterval) = .empty;
     defer active.deinit(allocator);
 
-    var spill_count: u32 = 0;
+    var spill_slots_used: u32 = 0;
 
     for (ranges) |range| {
         // Expire old intervals that ended before this one starts
@@ -136,6 +137,7 @@ pub fn allocateFromRanges(
                 .vreg = range.vreg,
                 .end = range.end,
                 .reg_idx = reg_idx,
+                .type = range.type,
             });
         } else {
             // No safe free register — try to evict an active interval
@@ -154,36 +156,55 @@ pub fn allocateFromRanges(
             if (best_evict) |evict_idx| {
                 const evicted = active.orderedRemove(evict_idx);
                 const stolen_reg = evicted.reg_idx;
-                const spill_offset = reg_set.spill_base +
-                    @as(i32, @intCast(spill_count)) * reg_set.spill_stride;
+                const spill_offset = allocateSpill(&spill_slots_used, reg_set, evicted.type);
                 try assignments.put(evicted.vreg, .{ .stack = spill_offset });
-                spill_count += 1;
                 try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[stolen_reg] });
                 try insertActive(&active, allocator, .{
                     .vreg = range.vreg,
                     .end = range.end,
                     .reg_idx = stolen_reg,
+                    .type = range.type,
                 });
             } else {
                 // No safe eviction candidate — spill the new interval
-                const spill_offset = reg_set.spill_base +
-                    @as(i32, @intCast(spill_count)) * reg_set.spill_stride;
+                const spill_offset = allocateSpill(&spill_slots_used, reg_set, range.type);
                 try assignments.put(range.vreg, .{ .stack = spill_offset });
-                spill_count += 1;
             }
         }
     }
 
     return .{
         .assignments = assignments,
-        .spill_count = spill_count,
+        .spill_count = spill_slots_used,
     };
+}
+
+fn allocateSpill(spill_slots_used: *u32, reg_set: RegSet, ty: ir.IrType) i32 {
+    const align_slots = @as(u32, ty.spillAlignSlots64());
+    const needed_slots = @as(u32, ty.spillSlots64());
+    while (!spillSlotAligned(reg_set, spill_slots_used.*, align_slots)) {
+        spill_slots_used.* += 1;
+    }
+    const offset = reg_set.spill_base +
+        @as(i32, @intCast(spill_slots_used.*)) * reg_set.spill_stride;
+    spill_slots_used.* += needed_slots;
+    return offset;
+}
+
+fn spillSlotAligned(reg_set: RegSet, slot_index: u32, align_slots: u32) bool {
+    if (align_slots <= 1) return true;
+    const offset = reg_set.spill_base +
+        @as(i32, @intCast(slot_index)) * reg_set.spill_stride;
+    const align_bytes = @as(i32, @intCast(align_slots * 8));
+    const abs_offset = if (offset < 0) -offset else offset;
+    return @mod(abs_offset, align_bytes) == 0;
 }
 
 const ActiveInterval = struct {
     vreg: ir.VReg,
     end: u32,
     reg_idx: u8,
+    type: ir.IrType,
 };
 
 /// Remove intervals from `active` whose end position is <= `pos`.
@@ -363,3 +384,26 @@ test "allocate: spills when pressure exceeds registers" {
     }
 }
 
+test "allocateFromRanges: v128 spills consume two aligned slots" {
+    const allocator = std.testing.allocator;
+    const one_reg_set: RegSet = .{
+        .alloc_regs = &.{0},
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{0},
+        .spill_base = 8,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 10, .type = .v128 },
+        .{ .vreg = 1, .start = 1, .end = 9, .type = .i64 },
+        .{ .vreg = 2, .start = 2, .end = 8, .type = .v128 },
+    };
+
+    var result = try allocateFromRanges(allocator, one_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 4), result.spill_count);
+    try std.testing.expectEqual(Allocation{ .stack = 16 }, result.get(0).?);
+    try std.testing.expectEqual(Allocation{ .stack = 32 }, result.get(1).?);
+    try std.testing.expectEqual(Allocation{ .reg = 0 }, result.get(2).?);
+}
