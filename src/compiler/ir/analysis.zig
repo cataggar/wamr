@@ -267,6 +267,18 @@ pub fn computeLiveRanges(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
 ) ![]LiveRange {
+    return computeLiveRangesWithOrder(func, null, allocator);
+}
+
+/// Compute live ranges with instruction numbering following `block_order`.
+/// When provided, this MUST match the codegen emission order so that the
+/// register allocator's interval arithmetic is consistent with actual
+/// code layout.
+pub fn computeLiveRangesWithOrder(
+    func: *const ir.IrFunction,
+    block_order: ?[]const ir.BlockId,
+    allocator: std.mem.Allocator,
+) ![]LiveRange {
     const liveness = try computeLiveness(func, allocator);
     defer {
         var it = @constCast(&liveness).iterator();
@@ -277,15 +289,26 @@ pub fn computeLiveRanges(
         @constCast(&liveness).deinit();
     }
 
-    // Global instruction numbering
+    // Global instruction numbering — follows block_order if provided.
     var def_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer def_pos.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
 
+    // Build default sequential order if none provided.
+    const nblocks = func.blocks.items.len;
+    var owns_order = false;
+    const effective_order: []const ir.BlockId = if (block_order) |bo| bo else blk: {
+        const raw = try allocator.alloc(ir.BlockId, nblocks);
+        for (raw, 0..) |*r, i| r.* = @intCast(i);
+        owns_order = true;
+        break :blk raw;
+    };
+    defer if (owns_order) allocator.free(effective_order);
+
     var global_idx: u32 = 0;
-    for (func.blocks.items, 0..) |block, block_idx| {
-        const bid: ir.BlockId = @intCast(block_idx);
+    for (effective_order) |bid| {
+        const block = func.blocks.items[bid];
 
         // VRegs in live_in are used before defined in this block — extend their range
         if (liveness.getPtr(bid)) |bl| {

@@ -5794,29 +5794,4 @@ test "promoteLocalsToSSA + lowerPhis: two-local sum loop" {
             try std.testing.expect(inst.op != .phi);
         }
     }
-
-    // Dump the lowered IR for inspection.
-    for (func.blocks.items, 0..) |blk, bid| {
-        std.debug.print("Block {d}:\n", .{bid});
-        for (blk.instructions.items) |inst| {
-            if (inst.dest) |d| {
-                std.debug.print("  v{d} = {s}", .{ d, @tagName(inst.op) });
-            } else {
-                std.debug.print("  {s}", .{@tagName(inst.op)});
-            }
-            switch (inst.op) {
-                .local_get => |idx| std.debug.print(" local={d}", .{idx}),
-                .local_set => |ls| std.debug.print(" local={d} val=v{d}", .{ ls.idx, ls.val }),
-                .iconst_32 => |v| std.debug.print(" {d}", .{v}),
-                .br => |t| std.debug.print(" -> B{d}", .{t}),
-                .br_if => |bi| std.debug.print(" cond=v{d} then=B{d} else=B{d}", .{ bi.cond, bi.then_block, bi.else_block }),
-                .eqz => |v| std.debug.print(" v{d}", .{v}),
-                .add => |a| std.debug.print(" v{d} v{d}", .{ a.lhs, a.rhs }),
-                .sub => |s| std.debug.print(" v{d} v{d}", .{ s.lhs, s.rhs }),
-                .ret => |v| if (v) |rv| std.debug.print(" v{d}", .{rv}),
-                else => {},
-            }
-            std.debug.print("\n", .{});
-        }
-    }
 }

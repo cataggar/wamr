@@ -301,7 +301,30 @@ pub fn compileFunctionImpl(
     // fusion pre-pass below, because fused MADD/MSUB reads a mul's sources
     // at the add position; we need to extend those vregs' live ranges past
     // the mul before allocation so the sources' physregs aren't reassigned.
-    var clobbers = try collectClobberPoints(func, allocator);
+    // Compute RPO block order ONCE, before anything that uses global
+    // instruction numbering. Clobber points, live ranges, FMA positions,
+    // flat indexing, kill lists, and code emission all must use THIS order.
+    const block_order = blk: {
+        var dom = try analysis.computeDominators(func, allocator);
+        defer dom.deinit();
+        const order = try allocator.alloc(ir.BlockId, func.blocks.items.len);
+        const po_len = dom.post_order.len;
+        for (dom.post_order, 0..) |bid, i| {
+            order[po_len - 1 - i] = bid;
+        }
+        var tail: usize = po_len;
+        for (0..func.blocks.items.len) |idx| {
+            const bid: ir.BlockId = @intCast(idx);
+            if (dom.post_num[bid] == null) {
+                order[tail] = bid;
+                tail += 1;
+            }
+        }
+        break :blk order;
+    };
+    defer allocator.free(block_order);
+
+    var clobbers = try collectClobberPoints(func, block_order, allocator);
     defer clobbers.deinit(allocator);
 
     var code = emit.CodeBuffer.init(allocator);
@@ -505,8 +528,8 @@ pub fn compileFunctionImpl(
     defer fma_add_pos.deinit();
     {
         var global_idx: u32 = 0;
-        for (func.blocks.items) |block| {
-            const insts = block.instructions.items;
+        for (block_order) |bo_bid| {
+            const insts = func.blocks.items[bo_bid].instructions.items;
             var i: usize = 0;
             while (i < insts.len) : (i += 1) {
                 defer global_idx += 1;
@@ -560,9 +583,8 @@ pub fn compileFunctionImpl(
     fctx.mul_fused = &mul_fused;
     fctx.fma_info = &fma_info;
 
-    // Run the linear-scan allocator. Compute live ranges first so we can
-    // extend FMA sources' ranges past the mul position (see comment above).
-    const live_ranges = try analysis.computeLiveRanges(func, allocator);
+    // Compute live ranges using the SAME block order as code emission.
+    const live_ranges = try analysis.computeLiveRangesWithOrder(func, block_order, allocator);
     defer allocator.free(live_ranges);
     if (fma_info.count() > 0) {
         // Build a vreg→range-index lookup for the patch loop.
@@ -639,9 +661,9 @@ pub fn compileFunctionImpl(
     defer allocator.free(block_flat_base);
     {
         var acc: usize = 0;
-        for (func.blocks.items, 0..) |block, bi| {
+        for (block_order) |bi| {
             block_flat_base[bi] = acc;
-            acc += block.instructions.items.len;
+            acc += func.blocks.items[bi].instructions.items.len;
         }
     }
 
@@ -669,9 +691,11 @@ pub fn compileFunctionImpl(
             }
         }.f;
 
-        var bi_rev = func.blocks.items.len;
-        while (bi_rev > 0) {
-            bi_rev -= 1;
+        // Scan blocks in reverse of the emission order (block_order).
+        var bo_rev = block_order.len;
+        while (bo_rev > 0) {
+            bo_rev -= 1;
+            const bi_rev = block_order[bo_rev];
             const insts = func.blocks.items[bi_rev].instructions.items;
             var ii_rev = insts.len;
             while (ii_rev > 0) {
@@ -812,33 +836,7 @@ pub fn compileFunctionImpl(
     defer allocator.free(block_offsets);
     @memset(block_offsets, 0);
 
-    // Emit blocks in RPO (Reverse Post-Order) so that dominator blocks
-    // are always processed before dominated blocks. This ensures VRegs
-    // defined in a dominating block are assigned before their uses in
-    // dominated blocks — required for cross-block SSA VReg flow after
-    // mem2reg.
-    const block_order = blk: {
-        var dom = try analysis.computeDominators(func, allocator);
-        defer dom.deinit();
-        const order = try allocator.alloc(ir.BlockId, func.blocks.items.len);
-        // DomTree.post_order lists reachable blocks in DFS post-order.
-        // Reverse it for RPO. Append unreachable blocks at the end.
-        const po_len = dom.post_order.len;
-        for (dom.post_order, 0..) |bid, i| {
-            order[po_len - 1 - i] = bid;
-        }
-        // Fill unreachable blocks (not in post_order) at the tail.
-        var tail: usize = po_len;
-        for (0..func.blocks.items.len) |idx| {
-            const bid: ir.BlockId = @intCast(idx);
-            if (dom.post_num[bid] == null) {
-                order[tail] = bid;
-                tail += 1;
-            }
-        }
-        break :blk order;
-    };
-    defer allocator.free(block_order);
+        // block_order already computed above — reuse for emission.
 
     var patches: std.ArrayListUnmanaged(BranchPatch) = .empty;
     defer patches.deinit(allocator);
@@ -4045,14 +4043,24 @@ pub fn aarch64RegSet(local_count: u32) regalloc.RegSet {
 /// `.atomic_rmw`, `.atomic_cmpxchg`, `.atomic_fence` (LSE atomics).
 pub fn collectClobberPoints(
     func: *const ir.IrFunction,
+    block_order_opt: ?[]const ir.BlockId,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(regalloc.ClobberPoint) {
     var clobbers: std.ArrayList(regalloc.ClobberPoint) = .empty;
     errdefer clobbers.deinit(allocator);
 
+    var owns_order = false;
+    const block_order: []const ir.BlockId = if (block_order_opt) |bo| bo else blk: {
+        const raw = try allocator.alloc(ir.BlockId, func.blocks.items.len);
+        for (raw, 0..) |*r, i| r.* = @intCast(i);
+        owns_order = true;
+        break :blk raw;
+    };
+    defer if (owns_order) allocator.free(block_order);
+
     var pos: u32 = 0;
-    for (func.blocks.items) |block| {
-        for (block.instructions.items) |ci| {
+    for (block_order) |bo_bid| {
+        for (func.blocks.items[bo_bid].instructions.items) |ci| {
             switch (ci.op) {
                 .call,
                 .call_indirect,
@@ -4087,7 +4095,7 @@ pub fn collectClobberPoints(
 /// This is called unconditionally from `compileFunctionImpl` and will be
 /// deleted in Phase 3 (replaced by a real consumer of the allocation).
 fn shadowRunRegalloc(func: *const ir.IrFunction, allocator: std.mem.Allocator) !void {
-    var clobbers = try collectClobberPoints(func, allocator);
+    var clobbers = try collectClobberPoints(func, null, allocator);
     defer clobbers.deinit(allocator);
 
     var alloc_result = try regalloc.allocate(
@@ -5275,7 +5283,7 @@ test "collectClobberPoints: no calls → empty" {
     try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v0 } });
 
-    var cps = try collectClobberPoints(&func, allocator);
+    var cps = try collectClobberPoints(&func, null, allocator);
     defer cps.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), cps.items.len);
 }
@@ -5295,7 +5303,7 @@ test "collectClobberPoints: one ClobberPoint per call, correct mask" {
     try block.append(.{ .op = .{ .memory_fill = .{ .dst = v0, .val = v0, .len = v0 } } });  // pos 3
     try block.append(.{ .op = .{ .ret = v1 } });                                 // pos 4
 
-    var cps = try collectClobberPoints(&func, allocator);
+    var cps = try collectClobberPoints(&func, null, allocator);
     defer cps.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cps.items.len);
@@ -5321,7 +5329,7 @@ test "collectClobberPoints: positions are monotonic across blocks" {
     try block1.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = func.newVReg() }); // pos 3
     try block1.append(.{ .op = .{ .ret = v0 } });                                 // pos 4
 
-    var cps = try collectClobberPoints(&func, allocator);
+    var cps = try collectClobberPoints(&func, null, allocator);
     defer cps.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cps.items.len);
