@@ -119,7 +119,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     // emit proper zero-extension for i32/f32 and preserve full 64 bits for
     // i64/f64.
     var local_types = try allocator.alloc(ir.IrType, total_locals);
-    defer allocator.free(local_types);
+    errdefer allocator.free(local_types);
     {
         var i: u32 = 0;
         for (func_type.params) |pt| {
@@ -149,6 +149,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     }
 
     var ir_func = ir.IrFunction.init(allocator, param_count, result_count, total_locals);
+    ir_func.local_types = local_types;
     errdefer ir_func.deinit();
 
     // Per-function arena for block-frame slices (param/result type tables and

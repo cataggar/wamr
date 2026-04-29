@@ -1215,6 +1215,8 @@ fn compileInst(
             try code.movRegMem(.rax, .r10, @as(i32, @intCast(fidx * 8)));
             try stack.push(code, .rax);
         },
+        // Phi must be lowered before codegen.
+        .phi => unreachable,
     }
 }
 
@@ -3998,6 +4000,8 @@ fn compileInstRA(
         },
 
         // ── Stubs for ops not commonly hit ────────────────────────────
+        // Phi must be lowered before codegen.
+        .phi => unreachable,
         else => {
             // For unhandled ops, emit a no-op placeholder
             if (inst.dest) |dest| {

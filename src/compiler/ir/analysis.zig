@@ -248,10 +248,11 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(ti.len, {}) catch {};
         },
         .elem_drop => {},
+        .phi => |edges| {
+            for (edges) |edge| live.put(edge.val, {}) catch {};
+        },
     }
 }
-
-// ── Live range computation ──────────────────────────────────────────────
 
 /// A live range interval for a VReg.
 pub const LiveRange = struct {
@@ -266,6 +267,18 @@ pub fn computeLiveRanges(
     func: *const ir.IrFunction,
     allocator: std.mem.Allocator,
 ) ![]LiveRange {
+    return computeLiveRangesWithOrder(func, null, allocator);
+}
+
+/// Compute live ranges with instruction numbering following `block_order`.
+/// When provided, this MUST match the codegen emission order so that the
+/// register allocator's interval arithmetic is consistent with actual
+/// code layout.
+pub fn computeLiveRangesWithOrder(
+    func: *const ir.IrFunction,
+    block_order: ?[]const ir.BlockId,
+    allocator: std.mem.Allocator,
+) ![]LiveRange {
     const liveness = try computeLiveness(func, allocator);
     defer {
         var it = @constCast(&liveness).iterator();
@@ -276,15 +289,26 @@ pub fn computeLiveRanges(
         @constCast(&liveness).deinit();
     }
 
-    // Global instruction numbering
+    // Global instruction numbering — follows block_order if provided.
     var def_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer def_pos.deinit();
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
 
+    // Build default sequential order if none provided.
+    const nblocks = func.blocks.items.len;
+    var owns_order = false;
+    const effective_order: []const ir.BlockId = if (block_order) |bo| bo else blk: {
+        const raw = try allocator.alloc(ir.BlockId, nblocks);
+        for (raw, 0..) |*r, i| r.* = @intCast(i);
+        owns_order = true;
+        break :blk raw;
+    };
+    defer if (owns_order) allocator.free(effective_order);
+
     var global_idx: u32 = 0;
-    for (func.blocks.items, 0..) |block, block_idx| {
-        const bid: ir.BlockId = @intCast(block_idx);
+    for (effective_order) |bid| {
+        const block = func.blocks.items[bid];
 
         // VRegs in live_in are used before defined in this block — extend their range
         if (liveness.getPtr(bid)) |bl| {
@@ -457,6 +481,9 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(ti.len, pos) catch {};
         },
         .elem_drop => {},
+        .phi => |edges| {
+            for (edges) |edge| last_use.put(edge.val, pos) catch {};
+        },
     }
 }
 
@@ -686,6 +713,73 @@ pub fn computeDominators(
         .post_order = try post_order.toOwnedSlice(allocator),
         .allocator = allocator,
     };
+}
+
+// ── Dominance frontiers ─────────────────────────────────────────────────
+
+/// Compute the dominance frontier for every block in `func`.
+///
+/// DF(b) = { y | ∃ pred of y that b dominates, but b does not strictly
+///             dominate y }. Uses the efficient "bottom-up" algorithm
+/// from Cooper, Harvey & Kennedy (2001), §4.2.
+///
+/// Caller owns the returned slices; call `freeDominanceFrontiers` to release.
+pub fn computeDominanceFrontiers(
+    dom: *const DomTree,
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) ![][]const ir.BlockId {
+    const nblocks = func.blocks.items.len;
+
+    var preds = try buildPredecessors(func, allocator);
+    defer {
+        var pit = preds.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        preds.deinit();
+    }
+
+    // Accumulate DF sets as ArrayLists, then convert to owned slices.
+    var df_lists = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer allocator.free(df_lists);
+    for (df_lists) |*l| l.* = .empty;
+
+    for (0..nblocks) |idx| {
+        const b: ir.BlockId = @intCast(idx);
+        const pred_list = preds.get(b) orelse continue;
+        if (pred_list.len < 2) continue; // join point iff ≥2 preds
+
+        for (pred_list) |p| {
+            var runner = p;
+            while (runner != (dom.idom[b] orelse break)) {
+                // Add b to DF(runner) if not already present.
+                var dup = false;
+                for (df_lists[runner].items) |existing| {
+                    if (existing == b) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) try df_lists[runner].append(allocator, b);
+                const next = dom.idom[runner] orelse break;
+                if (next == runner) break;
+                runner = next;
+            }
+        }
+    }
+
+    // Convert to owned slices.
+    const result = try allocator.alloc([]const ir.BlockId, nblocks);
+    errdefer allocator.free(result);
+    for (df_lists, 0..) |*l, i| {
+        result[i] = try l.toOwnedSlice(allocator);
+    }
+    return result;
+}
+
+/// Free the slices returned by `computeDominanceFrontiers`.
+pub fn freeDominanceFrontiers(df: [][]const ir.BlockId, allocator: std.mem.Allocator) void {
+    for (df) |s| allocator.free(s);
+    allocator.free(df);
 }
 
 // ── Natural-loop detection ──────────────────────────────────────────────

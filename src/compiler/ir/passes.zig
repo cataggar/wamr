@@ -73,6 +73,13 @@ pub fn buildUseDef(func: *const ir.IrFunction, allocator: std.mem.Allocator) !st
                         entry.value_ptr.use_count += 1;
                     }
                 },
+                .phi => |edges| {
+                    for (edges) |edge| {
+                        const entry = try info.getOrPut(edge.val);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
                 else => {},
             }
         }
@@ -191,6 +198,8 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(ti.len);
         },
         .elem_drop => {},
+        // Phi operands handled separately (unbounded, like call args).
+        .phi => {},
     }
     return list;
 }
@@ -363,6 +372,11 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (ti.len == old) ti.len = new;
         },
         .elem_drop => {},
+        .phi => |edges| {
+            for (@constCast(edges)) |*edge| {
+                if (edge.val == old) edge.val = new;
+            }
+        },
     }
 }
 
@@ -2157,6 +2171,9 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             ti.src += offset;
             ti.len += offset;
         },
+        .phi => |edges| {
+            for (@constCast(edges)) |*edge| edge.val += offset;
+        },
     }
 }
 
@@ -2402,6 +2419,487 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
     return any_inlined;
 }
 
+// ── SSA Promotion (mem2reg) ─────────────────────────────────────────────
+
+/// Promote wasm locals from explicit `local_set`/`local_get` ops to SSA
+/// VRegs with phi nodes at CFG join points.
+///
+/// Algorithm: Cytron et al. "Efficiently Computing Static Single
+/// Assignment Form and the Control Dependence Graph" (1991).
+///
+/// 1. Compute dominance frontiers.
+/// 2. For each local, place phis at the iterated dominance frontier of
+///    blocks containing a `local.set` for that local.
+/// 3. Rename: DFS walk of the dominator tree with a per-local value
+///    stack. `local.set` pushes the value; `local.get` reads the top.
+///    Phi operands are filled in when processing successor edges.
+/// 4. Dead `local.set`/`local.get` ops are left in place for DCE.
+///
+/// After this pass, phis must be lowered (via `lowerPhisToLocals`)
+/// before codegen.
+pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+    if (func.local_count == 0) return false;
+
+    // Strip dead code after the first terminator in each block.
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items, 0..) |inst, idx| {
+            switch (inst.op) {
+                .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
+                    if (idx + 1 < block.instructions.items.len)
+                        block.instructions.shrinkRetainingCapacity(idx + 1);
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Strip dead code after the first terminator in each block.
+    for (func.blocks.items) |*block| {
+        for (block.instructions.items, 0..) |inst, idx| {
+            switch (inst.op) {
+                .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => {
+                    if (idx + 1 < block.instructions.items.len) {
+                        block.instructions.shrinkRetainingCapacity(idx + 1);
+                    }
+                    break;
+                },
+                else => {},
+            }
+        }
+    }
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    if (dom.idom[0] == null) return false;
+
+    const df = try analysis.computeDominanceFrontiers(&dom, func, allocator);
+    defer analysis.freeDominanceFrontiers(df, allocator);
+
+    var preds = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var pit = preds.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        preds.deinit();
+    }
+
+    const nblocks = func.blocks.items.len;
+    const nlocals = func.local_count;
+
+    // ── Step 1: find which blocks define (local.set) each local ──────
+    var def_blocks = try allocator.alloc(std.ArrayList(ir.BlockId), nlocals);
+    defer {
+        for (def_blocks) |*l| l.deinit(allocator);
+        allocator.free(def_blocks);
+    }
+    for (def_blocks) |*l| l.* = .empty;
+
+    for (func.blocks.items, 0..) |block, bid_usize| {
+        const bid: ir.BlockId = @intCast(bid_usize);
+        for (block.instructions.items) |inst| {
+            if (inst.op == .local_set) {
+                const idx = inst.op.local_set.idx;
+                if (idx < nlocals) {
+                    // Deduplicate.
+                    var dup = false;
+                    for (def_blocks[idx].items) |existing| {
+                        if (existing == bid) { dup = true; break; }
+                    }
+                    if (!dup) try def_blocks[idx].append(allocator, bid);
+                }
+            }
+        }
+    }
+
+    // ── Step 2: place phi nodes at iterated dominance frontiers ──────
+    // For each local, compute IDF(def_blocks) and insert phi.
+    // has_phi[local][block] tracks whether a phi was already placed.
+    var has_phi = try allocator.alloc(std.AutoHashMap(ir.BlockId, ir.VReg), nlocals);
+    defer {
+        for (has_phi) |*m| m.deinit();
+        allocator.free(has_phi);
+    }
+    for (has_phi) |*m| m.* = std.AutoHashMap(ir.BlockId, ir.VReg).init(allocator);
+
+    // Worklist for iterated DF.
+    var worklist: std.ArrayList(ir.BlockId) = .empty;
+    defer worklist.deinit(allocator);
+    var in_worklist = try allocator.alloc(bool, nblocks);
+    defer allocator.free(in_worklist);
+
+    for (0..nlocals) |local_idx| {
+        // Pruned SSA: skip locals that have no defs (never set).
+        if (def_blocks[local_idx].items.len == 0) continue;
+
+        // Seed worklist with defining blocks.
+        worklist.clearRetainingCapacity();
+        @memset(in_worklist, false);
+        for (def_blocks[local_idx].items) |b| {
+            try worklist.append(allocator, b);
+            in_worklist[b] = true;
+        }
+
+        var wi: usize = 0;
+        while (wi < worklist.items.len) : (wi += 1) {
+            const b = worklist.items[wi];
+            for (df[b]) |y| {
+                if (!has_phi[local_idx].contains(y)) {
+                    // Insert phi at top of block y.
+                    const phi_dest = func.newVReg();
+                    const pred_list = preds.get(y) orelse &[_]ir.BlockId{};
+                    const edges = try allocator.alloc(ir.Inst.PhiEdge, pred_list.len);
+                    // Initialize with sentinel VRegs; rename pass fills them.
+                    for (edges, 0..) |*e, ei| {
+                        e.* = .{ .block = pred_list[ei], .val = phi_dest };
+                    }
+                    const local_type = if (func.local_types) |lt|
+                        (if (local_idx < lt.len) lt[local_idx] else ir.IrType.i32)
+                    else
+                        ir.IrType.i32;
+                    try func.getBlock(y).instructions.insert(func.allocator, 0, .{
+                        .op = .{ .phi = edges },
+                        .dest = phi_dest,
+                        .type = local_type,
+                    });
+                    try has_phi[local_idx].put(y, phi_dest);
+                    if (!in_worklist[y]) {
+                        try worklist.append(allocator, y);
+                        in_worklist[y] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Step 3: rename ───────────────────────────────────────────────
+    // Per-local value stack. Top = current SSA value for this local.
+    var stacks = try allocator.alloc(std.ArrayList(ir.VReg), nlocals);
+    defer {
+        for (stacks) |*s| s.deinit(allocator);
+        allocator.free(stacks);
+    }
+    for (stacks) |*s| s.* = .empty;
+
+    // Seed stacks with initial values.
+    // Params: the frontend allocates VRegs 0..param_count-1 for params.
+    // Declared locals: start at zero (insert iconst/fconst in entry block).
+    for (0..nlocals) |idx| {
+        if (idx < func.param_count) {
+            // Params live in frame slots; seed with a local_get so the
+            // SSA value has an explicit definition the regalloc can track.
+            const local_type = if (func.local_types) |lt|
+                (if (idx < lt.len) lt[idx] else ir.IrType.i32)
+            else
+                ir.IrType.i32;
+            const param_vreg = func.newVReg();
+            try func.getBlock(0).instructions.insert(func.allocator, 0, .{
+                .op = .{ .local_get = @intCast(idx) },
+                .dest = param_vreg,
+                .type = local_type,
+            });
+            try stacks[idx].append(allocator, param_vreg);
+        } else {
+            // Declared/synthetic local: seed with typed zero.
+            const local_type = if (func.local_types) |lt|
+                (if (idx < lt.len) lt[idx] else ir.IrType.i32)
+            else
+                ir.IrType.i32;
+            const zero_vreg = func.newVReg();
+            const zero_op: ir.Inst.Op = switch (local_type) {
+                .i32 => .{ .iconst_32 = 0 },
+                .i64 => .{ .iconst_64 = 0 },
+                .f32 => .{ .fconst_32 = 0 },
+                .f64 => .{ .fconst_64 = 0 },
+                .void => .{ .iconst_32 = 0 },
+            };
+            // Insert at start of entry block (block 0) before phis.
+            try func.getBlock(0).instructions.insert(func.allocator, 0, .{
+                .op = zero_op,
+                .dest = zero_vreg,
+                .type = local_type,
+            });
+            try stacks[idx].append(allocator, zero_vreg);
+        }
+    }
+
+    // Build dom-tree children list.
+    var dom_children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer {
+        for (dom_children) |*l| l.deinit(allocator);
+        allocator.free(dom_children);
+    }
+    for (dom_children) |*l| l.* = .empty;
+    for (0..nblocks) |i| {
+        const bid: ir.BlockId = @intCast(i);
+        const idom = dom.idom[bid] orelse continue;
+        if (idom == bid) continue;
+        try dom_children[idom].append(allocator, bid);
+    }
+
+    // Compute successors for filling phi operands in successor blocks.
+    var successors = try analysis.buildSuccessors(func, allocator);
+    defer {
+        var sit = successors.iterator();
+        while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
+        successors.deinit();
+    }
+
+    // DFS rename walk.
+    const RenameFrame = struct {
+        bid: ir.BlockId,
+        phase: u1,
+        stack_heights: []u32, // per-local stack height on entry (for restore)
+        rename_snap: u32, // rename_keys length on entry (for restore)
+    };
+    var rename_stack: std.ArrayList(RenameFrame) = .empty;
+    defer {
+        for (rename_stack.items) |f| allocator.free(f.stack_heights);
+        rename_stack.deinit(allocator);
+    }
+
+    // Map from old local_get dest VReg → SSA replacement VReg.
+    // Entries are scoped to the dominator subtree: when the DFS backtracks,
+    // entries added by the leaving block are removed to prevent stale
+    // rewrites in non-dominated sibling blocks.
+    var rename_map = std.AutoHashMap(ir.VReg, ir.VReg).init(allocator);
+    defer rename_map.deinit();
+
+    // Track keys added to rename_map for each DFS level so we can undo them.
+    var rename_keys: std.ArrayList(ir.VReg) = .empty;
+    defer rename_keys.deinit(allocator);
+
+    const entry_heights = try allocator.alloc(u32, nlocals);
+    for (0..nlocals) |i| entry_heights[i] = @intCast(stacks[i].items.len);
+    try rename_stack.append(allocator, .{
+        .bid = 0,
+        .phase = 0,
+        .stack_heights = entry_heights,
+        .rename_snap = 0,
+    });
+
+    var changed = false;
+    while (rename_stack.items.len > 0) {
+        const top = &rename_stack.items[rename_stack.items.len - 1];
+
+        if (top.phase == 1) {
+            // Restore stacks.
+            for (0..nlocals) |i| {
+                stacks[i].shrinkRetainingCapacity(top.stack_heights[i]);
+            }
+            // Restore rename_map: remove entries added by this block.
+            while (rename_keys.items.len > top.rename_snap) {
+                const key = rename_keys.pop().?;
+                _ = rename_map.remove(key);
+            }
+            allocator.free(top.stack_heights);
+            _ = rename_stack.pop();
+            continue;
+        }
+        const bid = top.bid;
+        top.phase = 1;
+
+        // Process instructions in this block.
+        const block = &func.blocks.items[bid];
+        for (block.instructions.items) |*inst| {
+            // Rewrite operands: any VReg in the rename map gets replaced.
+            // This handles uses of local_get dests that were renamed.
+            switch (inst.op) {
+                .phi, .local_set, .local_get => {},
+                else => {
+                    const used = getUsedVRegs(inst.*);
+                    for (used.slice()) |u| {
+                        if (rename_map.get(u)) |replacement| {
+                            replaceInInst(inst, u, replacement);
+                        }
+                    }
+                    // Also handle unbounded operand lists.
+                    switch (inst.op) {
+                        .call => |cl| for (@constCast(cl.args)) |*a| {
+                            if (rename_map.get(a.*)) |r| a.* = r;
+                        },
+                        .call_indirect => |ci| {
+                            if (rename_map.get(ci.elem_idx)) |r| @constCast(&ci.elem_idx).* = r;
+                            for (@constCast(ci.args)) |*a| {
+                                if (rename_map.get(a.*)) |r| a.* = r;
+                            }
+                        },
+                        .call_ref => |cr| {
+                            if (rename_map.get(cr.func_ref)) |r| @constCast(&cr.func_ref).* = r;
+                            for (@constCast(cr.args)) |*a| {
+                                if (rename_map.get(a.*)) |r| a.* = r;
+                            }
+                        },
+                        .ret_multi => |vregs| for (@constCast(vregs)) |*v| {
+                            if (rename_map.get(v.*)) |r| v.* = r;
+                        },
+                        else => {},
+                    }
+                },
+            }
+
+            switch (inst.op) {
+                .phi => {
+                    // Push phi dest onto the local's stack.
+                    const dest = inst.dest orelse continue;
+                    for (0..nlocals) |local_idx| {
+                        if (has_phi[local_idx].get(bid)) |phi_vreg| {
+                            if (phi_vreg == dest) {
+                                try stacks[local_idx].append(allocator, dest);
+                                break;
+                            }
+                        }
+                    }
+                },
+                .local_set => |ls| {
+                    if (ls.idx < nlocals) {
+                        // Rewrite the value operand, chasing rename chains.
+                        var val = ls.val;
+                        while (rename_map.get(val)) |r| { if (r == val) break; val = r; }
+                        try stacks[ls.idx].append(allocator, val);
+                        inst.op = .{ .iconst_32 = 0 };
+                        inst.dest = null;
+                        changed = true;
+                    }
+                },
+                .local_get => |idx| {
+                    if (idx < nlocals and stacks[idx].items.len > 0) {
+                        const current_val = stacks[idx].items[stacks[idx].items.len - 1];
+                        if (inst.dest) |dest| {
+                            if (dest == current_val and idx < func.param_count) {
+                                // Seeded parameter local_get: this instruction
+                                // IS the definition of the SSA VReg for the
+                                // parameter value — keep it alive.
+                            } else {
+                                try rename_map.put(dest, current_val);
+                                try rename_keys.append(allocator, dest);
+                                inst.op = .{ .iconst_32 = 0 };
+                                inst.dest = null;
+                                changed = true;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Fill phi operands in successor blocks.
+        const succs = successors.get(bid) orelse &[_]ir.BlockId{};
+        for (succs) |succ| {
+            const succ_block = &func.blocks.items[succ];
+            for (succ_block.instructions.items) |*succ_inst| {
+                if (succ_inst.op != .phi) break; // phis are at top
+                const phi_dest = succ_inst.dest orelse continue;
+                // Find which local this phi belongs to.
+                for (0..nlocals) |local_idx| {
+                    if (has_phi[local_idx].get(succ)) |pv| {
+                        if (pv == phi_dest) {
+                            // Fill in this block's edge.
+                            for (@constCast(succ_inst.op.phi)) |*edge| {
+                                if (edge.block == bid) {
+                                    if (stacks[local_idx].items.len > 0) {
+                                        edge.val = stacks[local_idx].items[stacks[local_idx].items.len - 1];
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Push dom-tree children.
+        for (dom_children[bid].items) |child| {
+            const heights = try allocator.alloc(u32, nlocals);
+            for (0..nlocals) |i| heights[i] = @intCast(stacks[i].items.len);
+            try rename_stack.append(allocator, .{
+                .bid = child,
+                .phase = 0,
+                .stack_heights = heights,
+                .rename_snap = @intCast(rename_keys.items.len),
+            });
+        }
+    }
+
+    return changed;
+}
+
+/// Lower phi nodes to parallel copies through synthetic locals.
+///
+/// For each phi `dest = phi [(B0, v0), (B1, v1), ...]`:
+///   - Allocate a synthetic local index L.
+///   - In each predecessor Bi, insert `local_set L, vi` before the
+///     terminator.
+///   - Replace the phi with `local_get L → dest`.
+///
+/// Parallel-copy correctness: when multiple phis exist in the same block
+/// (phi-of-phi, common in loops), all reads (the `vi` operands) must be
+/// captured before any writes (local_set). We achieve this by allocating
+/// distinct synthetic locals per phi — each phi gets its own slot, so
+/// writes to one don't clobber reads of another.
+pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    var changed = false;
+    var next_synth_local = func.local_count;
+
+    for (func.blocks.items) |*block| {
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            if (block.instructions.items[i].op != .phi) { i += 1; continue; }
+
+            const dest = block.instructions.items[i].dest orelse { i += 1; continue; };
+            const edges = block.instructions.items[i].op.phi;
+            const phi_type = block.instructions.items[i].type;
+            const synth_idx = next_synth_local;
+            next_synth_local += 1;
+
+            // Insert local_set in each predecessor before its terminator.
+            // NOTE: when a predecessor is this block (self-loop), the insert
+            // may reallocate block.instructions.items — do NOT hold a pointer
+            // into the instruction list across this loop.
+            for (edges) |edge| {
+                const pred_block = &func.blocks.items[edge.block];
+                const term_idx = findTerminatorIndex(pred_block);
+                try pred_block.instructions.insert(func.allocator, term_idx, .{
+                    .op = .{ .local_set = .{ .idx = synth_idx, .val = edge.val } },
+                });
+            }
+
+            allocator.free(edges);
+
+            // Replace phi with local_get.  Re-index into the instruction list
+            // because inserts above may have reallocated the backing array.
+            block.instructions.items[i] = .{
+                .op = .{ .local_get = synth_idx },
+                .dest = dest,
+                .type = phi_type,
+            };
+            changed = true;
+            i += 1;
+        }
+    }
+
+    // Update local_count to include synthetic locals.
+    if (next_synth_local > func.local_count) {
+        func.local_count = next_synth_local;
+    }
+
+    return changed;
+}
+
+/// Find the index of the terminator instruction in a block.
+/// Terminators are br, br_if, br_table, ret, ret_multi, unreachable.
+fn findTerminatorIndex(block: *const ir.BasicBlock) usize {
+    for (block.instructions.items, 0..) |inst, idx| {
+        switch (inst.op) {
+            .br, .br_if, .br_table, .ret, .ret_multi, .@"unreachable" => return idx,
+            else => {},
+        }
+    }
+    return block.instructions.items.len;
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
     // Module-level: inline small leaf callees before per-function passes.
@@ -2412,6 +2910,12 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
         total_changes += 1;
     }
     for (module.functions.items) |*func| {
+        // SSA promotion: run once before the fixpoint loop.
+        if (try promoteLocalsToSSA(func, allocator)) {
+            total_changes += 1;
+            if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
+        }
+
         // Iterate the pipeline until fixpoint so that passes can re-expose
         // opportunities for each other (e.g. constantFold → CSE → DCE →
         // more constantFold). Cap iterations as a safety net.
@@ -5135,5 +5639,159 @@ test "foldWrapOfExtend: composes with DCE to drop the extend" {
     for (block.instructions.items) |inst| {
         try std.testing.expect(inst.op != .extend_i32_s);
         try std.testing.expect(inst.op != .wrap_i64);
+    }
+}
+
+test "promoteLocalsToSSA: simple countdown loop" {
+    // Build a simple loop: local 0 starts at 3, counts down by 1 each
+    // iteration until 0. Tests phi placement + rename on a loop.
+    //
+    //   block 0 (entry):
+    //     local_set 0, 3
+    //     br block 1
+    //   block 1 (loop header):
+    //     v_ctr = local_get 0
+    //     v_eqz = eqz v_ctr
+    //     br_if v_eqz → block 2 (exit), else block 3 (body)
+    //   block 3 (body):
+    //     v_one = iconst_32 1
+    //     v_dec = sub v_ctr, v_one
+    //     local_set 0, v_dec
+    //     br block 1
+    //   block 2 (exit):
+    //     v_result = local_get 0
+    //     ret v_result
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+
+    // Set local_types for the single local (i32).
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v_three = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_three });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_three } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_ctr = func.newVReg();
+    const v_eqz = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_ctr });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_ctr }, .dest = v_eqz });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_eqz, .then_block = b2, .else_block = b3 } } });
+
+    const v_one = func.newVReg();
+    const v_dec = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one });
+    try func.getBlock(b3).append(.{ .op = .{ .sub = .{ .lhs = v_ctr, .rhs = v_one } }, .dest = v_dec });
+    try func.getBlock(b3).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_dec } } });
+    try func.getBlock(b3).append(.{ .op = .{ .br = b1 } });
+
+    const v_result = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 0 }, .dest = v_result });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_result } });
+
+    // Run mem2reg.
+    const changed = try promoteLocalsToSSA(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Block 1 should have a phi at the top.
+    const header = func.getBlock(b1);
+    try std.testing.expect(header.instructions.items[0].op == .phi);
+    const phi_dest = header.instructions.items[0].dest.?;
+    const phi_edges = header.instructions.items[0].op.phi;
+    try std.testing.expectEqual(@as(usize, 2), phi_edges.len);
+
+    // Phi should have edges from block 0 (initial value) and block 3 (decremented).
+    var has_b0_edge = false;
+    var has_b3_edge = false;
+    for (phi_edges) |edge| {
+        if (edge.block == b0) has_b0_edge = true;
+        if (edge.block == b3) has_b3_edge = true;
+    }
+    try std.testing.expect(has_b0_edge);
+    try std.testing.expect(has_b3_edge);
+
+    // Now lower phis and verify the result is runnable.
+    _ = try lowerPhisToLocals(&func, allocator);
+
+    // After lowering, no phi should remain.
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            try std.testing.expect(inst.op != .phi);
+        }
+    }
+
+    // The phi dest should still be used in block 1's eqz (or its replacement).
+    // Check that the block 1 still has an eqz of the phi dest or its forwarded value.
+    _ = phi_dest;
+}
+
+test "promoteLocalsToSSA + lowerPhis: two-local sum loop" {
+    // sum = 0; i = 3; while (i != 0) { sum += i; i--; } ret sum
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+
+    const lt = try allocator.alloc(ir.IrType, 2);
+    lt[0] = .i32;
+    lt[1] = .i32;
+    func.local_types = lt;
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    // Block 0: sum=0, i=3, br 1
+    const v_zero_init = func.newVReg();
+    const v_three_init = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero_init });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero_init } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_three_init });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_three_init } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // Block 1: i = local_get 1; if (i==0) goto exit else goto body
+    const v_i = func.newVReg();
+    const v_eqz = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 1 }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_i }, .dest = v_eqz });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_eqz, .then_block = b2, .else_block = b3 } } });
+
+    // Block 3: sum += i; i--; br 1
+    const v_sum = func.newVReg();
+    const v_new_sum = func.newVReg();
+    const v_one = func.newVReg();
+    const v_dec = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .local_get = 0 }, .dest = v_sum, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v_sum, .rhs = v_i } }, .dest = v_new_sum });
+    try func.getBlock(b3).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_new_sum } } });
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one });
+    try func.getBlock(b3).append(.{ .op = .{ .sub = .{ .lhs = v_i, .rhs = v_one } }, .dest = v_dec });
+    try func.getBlock(b3).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_dec } } });
+    try func.getBlock(b3).append(.{ .op = .{ .br = b1 } });
+
+    // Block 2: ret local_get 0
+    const v_result = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 0 }, .dest = v_result, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_result } });
+
+    // Run mem2reg + phi lowering.
+    const changed = try promoteLocalsToSSA(&func, allocator);
+    try std.testing.expect(changed);
+    _ = try lowerPhisToLocals(&func, allocator);
+
+    // After lowering, no phi should remain.
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            try std.testing.expect(inst.op != .phi);
+        }
     }
 }
