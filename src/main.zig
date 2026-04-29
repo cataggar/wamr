@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (show_version) {
-        std.debug.print("iwasm (Zig) {s}\n", .{wamr.version.string});
+        printVersion();
         if (wasm_path == null) return;
     }
 
@@ -335,9 +335,17 @@ fn runWasm(
     };
 }
 
+fn versionLine() []const u8 {
+    return "wamr " ++ wamr.version.string ++ "\n";
+}
+
+fn printVersion() void {
+    std.debug.print("{s}", .{versionLine()});
+}
+
 fn printUsage() void {
     std.debug.print(
-        \\iwasm (Zig) - WebAssembly Micro Runtime
+        \\wamr - WebAssembly Micro Runtime
         \\
         \\Usage: wamr [options] <file.wasm> [args...]
         \\
@@ -349,4 +357,8 @@ fn printUsage() void {
         \\  --listen=<ip:port>       Serve a WASI HTTP component on a TCP address
         \\
     , .{});
+}
+
+test "version line uses wamr name and build version" {
+    try std.testing.expectEqualStrings("wamr " ++ wamr.version.string ++ "\n", versionLine());
 }

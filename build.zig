@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    // ── iwasm executable ───────────────────────────────────────────────
+    // ── wamr executable ────────────────────────────────────────────────
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

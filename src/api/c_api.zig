@@ -11,6 +11,7 @@ const instance_mod = @import("../runtime/interpreter/instance.zig");
 const types = @import("../runtime/common/types.zig");
 
 const backing_allocator = std.heap.page_allocator;
+const version_cstr = config.version ++ "\x00";
 
 /// Internal wrapper that pairs a WasmModule with its arena.
 const ModuleWrapper = struct {
@@ -86,7 +87,7 @@ export fn wasm_runtime_destroy() void {}
 
 /// Get the version string.
 export fn wasm_runtime_get_version() [*:0]const u8 {
-    return "0.1.0-zig";
+    return version_cstr;
 }
 
 /// Load a module from binary data.
@@ -172,18 +173,20 @@ test "c_api: init and destroy" {
 test "c_api: version string" {
     const ver = wasm_runtime_get_version();
     const slice = std.mem.span(ver);
-    try std.testing.expectEqualStrings("0.1.0-zig", slice);
+    try std.testing.expectEqualStrings(config.version, slice);
 }
 
 /// (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add)
 const add_wasm = [_]u8{
     0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
     // type section: 1 type — (param i32 i32) (result i32)
-    0x01, 0x07, 0x01, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F,
+    0x01, 0x07, 0x01, 0x60, 0x02, 0x7F, 0x7F, 0x01,
+    0x7F,
     // function section: 1 function, type index 0
     0x03, 0x02, 0x01, 0x00,
     // export section: "add" -> func 0
-    0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00,
+    0x07, 0x07, 0x01,
+    0x03, 0x61, 0x64, 0x64, 0x00, 0x00,
     // code section: 1 body
     0x0A, 0x09, 0x01, // section id, size, count
     0x07, 0x00, // body size, local decl count
