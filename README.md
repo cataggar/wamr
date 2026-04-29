@@ -62,7 +62,9 @@ $ ./zig-out/bin/spec-test-runner tests/spec-json
 
 Experimental support for the [WebAssembly Component Model][cm] and
 [WASI Preview 2][p2]. Run a component with `wamr component.wasm`; it is
-auto-detected by the binary's version word.
+auto-detected by the binary's version word. Components that export
+`wasi:http/incoming-handler.handle` can be served with
+`wamr --listen=127.0.0.1:8080 component.wasm`.
 
 [cm]: https://component-model.bytecodealliance.org/
 [p2]: https://github.com/WebAssembly/WASI/blob/main/wasip2/README.md
@@ -87,13 +89,16 @@ What works today:
   - `wasi:sockets/{network,instance-network,tcp,tcp-create-socket,udp,
     udp-create-socket,ip-name-lookup}` — resource binding + handle
     allocation; outbound I/O default-deny pending capability allow-list
-  - `wasi:http/{types,outgoing-handler,incoming-handler}` — all 11
-    resource types registered; outbound handler default-deny pending
-    real `std.http.Client` integration
+  - `wasi:http/{types,outgoing-handler,incoming-handler}` — resource
+    tables, outbound requests via `std.http.Client` when network access is
+    allowed, and an opt-in incoming HTTP/1.1 server entry point via
+    `--listen=<ip:port>`. The incoming server currently handles one request
+    per connection, closes after each response, and supports bounded
+    `Content-Length` request bodies (no chunked request decoding yet).
 
 Deferred follow-ups (not blocking preview-2 component loading) are
-tracked individually: real outbound HTTP+TLS, sockets capability
-allow-list, real TCP/UDP I/O, real DNS, real filesystem timestamps.
+tracked individually: HTTP TLS/chunked/server concurrency, sockets
+capability allow-list refinements, DNS, and filesystem timestamp fidelity.
 
 ## License
 
