@@ -18,6 +18,7 @@ pub const Class = enum {
     alu,
     mul,
     compare,
+    load,
 };
 
 pub const Metadata = struct {
@@ -167,6 +168,16 @@ fn appendScheduledWindow(
         if (inst.dest) |dest| try defs.put(dest, idx);
     }
 
+    var last_memory: ?usize = null;
+    for (window, 0..) |inst, idx| {
+        if (!isOrderedMemory(inst)) continue;
+        if (last_memory) |pred| {
+            try nodes[pred].succs.append(allocator, idx);
+            nodes[idx].preds_left += 1;
+        }
+        last_memory = idx;
+    }
+
     var rev_idx = nodes.len;
     while (rev_idx > 0) {
         rev_idx -= 1;
@@ -255,10 +266,13 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .ge_u,
         => if (def != null and isIntegerType(inst.type)) .compare else .barrier,
 
+        .load => if (def != null) .load else .barrier,
+
         else => .barrier,
     };
 
     const latency: u8 = switch (class) {
+        .load => 4,
         .mul => 3,
         .constant, .alu, .compare => 1,
         .barrier => 0,
@@ -274,6 +288,13 @@ pub fn metadata(inst: ir.Inst) Metadata {
 
 fn isIntegerType(ty: ir.IrType) bool {
     return ty == .i32 or ty == .i64;
+}
+
+fn isOrderedMemory(inst: ir.Inst) bool {
+    return switch (inst.op) {
+        .load => true,
+        else => false,
+    };
 }
 
 pub fn forEachUse(
@@ -448,7 +469,8 @@ test "metadata marks pure integer ops schedulable and hazards as barriers" {
     try std.testing.expectEqual(@as(u8, 3), metadata(mul).latency);
 
     const load = ir.Inst{ .op = .{ .load = .{ .base = 1, .offset = 0, .size = 4 } }, .dest = 2, .type = .i32 };
-    try std.testing.expect(metadata(load).barrier);
+    try std.testing.expect(!metadata(load).barrier);
+    try std.testing.expectEqual(Class.load, metadata(load).class);
 
     const call = ir.Inst{ .op = .{ .call = .{ .func_idx = 0, .args = &.{1} } }, .dest = 2, .type = .i32 };
     try std.testing.expect(metadata(call).barrier);
@@ -503,4 +525,49 @@ test "local scheduler keeps barriers fixed" {
     try std.testing.expectEqual(@as(?ir.VReg, 3), scheduled[2].dest);
     try std.testing.expectEqual(@as(?ir.VReg, 4), scheduled[3].dest);
     try std.testing.expectEqual(@as(?ir.VReg, 5), scheduled[4].dest);
+}
+
+test "local scheduler can overlap load latency with independent ALU" {
+    const insts = [_]ir.Inst{
+        .{ .op = .{ .iconst_32 = 10 }, .dest = 1, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 20 }, .dest = 2, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 1, .rhs = 2 } }, .dest = 3, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 0 }, .dest = 4, .type = .i32 },
+        .{ .op = .{ .load = .{ .base = 4, .offset = 0, .size = 4 } }, .dest = 5, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 5, .rhs = 3 } }, .dest = 6, .type = .i32 },
+    };
+
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    defer std.testing.allocator.free(scheduled);
+
+    try std.testing.expectEqual(@as(?ir.VReg, 4), scheduled[0].dest);
+    try std.testing.expectEqual(@as(?ir.VReg, 5), scheduled[1].dest);
+    try std.testing.expectEqual(@as(?ir.VReg, 1), scheduled[2].dest);
+    try std.testing.expectEqual(@as(?ir.VReg, 2), scheduled[3].dest);
+    try std.testing.expectEqual(@as(?ir.VReg, 3), scheduled[4].dest);
+    try std.testing.expectEqual(@as(?ir.VReg, 6), scheduled[5].dest);
+}
+
+test "local scheduler preserves load trap order" {
+    const insts = [_]ir.Inst{
+        .{ .op = .{ .iconst_32 = 0 }, .dest = 1, .type = .i32 },
+        .{ .op = .{ .load = .{ .base = 1, .offset = 0, .size = 4 } }, .dest = 2, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 4 }, .dest = 3, .type = .i32 },
+        .{ .op = .{ .load = .{ .base = 3, .offset = 0, .size = 4 } }, .dest = 4, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 4, .rhs = 2 } }, .dest = 5, .type = .i32 },
+    };
+
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    defer std.testing.allocator.free(scheduled);
+
+    var first_load_pos: ?usize = null;
+    var second_load_pos: ?usize = null;
+    for (scheduled, 0..) |inst, idx| {
+        if (inst.dest == 2) first_load_pos = idx;
+        if (inst.dest == 4) second_load_pos = idx;
+    }
+
+    try std.testing.expect(first_load_pos != null);
+    try std.testing.expect(second_load_pos != null);
+    try std.testing.expect(first_load_pos.? < second_load_pos.?);
 }
