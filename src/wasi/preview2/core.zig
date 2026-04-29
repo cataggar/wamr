@@ -35,6 +35,8 @@ fn fillRandom(buf: []u8) void {
         _ = processPrng(buf.ptr, buf.len);
     } else if (builtin.os.tag == .linux) {
         _ = std.os.linux.getrandom(buf.ptr, buf.len, 0);
+    } else if (builtin.os.tag == .wasi) {
+        _ = std.os.wasi.random_get(buf.ptr, buf.len);
     } else {
         // macOS and other BSDs
         std.c.arc4random_buf(buf.ptr, buf.len);
