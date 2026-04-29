@@ -1089,60 +1089,111 @@ fn hasSideEffect(inst: ir.Inst) bool {
 
 // ── Common Subexpression Elimination ────────────────────────────────────────
 
-/// Block-local CSE: deduplicate identical pure, non-trapping
-/// instructions within a basic block.
+/// Dominator-scoped CSE: deduplicate identical pure, non-trapping
+/// instructions across basic blocks using the dominator tree.
 ///
-/// **Why block-local only:** A previous iteration of this pass walked
-/// the dominator tree to extend CSE across blocks. That version was
-/// reverted because it was unsound against the AArch64 codegen, which
-/// iterates `func.blocks.items` in raw block-id order rather than RPO
-/// or dom-tree order. Cross-block CSE picks a canonical def in some
-/// dominator block; if that block has a higher block-id than the
-/// blocks where the (formerly redundant) def's uses live, codegen
-/// observes the use before the def and fails with `error.UnboundVReg`.
-/// CoreMark hits this on a `iconst_32 1` deduplicated across many
-/// blocks whose def-block id is far higher than its use-blocks'.
+/// Walks the dominator tree in DFS order, maintaining a scoped
+/// expression table. When a dominated block computes an expression
+/// already available from a dominator, the redundant def's uses are
+/// rewritten to the earlier def via `replaceVReg`. The now-dead
+/// instruction is left in place for `deadCodeElimination` to clean up.
 ///
-/// Re-enabling cross-block CSE requires either:
-///   1. Teaching codegen to iterate blocks in dom-tree / RPO order; or
-///   2. Restricting CSE to pick a representative whose block-id is
-///      ≤ all candidate use blocks.
-/// Tracked under issue #136. The dom/loop analysis code in
-/// `analysis.zig` is independent and remains in place for future use
-/// (LICM, GVN, etc.).
+/// This strictly subsumes block-local CSE: within a single block the
+/// table accumulates entries exactly as the old linear scan did, but
+/// entries also propagate down to dom-tree children and are restored
+/// (snapshot/restore) when backtracking — the same pattern used by
+/// `elideRedundantBoundsChecks`.
 ///
-/// Replacement is via `replaceVReg`; the now-redundant instruction is
-/// left in place with its uses rewritten and `deadCodeElimination`
-/// removes it.
+/// Safety (SSA): each VReg has exactly one definition. If block A
+/// dominates block B, then A also dominates every use of B's defs
+/// (because the def in B dominates its own uses, and A dominates B).
+/// Therefore `replaceVReg(func, v_B, v_A)` is globally correct.
+///
+/// History: a prior cross-block CSE was reverted because codegen
+/// iterated blocks in raw id order, not RPO. PR #195 fixed block
+/// ordering and emission order, making this safe again.
 pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    _ = allocator;
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+
+    const nblocks = func.blocks.items.len;
+
+    // Build dom-tree children lists.
+    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer {
+        for (children) |*list| list.deinit(allocator);
+        allocator.free(children);
+    }
+    for (children) |*list| list.* = .empty;
+    for (0..nblocks) |i| {
+        const bid: ir.BlockId = @intCast(i);
+        const idom = dom.idom[bid] orelse continue;
+        if (idom == bid) continue; // entry block
+        try children[idom].append(allocator, bid);
+    }
+
+    // Expression table: flat append-only list with snapshot/restore.
+    const ExprEntry = struct { inst: ir.Inst, dest: ir.VReg };
+    var table: std.ArrayList(ExprEntry) = .empty;
+    defer table.deinit(allocator);
+
+    const Frame = struct {
+        bid: ir.BlockId,
+        phase: u1,
+        snap_len: usize,
+    };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+
+    if (dom.idom[0] == null) return false;
+    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0 });
+
     var changed = false;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.phase == 1) {
+            // Backtrack: restore expression table.
+            table.shrinkRetainingCapacity(top.snap_len);
+            _ = stack.pop();
+            continue;
+        }
+        const bid = top.bid;
+        top.phase = 1;
+        top.snap_len = table.items.len;
 
-    for (func.blocks.items) |*block| {
-        var i: usize = 0;
-        while (i < block.instructions.items.len) {
-            const inst = &block.instructions.items[i];
-            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) {
-                i += 1;
-                continue;
-            }
+        const block = &func.blocks.items[bid];
+        for (block.instructions.items) |*inst| {
+            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) continue;
 
-            // Look backwards within the same block for a matching def.
-            // Type check guards against same-tag-different-type aliasing
-            // (e.g. f32.convert_i32_s vs f64.convert_i32_s lower to the
-            // same IR tag).
-            var j: usize = 0;
-            while (j < i) : (j += 1) {
-                const earlier = block.instructions.items[j];
-                if (earlier.dest != null and earlier.type == inst.type and sameOp(earlier, inst.*)) {
-                    replaceVReg(func, inst.dest.?, earlier.dest.?);
+            // Scan table backwards for nearest dominating match.
+            // Later entries are from closer ancestors, so backwards
+            // scan picks the nearest def and minimises live-range
+            // inflation.
+            var found = false;
+            var k: usize = table.items.len;
+            while (k > 0) {
+                k -= 1;
+                const entry = &table.items[k];
+                if (entry.inst.type == inst.type and sameOp(entry.inst, inst.*)) {
+                    replaceVReg(func, inst.dest.?, entry.dest);
                     changed = true;
+                    found = true;
                     break;
                 }
             }
-            i += 1;
+            if (!found) {
+                try table.append(allocator, .{ .inst = inst.*, .dest = inst.dest.? });
+            }
+        }
+
+        // Push dom-tree children for DFS traversal.
+        for (children[bid].items) |c| {
+            try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0 });
         }
     }
+
     return changed;
 }
 
@@ -1170,8 +1221,12 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
     const TagType = std.meta.Tag(ir.Inst.Op);
     if (@as(TagType, a.op) != @as(TagType, b.op)) return false;
     return switch (a.op) {
+        // Constants
         .iconst_32 => |v| v == b.op.iconst_32,
         .iconst_64 => |v| v == b.op.iconst_64,
+        .fconst_32 => |v| @as(u32, @bitCast(v)) == @as(u32, @bitCast(b.op.fconst_32)),
+        .fconst_64 => |v| @as(u64, @bitCast(v)) == @as(u64, @bitCast(b.op.fconst_64)),
+        // Binary integer arithmetic / logic / shifts / rotations
         .add => |bin| bin.lhs == b.op.add.lhs and bin.rhs == b.op.add.rhs,
         .sub => |bin| bin.lhs == b.op.sub.lhs and bin.rhs == b.op.sub.rhs,
         .mul => |bin| bin.lhs == b.op.mul.lhs and bin.rhs == b.op.mul.rhs,
@@ -1181,15 +1236,29 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .shl => |bin| bin.lhs == b.op.shl.lhs and bin.rhs == b.op.shl.rhs,
         .shr_s => |bin| bin.lhs == b.op.shr_s.lhs and bin.rhs == b.op.shr_s.rhs,
         .shr_u => |bin| bin.lhs == b.op.shr_u.lhs and bin.rhs == b.op.shr_u.rhs,
+        .rotl => |bin| bin.lhs == b.op.rotl.lhs and bin.rhs == b.op.rotl.rhs,
+        .rotr => |bin| bin.lhs == b.op.rotr.lhs and bin.rhs == b.op.rotr.rhs,
+        // Integer comparisons
         .eq => |bin| bin.lhs == b.op.eq.lhs and bin.rhs == b.op.eq.rhs,
         .ne => |bin| bin.lhs == b.op.ne.lhs and bin.rhs == b.op.ne.rhs,
+        .lt_s => |bin| bin.lhs == b.op.lt_s.lhs and bin.rhs == b.op.lt_s.rhs,
+        .lt_u => |bin| bin.lhs == b.op.lt_u.lhs and bin.rhs == b.op.lt_u.rhs,
+        .gt_s => |bin| bin.lhs == b.op.gt_s.lhs and bin.rhs == b.op.gt_s.rhs,
+        .gt_u => |bin| bin.lhs == b.op.gt_u.lhs and bin.rhs == b.op.gt_u.rhs,
+        .le_s => |bin| bin.lhs == b.op.le_s.lhs and bin.rhs == b.op.le_s.rhs,
+        .le_u => |bin| bin.lhs == b.op.le_u.lhs and bin.rhs == b.op.le_u.rhs,
+        .ge_s => |bin| bin.lhs == b.op.ge_s.lhs and bin.rhs == b.op.ge_s.rhs,
+        .ge_u => |bin| bin.lhs == b.op.ge_u.lhs and bin.rhs == b.op.ge_u.rhs,
+        // Unary integer
         .eqz => |v| v == b.op.eqz,
         .clz => |v| v == b.op.clz,
         .ctz => |v| v == b.op.ctz,
         .popcnt => |v| v == b.op.popcnt,
+        // Sign extensions
         .extend8_s => |v| v == b.op.extend8_s,
         .extend16_s => |v| v == b.op.extend16_s,
         .extend32_s => |v| v == b.op.extend32_s,
+        // Float unary
         .f_neg => |v| v == b.op.f_neg,
         .f_abs => |v| v == b.op.f_abs,
         .f_sqrt => |v| v == b.op.f_sqrt,
@@ -1197,6 +1266,18 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .f_floor => |v| v == b.op.f_floor,
         .f_trunc => |v| v == b.op.f_trunc,
         .f_nearest => |v| v == b.op.f_nearest,
+        // Float binary
+        .f_min => |bin| bin.lhs == b.op.f_min.lhs and bin.rhs == b.op.f_min.rhs,
+        .f_max => |bin| bin.lhs == b.op.f_max.lhs and bin.rhs == b.op.f_max.rhs,
+        .f_copysign => |bin| bin.lhs == b.op.f_copysign.lhs and bin.rhs == b.op.f_copysign.rhs,
+        // Float comparisons
+        .f_eq => |bin| bin.lhs == b.op.f_eq.lhs and bin.rhs == b.op.f_eq.rhs,
+        .f_ne => |bin| bin.lhs == b.op.f_ne.lhs and bin.rhs == b.op.f_ne.rhs,
+        .f_lt => |bin| bin.lhs == b.op.f_lt.lhs and bin.rhs == b.op.f_lt.rhs,
+        .f_gt => |bin| bin.lhs == b.op.f_gt.lhs and bin.rhs == b.op.f_gt.rhs,
+        .f_le => |bin| bin.lhs == b.op.f_le.lhs and bin.rhs == b.op.f_le.rhs,
+        .f_ge => |bin| bin.lhs == b.op.f_ge.lhs and bin.rhs == b.op.f_ge.rhs,
+        // Conversions
         .wrap_i64 => |v| v == b.op.wrap_i64,
         .extend_i32_s => |v| v == b.op.extend_i32_s,
         .extend_i32_u => |v| v == b.op.extend_i32_u,
@@ -1217,6 +1298,12 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .trunc_sat_f32_u => |v| v == b.op.trunc_sat_f32_u,
         .trunc_sat_f64_s => |v| v == b.op.trunc_sat_f64_s,
         .trunc_sat_f64_u => |v| v == b.op.trunc_sat_f64_u,
+        // div/rem: covered by isPure+hasSideEffect guard; float variants
+        // (side-effect-free) reach here.
+        .div_s => |bin| bin.lhs == b.op.div_s.lhs and bin.rhs == b.op.div_s.rhs,
+        .div_u => |bin| bin.lhs == b.op.div_u.lhs and bin.rhs == b.op.div_u.rhs,
+        .rem_s => |bin| bin.lhs == b.op.rem_s.lhs and bin.rhs == b.op.rem_s.rhs,
+        .rem_u => |bin| bin.lhs == b.op.rem_u.lhs and bin.rhs == b.op.rem_u.rhs,
         else => false,
     };
 }
@@ -3331,12 +3418,10 @@ test "CSE: deduplicates identical add" {
     try std.testing.expectEqual(ir.Inst.Op{ .ret = v2 }, block.instructions.items[4].op);
 }
 
-test "CSE: cross-block CSE intentionally not performed" {
-    // Block-local CSE only — see commonSubexprElimination doc comment for
-    // why cross-block CSE was reverted (codegen iterates by raw block-id,
-    // not RPO, breaking dominator-based rewrites in CoreMark).
+test "CSE: cross-block CSE via dominator tree" {
     // b0 defines add(v0, v1) = v2; b0 branches to b1; b1 recomputes the
-    // same add into v3. The current pass must NOT rewrite v3 to v2.
+    // same add into v3. Since b0 dominates b1, the dominator-scoped CSE
+    // rewrites v3's uses to v2.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 0);
     defer func.deinit();
@@ -3355,11 +3440,10 @@ test "CSE: cross-block CSE intentionally not performed" {
     try func.getBlock(b1).append(.{ .op = .{ .ret = v3 } });
 
     const changed = try commonSubexprElimination(&func, allocator);
-    try std.testing.expect(!changed);
+    try std.testing.expect(changed);
 
-    // b1's add is preserved as a fresh def of v3, and ret still uses v3.
-    try std.testing.expectEqual(@as(?ir.VReg, v3), func.getBlock(b1).instructions.items[0].dest);
-    try std.testing.expectEqual(ir.Inst.Op{ .ret = v3 }, func.getBlock(b1).instructions.items[1].op);
+    // b1's ret should now reference v2 (the dominator's def).
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v2 }, func.getBlock(b1).instructions.items[1].op);
 }
 
 test "CSE: sibling defs do not match at merge" {
@@ -3462,9 +3546,9 @@ test "CSE: trapping int div_s is not deduplicated" {
     try std.testing.expectEqual(@as(?ir.VReg, v3), block.instructions.items[3].dest);
 }
 
-test "CSE: loop header def not rewritten in body (block-local only)" {
-    // Block-local CSE only — see commonSubexprElimination doc comment.
-    // The loop body's redundant add is NOT rewritten to the header's def.
+test "CSE: loop header def rewritten in body (dom-scoped)" {
+    // The loop header dominates the body, so the body's redundant add IS
+    // rewritten to the header's def.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 0, 1);
     defer func.deinit();
@@ -3494,11 +3578,11 @@ test "CSE: loop header def not rewritten in body (block-local only)" {
     try func.getBlock(exit).append(.{ .op = .{ .ret = v_h } });
 
     const changed = try commonSubexprElimination(&func, allocator);
-    try std.testing.expect(!changed);
+    try std.testing.expect(changed);
 
-    // local_set still references v_body (no cross-block rewrite).
+    // local_set now references v_h (the header's dominating def).
     try std.testing.expectEqual(
-        ir.Inst.Op{ .local_set = .{ .idx = 0, .val = v_body } },
+        ir.Inst.Op{ .local_set = .{ .idx = 0, .val = v_h } },
         func.getBlock(body).instructions.items[1].op,
     );
 }
@@ -3526,6 +3610,98 @@ test "CSE: unreachable block is skipped" {
 
     // b1's add is untouched.
     try std.testing.expectEqual(@as(?ir.VReg, v2), func.getBlock(b1).instructions.items[2].dest);
+}
+
+test "CSE: diamond — dominator's def reaches both arms" {
+    // b0 computes add(v0,v1)=v2, then branches to b1 and b2.
+    // Both b1 and b2 recompute the same add. b0 dominates both,
+    // so both should be rewritten to v2.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg(); // add in b0
+    const cond = func.newVReg();
+    const v_b1 = func.newVReg(); // redundant add in b1
+    const v_b2 = func.newVReg(); // redundant add in b2
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_b1 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v_b1 } });
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_b2 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_b2 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } }); // unused merge point
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Both arms' rets should reference v2 from b0.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v2 }, func.getBlock(b1).instructions.items[1].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v2 }, func.getBlock(b2).instructions.items[1].op);
+}
+
+test "CSE: chain — grandparent dominates grandchild" {
+    // b0 → b1 → b2. b0 computes add, b2 recomputes it.
+    // b0 dominates b1, b1 dominates b2, so b0's def should reach b2.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v_b0 = func.newVReg();
+    const v_b2 = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_b0 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_b2 });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_b2 } });
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(changed);
+
+    // b2's ret should reference v_b0 from b0.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_b0 }, func.getBlock(b2).instructions.items[1].op);
+}
+
+test "CSE: iconst_32 dedup across blocks" {
+    // b0 defines iconst_32 42 = v0; b1 redefines iconst_32 42 = v1.
+    // Since b0 dominates b1, v1's uses should be rewritten to v0.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v1 });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = v1 } });
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(changed);
+
+    // b1's ret should reference v0 from b0.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v0 }, func.getBlock(b1).instructions.items[1].op);
 }
 
 test "combined pipeline: fold + DCE" {
