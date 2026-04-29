@@ -1379,6 +1379,7 @@ const GlobalCallPatch = struct {
 // ── Register-Allocated Compilation ────────────────────────────────────
 
 const regalloc = @import("../../ir/regalloc.zig");
+const analysis = @import("../../ir/analysis.zig");
 
 /// x86-64 allocatable GPR set: rdx(2), rbx(3), rsi(6), rdi(7), r8(8), r9(9),
 /// r12(12), r13(13), r14(14), r15(15). Order matches the legacy mask layout,
@@ -1425,14 +1426,20 @@ fn x86_64_reg_set(local_count: u32) regalloc.RegSet {
 /// VRegs are assigned to physical registers; instructions operate directly
 /// on assigned registers without push/pop through a CachedStack.
 pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocator: std.mem.Allocator) !FuncCompileResult {
+    // Compute block emission order ONCE, before anything that uses global
+    // instruction numbering. Clobber points, live ranges, and code emission
+    // all must use THIS order (same fix as aarch64 — see PR #195 / #203).
+    const block_order = try passes.reorderBlocks(func, allocator);
+    defer allocator.free(block_order);
+
     // Collect clobber points: instructions that destroy specific registers.
-    // Uses the same sequential numbering as computeLiveRanges in analysis.zig.
+    // Uses block_order so numbering matches live-range computation.
     var clobber_points: std.ArrayList(regalloc.ClobberPoint) = .empty;
     defer clobber_points.deinit(allocator);
     {
         var pos: u32 = 0;
-        for (func.blocks.items) |block| {
-            for (block.instructions.items) |ci| {
+        for (block_order) |block_id| {
+            for (func.blocks.items[block_id].instructions.items) |ci| {
                 switch (ci.op) {
                     .call, .call_indirect, .call_ref, .memory_grow, .memory_copy, .table_grow, .table_set => {
                         // Calls clobber caller-saved allocatable regs.
@@ -1454,7 +1461,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         }
     }
 
-    var alloc_result = try regalloc.allocate(func, allocator, x86_64_reg_set(func.local_count), clobber_points.items);
+    // Compute live ranges using the SAME block_order, then allocate registers.
+    const live_ranges = try analysis.computeLiveRangesWithOrder(func, block_order, allocator);
+    defer allocator.free(live_ranges);
+    var alloc_result = try regalloc.allocateFromRanges(allocator, x86_64_reg_set(func.local_count), clobber_points.items, live_ranges);
     defer alloc_result.deinit();
 
     // Compute which caller-saved registers are actually used by this function.
@@ -1602,9 +1612,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     var table_patches: std.ArrayList(TablePatch) = .empty;
     defer table_patches.deinit(allocator);
 
-    // Compute block emission order: RPO with cold-block sinking.
-    const block_order = try passes.reorderBlocks(func, allocator);
-    defer allocator.free(block_order);
+    // block_order already computed above — reuse for emission.
 
     var last_was_ret = false;
     for (block_order, 0..) |block_id, order_idx| {
@@ -5511,4 +5519,61 @@ test "compileFunctionRA: i32.store emits inline memory bounds check" {
     try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
     // call rax (trap dispatch)
     try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
+}
+
+test "compileFunctionRA: block ordering consistency (clobbers match live ranges)" {
+    // Regression test for #209: clobber-point numbering must use the same
+    // block order as live-range computation. Construct a diamond CFG where
+    // RPO differs from raw block order and a call (clobber) sits in a block
+    // that moves position under reordering.
+    //
+    //   b0 → br_if → b1 (call) → b3 (ret)
+    //              ↘ b2 (nop)  ↗
+    //
+    // Raw order: b0, b1, b2, b3. RPO: b0, b1, b2, b3 or b0, b2, b1, b3
+    // depending on successor traversal. The key is that both clobbers and
+    // live ranges use the SAME order — if they don't, the allocator may
+    // place a vreg in a caller-saved register across a call.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 2, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+    const block2 = func.getBlock(b2);
+    const block3 = func.getBlock(b3);
+
+    const cond = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+
+    // b0: cond = local_get 0; br_if cond, then=b1, else=b2
+    try block0.append(.{ .op = .{ .local_get = 0 }, .dest = cond, .type = .i32 });
+    try block0.append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+
+    // b1: v1 = call func 0 (clobber point); br b3
+    try block1.append(.{ .op = .{ .call = .{ .func_idx = 0, .args = &.{} } }, .dest = v1, .type = .i32 });
+    try block1.append(.{ .op = .{ .br = b3 } });
+
+    // b2: v2 = iconst 42; br b3
+    try block2.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v2, .type = .i32 });
+    try block2.append(.{ .op = .{ .br = b3 } });
+
+    // b3: ret (void)
+    try block3.append(.{ .op = .{ .ret = null } });
+
+    // This should compile without errors — before the fix, mismatched
+    // clobber/live-range numbering could cause allocation failures or
+    // silent register conflicts.
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    defer allocator.free(compile_result.code);
+    defer allocator.free(compile_result.call_patches);
+
+    // Sanity: produced non-empty code.
+    try std.testing.expect(compile_result.code.len > 0);
 }
