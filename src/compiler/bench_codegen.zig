@@ -293,6 +293,23 @@ fn bodyDivByConst(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = q } }) catch unreachable;
 }
 
+/// Prior checked base access followed by `add base, const` feeding a load.
+/// With `foldLoadStoreOffset`, the second load uses `base` with a larger
+/// immediate offset and the add becomes dead.
+fn bodyAddIntoLoad(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const base = func.newVReg();
+    const guard = func.newVReg();
+    const c = func.newVReg();
+    const addr = func.newVReg();
+    const loaded = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = base, .offset = 0, .size = 4, .checked_end = 32 } }, .dest = guard, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = c, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = c } }, .dest = addr, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = addr, .offset = 4, .size = 4 } }, .dest = loaded, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = loaded } }) catch unreachable;
+}
+
 // ── Branch benchmark bodies ───────────────────────────────────────────
 
 /// compare + br_if diamond — exercises Jcc fusion and branch layout.
@@ -614,6 +631,7 @@ pub fn main() !void {
         .{ .name = "mul(x, 8) → shl(x, 3)", .body = &bodyMulByPow2 },
         .{ .name = "3× load same base (hoisted)", .body = &bodyConsecutiveLoads },
         .{ .name = "div_u by const 7 (magic mul)", .body = &bodyDivByConst },
+        .{ .name = "add base,const → load offset", .body = &bodyAddIntoLoad },
         .{ .name = "4× load + sum (bounds elide)", .body = &bodyLoadStoreMulti },
         .{ .name = "reg pressure (12 live vals)", .body = &bodyRegPressure },
     };

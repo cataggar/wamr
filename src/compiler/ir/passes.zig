@@ -1981,6 +1981,167 @@ fn patchSegment(seg_first: *std.AutoHashMap(ir.VReg, SegEntry)) bool {
     return patched;
 }
 
+// ── Address-mode folding (load/store offset) ────────────────────────────────
+
+/// Fold `add base, iconst_32 C` feeding into a `load`/`store` by absorbing
+/// `C` into the memory immediate offset:
+///
+///     v_addr = add base, C
+///     load  v_addr, offset=N  =>  load  base, offset=N+C
+///
+/// This is only sound when a dominating bounds check has already proven
+/// `base + (N+C) + size <= memory_size`. Without that proof, folding can
+/// change wrapping semantics: Wasm `i32.add` wraps, but the load/store
+/// effective address uses the zero-extended base plus a non-wrapping offset.
+pub fn foldLoadStoreOffset(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    if (dom.idom[0] == null) return false;
+
+    const nblocks = func.blocks.items.len;
+    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer {
+        for (children) |*list| list.deinit(allocator);
+        allocator.free(children);
+    }
+    for (children) |*list| list.* = .empty;
+    for (0..nblocks) |i| {
+        const bid: ir.BlockId = @intCast(i);
+        const idom = dom.idom[bid] orelse continue;
+        if (idom == bid) continue;
+        try children[idom].append(allocator, bid);
+    }
+
+    const AddInfo = struct { base: ir.VReg, offset: u32 };
+
+    var table: std.ArrayList(BoundsEntry) = .empty;
+    defer table.deinit(allocator);
+    var valid_start: usize = 0;
+
+    const Frame = struct { bid: ir.BlockId, phase: u1, snap_len: usize, snap_valid_start: usize };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+
+    var iconst32 = std.AutoHashMap(ir.VReg, i32).init(allocator);
+    defer iconst32.deinit();
+    var add_info = std.AutoHashMap(ir.VReg, AddInfo).init(allocator);
+    defer add_info.deinit();
+    var block_checked = std.AutoHashMap(ir.VReg, u64).init(allocator);
+    defer block_checked.deinit();
+
+    var changed = false;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.phase == 1) {
+            table.shrinkRetainingCapacity(top.snap_len);
+            valid_start = top.snap_valid_start;
+            _ = stack.pop();
+            continue;
+        }
+
+        const bid = top.bid;
+        top.phase = 1;
+        top.snap_len = table.items.len;
+        top.snap_valid_start = valid_start;
+
+        iconst32.clearRetainingCapacity();
+        add_info.clearRetainingCapacity();
+        block_checked.clearRetainingCapacity();
+
+        const block = &func.blocks.items[bid];
+        for (block.instructions.items) |*inst| {
+            switch (inst.op) {
+                .iconst_32 => |c| {
+                    if (inst.dest) |d| try iconst32.put(d, c);
+                },
+                .add => |bin| {
+                    if (inst.type != .i32) continue;
+                    const dest = inst.dest orelse continue;
+                    if (iconst32.get(bin.rhs)) |c| {
+                        if (c >= 0) try add_info.put(dest, .{ .base = bin.lhs, .offset = @intCast(c) });
+                    } else if (iconst32.get(bin.lhs)) |c| {
+                        if (c >= 0) try add_info.put(dest, .{ .base = bin.rhs, .offset = @intCast(c) });
+                    }
+                },
+                .load => |*ld| {
+                    if (add_info.get(ld.base)) |info| {
+                        const access_end = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
+                        const new_end: ?u64 = std.math.add(u64, @as(u64, info.offset), access_end) catch null;
+                        const new_offset: ?u64 = std.math.add(u64, @as(u64, info.offset), @as(u64, ld.offset)) catch null;
+                        if (new_end) |end| {
+                            if (new_offset) |off| {
+                                const block_max = block_checked.get(info.base) orelse 0;
+                                const dom_max = domMaxEnd(table.items, valid_start, info.base);
+                                const proof = @max(block_max, dom_max);
+                                if (end <= proof and off <= std.math.maxInt(i32)) {
+                                    ld.base = info.base;
+                                    ld.offset = @intCast(off);
+                                    if (ld.checked_end > 0) ld.checked_end = end;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!ld.bounds_known) {
+                        const end = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
+                        const gop = try block_checked.getOrPut(ld.base);
+                        if (!gop.found_existing or end > gop.value_ptr.*) gop.value_ptr.* = end;
+                    }
+                },
+                .store => |*st| {
+                    if (add_info.get(st.base)) |info| {
+                        const access_end = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
+                        const new_end: ?u64 = std.math.add(u64, @as(u64, info.offset), access_end) catch null;
+                        const new_offset: ?u64 = std.math.add(u64, @as(u64, info.offset), @as(u64, st.offset)) catch null;
+                        if (new_end) |end| {
+                            if (new_offset) |off| {
+                                const block_max = block_checked.get(info.base) orelse 0;
+                                const dom_max = domMaxEnd(table.items, valid_start, info.base);
+                                const proof = @max(block_max, dom_max);
+                                if (end <= proof and off <= std.math.maxInt(i32)) {
+                                    st.base = info.base;
+                                    st.offset = @intCast(off);
+                                    if (st.checked_end > 0) st.checked_end = end;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!st.bounds_known) {
+                        const end = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
+                        const gop = try block_checked.getOrPut(st.base);
+                        if (!gop.found_existing or end > gop.value_ptr.*) gop.value_ptr.* = end;
+                    }
+                },
+                .memory_grow,
+                .call, .call_indirect, .call_ref,
+                .memory_copy, .memory_fill, .memory_init,
+                .table_grow, .table_init,
+                .atomic_notify, .atomic_wait,
+                => {
+                    block_checked.clearRetainingCapacity();
+                    valid_start = table.items.len;
+                },
+                else => {},
+            }
+        }
+
+        var bit = block_checked.iterator();
+        while (bit.next()) |kv| {
+            try table.append(allocator, .{ .base = kv.key_ptr.*, .max_end = kv.value_ptr.* });
+        }
+
+        for (children[bid].items) |c| {
+            try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+        }
+    }
+
+    return changed;
+}
+
 /// Forward `local_set K, val` → subsequent `local_get K` within the same
 /// block: rewrite consumers of the `local_get`'s dest to use `val` directly,
 /// turning the `local_get` into dead code that DCE then removes. This
@@ -3497,6 +3658,7 @@ pub const default_passes: []const PassFn = &.{
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 // ── Block Reordering ────────────────────────────────────────────────────────
@@ -6657,6 +6819,157 @@ test "foldWrapOfExtend: composes with DCE to drop the extend" {
         try std.testing.expect(inst.op != .extend_i32_s);
         try std.testing.expect(inst.op != .wrap_i64);
     }
+}
+
+test "foldLoadStoreOffset: folds add base, const into load offset when prior check proves range" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 32 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const ld = block.instructions.items[4].op.load;
+    try std.testing.expectEqual(v_base, ld.base);
+    try std.testing.expectEqual(@as(u32, 16), ld.offset);
+    try std.testing.expectEqual(@as(u64, 0), ld.checked_end);
+}
+
+test "foldLoadStoreOffset: folds commuted add into store offset" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_val = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 16 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_c, .rhs = v_base } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_val, .type = .i32 });
+    try block.append(.{ .op = .{ .store = .{ .base = v_addr, .offset = 0, .size = 4, .val = v_val } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const st = block.instructions.items[5].op.store;
+    try std.testing.expectEqual(v_base, st.base);
+    try std.testing.expectEqual(@as(u32, 8), st.offset);
+}
+
+test "foldLoadStoreOffset: skips unproven add to preserve wrapping semantics" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(v_addr, block.instructions.items[3].op.load.base);
+}
+
+test "foldLoadStoreOffset: skips negative constants" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 32 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = -4 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 8, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(v_addr, block.instructions.items[4].op.load.base);
+}
+
+test "foldLoadStoreOffset: skips i64 adds" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 32 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_64 = 8 }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i64 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(v_addr, block.instructions.items[4].op.load.base);
+}
+
+test "foldLoadStoreOffset: adjusts checked_end when folding a widened access" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 64 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4, .checked_end = 20 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const ld = block.instructions.items[4].op.load;
+    try std.testing.expectEqual(v_base, ld.base);
+    try std.testing.expectEqual(@as(u32, 16), ld.offset);
+    try std.testing.expectEqual(@as(u64, 32), ld.checked_end);
 }
 
 test "promoteLocalsToSSA: simple countdown loop" {
