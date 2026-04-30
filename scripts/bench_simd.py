@@ -217,7 +217,7 @@ def render_table(
     lines.extend(
         [
             "",
-            "AOT rows with `unsupported` are expected for SIMD cases until native v128 lowering lands.",
+            "AOT rows with `unsupported` are expected for refs or SIMD opcode families without native v128 lowering.",
             "CoreMark is scalar, so this harness is the SIMD-specific signal for issue #220.",
         ]
     )

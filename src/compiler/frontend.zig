@@ -1702,8 +1702,127 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .simd_prefix => {
                 const sub = readU32(code, &ip);
                 const simd_op: SimdOpcode = @enumFromInt(sub);
-                std.debug.print("wamrc: unsupported SIMD opcode 0x{X}\n", .{@intFromEnum(simd_op)});
-                return error.UnsupportedOpcode;
+                switch (simd_op) {
+                    .v128_const => {
+                        const val = try readV128(code, &ip);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_const = val },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .v128_load => {
+                        const alignment = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const base = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_load = .{
+                                .base = base,
+                                .offset = offset,
+                                .alignment = alignment,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .v128_store => {
+                        const alignment = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const val = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_store = .{
+                                .base = base,
+                                .offset = offset,
+                                .alignment = alignment,
+                                .val = val,
+                            } },
+                        });
+                    },
+                    .v128_not => {
+                        const src = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_not = src },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .v128_and,
+                    .v128_andnot,
+                    .v128_or,
+                    .v128_xor,
+                    => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const bit_op: ir.Inst.V128BitwiseOp = switch (simd_op) {
+                            .v128_and => .@"and",
+                            .v128_andnot => .andnot,
+                            .v128_or => .@"or",
+                            .v128_xor => .xor,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_bitwise = .{
+                                .op = bit_op,
+                                .lhs = lhs,
+                                .rhs = rhs,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_add,
+                    .i32x4_sub,
+                    .i32x4_eq,
+                    => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const lane_op: ir.Inst.I32x4Op = switch (simd_op) {
+                            .i32x4_add => .add,
+                            .i32x4_sub => .sub,
+                            .i32x4_eq => .eq,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_binop = .{
+                                .op = lane_op,
+                                .lhs = lhs,
+                                .rhs = rhs,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_extract_lane => {
+                        const lane_raw = try readByte(code, &ip);
+                        if (lane_raw >= 4) return error.InvalidBytecode;
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_extract_lane = .{
+                                .vector = vector,
+                                .lane = @intCast(lane_raw),
+                            } },
+                            .dest = dest,
+                            .type = .i32,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    else => {
+                        std.debug.print("wamrc: unsupported SIMD opcode 0x{X}\n", .{@intFromEnum(simd_op)});
+                        return error.UnsupportedOpcode;
+                    },
+                }
             },
 
             // ── Sign-extension ops ─────────────────────────────────────
@@ -2241,6 +2360,20 @@ fn readI64(code: []const u8, ip_ptr: *usize) i64 {
     return leb128.readSignedLossy(i64, code, ip_ptr);
 }
 
+fn readByte(code: []const u8, ip_ptr: *usize) LowerError!u8 {
+    if (ip_ptr.* >= code.len) return error.InvalidBytecode;
+    const b = code[ip_ptr.*];
+    ip_ptr.* += 1;
+    return b;
+}
+
+fn readV128(code: []const u8, ip_ptr: *usize) LowerError!u128 {
+    if (code.len -| ip_ptr.* < 16) return error.InvalidBytecode;
+    const val = std.mem.readInt(u128, code[ip_ptr.*..][0..16], .little);
+    ip_ptr.* += 16;
+    return val;
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 
 test "readI32 decodes signed LEB128 including single-byte negatives" {
@@ -2389,6 +2522,72 @@ test "lower v128 local type is not treated as i64" {
     try std.testing.expectEqual(@as(u32, 0), insts[0].op.local_get);
     try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
     try std.testing.expect(insts[1].op.ret != null);
+}
+
+test "lower selected SIMD first-family opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const
+        0x01, 0x00,
+        0x00, 0x00,
+        0x02, 0x00,
+        0x00, 0x00,
+        0x03, 0x00,
+        0x00, 0x00,
+        0x04, 0x00,
+        0x00, 0x00,
+        0xFD, 0x0C, // v128.const
+        0x05, 0x00,
+        0x00, 0x00,
+        0x06, 0x00,
+        0x00, 0x00,
+        0x07, 0x00,
+        0x00, 0x00,
+        0x08, 0x00,
+        0x00, 0x00,
+        0xFD, 0x51, // v128.xor
+        0xFD, 0x0C, // v128.const
+        0x09, 0x00,
+        0x00, 0x00,
+        0x0A, 0x00,
+        0x00, 0x00,
+        0x0B, 0x00,
+        0x00, 0x00,
+        0x0C, 0x00,
+        0x00, 0x00,
+        0xFD, 0xAE, 0x01, // i32x4.add
+        0xFD, 0x1B, 0x00, // i32x4.extract_lane 0
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 7), insts.len);
+    try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
+    try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
+    try std.testing.expectEqual(ir.Inst.V128BitwiseOp.xor, insts[2].op.v128_bitwise.op);
+    try std.testing.expectEqual(ir.IrType.v128, insts[3].type);
+    try std.testing.expectEqual(ir.Inst.I32x4Op.add, insts[4].op.i32x4_binop.op);
+    try std.testing.expectEqual(@as(u2, 0), insts[5].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[6].op.ret != null);
 }
 
 test "lower unreachable" {
