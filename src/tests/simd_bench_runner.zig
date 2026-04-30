@@ -59,6 +59,26 @@ const cases = [_]BenchCase{
         .build = buildSimdI32x4EqLane0Module,
     },
     .{
+        .name = "simd_i32x4_mul_lane0",
+        .simd = true,
+        .build = buildSimdI32x4MulLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_ne_lane0",
+        .simd = true,
+        .build = buildSimdI32x4NeLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_gt_s_lane0",
+        .simd = true,
+        .build = buildSimdI32x4GtSLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_gt_u_lane0",
+        .simd = true,
+        .build = buildSimdI32x4GtULane0Module,
+    },
+    .{
         .name = "simd_i32x4_splat_lane0",
         .simd = true,
         .build = buildSimdI32x4SplatLane0Module,
@@ -385,6 +405,54 @@ fn buildSimdI32x4EqLane0Module(allocator: Allocator) ![]u8 {
     try appendV128ConstI32x4(&instr, allocator, .{ 42, 2, 3, 4 });
     try appendV128ConstI32x4(&instr, allocator, .{ 42, 0, 3, 5 });
     try appendSimdOpcode(&instr, allocator, 0x37); // i32x4.eq
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4MulLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ 50_000, -7, 3, 4 });
+    try appendV128ConstI32x4(&instr, allocator, .{ 50_000, 6, 7, 8 });
+    try appendSimdOpcode(&instr, allocator, 0xB5); // i32x4.mul
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4NeLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ 42, 2, 3, 4 });
+    try appendV128ConstI32x4(&instr, allocator, .{ 7, 2, 0, 4 });
+    try appendSimdOpcode(&instr, allocator, 0x38); // i32x4.ne
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4GtSLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ -1, 10, -5, 4 });
+    try appendV128ConstI32x4(&instr, allocator, .{ 1, 9, -6, 4 });
+    try appendSimdOpcode(&instr, allocator, 0x3B); // i32x4.gt_s
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4GtULane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ -1, 10, -5, 4 });
+    try appendV128ConstI32x4(&instr, allocator, .{ 1, 9, -6, 4 });
+    try appendSimdOpcode(&instr, allocator, 0x3C); // i32x4.gt_u
     try appendI32x4ExtractLane(&instr, allocator, 0);
 
     return buildRunI32Module(allocator, instr.items, .{});

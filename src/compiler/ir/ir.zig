@@ -248,7 +248,21 @@ pub const Inst = struct {
 
     pub const V128BitwiseOp = enum { @"and", andnot, @"or", xor };
 
-    pub const I32x4Op = enum { add, sub, eq };
+    pub const I32x4Op = enum {
+        add,
+        sub,
+        eq,
+        ne,
+        lt_s,
+        lt_u,
+        gt_s,
+        gt_u,
+        le_s,
+        le_u,
+        ge_s,
+        ge_u,
+        mul,
+    };
 
     pub const V128Mem = struct {
         base: VReg,
