@@ -71,7 +71,9 @@ pub const Inst = struct {
         v128_not: VReg,
         v128_bitwise: V128Bitwise,
         i32x4_binop: I32x4BinOp,
+        i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
+        i32x4_replace_lane: I32x4ReplaceLane,
 
         // Binary arithmetic (dest = lhs op rhs)
         add: BinOp,
@@ -282,6 +284,12 @@ pub const Inst = struct {
         lane: u2,
     };
 
+    pub const I32x4ReplaceLane = struct {
+        vector: VReg,
+        val: VReg,
+        lane: u2,
+    };
+
     pub const PhiEdge = struct {
         block: BlockId,
         val: VReg,
@@ -455,6 +463,22 @@ test "Inst: first v128 op family preserves operand shape" {
         .type = .i32,
     };
     try std.testing.expectEqual(@as(u2, 2), lane.op.i32x4_extract_lane.lane);
+
+    const splat = Inst{
+        .op = .{ .i32x4_splat = 5 },
+        .dest = 6,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 5), splat.op.i32x4_splat);
+
+    const replace = Inst{
+        .op = .{ .i32x4_replace_lane = .{ .vector = 6, .val = 7, .lane = 1 } },
+        .dest = 8,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 6), replace.op.i32x4_replace_lane.vector);
+    try std.testing.expectEqual(@as(VReg, 7), replace.op.i32x4_replace_lane.val);
+    try std.testing.expectEqual(@as(u2, 1), replace.op.i32x4_replace_lane.lane);
 }
 
 test "IrModule: add multiple functions" {

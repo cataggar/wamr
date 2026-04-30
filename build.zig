@@ -331,8 +331,8 @@ pub fn build(b: *std.Build) void {
 
     // ── SIMD benchmark runner ───────────────────────────────────────────
     // Builds small in-memory SIMD modules and reports interpreter vs AOT
-    // status/timing.  SIMD AOT is expected to report "unsupported" until the
-    // first native v128 lowering slice lands.
+    // status/timing. Optional runner args after `--` can enable external
+    // baselines such as Wasmtime.
     const simd_bench_module = b.createModule(.{
         .root_source_file = b.path("src/tests/simd_bench_runner.zig"),
         .target = target,
@@ -354,6 +354,7 @@ pub fn build(b: *std.Build) void {
         const run_simd_bench = b.addRunArtifact(simd_bench_exe);
         run_simd_bench.addArg("--iterations");
         run_simd_bench.addArg("10000");
+        if (b.args) |args| run_simd_bench.addArgs(args);
         simd_bench_step.dependOn(&run_simd_bench.step);
     }
 

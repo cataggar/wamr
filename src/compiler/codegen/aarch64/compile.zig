@@ -355,6 +355,8 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
+        .i32x4_splat,
+        .i32x4_replace_lane,
         => inst.type == .v128,
         else => false,
     };
@@ -375,6 +377,8 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .v128_not,
                 .v128_bitwise,
                 .i32x4_binop,
+                .i32x4_splat,
+                .i32x4_replace_lane,
                 => {
                     if (!isSupportedV128Def(inst)) return true;
                 },
@@ -1172,7 +1176,9 @@ fn compileInst(
         .v128_not => |src| try emitV128Not(code, inst, src, v128_map),
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map),
         .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map),
+        .i32x4_splat => |src| try emitI32x4Splat(code, inst, src, reg_map, v128_map),
         .i32x4_extract_lane => |lane| try emitI32x4ExtractLane(code, inst, lane, reg_map, v128_map),
+        .i32x4_replace_lane => |lane| try emitI32x4ReplaceLane(code, inst, lane, reg_map, v128_map),
 
         .add => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .add)
@@ -1561,6 +1567,18 @@ fn emitI32x4BinOp(
     try storeV128Dest(code, inst, v128_map, v128_tmp0);
 }
 
+fn emitI32x4Splat(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+) !void {
+    const src_reg = try useInto(code, reg_map, src, RegMap.tmp0);
+    try code.dup4sFromGp32(v128_tmp0, src_reg);
+    try storeV128Dest(code, inst, v128_map, v128_tmp0);
+}
+
 fn emitI32x4ExtractLane(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -1573,6 +1591,19 @@ fn emitI32x4ExtractLane(
     const info = try destBegin(reg_map, dest, RegMap.tmp0);
     try code.umovWFromS(info.reg, v128_tmp0, lane.lane);
     try destCommit(code, reg_map, info);
+}
+
+fn emitI32x4ReplaceLane(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lane: ir.Inst.I32x4ReplaceLane,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+) !void {
+    try loadV128Slot(code, v128_map, lane.vector, v128_tmp0);
+    const val_reg = try useInto(code, reg_map, lane.val, RegMap.tmp0);
+    try code.insSFromGp32(v128_tmp0, lane.lane, val_reg);
+    try storeV128Dest(code, inst, v128_map, v128_tmp0);
 }
 
 const ExtendWidth = enum { b, h, w };
@@ -4705,6 +4736,52 @@ test "compile: v128 first-family ops emit NEON instructions" {
 
     try std.testing.expect(found_eor);
     try std.testing.expect(found_add4s);
+    try std.testing.expect(found_umov);
+}
+
+test "compile: i32x4 lane ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const scalar = func.newVReg();
+    const splat = func.newVReg();
+    const replacement = func.newVReg();
+    const replaced = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = scalar, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_splat = scalar }, .dest = splat, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 99 }, .dest = replacement, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_replace_lane = .{ .vector = splat, .val = replacement, .lane = 2 } },
+        .dest = replaced,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = replaced, .lane = 2 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_dup = false;
+    var found_ins = false;
+    var found_umov = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4E040C00) found_dup = true;
+        if ((w & 0xFFFFFC00) == 0x4E141C00) found_ins = true;
+        if ((w & 0x0FE0FC00) == 0x0E003C00) found_umov = true;
+    }
+
+    try std.testing.expect(found_dup);
+    try std.testing.expect(found_ins);
     try std.testing.expect(found_umov);
 }
 

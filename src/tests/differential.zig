@@ -328,6 +328,70 @@ test "differential SIMD: i32x4.eq extracts all-ones lane" {
     try expectSimdDiffI32(wasm, "f", -1);
 }
 
+test "differential SIMD: i32x4.splat extracts lane 3" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try body.append(testing.allocator, 0x41);
+    try encodeSLEB128(&body, testing.allocator, -123);
+    try appendI32x4Splat(&body, testing.allocator);
+    try appendI32x4ExtractLane(&body, testing.allocator, 3);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", -123);
+}
+
+test "differential SIMD: i32x4.replace_lane updates selected lane" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 1, 2, 3, 4 });
+    try body.append(testing.allocator, 0x41);
+    try encodeSLEB128(&body, testing.allocator, 99);
+    try appendI32x4ReplaceLane(&body, testing.allocator, 2);
+    try appendI32x4ExtractLane(&body, testing.allocator, 2);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 99);
+}
+
+test "differential SIMD: i32x4.replace_lane preserves untouched lanes" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 10, 20, 30, 40 });
+    try body.append(testing.allocator, 0x41);
+    try encodeSLEB128(&body, testing.allocator, 99);
+    try appendI32x4ReplaceLane(&body, testing.allocator, 2);
+    try appendI32x4ExtractLane(&body, testing.allocator, 0);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 10);
+}
+
+test "differential SIMD: i32x4.splat feeds i32x4.add" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try body.append(testing.allocator, 0x41);
+    try encodeSLEB128(&body, testing.allocator, 3);
+    try appendI32x4Splat(&body, testing.allocator);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 4, 5, 6, 7 });
+    try appendSimdOpcode(&body, testing.allocator, 0xAE);
+    try appendI32x4ExtractLane(&body, testing.allocator, 2);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 9);
+}
+
 test "differential SIMD: v128 bitwise xor extracts lane 0" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -515,8 +579,17 @@ fn appendV128ConstI32x4(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, l
     }
 }
 
+fn appendI32x4Splat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try appendSimdOpcode(buf, allocator, 0x11);
+}
+
 fn appendI32x4ExtractLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1B);
+    try buf.append(allocator, lane);
+}
+
+fn appendI32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x1C);
     try buf.append(allocator, lane);
 }
 

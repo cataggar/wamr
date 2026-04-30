@@ -30,6 +30,13 @@ const RunResult = struct {
     run_ns: u64,
 };
 
+const BenchOptions = struct {
+    iterations: u32 = 10_000,
+    run_wasmtime: bool = false,
+    wasmtime_path: []const u8 = "wasmtime",
+    wasmtime_iterations: ?u32 = null,
+};
+
 const cases = [_]BenchCase{
     .{
         .name = "scalar_i32_add",
@@ -52,6 +59,16 @@ const cases = [_]BenchCase{
         .build = buildSimdI32x4EqLane0Module,
     },
     .{
+        .name = "simd_i32x4_splat_lane0",
+        .simd = true,
+        .build = buildSimdI32x4SplatLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_replace_lane2",
+        .simd = true,
+        .build = buildSimdI32x4ReplaceLane2Module,
+    },
+    .{
         .name = "simd_v128_load_store_lane0",
         .simd = true,
         .build = buildSimdLoadStoreLane0Module,
@@ -61,7 +78,7 @@ const cases = [_]BenchCase{
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    const iterations = parseIterations(args) catch |err| {
+    const options = parseOptions(args) catch |err| {
         std.debug.print("simd-bench-runner: invalid arguments: {s}\n", .{@errorName(err)});
         usage();
         std.process.exit(2);
@@ -75,23 +92,25 @@ pub fn main(init: std.process.Init) !void {
     }
 
     for (cases) |case| {
-        try runCase(allocator, case, iterations);
+        try runCase(allocator, init.io, case, options);
     }
 }
 
 fn usage() void {
     std.debug.print(
-        \\usage: simd-bench-runner [--iterations N]
+        \\usage: simd-bench-runner [--iterations N] [--wasmtime] [--wasmtime-path PATH] [--wasmtime-iterations N]
         \\
         \\Runs embedded SIMD microbench modules through the interpreter and,
         \\when supported by the host CPU, through the in-memory AOT pipeline.
+        \\With --wasmtime, also invokes the Wasmtime CLI for a small external
+        \\baseline. Wasmtime timings include CLI startup and compilation.
         \\Rows are tab-separated and prefixed with "bench".
         \\
     , .{});
 }
 
-fn parseIterations(args: []const []const u8) !u32 {
-    var iterations: u32 = 10_000;
+fn parseOptions(args: []const []const u8) !BenchOptions {
+    var options = BenchOptions{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
@@ -100,28 +119,59 @@ fn parseIterations(args: []const []const u8) !u32 {
         } else if (std.mem.eql(u8, args[i], "--iterations")) {
             i += 1;
             if (i >= args.len) return error.MissingValue;
-            iterations = try std.fmt.parseUnsigned(u32, args[i], 10);
-            if (iterations == 0) return error.InvalidIterationCount;
+            options.iterations = try std.fmt.parseUnsigned(u32, args[i], 10);
+            if (options.iterations == 0) return error.InvalidIterationCount;
+        } else if (std.mem.eql(u8, args[i], "--wasmtime")) {
+            options.run_wasmtime = true;
+        } else if (std.mem.eql(u8, args[i], "--wasmtime-path")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            options.wasmtime_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--wasmtime-iterations")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            options.wasmtime_iterations = try std.fmt.parseUnsigned(u32, args[i], 10);
+            if (options.wasmtime_iterations.? == 0) return error.InvalidIterationCount;
         } else {
             return error.UnknownArgument;
         }
     }
-    return iterations;
+    return options;
 }
 
-fn runCase(allocator: Allocator, case: BenchCase, iterations: u32) !void {
+fn runCase(allocator: Allocator, io: std.Io, case: BenchCase, options: BenchOptions) !void {
     const wasm = try case.build(allocator);
     defer allocator.free(wasm);
 
-    const interp_result = runInterpMany(allocator, wasm, "run", iterations) catch |err| {
-        emitRow(case.name, "interp", "trap", null, null, null, iterations, wasm.len);
+    const interp_result = runInterpMany(allocator, wasm, "run", options.iterations) catch |err| {
+        emitRow(case.name, "interp", "trap", null, null, null, options.iterations, wasm.len);
         std.debug.print("simd-bench-runner: interpreter failed for {s}: {s}\n", .{ case.name, @errorName(err) });
         return;
     };
-    emitRow(case.name, "interp", "ok", interp_result.result, 0, interp_result.run_ns, iterations, wasm.len);
+    emitRow(case.name, "interp", "ok", interp_result.result, 0, interp_result.run_ns, options.iterations, wasm.len);
+
+    if (options.run_wasmtime) {
+        const wasmtime_iterations = options.wasmtime_iterations orelse @min(options.iterations, 10);
+        const wasmtime_result = runWasmtimeMany(
+            allocator,
+            io,
+            wasm,
+            "run",
+            case.name,
+            wasmtime_iterations,
+            options.wasmtime_path,
+        ) catch |err| {
+            const status = if (err == error.FileNotFound) "unsupported" else "trap";
+            emitRow(case.name, "wasmtime", status, null, null, null, wasmtime_iterations, wasm.len);
+            std.debug.print("simd-bench-runner: Wasmtime failed for {s}: {s}\n", .{ case.name, @errorName(err) });
+            return;
+        };
+        const status = if (wasmtime_result.result == interp_result.result) "ok" else "mismatch";
+        emitRow(case.name, "wasmtime", status, wasmtime_result.result, null, wasmtime_result.run_ns, wasmtime_iterations, wasm.len);
+    }
 
     if (!aot_harness.can_exec_aot) {
-        emitRow(case.name, "aot", "unsupported", null, null, null, iterations, null);
+        emitRow(case.name, "aot", "unsupported", null, null, null, options.iterations, null);
         return;
     }
 
@@ -133,19 +183,19 @@ fn runCase(allocator: Allocator, case: BenchCase, iterations: u32) !void {
         .{ .invoke_start = false },
     ) catch |err| {
         const status = if (case.simd and err == error.CompileFailed) "unsupported" else "compile_failed";
-        emitRow(case.name, "aot", status, null, elapsedSince(compile_start), null, iterations, null);
+        emitRow(case.name, "aot", status, null, elapsedSince(compile_start), null, options.iterations, null);
         return;
     };
     const compile_ns = elapsedSince(compile_start);
     defer h.deinit();
 
-    const aot_result = runAotMany(h, "run", iterations) catch |err| {
-        emitRow(case.name, "aot", "trap", null, compile_ns, null, iterations, h.aot_bin.len);
+    const aot_result = runAotMany(h, "run", options.iterations) catch |err| {
+        emitRow(case.name, "aot", "trap", null, compile_ns, null, options.iterations, h.aot_bin.len);
         std.debug.print("simd-bench-runner: AOT failed for {s}: {s}\n", .{ case.name, @errorName(err) });
         return;
     };
     const status = if (aot_result.result == interp_result.result) "ok" else "mismatch";
-    emitRow(case.name, "aot", status, aot_result.result, compile_ns, aot_result.run_ns, iterations, h.aot_bin.len);
+    emitRow(case.name, "aot", status, aot_result.result, compile_ns, aot_result.run_ns, options.iterations, h.aot_bin.len);
 }
 
 fn emitRow(
@@ -238,6 +288,49 @@ fn runAotMany(h: *aot_harness.Harness, name: []const u8, iterations: u32) !RunRe
     };
 }
 
+fn runWasmtimeMany(
+    allocator: Allocator,
+    io: std.Io,
+    wasm: []const u8,
+    name: []const u8,
+    case_name: []const u8,
+    iterations: u32,
+    wasmtime_path: []const u8,
+) !RunResult {
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, ".zig-cache/simd-bench-wasmtime");
+    const wasm_path = try std.fmt.allocPrint(allocator, ".zig-cache/simd-bench-wasmtime/{s}.wasm", .{case_name});
+    defer allocator.free(wasm_path);
+    defer cwd.deleteFile(io, wasm_path) catch {};
+
+    try cwd.writeFile(io, .{ .sub_path = wasm_path, .data = wasm });
+
+    var last: i32 = 0;
+    const start = nowNs();
+    var i: u32 = 0;
+    while (i < iterations) : (i += 1) {
+        const argv = [_][]const u8{ wasmtime_path, "--invoke", name, wasm_path };
+        const result = try std.process.run(allocator, io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+
+        switch (result.term) {
+            .exited => |code| if (code != 0) return error.WasmtimeFailed,
+            else => return error.WasmtimeFailed,
+        }
+        const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+        last = try std.fmt.parseInt(i32, trimmed, 10);
+    }
+    return .{
+        .result = last,
+        .run_ns = elapsedSince(start),
+    };
+}
+
 fn buildScalarAddModule(allocator: Allocator) ![]u8 {
     var instr: std.ArrayList(u8) = .empty;
     defer instr.deinit(allocator);
@@ -283,6 +376,31 @@ fn buildSimdI32x4EqLane0Module(allocator: Allocator) ![]u8 {
     try appendV128ConstI32x4(&instr, allocator, .{ 42, 0, 3, 5 });
     try appendSimdOpcode(&instr, allocator, 0x37); // i32x4.eq
     try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4SplatLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try instr.append(allocator, 0x41); // i32.const
+    try encodeSLEB128(&instr, allocator, 77);
+    try appendI32x4Splat(&instr, allocator);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4ReplaceLane2Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ 1, 2, 3, 4 });
+    try instr.append(allocator, 0x41); // i32.const
+    try encodeSLEB128(&instr, allocator, 99);
+    try appendI32x4ReplaceLane(&instr, allocator, 2);
+    try appendI32x4ExtractLane(&instr, allocator, 2);
 
     return buildRunI32Module(allocator, instr.items, .{});
 }
@@ -405,8 +523,17 @@ fn appendV128ConstI32x4(buf: *std.ArrayList(u8), allocator: Allocator, lanes: [4
     }
 }
 
+fn appendI32x4Splat(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try appendSimdOpcode(buf, allocator, 0x11); // i32x4.splat
+}
+
 fn appendI32x4ExtractLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1B); // i32x4.extract_lane
+    try buf.append(allocator, lane);
+}
+
+fn appendI32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x1C); // i32x4.replace_lane
     try buf.append(allocator, lane);
 }
 
