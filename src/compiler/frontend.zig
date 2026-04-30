@@ -1803,6 +1803,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i32x4_splat => {
+                        const val = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_splat = val },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i32x4_extract_lane => {
                         const lane_raw = try readByte(code, &ip);
                         if (lane_raw >= 4) return error.InvalidBytecode;
@@ -1815,6 +1825,23 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             } },
                             .dest = dest,
                             .type = .i32,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_replace_lane => {
+                        const lane_raw = try readByte(code, &ip);
+                        if (lane_raw >= 4) return error.InvalidBytecode;
+                        const val = safePop(&vreg_stack);
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_replace_lane = .{
+                                .vector = vector,
+                                .val = val,
+                                .lane = @intCast(lane_raw),
+                            } },
+                            .dest = dest,
+                            .type = .v128,
                         });
                         try vreg_stack.append(allocator, dest);
                     },
@@ -2588,6 +2615,50 @@ test "lower selected SIMD first-family opcodes" {
     try std.testing.expectEqual(ir.Inst.I32x4Op.add, insts[4].op.i32x4_binop.op);
     try std.testing.expectEqual(@as(u2, 0), insts[5].op.i32x4_extract_lane.lane);
     try std.testing.expect(insts[6].op.ret != null);
+}
+
+test "lower i32x4 dynamic lane opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0x41, 0x07, // i32.const 7
+        0xFD, 0x11, // i32x4.splat
+        0x41, 0xE3, 0x00, // i32.const 99
+        0xFD, 0x1C, 0x02, // i32x4.replace_lane 2
+        0xFD, 0x1B, 0x02, // i32x4.extract_lane 2
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 6), insts.len);
+    try std.testing.expectEqual(@as(i32, 7), insts[0].op.iconst_32);
+    try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
+    try std.testing.expectEqual(insts[0].dest.?, insts[1].op.i32x4_splat);
+    try std.testing.expectEqual(@as(i32, 99), insts[2].op.iconst_32);
+    try std.testing.expectEqual(ir.IrType.v128, insts[3].type);
+    try std.testing.expectEqual(insts[1].dest.?, insts[3].op.i32x4_replace_lane.vector);
+    try std.testing.expectEqual(insts[2].dest.?, insts[3].op.i32x4_replace_lane.val);
+    try std.testing.expectEqual(@as(u2, 2), insts[3].op.i32x4_replace_lane.lane);
+    try std.testing.expectEqual(@as(u2, 2), insts[4].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[5].op.ret != null);
 }
 
 test "lower unreachable" {

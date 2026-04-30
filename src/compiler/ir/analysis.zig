@@ -220,8 +220,13 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .trunc_sat_f64_s,
         .trunc_sat_f64_u,
         .v128_not,
+        .i32x4_splat,
         => |vreg| live.put(vreg, {}) catch {},
         .i32x4_extract_lane => |lane| live.put(lane.vector, {}) catch {},
+        .i32x4_replace_lane => |lane| {
+            live.put(lane.vector, {}) catch {};
+            live.put(lane.val, {}) catch {};
+        },
 
         .local_set => |ls| live.put(ls.val, {}) catch {},
         .global_set => |gs| live.put(gs.val, {}) catch {},
@@ -535,8 +540,13 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .trunc_sat_f64_s,
         .trunc_sat_f64_u,
         .v128_not,
+        .i32x4_splat,
         => |vreg| last_use.put(vreg, pos) catch {},
         .i32x4_extract_lane => |lane| last_use.put(lane.vector, pos) catch {},
+        .i32x4_replace_lane => |lane| {
+            last_use.put(lane.vector, pos) catch {};
+            last_use.put(lane.val, pos) catch {};
+        },
 
         .local_set => |ls| last_use.put(ls.val, pos) catch {},
         .global_set => |gs| last_use.put(gs.val, pos) catch {},

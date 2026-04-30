@@ -114,6 +114,9 @@ def build_and_run(
     source_repo: Path,
     runs: int,
     iterations: int,
+    wasmtime: bool,
+    wasmtime_path: str,
+    wasmtime_iterations: int | None,
 ) -> list[Measurement]:
     env = os.environ.copy()
     overlay_harness(source_repo, wt)
@@ -131,7 +134,13 @@ def build_and_run(
             f"[harness] running {wt.name} ({i + 1}/{runs}, iterations={iterations})",
             file=sys.stderr,
         )
-        out = run([str(runner), "--iterations", str(iterations)], cwd=wt, env=env)
+        runner_args = [str(runner), "--iterations", str(iterations)]
+        if wasmtime:
+            runner_args.append("--wasmtime")
+            runner_args.extend(["--wasmtime-path", wasmtime_path])
+            if wasmtime_iterations is not None:
+                runner_args.extend(["--wasmtime-iterations", str(wasmtime_iterations)])
+        out = run(runner_args, cwd=wt, env=env)
         measurements.extend(parse_runner_output(out, i + 1))
     return measurements
 
@@ -236,6 +245,22 @@ def main() -> int:
         help="function calls per runner invocation",
     )
     p.add_argument(
+        "--wasmtime",
+        action="store_true",
+        help="include Wasmtime CLI rows as an external baseline",
+    )
+    p.add_argument(
+        "--wasmtime-path",
+        default="wasmtime",
+        help="Wasmtime executable to use with --wasmtime",
+    )
+    p.add_argument(
+        "--wasmtime-iterations",
+        type=int,
+        default=None,
+        help="Wasmtime CLI invocations per run; defaults to min(iterations, 10)",
+    )
+    p.add_argument(
         "--repo",
         type=Path,
         default=Path(__file__).resolve().parents[1],
@@ -259,6 +284,8 @@ def main() -> int:
         raise ValueError("--runs must be positive")
     if args.iterations <= 0:
         raise ValueError("--iterations must be positive")
+    if args.wasmtime_iterations is not None and args.wasmtime_iterations <= 0:
+        raise ValueError("--wasmtime-iterations must be positive")
 
     repo = args.repo.resolve()
     with tempfile.TemporaryDirectory(
@@ -270,8 +297,24 @@ def main() -> int:
             wt_b = make_worktree(repo, args.baseline, root, "baseline")
             wt_t = make_worktree(repo, args.target, root, "target")
 
-            baseline_rows = build_and_run(wt_b, repo, args.runs, args.iterations)
-            target_rows = build_and_run(wt_t, repo, args.runs, args.iterations)
+            baseline_rows = build_and_run(
+                wt_b,
+                repo,
+                args.runs,
+                args.iterations,
+                args.wasmtime,
+                args.wasmtime_path,
+                args.wasmtime_iterations,
+            )
+            target_rows = build_and_run(
+                wt_t,
+                repo,
+                args.runs,
+                args.iterations,
+                args.wasmtime,
+                args.wasmtime_path,
+                args.wasmtime_iterations,
+            )
         finally:
             run(["git", "worktree", "prune"], cwd=repo)
 

@@ -235,7 +235,9 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
+        .i32x4_splat,
         .i32x4_extract_lane,
+        .i32x4_replace_lane,
         => .barrier,
 
         .mul => if (def != null and isIntegerType(inst.type)) .mul else .barrier,
@@ -479,7 +481,12 @@ pub fn forEachUse(
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .i32x4_splat => |v| try visit(context, v),
         .i32x4_extract_lane => |lane| try visit(context, lane.vector),
+        .i32x4_replace_lane => |lane| {
+            try visit(context, lane.vector);
+            try visit(context, lane.val);
+        },
         else => {},
     }
 }

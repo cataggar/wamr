@@ -8,13 +8,34 @@ const std = @import("std");
 
 /// AArch64 general-purpose registers (64-bit X registers).
 pub const Reg = enum(u5) {
-    x0 = 0, x1 = 1, x2 = 2, x3 = 3,
-    x4 = 4, x5 = 5, x6 = 6, x7 = 7,
-    x8 = 8, x9 = 9, x10 = 10, x11 = 11,
-    x12 = 12, x13 = 13, x14 = 14, x15 = 15,
-    x16 = 16, x17 = 17, x18 = 18, x19 = 19,
-    x20 = 20, x21 = 21, x22 = 22, x23 = 23,
-    x24 = 24, x25 = 25, x26 = 26, x27 = 27,
+    x0 = 0,
+    x1 = 1,
+    x2 = 2,
+    x3 = 3,
+    x4 = 4,
+    x5 = 5,
+    x6 = 6,
+    x7 = 7,
+    x8 = 8,
+    x9 = 9,
+    x10 = 10,
+    x11 = 11,
+    x12 = 12,
+    x13 = 13,
+    x14 = 14,
+    x15 = 15,
+    x16 = 16,
+    x17 = 17,
+    x18 = 18,
+    x19 = 19,
+    x20 = 20,
+    x21 = 21,
+    x22 = 22,
+    x23 = 23,
+    x24 = 24,
+    x25 = 25,
+    x26 = 26,
+    x27 = 27,
     x28 = 28,
     fp = 29, // frame pointer (x29)
     lr = 30, // link register (x30)
@@ -421,7 +442,12 @@ pub const CodeBuffer = struct {
     /// LSLV/LSRV/ASRV/RORV Xd, Xn, Xm (variable shift, 64-bit)
     pub fn shiftRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, op: ShiftOp) !void {
         // 1|0|0|11010110|Rm|0010|op|Rn|Rd
-        const opc: u2 = switch (op) { .lsl => 0b00, .lsr => 0b01, .asr => 0b10, .ror => 0b11 };
+        const opc: u2 = switch (op) {
+            .lsl => 0b00,
+            .lsr => 0b01,
+            .asr => 0b10,
+            .ror => 0b11,
+        };
         try self.emit32(0x9AC02000 | (@as(u32, rm.encoding()) << 16) |
             (@as(u32, opc) << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
@@ -429,7 +455,12 @@ pub const CodeBuffer = struct {
 
     /// 32-bit variable shift (mask count by 5 per AArch64 semantics — matches wasm i32).
     pub fn shiftRegReg32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, op: ShiftOp) !void {
-        const opc: u2 = switch (op) { .lsl => 0b00, .lsr => 0b01, .asr => 0b10, .ror => 0b11 };
+        const opc: u2 = switch (op) {
+            .lsl => 0b00,
+            .lsr => 0b01,
+            .asr => 0b10,
+            .ror => 0b11,
+        };
         try self.emit32(0x1AC02000 | (@as(u32, rm.encoding()) << 16) |
             (@as(u32, opc) << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
@@ -647,6 +678,19 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// DUP Vd.4S, Wn.
+    pub fn dup4sFromGp32(self: *CodeBuffer, vd: u5, rn: Reg) !void {
+        try self.emit32(0x4E040C00 | (@as(u32, rn.encoding()) << 5) | vd);
+    }
+
+    /// INS Vd.S[lane], Wn (alias: MOV Vd.S[lane], Wn).
+    pub fn insSFromGp32(self: *CodeBuffer, vd: u5, lane: u2, rn: Reg) !void {
+        try self.emit32(0x4E041C00 |
+            (@as(u32, lane) << 19) |
+            (@as(u32, rn.encoding()) << 5) |
+            vd);
+    }
+
     /// MVN Vd.16B, Vn.16B (alias for NOT).
     pub fn mvn16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x6E205800 | (@as(u32, vn) << 5) | vd);
@@ -767,11 +811,11 @@ pub const CodeBuffer = struct {
     /// Size selects the base opcode (byte/half/word/dword); opcode12 is
     /// the operation selector in bits [15:12].
     pub const LseOp = enum(u32) {
-        add = 0x0000,   // LDADD  — new = old + Rs
-        clr = 0x1000,   // LDCLR  — new = old & ~Rs
-        eor = 0x2000,   // LDEOR  — new = old ^ Rs
-        set = 0x3000,   // LDSET  — new = old | Rs
-        swp = 0x8000,   // SWP    — new = Rs
+        add = 0x0000, // LDADD  — new = old + Rs
+        clr = 0x1000, // LDCLR  — new = old & ~Rs
+        eor = 0x2000, // LDEOR  — new = old ^ Rs
+        set = 0x3000, // LDSET  — new = old | Rs
+        swp = 0x8000, // SWP    — new = Rs
     };
 
     pub fn lseAtomic(
@@ -1496,6 +1540,20 @@ test "emit: MOV v0.d[1], x17" {
     defer code.deinit();
     try code.insDFromGp64(0, 1, .x17);
     try expectWord(0x4E181E20, &code);
+}
+
+test "emit: DUP v0.4s, w1" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.dup4sFromGp32(0, .x1);
+    try expectWord(0x4E040C20, &code);
+}
+
+test "emit: MOV v0.s[2], w17" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.insSFromGp32(0, 2, .x17);
+    try expectWord(0x4E141E20, &code);
 }
 
 test "emit: MVN v0.16b, v1.16b" {
