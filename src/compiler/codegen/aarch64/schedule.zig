@@ -19,6 +19,7 @@ pub const Class = enum {
     mul,
     compare,
     load,
+    store,
 };
 
 pub const Metadata = struct {
@@ -158,6 +159,7 @@ fn appendScheduledWindow(
     }.f;
 
     for (window, 0..) |inst, idx| {
+        const meta = metadata(inst);
         var edge_ctx = EdgeCtx{
             .defs = &defs,
             .nodes = nodes,
@@ -165,7 +167,7 @@ fn appendScheduledWindow(
             .allocator = allocator,
         };
         try forEachUse(inst, &edge_ctx, addUseEdge);
-        if (inst.dest) |dest| try defs.put(dest, idx);
+        if (meta.def) |dest| try defs.put(dest, idx);
     }
 
     var last_memory: ?usize = null;
@@ -227,18 +229,16 @@ pub fn metadata(inst: ir.Inst) Metadata {
     const def = inst.dest;
     const class: Class = switch (inst.op) {
         .iconst_32, .iconst_64 => if (def != null) .constant else .barrier,
-        // SIMD/v128 lowering is intentionally a barrier until the backend has
-        // explicit vector dependency/latency modeling.
-        .v128_const,
-        .v128_load,
-        .v128_store,
+        .v128_const => if (def != null) .constant else .barrier,
+        .v128_load => if (def != null) .load else .barrier,
+        .v128_store => .store,
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
-        => .barrier,
+        => if (def != null) .alu else .barrier,
 
         .mul => if (def != null and isIntegerType(inst.type)) .mul else .barrier,
 
@@ -286,7 +286,7 @@ pub fn metadata(inst: ir.Inst) Metadata {
     const latency: u8 = switch (class) {
         .load => 4,
         .mul => 3,
-        .constant, .alu, .compare => 1,
+        .constant, .alu, .compare, .store => 1,
         .barrier => 0,
     };
 
@@ -294,7 +294,10 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .class = class,
         .latency = latency,
         .barrier = class == .barrier,
-        .def = if (class == .barrier) null else def,
+        .def = switch (class) {
+            .barrier, .store => null,
+            else => def,
+        },
     };
 }
 
@@ -304,7 +307,7 @@ fn isIntegerType(ty: ir.IrType) bool {
 
 fn isOrderedMemory(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .load => true,
+        .load, .v128_load, .v128_store => true,
         else => false,
     };
 }
@@ -517,6 +520,48 @@ test "metadata marks pure integer ops schedulable and hazards as barriers" {
     try std.testing.expect(metadata(atomic).barrier);
 }
 
+test "metadata models supported v128 ops as schedulable" {
+    const vconst = ir.Inst{ .op = .{ .v128_const = 0x0102030405060708090a0b0c0d0e0f10 }, .dest = 1, .type = .v128 };
+    try std.testing.expect(!metadata(vconst).barrier);
+    try std.testing.expectEqual(Class.constant, metadata(vconst).class);
+    try std.testing.expectEqual(@as(?ir.VReg, 1), metadata(vconst).def);
+
+    const load = ir.Inst{ .op = .{ .v128_load = .{ .base = 2, .offset = 0, .alignment = 4 } }, .dest = 3, .type = .v128 };
+    try std.testing.expect(!metadata(load).barrier);
+    try std.testing.expectEqual(Class.load, metadata(load).class);
+    try std.testing.expectEqual(@as(u8, 4), metadata(load).latency);
+    try std.testing.expectEqual(@as(?ir.VReg, 3), metadata(load).def);
+
+    const store = ir.Inst{ .op = .{ .v128_store = .{ .base = 4, .offset = 16, .alignment = 4, .val = 3 } }, .type = .void };
+    try std.testing.expect(!metadata(store).barrier);
+    try std.testing.expectEqual(Class.store, metadata(store).class);
+    try std.testing.expectEqual(@as(?ir.VReg, null), metadata(store).def);
+
+    const not = ir.Inst{ .op = .{ .v128_not = 3 }, .dest = 5, .type = .v128 };
+    try std.testing.expect(!metadata(not).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(not).class);
+
+    const bitwise = ir.Inst{ .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = 3, .rhs = 5 } }, .dest = 6, .type = .v128 };
+    try std.testing.expect(!metadata(bitwise).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(bitwise).class);
+
+    const binop = ir.Inst{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = 3, .rhs = 6 } }, .dest = 7, .type = .v128 };
+    try std.testing.expect(!metadata(binop).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(binop).class);
+
+    const splat = ir.Inst{ .op = .{ .i32x4_splat = 8 }, .dest = 9, .type = .v128 };
+    try std.testing.expect(!metadata(splat).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(splat).class);
+
+    const extract = ir.Inst{ .op = .{ .i32x4_extract_lane = .{ .vector = 7, .lane = 2 } }, .dest = 10, .type = .i32 };
+    try std.testing.expect(!metadata(extract).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(extract).class);
+
+    const replace = ir.Inst{ .op = .{ .i32x4_replace_lane = .{ .vector = 7, .val = 8, .lane = 1 } }, .dest = 11, .type = .v128 };
+    try std.testing.expect(!metadata(replace).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(replace).class);
+}
+
 test "local scheduler prioritizes a long independent multiply chain" {
     const insts = [_]ir.Inst{
         .{ .op = .{ .iconst_32 = 10 }, .dest = 1, .type = .i32 },
@@ -602,4 +647,72 @@ test "local scheduler preserves load trap order" {
     try std.testing.expect(first_load_pos != null);
     try std.testing.expect(second_load_pos != null);
     try std.testing.expect(first_load_pos.? < second_load_pos.?);
+}
+
+fn findDest(insts: []const ir.Inst, dest: ir.VReg) ?usize {
+    for (insts, 0..) |inst, idx| {
+        if (inst.dest == dest) return idx;
+    }
+    return null;
+}
+
+fn findV128Store(insts: []const ir.Inst) ?usize {
+    for (insts, 0..) |inst, idx| {
+        switch (inst.op) {
+            .v128_store => return idx,
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "local scheduler models v128 dependencies while moving independent scalar work" {
+    const insts = [_]ir.Inst{
+        .{ .op = .{ .iconst_32 = 0 }, .dest = 1, .type = .i32 },
+        .{ .op = .{ .v128_load = .{ .base = 1, .offset = 0, .alignment = 4 } }, .dest = 2, .type = .v128 },
+        .{ .op = .{ .v128_not = 2 }, .dest = 3, .type = .v128 },
+        .{ .op = .{ .i32x4_extract_lane = .{ .vector = 3, .lane = 0 } }, .dest = 4, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 10 }, .dest = 5, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 20 }, .dest = 6, .type = .i32 },
+        .{ .op = .{ .mul = .{ .lhs = 5, .rhs = 6 } }, .dest = 7, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 4, .rhs = 7 } }, .dest = 8, .type = .i32 },
+    };
+
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    defer std.testing.allocator.free(scheduled);
+
+    const load_pos = findDest(scheduled, 2).?;
+    const not_pos = findDest(scheduled, 3).?;
+    const extract_pos = findDest(scheduled, 4).?;
+    const mul_pos = findDest(scheduled, 7).?;
+    const add_pos = findDest(scheduled, 8).?;
+
+    try std.testing.expect(load_pos < not_pos);
+    try std.testing.expect(not_pos < extract_pos);
+    try std.testing.expect(extract_pos < add_pos);
+    try std.testing.expect(mul_pos < add_pos);
+    try std.testing.expect(load_pos < mul_pos);
+    try std.testing.expect(mul_pos < not_pos);
+}
+
+test "local scheduler preserves mixed scalar and v128 memory order" {
+    const insts = [_]ir.Inst{
+        .{ .op = .{ .iconst_32 = 0 }, .dest = 1, .type = .i32 },
+        .{ .op = .{ .v128_load = .{ .base = 1, .offset = 0, .alignment = 4 } }, .dest = 2, .type = .v128 },
+        .{ .op = .{ .iconst_32 = 16 }, .dest = 3, .type = .i32 },
+        .{ .op = .{ .v128_store = .{ .base = 3, .offset = 0, .alignment = 4, .val = 2 } }, .type = .void },
+        .{ .op = .{ .iconst_32 = 32 }, .dest = 4, .type = .i32 },
+        .{ .op = .{ .load = .{ .base = 4, .offset = 0, .size = 4 } }, .dest = 5, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 5, .rhs = 3 } }, .dest = 6, .type = .i32 },
+    };
+
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    defer std.testing.allocator.free(scheduled);
+
+    const v128_load_pos = findDest(scheduled, 2).?;
+    const v128_store_pos = findV128Store(scheduled).?;
+    const scalar_load_pos = findDest(scheduled, 5).?;
+
+    try std.testing.expect(v128_load_pos < v128_store_pos);
+    try std.testing.expect(v128_store_pos < scalar_load_pos);
 }
