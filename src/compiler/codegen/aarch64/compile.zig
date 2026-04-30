@@ -217,6 +217,137 @@ const V128StackMap = struct {
     }
 };
 
+const V128RegCache = struct {
+    const Slot = struct {
+        vreg: ?ir.VReg = null,
+        dirty: bool = false,
+    };
+
+    const regs = [_]u5{ v128_tmp0, v128_tmp1 };
+
+    slots: [regs.len]Slot = [_]Slot{.{}} ** regs.len,
+
+    fn regForSlot(idx: usize) u5 {
+        return regs[idx];
+    }
+
+    fn slotForReg(vt: u5) ?usize {
+        for (regs, 0..) |reg, idx| {
+            if (reg == vt) return idx;
+        }
+        return null;
+    }
+
+    fn find(self: *const V128RegCache, vreg: ir.VReg) ?usize {
+        for (self.slots, 0..) |slot, idx| {
+            if (slot.vreg == vreg) return idx;
+        }
+        return null;
+    }
+
+    fn evictSlot(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        idx: usize,
+        write_dirty: bool,
+    ) !void {
+        const slot = self.slots[idx];
+        const vreg = slot.vreg orelse return;
+        if (write_dirty and slot.dirty) {
+            const off = try v128_map.assign(vreg);
+            try storeV128SlotAbs(code, off, regForSlot(idx));
+        }
+        self.slots[idx] = .{};
+    }
+
+    fn flushAll(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+    ) !void {
+        for (self.slots, 0..) |_, idx| {
+            try self.evictSlot(code, v128_map, idx, true);
+        }
+    }
+
+    fn release(self: *V128RegCache, vreg: ir.VReg) void {
+        const idx = self.find(vreg) orelse return;
+        self.slots[idx] = .{};
+    }
+
+    fn ensure(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        vreg: ir.VReg,
+        excluded_reg: ?u5,
+    ) !u5 {
+        if (self.find(vreg)) |idx| return regForSlot(idx);
+
+        const idx = try self.allocSlot(code, v128_map, excluded_reg);
+        const off = try v128_map.get(vreg);
+        try frameAddr(code, RegMap.tmp0, off);
+        try code.ldrQ(regForSlot(idx), RegMap.tmp0);
+        self.slots[idx] = .{ .vreg = vreg, .dirty = false };
+        return regForSlot(idx);
+    }
+
+    fn allocSlot(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        excluded_reg: ?u5,
+    ) !usize {
+        if (self.chooseSlot(excluded_reg, true)) |idx| return idx;
+        const idx = self.chooseSlot(excluded_reg, false) orelse return error.OutOfV128ScratchRegs;
+        try self.evictSlot(code, v128_map, idx, true);
+        return idx;
+    }
+
+    fn chooseSlot(self: *const V128RegCache, excluded_reg: ?u5, want_free: bool) ?usize {
+        for (self.slots, 0..) |slot, idx| {
+            const reg = regForSlot(idx);
+            if (excluded_reg != null and excluded_reg.? == reg) continue;
+            if ((slot.vreg == null) == want_free) return idx;
+        }
+        return null;
+    }
+
+    fn defineFresh(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        dest: ir.VReg,
+        excluded_reg: ?u5,
+    ) !u5 {
+        const idx = try self.allocSlot(code, v128_map, excluded_reg);
+        _ = try v128_map.assign(dest);
+        self.slots[idx] = .{ .vreg = dest, .dirty = true };
+        return regForSlot(idx);
+    }
+
+    fn prepareOverwrite(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        vt: u5,
+        drop_existing: bool,
+    ) !void {
+        const idx = slotForReg(vt) orelse return error.InvalidV128ScratchReg;
+        try self.evictSlot(code, v128_map, idx, !drop_existing);
+    }
+
+    fn defineInReg(self: *V128RegCache, v128_map: *V128StackMap, dest: ir.VReg, vt: u5) !void {
+        const idx = slotForReg(vt) orelse return error.InvalidV128ScratchReg;
+        if (self.find(dest)) |existing_idx| {
+            self.slots[existing_idx] = .{};
+        }
+        _ = try v128_map.assign(dest);
+        self.slots[idx] = .{ .vreg = dest, .dirty = true };
+    }
+};
+
 /// A pending branch that needs its 19/26-bit PC-relative offset patched once
 /// the target block's offset is known.
 const BranchPatch = struct {
@@ -691,6 +822,7 @@ pub fn compileFunctionImpl(
 
     var v128_map = V128StackMap.init(allocator, v128_spill_base, v128_spill_capacity);
     defer v128_map.deinit();
+    var v128_cache = V128RegCache{};
 
     fctx.call_save_base = call_save_base;
     fctx.callee_save_base = callee_save_base;
@@ -808,10 +940,14 @@ pub fn compileFunctionImpl(
             last_was_ret = isRet(inst.op);
             const flat_idx = block_flat_base[bi] + ii;
             fctx.current_kills = kill_lists[flat_idx].items;
-            try compileInst(&code, inst, &reg_map, &v128_map, frame_size, &patches, &fctx);
+            try compileInst(&code, inst, &reg_map, &v128_map, &v128_cache, frame_size, &patches, &fctx);
             // Release physregs of vregs whose last static use is this inst.
-            for (kill_lists[flat_idx].items) |v| reg_map.freeVReg(v);
+            for (kill_lists[flat_idx].items) |v| {
+                reg_map.freeVReg(v);
+                v128_cache.release(v);
+            }
         }
+        try v128_cache.flushAll(&code, &v128_map);
     }
 
     if (!last_was_ret) {
@@ -1135,15 +1271,100 @@ fn patchUnusedCalleeSaveSlots(
     }
 }
 
+fn isV128Inst(inst: ir.Inst) bool {
+    return switch (inst.op) {
+        .v128_const,
+        .v128_load,
+        .v128_store,
+        .v128_not,
+        .v128_bitwise,
+        .i32x4_binop,
+        .i32x4_splat,
+        .i32x4_extract_lane,
+        .i32x4_replace_lane,
+        => true,
+        else => false,
+    };
+}
+
+fn instRequiresV128Flush(inst: ir.Inst) bool {
+    if (isV128Inst(inst)) return false;
+    return switch (inst.op) {
+        .iconst_32,
+        .iconst_64,
+        .fconst_32,
+        .fconst_64,
+        => false,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        => inst.type == .f32 or inst.type == .f64,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .eqz,
+        .clz,
+        .ctz,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .extend_i32_s,
+        .extend_i32_u,
+        .wrap_i64,
+        .select,
+        .local_get,
+        .local_set,
+        .load,
+        .store,
+        .memory_size,
+        .reinterpret,
+        .global_get,
+        .global_set,
+        .atomic_load,
+        .atomic_store,
+        .atomic_rmw,
+        .atomic_cmpxchg,
+        .atomic_fence,
+        .memory_init,
+        .data_drop,
+        => false,
+        else => true,
+    };
+}
+
 fn compileInst(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     reg_map: *RegMap,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
     frame_size: u32,
     patches: *std.ArrayListUnmanaged(BranchPatch),
     fctx: *FuncCompileCtx,
 ) !void {
+    if (instRequiresV128Flush(inst)) {
+        try v128_cache.flushAll(code, v128_map);
+    }
+
     switch (inst.op) {
         // ── Constants ────────────────────────────────────────────────
         .iconst_32 => |val| {
@@ -1170,15 +1391,15 @@ fn compileInst(
             try code.movImm64(info.reg, @bitCast(val));
             try destCommit(code, reg_map, info);
         },
-        .v128_const => |val| try emitV128Const(code, inst, val, v128_map),
-        .v128_load => |ld| try emitV128Load(code, inst, ld, reg_map, v128_map),
-        .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map),
-        .v128_not => |src| try emitV128Not(code, inst, src, v128_map),
-        .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map),
-        .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map),
-        .i32x4_splat => |src| try emitI32x4Splat(code, inst, src, reg_map, v128_map),
-        .i32x4_extract_lane => |lane| try emitI32x4ExtractLane(code, inst, lane, reg_map, v128_map),
-        .i32x4_replace_lane => |lane| try emitI32x4ReplaceLane(code, inst, lane, reg_map, v128_map),
+        .v128_const => |val| try emitV128Const(code, inst, val, v128_map, v128_cache),
+        .v128_load => |ld| try emitV128Load(code, inst, ld, reg_map, v128_map, v128_cache),
+        .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache),
+        .v128_not => |src| try emitV128Not(code, inst, src, v128_map, v128_cache, fctx),
+        .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
+        .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
+        .i32x4_splat => |src| try emitI32x4Splat(code, inst, src, reg_map, v128_map, v128_cache),
+        .i32x4_extract_lane => |lane| try emitI32x4ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
+        .i32x4_replace_lane => |lane| try emitI32x4ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
 
         .add => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .add)
@@ -1438,17 +1659,6 @@ fn useReg(reg_map: *const RegMap, vreg: ir.VReg) ?emit.Reg {
 const v128_tmp0: u5 = 0;
 const v128_tmp1: u5 = 1;
 
-fn loadV128Slot(
-    code: *emit.CodeBuffer,
-    v128_map: *const V128StackMap,
-    vreg: ir.VReg,
-    vt: u5,
-) !void {
-    const off = try v128_map.get(vreg);
-    try frameAddr(code, RegMap.tmp0, off);
-    try code.ldrQ(vt, RegMap.tmp0);
-}
-
 fn storeV128SlotAbs(
     code: *emit.CodeBuffer,
     slot_off: u32,
@@ -1458,15 +1668,51 @@ fn storeV128SlotAbs(
     try code.strQ(vt, RegMap.tmp0);
 }
 
-fn storeV128Dest(
+fn isCurrentKill(fctx: *const FuncCompileCtx, vreg: ir.VReg) bool {
+    for (fctx.current_kills) |killed| {
+        if (killed == vreg) return true;
+    }
+    return false;
+}
+
+fn prepareV128UnaryDest(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
+    src: ir.VReg,
+    src_reg: u5,
     v128_map: *V128StackMap,
-    vt: u5,
-) !void {
-    const dest = inst.dest orelse return;
-    const off = try v128_map.assign(dest);
-    try storeV128SlotAbs(code, off, vt);
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !u5 {
+    const dest = inst.dest orelse return src_reg;
+    try v128_cache.prepareOverwrite(code, v128_map, src_reg, isCurrentKill(fctx, src));
+    try v128_cache.defineInReg(v128_map, dest, src_reg);
+    return src_reg;
+}
+
+fn prepareV128BinaryDest(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lhs: ir.VReg,
+    lhs_reg: u5,
+    rhs: ir.VReg,
+    rhs_reg: u5,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !u5 {
+    const dest = inst.dest orelse return lhs_reg;
+    const dest_reg = if (isCurrentKill(fctx, lhs))
+        lhs_reg
+    else if (isCurrentKill(fctx, rhs))
+        rhs_reg
+    else
+        lhs_reg;
+    const drop_existing = (dest_reg == lhs_reg and isCurrentKill(fctx, lhs)) or
+        (dest_reg == rhs_reg and isCurrentKill(fctx, rhs));
+    try v128_cache.prepareOverwrite(code, v128_map, dest_reg, drop_existing);
+    try v128_cache.defineInReg(v128_map, dest, dest_reg);
+    return dest_reg;
 }
 
 fn emitV128Const(
@@ -1474,16 +1720,16 @@ fn emitV128Const(
     inst: ir.Inst,
     val: u128,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
 ) !void {
     const dest = inst.dest orelse return;
-    const off = try v128_map.assign(dest);
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     const lo: u64 = @truncate(val);
     const hi: u64 = @truncate(val >> 64);
     try code.movImm64(RegMap.tmp0, lo);
-    try code.fmovDFromGp64(v128_tmp0, RegMap.tmp0);
+    try code.fmovDFromGp64(dest_reg, RegMap.tmp0);
     try code.movImm64(RegMap.tmp0, hi);
-    try code.insDFromGp64(v128_tmp0, 1, RegMap.tmp0);
-    try storeV128SlotAbs(code, off, v128_tmp0);
+    try code.insDFromGp64(dest_reg, 1, RegMap.tmp0);
 }
 
 fn emitV128Load(
@@ -1492,33 +1738,34 @@ fn emitV128Load(
     ld: ir.Inst.V128Mem,
     reg_map: *RegMap,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
 ) !void {
     const dest = inst.dest orelse return;
-    const off = try v128_map.assign(dest);
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + 16;
     if (ld.bounds_known) {
         try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
     } else {
         try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
     }
-    try code.ldrQ(v128_tmp0, RegMap.tmp0);
-    try storeV128SlotAbs(code, off, v128_tmp0);
+    try code.ldrQ(dest_reg, RegMap.tmp0);
 }
 
 fn emitV128Store(
     code: *emit.CodeBuffer,
     st: ir.Inst.V128Store,
     reg_map: *RegMap,
-    v128_map: *const V128StackMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
 ) !void {
-    try loadV128Slot(code, v128_map, st.val, v128_tmp0);
+    const val_reg = try v128_cache.ensure(code, v128_map, st.val, null);
     const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + 16;
     if (st.bounds_known) {
         try emitMemAddrSkipBounds(code, reg_map, st.base, st.offset);
     } else {
         try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
     }
-    try code.strQ(v128_tmp0, RegMap.tmp0);
+    try code.strQ(val_reg, RegMap.tmp0);
 }
 
 fn emitV128Not(
@@ -1526,10 +1773,12 @@ fn emitV128Not(
     inst: ir.Inst,
     src: ir.VReg,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
-    try loadV128Slot(code, v128_map, src, v128_tmp0);
-    try code.mvn16b(v128_tmp0, v128_tmp0);
-    try storeV128Dest(code, inst, v128_map, v128_tmp0);
+    const src_reg = try v128_cache.ensure(code, v128_map, src, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, src, src_reg, v128_map, v128_cache, fctx);
+    try code.mvn16b(dest_reg, src_reg);
 }
 
 fn emitV128Bitwise(
@@ -1537,17 +1786,32 @@ fn emitV128Bitwise(
     inst: ir.Inst,
     bin: ir.Inst.V128Bitwise,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
-    try loadV128Slot(code, v128_map, bin.lhs, v128_tmp0);
-    try loadV128Slot(code, v128_map, bin.rhs, v128_tmp1);
+    const lhs_reg = try v128_cache.ensure(code, v128_map, bin.lhs, null);
+    const rhs_reg = if (bin.rhs == bin.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, bin.rhs, lhs_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        bin.lhs,
+        lhs_reg,
+        bin.rhs,
+        rhs_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
     const op: emit.CodeBuffer.V128BitwiseOp = switch (bin.op) {
         .@"and" => .@"and",
         .andnot => .bic,
         .@"or" => .orr,
         .xor => .eor,
     };
-    try code.bitwise16b(op, v128_tmp0, v128_tmp0, v128_tmp1);
-    try storeV128Dest(code, inst, v128_map, v128_tmp0);
+    try code.bitwise16b(op, dest_reg, lhs_reg, rhs_reg);
 }
 
 fn emitI32x4BinOp(
@@ -1555,16 +1819,31 @@ fn emitI32x4BinOp(
     inst: ir.Inst,
     bin: ir.Inst.I32x4BinOp,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
-    try loadV128Slot(code, v128_map, bin.lhs, v128_tmp0);
-    try loadV128Slot(code, v128_map, bin.rhs, v128_tmp1);
+    const lhs_reg = try v128_cache.ensure(code, v128_map, bin.lhs, null);
+    const rhs_reg = if (bin.rhs == bin.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, bin.rhs, lhs_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        bin.lhs,
+        lhs_reg,
+        bin.rhs,
+        rhs_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
     const op: emit.CodeBuffer.I32x4Op = switch (bin.op) {
         .add => .add,
         .sub => .sub,
         .eq => .cmeq,
     };
-    try code.i32x4Op(op, v128_tmp0, v128_tmp0, v128_tmp1);
-    try storeV128Dest(code, inst, v128_map, v128_tmp0);
+    try code.i32x4Op(op, dest_reg, lhs_reg, rhs_reg);
 }
 
 fn emitI32x4Splat(
@@ -1573,10 +1852,12 @@ fn emitI32x4Splat(
     src: ir.VReg,
     reg_map: *const RegMap,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
 ) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     const src_reg = try useInto(code, reg_map, src, RegMap.tmp0);
-    try code.dup4sFromGp32(v128_tmp0, src_reg);
-    try storeV128Dest(code, inst, v128_map, v128_tmp0);
+    try code.dup4sFromGp32(dest_reg, src_reg);
 }
 
 fn emitI32x4ExtractLane(
@@ -1584,12 +1865,13 @@ fn emitI32x4ExtractLane(
     inst: ir.Inst,
     lane: ir.Inst.I32x4ExtractLane,
     reg_map: *RegMap,
-    v128_map: *const V128StackMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
 ) !void {
     const dest = inst.dest orelse return;
-    try loadV128Slot(code, v128_map, lane.vector, v128_tmp0);
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
     const info = try destBegin(reg_map, dest, RegMap.tmp0);
-    try code.umovWFromS(info.reg, v128_tmp0, lane.lane);
+    try code.umovWFromS(info.reg, vector_reg, lane.lane);
     try destCommit(code, reg_map, info);
 }
 
@@ -1599,11 +1881,13 @@ fn emitI32x4ReplaceLane(
     lane: ir.Inst.I32x4ReplaceLane,
     reg_map: *const RegMap,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
-    try loadV128Slot(code, v128_map, lane.vector, v128_tmp0);
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, lane.vector, vector_reg, v128_map, v128_cache, fctx);
     const val_reg = try useInto(code, reg_map, lane.val, RegMap.tmp0);
-    try code.insSFromGp32(v128_tmp0, lane.lane, val_reg);
-    try storeV128Dest(code, inst, v128_map, v128_tmp0);
+    try code.insSFromGp32(dest_reg, lane.lane, val_reg);
 }
 
 const ExtendWidth = enum { b, h, w };
@@ -5373,6 +5657,240 @@ test "compileModule: multi-result call (ret_multi + call_result)" {
 
     try std.testing.expect(result.code.len > 0);
     try std.testing.expect(result.code.len % 4 == 0);
+}
+
+const QMemOpCounts = struct {
+    loads: u32 = 0,
+    stores: u32 = 0,
+};
+
+fn countQMemOps(code: []const u8) QMemOpCounts {
+    var counts = QMemOpCounts{};
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x3DC00000) counts.loads += 1;
+        if ((w & 0xFFFFFC00) == 0x3D800000) counts.stores += 1;
+    }
+    return counts;
+}
+
+test "compile: v128 cache keeps local unary chain in registers" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const inverted = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_not = vector },
+        .dest = inverted,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = inverted, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
+test "compile: v128 cache does not flush for float constants" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const float_const = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 4.0 },
+        .dest = float_const,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
+test "compile: v128 cache avoids stack traffic in memory add chain" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr_a = func.newVReg();
+    const addr_b = func.newVReg();
+    const addr_dst = func.newVReg();
+    const vec_a = func.newVReg();
+    const vec_b = func.newVReg();
+    const sum = func.newVReg();
+    const ret = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr_a, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_load = .{ .base = addr_a, .offset = 0, .alignment = 4, .bounds_known = true } },
+        .dest = vec_a,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 16 }, .dest = addr_b, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_load = .{ .base = addr_b, .offset = 0, .alignment = 4, .bounds_known = true } },
+        .dest = vec_b,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_binop = .{ .op = .add, .lhs = vec_a, .rhs = vec_b } },
+        .dest = sum,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 32 }, .dest = addr_dst, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_store = .{ .base = addr_dst, .offset = 0, .alignment = 4, .val = sum, .bounds_known = true } },
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = ret, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = ret } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 2), counts.loads);
+    try std.testing.expectEqual(@as(u32, 1), counts.stores);
+}
+
+test "compile: v128 cache flushes across block boundary" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const done = try func.newBlock();
+    const vector = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(entry).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(entry).append(.{ .op = .{ .br = done } });
+    try func.getBlock(done).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(done).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 1), counts.loads);
+    try std.testing.expectEqual(@as(u32, 1), counts.stores);
+}
+
+test "compile: v128 cache flushes before scalar V-register clobber" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const float_src = func.newVReg();
+    const float_result = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 4.0 },
+        .dest = float_src,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f_sqrt = float_src },
+        .dest = float_result,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 1), counts.loads);
+    try std.testing.expectEqual(@as(u32, 1), counts.stores);
+}
+
+test "compile: v128 cache flushes before float binop clobber" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const float_lhs = func.newVReg();
+    const float_rhs = func.newVReg();
+    const float_result = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 4.0 },
+        .dest = float_lhs,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 9.0 },
+        .dest = float_rhs,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .add = .{ .lhs = float_lhs, .rhs = float_rhs } },
+        .dest = float_result,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 1), counts.loads);
+    try std.testing.expectEqual(@as(u32, 1), counts.stores);
 }
 
 test "compile: popcnt round-trips via CNT + ADDV" {
