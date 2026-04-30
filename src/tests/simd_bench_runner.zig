@@ -73,6 +73,16 @@ const cases = [_]BenchCase{
         .simd = true,
         .build = buildSimdLoadStoreLane0Module,
     },
+    .{
+        .name = "scalar_i32_mem_add_4k_loop",
+        .simd = false,
+        .build = buildScalarI32MemoryAdd4kLoopModule,
+    },
+    .{
+        .name = "simd_i32x4_mem_add_4k_loop",
+        .simd = true,
+        .build = buildSimdI32x4MemoryAdd4kLoopModule,
+    },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -432,9 +442,138 @@ fn buildSimdLoadStoreLane0Module(allocator: Allocator) ![]u8 {
     });
 }
 
+const memory_loop_lanes: u32 = 1024;
+const memory_loop_bytes: u32 = memory_loop_lanes * @sizeOf(u32);
+const memory_loop_a_base: u32 = 0;
+const memory_loop_b_base: u32 = memory_loop_a_base + memory_loop_bytes;
+const memory_loop_dst_base: u32 = memory_loop_b_base + memory_loop_bytes;
+
+fn buildScalarI32MemoryAdd4kLoopModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBlock(&instr, allocator);
+    try appendLoop(&instr, allocator);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, memory_loop_bytes);
+    try appendI32GeU(&instr, allocator);
+    try appendBrIf(&instr, allocator, 1);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendI32Load(&instr, allocator, 2, 0);
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendI32Load(&instr, allocator, 2, 0);
+
+    try appendI32Add(&instr, allocator);
+    try appendI32Store(&instr, allocator, 2, 0);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, @sizeOf(u32));
+    try appendI32Add(&instr, allocator);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBr(&instr, allocator, 0);
+
+    try appendEnd(&instr, allocator);
+    try appendEnd(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base + memory_loop_bytes - @sizeOf(u32));
+    try appendI32Load(&instr, allocator, 2, 0);
+
+    const data = try buildMemoryLoopData(allocator);
+    defer allocator.free(data);
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data,
+        .local_i32_count = 1,
+    });
+}
+
+fn buildSimdI32x4MemoryAdd4kLoopModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBlock(&instr, allocator);
+    try appendLoop(&instr, allocator);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, memory_loop_bytes);
+    try appendI32GeU(&instr, allocator);
+    try appendBrIf(&instr, allocator, 1);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+
+    try appendSimdOpcode(&instr, allocator, 0xAE); // i32x4.add
+    try appendSimdMemOpcode(&instr, allocator, 0x0B, 4, 0); // v128.store
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, 16);
+    try appendI32Add(&instr, allocator);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBr(&instr, allocator, 0);
+
+    try appendEnd(&instr, allocator);
+    try appendEnd(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base + memory_loop_bytes - 16);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendI32x4ExtractLane(&instr, allocator, 3);
+
+    const data = try buildMemoryLoopData(allocator);
+    defer allocator.free(data);
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data,
+        .local_i32_count = 1,
+    });
+}
+
+fn buildMemoryLoopData(allocator: Allocator) ![]u8 {
+    const data_len = memory_loop_b_base + memory_loop_bytes;
+    const data = try allocator.alloc(u8, data_len);
+    @memset(data, 0);
+
+    var lane: u32 = 0;
+    while (lane < memory_loop_lanes) : (lane += 1) {
+        const lane_offset = lane * @sizeOf(u32);
+        const a_pos: usize = @intCast(memory_loop_a_base + lane_offset);
+        const b_pos: usize = @intCast(memory_loop_b_base + lane_offset);
+        writeI32Lane(data[a_pos..][0..4], lane * 3 + 5);
+        writeI32Lane(data[b_pos..][0..4], lane * 7 + 11);
+    }
+
+    return data;
+}
+
 const ModuleExtras = struct {
     memory_min: ?u32 = null,
     data: ?[]const u8 = null,
+    local_i32_count: u32 = 0,
 };
 
 fn buildRunI32Module(allocator: Allocator, instructions: []const u8, extras: ModuleExtras) ![]u8 {
@@ -482,7 +621,13 @@ fn buildRunI32Module(allocator: Allocator, instructions: []const u8, extras: Mod
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
-    try body.append(allocator, 0x00); // local decl count
+    if (extras.local_i32_count == 0) {
+        try body.append(allocator, 0x00); // local decl count
+    } else {
+        try body.append(allocator, 0x01); // local decl group count
+        try encodeULEB128(&body, allocator, extras.local_i32_count);
+        try body.append(allocator, 0x7F); // i32
+    }
     try body.appendSlice(allocator, instructions);
     try body.append(allocator, 0x0B); // end
 
@@ -535,6 +680,73 @@ fn appendI32x4ExtractLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u
 fn appendI32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1C); // i32x4.replace_lane
     try buf.append(allocator, lane);
+}
+
+fn appendI32Const(buf: *std.ArrayList(u8), allocator: Allocator, value: i64) !void {
+    try buf.append(allocator, 0x41); // i32.const
+    try encodeSLEB128(buf, allocator, value);
+}
+
+fn appendLocalGet(buf: *std.ArrayList(u8), allocator: Allocator, index: u32) !void {
+    try buf.append(allocator, 0x20); // local.get
+    try encodeULEB128(buf, allocator, index);
+}
+
+fn appendLocalSet(buf: *std.ArrayList(u8), allocator: Allocator, index: u32) !void {
+    try buf.append(allocator, 0x21); // local.set
+    try encodeULEB128(buf, allocator, index);
+}
+
+fn appendBlock(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try buf.appendSlice(allocator, &[_]u8{ 0x02, 0x40 }); // block void
+}
+
+fn appendLoop(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try buf.appendSlice(allocator, &[_]u8{ 0x03, 0x40 }); // loop void
+}
+
+fn appendEnd(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try buf.append(allocator, 0x0B); // end
+}
+
+fn appendBr(buf: *std.ArrayList(u8), allocator: Allocator, depth: u32) !void {
+    try buf.append(allocator, 0x0C); // br
+    try encodeULEB128(buf, allocator, depth);
+}
+
+fn appendBrIf(buf: *std.ArrayList(u8), allocator: Allocator, depth: u32) !void {
+    try buf.append(allocator, 0x0D); // br_if
+    try encodeULEB128(buf, allocator, depth);
+}
+
+fn appendI32Add(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try buf.append(allocator, 0x6A); // i32.add
+}
+
+fn appendI32GeU(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try buf.append(allocator, 0x4F); // i32.ge_u
+}
+
+fn appendI32Load(
+    buf: *std.ArrayList(u8),
+    allocator: Allocator,
+    alignment: u32,
+    offset: u32,
+) !void {
+    try buf.append(allocator, 0x28); // i32.load
+    try encodeULEB128(buf, allocator, alignment);
+    try encodeULEB128(buf, allocator, offset);
+}
+
+fn appendI32Store(
+    buf: *std.ArrayList(u8),
+    allocator: Allocator,
+    alignment: u32,
+    offset: u32,
+) !void {
+    try buf.append(allocator, 0x36); // i32.store
+    try encodeULEB128(buf, allocator, alignment);
+    try encodeULEB128(buf, allocator, offset);
 }
 
 fn appendSimdMemOpcode(
