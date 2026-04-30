@@ -629,6 +629,66 @@ pub const CodeBuffer = struct {
         try self.emit32(0x0E31B800 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// LDR Qt, [Xn] — full-width 128-bit vector load.
+    pub fn ldrQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.emit32(0x3DC00000 | (@as(u32, rn.encoding()) << 5) | vt);
+    }
+
+    /// STR Qt, [Xn] — full-width 128-bit vector store.
+    pub fn strQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.emit32(0x3D800000 | (@as(u32, rn.encoding()) << 5) | vt);
+    }
+
+    /// INS Vd.D[lane], Xn (alias: MOV Vd.D[lane], Xn).
+    pub fn insDFromGp64(self: *CodeBuffer, vd: u5, lane: u1, rn: Reg) !void {
+        try self.emit32(0x4E081C00 |
+            (@as(u32, lane) << 20) |
+            (@as(u32, rn.encoding()) << 5) |
+            vd);
+    }
+
+    /// MVN Vd.16B, Vn.16B (alias for NOT).
+    pub fn mvn16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E205800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    pub const V128BitwiseOp = enum(u32) {
+        @"and" = 0x4E201C00,
+        bic = 0x4E601C00,
+        orr = 0x4EA01C00,
+        eor = 0x6E201C00,
+    };
+
+    /// AND/BIC/ORR/EOR Vd.16B, Vn.16B, Vm.16B.
+    pub fn bitwise16b(self: *CodeBuffer, op: V128BitwiseOp, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    pub const I32x4Op = enum(u32) {
+        add = 0x4EA08400,
+        sub = 0x6EA08400,
+        cmeq = 0x6EA08C00,
+    };
+
+    /// ADD/SUB/CMEQ Vd.4S, Vn.4S, Vm.4S.
+    pub fn i32x4Op(self: *CodeBuffer, op: I32x4Op, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMOV Wd, Vn.S[lane] (alias: MOV Wd, Vn.S[lane]).
+    pub fn umovWFromS(self: *CodeBuffer, rd: Reg, vn: u5, lane: u2) !void {
+        try self.emit32(0x0E043C00 |
+            (@as(u32, lane) << 19) |
+            (@as(u32, vn) << 5) |
+            rd.encoding());
+    }
+
     /// DMB ISH — full data memory barrier (inner shareable domain).
     /// Provides seq-cst ordering when paired around plain loads/stores.
     pub fn dmbIsh(self: *CodeBuffer) !void {
@@ -1415,6 +1475,62 @@ test "emit: ADDV b0, v1.8b" {
     defer code.deinit();
     try code.addvB8b(0, 1);
     try expectWord(0x0E31B820, &code);
+}
+
+test "emit: LDR q0, [x1]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrQ(0, .x1);
+    try expectWord(0x3DC00020, &code);
+}
+
+test "emit: STR q0, [x1]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.strQ(0, .x1);
+    try expectWord(0x3D800020, &code);
+}
+
+test "emit: MOV v0.d[1], x17" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.insDFromGp64(0, 1, .x17);
+    try expectWord(0x4E181E20, &code);
+}
+
+test "emit: MVN v0.16b, v1.16b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.mvn16b(0, 1);
+    try expectWord(0x6E205820, &code);
+}
+
+test "emit: EOR v0.16b, v1.16b, v2.16b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.bitwise16b(.eor, 0, 1, 2);
+    try expectWord(0x6E221C20, &code);
+}
+
+test "emit: ADD v0.4s, v1.4s, v2.4s" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.i32x4Op(.add, 0, 1, 2);
+    try expectWord(0x4EA28420, &code);
+}
+
+test "emit: CMEQ v0.4s, v1.4s, v2.4s" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.i32x4Op(.cmeq, 0, 1, 2);
+    try expectWord(0x6EA28C20, &code);
+}
+
+test "emit: UMOV w0, v1.s[3]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.umovWFromS(.x0, 1, 3);
+    try expectWord(0x0E1C3C20, &code);
 }
 
 test "emit: DMB ISH" {
