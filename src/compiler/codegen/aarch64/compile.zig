@@ -1838,12 +1838,24 @@ fn emitI32x4BinOp(
         v128_cache,
         fctx,
     );
-    const op: emit.CodeBuffer.I32x4Op = switch (bin.op) {
-        .add => .add,
-        .sub => .sub,
-        .eq => .cmeq,
-    };
-    try code.i32x4Op(op, dest_reg, lhs_reg, rhs_reg);
+    switch (bin.op) {
+        .add => try code.i32x4Op(.add, dest_reg, lhs_reg, rhs_reg),
+        .sub => try code.i32x4Op(.sub, dest_reg, lhs_reg, rhs_reg),
+        .mul => try code.i32x4Op(.mul, dest_reg, lhs_reg, rhs_reg),
+        .eq => try code.i32x4Op(.cmeq, dest_reg, lhs_reg, rhs_reg),
+        .ne => {
+            try code.i32x4Op(.cmeq, dest_reg, lhs_reg, rhs_reg);
+            try code.mvn16b(dest_reg, dest_reg);
+        },
+        .gt_s => try code.i32x4Op(.cmgt, dest_reg, lhs_reg, rhs_reg),
+        .ge_s => try code.i32x4Op(.cmge, dest_reg, lhs_reg, rhs_reg),
+        .lt_s => try code.i32x4Op(.cmgt, dest_reg, rhs_reg, lhs_reg),
+        .le_s => try code.i32x4Op(.cmge, dest_reg, rhs_reg, lhs_reg),
+        .gt_u => try code.i32x4Op(.cmhi, dest_reg, lhs_reg, rhs_reg),
+        .ge_u => try code.i32x4Op(.cmhs, dest_reg, lhs_reg, rhs_reg),
+        .lt_u => try code.i32x4Op(.cmhi, dest_reg, rhs_reg, lhs_reg),
+        .le_u => try code.i32x4Op(.cmhs, dest_reg, rhs_reg, lhs_reg),
+    }
 }
 
 fn emitI32x4Splat(
@@ -5067,6 +5079,76 @@ test "compile: i32x4 lane ops emit NEON instructions" {
     try std.testing.expect(found_dup);
     try std.testing.expect(found_ins);
     try std.testing.expect(found_umov);
+}
+
+test "compile: i32x4 cmp and mul ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const mul = func.newVReg();
+    const ne = func.newVReg();
+    const lt_s = func.newVReg();
+    const gt_s = func.newVReg();
+    const le_s = func.newVReg();
+    const ge_s = func.newVReg();
+    const lt_u = func.newVReg();
+    const gt_u = func.newVReg();
+    const le_u = func.newVReg();
+    const ge_u = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_8000_0000_FFFF_FFFF_0000_0002 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0003_8000_0000_0000_0001_0000_0003 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .mul, .lhs = a, .rhs = b } }, .dest = mul, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .ne, .lhs = a, .rhs = b } }, .dest = ne, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .lt_s, .lhs = a, .rhs = b } }, .dest = lt_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .gt_s, .lhs = a, .rhs = b } }, .dest = gt_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .le_s, .lhs = a, .rhs = b } }, .dest = le_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .ge_s, .lhs = a, .rhs = b } }, .dest = ge_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .lt_u, .lhs = a, .rhs = b } }, .dest = lt_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .gt_u, .lhs = a, .rhs = b } }, .dest = gt_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .le_u, .lhs = a, .rhs = b } }, .dest = le_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .ge_u, .lhs = a, .rhs = b } }, .dest = ge_u, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = ge_u, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_mul = false;
+    var found_cmeq = false;
+    var found_mvn = false;
+    var found_cmgt = false;
+    var found_cmge = false;
+    var found_cmhi = false;
+    var found_cmhs = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0x4EA09C00) found_mul = true;
+        if ((w & 0xFFE0FC00) == 0x6EA08C00) found_cmeq = true;
+        if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
+        if ((w & 0xFFE0FC00) == 0x4EA03400) found_cmgt = true;
+        if ((w & 0xFFE0FC00) == 0x4EA03C00) found_cmge = true;
+        if ((w & 0xFFE0FC00) == 0x6EA03400) found_cmhi = true;
+        if ((w & 0xFFE0FC00) == 0x6EA03C00) found_cmhs = true;
+    }
+
+    try std.testing.expect(found_mul);
+    try std.testing.expect(found_cmeq);
+    try std.testing.expect(found_mvn);
+    try std.testing.expect(found_cmgt);
+    try std.testing.expect(found_cmge);
+    try std.testing.expect(found_cmhi);
+    try std.testing.expect(found_cmhs);
 }
 
 test "compile: v128 locals remain unsupported before ABI support" {
