@@ -19,7 +19,7 @@ incorrect canonical ABI lifting/lowering across guest memory.
 
 Out of scope for this checklist: performance-only work, the public security
 advisory process, and broad fuzz-campaign operations. Fuzzing infrastructure is
-tracked separately from this audit checklist.
+tracked in [tests/fuzz/README.md](tests/fuzz/README.md).
 
 ## Review checklist
 
@@ -174,4 +174,4 @@ Potential follow-up audit areas:
 
 - `zig build test`
 - `zig build spec-tests-aot`
-- `zig build fuzz`
+- `zig build fuzz` (see [tests/fuzz/README.md](tests/fuzz/README.md))

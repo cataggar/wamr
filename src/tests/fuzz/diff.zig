@@ -7,7 +7,7 @@
 //! A true result-comparison oracle requires a shared "invoke export
 //! N, capture typed results" helper that neither interp nor AOT
 //! currently expose uniformly. For v1 the harness only exercises
-//! the compile paths. See plan_fuzz_security.md for the v2 design.
+//! the compile paths. See tests/fuzz/README.md for the v2 scope.
 
 const std = @import("std");
 const wamr = @import("wamr");
