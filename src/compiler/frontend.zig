@@ -1891,6 +1891,30 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i16x8_shl,
+                    .i16x8_shr_s,
+                    .i16x8_shr_u,
+                    => {
+                        const count = safePop(&vreg_stack);
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const shift_op: ir.Inst.I16x8ShiftOp = switch (simd_op) {
+                            .i16x8_shl => .shl,
+                            .i16x8_shr_s => .shr_s,
+                            .i16x8_shr_u => .shr_u,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i16x8_shift = .{
+                                .op = shift_op,
+                                .vector = vector,
+                                .count = count,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i32x4_splat => {
                         const val = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
@@ -2946,6 +2970,63 @@ test "lower i32x4 scalar-count shift opcodes" {
     try std.testing.expectEqual(insts[4].dest.?, insts[6].op.i32x4_shift.vector);
     try std.testing.expectEqual(insts[5].dest.?, insts[6].op.i32x4_shift.count);
     try std.testing.expectEqual(@as(u2, 0), insts[7].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[8].op.ret != null);
+}
+
+test "lower i16x8 scalar-count shift opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const
+        0x01, 0x00,
+        0x02, 0x00,
+        0x03, 0x00,
+        0x04, 0x00,
+        0x05, 0x00,
+        0x06, 0x00,
+        0x07, 0x00,
+        0x08, 0x00,
+        0x41, 0x11, // i32.const 17
+        0xFD, 0x8B, 0x01, // i16x8.shl
+        0x41, 0x10, // i32.const 16
+        0xFD, 0x8C, 0x01, // i16x8.shr_s
+        0x41, 0x1F, // i32.const 31
+        0xFD, 0x8D, 0x01, // i16x8.shr_u
+        0xFD, 0x19, 0x00, // i16x8.extract_lane_u 0
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 9), insts.len);
+    try std.testing.expectEqual(ir.Inst.I16x8ShiftOp.shl, insts[2].op.i16x8_shift.op);
+    try std.testing.expectEqual(insts[0].dest.?, insts[2].op.i16x8_shift.vector);
+    try std.testing.expectEqual(insts[1].dest.?, insts[2].op.i16x8_shift.count);
+    try std.testing.expectEqual(ir.Inst.I16x8ShiftOp.shr_s, insts[4].op.i16x8_shift.op);
+    try std.testing.expectEqual(insts[2].dest.?, insts[4].op.i16x8_shift.vector);
+    try std.testing.expectEqual(insts[3].dest.?, insts[4].op.i16x8_shift.count);
+    try std.testing.expectEqual(ir.Inst.I16x8ShiftOp.shr_u, insts[6].op.i16x8_shift.op);
+    try std.testing.expectEqual(insts[4].dest.?, insts[6].op.i16x8_shift.vector);
+    try std.testing.expectEqual(insts[5].dest.?, insts[6].op.i16x8_shift.count);
+    try std.testing.expectEqual(@as(u3, 0), insts[7].op.i16x8_extract_lane.lane);
+    try std.testing.expectEqual(ir.Inst.I16x8LaneSign.unsigned, insts[7].op.i16x8_extract_lane.sign);
     try std.testing.expect(insts[8].op.ret != null);
 }
 
