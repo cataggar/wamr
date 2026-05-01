@@ -143,6 +143,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .i16x8_binop => |bin| {
+            list.append(bin.lhs);
+            list.append(bin.rhs);
+        },
         .i32x4_shift => |shift| {
             list.append(shift.vector);
             list.append(shift.count);
@@ -185,9 +189,15 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .trunc_sat_f64_u,
         .v128_not,
         .i32x4_splat,
+        .i16x8_splat,
         => |vreg| list.append(vreg),
         .i32x4_extract_lane => |lane| list.append(lane.vector),
+        .i16x8_extract_lane => |lane| list.append(lane.vector),
         .i32x4_replace_lane => |lane| {
+            list.append(lane.vector);
+            list.append(lane.val);
+        },
+        .i16x8_replace_lane => |lane| {
             list.append(lane.vector);
             list.append(lane.val);
         },
@@ -387,6 +397,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
         },
+        .i16x8_binop => |*bin| {
+            if (bin.lhs == old) bin.lhs = new;
+            if (bin.rhs == old) bin.rhs = new;
+        },
         .i32x4_shift => |*shift| {
             if (shift.vector == old) shift.vector = new;
             if (shift.count == old) shift.count = new;
@@ -428,13 +442,21 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .trunc_sat_f64_u,
         .v128_not,
         .i32x4_splat,
+        .i16x8_splat,
         => |*vreg| if (vreg.* == old) {
             vreg.* = new;
         },
         .i32x4_extract_lane => |*lane| if (lane.vector == old) {
             lane.vector = new;
         },
+        .i16x8_extract_lane => |*lane| if (lane.vector == old) {
+            lane.vector = new;
+        },
         .i32x4_replace_lane => |*lane| {
+            if (lane.vector == old) lane.vector = new;
+            if (lane.val == old) lane.val = new;
+        },
+        .i16x8_replace_lane => |*lane| {
             if (lane.vector == old) lane.vector = new;
             if (lane.val == old) lane.val = new;
         },
@@ -1628,6 +1650,10 @@ fn isPure(inst: ir.Inst) bool {
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
+        .i16x8_binop,
+        .i16x8_splat,
+        .i16x8_extract_lane,
+        .i16x8_replace_lane,
         => true,
         else => false,
     };
@@ -1722,6 +1748,10 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .i32x4_splat => |v| v == b.op.i32x4_splat,
         .i32x4_extract_lane => |lane| lane.vector == b.op.i32x4_extract_lane.vector and lane.lane == b.op.i32x4_extract_lane.lane,
         .i32x4_replace_lane => |lane| lane.vector == b.op.i32x4_replace_lane.vector and lane.val == b.op.i32x4_replace_lane.val and lane.lane == b.op.i32x4_replace_lane.lane,
+        .i16x8_binop => |bin| bin.op == b.op.i16x8_binop.op and bin.lhs == b.op.i16x8_binop.lhs and bin.rhs == b.op.i16x8_binop.rhs,
+        .i16x8_splat => |v| v == b.op.i16x8_splat,
+        .i16x8_extract_lane => |lane| lane.vector == b.op.i16x8_extract_lane.vector and lane.lane == b.op.i16x8_extract_lane.lane and lane.sign == b.op.i16x8_extract_lane.sign,
+        .i16x8_replace_lane => |lane| lane.vector == b.op.i16x8_replace_lane.vector and lane.val == b.op.i16x8_replace_lane.val and lane.lane == b.op.i16x8_replace_lane.lane,
         // div/rem: covered by isPure+hasSideEffect guard; float variants
         // (side-effect-free) reach here.
         .div_s => |bin| bin.lhs == b.op.div_s.lhs and bin.rhs == b.op.div_s.rhs,
@@ -3177,6 +3207,10 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             bin.lhs += offset;
             bin.rhs += offset;
         },
+        .i16x8_binop => |*bin| {
+            bin.lhs += offset;
+            bin.rhs += offset;
+        },
         .i32x4_shift => |*shift| {
             shift.vector += offset;
             shift.count += offset;
@@ -3218,9 +3252,15 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .trunc_sat_f64_u,
         .v128_not,
         .i32x4_splat,
+        .i16x8_splat,
         => |*vreg| vreg.* += offset,
         .i32x4_extract_lane => |*lane| lane.vector += offset,
+        .i16x8_extract_lane => |*lane| lane.vector += offset,
         .i32x4_replace_lane => |*lane| {
+            lane.vector += offset;
+            lane.val += offset;
+        },
+        .i16x8_replace_lane => |*lane| {
             lane.vector += offset;
             lane.val += offset;
         },

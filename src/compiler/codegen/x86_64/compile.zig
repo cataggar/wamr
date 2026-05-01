@@ -1257,6 +1257,10 @@ fn compileInst(
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
+        .i16x8_binop,
+        .i16x8_splat,
+        .i16x8_extract_lane,
+        .i16x8_replace_lane,
         => return error.UnsupportedV128,
         // Phi must be lowered before codegen.
         .phi => unreachable,
@@ -1483,6 +1487,10 @@ fn functionUsesV128(func: *const ir.IrFunction) bool {
                 .i32x4_splat,
                 .i32x4_extract_lane,
                 .i32x4_replace_lane,
+                .i16x8_binop,
+                .i16x8_splat,
+                .i16x8_extract_lane,
+                .i16x8_replace_lane,
                 => return true,
                 else => {},
             }

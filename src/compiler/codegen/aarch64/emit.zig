@@ -688,10 +688,23 @@ pub const CodeBuffer = struct {
         try self.emit32(0x4E040C00 | (@as(u32, rn.encoding()) << 5) | vd);
     }
 
+    /// DUP Vd.8H, Wn.
+    pub fn dup8hFromGp32(self: *CodeBuffer, vd: u5, rn: Reg) !void {
+        try self.emit32(0x4E020C00 | (@as(u32, rn.encoding()) << 5) | vd);
+    }
+
     /// INS Vd.S[lane], Wn (alias: MOV Vd.S[lane], Wn).
     pub fn insSFromGp32(self: *CodeBuffer, vd: u5, lane: u2, rn: Reg) !void {
         try self.emit32(0x4E041C00 |
             (@as(u32, lane) << 19) |
+            (@as(u32, rn.encoding()) << 5) |
+            vd);
+    }
+
+    /// INS Vd.H[lane], Wn (alias: MOV Vd.H[lane], Wn).
+    pub fn insHFromGp32(self: *CodeBuffer, vd: u5, lane: u3, rn: Reg) !void {
+        try self.emit32(0x4E021C00 |
+            (@as(u32, lane) << 18) |
             (@as(u32, rn.encoding()) << 5) |
             vd);
     }
@@ -735,6 +748,25 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    pub const I16x8Op = enum(u32) {
+        add = 0x4E608400,
+        sub = 0x6E608400,
+        mul = 0x4E609C00,
+        cmeq = 0x6E608C00,
+        cmgt = 0x4E603400,
+        cmge = 0x4E603C00,
+        cmhi = 0x6E603400,
+        cmhs = 0x6E603C00,
+    };
+
+    /// Integer 8H binary vector op: ADD/SUB/MUL/CMEQ/CMGT/CMGE/CMHI/CMHS.
+    pub fn i16x8Op(self: *CodeBuffer, op: I16x8Op, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// SSHL Vd.4S, Vn.4S, Vm.4S — signed variable shift.
     pub fn sshl4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4EA04400 |
@@ -762,6 +794,22 @@ pub const CodeBuffer = struct {
     pub fn umovWFromS(self: *CodeBuffer, rd: Reg, vn: u5, lane: u2) !void {
         try self.emit32(0x0E043C00 |
             (@as(u32, lane) << 19) |
+            (@as(u32, vn) << 5) |
+            rd.encoding());
+    }
+
+    /// UMOV Wd, Vn.H[lane] (alias: MOV Wd, Vn.H[lane]).
+    pub fn umovWFromH(self: *CodeBuffer, rd: Reg, vn: u5, lane: u3) !void {
+        try self.emit32(0x0E023C00 |
+            (@as(u32, lane) << 18) |
+            (@as(u32, vn) << 5) |
+            rd.encoding());
+    }
+
+    /// SMOV Wd, Vn.H[lane].
+    pub fn smovWFromH(self: *CodeBuffer, rd: Reg, vn: u5, lane: u3) !void {
+        try self.emit32(0x0E022C00 |
+            (@as(u32, lane) << 18) |
             (@as(u32, vn) << 5) |
             rd.encoding());
     }
@@ -1589,11 +1637,25 @@ test "emit: DUP v0.4s, w1" {
     try expectWord(0x4E040C20, &code);
 }
 
+test "emit: DUP v0.8h, w1" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.dup8hFromGp32(0, .x1);
+    try expectWord(0x4E020C20, &code);
+}
+
 test "emit: MOV v0.s[2], w17" {
     var code = CodeBuffer.init(std.testing.allocator);
     defer code.deinit();
     try code.insSFromGp32(0, 2, .x17);
     try expectWord(0x4E141E20, &code);
+}
+
+test "emit: MOV v0.h[5], w17" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.insHFromGp32(0, 5, .x17);
+    try expectWord(0x4E161E20, &code);
 }
 
 test "emit: MVN v0.16b, v1.16b" {
@@ -1629,6 +1691,57 @@ test "emit: MUL v0.4s, v1.4s, v2.4s" {
     defer code.deinit();
     try code.i32x4Op(.mul, 0, 1, 2);
     try expectWord(0x4EA29C20, &code);
+}
+
+test "emit: i16x8 vector ops" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.add, 0, 1, 2);
+        try expectWord(0x4E628420, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.sub, 3, 4, 5);
+        try expectWord(0x6E658483, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.mul, 6, 7, 8);
+        try expectWord(0x4E689CE6, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.cmeq, 9, 10, 11);
+        try expectWord(0x6E6B8D49, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.cmgt, 12, 13, 14);
+        try expectWord(0x4E6E35AC, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.cmge, 15, 16, 17);
+        try expectWord(0x4E713E0F, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.cmhi, 18, 19, 20);
+        try expectWord(0x6E743672, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i16x8Op(.cmhs, 21, 22, 23);
+        try expectWord(0x6E773ED5, &code);
+    }
 }
 
 test "emit: i32x4 variable shifts" {
@@ -1687,6 +1800,21 @@ test "emit: UMOV w0, v1.s[3]" {
     defer code.deinit();
     try code.umovWFromS(.x0, 1, 3);
     try expectWord(0x0E1C3C20, &code);
+}
+
+test "emit: UMOV/SMOV w from h lane" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.umovWFromH(.x2, 3, 6);
+        try expectWord(0x0E1A3C62, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.smovWFromH(.x4, 5, 7);
+        try expectWord(0x0E1E2CA4, &code);
+    }
 }
 
 test "emit: DMB ISH" {

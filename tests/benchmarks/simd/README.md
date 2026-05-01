@@ -25,7 +25,9 @@ The `simd_i32x4_mem_sum8_4k_loop` row is a v128 register-pressure probe. Each lo
 
 The `simd_i32x4_shift_mix_4k_loop` row is a dynamic-shift throughput probe. Each loop iteration derives the scalar shift count from the loop index, exercises `i32x4.shl`, `i32x4.shr_u`, and `i32x4.shr_s`, stores a vector result, and returns one scalar checksum lane. This keeps shift counts data-dependent and above the lane width so modulo masking is covered in the AOT path.
 
-The small `simd_i32x4_*_lane0` rows are coverage/status probes for individual opcode families. They intentionally return one scalar lane so interpreter, AOT, and optional Wasmtime rows can be compared before the runtime supports direct exported v128 values.
+The `simd_i16x8_mem_add_4k_loop` row is the 16-bit lane counterpart to the i32x4 memory-add loop. It walks two 4 KiB arrays as packed 16-bit lanes with `v128.load`, `i16x8.add`, and `v128.store`, then returns the final unsigned 16-bit lane as a scalar checksum.
+
+The small `simd_i32x4_*_lane0` and `simd_i16x8_*_lane0` rows are coverage/status probes for individual opcode families. They intentionally return one scalar lane so interpreter, AOT, and optional Wasmtime rows can be compared before the runtime supports direct exported v128 values. The i16x8 comparison and replace-lane rows also cover signed vs unsigned 16-bit extraction of all-ones masks and high-bit lane values.
 
 Wasmtime can be included as an external baseline:
 
