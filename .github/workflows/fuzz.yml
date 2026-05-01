@@ -87,7 +87,7 @@ jobs:
             # Minimal component: "\0asm" plus version/layer 0x0001000d.
             printf '\000asm\015\000\001\000' > .fuzz-corpus/${{ matrix.target }}/minimal-component.wasm
           fi
-          if [ "${{ matrix.target }}" = "interp" ]; then
+          if [ "${{ matrix.target }}" = "interp" ] || [ "${{ matrix.target }}" = "diff" ]; then
             # Minimal core module exporting `run: () -> i32`.
             printf '\000asm\001\000\000\000\001\005\001\140\000\001\177\003\002\001\000\007\007\001\003run\000\000\012\006\001\004\000\101\052\013' > .fuzz-corpus/${{ matrix.target }}/minimal-interp-run.wasm
           fi
@@ -105,7 +105,7 @@ jobs:
         run: |
           mkdir -p .fuzz-crashes
           extra_args=()
-          if [ "$FUZZ_TARGET" = "interp" ]; then
+          if [ "$FUZZ_TARGET" = "interp" ] || [ "$FUZZ_TARGET" = "diff" ]; then
             extra_args+=(--fuel "$FUZZ_INTERP_FUEL")
           fi
           ./zig-out/bin/fuzz-${FUZZ_TARGET} \

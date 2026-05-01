@@ -64,7 +64,7 @@ pub const Args = struct {
             \\Replays every .wasm file under <corpus> through the target until
             \\<duration> seconds have elapsed. A crashing input is left at
             \\<crashes>/in-flight.wasm when the process aborts.
-            \\The optional --fuel limit is currently used by fuzz-interp.
+            \\The optional --fuel limit is currently used by fuzz-interp and fuzz-diff.
             \\
         , .{});
     }

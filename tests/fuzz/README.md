@@ -28,7 +28,7 @@ abort, or small-input OOM is a bug.
 | `fuzz-component-loader` | Component-model binary loader | A valid component or typed component loader error is OK. A panic, abort, or safety-check failure is a bug. |
 | `fuzz-interp` | Interpreter load, instantiate, and bounded nullary export invocation | Loader/validation/instantiation errors, guest traps, fuel exhaustion, and unsupported signatures are OK. Panics, aborts, or result-stack shape mismatches are bugs. |
 | `fuzz-aot` | AOT compile, AOT loader, and instantiate path | Compile/instantiate errors are OK. The harness deliberately sets `invoke_start = false` and does not execute attacker-supplied start functions. |
-| `fuzz-diff` | Interpreter load plus AOT compile/instantiate scaffold | Pipeline errors are OK. Result comparison for supported exports is tracked as follow-up work. |
+| `fuzz-diff` | Interpreter vs AOT result oracle for a statically safe straight-line scalar subset | Loader/instantiate errors, interpreter traps, fuel exhaustion, unsupported signatures, and exports whose bytecode is outside the safe subset are OK. A result-shape, tag, or value mismatch is saved as `diff-mismatch-<hash>.wasm` and is a bug. |
 
 ## Local use
 
@@ -69,9 +69,18 @@ The harnesses replay every `.wasm` file under `--corpus` until the duration
 expires. They are not coverage-guided mutators by themselves; use them as stable
 entry points for CI and future mutation/generation infrastructure.
 
-`fuzz-interp` uses `--fuel <instructions>` as a per-export interpreter instruction
-budget. Fuel exhaustion is an expected outcome and is reported separately from a
-guest `unreachable` trap.
+`fuzz-interp` and `fuzz-diff` accept `--fuel <instructions>` as a per-export
+interpreter instruction budget. Fuel exhaustion is an expected outcome and is
+reported separately from a guest `unreachable` trap.
+
+For `fuzz-diff` smoke with the same minimal seed:
+
+```sh
+rm -rf /tmp/wamr-diff-corpus /tmp/wamr-fuzz-crashes
+mkdir -p /tmp/wamr-diff-corpus /tmp/wamr-fuzz-crashes
+printf '\000asm\001\000\000\000\001\005\001\140\000\001\177\003\002\001\000\007\007\001\003run\000\000\012\006\001\004\000\101\052\013' > /tmp/wamr-diff-corpus/minimal-interp-run.wasm
+./zig-out/bin/fuzz-diff --corpus /tmp/wamr-diff-corpus --crashes /tmp/wamr-fuzz-crashes --duration 5 --fuel 100000
+```
 
 ## Crash artifacts and reproduction
 
@@ -97,14 +106,14 @@ touch runtime/compiler/component/fuzz code. The workflow:
 - builds all harnesses with `zig build fuzz -Doptimize=ReleaseSafe`;
 - seeds per-target corpora from `tests/malformed/fuzz` and `tests/spec-json`;
 - adds a generated minimal component seed for `fuzz-component-loader`;
-- adds a generated nullary scalar export seed for `fuzz-interp`;
+- adds a generated nullary scalar export seed for `fuzz-interp` and `fuzz-diff`;
 - uploads `.fuzz-crashes` artifacts with 30-day retention;
 - uploads per-target corpus artifacts with 7-day retention;
 - fails the job when any crash artifact remains.
 
 Manual runs can choose `all`, `loader`, `component-loader`, `interp`, `aot`, or
-`diff`, set a per-target duration, and set the per-export `fuzz-interp` fuel
-budget.
+`diff`, set a per-target duration, and set the per-export interpreter fuel
+budget shared by `fuzz-interp` and `fuzz-diff`.
 
 ## Current limitations and follow-ups
 
@@ -117,9 +126,13 @@ host-protection mechanism.
   `() -> i32`, `() -> i64`, `() -> f32`, or `() -> f64`. Parameterized,
   reference-typed, `v128`, imported-function, and multi-result exports remain
   out of scope until a deterministic input and host-import policy is designed.
-- `fuzz-diff` does not yet compare typed interpreter and AOT results (#246). A future
-  oracle should select supported nullary or bounded-argument scalar exports and
-  handle platform-specific AOT traps outside the test runner.
+- `fuzz-diff` only compares results for nullary scalar exports whose bytecode
+  passes a conservative straight-line filter that rejects calls, branches,
+  loops, memory/table/atomic/exception/SIMD/ref ops, integer div/rem,
+  truncation conversions, and `unreachable`. Broader AOT execution (arbitrary
+  exports, parameterized exports, native trap differential) needs subprocess
+  isolation because the AOT runtime only converts traps to typed errors on
+  Windows x86_64; on Linux/AArch64 a native AOT trap can terminate the host.
 - Direct WASI and component-adapter fuzzing needs a deterministic byte-command
   model for resource tables, paths, descriptors, sockets, HTTP streams, and
   guest-memory pointer/length pairs (#247).
