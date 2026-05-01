@@ -239,6 +239,10 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
+        .i16x8_binop,
+        .i16x8_splat,
+        .i16x8_extract_lane,
+        .i16x8_replace_lane,
         => if (def != null) .alu else .barrier,
 
         .mul => if (def != null and isIntegerType(inst.type)) .mul else .barrier,
@@ -485,6 +489,10 @@ pub fn forEachUse(
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .i16x8_binop => |bin| {
+            try visit(context, bin.lhs);
+            try visit(context, bin.rhs);
+        },
         .i32x4_shift => |shift| {
             try visit(context, shift.vector);
             try visit(context, shift.count);
@@ -492,6 +500,12 @@ pub fn forEachUse(
         .i32x4_splat => |v| try visit(context, v),
         .i32x4_extract_lane => |lane| try visit(context, lane.vector),
         .i32x4_replace_lane => |lane| {
+            try visit(context, lane.vector);
+            try visit(context, lane.val);
+        },
+        .i16x8_splat => |v| try visit(context, v),
+        .i16x8_extract_lane => |lane| try visit(context, lane.vector),
+        .i16x8_replace_lane => |lane| {
             try visit(context, lane.vector);
             try visit(context, lane.val);
         },
@@ -565,6 +579,14 @@ test "metadata models supported v128 ops as schedulable" {
     const replace = ir.Inst{ .op = .{ .i32x4_replace_lane = .{ .vector = 7, .val = 8, .lane = 1 } }, .dest = 11, .type = .v128 };
     try std.testing.expect(!metadata(replace).barrier);
     try std.testing.expectEqual(Class.alu, metadata(replace).class);
+
+    const i16_binop = ir.Inst{ .op = .{ .i16x8_binop = .{ .op = .add, .lhs = 7, .rhs = 11 } }, .dest = 12, .type = .v128 };
+    try std.testing.expect(!metadata(i16_binop).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(i16_binop).class);
+
+    const i16_extract = ir.Inst{ .op = .{ .i16x8_extract_lane = .{ .vector = 12, .lane = 5, .sign = .unsigned } }, .dest = 13, .type = .i32 };
+    try std.testing.expect(!metadata(i16_extract).barrier);
+    try std.testing.expectEqual(Class.alu, metadata(i16_extract).class);
 }
 
 test "local scheduler prioritizes a long independent multiply chain" {
