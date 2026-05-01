@@ -240,6 +240,7 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .i32x4_extract_lane,
         .i32x4_replace_lane,
         .i8x16_binop,
+        .i8x16_shift,
         .i8x16_splat,
         .i8x16_extract_lane,
         .i8x16_replace_lane,
@@ -497,6 +498,10 @@ pub fn forEachUse(
         .i8x16_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
+        },
+        .i8x16_shift => |shift| {
+            try visit(context, shift.vector);
+            try visit(context, shift.count);
         },
         .i16x8_binop => |bin| {
             try visit(context, bin.lhs);
