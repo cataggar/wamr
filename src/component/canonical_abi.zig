@@ -535,11 +535,11 @@ pub fn loadVal(memory: []const u8, ptr: u32, t: ctypes.ValType) !InterfaceValue 
         .own, .borrow => .{ .handle = loadU32(memory, ptr) },
         .string => .{ .string = .{
             .ptr = loadU32(memory, ptr),
-            .len = loadU32(memory, ptr + 4),
+            .len = loadU32At(memory, ptr, 4),
         } },
         .list => .{ .list = .{
             .ptr = loadU32(memory, ptr),
-            .len = loadU32(memory, ptr + 4),
+            .len = loadU32At(memory, ptr, 4),
         } },
         .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => error.CompoundNeedsRegistry,
     };
@@ -580,7 +580,7 @@ pub fn loadValReg(memory: []const u8, ptr: u32, t: ctypes.ValType, reg: TypeRegi
                 words[0] = loadU16(memory, ptr);
             } else {
                 for (0..n_words) |i| {
-                    words[i] = loadU32(memory, ptr + @as(u32, @intCast(i)) * 4);
+                    words[i] = loadU32At(memory, ptr, i * 4);
                 }
             }
             break :blk .{ .flags_val = words };
@@ -666,7 +666,7 @@ fn loadValFromDef(memory: []const u8, ptr: u32, td: ctypes.TypeDef, reg: TypeReg
         // `(type (list T))` — list is laid out in linear memory as (ptr, len).
         .list => .{ .list = .{
             .ptr = loadU32(memory, ptr),
-            .len = loadU32(memory, ptr + 4),
+            .len = loadU32At(memory, ptr, 4),
         } },
         .record => |r| blk: {
             const vals = try alloc.alloc(InterfaceValue, r.fields.len);
@@ -713,7 +713,7 @@ fn loadValFromDef(memory: []const u8, ptr: u32, td: ctypes.TypeDef, reg: TypeReg
                 words[0] = loadU16(memory, ptr);
             } else {
                 for (0..n_words) |i| {
-                    words[i] = loadU32(memory, ptr + @as(u32, @intCast(i)) * 4);
+                    words[i] = loadU32At(memory, ptr, i * 4);
                 }
             }
             break :blk .{ .flags_val = words };
@@ -777,11 +777,11 @@ pub fn storeVal(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValue) 
         .own, .borrow => storeU32(memory, ptr, val.handle),
         .string => {
             storeU32(memory, ptr, val.string.ptr);
-            storeU32(memory, ptr + 4, val.string.len);
+            storeU32At(memory, ptr, 4, val.string.len);
         },
         .list => {
             storeU32(memory, ptr, val.list.ptr);
-            storeU32(memory, ptr + 4, val.list.len);
+            storeU32At(memory, ptr, 4, val.list.len);
         },
         .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => return error.CompoundNeedsRegistry,
     }
@@ -818,7 +818,7 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
             } else {
                 const n_words = (n_flags + 31) / 32;
                 for (0..n_words) |i| {
-                    storeU32(memory, ptr + @as(u32, @intCast(i)) * 4, val.flags_val[i]);
+                    storeU32At(memory, ptr, i * 4, val.flags_val[i]);
                 }
             }
         },
@@ -907,7 +907,7 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
         // `(type (list T))` — store as (ptr, len) pair in linear memory.
         .list => {
             storeU32(memory, ptr, val.list.ptr);
-            storeU32(memory, ptr + 4, val.list.len);
+            storeU32At(memory, ptr, 4, val.list.len);
         },
         .record => |r| {
             var offset: u32 = ptr;
@@ -948,7 +948,7 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
             } else {
                 const n_words = (fl.names.len + 31) / 32;
                 for (0..n_words) |i| {
-                    storeU32(memory, ptr + @as(u32, @intCast(i)) * 4, val.flags_val[i]);
+                    storeU32At(memory, ptr, i * 4, val.flags_val[i]);
                 }
             }
         },
@@ -1096,8 +1096,8 @@ pub fn lowerFlat(val: InterfaceValue, t: ctypes.ValType, out: []u32) !u32 {
 
 /// Validate and measure a UTF-8 encoded string in linear memory.
 pub fn validateUtf8(memory: []const u8, ptr: u32, len: u32) bool {
-    if (ptr + len > memory.len) return false;
-    return std.unicode.utf8ValidateSlice(memory[ptr .. ptr + len]);
+    const range = checkedRange(memory.len, ptr, @intCast(len)) orelse return false;
+    return std.unicode.utf8ValidateSlice(memory[range.start..range.end]);
 }
 
 /// Transcode UTF-8 bytes to UTF-16LE, writing into `out`.
@@ -1126,9 +1126,9 @@ pub fn utf8ToUtf16(src: []const u8, out: []u16) !u32 {
 /// Decode UTF-16LE bytes from linear memory into a UTF-8 string.
 /// Returns a newly-allocated UTF-8 byte slice.
 pub fn utf16ToUtf8(mem: []const u8, ptr: u32, code_units: u32, allocator: Allocator) ![]u8 {
-    const byte_len = @as(u32, code_units) * 2;
-    if (ptr + byte_len > mem.len) return error.BufferTooSmall;
-    const slice = mem[ptr .. ptr + byte_len];
+    const byte_len = std.math.mul(usize, @intCast(code_units), 2) catch return error.BufferTooSmall;
+    const range = checkedRange(mem.len, ptr, byte_len) orelse return error.BufferTooSmall;
+    const slice = mem[range.start..range.end];
 
     // First pass: measure UTF-8 length
     var utf8_len: usize = 0;
@@ -1183,8 +1183,8 @@ pub fn decodeLatin1Utf16(mem: []const u8, ptr: u32, tagged_len: u32, allocator: 
         return utf16ToUtf8(mem, ptr, code_units, allocator);
     } else {
         // Latin-1 encoded: each byte is a code point ≤ 0xFF
-        if (ptr + tagged_len > mem.len) return error.BufferTooSmall;
-        const latin1 = mem[ptr .. ptr + tagged_len];
+        const range = checkedRange(mem.len, ptr, @intCast(tagged_len)) orelse return error.BufferTooSmall;
+        const latin1 = mem[range.start..range.end];
         // Latin-1 → UTF-8: code points 0x80-0xFF become 2-byte sequences
         var utf8_len: usize = 0;
         for (latin1) |b| {
@@ -1214,15 +1214,16 @@ pub fn encodeUtf16ToMem(mem: []u8, ptr: u32, src: []const u8) !u32 {
     var view = std.unicode.Utf8View.initUnchecked(src);
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
+        const byte_offset = std.math.mul(usize, @intCast(written), 2) catch return error.BufferTooSmall;
         if (cp <= 0xFFFF) {
-            if (ptr + written * 2 + 2 > mem.len) return error.BufferTooSmall;
-            storeU16(mem, ptr + written * 2, @intCast(cp));
+            const range = checkedRangeAt(mem.len, ptr, byte_offset, 2) orelse return error.BufferTooSmall;
+            std.mem.writeInt(u16, mem[range.start..range.end][0..2], @intCast(cp), .little);
             written += 1;
         } else {
-            if (ptr + written * 2 + 4 > mem.len) return error.BufferTooSmall;
+            const range = checkedRangeAt(mem.len, ptr, byte_offset, 4) orelse return error.BufferTooSmall;
             const adj = cp - 0x10000;
-            storeU16(mem, ptr + written * 2, @intCast(0xD800 + (adj >> 10)));
-            storeU16(mem, ptr + written * 2 + 2, @intCast(0xDC00 + (adj & 0x3FF)));
+            std.mem.writeInt(u16, mem[range.start..][0..2], @intCast(0xD800 + (adj >> 10)), .little);
+            std.mem.writeInt(u16, mem[range.start + 2 ..][0..2], @intCast(0xDC00 + (adj & 0x3FF)), .little);
             written += 2;
         }
     }
@@ -1242,44 +1243,69 @@ pub const AbiError = error{
 
 // ── Memory helpers ──────────────────────────────────────────────────────────
 
+const MemRange = struct {
+    start: usize,
+    end: usize,
+};
+
+fn checkedRange(mem_len: usize, ptr: u32, byte_len: usize) ?MemRange {
+    return checkedRangeAt(mem_len, ptr, 0, byte_len);
+}
+
+fn checkedRangeAt(mem_len: usize, ptr: u32, byte_offset: usize, byte_len: usize) ?MemRange {
+    const base: usize = @intCast(ptr);
+    const start = std.math.add(usize, base, byte_offset) catch return null;
+    const end = std.math.add(usize, start, byte_len) catch return null;
+    if (end > mem_len) return null;
+    return .{ .start = start, .end = end };
+}
+
 fn loadU8(mem: []const u8, ptr: u32) u8 {
-    if (ptr >= mem.len) return 0;
-    return mem[ptr];
+    const range = checkedRange(mem.len, ptr, 1) orelse return 0;
+    return mem[range.start];
 }
 
 fn loadU16(mem: []const u8, ptr: u32) u16 {
-    if (ptr + 2 > mem.len) return 0;
-    return std.mem.readInt(u16, mem[ptr..][0..2], .little);
+    const range = checkedRange(mem.len, ptr, 2) orelse return 0;
+    return std.mem.readInt(u16, mem[range.start..range.end][0..2], .little);
 }
 
 fn loadU32(mem: []const u8, ptr: u32) u32 {
-    if (ptr + 4 > mem.len) return 0;
-    return std.mem.readInt(u32, mem[ptr..][0..4], .little);
+    return loadU32At(mem, ptr, 0);
+}
+
+fn loadU32At(mem: []const u8, ptr: u32, byte_offset: usize) u32 {
+    const range = checkedRangeAt(mem.len, ptr, byte_offset, 4) orelse return 0;
+    return std.mem.readInt(u32, mem[range.start..range.end][0..4], .little);
 }
 
 fn loadU64(mem: []const u8, ptr: u32) u64 {
-    if (ptr + 8 > mem.len) return 0;
-    return std.mem.readInt(u64, mem[ptr..][0..8], .little);
+    const range = checkedRange(mem.len, ptr, 8) orelse return 0;
+    return std.mem.readInt(u64, mem[range.start..range.end][0..8], .little);
 }
 
 fn storeU8(mem: []u8, ptr: u32, val: u8) void {
-    if (ptr >= mem.len) return;
-    mem[ptr] = val;
+    const range = checkedRange(mem.len, ptr, 1) orelse return;
+    mem[range.start] = val;
 }
 
 fn storeU16(mem: []u8, ptr: u32, val: u16) void {
-    if (ptr + 2 > mem.len) return;
-    std.mem.writeInt(u16, mem[ptr..][0..2], val, .little);
+    const range = checkedRange(mem.len, ptr, 2) orelse return;
+    std.mem.writeInt(u16, mem[range.start..range.end][0..2], val, .little);
 }
 
 fn storeU32(mem: []u8, ptr: u32, val: u32) void {
-    if (ptr + 4 > mem.len) return;
-    std.mem.writeInt(u32, mem[ptr..][0..4], val, .little);
+    storeU32At(mem, ptr, 0, val);
+}
+
+fn storeU32At(mem: []u8, ptr: u32, byte_offset: usize, val: u32) void {
+    const range = checkedRangeAt(mem.len, ptr, byte_offset, 4) orelse return;
+    std.mem.writeInt(u32, mem[range.start..range.end][0..4], val, .little);
 }
 
 fn storeU64(mem: []u8, ptr: u32, val: u64) void {
-    if (ptr + 8 > mem.len) return;
-    std.mem.writeInt(u64, mem[ptr..][0..8], val, .little);
+    const range = checkedRange(mem.len, ptr, 8) orelse return;
+    std.mem.writeInt(u64, mem[range.start..range.end][0..8], val, .little);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1342,7 +1368,7 @@ test "TypeRegistry: extended types append past component indexspace" {
 }
 
 test "TypeRegistry: fromExtended falls back to component-only when ext empty" {
-    const comp_types = [_]ctypes.TypeDef{ .{ .val = .u32 } };
+    const comp_types = [_]ctypes.TypeDef{.{ .val = .u32 }};
     var component = std.mem.zeroes(ctypes.Component);
     component.types = &comp_types;
 
@@ -1415,6 +1441,24 @@ test "validateUtf8: valid and invalid" {
     const mem = "Hello, world!";
     try std.testing.expect(validateUtf8(mem, 0, 13));
     try std.testing.expect(!validateUtf8(mem, 0, 100)); // out of bounds
+}
+
+test "canonical memory ranges reject wrapping pointers" {
+    const allocator = std.testing.allocator;
+    const max_u32 = std.math.maxInt(u32);
+    var mem = [_]u8{0} ** 8;
+
+    try std.testing.expect(!validateUtf8(&mem, max_u32 - 3, 8));
+    try std.testing.expectError(error.BufferTooSmall, utf16ToUtf8(&mem, max_u32 - 1, 2, allocator));
+    try std.testing.expectError(error.BufferTooSmall, decodeLatin1Utf16(&mem, max_u32 - 3, 8, allocator));
+    try std.testing.expectError(error.BufferTooSmall, encodeUtf16ToMem(&mem, max_u32 - 1, "A"));
+
+    const loaded = try loadVal(&mem, max_u32 - 3, .string);
+    try std.testing.expectEqual(@as(u32, 0), loaded.string.ptr);
+    try std.testing.expectEqual(@as(u32, 0), loaded.string.len);
+
+    try storeVal(&mem, max_u32 - 3, .string, .{ .string = .{ .ptr = 1, .len = 2 } });
+    try std.testing.expectEqualSlices(u8, &[_]u8{0} ** 8, &mem);
 }
 
 test "utf8ToUtf16: basic ASCII" {

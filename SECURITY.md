@@ -22,3 +22,6 @@ guaranteed CVE process.
 
 Please do not report vulnerabilities in this repository to the Bytecode Alliance
 unless the same issue also affects a Bytecode Alliance project.
+
+For proactive review scope and sandbox-critical audit checklists, see
+[SECURITY_AUDIT.md](SECURITY_AUDIT.md).
