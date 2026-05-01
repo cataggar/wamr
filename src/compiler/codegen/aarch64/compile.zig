@@ -568,6 +568,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i16x8_splat,
         .i16x8_replace_lane,
         .i64x2_binop,
+        .i64x2_shift,
         .i64x2_splat,
         .i64x2_replace_lane,
         => inst.type == .v128,
@@ -602,6 +603,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i16x8_splat,
                 .i16x8_replace_lane,
                 .i64x2_binop,
+                .i64x2_shift,
                 .i64x2_splat,
                 .i64x2_replace_lane,
                 => {
@@ -1392,6 +1394,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i16x8_extract_lane,
         .i16x8_replace_lane,
         .i64x2_binop,
+        .i64x2_shift,
         .i64x2_splat,
         .i64x2_extract_lane,
         .i64x2_replace_lane,
@@ -1557,6 +1560,7 @@ fn compileInst(
         .i16x8_extract_lane => |lane| try emitI16x8ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
         .i16x8_replace_lane => |lane| try emitI16x8ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
         .i64x2_binop => |bin| try emitI64x2BinOp(code, inst, bin, v128_map, v128_cache, fctx),
+        .i64x2_shift => |shift| try emitI64x2Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
         .i64x2_splat => |src| try emitI64x2Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i64x2_extract_lane => |lane| try emitI64x2ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
         .i64x2_replace_lane => |lane| try emitI64x2ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
@@ -2363,6 +2367,34 @@ fn emitI64x2BinOp(
         .ge_s => try code.i64x2Op(.cmge, dest_reg, lhs_reg, rhs_reg),
         .lt_s => try code.i64x2Op(.cmgt, dest_reg, rhs_reg, lhs_reg),
         .le_s => try code.i64x2Op(.cmge, dest_reg, rhs_reg, lhs_reg),
+    }
+}
+
+fn emitI64x2Shift(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    shift: ir.Inst.I64x2Shift,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, shift.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, shift.vector, vector_reg, v128_map, v128_cache, fctx);
+    const count_reg = try useInto(code, reg_map, shift.count, RegMap.tmp0);
+    try code.andImm32Mask63(RegMap.tmp0, count_reg);
+    const shift_reg = v128_tmp1;
+    try code.dup2dFromGp64(shift_reg, RegMap.tmp0);
+    switch (shift.op) {
+        .shl => try code.sshl2d(dest_reg, vector_reg, shift_reg),
+        .shr_s => {
+            try code.neg2d(shift_reg, shift_reg);
+            try code.sshl2d(dest_reg, vector_reg, shift_reg);
+        },
+        .shr_u => {
+            try code.neg2d(shift_reg, shift_reg);
+            try code.ushl2d(dest_reg, vector_reg, shift_reg);
+        },
     }
 }
 
@@ -6035,6 +6067,58 @@ test "compile: i64x2 cmp and arithmetic ops emit NEON instructions" {
     try std.testing.expect(found_mvn);
     try std.testing.expect(found_cmgt);
     try std.testing.expect(found_cmge);
+}
+
+test "compile: i64x2 scalar-count shifts emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const vector = func.newVReg();
+    const count_shl = func.newVReg();
+    const shl = func.newVReg();
+    const count_shr_s = func.newVReg();
+    const shr_s = func.newVReg();
+    const count_shr_u = func.newVReg();
+    const shr_u = func.newVReg();
+    const lane = func.newVReg();
+    const wrapped = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_0000_0001_ffff_ffff_ffff_ff80 }, .dest = vector, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 65 }, .dest = count_shl, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i64x2_shift = .{ .op = .shl, .vector = vector, .count = count_shl } }, .dest = shl, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 64 }, .dest = count_shr_s, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i64x2_shift = .{ .op = .shr_s, .vector = shl, .count = count_shr_s } }, .dest = shr_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 63 }, .dest = count_shr_u, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i64x2_shift = .{ .op = .shr_u, .vector = shr_s, .count = count_shr_u } }, .dest = shr_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i64x2_extract_lane = .{ .vector = shr_u, .lane = 0 } }, .dest = lane, .type = .i64 });
+    try func.getBlock(bid).append(.{ .op = .{ .wrap_i64 = lane }, .dest = wrapped, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = wrapped } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_count_mask = false;
+    var found_dup = false;
+    var found_sshl = false;
+    var found_neg2d = false;
+    var found_ushl = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x12001400) found_count_mask = true;
+        if ((w & 0xFFFFFC00) == 0x4E080C00) found_dup = true;
+        if ((w & 0xFFE0FC00) == 0x4EE04400) found_sshl = true;
+        if ((w & 0xFFFFFC00) == 0x6EE0B800) found_neg2d = true;
+        if ((w & 0xFFE0FC00) == 0x6EE04400) found_ushl = true;
+    }
+
+    try std.testing.expect(found_count_mask);
+    try std.testing.expect(found_dup);
+    try std.testing.expect(found_sshl);
+    try std.testing.expect(found_neg2d);
+    try std.testing.expect(found_ushl);
 }
 
 test "compile: i8x16 scalar-count shifts emit NEON instructions" {

@@ -120,6 +120,11 @@ pub const CodeBuffer = struct {
         try self.emit32(0x12001000 | (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// AND Wd, Wn, #0x3f — mask a scalar i64x2 shift count modulo 64.
+    pub fn andImm32Mask63(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
+        try self.emit32(0x12001400 | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// AND Wd, Wn, #0xf — mask a scalar i16x8 shift count modulo 16.
     pub fn andImm32Mask15(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
         try self.emit32(0x12000C00 | (@as(u32, rn.encoding()) << 5) | rd.encoding());
@@ -830,6 +835,29 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// SSHL Vd.2D, Vn.2D, Vm.2D — signed variable shift.
+    pub fn sshl2d(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4EE04400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHL Vd.2D, Vn.2D, Vm.2D — unsigned variable shift.
+    pub fn ushl2d(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6EE04400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// NEG Vd.2D, Vn.2D.
+    pub fn neg2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6EE0B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// SSHL Vd.4S, Vn.4S, Vm.4S — signed variable shift.
     pub fn sshl4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4EA04400 |
@@ -1494,6 +1522,13 @@ test "emit: AND w3, w4, #31" {
     try expectWord(0x12001083, &code);
 }
 
+test "emit: AND w16, w17, #63" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.andImm32Mask63(.x16, .x17);
+    try expectWord(0x12001630, &code);
+}
+
 test "emit: AND w3, w4, #15" {
     var code = CodeBuffer.init(std.testing.allocator);
     defer code.deinit();
@@ -2025,6 +2060,27 @@ test "emit: i32x4 variable shifts" {
         defer code.deinit();
         try code.ushl4s(20, 21, 30);
         try expectWord(0x6EBE46B4, &code);
+    }
+}
+
+test "emit: i64x2 variable shifts" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshl2d(16, 17, 30);
+        try expectWord(0x4EFE4630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg2d(16, 17);
+        try expectWord(0x6EE0BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ushl2d(20, 21, 30);
+        try expectWord(0x6EFE46B4, &code);
     }
 }
 

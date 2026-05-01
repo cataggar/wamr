@@ -159,6 +159,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .i64x2_shift => |shift| {
+            list.append(shift.vector);
+            list.append(shift.count);
+        },
         .i32x4_shift => |shift| {
             list.append(shift.vector);
             list.append(shift.count);
@@ -440,6 +444,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .i64x2_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
+        },
+        .i64x2_shift => |*shift| {
+            if (shift.vector == old) shift.vector = new;
+            if (shift.count == old) shift.count = new;
         },
         .i32x4_shift => |*shift| {
             if (shift.vector == old) shift.vector = new;
@@ -1721,6 +1729,7 @@ fn isPure(inst: ir.Inst) bool {
         .i16x8_extract_lane,
         .i16x8_replace_lane,
         .i64x2_binop,
+        .i64x2_shift,
         .i64x2_splat,
         .i64x2_extract_lane,
         .i64x2_replace_lane,
@@ -1829,6 +1838,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .i16x8_extract_lane => |lane| lane.vector == b.op.i16x8_extract_lane.vector and lane.lane == b.op.i16x8_extract_lane.lane and lane.sign == b.op.i16x8_extract_lane.sign,
         .i16x8_replace_lane => |lane| lane.vector == b.op.i16x8_replace_lane.vector and lane.val == b.op.i16x8_replace_lane.val and lane.lane == b.op.i16x8_replace_lane.lane,
         .i64x2_binop => |bin| bin.op == b.op.i64x2_binop.op and bin.lhs == b.op.i64x2_binop.lhs and bin.rhs == b.op.i64x2_binop.rhs,
+        .i64x2_shift => |shift| shift.op == b.op.i64x2_shift.op and shift.vector == b.op.i64x2_shift.vector and shift.count == b.op.i64x2_shift.count,
         .i64x2_splat => |v| v == b.op.i64x2_splat,
         .i64x2_extract_lane => |lane| lane.vector == b.op.i64x2_extract_lane.vector and lane.lane == b.op.i64x2_extract_lane.lane,
         .i64x2_replace_lane => |lane| lane.vector == b.op.i64x2_replace_lane.vector and lane.val == b.op.i64x2_replace_lane.val and lane.lane == b.op.i64x2_replace_lane.lane,
@@ -3302,6 +3312,10 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .i64x2_binop => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;
+        },
+        .i64x2_shift => |*shift| {
+            shift.vector += offset;
+            shift.count += offset;
         },
         .i32x4_shift => |*shift| {
             shift.vector += offset;
