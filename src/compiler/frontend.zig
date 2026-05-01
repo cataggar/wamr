@@ -2015,6 +2015,30 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i64x2_shl,
+                    .i64x2_shr_s,
+                    .i64x2_shr_u,
+                    => {
+                        const count = safePop(&vreg_stack);
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const shift_op: ir.Inst.I64x2ShiftOp = switch (simd_op) {
+                            .i64x2_shl => .shl,
+                            .i64x2_shr_s => .shr_s,
+                            .i64x2_shr_u => .shr_u,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i64x2_shift = .{
+                                .op = shift_op,
+                                .vector = vector,
+                                .count = count,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i32x4_splat => {
                         const val = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
@@ -3453,6 +3477,65 @@ test "lower i8x16 scalar-count shift opcodes" {
     try std.testing.expectEqual(@as(u4, 0), insts[7].op.i8x16_extract_lane.lane);
     try std.testing.expectEqual(ir.Inst.I8x16LaneSign.unsigned, insts[7].op.i8x16_extract_lane.sign);
     try std.testing.expect(insts[8].op.ret != null);
+}
+
+test "lower i64x2 scalar-count shift opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const
+        0x80, 0x7F,
+        0xFF, 0xFF,
+        0xFF, 0xFF,
+        0xFF, 0xFF,
+        0x01, 0x00,
+        0x00, 0x00,
+        0x00, 0x00,
+        0x00, 0x80,
+        0x41, 0xC1, 0x00, // i32.const 65
+        0xFD, 0xCB, 0x01, // i64x2.shl
+        0x41, 0xC0, 0x00, // i32.const 64
+        0xFD, 0xCC, 0x01, // i64x2.shr_s
+        0x41, 0x7F, // i32.const -1 (masked to 63)
+        0xFD, 0xCD, 0x01, // i64x2.shr_u
+        0xFD, 0x1D, 0x00, // i64x2.extract_lane 0
+        0xA7, // i32.wrap_i64
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 10), insts.len);
+    try std.testing.expectEqual(ir.Inst.I64x2ShiftOp.shl, insts[2].op.i64x2_shift.op);
+    try std.testing.expectEqual(insts[0].dest.?, insts[2].op.i64x2_shift.vector);
+    try std.testing.expectEqual(insts[1].dest.?, insts[2].op.i64x2_shift.count);
+    try std.testing.expectEqual(ir.Inst.I64x2ShiftOp.shr_s, insts[4].op.i64x2_shift.op);
+    try std.testing.expectEqual(insts[2].dest.?, insts[4].op.i64x2_shift.vector);
+    try std.testing.expectEqual(insts[3].dest.?, insts[4].op.i64x2_shift.count);
+    try std.testing.expectEqual(ir.Inst.I64x2ShiftOp.shr_u, insts[6].op.i64x2_shift.op);
+    try std.testing.expectEqual(insts[4].dest.?, insts[6].op.i64x2_shift.vector);
+    try std.testing.expectEqual(insts[5].dest.?, insts[6].op.i64x2_shift.count);
+    try std.testing.expectEqual(@as(u1, 0), insts[7].op.i64x2_extract_lane.lane);
+    try std.testing.expectEqual(ir.IrType.i64, insts[7].type);
+    try std.testing.expectEqual(insts[7].dest.?, insts[8].op.wrap_i64);
+    try std.testing.expect(insts[9].op.ret != null);
 }
 
 test "lower i32x4 cmp and mul opcodes" {
