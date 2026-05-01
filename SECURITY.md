@@ -25,3 +25,6 @@ unless the same issue also affects a Bytecode Alliance project.
 
 For proactive review scope and sandbox-critical audit checklists, see
 [SECURITY_AUDIT.md](SECURITY_AUDIT.md).
+
+For maintainer triage, advisory decisions, upstream advisory tracking, and
+security-review expectations, see [SECURITY_PROCESS.md](SECURITY_PROCESS.md).

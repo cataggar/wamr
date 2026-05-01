@@ -7,7 +7,14 @@ assignees: ""
 ---
 
 **Is it a security vulnerability?**
-If it results in a crash or hang, please refer to [a quick checklist](../../doc/security_need_to_know.md#is-this-bug-considered-a-security-vulnerability) to determine if it is a security vulnerability. If you are still unsure, please report it through [a security advisor](https://github.com/bytecodealliance/wasm-micro-runtime/security/advisories) and allow the maintainer to make a decision. Thank you.
+If this may expose host memory, bypass a sandbox or WASI/component capability,
+mis-handle a private vulnerability report, or includes sensitive proof-of-concept
+details, do not file it publicly. Use this repository's private vulnerability
+reporting instead:
+https://github.com/cataggar/wamr/security/advisories/new
+
+Public issues are fine for non-sensitive bugs, crashes without exploit details,
+and hardening ideas.
 
 **Describe the bug**
 A clear and concise description of what the bug is.
@@ -18,10 +25,10 @@ Information like tags, release version, commits.
 **To Reproduce**
 Steps to reproduce the behavior:
 
-1. Compile iwasm with flags like '...'
-2. (Optional) Compile wamrc with flags like '....'
-3. (Optional) Run wamrc with CLI options like '...' to generate .aot
-4. Run iwasm with CLI options like '...'
+1. Build `wamr` with flags like '...'
+2. (Optional) Build `wamrc` with flags like '....'
+3. (Optional) Run `wamrc` with CLI options like '...' to generate AOT output
+4. Run `wamr` with CLI options like '...'
 5. See error
 
 **Expected behavior**
