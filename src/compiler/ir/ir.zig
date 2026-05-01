@@ -85,6 +85,10 @@ pub const Inst = struct {
         i16x8_splat: VReg,
         i16x8_extract_lane: I16x8ExtractLane,
         i16x8_replace_lane: I16x8ReplaceLane,
+        i64x2_binop: I64x2BinOp,
+        i64x2_splat: VReg,
+        i64x2_extract_lane: I64x2ExtractLane,
+        i64x2_replace_lane: I64x2ReplaceLane,
 
         // Binary arithmetic (dest = lhs op rhs)
         add: BinOp,
@@ -306,6 +310,17 @@ pub const Inst = struct {
         mul,
     };
 
+    pub const I64x2Op = enum {
+        add,
+        sub,
+        eq,
+        ne,
+        lt_s,
+        gt_s,
+        le_s,
+        ge_s,
+    };
+
     pub const I32x4ShiftOp = enum {
         shl,
         shr_s,
@@ -365,6 +380,12 @@ pub const Inst = struct {
         rhs: VReg,
     };
 
+    pub const I64x2BinOp = struct {
+        op: I64x2Op,
+        lhs: VReg,
+        rhs: VReg,
+    };
+
     pub const I32x4Shift = struct {
         op: I32x4ShiftOp,
         vector: VReg,
@@ -404,6 +425,11 @@ pub const Inst = struct {
         sign: I16x8LaneSign,
     };
 
+    pub const I64x2ExtractLane = struct {
+        vector: VReg,
+        lane: u1,
+    };
+
     pub const I32x4ReplaceLane = struct {
         vector: VReg,
         val: VReg,
@@ -420,6 +446,12 @@ pub const Inst = struct {
         vector: VReg,
         val: VReg,
         lane: u3,
+    };
+
+    pub const I64x2ReplaceLane = struct {
+        vector: VReg,
+        val: VReg,
+        lane: u1,
     };
 
     pub const PhiEdge = struct {
@@ -688,6 +720,37 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(VReg, 18), i16_replace.op.i16x8_replace_lane.vector);
     try std.testing.expectEqual(@as(VReg, 21), i16_replace.op.i16x8_replace_lane.val);
     try std.testing.expectEqual(@as(u3, 7), i16_replace.op.i16x8_replace_lane.lane);
+
+    const i64_bin = Inst{
+        .op = .{ .i64x2_binop = .{ .op = .gt_s, .lhs = 23, .rhs = 24 } },
+        .dest = 25,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.I64x2Op.gt_s, i64_bin.op.i64x2_binop.op);
+    try std.testing.expectEqual(@as(VReg, 23), i64_bin.op.i64x2_binop.lhs);
+
+    const i64_splat = Inst{
+        .op = .{ .i64x2_splat = 26 },
+        .dest = 27,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 26), i64_splat.op.i64x2_splat);
+
+    const i64_extract = Inst{
+        .op = .{ .i64x2_extract_lane = .{ .vector = 27, .lane = 1 } },
+        .dest = 28,
+        .type = .i64,
+    };
+    try std.testing.expectEqual(@as(u1, 1), i64_extract.op.i64x2_extract_lane.lane);
+
+    const i64_replace = Inst{
+        .op = .{ .i64x2_replace_lane = .{ .vector = 27, .val = 28, .lane = 1 } },
+        .dest = 29,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 27), i64_replace.op.i64x2_replace_lane.vector);
+    try std.testing.expectEqual(@as(VReg, 28), i64_replace.op.i64x2_replace_lane.val);
+    try std.testing.expectEqual(@as(u1, 1), i64_replace.op.i64x2_replace_lane.lane);
 }
 
 test "IrModule: add multiple functions" {
