@@ -120,6 +120,11 @@ pub const CodeBuffer = struct {
         try self.emit32(0x12001000 | (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// AND Wd, Wn, #0xf — mask a scalar i16x8 shift count modulo 16.
+    pub fn andImm32Mask15(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
+        try self.emit32(0x12000C00 | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// ORR Xd, Xn, Xm
     pub fn orrRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
         // 1|01|01010|00|0|Rm|000000|Rn|Rd
@@ -790,6 +795,29 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// SSHL Vd.8H, Vn.8H, Vm.8H — signed variable shift.
+    pub fn sshl8h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4E604400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHL Vd.8H, Vn.8H, Vm.8H — unsigned variable shift.
+    pub fn ushl8h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6E604400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// NEG Vd.8H, Vn.8H.
+    pub fn neg8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E60B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// UMOV Wd, Vn.S[lane] (alias: MOV Wd, Vn.S[lane]).
     pub fn umovWFromS(self: *CodeBuffer, rd: Reg, vn: u5, lane: u2) !void {
         try self.emit32(0x0E043C00 |
@@ -1359,6 +1387,13 @@ test "emit: AND w3, w4, #31" {
     try expectWord(0x12001083, &code);
 }
 
+test "emit: AND w3, w4, #15" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.andImm32Mask15(.x3, .x4);
+    try expectWord(0x12000C83, &code);
+}
+
 fn expectWord(expected: u32, code: *const CodeBuffer) !void {
     try std.testing.expectEqual(expected, std.mem.readInt(u32, code.getCode()[0..4], .little));
 }
@@ -1762,6 +1797,27 @@ test "emit: i32x4 variable shifts" {
         defer code.deinit();
         try code.ushl4s(20, 21, 30);
         try expectWord(0x6EBE46B4, &code);
+    }
+}
+
+test "emit: i16x8 variable shifts" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshl8h(16, 17, 30);
+        try expectWord(0x4E7E4630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg8h(30, 30);
+        try expectWord(0x6E60BBDE, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ushl8h(20, 21, 30);
+        try expectWord(0x6E7E46B4, &code);
     }
 }
 
