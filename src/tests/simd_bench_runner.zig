@@ -103,6 +103,11 @@ const cases = [_]BenchCase{
         .simd = true,
         .build = buildSimdI32x4MemoryAdd4kLoopModule,
     },
+    .{
+        .name = "simd_i32x4_mem_sum8_4k_loop",
+        .simd = true,
+        .build = buildSimdI32x4MemorySum8_4kLoopModule,
+    },
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -618,6 +623,60 @@ fn buildSimdI32x4MemoryAdd4kLoopModule(allocator: Allocator) ![]u8 {
         .memory_min = 1,
         .data = data,
         .local_i32_count = 1,
+    });
+}
+
+fn buildSimdI32x4MemorySum8_4kLoopModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBlock(&instr, allocator);
+    try appendLoop(&instr, allocator);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, memory_loop_bytes);
+    try appendI32GeU(&instr, allocator);
+    try appendBrIf(&instr, allocator, 1);
+
+    inline for (0..4) |chunk| {
+        const byte_offset = chunk * 16;
+
+        try appendI32Const(&instr, allocator, memory_loop_a_base);
+        try appendLocalGet(&instr, allocator, 0);
+        try appendI32Add(&instr, allocator);
+        try appendSimdMemOpcode(&instr, allocator, 0x00, 4, byte_offset); // v128.load
+
+        try appendI32Const(&instr, allocator, memory_loop_b_base);
+        try appendLocalGet(&instr, allocator, 0);
+        try appendI32Add(&instr, allocator);
+        try appendSimdMemOpcode(&instr, allocator, 0x00, 4, byte_offset); // v128.load
+    }
+
+    inline for (0..7) |_| {
+        try appendSimdOpcode(&instr, allocator, 0xAE); // i32x4.add
+    }
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+    try appendLocalSet(&instr, allocator, 1);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, 64);
+    try appendI32Add(&instr, allocator);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBr(&instr, allocator, 0);
+
+    try appendEnd(&instr, allocator);
+    try appendEnd(&instr, allocator);
+
+    try appendLocalGet(&instr, allocator, 1);
+
+    const data = try buildMemoryLoopData(allocator);
+    defer allocator.free(data);
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data,
+        .local_i32_count = 2,
     });
 }
 
