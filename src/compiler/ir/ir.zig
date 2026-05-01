@@ -76,6 +76,7 @@ pub const Inst = struct {
         i32x4_extract_lane: I32x4ExtractLane,
         i32x4_replace_lane: I32x4ReplaceLane,
         i8x16_binop: I8x16BinOp,
+        i8x16_shift: I8x16Shift,
         i8x16_splat: VReg,
         i8x16_extract_lane: I8x16ExtractLane,
         i8x16_replace_lane: I8x16ReplaceLane,
@@ -317,6 +318,12 @@ pub const Inst = struct {
         shr_u,
     };
 
+    pub const I8x16ShiftOp = enum {
+        shl,
+        shr_s,
+        shr_u,
+    };
+
     pub const V128Mem = struct {
         base: VReg,
         offset: u32,
@@ -366,6 +373,12 @@ pub const Inst = struct {
 
     pub const I16x8Shift = struct {
         op: I16x8ShiftOp,
+        vector: VReg,
+        count: VReg,
+    };
+
+    pub const I8x16Shift = struct {
+        op: I8x16ShiftOp,
         vector: VReg,
         count: VReg,
     };
@@ -615,6 +628,15 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.I8x16Op.sub, i8_bin.op.i8x16_binop.op);
     try std.testing.expectEqual(@as(VReg, 11), i8_bin.op.i8x16_binop.lhs);
+
+    const i8_shift = Inst{
+        .op = .{ .i8x16_shift = .{ .op = .shr_s, .vector = 13, .count = 14 } },
+        .dest = 15,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.I8x16ShiftOp.shr_s, i8_shift.op.i8x16_shift.op);
+    try std.testing.expectEqual(@as(VReg, 13), i8_shift.op.i8x16_shift.vector);
+    try std.testing.expectEqual(@as(VReg, 14), i8_shift.op.i8x16_shift.count);
 
     const i8_extract = Inst{
         .op = .{ .i8x16_extract_lane = .{ .vector = 13, .lane = 15, .sign = .unsigned } },
