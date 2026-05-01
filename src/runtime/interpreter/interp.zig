@@ -65,6 +65,7 @@ const simd = @import("simd.zig");
 const leb128 = @import("../../shared/utils/leb128.zig");
 
 pub const TrapError = error{
+    OutOfFuel,
     Unreachable,
     IntegerOverflow,
     IntegerDivisionByZero,
@@ -81,6 +82,21 @@ pub const TrapError = error{
     UnknownOpcode,
     UnalignedAtomicAccess,
     UncaughtException,
+};
+
+pub const default_fuel: u32 = 100_000_000;
+
+pub const ExecuteOptions = struct {
+    fuel: u32 = default_fuel,
+};
+
+const FuelBudget = struct {
+    remaining: u32,
+
+    fn consume(self: *FuelBudget) TrapError!void {
+        if (self.remaining == 0) return error.OutOfFuel;
+        self.remaining -= 1;
+    }
 };
 
 /// Sentinel type_idx for GC objects that wrap externref values via any.convert_extern.
@@ -772,6 +788,16 @@ fn prepareTailCall(env: *ExecEnv, func_idx: u32) TrapError!void {
 
 /// Execute a function by index within the module instance.
 pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
+    return executeFunctionWithOptions(env, func_idx, .{});
+}
+
+/// Execute a function with caller-supplied limits.
+pub fn executeFunctionWithOptions(env: *ExecEnv, func_idx: u32, options: ExecuteOptions) TrapError!void {
+    var fuel = FuelBudget{ .remaining = options.fuel };
+    return executeFunctionWithFuel(env, func_idx, &fuel);
+}
+
+fn executeFunctionWithFuel(env: *ExecEnv, func_idx: u32, fuel: *FuelBudget) TrapError!void {
     var current_func_idx = func_idx;
 
     while (true) {
@@ -797,7 +823,7 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
                 const saved_module_inst = env.module_inst;
                 env.module_inst = imported.module_inst;
                 defer env.module_inst = saved_module_inst;
-                try executeFunction(env, imported.func_idx);
+                try executeFunctionWithFuel(env, imported.func_idx, fuel);
                 return;
             }
             // Fallback: no-op stub for unresolved imports (pop args, push zero results)
@@ -874,7 +900,7 @@ pub fn executeFunction(env: *ExecEnv, func_idx: u32) TrapError!void {
         }
 
         var tail_call_target: u32 = 0;
-        const result = dispatchLoop(env, func.code, &tail_call_target) catch |err| {
+        const result = dispatchLoopWithFuel(env, func.code, &tail_call_target, fuel) catch |err| {
             if (err == error.UncaughtException) {
                 // Pop the callee's frame and restore the caller's stack
                 const frame = env.popFrame() catch return err;
@@ -1414,10 +1440,14 @@ fn funcTypesEqual(a: types.FuncType, b: types.FuncType) bool {
 // ── Dispatch loop ────────────────────────────────────────────────────────
 
 fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapError!DispatchResult {
+    var fuel = FuelBudget{ .remaining = default_fuel };
+    return dispatchLoopWithFuel(env, code, tail_call_target, &fuel);
+}
+
+fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32, fuel: *FuelBudget) TrapError!DispatchResult {
     var ip: usize = 0;
     var labels: [MAX_LABELS]Label = undefined;
     var label_sp: u32 = 0;
-    var fuel: u32 = 100_000_000;
 
     // Push implicit function-body label so br/br_if/br_table can target the function.
     const return_arity: u32 = if (env.currentFrame()) |frame| frame.return_arity else 0;
@@ -1430,10 +1460,9 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
     label_sp = 1;
 
     while (ip < code.len) {
-        fuel -|= 1;
-        if (fuel == 0) return error.Unreachable;
+        try fuel.consume();
         // Check for cross-thread trap (every 4096 iterations to minimize overhead)
-        if (fuel % 4096 == 0) {
+        if (fuel.remaining % 4096 == 0) {
             if (env.thread_manager) |tm| {
                 if (tm.hasTrap()) return error.Unreachable;
             }
@@ -1750,7 +1779,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 const func_idx = readU32(code, &ip);
                 const frame = env.currentFrameMut() orelse return error.CallStackUnderflow;
                 frame.ip = @intCast(ip);
-                executeFunction(env, func_idx) catch |err| {
+                executeFunctionWithFuel(env, func_idx, fuel) catch |err| {
                     if (err == error.UncaughtException) {
                         if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
                     }
@@ -1799,7 +1828,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 if (funcref.module_inst != env.module_inst) {
                     const saved = env.module_inst;
                     env.module_inst = funcref.module_inst;
-                    executeFunction(env, funcref.func_idx) catch |err| {
+                    executeFunctionWithFuel(env, funcref.func_idx, fuel) catch |err| {
                         env.module_inst = saved;
                         if (err == error.UncaughtException) {
                             if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
@@ -1808,7 +1837,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                     };
                     env.module_inst = saved;
                 } else {
-                    executeFunction(env, funcref.func_idx) catch |err| {
+                    executeFunctionWithFuel(env, funcref.func_idx, fuel) catch |err| {
                         if (err == error.UncaughtException) {
                             if (try handleUncaughtException(env, labels[0..label_sp], code, &label_sp, &ip)) continue;
                         }
@@ -2783,7 +2812,7 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
                 };
                 _ = type_idx;
                 // Call the function by index (same as call)
-                try executeFunction(env, func_idx);
+                try executeFunctionWithFuel(env, func_idx, fuel);
             },
             .return_call_ref => {
                 const type_idx = readU32(code, &ip);
@@ -3600,6 +3629,30 @@ fn runCode(code: []const u8) !i32 {
 fn runCodeExpectTrap(code: []const u8, expected: TrapError) !void {
     const result = runCode(code);
     try testing.expectError(expected, result);
+}
+
+test "interp: dispatch fuel exhaustion reports OutOfFuel" {
+    const alloc = testing.allocator;
+    var inst = types.ModuleInstance{
+        .module = &.{},
+        .memories = &.{},
+        .tables = &.{},
+        .globals = &.{},
+        .allocator = alloc,
+    };
+    var env = ExecEnv{
+        .module_inst = &inst,
+        .operand_stack = try alloc.alloc(types.Value, 16),
+        .call_stack = try alloc.alloc(CallFrame, 16),
+        .allocator = alloc,
+    };
+    defer alloc.free(env.operand_stack);
+    defer alloc.free(env.call_stack);
+
+    try env.pushFrame(.{ .func_idx = 0, .ip = 0, .stack_base = 0, .local_count = 0, .return_arity = 1, .prev_sp = 0 });
+    var dummy_target: u32 = 0;
+    var fuel = FuelBudget{ .remaining = 1 };
+    try testing.expectError(error.OutOfFuel, dispatchLoopWithFuel(&env, &.{ 0x41, 42, 0x0B }, &dummy_target, &fuel));
 }
 
 test "interp: i32.const" {

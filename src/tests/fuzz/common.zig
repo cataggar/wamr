@@ -16,11 +16,13 @@ pub const Args = struct {
     corpus_dir: []const u8,
     crashes_dir: []const u8,
     duration_ms: u64,
+    fuel: ?u32,
 
     pub fn parse(argv: []const []const u8) !Args {
         var corpus: ?[]const u8 = null;
         var crashes: ?[]const u8 = null;
         var duration_s: u64 = 60;
+        var fuel: ?u32 = null;
 
         var i: usize = 1;
         while (i < argv.len) : (i += 1) {
@@ -34,6 +36,9 @@ pub const Args = struct {
             } else if (std.mem.eql(u8, a, "--duration") and i + 1 < argv.len) {
                 i += 1;
                 duration_s = try std.fmt.parseInt(u64, argv[i], 10);
+            } else if (std.mem.eql(u8, a, "--fuel") and i + 1 < argv.len) {
+                i += 1;
+                fuel = try std.fmt.parseInt(u32, argv[i], 10);
             } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
                 printUsage();
                 std.process.exit(0);
@@ -48,16 +53,18 @@ pub const Args = struct {
             .corpus_dir = corpus orelse return error.MissingCorpus,
             .crashes_dir = crashes orelse return error.MissingCrashesDir,
             .duration_ms = duration_s * std.time.ms_per_s,
+            .fuel = fuel,
         };
     }
 
     fn printUsage() void {
         std.debug.print(
-            \\usage: fuzz-<target> --corpus <dir> --crashes <dir> [--duration <seconds>]
+            \\usage: fuzz-<target> --corpus <dir> --crashes <dir> [--duration <seconds>] [--fuel <instructions>]
             \\
             \\Replays every .wasm file under <corpus> through the target until
             \\<duration> seconds have elapsed. A crashing input is left at
             \\<crashes>/in-flight.wasm when the process aborts.
+            \\The optional --fuel limit is currently used by fuzz-interp.
             \\
         , .{});
     }

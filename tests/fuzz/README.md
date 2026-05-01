@@ -26,7 +26,7 @@ abort, or small-input OOM is a bug.
 | --- | --- | --- |
 | `fuzz-loader` | Core Wasm loader and validation | A valid module or typed loader error is OK. A panic, abort, or safety-check failure is a bug. |
 | `fuzz-component-loader` | Component-model binary loader | A valid component or typed component loader error is OK. A panic, abort, or safety-check failure is a bug. |
-| `fuzz-interp` | Interpreter loader and validation scaffold | Loader/validation errors are OK. Full bounded export invocation is tracked as follow-up work. |
+| `fuzz-interp` | Interpreter load, instantiate, and bounded nullary export invocation | Loader/validation/instantiation errors, guest traps, fuel exhaustion, and unsupported signatures are OK. Panics, aborts, or result-stack shape mismatches are bugs. |
 | `fuzz-aot` | AOT compile, AOT loader, and instantiate path | Compile/instantiate errors are OK. The harness deliberately sets `invoke_start = false` and does not execute attacker-supplied start functions. |
 | `fuzz-diff` | Interpreter load plus AOT compile/instantiate scaffold | Pipeline errors are OK. Result comparison for supported exports is tracked as follow-up work. |
 
@@ -56,9 +56,22 @@ printf '\000asm\015\000\001\000' > /tmp/wamr-component-corpus/minimal-component.
 ./zig-out/bin/fuzz-component-loader --corpus /tmp/wamr-component-corpus --crashes /tmp/wamr-fuzz-crashes --duration 5
 ```
 
+For interpreter invocation smoke with at least one valid nullary export:
+
+```sh
+rm -rf /tmp/wamr-interp-corpus /tmp/wamr-fuzz-crashes
+mkdir -p /tmp/wamr-interp-corpus /tmp/wamr-fuzz-crashes
+printf '\000asm\001\000\000\000\001\005\001\140\000\001\177\003\002\001\000\007\007\001\003run\000\000\012\006\001\004\000\101\052\013' > /tmp/wamr-interp-corpus/minimal-interp-run.wasm
+./zig-out/bin/fuzz-interp --corpus /tmp/wamr-interp-corpus --crashes /tmp/wamr-fuzz-crashes --duration 5 --fuel 100000
+```
+
 The harnesses replay every `.wasm` file under `--corpus` until the duration
 expires. They are not coverage-guided mutators by themselves; use them as stable
 entry points for CI and future mutation/generation infrastructure.
+
+`fuzz-interp` uses `--fuel <instructions>` as a per-export interpreter instruction
+budget. Fuel exhaustion is an expected outcome and is reported separately from a
+guest `unreachable` trap.
 
 ## Crash artifacts and reproduction
 
@@ -84,12 +97,14 @@ touch runtime/compiler/component/fuzz code. The workflow:
 - builds all harnesses with `zig build fuzz -Doptimize=ReleaseSafe`;
 - seeds per-target corpora from `tests/malformed/fuzz` and `tests/spec-json`;
 - adds a generated minimal component seed for `fuzz-component-loader`;
+- adds a generated nullary scalar export seed for `fuzz-interp`;
 - uploads `.fuzz-crashes` artifacts with 30-day retention;
 - uploads per-target corpus artifacts with 7-day retention;
 - fails the job when any crash artifact remains.
 
 Manual runs can choose `all`, `loader`, `component-loader`, `interp`, `aot`, or
-`diff` and can set a per-target duration.
+`diff`, set a per-target duration, and set the per-export `fuzz-interp` fuel
+budget.
 
 ## Current limitations and follow-ups
 
@@ -97,9 +112,11 @@ The current targets are intentionally conservative. Do not remove these limits
 without adding bounded execution, subprocess isolation, or another equivalent
 host-protection mechanism.
 
-- `fuzz-interp` does not yet invoke exports (#245). A future target should instantiate
-  safe modules, provide deterministic host imports, and use fuel/timeouts or
-  subprocesses so valid infinite loops cannot hang CI.
+- `fuzz-interp` skips modules with imports or start functions, then invokes at
+  most eight exported local functions whose signatures are `() -> ()`,
+  `() -> i32`, `() -> i64`, `() -> f32`, or `() -> f64`. Parameterized,
+  reference-typed, `v128`, imported-function, and multi-result exports remain
+  out of scope until a deterministic input and host-import policy is designed.
 - `fuzz-diff` does not yet compare typed interpreter and AOT results (#246). A future
   oracle should select supported nullary or bounded-argument scalar exports and
   handle platform-specific AOT traps outside the test runner.

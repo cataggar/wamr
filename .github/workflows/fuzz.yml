@@ -14,6 +14,10 @@ on:
         description: "Per-target fuzz duration in seconds"
         required: false
         default: "300"
+      interp_fuel:
+        description: "Per-export interpreter fuel for fuzz-interp"
+        required: false
+        default: "100000"
       target:
         description: "Fuzz target (all, loader, component-loader, interp, aot, diff)"
         required: false
@@ -83,6 +87,10 @@ jobs:
             # Minimal component: "\0asm" plus version/layer 0x0001000d.
             printf '\000asm\015\000\001\000' > .fuzz-corpus/${{ matrix.target }}/minimal-component.wasm
           fi
+          if [ "${{ matrix.target }}" = "interp" ]; then
+            # Minimal core module exporting `run: () -> i32`.
+            printf '\000asm\001\000\000\000\001\005\001\140\000\001\177\003\002\001\000\007\007\001\003run\000\000\012\006\001\004\000\101\052\013' > .fuzz-corpus/${{ matrix.target }}/minimal-interp-run.wasm
+          fi
           ls .fuzz-corpus/${{ matrix.target }} | wc -l
 
       - name: Build fuzz harness
@@ -93,12 +101,18 @@ jobs:
           FUZZ_DURATION: ${{ github.event.inputs.duration_seconds || '600' }}
           FUZZ_TARGET: ${{ matrix.target }}
           FUZZ_CORPUS: .fuzz-corpus/${{ matrix.target }}
+          FUZZ_INTERP_FUEL: ${{ github.event.inputs.interp_fuel || '100000' }}
         run: |
           mkdir -p .fuzz-crashes
+          extra_args=()
+          if [ "$FUZZ_TARGET" = "interp" ]; then
+            extra_args+=(--fuel "$FUZZ_INTERP_FUEL")
+          fi
           ./zig-out/bin/fuzz-${FUZZ_TARGET} \
             --corpus "$FUZZ_CORPUS" \
             --crashes .fuzz-crashes \
-            --duration "$FUZZ_DURATION"
+            --duration "$FUZZ_DURATION" \
+            "${extra_args[@]}"
 
       - name: Upload crashes
         if: always()
