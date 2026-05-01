@@ -160,10 +160,13 @@ pub const version = .{
     .major = 0,
     .minor = 1,
     .patch = 0,
-    .string = "0.1.0-zig",
+    .string = config.version,
 };
 
 test {
     std.testing.refAllDecls(@This());
 }
 
+test "version string comes from build config" {
+    try std.testing.expectEqualStrings(config.version, version.string);
+}

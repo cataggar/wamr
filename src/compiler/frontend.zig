@@ -6,6 +6,7 @@ const std = @import("std");
 const types = @import("../runtime/common/types.zig");
 const ir = @import("ir/ir.zig");
 const Opcode = @import("../runtime/interpreter/opcode.zig").Opcode;
+const SimdOpcode = @import("../runtime/interpreter/opcode.zig").SimdOpcode;
 const MiscOpcode = @import("../runtime/interpreter/opcode.zig").MiscOpcode;
 const AtomicOpcode = @import("../runtime/interpreter/opcode.zig").AtomicOpcode;
 const leb128 = @import("../shared/utils/leb128.zig");
@@ -30,6 +31,7 @@ const ONE_I32: []const ir.IrType = &[_]ir.IrType{.i32};
 const ONE_I64: []const ir.IrType = &[_]ir.IrType{.i64};
 const ONE_F32: []const ir.IrType = &[_]ir.IrType{.f32};
 const ONE_F64: []const ir.IrType = &[_]ir.IrType{.f64};
+const ONE_V128: []const ir.IrType = &[_]ir.IrType{.v128};
 
 fn valTypeToIr(vt: types.ValType) ir.IrType {
     return switch (vt) {
@@ -37,6 +39,7 @@ fn valTypeToIr(vt: types.ValType) ir.IrType {
         .i64 => .i64,
         .f32 => .f32,
         .f64 => .f64,
+        .v128 => .v128,
         else => .i64,
     };
 }
@@ -115,31 +118,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     for (func.locals) |local| total_locals += local.count;
 
     // Build local type table (params first, then declared locals). Used to
-    // give each `.local_get` IR instruction the correct type so codegen can
-    // emit proper zero-extension for i32/f32 and preserve full 64 bits for
-    // i64/f64.
+    // give each `.local_get` IR instruction the correct type so codegen and
+    // analysis never confuse v128 with a scalar i64 slot.
     var local_types = try allocator.alloc(ir.IrType, total_locals);
     errdefer allocator.free(local_types);
     {
         var i: u32 = 0;
         for (func_type.params) |pt| {
-            local_types[i] = switch (pt) {
-                .i32 => .i32,
-                .i64 => .i64,
-                .f32 => .f32,
-                .f64 => .f64,
-                else => .i64,
-            };
+            local_types[i] = valTypeToIr(pt);
             i += 1;
         }
         for (func.locals) |decl| {
-            const ir_t: ir.IrType = switch (decl.val_type) {
-                .i32 => .i32,
-                .i64 => .i64,
-                .f32 => .f32,
-                .f64 => .f64,
-                else => .i64,
-            };
+            const ir_t = valTypeToIr(decl.val_type);
             var n: u32 = 0;
             while (n < decl.count) : (n += 1) {
                 local_types[i] = ir_t;
@@ -258,6 +248,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     -2 => .{ .params = NO_TYPES, .results = ONE_I64 }, // -0x02 = i64
                     -3 => .{ .params = NO_TYPES, .results = ONE_F32 }, // -0x03 = f32
                     -4 => .{ .params = NO_TYPES, .results = ONE_F64 }, // -0x04 = f64
+                    -5 => .{ .params = NO_TYPES, .results = ONE_V128 }, // -0x05 = v128
                     else => .{ .params = NO_TYPES, .results = ONE_I64 }, // ref types (funcref/externref/anyref/...) → 64-bit slot
                 };
             }
@@ -840,13 +831,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const idx = readU32(code, &ip);
                 const dest = ir_func.newVReg();
                 const gt = globalValTypeByIdx(wasm_module, idx) orelse .i32;
-                const ir_ty: ir.IrType = switch (gt) {
-                    .i32 => .i32,
-                    .i64 => .i64,
-                    .f32 => .f32,
-                    .f64 => .f64,
-                    else => .i64,
-                };
+                const ir_ty = valTypeToIr(gt);
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .global_get = idx }, .dest = dest, .type = ir_ty });
                 try vreg_stack.append(allocator, dest);
             },
@@ -856,9 +841,20 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } } });
             },
             // ── Load variants ────────────────────────────────────────────
-            .i32_load, .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
-            .i64_load, .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u, .i64_load32_s, .i64_load32_u,
-            .f32_load, .f64_load,
+            .i32_load,
+            .i32_load8_s,
+            .i32_load8_u,
+            .i32_load16_s,
+            .i32_load16_u,
+            .i64_load,
+            .i64_load8_s,
+            .i64_load8_u,
+            .i64_load16_s,
+            .i64_load16_u,
+            .i64_load32_s,
+            .i64_load32_u,
+            .f32_load,
+            .f64_load,
             => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
@@ -872,8 +868,11 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     else => unreachable,
                 };
                 const sign_extend: bool = switch (op) {
-                    .i32_load8_s, .i32_load16_s,
-                    .i64_load8_s, .i64_load16_s, .i64_load32_s,
+                    .i32_load8_s,
+                    .i32_load16_s,
+                    .i64_load8_s,
+                    .i64_load16_s,
+                    .i64_load32_s,
                     => true,
                     else => false,
                 };
@@ -887,9 +886,15 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try vreg_stack.append(allocator, dest);
             },
             // ── Store variants ───────────────────────────────────────────
-            .i32_store, .i32_store8, .i32_store16,
-            .i64_store, .i64_store8, .i64_store16, .i64_store32,
-            .f32_store, .f64_store,
+            .i32_store,
+            .i32_store8,
+            .i32_store16,
+            .i64_store,
+            .i64_store8,
+            .i64_store16,
+            .i64_store32,
+            .f32_store,
+            .f64_store,
             => {
                 _ = readU32(code, &ip); // alignment
                 const offset = readU32(code, &ip);
@@ -1256,8 +1261,14 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
 
             // ── Float arithmetic (stub: lower to IR but codegen not yet) ──
-            .f32_add, .f32_sub, .f32_mul, .f32_div,
-            .f64_add, .f64_sub, .f64_mul, .f64_div,
+            .f32_add,
+            .f32_sub,
+            .f32_mul,
+            .f32_div,
+            .f64_add,
+            .f64_sub,
+            .f64_mul,
+            .f64_div,
             => {
                 const rhs = safePop(&vreg_stack);
                 const lhs = safePop(&vreg_stack);
@@ -1296,10 +1307,14 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
 
             // ── Truncation (float → int) ──────────────────────────────
-            .i32_trunc_f32_s, .i32_trunc_f32_u,
-            .i32_trunc_f64_s, .i32_trunc_f64_u,
-            .i64_trunc_f32_s, .i64_trunc_f32_u,
-            .i64_trunc_f64_s, .i64_trunc_f64_u,
+            .i32_trunc_f32_s,
+            .i32_trunc_f32_u,
+            .i32_trunc_f64_s,
+            .i32_trunc_f64_u,
+            .i64_trunc_f32_s,
+            .i64_trunc_f32_u,
+            .i64_trunc_f64_s,
+            .i64_trunc_f64_u,
             => {
                 const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
@@ -1319,8 +1334,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
 
             // ── Conversion (int → float) ──────────────────────────────
-            .f32_convert_i32_s, .f32_convert_i64_s,
-            .f64_convert_i32_s, .f64_convert_i64_s,
+            .f32_convert_i32_s,
+            .f32_convert_i64_s,
+            .f64_convert_i32_s,
+            .f64_convert_i64_s,
             => {
                 const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
@@ -1335,8 +1352,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 try ir_func.getBlock(current_block).append(.{ .op = ir_op, .dest = dest, .type = ir_type });
                 try vreg_stack.append(allocator, dest);
             },
-            .f32_convert_i32_u, .f32_convert_i64_u,
-            .f64_convert_i32_u, .f64_convert_i64_u,
+            .f32_convert_i32_u,
+            .f32_convert_i64_u,
+            .f64_convert_i32_u,
+            .f64_convert_i64_u,
             => {
                 const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
@@ -1396,10 +1415,14 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .misc_prefix => {
                 const sub_opcode: MiscOpcode = @enumFromInt(readU32(code, &ip));
                 switch (sub_opcode) {
-                    .i32_trunc_sat_f32_s, .i32_trunc_sat_f32_u,
-                    .i32_trunc_sat_f64_s, .i32_trunc_sat_f64_u,
-                    .i64_trunc_sat_f32_s, .i64_trunc_sat_f32_u,
-                    .i64_trunc_sat_f64_s, .i64_trunc_sat_f64_u,
+                    .i32_trunc_sat_f32_s,
+                    .i32_trunc_sat_f32_u,
+                    .i32_trunc_sat_f64_s,
+                    .i32_trunc_sat_f64_u,
+                    .i64_trunc_sat_f32_s,
+                    .i64_trunc_sat_f32_u,
+                    .i64_trunc_sat_f64_s,
+                    .i64_trunc_sat_f64_u,
                     => {
                         const val = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
@@ -1411,8 +1434,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             else => unreachable,
                         };
                         const ir_type: ir.IrType = switch (sub_opcode) {
-                            .i32_trunc_sat_f32_s, .i32_trunc_sat_f32_u,
-                            .i32_trunc_sat_f64_s, .i32_trunc_sat_f64_u,
+                            .i32_trunc_sat_f32_s,
+                            .i32_trunc_sat_f32_u,
+                            .i32_trunc_sat_f64_s,
+                            .i32_trunc_sat_f64_u,
                             => .i32,
                             else => .i64,
                         };
@@ -1514,9 +1539,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try vreg_stack.append(allocator, dest);
                     },
 
-                    .i32_atomic_load, .i64_atomic_load,
-                    .i32_atomic_load8_u, .i32_atomic_load16_u,
-                    .i64_atomic_load8_u, .i64_atomic_load16_u, .i64_atomic_load32_u,
+                    .i32_atomic_load,
+                    .i64_atomic_load,
+                    .i32_atomic_load8_u,
+                    .i32_atomic_load16_u,
+                    .i64_atomic_load8_u,
+                    .i64_atomic_load16_u,
+                    .i64_atomic_load32_u,
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
@@ -1538,9 +1567,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try vreg_stack.append(allocator, dest);
                     },
 
-                    .i32_atomic_store, .i64_atomic_store,
-                    .i32_atomic_store8, .i32_atomic_store16,
-                    .i64_atomic_store8, .i64_atomic_store16, .i64_atomic_store32,
+                    .i32_atomic_store,
+                    .i64_atomic_store,
+                    .i32_atomic_store8,
+                    .i32_atomic_store16,
+                    .i64_atomic_store8,
+                    .i64_atomic_store16,
+                    .i64_atomic_store32,
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
@@ -1557,24 +1590,48 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try ir_func.getBlock(current_block).append(.{ .op = .{ .atomic_store = .{ .base = base, .offset = offset, .size = size, .val = val } } });
                     },
 
-                    .i32_atomic_rmw_add, .i64_atomic_rmw_add,
-                    .i32_atomic_rmw8_add_u, .i32_atomic_rmw16_add_u,
-                    .i64_atomic_rmw8_add_u, .i64_atomic_rmw16_add_u, .i64_atomic_rmw32_add_u,
-                    .i32_atomic_rmw_sub, .i64_atomic_rmw_sub,
-                    .i32_atomic_rmw8_sub_u, .i32_atomic_rmw16_sub_u,
-                    .i64_atomic_rmw8_sub_u, .i64_atomic_rmw16_sub_u, .i64_atomic_rmw32_sub_u,
-                    .i32_atomic_rmw_and, .i64_atomic_rmw_and,
-                    .i32_atomic_rmw8_and_u, .i32_atomic_rmw16_and_u,
-                    .i64_atomic_rmw8_and_u, .i64_atomic_rmw16_and_u, .i64_atomic_rmw32_and_u,
-                    .i32_atomic_rmw_or, .i64_atomic_rmw_or,
-                    .i32_atomic_rmw8_or_u, .i32_atomic_rmw16_or_u,
-                    .i64_atomic_rmw8_or_u, .i64_atomic_rmw16_or_u, .i64_atomic_rmw32_or_u,
-                    .i32_atomic_rmw_xor, .i64_atomic_rmw_xor,
-                    .i32_atomic_rmw8_xor_u, .i32_atomic_rmw16_xor_u,
-                    .i64_atomic_rmw8_xor_u, .i64_atomic_rmw16_xor_u, .i64_atomic_rmw32_xor_u,
-                    .i32_atomic_rmw_xchg, .i64_atomic_rmw_xchg,
-                    .i32_atomic_rmw8_xchg_u, .i32_atomic_rmw16_xchg_u,
-                    .i64_atomic_rmw8_xchg_u, .i64_atomic_rmw16_xchg_u, .i64_atomic_rmw32_xchg_u,
+                    .i32_atomic_rmw_add,
+                    .i64_atomic_rmw_add,
+                    .i32_atomic_rmw8_add_u,
+                    .i32_atomic_rmw16_add_u,
+                    .i64_atomic_rmw8_add_u,
+                    .i64_atomic_rmw16_add_u,
+                    .i64_atomic_rmw32_add_u,
+                    .i32_atomic_rmw_sub,
+                    .i64_atomic_rmw_sub,
+                    .i32_atomic_rmw8_sub_u,
+                    .i32_atomic_rmw16_sub_u,
+                    .i64_atomic_rmw8_sub_u,
+                    .i64_atomic_rmw16_sub_u,
+                    .i64_atomic_rmw32_sub_u,
+                    .i32_atomic_rmw_and,
+                    .i64_atomic_rmw_and,
+                    .i32_atomic_rmw8_and_u,
+                    .i32_atomic_rmw16_and_u,
+                    .i64_atomic_rmw8_and_u,
+                    .i64_atomic_rmw16_and_u,
+                    .i64_atomic_rmw32_and_u,
+                    .i32_atomic_rmw_or,
+                    .i64_atomic_rmw_or,
+                    .i32_atomic_rmw8_or_u,
+                    .i32_atomic_rmw16_or_u,
+                    .i64_atomic_rmw8_or_u,
+                    .i64_atomic_rmw16_or_u,
+                    .i64_atomic_rmw32_or_u,
+                    .i32_atomic_rmw_xor,
+                    .i64_atomic_rmw_xor,
+                    .i32_atomic_rmw8_xor_u,
+                    .i32_atomic_rmw16_xor_u,
+                    .i64_atomic_rmw8_xor_u,
+                    .i64_atomic_rmw16_xor_u,
+                    .i64_atomic_rmw32_xor_u,
+                    .i32_atomic_rmw_xchg,
+                    .i64_atomic_rmw_xchg,
+                    .i32_atomic_rmw8_xchg_u,
+                    .i32_atomic_rmw16_xchg_u,
+                    .i64_atomic_rmw8_xchg_u,
+                    .i64_atomic_rmw16_xchg_u,
+                    .i64_atomic_rmw32_xchg_u,
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
@@ -1606,9 +1663,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         try vreg_stack.append(allocator, dest);
                     },
 
-                    .i32_atomic_rmw_cmpxchg, .i64_atomic_rmw_cmpxchg,
-                    .i32_atomic_rmw8_cmpxchg_u, .i32_atomic_rmw16_cmpxchg_u,
-                    .i64_atomic_rmw8_cmpxchg_u, .i64_atomic_rmw16_cmpxchg_u, .i64_atomic_rmw32_cmpxchg_u,
+                    .i32_atomic_rmw_cmpxchg,
+                    .i64_atomic_rmw_cmpxchg,
+                    .i32_atomic_rmw8_cmpxchg_u,
+                    .i32_atomic_rmw16_cmpxchg_u,
+                    .i64_atomic_rmw8_cmpxchg_u,
+                    .i64_atomic_rmw16_cmpxchg_u,
+                    .i64_atomic_rmw32_cmpxchg_u,
                     => {
                         _ = readU32(code, &ip);
                         const offset = readU32(code, &ip);
@@ -1638,10 +1699,209 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     },
                 }
             },
+            .simd_prefix => {
+                const sub = readU32(code, &ip);
+                const simd_op: SimdOpcode = @enumFromInt(sub);
+                switch (simd_op) {
+                    .v128_const => {
+                        const val = try readV128(code, &ip);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_const = val },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .v128_load => {
+                        const alignment = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const base = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_load = .{
+                                .base = base,
+                                .offset = offset,
+                                .alignment = alignment,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .v128_store => {
+                        const alignment = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const val = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_store = .{
+                                .base = base,
+                                .offset = offset,
+                                .alignment = alignment,
+                                .val = val,
+                            } },
+                        });
+                    },
+                    .v128_not => {
+                        const src = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_not = src },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .v128_and,
+                    .v128_andnot,
+                    .v128_or,
+                    .v128_xor,
+                    => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const bit_op: ir.Inst.V128BitwiseOp = switch (simd_op) {
+                            .v128_and => .@"and",
+                            .v128_andnot => .andnot,
+                            .v128_or => .@"or",
+                            .v128_xor => .xor,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_bitwise = .{
+                                .op = bit_op,
+                                .lhs = lhs,
+                                .rhs = rhs,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_add,
+                    .i32x4_sub,
+                    .i32x4_eq,
+                    .i32x4_ne,
+                    .i32x4_lt_s,
+                    .i32x4_lt_u,
+                    .i32x4_gt_s,
+                    .i32x4_gt_u,
+                    .i32x4_le_s,
+                    .i32x4_le_u,
+                    .i32x4_ge_s,
+                    .i32x4_ge_u,
+                    .i32x4_mul,
+                    => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const lane_op: ir.Inst.I32x4Op = switch (simd_op) {
+                            .i32x4_add => .add,
+                            .i32x4_sub => .sub,
+                            .i32x4_eq => .eq,
+                            .i32x4_ne => .ne,
+                            .i32x4_lt_s => .lt_s,
+                            .i32x4_lt_u => .lt_u,
+                            .i32x4_gt_s => .gt_s,
+                            .i32x4_gt_u => .gt_u,
+                            .i32x4_le_s => .le_s,
+                            .i32x4_le_u => .le_u,
+                            .i32x4_ge_s => .ge_s,
+                            .i32x4_ge_u => .ge_u,
+                            .i32x4_mul => .mul,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_binop = .{
+                                .op = lane_op,
+                                .lhs = lhs,
+                                .rhs = rhs,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_shl,
+                    .i32x4_shr_s,
+                    .i32x4_shr_u,
+                    => {
+                        const count = safePop(&vreg_stack);
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const shift_op: ir.Inst.I32x4ShiftOp = switch (simd_op) {
+                            .i32x4_shl => .shl,
+                            .i32x4_shr_s => .shr_s,
+                            .i32x4_shr_u => .shr_u,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_shift = .{
+                                .op = shift_op,
+                                .vector = vector,
+                                .count = count,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_splat => {
+                        const val = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_splat = val },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_extract_lane => {
+                        const lane_raw = try readByte(code, &ip);
+                        if (lane_raw >= 4) return error.InvalidBytecode;
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_extract_lane = .{
+                                .vector = vector,
+                                .lane = @intCast(lane_raw),
+                            } },
+                            .dest = dest,
+                            .type = .i32,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i32x4_replace_lane => {
+                        const lane_raw = try readByte(code, &ip);
+                        if (lane_raw >= 4) return error.InvalidBytecode;
+                        const val = safePop(&vreg_stack);
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_replace_lane = .{
+                                .vector = vector,
+                                .val = val,
+                                .lane = @intCast(lane_raw),
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    else => {
+                        std.debug.print("wamrc: unsupported SIMD opcode 0x{X}\n", .{@intFromEnum(simd_op)});
+                        return error.UnsupportedOpcode;
+                    },
+                }
+            },
 
             // ── Sign-extension ops ─────────────────────────────────────
-            .i32_extend8_s, .i32_extend16_s,
-            .i64_extend8_s, .i64_extend16_s, .i64_extend32_s,
+            .i32_extend8_s,
+            .i32_extend16_s,
+            .i64_extend8_s,
+            .i64_extend16_s,
+            .i64_extend32_s,
             => {
                 const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
@@ -1660,8 +1920,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
 
             // ── Float comparisons ──────────────────────────────────────
-            .f32_eq, .f32_ne, .f32_lt, .f32_gt, .f32_le, .f32_ge,
-            .f64_eq, .f64_ne, .f64_lt, .f64_gt, .f64_le, .f64_ge,
+            .f32_eq,
+            .f32_ne,
+            .f32_lt,
+            .f32_gt,
+            .f32_le,
+            .f32_ge,
+            .f64_eq,
+            .f64_ne,
+            .f64_lt,
+            .f64_gt,
+            .f64_le,
+            .f64_ge,
             => {
                 const rhs = safePop(&vreg_stack);
                 const lhs = safePop(&vreg_stack);
@@ -1685,8 +1955,20 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
 
             // ── Float unary math ───────────────────────────────────────
-            .f32_abs, .f32_neg, .f32_sqrt, .f32_ceil, .f32_floor, .f32_trunc, .f32_nearest,
-            .f64_abs, .f64_neg, .f64_sqrt, .f64_ceil, .f64_floor, .f64_trunc, .f64_nearest,
+            .f32_abs,
+            .f32_neg,
+            .f32_sqrt,
+            .f32_ceil,
+            .f32_floor,
+            .f32_trunc,
+            .f32_nearest,
+            .f64_abs,
+            .f64_neg,
+            .f64_sqrt,
+            .f64_ceil,
+            .f64_floor,
+            .f64_trunc,
+            .f64_nearest,
             => {
                 const val = safePop(&vreg_stack);
                 const dest = ir_func.newVReg();
@@ -1709,8 +1991,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             },
 
             // ── Float binary math ──────────────────────────────────────
-            .f32_min, .f32_max, .f32_copysign,
-            .f64_min, .f64_max, .f64_copysign,
+            .f32_min,
+            .f32_max,
+            .f32_copysign,
+            .f64_min,
+            .f64_max,
+            .f64_copysign,
             => {
                 const rhs = safePop(&vreg_stack);
                 const lhs = safePop(&vreg_stack);
@@ -2023,18 +2309,36 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
             while (i <= count) : (i += 1) _ = readU32(code, ip);
         },
         // Load/store ops have align + offset
-        .i32_load, .i64_load, .f32_load, .f64_load,
-        .i32_load8_s, .i32_load8_u, .i32_load16_s, .i32_load16_u,
-        .i64_load8_s, .i64_load8_u, .i64_load16_s, .i64_load16_u,
-        .i64_load32_s, .i64_load32_u,
-        .i32_store, .i64_store, .f32_store, .f64_store,
-        .i32_store8, .i32_store16, .i64_store8, .i64_store16, .i64_store32,
+        .i32_load,
+        .i64_load,
+        .f32_load,
+        .f64_load,
+        .i32_load8_s,
+        .i32_load8_u,
+        .i32_load16_s,
+        .i32_load16_u,
+        .i64_load8_s,
+        .i64_load8_u,
+        .i64_load16_s,
+        .i64_load16_u,
+        .i64_load32_s,
+        .i64_load32_u,
+        .i32_store,
+        .i64_store,
+        .f32_store,
+        .f64_store,
+        .i32_store8,
+        .i32_store16,
+        .i64_store8,
+        .i64_store16,
+        .i64_store32,
         => {
             _ = readU32(code, ip); // align
             _ = readU32(code, ip); // offset
         },
         // Prefix opcodes
         .misc_prefix => _ = readU32(code, ip),
+        .simd_prefix => skipSimdOperands(code, ip),
         .atomic_prefix => {
             _ = readU32(code, ip); // sub-opcode
             _ = readU32(code, ip); // align
@@ -2055,6 +2359,64 @@ fn skipOperands(code: []const u8, ip: *usize, op: Opcode) void {
     }
 }
 
+fn skipSimdOperands(code: []const u8, ip: *usize) void {
+    const sub = readU32(code, ip);
+    const simd_op: SimdOpcode = @enumFromInt(sub);
+    switch (simd_op) {
+        .v128_load,
+        .v128_load8x8_s,
+        .v128_load8x8_u,
+        .v128_load16x4_s,
+        .v128_load16x4_u,
+        .v128_load32x2_s,
+        .v128_load32x2_u,
+        .v128_load8_splat,
+        .v128_load16_splat,
+        .v128_load32_splat,
+        .v128_load64_splat,
+        .v128_store,
+        .v128_load32_zero,
+        .v128_load64_zero,
+        => {
+            _ = readU32(code, ip); // alignment
+            _ = readU32(code, ip); // offset
+        },
+        .v128_const => ip.* += @min(@as(usize, 16), code.len -| ip.*),
+        .i8x16_shuffle => ip.* += @min(@as(usize, 16), code.len -| ip.*),
+        .i8x16_extract_lane_s,
+        .i8x16_extract_lane_u,
+        .i8x16_replace_lane,
+        .i16x8_extract_lane_s,
+        .i16x8_extract_lane_u,
+        .i16x8_replace_lane,
+        .i32x4_extract_lane,
+        .i32x4_replace_lane,
+        .i64x2_extract_lane,
+        .i64x2_replace_lane,
+        .f32x4_extract_lane,
+        .f32x4_replace_lane,
+        .f64x2_extract_lane,
+        .f64x2_replace_lane,
+        => {
+            if (ip.* < code.len) ip.* += 1;
+        },
+        .v128_load8_lane,
+        .v128_load16_lane,
+        .v128_load32_lane,
+        .v128_load64_lane,
+        .v128_store8_lane,
+        .v128_store16_lane,
+        .v128_store32_lane,
+        .v128_store64_lane,
+        => {
+            _ = readU32(code, ip); // alignment
+            _ = readU32(code, ip); // offset
+            if (ip.* < code.len) ip.* += 1; // lane
+        },
+        else => {},
+    }
+}
+
 // ── LEB128 decoders ────────────────────────────────────────────────
 
 fn readU32(code: []const u8, ip_ptr: *usize) u32 {
@@ -2067,6 +2429,20 @@ fn readI32(code: []const u8, ip_ptr: *usize) i32 {
 
 fn readI64(code: []const u8, ip_ptr: *usize) i64 {
     return leb128.readSignedLossy(i64, code, ip_ptr);
+}
+
+fn readByte(code: []const u8, ip_ptr: *usize) LowerError!u8 {
+    if (ip_ptr.* >= code.len) return error.InvalidBytecode;
+    const b = code[ip_ptr.*];
+    ip_ptr.* += 1;
+    return b;
+}
+
+fn readV128(code: []const u8, ip_ptr: *usize) LowerError!u128 {
+    if (code.len -| ip_ptr.* < 16) return error.InvalidBytecode;
+    const val = std.mem.readInt(u128, code[ip_ptr.*..][0..16], .little);
+    ip_ptr.* += 16;
+    return val;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -2186,6 +2562,300 @@ test "lower local.get 0; local.get 1; i32.add; end" {
     try std.testing.expect(insts[3].op.ret != null);
 }
 
+test "lower v128 local type is not treated as i64" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{.v128},
+        .results = &.{.v128},
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 1,
+        .locals = &.{},
+        // local.get 0, end
+        .code = &[_]u8{ 0x20, 0x00, 0x0B },
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    try std.testing.expect(ir_func.local_types != null);
+    try std.testing.expectEqual(ir.IrType.v128, ir_func.local_types.?[0]);
+
+    const insts = ir_func.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(u32, 0), insts[0].op.local_get);
+    try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
+    try std.testing.expect(insts[1].op.ret != null);
+}
+
+test "lower selected SIMD first-family opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const
+        0x01, 0x00,
+        0x00, 0x00,
+        0x02, 0x00,
+        0x00, 0x00,
+        0x03, 0x00,
+        0x00, 0x00,
+        0x04, 0x00,
+        0x00, 0x00,
+        0xFD, 0x0C, // v128.const
+        0x05, 0x00,
+        0x00, 0x00,
+        0x06, 0x00,
+        0x00, 0x00,
+        0x07, 0x00,
+        0x00, 0x00,
+        0x08, 0x00,
+        0x00, 0x00,
+        0xFD, 0x51, // v128.xor
+        0xFD, 0x0C, // v128.const
+        0x09, 0x00,
+        0x00, 0x00,
+        0x0A, 0x00,
+        0x00, 0x00,
+        0x0B, 0x00,
+        0x00, 0x00,
+        0x0C, 0x00,
+        0x00, 0x00,
+        0xFD, 0xAE, 0x01, // i32x4.add
+        0xFD, 0x1B, 0x00, // i32x4.extract_lane 0
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 7), insts.len);
+    try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
+    try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
+    try std.testing.expectEqual(ir.Inst.V128BitwiseOp.xor, insts[2].op.v128_bitwise.op);
+    try std.testing.expectEqual(ir.IrType.v128, insts[3].type);
+    try std.testing.expectEqual(ir.Inst.I32x4Op.add, insts[4].op.i32x4_binop.op);
+    try std.testing.expectEqual(@as(u2, 0), insts[5].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[6].op.ret != null);
+}
+
+test "lower i32x4 dynamic lane opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0x41, 0x07, // i32.const 7
+        0xFD, 0x11, // i32x4.splat
+        0x41, 0xE3, 0x00, // i32.const 99
+        0xFD, 0x1C, 0x02, // i32x4.replace_lane 2
+        0xFD, 0x1B, 0x02, // i32x4.extract_lane 2
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 6), insts.len);
+    try std.testing.expectEqual(@as(i32, 7), insts[0].op.iconst_32);
+    try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
+    try std.testing.expectEqual(insts[0].dest.?, insts[1].op.i32x4_splat);
+    try std.testing.expectEqual(@as(i32, 99), insts[2].op.iconst_32);
+    try std.testing.expectEqual(ir.IrType.v128, insts[3].type);
+    try std.testing.expectEqual(insts[1].dest.?, insts[3].op.i32x4_replace_lane.vector);
+    try std.testing.expectEqual(insts[2].dest.?, insts[3].op.i32x4_replace_lane.val);
+    try std.testing.expectEqual(@as(u2, 2), insts[3].op.i32x4_replace_lane.lane);
+    try std.testing.expectEqual(@as(u2, 2), insts[4].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[5].op.ret != null);
+}
+
+test "lower i32x4 scalar-count shift opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const
+        0x01, 0x00,
+        0x00, 0x00,
+        0x02, 0x00,
+        0x00, 0x00,
+        0x03, 0x00,
+        0x00, 0x00,
+        0x04, 0x00,
+        0x00, 0x00,
+        0x41, 0x21, // i32.const 33
+        0xFD, 0xAB, 0x01, // i32x4.shl
+        0x41, 0x20, // i32.const 32
+        0xFD, 0xAC, 0x01, // i32x4.shr_s
+        0x41, 0x3F, // i32.const 63
+        0xFD, 0xAD, 0x01, // i32x4.shr_u
+        0xFD, 0x1B, 0x00, // i32x4.extract_lane 0
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 9), insts.len);
+    try std.testing.expectEqual(ir.Inst.I32x4ShiftOp.shl, insts[2].op.i32x4_shift.op);
+    try std.testing.expectEqual(insts[0].dest.?, insts[2].op.i32x4_shift.vector);
+    try std.testing.expectEqual(insts[1].dest.?, insts[2].op.i32x4_shift.count);
+    try std.testing.expectEqual(ir.Inst.I32x4ShiftOp.shr_s, insts[4].op.i32x4_shift.op);
+    try std.testing.expectEqual(insts[2].dest.?, insts[4].op.i32x4_shift.vector);
+    try std.testing.expectEqual(insts[3].dest.?, insts[4].op.i32x4_shift.count);
+    try std.testing.expectEqual(ir.Inst.I32x4ShiftOp.shr_u, insts[6].op.i32x4_shift.op);
+    try std.testing.expectEqual(insts[4].dest.?, insts[6].op.i32x4_shift.vector);
+    try std.testing.expectEqual(insts[5].dest.?, insts[6].op.i32x4_shift.count);
+    try std.testing.expectEqual(@as(u2, 0), insts[7].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[8].op.ret != null);
+}
+
+test "lower i32x4 cmp and mul opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Case = struct {
+        opcode: u32,
+        expected: ir.Inst.I32x4Op,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0x38, .expected = .ne },
+        .{ .opcode = 0x39, .expected = .lt_s },
+        .{ .opcode = 0x3A, .expected = .lt_u },
+        .{ .opcode = 0x3B, .expected = .gt_s },
+        .{ .opcode = 0x3C, .expected = .gt_u },
+        .{ .opcode = 0x3D, .expected = .le_s },
+        .{ .opcode = 0x3E, .expected = .le_u },
+        .{ .opcode = 0x3F, .expected = .ge_s },
+        .{ .opcode = 0x40, .expected = .ge_u },
+        .{ .opcode = 0xB5, .expected = .mul },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+    const appendConst = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, lanes: [4]i32) !void {
+            try appendSimd(buf, alloc, 0x0C);
+            for (lanes) |lane| {
+                var le = std.mem.nativeToLittle(u32, @bitCast(lane));
+                try buf.appendSlice(alloc, std.mem.asBytes(&le));
+            }
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try appendConst(&code, allocator, .{ -1, 1, -2, 2 });
+    try appendConst(&code, allocator, .{ 1, -1, 2, -2 });
+    for (cases, 0..) |case, idx| {
+        if (idx != 0) try appendConst(&code, allocator, .{ 2, 3, 4, 5 });
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x1B); // i32x4.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 2 + cases.len * 2 + 1), insts.len);
+    var inst_idx: usize = 2;
+    for (cases, 0..) |case, idx| {
+        try std.testing.expectEqual(case.expected, insts[inst_idx].op.i32x4_binop.op);
+        inst_idx += 1;
+        if (idx + 1 < cases.len) {
+            try std.testing.expectEqual(ir.IrType.v128, insts[inst_idx].type);
+            inst_idx += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u2, 0), insts[inst_idx].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[inst_idx + 1].op.ret != null);
+}
+
 test "lower unreachable" {
     const allocator = std.testing.allocator;
 
@@ -2268,13 +2938,20 @@ test "lower: dead code after br is skipped" {
     // The i32.const 99 after br is dead code and should be skipped
     var bytecode: [20]u8 = undefined;
     var pos: usize = 0;
-    bytecode[pos] = 0x41; pos += 1; // i32.const
-    bytecode[pos] = 42; pos += 1; // 42
-    bytecode[pos] = 0x0C; pos += 1; // br
-    bytecode[pos] = 0; pos += 1; // depth 0
-    bytecode[pos] = 0x41; pos += 1; // i32.const (dead)
-    bytecode[pos] = 99; pos += 1; // 99 (dead)
-    bytecode[pos] = 0x0B; pos += 1; // end
+    bytecode[pos] = 0x41;
+    pos += 1; // i32.const
+    bytecode[pos] = 42;
+    pos += 1; // 42
+    bytecode[pos] = 0x0C;
+    pos += 1; // br
+    bytecode[pos] = 0;
+    pos += 1; // depth 0
+    bytecode[pos] = 0x41;
+    pos += 1; // i32.const (dead)
+    bytecode[pos] = 99;
+    pos += 1; // 99 (dead)
+    bytecode[pos] = 0x0B;
+    pos += 1; // end
 
     const func_type = types.FuncType{ .params = &.{}, .results = &.{} };
     const func = types.WasmFunction{

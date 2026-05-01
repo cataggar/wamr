@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (args.len < 3) {
         std.debug.print("Usage: wamrc <input.wasm> -o <output.aot>\n", .{});
+        std.debug.print("       wamrc [--aarch64-no-scheduler] [--target aarch64|x86_64] <input.wasm> -o <output.aot>\n", .{});
         std.debug.print("\nWebAssembly AOT Compiler (Zig)\n", .{});
         std.process.exit(1);
     }
@@ -26,6 +27,7 @@ pub fn main(init: std.process.Init) !void {
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var optimize = true;
+    var enable_aarch64_scheduler = true;
     var target_arch: TargetArch = switch (builtin.cpu.arch) {
         .aarch64 => .aarch64,
         else => .x86_64,
@@ -48,6 +50,8 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("Error: unknown target '{s}' (supported: x86_64, aarch64)\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--aarch64-no-scheduler")) {
+            enable_aarch64_scheduler = false;
         } else {
             input_path = args[i];
         }
@@ -109,7 +113,9 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         },
         .aarch64 => blk: {
-            const r = aarch64_compile.compileModule(&ir_module, allocator) catch |err| {
+            const r = aarch64_compile.compileModuleWithOptions(&ir_module, allocator, .{
+                .enable_scheduler = enable_aarch64_scheduler,
+            }) catch |err| {
                 std.debug.print("Error compiling to AArch64: {}\n", .{err});
                 std.process.exit(1);
             };

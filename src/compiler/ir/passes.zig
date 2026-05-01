@@ -91,34 +91,116 @@ pub fn buildUseDef(func: *const ir.IrFunction, allocator: std.mem.Allocator) !st
 fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
     var list = BoundedVRegList{};
     switch (inst.op) {
-        .iconst_32, .iconst_64, .fconst_32, .fconst_64 => {},
+        .iconst_32, .iconst_64, .fconst_32, .fconst_64, .v128_const => {},
         .local_get, .global_get => {},
         .br, .@"unreachable" => {},
 
         // Binary ops
-        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
-        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
-        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
-        .f_min, .f_max, .f_copysign,
-        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
         => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
 
+        .v128_bitwise => |bin| {
+            list.append(bin.lhs);
+            list.append(bin.rhs);
+        },
+        .i32x4_binop => |bin| {
+            list.append(bin.lhs);
+            list.append(bin.rhs);
+        },
+        .i32x4_shift => |shift| {
+            list.append(shift.vector);
+            list.append(shift.count);
+        },
+
         // Unary ops
-        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
-        .extend8_s, .extend16_s, .extend32_s,
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
-        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        .clz,
+        .ctz,
+        .popcnt,
+        .eqz,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .reinterpret,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .v128_not,
+        .i32x4_splat,
         => |vreg| list.append(vreg),
+        .i32x4_extract_lane => |lane| list.append(lane.vector),
+        .i32x4_replace_lane => |lane| {
+            list.append(lane.vector);
+            list.append(lane.val);
+        },
 
         .local_set => |ls| list.append(ls.val),
         .global_set => |gs| list.append(gs.val),
         .load => |ld| list.append(ld.base),
+        .v128_load => |ld| list.append(ld.base),
         .store => |st| {
+            list.append(st.base);
+            list.append(st.val);
+        },
+        .v128_store => |st| {
             list.append(st.base);
             list.append(st.val);
         },
@@ -247,38 +329,145 @@ pub fn countUsesOfVReg(func: *const ir.IrFunction, vreg: ir.VReg) u32 {
 
 fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
     switch (inst.op) {
-        .iconst_32, .iconst_64, .fconst_32, .fconst_64,
-        .local_get, .global_get, .br, .@"unreachable",
+        .iconst_32,
+        .iconst_64,
+        .fconst_32,
+        .fconst_64,
+        .v128_const,
+        .local_get,
+        .global_get,
+        .br,
+        .@"unreachable",
         => {},
 
-        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
-        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
-        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
-        .f_min, .f_max, .f_copysign,
-        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
         => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
         },
 
-        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
-        .extend8_s, .extend16_s, .extend32_s,
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
-        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
-        => |*vreg| if (vreg.* == old) { vreg.* = new; },
+        .v128_bitwise => |*bin| {
+            if (bin.lhs == old) bin.lhs = new;
+            if (bin.rhs == old) bin.rhs = new;
+        },
+        .i32x4_binop => |*bin| {
+            if (bin.lhs == old) bin.lhs = new;
+            if (bin.rhs == old) bin.rhs = new;
+        },
+        .i32x4_shift => |*shift| {
+            if (shift.vector == old) shift.vector = new;
+            if (shift.count == old) shift.count = new;
+        },
 
-        .local_set => |*ls| if (ls.val == old) { ls.val = new; },
-        .global_set => |*gs| if (gs.val == old) { gs.val = new; },
-        .load => |*ld| if (ld.base == old) { ld.base = new; },
+        .clz,
+        .ctz,
+        .popcnt,
+        .eqz,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .reinterpret,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .v128_not,
+        .i32x4_splat,
+        => |*vreg| if (vreg.* == old) {
+            vreg.* = new;
+        },
+        .i32x4_extract_lane => |*lane| if (lane.vector == old) {
+            lane.vector = new;
+        },
+        .i32x4_replace_lane => |*lane| {
+            if (lane.vector == old) lane.vector = new;
+            if (lane.val == old) lane.val = new;
+        },
+
+        .local_set => |*ls| if (ls.val == old) {
+            ls.val = new;
+        },
+        .global_set => |*gs| if (gs.val == old) {
+            gs.val = new;
+        },
+        .load => |*ld| if (ld.base == old) {
+            ld.base = new;
+        },
+        .v128_load => |*ld| if (ld.base == old) {
+            ld.base = new;
+        },
         .store => |*st| {
             if (st.base == old) st.base = new;
             if (st.val == old) st.val = new;
         },
-        .br_if => |*bi| if (bi.cond == old) { bi.cond = new; },
-        .br_table => |*bt| if (bt.index == old) { bt.index = new; },
-        .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { if (v == old) maybe_vreg.* = new; },
+        .v128_store => |*st| {
+            if (st.base == old) st.base = new;
+            if (st.val == old) st.val = new;
+        },
+        .br_if => |*bi| if (bi.cond == old) {
+            bi.cond = new;
+        },
+        .br_table => |*bt| if (bt.index == old) {
+            bt.index = new;
+        },
+        .ret => |*maybe_vreg| if (maybe_vreg.*) |v| {
+            if (v == old) maybe_vreg.* = new;
+        },
         .ret_multi => |vregs| {
             for (@constCast(vregs)) |*v| {
                 if (v.* == old) v.* = new;
@@ -310,7 +499,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
 
         // Atomic operations
         .atomic_fence => {},
-        .atomic_load => |*al| if (al.base == old) { al.base = new; },
+        .atomic_load => |*al| if (al.base == old) {
+            al.base = new;
+        },
         .atomic_store => |*ast| {
             if (ast.base == old) ast.base = new;
             if (ast.val == old) ast.val = new;
@@ -397,11 +588,31 @@ pub fn constantFold(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
                 .iconst_64 => |v| if (inst.dest) |d| {
                     try constants.put(d, v);
                 },
-                .add, .sub, .mul, .@"and", .@"or", .xor,
-                .shl, .shr_s, .shr_u, .rotl, .rotr,
-                .eq, .ne, .lt_s, .gt_s, .le_s, .ge_s,
-                .lt_u, .gt_u, .le_u, .ge_u,
-                .div_s, .div_u, .rem_s, .rem_u,
+                .add,
+                .sub,
+                .mul,
+                .@"and",
+                .@"or",
+                .xor,
+                .shl,
+                .shr_s,
+                .shr_u,
+                .rotl,
+                .rotr,
+                .eq,
+                .ne,
+                .lt_s,
+                .gt_s,
+                .le_s,
+                .ge_s,
+                .lt_u,
+                .gt_u,
+                .le_u,
+                .ge_u,
+                .div_s,
+                .div_u,
+                .rem_s,
+                .rem_u,
                 => |bin| {
                     const dest = inst.dest orelse continue;
                     const maybe_lhs = constants.get(bin.lhs);
@@ -537,22 +748,14 @@ fn evalBinOp(op: ir.Inst.Op, lhs: i64, rhs: i64, ty: ir.IrType) ?i64 {
         },
         .eq => @intFromBool(lhs == rhs),
         .ne => @intFromBool(lhs != rhs),
-        .lt_s => if (ty == .i64) @intFromBool(lhs < rhs)
-            else @intFromBool(@as(i32, @truncate(lhs)) < @as(i32, @truncate(rhs))),
-        .gt_s => if (ty == .i64) @intFromBool(lhs > rhs)
-            else @intFromBool(@as(i32, @truncate(lhs)) > @as(i32, @truncate(rhs))),
-        .le_s => if (ty == .i64) @intFromBool(lhs <= rhs)
-            else @intFromBool(@as(i32, @truncate(lhs)) <= @as(i32, @truncate(rhs))),
-        .ge_s => if (ty == .i64) @intFromBool(lhs >= rhs)
-            else @intFromBool(@as(i32, @truncate(lhs)) >= @as(i32, @truncate(rhs))),
-        .lt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) < @as(u64, @bitCast(rhs)))
-            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) < @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
-        .gt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) > @as(u64, @bitCast(rhs)))
-            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) > @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
-        .le_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) <= @as(u64, @bitCast(rhs)))
-            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) <= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
-        .ge_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) >= @as(u64, @bitCast(rhs)))
-            else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) >= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .lt_s => if (ty == .i64) @intFromBool(lhs < rhs) else @intFromBool(@as(i32, @truncate(lhs)) < @as(i32, @truncate(rhs))),
+        .gt_s => if (ty == .i64) @intFromBool(lhs > rhs) else @intFromBool(@as(i32, @truncate(lhs)) > @as(i32, @truncate(rhs))),
+        .le_s => if (ty == .i64) @intFromBool(lhs <= rhs) else @intFromBool(@as(i32, @truncate(lhs)) <= @as(i32, @truncate(rhs))),
+        .ge_s => if (ty == .i64) @intFromBool(lhs >= rhs) else @intFromBool(@as(i32, @truncate(lhs)) >= @as(i32, @truncate(rhs))),
+        .lt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) < @as(u64, @bitCast(rhs))) else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) < @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .gt_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) > @as(u64, @bitCast(rhs))) else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) > @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .le_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) <= @as(u64, @bitCast(rhs))) else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) <= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
+        .ge_u => if (ty == .i64) @intFromBool(@as(u64, @bitCast(lhs)) >= @as(u64, @bitCast(rhs))) else @intFromBool(@as(u32, @truncate(@as(u64, @bitCast(lhs)))) >= @as(u32, @truncate(@as(u64, @bitCast(rhs))))),
         .div_s => blk: {
             if (rhs == 0) break :blk null;
             if (ty == .i64) {
@@ -908,11 +1111,13 @@ pub fn strengthReduceDivRem(func: *ir.IrFunction, allocator: std.mem.Allocator) 
                         else
                             .{ .iconst_32 = @intCast(k) };
                         try block.instructions.insert(
-                            block.allocator, i,
+                            block.allocator,
+                            i,
                             .{ .op = shift_op, .dest = shift_vreg, .type = inst.type },
                         );
                         block.instructions.items[i + 1].op = .{ .shr_u = .{
-                            .lhs = bin.lhs, .rhs = shift_vreg,
+                            .lhs = bin.lhs,
+                            .rhs = shift_vreg,
                         } };
                         block.instructions.items[i + 1].dest = dest;
                         try constants.put(shift_vreg, @intCast(k));
@@ -968,11 +1173,13 @@ pub fn strengthReduceDivRem(func: *ir.IrFunction, allocator: std.mem.Allocator) 
                         else
                             .{ .iconst_32 = @bitCast(@as(u32, @truncate(mask_u))) };
                         try block.instructions.insert(
-                            block.allocator, i,
+                            block.allocator,
+                            i,
                             .{ .op = mask_op, .dest = mask_vreg, .type = inst.type },
                         );
                         block.instructions.items[i + 1].op = .{ .@"and" = .{
-                            .lhs = bin.lhs, .rhs = mask_vreg,
+                            .lhs = bin.lhs,
+                            .rhs = mask_vreg,
                         } };
                         block.instructions.items[i + 1].dest = dest;
                         try constants.put(mask_vreg, @as(i64, @bitCast(mask_u)));
@@ -1010,7 +1217,8 @@ pub fn strengthReduceDivRem(func: *ir.IrFunction, allocator: std.mem.Allocator) 
                         }
                         // Replace rem_u with sub(x, q*d).
                         block.instructions.items[i].op = .{ .sub = .{
-                            .lhs = bin.lhs, .rhs = v_qd,
+                            .lhs = bin.lhs,
+                            .rhs = v_qd,
                         } };
                         block.instructions.items[i].dest = dest;
                         block.instructions.items[i].type = .i32;
@@ -1055,7 +1263,10 @@ fn computeMagicU32(d: u32) ?struct { magic: u64, shift: u6 } {
             // Compute (x * m) >> (32 + s) using 128-bit arithmetic via two 64-bit muls.
             const prod = @as(u128, x) * @as(u128, m);
             const result = @as(u64, @truncate(prod >> shift_amt));
-            if (result != expected) { ok = false; break; }
+            if (result != expected) {
+                ok = false;
+                break;
+            }
         }
         if (ok) return .{ .magic = m, .shift = s };
     }
@@ -1178,15 +1389,46 @@ pub fn algebraicSimplify(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
 
 fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .store, .local_set, .global_set, .call, .call_indirect, .call_ref, .ret, .ret_multi, .br, .br_if, .br_table, .@"unreachable",
-        .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw, .atomic_cmpxchg,
-        .atomic_notify, .atomic_wait, .memory_copy, .memory_fill, .memory_grow,
-        .memory_init, .data_drop, .table_init, .elem_drop, .table_set, .table_grow,
+        .store,
+        .v128_store,
+        .local_set,
+        .global_set,
+        .call,
+        .call_indirect,
+        .call_ref,
+        .ret,
+        .ret_multi,
+        .br,
+        .br_if,
+        .br_table,
+        .@"unreachable",
+        .atomic_fence,
+        .atomic_load,
+        .atomic_store,
+        .atomic_rmw,
+        .atomic_cmpxchg,
+        .atomic_notify,
+        .atomic_wait,
+        .memory_copy,
+        .memory_fill,
+        .memory_grow,
+        .memory_init,
+        .data_drop,
+        .table_init,
+        .elem_drop,
+        .table_set,
+        .table_grow,
         => true,
         // Trapping ops: must not be removed even if result is unused.
-        .load, .table_get,
-        .div_u, .rem_u,
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
+        .load,
+        .v128_load,
+        .table_get,
+        .div_u,
+        .rem_u,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
         => true,
         // div_s/rem_s trap for integers but not floats (float div produces NaN/Inf).
         .div_s, .rem_s => inst.type != .f32 and inst.type != .f64,
@@ -1306,19 +1548,86 @@ pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocat
 
 fn isPure(inst: ir.Inst) bool {
     return switch (inst.op) {
-        .iconst_32, .iconst_64, .fconst_32, .fconst_64,
-        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
-        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
-        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
-        .clz, .ctz, .popcnt, .eqz,
-        .wrap_i64, .extend_i32_s, .extend_i32_u,
-        .extend8_s, .extend16_s, .extend32_s,
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
-        .f_min, .f_max, .f_copysign,
-        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
-        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        .iconst_32,
+        .iconst_64,
+        .fconst_32,
+        .fconst_64,
+        .v128_const,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .clz,
+        .ctz,
+        .popcnt,
+        .eqz,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .reinterpret,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .v128_not,
+        .v128_bitwise,
+        .i32x4_binop,
+        .i32x4_shift,
+        .i32x4_splat,
+        .i32x4_extract_lane,
+        .i32x4_replace_lane,
         => true,
         else => false,
     };
@@ -1333,6 +1642,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .iconst_64 => |v| v == b.op.iconst_64,
         .fconst_32 => |v| @as(u32, @bitCast(v)) == @as(u32, @bitCast(b.op.fconst_32)),
         .fconst_64 => |v| @as(u64, @bitCast(v)) == @as(u64, @bitCast(b.op.fconst_64)),
+        .v128_const => |v| v == b.op.v128_const,
         // Binary integer arithmetic / logic / shifts / rotations
         .add => |bin| bin.lhs == b.op.add.lhs and bin.rhs == b.op.add.rhs,
         .sub => |bin| bin.lhs == b.op.sub.lhs and bin.rhs == b.op.sub.rhs,
@@ -1405,6 +1715,13 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .trunc_sat_f32_u => |v| v == b.op.trunc_sat_f32_u,
         .trunc_sat_f64_s => |v| v == b.op.trunc_sat_f64_s,
         .trunc_sat_f64_u => |v| v == b.op.trunc_sat_f64_u,
+        .v128_not => |v| v == b.op.v128_not,
+        .v128_bitwise => |bin| bin.op == b.op.v128_bitwise.op and bin.lhs == b.op.v128_bitwise.lhs and bin.rhs == b.op.v128_bitwise.rhs,
+        .i32x4_binop => |bin| bin.op == b.op.i32x4_binop.op and bin.lhs == b.op.i32x4_binop.lhs and bin.rhs == b.op.i32x4_binop.rhs,
+        .i32x4_shift => |shift| shift.op == b.op.i32x4_shift.op and shift.vector == b.op.i32x4_shift.vector and shift.count == b.op.i32x4_shift.count,
+        .i32x4_splat => |v| v == b.op.i32x4_splat,
+        .i32x4_extract_lane => |lane| lane.vector == b.op.i32x4_extract_lane.vector and lane.lane == b.op.i32x4_extract_lane.lane,
+        .i32x4_replace_lane => |lane| lane.vector == b.op.i32x4_replace_lane.vector and lane.val == b.op.i32x4_replace_lane.val and lane.lane == b.op.i32x4_replace_lane.lane,
         // div/rem: covered by isPure+hasSideEffect guard; float variants
         // (side-effect-free) reach here.
         .div_s => |bin| bin.lhs == b.op.div_s.lhs and bin.rhs == b.op.div_s.rhs,
@@ -1600,10 +1917,16 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
             // Fence: stop scanning.
             switch (inst.op) {
                 .memory_grow,
-                .call, .call_indirect, .call_ref,
-                .memory_copy, .memory_fill, .memory_init,
-                .table_grow, .table_init,
-                .atomic_notify, .atomic_wait,
+                .call,
+                .call_indirect,
+                .call_ref,
+                .memory_copy,
+                .memory_fill,
+                .memory_init,
+                .table_grow,
+                .table_init,
+                .atomic_notify,
+                .atomic_wait,
                 => break,
                 else => {},
             }
@@ -1614,8 +1937,7 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
                     if (loop.containsBlock(db)) continue; // not loop-invariant
                     const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
                     const gop = try base_max.getOrPut(ld.base);
-                    if (!gop.found_existing) gop.value_ptr.* = end
-                    else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
+                    if (!gop.found_existing) gop.value_ptr.* = end else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
                 },
                 .store => |st| {
                     if (st.bounds_known) continue;
@@ -1623,8 +1945,7 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
                     if (loop.containsBlock(db)) continue;
                     const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
                     const gop = try base_max.getOrPut(st.base);
-                    if (!gop.found_existing) gop.value_ptr.* = end
-                    else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
+                    if (!gop.found_existing) gop.value_ptr.* = end else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
                 },
                 else => {},
             }
@@ -1721,7 +2042,10 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
         var preheader: ?ir.BlockId = null;
         for (header_preds) |p| {
             if (!loop.containsBlock(p)) {
-                if (preheader != null) { preheader = null; break; }
+                if (preheader != null) {
+                    preheader = null;
+                    break;
+                }
                 preheader = p;
             }
         }
@@ -1729,7 +2053,9 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
         const ph_insts = func.blocks.items[ph].instructions.items;
         if (ph_insts.len == 0) continue;
         switch (ph_insts[ph_insts.len - 1].op) {
-            .br => |t| { if (t != loop.header) continue; },
+            .br => |t| {
+                if (t != loop.header) continue;
+            },
             else => continue,
         }
         if (!dom.dominates(ph, loop.header)) continue;
@@ -1750,10 +2076,16 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
                     var ok = true;
                     for (used.slice()) |v| {
                         if (def_block.get(v)) |db| {
-                            if (loop.containsBlock(db)) { ok = false; break; }
+                            if (loop.containsBlock(db)) {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    if (!ok) { i += 1; continue; }
+                    if (!ok) {
+                        i += 1;
+                        continue;
+                    }
 
                     const ph_block = &func.blocks.items[ph];
                     try ph_block.instructions.insert(ph_block.allocator, ph_block.instructions.items.len - 1, inst);
@@ -1913,10 +2245,16 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
                 // on first accesses) then hide all dominator entries
                 // from post-fence instructions and dom-tree descendants.
                 .memory_grow,
-                .call, .call_indirect, .call_ref,
-                .memory_copy, .memory_fill, .memory_init,
-                .table_grow, .table_init,
-                .atomic_notify, .atomic_wait,
+                .call,
+                .call_indirect,
+                .call_ref,
+                .memory_copy,
+                .memory_fill,
+                .memory_init,
+                .table_grow,
+                .table_init,
+                .atomic_notify,
+                .atomic_wait,
                 => {
                     changed = patchSegment(&seg_first) or changed;
                     seg_first.clearRetainingCapacity();
@@ -1979,6 +2317,173 @@ fn patchSegment(seg_first: *std.AutoHashMap(ir.VReg, SegEntry)) bool {
         }
     }
     return patched;
+}
+
+// ── Address-mode folding (load/store offset) ────────────────────────────────
+
+/// Fold `add base, iconst_32 C` feeding into a `load`/`store` by absorbing
+/// `C` into the memory immediate offset:
+///
+///     v_addr = add base, C
+///     load  v_addr, offset=N  =>  load  base, offset=N+C
+///
+/// This is only sound when a dominating bounds check has already proven
+/// `base + (N+C) + size <= memory_size`. Without that proof, folding can
+/// change wrapping semantics: Wasm `i32.add` wraps, but the load/store
+/// effective address uses the zero-extended base plus a non-wrapping offset.
+pub fn foldLoadStoreOffset(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    if (dom.idom[0] == null) return false;
+
+    const nblocks = func.blocks.items.len;
+    var children = try allocator.alloc(std.ArrayList(ir.BlockId), nblocks);
+    defer {
+        for (children) |*list| list.deinit(allocator);
+        allocator.free(children);
+    }
+    for (children) |*list| list.* = .empty;
+    for (0..nblocks) |i| {
+        const bid: ir.BlockId = @intCast(i);
+        const idom = dom.idom[bid] orelse continue;
+        if (idom == bid) continue;
+        try children[idom].append(allocator, bid);
+    }
+
+    const AddInfo = struct { base: ir.VReg, offset: u32 };
+
+    var table: std.ArrayList(BoundsEntry) = .empty;
+    defer table.deinit(allocator);
+    var valid_start: usize = 0;
+
+    const Frame = struct { bid: ir.BlockId, phase: u1, snap_len: usize, snap_valid_start: usize };
+    var stack: std.ArrayList(Frame) = .empty;
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+
+    var iconst32 = std.AutoHashMap(ir.VReg, i32).init(allocator);
+    defer iconst32.deinit();
+    var add_info = std.AutoHashMap(ir.VReg, AddInfo).init(allocator);
+    defer add_info.deinit();
+    var block_checked = std.AutoHashMap(ir.VReg, u64).init(allocator);
+    defer block_checked.deinit();
+
+    var changed = false;
+    while (stack.items.len > 0) {
+        const top = &stack.items[stack.items.len - 1];
+        if (top.phase == 1) {
+            table.shrinkRetainingCapacity(top.snap_len);
+            valid_start = top.snap_valid_start;
+            _ = stack.pop();
+            continue;
+        }
+
+        const bid = top.bid;
+        top.phase = 1;
+        top.snap_len = table.items.len;
+        top.snap_valid_start = valid_start;
+
+        iconst32.clearRetainingCapacity();
+        add_info.clearRetainingCapacity();
+        block_checked.clearRetainingCapacity();
+
+        const block = &func.blocks.items[bid];
+        for (block.instructions.items) |*inst| {
+            switch (inst.op) {
+                .iconst_32 => |c| {
+                    if (inst.dest) |d| try iconst32.put(d, c);
+                },
+                .add => |bin| {
+                    if (inst.type != .i32) continue;
+                    const dest = inst.dest orelse continue;
+                    if (iconst32.get(bin.rhs)) |c| {
+                        if (c >= 0) try add_info.put(dest, .{ .base = bin.lhs, .offset = @intCast(c) });
+                    } else if (iconst32.get(bin.lhs)) |c| {
+                        if (c >= 0) try add_info.put(dest, .{ .base = bin.rhs, .offset = @intCast(c) });
+                    }
+                },
+                .load => |*ld| {
+                    if (add_info.get(ld.base)) |info| {
+                        const access_end = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
+                        const new_end: ?u64 = std.math.add(u64, @as(u64, info.offset), access_end) catch null;
+                        const new_offset: ?u64 = std.math.add(u64, @as(u64, info.offset), @as(u64, ld.offset)) catch null;
+                        if (new_end) |end| {
+                            if (new_offset) |off| {
+                                const block_max = block_checked.get(info.base) orelse 0;
+                                const dom_max = domMaxEnd(table.items, valid_start, info.base);
+                                const proof = @max(block_max, dom_max);
+                                if (end <= proof and off <= std.math.maxInt(i32)) {
+                                    ld.base = info.base;
+                                    ld.offset = @intCast(off);
+                                    if (ld.checked_end > 0) ld.checked_end = end;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!ld.bounds_known) {
+                        const end = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
+                        const gop = try block_checked.getOrPut(ld.base);
+                        if (!gop.found_existing or end > gop.value_ptr.*) gop.value_ptr.* = end;
+                    }
+                },
+                .store => |*st| {
+                    if (add_info.get(st.base)) |info| {
+                        const access_end = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
+                        const new_end: ?u64 = std.math.add(u64, @as(u64, info.offset), access_end) catch null;
+                        const new_offset: ?u64 = std.math.add(u64, @as(u64, info.offset), @as(u64, st.offset)) catch null;
+                        if (new_end) |end| {
+                            if (new_offset) |off| {
+                                const block_max = block_checked.get(info.base) orelse 0;
+                                const dom_max = domMaxEnd(table.items, valid_start, info.base);
+                                const proof = @max(block_max, dom_max);
+                                if (end <= proof and off <= std.math.maxInt(i32)) {
+                                    st.base = info.base;
+                                    st.offset = @intCast(off);
+                                    if (st.checked_end > 0) st.checked_end = end;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!st.bounds_known) {
+                        const end = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
+                        const gop = try block_checked.getOrPut(st.base);
+                        if (!gop.found_existing or end > gop.value_ptr.*) gop.value_ptr.* = end;
+                    }
+                },
+                .memory_grow,
+                .call,
+                .call_indirect,
+                .call_ref,
+                .memory_copy,
+                .memory_fill,
+                .memory_init,
+                .table_grow,
+                .table_init,
+                .atomic_notify,
+                .atomic_wait,
+                => {
+                    block_checked.clearRetainingCapacity();
+                    valid_start = table.items.len;
+                },
+                else => {},
+            }
+        }
+
+        var bit = block_checked.iterator();
+        while (bit.next()) |kv| {
+            try table.append(allocator, .{ .base = kv.key_ptr.*, .max_end = kv.value_ptr.* });
+        }
+
+        for (children[bid].items) |c| {
+            try stack.append(allocator, .{ .bid = c, .phase = 0, .snap_len = 0, .snap_valid_start = 0 });
+        }
+    }
+
+    return changed;
 }
 
 /// Forward `local_set K, val` → subsequent `local_get K` within the same
@@ -2607,40 +3112,136 @@ pub fn foldInverseCompareEqz(func: *ir.IrFunction, allocator: std.mem.Allocator)
 fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
     if (inst.dest) |d| inst.dest = d + offset;
     switch (inst.op) {
-        .iconst_32, .iconst_64, .fconst_32, .fconst_64,
-        .local_get, .global_get, .br, .@"unreachable",
-        .memory_size, .table_size, .ref_func, .data_drop, .elem_drop,
-        .atomic_fence, .call_result,
+        .iconst_32,
+        .iconst_64,
+        .fconst_32,
+        .fconst_64,
+        .v128_const,
+        .local_get,
+        .global_get,
+        .br,
+        .@"unreachable",
+        .memory_size,
+        .table_size,
+        .ref_func,
+        .data_drop,
+        .elem_drop,
+        .atomic_fence,
+        .call_result,
         => {},
 
-        .add, .sub, .mul, .div_s, .div_u, .rem_s, .rem_u,
-        .@"and", .@"or", .xor, .shl, .shr_s, .shr_u, .rotl, .rotr,
-        .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u, .le_s, .le_u, .ge_s, .ge_u,
-        .f_min, .f_max, .f_copysign,
-        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
         => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;
         },
 
-        .clz, .ctz, .popcnt, .eqz, .wrap_i64, .extend_i32_s, .extend_i32_u,
-        .extend8_s, .extend16_s, .extend32_s,
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32, .reinterpret,
-        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
+        .v128_bitwise => |*bin| {
+            bin.lhs += offset;
+            bin.rhs += offset;
+        },
+        .i32x4_binop => |*bin| {
+            bin.lhs += offset;
+            bin.rhs += offset;
+        },
+        .i32x4_shift => |*shift| {
+            shift.vector += offset;
+            shift.count += offset;
+        },
+
+        .clz,
+        .ctz,
+        .popcnt,
+        .eqz,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .reinterpret,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .v128_not,
+        .i32x4_splat,
         => |*vreg| vreg.* += offset,
+        .i32x4_extract_lane => |*lane| lane.vector += offset,
+        .i32x4_replace_lane => |*lane| {
+            lane.vector += offset;
+            lane.val += offset;
+        },
 
         .local_set => |*ls| ls.val += offset,
         .global_set => |*gs| gs.val += offset,
         .load => |*ld| ld.base += offset,
+        .v128_load => |*ld| ld.base += offset,
         .store => |*st| {
+            st.base += offset;
+            st.val += offset;
+        },
+        .v128_store => |*st| {
             st.base += offset;
             st.val += offset;
         },
         .br_if => |*bi| bi.cond += offset,
         .br_table => |*bt| bt.index += offset,
-        .ret => |*maybe_vreg| if (maybe_vreg.*) |v| { maybe_vreg.* = v + offset; },
+        .ret => |*maybe_vreg| if (maybe_vreg.*) |v| {
+            maybe_vreg.* = v + offset;
+        },
         .ret_multi => |vregs| {
             for (@constCast(vregs)) |*v| v.* += offset;
         },
@@ -2751,12 +3352,25 @@ fn isInlinable(callee: *const ir.IrFunction, max_insts: u32, max_blocks: u32) bo
 
         for (blk.instructions.items) |inst| {
             switch (inst.op) {
-                .call, .call_indirect, .call_ref, .call_result,
+                .call,
+                .call_indirect,
+                .call_ref,
+                .call_result,
                 .memory_grow,
-                .atomic_fence, .atomic_load, .atomic_store, .atomic_rmw,
-                .atomic_cmpxchg, .atomic_notify, .atomic_wait,
-                .memory_copy, .memory_fill, .memory_init, .table_init,
-                .table_grow, .data_drop, .elem_drop,
+                .atomic_fence,
+                .atomic_load,
+                .atomic_store,
+                .atomic_rmw,
+                .atomic_cmpxchg,
+                .atomic_notify,
+                .atomic_wait,
+                .memory_copy,
+                .memory_fill,
+                .memory_init,
+                .table_init,
+                .table_grow,
+                .data_drop,
+                .elem_drop,
                 .br_table,
                 .ret_multi,
                 .local_set,
@@ -3046,7 +3660,10 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                     // Deduplicate.
                     var dup = false;
                     for (def_blocks[idx].items) |existing| {
-                        if (existing == bid) { dup = true; break; }
+                        if (existing == bid) {
+                            dup = true;
+                            break;
+                        }
                     }
                     if (!dup) try def_blocks[idx].append(allocator, bid);
                 }
@@ -3153,6 +3770,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                 .i64 => .{ .iconst_64 = 0 },
                 .f32 => .{ .fconst_32 = 0 },
                 .f64 => .{ .fconst_64 = 0 },
+                .v128 => .{ .v128_const = 0 },
                 .void => .{ .iconst_32 = 0 },
             };
             // Insert at start of entry block (block 0) before phis.
@@ -3297,7 +3915,10 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
                     if (ls.idx < nlocals) {
                         // Rewrite the value operand, chasing rename chains.
                         var val = ls.val;
-                        while (rename_map.get(val)) |r| { if (r == val) break; val = r; }
+                        while (rename_map.get(val)) |r| {
+                            if (r == val) break;
+                            val = r;
+                        }
                         try stacks[ls.idx].append(allocator, val);
                         inst.op = .{ .iconst_32 = 0 };
                         inst.dest = null;
@@ -3388,9 +4009,15 @@ pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
     for (func.blocks.items) |*block| {
         var i: usize = 0;
         while (i < block.instructions.items.len) {
-            if (block.instructions.items[i].op != .phi) { i += 1; continue; }
+            if (block.instructions.items[i].op != .phi) {
+                i += 1;
+                continue;
+            }
 
-            const dest = block.instructions.items[i].dest orelse { i += 1; continue; };
+            const dest = block.instructions.items[i].dest orelse {
+                i += 1;
+                continue;
+            };
             const edges = block.instructions.items[i].op.phi;
             const phi_type = block.instructions.items[i].type;
             const synth_idx = next_synth_local;
@@ -3497,6 +4124,7 @@ pub const default_passes: []const PassFn = &.{
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 // ── Block Reordering ────────────────────────────────────────────────────────
@@ -4636,12 +5264,18 @@ test "hoistLoopInvariantCode: pure add with invariant operands hoisted" {
     try std.testing.expect(changed);
     var found_add = false;
     for (func.getBlock(b0).instructions.items) |inst| {
-        if (inst.op == .add) { found_add = true; break; }
+        if (inst.op == .add) {
+            found_add = true;
+            break;
+        }
     }
     try std.testing.expect(found_add);
     var hdr_has_add = false;
     for (func.getBlock(b1).instructions.items) |inst| {
-        if (inst.op == .add) { hdr_has_add = true; break; }
+        if (inst.op == .add) {
+            hdr_has_add = true;
+            break;
+        }
     }
     try std.testing.expect(!hdr_has_add);
 }
@@ -4671,7 +5305,10 @@ test "hoistLoopInvariantCode: cascading hoist" {
     try std.testing.expect(changed);
     var ph_has_add = false;
     for (func.getBlock(b0).instructions.items) |inst| {
-        if (inst.op == .add) { ph_has_add = true; break; }
+        if (inst.op == .add) {
+            ph_has_add = true;
+            break;
+        }
     }
     try std.testing.expect(ph_has_add);
 }
@@ -6090,8 +6727,8 @@ test "foldInverseCompareEqz: all 10 mappings" {
         src: ir.Inst.Op,
         expect_tag: std.meta.Tag(ir.Inst.Op),
     }{
-        .{ .src = .{ .eq   = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ne   },
-        .{ .src = .{ .ne   = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .eq   },
+        .{ .src = .{ .eq = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ne },
+        .{ .src = .{ .ne = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .eq },
         .{ .src = .{ .lt_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .ge_s },
         .{ .src = .{ .ge_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .lt_s },
         .{ .src = .{ .le_s = .{ .lhs = 0, .rhs = 0 } }, .expect_tag = .gt_s },
@@ -6112,8 +6749,16 @@ test "foldInverseCompareEqz: all 10 mappings" {
         const v_neg = func.newVReg();
         var src = c.src;
         switch (src) {
-            .eq, .ne, .lt_s, .ge_s, .le_s, .gt_s,
-            .lt_u, .ge_u, .le_u, .gt_u,
+            .eq,
+            .ne,
+            .lt_s,
+            .ge_s,
+            .le_s,
+            .gt_s,
+            .lt_u,
+            .ge_u,
+            .le_u,
+            .gt_u,
             => |*b| {
                 b.lhs = v0;
                 b.rhs = v1;
@@ -6657,6 +7302,157 @@ test "foldWrapOfExtend: composes with DCE to drop the extend" {
         try std.testing.expect(inst.op != .extend_i32_s);
         try std.testing.expect(inst.op != .wrap_i64);
     }
+}
+
+test "foldLoadStoreOffset: folds add base, const into load offset when prior check proves range" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 32 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const ld = block.instructions.items[4].op.load;
+    try std.testing.expectEqual(v_base, ld.base);
+    try std.testing.expectEqual(@as(u32, 16), ld.offset);
+    try std.testing.expectEqual(@as(u64, 0), ld.checked_end);
+}
+
+test "foldLoadStoreOffset: folds commuted add into store offset" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_val = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 16 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 8 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_c, .rhs = v_base } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_val, .type = .i32 });
+    try block.append(.{ .op = .{ .store = .{ .base = v_addr, .offset = 0, .size = 4, .val = v_val } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const st = block.instructions.items[5].op.store;
+    try std.testing.expectEqual(v_base, st.base);
+    try std.testing.expectEqual(@as(u32, 8), st.offset);
+}
+
+test "foldLoadStoreOffset: skips unproven add to preserve wrapping semantics" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(v_addr, block.instructions.items[3].op.load.base);
+}
+
+test "foldLoadStoreOffset: skips negative constants" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 32 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = -4 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 8, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(v_addr, block.instructions.items[4].op.load.base);
+}
+
+test "foldLoadStoreOffset: skips i64 adds" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 32 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_64 = 8 }, .dest = v_c, .type = .i64 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i64 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(v_addr, block.instructions.items[4].op.load.base);
+}
+
+test "foldLoadStoreOffset: adjusts checked_end when folding a widened access" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    var block = &func.blocks.items[b0];
+
+    const v_base = func.newVReg();
+    const v_guard = func.newVReg();
+    const v_c = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4, .checked_end = 64 } }, .dest = v_guard, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 12 }, .dest = v_c, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_c } }, .dest = v_addr, .type = .i32 });
+    try block.append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4, .checked_end = 20 } }, .dest = v_load, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v_load } });
+
+    const changed = try foldLoadStoreOffset(&func, allocator);
+    try std.testing.expect(changed);
+    const ld = block.instructions.items[4].op.load;
+    try std.testing.expectEqual(v_base, ld.base);
+    try std.testing.expectEqual(@as(u32, 16), ld.offset);
+    try std.testing.expectEqual(@as(u64, 32), ld.checked_end);
 }
 
 test "promoteLocalsToSSA: simple countdown loop" {

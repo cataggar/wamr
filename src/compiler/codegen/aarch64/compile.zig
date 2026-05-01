@@ -7,6 +7,7 @@
 const std = @import("std");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
+const schedule = @import("schedule.zig");
 const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
 
@@ -40,7 +41,9 @@ const RegMap = struct {
         .x0,  .x1,  .x2,  .x3,  .x4,  .x5,  .x6,  .x7,
         .x8,  .x9,  .x10, .x11, .x12, .x13, .x14,
         // Callee-saved:
-        .x19, .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28,
+        .x19,
+        .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27,
+        .x28,
     };
 
     /// Non-allocatable scratch registers usable by any handler.
@@ -177,6 +180,244 @@ const RegMap = struct {
     }
 };
 
+/// Stack-resident v128 storage for the first native SIMD slice.
+///
+/// Scalar VRegs continue to use the existing GPR allocator. v128 values get
+/// their own 16-byte aligned frame slots and are moved through scratch NEON Q
+/// registers only while an instruction is being emitted.
+const V128StackMap = struct {
+    entries: std.AutoHashMap(ir.VReg, u32),
+    spill_base: u32,
+    spill_capacity: u32,
+    next_offset: u32 = 0,
+
+    fn init(allocator: std.mem.Allocator, spill_base: u32, spill_capacity: u32) V128StackMap {
+        return .{
+            .entries = std.AutoHashMap(ir.VReg, u32).init(allocator),
+            .spill_base = spill_base,
+            .spill_capacity = spill_capacity,
+        };
+    }
+
+    fn deinit(self: *V128StackMap) void {
+        self.entries.deinit();
+    }
+
+    fn assign(self: *V128StackMap, vreg: ir.VReg) !u32 {
+        if (self.entries.get(vreg)) |off| return off;
+        if (self.next_offset + 16 > self.spill_capacity) return error.OutOfV128SpillSlots;
+        const off = self.spill_base + self.next_offset;
+        self.next_offset += 16;
+        try self.entries.put(vreg, off);
+        return off;
+    }
+
+    fn get(self: *const V128StackMap, vreg: ir.VReg) !u32 {
+        return self.entries.get(vreg) orelse error.UnboundV128;
+    }
+};
+
+const UseQueryCtx = struct {
+    target: ir.VReg,
+    found: bool = false,
+};
+
+fn recordUseQuery(ctx: *UseQueryCtx, vreg: ir.VReg) !void {
+    if (vreg == ctx.target) ctx.found = true;
+}
+
+const V128RegCache = struct {
+    const Slot = struct {
+        vreg: ?ir.VReg = null,
+        dirty: bool = false,
+    };
+
+    // Use caller-saved vector registers that do not overlap scalar FP helper
+    // scratch V0/V1. Q8-Q15 are intentionally excluded because AAPCS64 only
+    // preserves their low 64 bits, not the full 128-bit SIMD value.
+    const regs = [_]u5{
+        16, 17, 18, 19,
+        20, 21, 22, 23,
+        24, 25, 26, 27,
+        28, 29, 30, 31,
+    };
+
+    slots: [regs.len]Slot = [_]Slot{.{}} ** regs.len,
+    current_block_insts: []const ir.Inst = &.{},
+    current_inst_index: usize = 0,
+
+    fn beginInst(self: *V128RegCache, insts: []const ir.Inst, inst_index: usize) void {
+        self.current_block_insts = insts;
+        self.current_inst_index = inst_index;
+    }
+
+    fn regForSlot(idx: usize) u5 {
+        return regs[idx];
+    }
+
+    fn slotForReg(vt: u5) ?usize {
+        for (regs, 0..) |reg, idx| {
+            if (reg == vt) return idx;
+        }
+        return null;
+    }
+
+    fn find(self: *const V128RegCache, vreg: ir.VReg) ?usize {
+        for (self.slots, 0..) |slot, idx| {
+            if (slot.vreg == vreg) return idx;
+        }
+        return null;
+    }
+
+    fn evictSlot(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        idx: usize,
+        write_dirty: bool,
+    ) !void {
+        const slot = self.slots[idx];
+        const vreg = slot.vreg orelse return;
+        if (write_dirty and slot.dirty) {
+            const off = try v128_map.assign(vreg);
+            try storeV128SlotAbs(code, off, regForSlot(idx));
+        }
+        self.slots[idx] = .{};
+    }
+
+    fn flushAll(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+    ) !void {
+        for (self.slots, 0..) |_, idx| {
+            try self.evictSlot(code, v128_map, idx, true);
+        }
+    }
+
+    fn release(self: *V128RegCache, vreg: ir.VReg) void {
+        const idx = self.find(vreg) orelse return;
+        self.slots[idx] = .{};
+    }
+
+    fn ensure(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        vreg: ir.VReg,
+        excluded_reg: ?u5,
+    ) !u5 {
+        if (self.find(vreg)) |idx| return regForSlot(idx);
+
+        const idx = try self.allocSlot(code, v128_map, excluded_reg);
+        const off = try v128_map.get(vreg);
+        try frameAddr(code, RegMap.tmp0, off);
+        try code.ldrQ(regForSlot(idx), RegMap.tmp0);
+        self.slots[idx] = .{ .vreg = vreg, .dirty = false };
+        return regForSlot(idx);
+    }
+
+    fn allocSlot(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        excluded_reg: ?u5,
+    ) !usize {
+        if (self.chooseFreeSlot(excluded_reg)) |idx| return idx;
+        const idx = self.chooseEvictionSlot(excluded_reg) orelse return error.OutOfV128ScratchRegs;
+        try self.evictSlot(code, v128_map, idx, true);
+        return idx;
+    }
+
+    fn chooseFreeSlot(self: *const V128RegCache, excluded_reg: ?u5) ?usize {
+        for (self.slots, 0..) |slot, idx| {
+            const reg = regForSlot(idx);
+            if (excluded_reg != null and excluded_reg.? == reg) continue;
+            if (slot.vreg == null) return idx;
+        }
+        return null;
+    }
+
+    fn chooseEvictionSlot(self: *const V128RegCache, excluded_reg: ?u5) ?usize {
+        var best_idx: ?usize = null;
+        var best_category: u2 = 3;
+        var best_next: usize = 0;
+
+        for (self.slots, 0..) |slot, idx| {
+            const reg = regForSlot(idx);
+            if (excluded_reg != null and excluded_reg.? == reg) continue;
+            const vreg = slot.vreg orelse continue;
+            const maybe_next = self.nextUseIndex(vreg);
+            const next = maybe_next orelse std.math.maxInt(usize);
+            const category: u2 = if (maybe_next == null)
+                0
+            else if (!slot.dirty)
+                1
+            else
+                2;
+
+            if (best_idx == null or
+                category < best_category or
+                (category == best_category and next > best_next))
+            {
+                best_idx = idx;
+                best_category = category;
+                best_next = next;
+            }
+        }
+
+        return best_idx;
+    }
+
+    fn nextUseIndex(self: *const V128RegCache, vreg: ir.VReg) ?usize {
+        if (self.current_inst_index >= self.current_block_insts.len) return null;
+        var idx = self.current_inst_index;
+        while (idx < self.current_block_insts.len) : (idx += 1) {
+            if (instUsesVReg(self.current_block_insts[idx], vreg)) return idx;
+        }
+        return null;
+    }
+
+    fn instUsesVReg(inst: ir.Inst, vreg: ir.VReg) bool {
+        var ctx = UseQueryCtx{ .target = vreg };
+        schedule.forEachUse(inst, &ctx, recordUseQuery) catch unreachable;
+        return ctx.found;
+    }
+
+    fn defineFresh(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        dest: ir.VReg,
+        excluded_reg: ?u5,
+    ) !u5 {
+        const idx = try self.allocSlot(code, v128_map, excluded_reg);
+        _ = try v128_map.assign(dest);
+        self.slots[idx] = .{ .vreg = dest, .dirty = true };
+        return regForSlot(idx);
+    }
+
+    fn prepareOverwrite(
+        self: *V128RegCache,
+        code: *emit.CodeBuffer,
+        v128_map: *V128StackMap,
+        vt: u5,
+        drop_existing: bool,
+    ) !void {
+        const idx = slotForReg(vt) orelse return error.InvalidV128ScratchReg;
+        try self.evictSlot(code, v128_map, idx, !drop_existing);
+    }
+
+    fn defineInReg(self: *V128RegCache, v128_map: *V128StackMap, dest: ir.VReg, vt: u5) !void {
+        const idx = slotForReg(vt) orelse return error.InvalidV128ScratchReg;
+        if (self.find(dest)) |existing_idx| {
+            self.slots[existing_idx] = .{};
+        }
+        _ = try v128_map.assign(dest);
+        self.slots[idx] = .{ .vreg = dest, .dirty = true };
+    }
+};
+
 /// A pending branch that needs its 19/26-bit PC-relative offset patched once
 /// the target block's offset is known.
 const BranchPatch = struct {
@@ -194,6 +435,10 @@ pub const CallPatch = struct {
     patch_offset: usize,
     /// Local function index (import_count already subtracted).
     target_func_idx: u32,
+};
+
+pub const CompileOptions = struct {
+    enable_scheduler: bool = true,
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -244,6 +489,7 @@ const FuncCompileCtx = struct {
     /// Call emitters consult this to elide save/restore work for
     /// caller-save regs that die at the call itself.
     current_kills: []const ir.VReg = &.{},
+    options: CompileOptions = .{},
     allocator: std.mem.Allocator,
 };
 
@@ -254,6 +500,19 @@ const FmaInfo = struct {
     addend: ir.VReg,
     is_sub: bool,
 };
+
+const KillUseCtx = struct {
+    seen: *std.AutoHashMap(ir.VReg, void),
+    kill_lists: []std.ArrayListUnmanaged(ir.VReg),
+    allocator: std.mem.Allocator,
+    flat_idx: usize,
+};
+
+fn recordKillUse(ctx: *KillUseCtx, v: ir.VReg) !void {
+    const e = try ctx.seen.getOrPut(v);
+    if (e.found_existing) return;
+    try ctx.kill_lists[ctx.flat_idx].append(ctx.allocator, v);
+}
 
 /// Compile an IR function to AArch64 machine code.
 ///
@@ -279,7 +538,86 @@ const FmaInfo = struct {
 pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
     // Test-friendly entry: no cross-function linking. Any `.call` op will
     // fail with error.CallLinkageUnavailable.
-    return compileFunctionImpl(func, .{ .allocator = allocator }, allocator);
+    return compileFunctionWithOptions(func, allocator, .{});
+}
+
+pub fn compileFunctionWithOptions(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+    options: CompileOptions,
+) ![]u8 {
+    return compileFunctionImpl(func, .{ .allocator = allocator, .options = options }, allocator);
+}
+
+fn isSupportedV128Def(inst: ir.Inst) bool {
+    return switch (inst.op) {
+        .v128_const,
+        .v128_load,
+        .v128_not,
+        .v128_bitwise,
+        .i32x4_binop,
+        .i32x4_shift,
+        .i32x4_splat,
+        .i32x4_replace_lane,
+        => inst.type == .v128,
+        else => false,
+    };
+}
+
+fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.local_types) |local_types| {
+        for (local_types) |ty| if (ty == .v128) return true;
+    }
+    var vreg_types = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer vreg_types.deinit();
+
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .v128_const,
+                .v128_load,
+                .v128_not,
+                .v128_bitwise,
+                .i32x4_binop,
+                .i32x4_shift,
+                .i32x4_splat,
+                .i32x4_replace_lane,
+                => {
+                    if (!isSupportedV128Def(inst)) return true;
+                },
+                .v128_store,
+                .i32x4_extract_lane,
+                => {},
+                else => {},
+            }
+            if (inst.type == .v128 and !isSupportedV128Def(inst)) return true;
+            if (inst.dest) |dest| try vreg_types.put(dest, inst.type);
+        }
+    }
+
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            switch (inst.op) {
+                .ret => |maybe_v| {
+                    if (maybe_v) |v| if ((vreg_types.get(v) orelse .void) == .v128) return true;
+                },
+                .ret_multi => |vals| {
+                    for (vals) |v| if ((vreg_types.get(v) orelse .void) == .v128) return true;
+                },
+                .local_set => |ls| if ((vreg_types.get(ls.val) orelse .void) == .v128) return true,
+                .global_set => |gs| if ((vreg_types.get(gs.val) orelse .void) == .v128) return true,
+                .select => |sel| {
+                    if ((vreg_types.get(sel.if_true) orelse .void) == .v128 or
+                        (vreg_types.get(sel.if_false) orelse .void) == .v128)
+                    {
+                        return true;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
 }
 
 pub fn compileFunctionImpl(
@@ -289,6 +627,7 @@ pub fn compileFunctionImpl(
 ) ![]u8 {
     // Phase 1b: stack args beyond x7 aren't supported yet.
     if (func.param_count > 7) return error.TooManyParams;
+    if (try functionHasUnsupportedV128(func, allocator)) return error.UnsupportedV128;
 
     // Phase 3 of regalloc adoption (issue #100): drive RegMap from a real
     // linear-scan allocation. `RegMap.assign` consults `alloc_result` first;
@@ -324,7 +663,12 @@ pub fn compileFunctionImpl(
     };
     defer allocator.free(block_order);
 
-    var clobbers = try collectClobberPoints(func, block_order, allocator);
+    var scheduled = try schedule.scheduleFunction(func, allocator, .{
+        .enabled = ctx.options.enable_scheduler,
+    });
+    defer scheduled.deinit();
+
+    var clobbers = try collectClobberPoints(func, block_order, &scheduled, allocator);
     defer clobbers.deinit(allocator);
 
     var code = emit.CodeBuffer.init(allocator);
@@ -347,8 +691,8 @@ pub fn compileFunctionImpl(
     // reserve caller-side scratch (`scratch_base`) + HRP save slot
     // (`hrp_save_off`, only meaningful if result_count > 1).
     var max_extra_results: u32 = 0;
-    for (func.blocks.items) |block| {
-        for (block.instructions.items) |inst| {
+    for (0..func.blocks.items.len) |bid| {
+        for (scheduled.instructions(@intCast(bid))) |inst| {
             switch (inst.op) {
                 .call => |cl| max_extra_results = @max(max_extra_results, cl.extra_results),
                 .call_indirect => |ci| max_extra_results = @max(max_extra_results, ci.extra_results),
@@ -371,8 +715,8 @@ pub fn compileFunctionImpl(
     // into immediate-form instructions. Scan is cheap — one pass over IR.
     var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
     defer const_vals.deinit();
-    for (func.blocks.items) |block| {
-        for (block.instructions.items) |inst| {
+    for (0..func.blocks.items.len) |bid| {
+        for (scheduled.instructions(@intCast(bid))) |inst| {
             const dest = inst.dest orelse continue;
             switch (inst.op) {
                 .iconst_32 => |v| try const_vals.put(dest, v),
@@ -404,116 +748,8 @@ pub fn compileFunctionImpl(
             e.value_ptr.* += 1;
         }
     }.f;
-    for (func.blocks.items) |block| {
-        for (block.instructions.items) |inst| {
-            switch (inst.op) {
-                // Binary ops: two vreg reads.
-                .add, .sub, .mul, .@"and", .@"or", .xor,
-                .div_s, .div_u, .rem_s, .rem_u,
-                .shl, .shr_s, .shr_u, .rotl, .rotr,
-                .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u,
-                .le_s, .le_u, .ge_s, .ge_u,
-                .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
-                => |b| {
-                    try bumpUse(&use_counts, b.lhs);
-                    try bumpUse(&use_counts, b.rhs);
-                },
-                // Single-operand ops.
-                .local_set => |ls| try bumpUse(&use_counts, ls.val),
-                .global_set => |gs| try bumpUse(&use_counts, gs.val),
-                .eqz,
-                .ctz, .clz, .popcnt,
-                .extend8_s, .extend16_s, .extend32_s,
-                .extend_i32_s, .extend_i32_u, .wrap_i64,
-                .f_neg, .f_abs, .f_sqrt,
-                .convert_i32_s, .convert_i32_u, .convert_i64_s, .convert_i64_u,
-                .demote_f64, .promote_f32,
-                .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-                .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
-                .reinterpret,
-                .memory_grow,
-                => |v| try bumpUse(&use_counts, v),
-                .ret => |maybe_v| if (maybe_v) |v| try bumpUse(&use_counts, v),
-                .ret_multi => |vregs| for (vregs) |v| try bumpUse(&use_counts, v),
-                .load => |ld| try bumpUse(&use_counts, ld.base),
-                .store => |st| {
-                    try bumpUse(&use_counts, st.base);
-                    try bumpUse(&use_counts, st.val);
-                },
-                .atomic_load => |ald| try bumpUse(&use_counts, ald.base),
-                .atomic_store => |ast| {
-                    try bumpUse(&use_counts, ast.base);
-                    try bumpUse(&use_counts, ast.val);
-                },
-                .atomic_rmw => |arm| {
-                    try bumpUse(&use_counts, arm.base);
-                    try bumpUse(&use_counts, arm.val);
-                },
-                .atomic_cmpxchg => |acx| {
-                    try bumpUse(&use_counts, acx.base);
-                    try bumpUse(&use_counts, acx.expected);
-                    try bumpUse(&use_counts, acx.replacement);
-                },
-                .atomic_notify => |an| {
-                    try bumpUse(&use_counts, an.base);
-                    try bumpUse(&use_counts, an.count);
-                },
-                .atomic_wait => |aw| {
-                    try bumpUse(&use_counts, aw.base);
-                    try bumpUse(&use_counts, aw.expected);
-                    try bumpUse(&use_counts, aw.timeout);
-                },
-                .select => |sel| {
-                    try bumpUse(&use_counts, sel.cond);
-                    try bumpUse(&use_counts, sel.if_true);
-                    try bumpUse(&use_counts, sel.if_false);
-                },
-                .br_if => |bi| try bumpUse(&use_counts, bi.cond),
-                .br_table => |bt| try bumpUse(&use_counts, bt.index),
-                .call => |cl| for (cl.args) |a| try bumpUse(&use_counts, a),
-                .call_indirect => |ci| {
-                    try bumpUse(&use_counts, ci.elem_idx);
-                    for (ci.args) |a| try bumpUse(&use_counts, a);
-                },
-                .call_ref => |cr| {
-                    try bumpUse(&use_counts, cr.func_ref);
-                    for (cr.args) |a| try bumpUse(&use_counts, a);
-                },
-                .memory_fill => |mf| {
-                    try bumpUse(&use_counts, mf.dst);
-                    try bumpUse(&use_counts, mf.val);
-                    try bumpUse(&use_counts, mf.len);
-                },
-                .memory_copy => |mc| {
-                    try bumpUse(&use_counts, mc.dst);
-                    try bumpUse(&use_counts, mc.src);
-                    try bumpUse(&use_counts, mc.len);
-                },
-                .memory_init => |mi| {
-                    try bumpUse(&use_counts, mi.dst);
-                    try bumpUse(&use_counts, mi.src);
-                    try bumpUse(&use_counts, mi.len);
-                },
-                .table_init => |ti| {
-                    try bumpUse(&use_counts, ti.dst);
-                    try bumpUse(&use_counts, ti.src);
-                    try bumpUse(&use_counts, ti.len);
-                },
-                .table_get => |tg| try bumpUse(&use_counts, tg.idx),
-                .table_set => |ts| {
-                    try bumpUse(&use_counts, ts.idx);
-                    try bumpUse(&use_counts, ts.val);
-                },
-                .table_grow => |tg| {
-                    try bumpUse(&use_counts, tg.init);
-                    try bumpUse(&use_counts, tg.delta);
-                },
-                // Zero-operand ops (producers only): iconst, fconst, local_get,
-                // global_get, memory_size, ref_func, ref_null, table_size, br,
-                // @"unreachable".
-                else => {},
-            }
-        }
+    for (0..func.blocks.items.len) |bid| {
+        for (scheduled.instructions(@intCast(bid))) |inst| try schedule.forEachUse(inst, &use_counts, bumpUse);
     }
 
     var mul_fused = std.AutoHashMap(ir.VReg, void).init(allocator);
@@ -529,7 +765,7 @@ pub fn compileFunctionImpl(
     {
         var global_idx: u32 = 0;
         for (block_order) |bo_bid| {
-            const insts = func.blocks.items[bo_bid].instructions.items;
+            const insts = scheduled.instructions(bo_bid);
             var i: usize = 0;
             while (i < insts.len) : (i += 1) {
                 defer global_idx += 1;
@@ -539,7 +775,9 @@ pub fn compileFunctionImpl(
                 if (!is_add and !is_sub) continue;
                 if (add_inst.type != .i32 and add_inst.type != .i64) continue;
                 const bin: ir.Inst.BinOp = switch (add_inst.op) {
-                    .add => |b| b, .sub => |b| b, else => continue,
+                    .add => |b| b,
+                    .sub => |b| b,
+                    else => continue,
                 };
                 const candidates: [2]?ir.VReg = if (is_add)
                     .{ bin.rhs, bin.lhs }
@@ -584,7 +822,7 @@ pub fn compileFunctionImpl(
     fctx.fma_info = &fma_info;
 
     // Compute live ranges using the SAME block order as code emission.
-    const live_ranges = try analysis.computeLiveRangesWithOrder(func, block_order, allocator);
+    const live_ranges = try computeLiveRangesScheduled(func, block_order, &scheduled, allocator);
     defer allocator.free(live_ranges);
     if (fma_info.count() > 0) {
         // Build a vreg→range-index lookup for the patch loop.
@@ -609,11 +847,22 @@ pub fn compileFunctionImpl(
         }
     }
 
+    var scalar_live_ranges: std.ArrayList(analysis.LiveRange) = .empty;
+    defer scalar_live_ranges.deinit(allocator);
+    var v128_spill_slots: u32 = 0;
+    for (live_ranges) |range| {
+        if (range.type == .v128) {
+            v128_spill_slots += 1;
+        } else {
+            try scalar_live_ranges.append(allocator, range);
+        }
+    }
+
     var alloc_result = try regalloc.allocateFromRanges(
         allocator,
         aarch64RegSet(func.local_count),
         clobbers.items,
-        live_ranges,
+        scalar_live_ranges.items,
     );
     defer alloc_result.deinit();
 
@@ -622,7 +871,13 @@ pub fn compileFunctionImpl(
     // (next_vreg+16)*8 which was wasteful; using the allocator's exact
     // count shrinks frames and reduces I-cache pressure on entry.
     const spill_capacity: u32 = @as(u32, @intCast(alloc_result.spill_count)) * 8;
-    const hrp_save_off: u32 = spill_base + spill_capacity;
+    const scalar_spill_end = spill_base + spill_capacity;
+    const v128_spill_base: u32 = if (v128_spill_slots == 0)
+        scalar_spill_end
+    else
+        alignForwardU32(scalar_spill_end, 16);
+    const v128_spill_capacity: u32 = v128_spill_slots * 16;
+    const hrp_save_off: u32 = v128_spill_base + v128_spill_capacity;
     const scratch_base: u32 = hrp_save_off + 8;
     const scratch_size: u32 = max_extra_results * 8;
     const call_save_base: u32 = scratch_base + scratch_size;
@@ -636,6 +891,10 @@ pub fn compileFunctionImpl(
     var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
     defer reg_map.deinit();
     reg_map.alloc_result = &alloc_result;
+
+    var v128_map = V128StackMap.init(allocator, v128_spill_base, v128_spill_capacity);
+    defer v128_map.deinit();
+    var v128_cache = V128RegCache{};
 
     fctx.call_save_base = call_save_base;
     fctx.callee_save_base = callee_save_base;
@@ -655,7 +914,7 @@ pub fn compileFunctionImpl(
     // operands' kills are attributed to the FMA add (which reads them via
     // `fma_info` instead of the mul's intermediate `dest`).
     var total_insts: usize = 0;
-    for (func.blocks.items) |block| total_insts += block.instructions.items.len;
+    for (0..func.blocks.items.len) |bid| total_insts += scheduled.instructions(@intCast(bid)).len;
 
     var block_flat_base = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_flat_base);
@@ -663,7 +922,7 @@ pub fn compileFunctionImpl(
         var acc: usize = 0;
         for (block_order) |bi| {
             block_flat_base[bi] = acc;
-            acc += func.blocks.items[bi].instructions.items.len;
+            acc += scheduled.instructions(bi).len;
         }
     }
 
@@ -696,7 +955,7 @@ pub fn compileFunctionImpl(
         while (bo_rev > 0) {
             bo_rev -= 1;
             const bi_rev = block_order[bo_rev];
-            const insts = func.blocks.items[bi_rev].instructions.items;
+            const insts = scheduled.instructions(bi_rev);
             var ii_rev = insts.len;
             while (ii_rev > 0) {
                 ii_rev -= 1;
@@ -720,108 +979,13 @@ pub fn compileFunctionImpl(
                     }
                 }
 
-                switch (inst.op) {
-                    .add, .sub, .mul, .@"and", .@"or", .xor,
-                    .div_s, .div_u, .rem_s, .rem_u,
-                    .shl, .shr_s, .shr_u, .rotl, .rotr,
-                    .eq, .ne, .lt_s, .lt_u, .gt_s, .gt_u,
-                    .le_s, .le_u, .ge_s, .ge_u,
-                    .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
-                    => |b| {
-                        try recordKill(&seen, kill_lists, allocator, b.lhs, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, b.rhs, flat_idx);
-                    },
-                    .local_set => |ls| try recordKill(&seen, kill_lists, allocator, ls.val, flat_idx),
-                    .global_set => |gs| try recordKill(&seen, kill_lists, allocator, gs.val, flat_idx),
-                    .eqz,
-                    .ctz, .clz, .popcnt,
-                    .extend8_s, .extend16_s, .extend32_s,
-                    .extend_i32_s, .extend_i32_u, .wrap_i64,
-                    .f_neg, .f_abs, .f_sqrt,
-                    .convert_i32_s, .convert_i32_u, .convert_i64_s, .convert_i64_u,
-                    .demote_f64, .promote_f32,
-                    .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-                    .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
-                    .reinterpret,
-                    .memory_grow,
-                    => |v| try recordKill(&seen, kill_lists, allocator, v, flat_idx),
-                    .ret => |maybe_v| if (maybe_v) |v| try recordKill(&seen, kill_lists, allocator, v, flat_idx),
-                    .ret_multi => |vregs| for (vregs) |v| try recordKill(&seen, kill_lists, allocator, v, flat_idx),
-                    .load => |ld| try recordKill(&seen, kill_lists, allocator, ld.base, flat_idx),
-                    .store => |st| {
-                        try recordKill(&seen, kill_lists, allocator, st.base, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, st.val, flat_idx);
-                    },
-                    .atomic_load => |ald| try recordKill(&seen, kill_lists, allocator, ald.base, flat_idx),
-                    .atomic_store => |ast| {
-                        try recordKill(&seen, kill_lists, allocator, ast.base, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, ast.val, flat_idx);
-                    },
-                    .atomic_rmw => |arm| {
-                        try recordKill(&seen, kill_lists, allocator, arm.base, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, arm.val, flat_idx);
-                    },
-                    .atomic_cmpxchg => |acx| {
-                        try recordKill(&seen, kill_lists, allocator, acx.base, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, acx.expected, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, acx.replacement, flat_idx);
-                    },
-                    .atomic_notify => |an| {
-                        try recordKill(&seen, kill_lists, allocator, an.base, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, an.count, flat_idx);
-                    },
-                    .atomic_wait => |aw| {
-                        try recordKill(&seen, kill_lists, allocator, aw.base, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, aw.expected, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, aw.timeout, flat_idx);
-                    },
-                    .select => |sel| {
-                        try recordKill(&seen, kill_lists, allocator, sel.cond, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, sel.if_true, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, sel.if_false, flat_idx);
-                    },
-                    .br_if => |bi| try recordKill(&seen, kill_lists, allocator, bi.cond, flat_idx),
-                    .br_table => |bt| try recordKill(&seen, kill_lists, allocator, bt.index, flat_idx),
-                    .call => |cl| for (cl.args) |a| try recordKill(&seen, kill_lists, allocator, a, flat_idx),
-                    .call_indirect => |ci| {
-                        try recordKill(&seen, kill_lists, allocator, ci.elem_idx, flat_idx);
-                        for (ci.args) |a| try recordKill(&seen, kill_lists, allocator, a, flat_idx);
-                    },
-                    .call_ref => |cr| {
-                        try recordKill(&seen, kill_lists, allocator, cr.func_ref, flat_idx);
-                        for (cr.args) |a| try recordKill(&seen, kill_lists, allocator, a, flat_idx);
-                    },
-                    .memory_fill => |mf| {
-                        try recordKill(&seen, kill_lists, allocator, mf.dst, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, mf.val, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, mf.len, flat_idx);
-                    },
-                    .memory_copy => |mc| {
-                        try recordKill(&seen, kill_lists, allocator, mc.dst, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, mc.src, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, mc.len, flat_idx);
-                    },
-                    .memory_init => |mi| {
-                        try recordKill(&seen, kill_lists, allocator, mi.dst, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, mi.src, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, mi.len, flat_idx);
-                    },
-                    .table_init => |ti| {
-                        try recordKill(&seen, kill_lists, allocator, ti.dst, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, ti.src, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, ti.len, flat_idx);
-                    },
-                    .table_get => |tg| try recordKill(&seen, kill_lists, allocator, tg.idx, flat_idx),
-                    .table_set => |ts| {
-                        try recordKill(&seen, kill_lists, allocator, ts.idx, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, ts.val, flat_idx);
-                    },
-                    .table_grow => |tg| {
-                        try recordKill(&seen, kill_lists, allocator, tg.init, flat_idx);
-                        try recordKill(&seen, kill_lists, allocator, tg.delta, flat_idx);
-                    },
-                    else => {},
-                }
+                var kill_ctx = KillUseCtx{
+                    .seen = &seen,
+                    .kill_lists = kill_lists,
+                    .allocator = allocator,
+                    .flat_idx = flat_idx,
+                };
+                try schedule.forEachUse(inst, &kill_ctx, recordKillUse);
             }
         }
     }
@@ -836,23 +1000,27 @@ pub fn compileFunctionImpl(
     defer allocator.free(block_offsets);
     @memset(block_offsets, 0);
 
-        // block_order already computed above — reuse for emission.
+    // block_order already computed above — reuse for emission.
 
     var patches: std.ArrayListUnmanaged(BranchPatch) = .empty;
     defer patches.deinit(allocator);
 
     var last_was_ret = false;
     for (block_order) |bi| {
-        const block = func.blocks.items[bi];
         block_offsets[bi] = code.len();
-        for (block.instructions.items, 0..) |inst, ii| {
+        for (scheduled.instructions(bi), 0..) |inst, ii| {
             last_was_ret = isRet(inst.op);
             const flat_idx = block_flat_base[bi] + ii;
             fctx.current_kills = kill_lists[flat_idx].items;
-            try compileInst(&code, inst, &reg_map, frame_size, &patches, &fctx);
+            v128_cache.beginInst(scheduled.instructions(bi), ii);
+            try compileInst(&code, inst, &reg_map, &v128_map, &v128_cache, frame_size, &patches, &fctx);
             // Release physregs of vregs whose last static use is this inst.
-            for (kill_lists[flat_idx].items) |v| reg_map.freeVReg(v);
+            for (kill_lists[flat_idx].items) |v| {
+                reg_map.freeVReg(v);
+                v128_cache.release(v);
+            }
         }
+        try v128_cache.flushAll(&code, &v128_map);
     }
 
     if (!last_was_ret) {
@@ -893,6 +1061,98 @@ pub fn compileFunctionImpl(
     return code.bytes.toOwnedSlice(allocator);
 }
 
+const LastUseCtx = struct {
+    last_use_pos: *std.AutoHashMap(ir.VReg, u32),
+    pos: u32,
+};
+
+fn recordLastUse(ctx: *LastUseCtx, v: ir.VReg) !void {
+    try ctx.last_use_pos.put(v, ctx.pos);
+}
+
+fn computeLiveRangesScheduled(
+    func: *const ir.IrFunction,
+    block_order: []const ir.BlockId,
+    scheduled: *const schedule.FunctionSchedule,
+    allocator: std.mem.Allocator,
+) ![]analysis.LiveRange {
+    const liveness = try analysis.computeLiveness(func, allocator);
+    defer {
+        var it = @constCast(&liveness).iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.live_in.deinit();
+            entry.value_ptr.live_out.deinit();
+        }
+        @constCast(&liveness).deinit();
+    }
+
+    var def_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer def_pos.deinit();
+    var def_type = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer def_type.deinit();
+    var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer last_use_pos.deinit();
+
+    var global_idx: u32 = 0;
+    for (block_order) |bid| {
+        if (liveness.getPtr(bid)) |bl| {
+            var lit = bl.live_in.iterator();
+            while (lit.next()) |entry| {
+                const vreg = entry.key_ptr.*;
+                const existing = last_use_pos.get(vreg) orelse 0;
+                try last_use_pos.put(vreg, @max(existing, global_idx));
+            }
+        }
+
+        for (scheduled.instructions(bid)) |inst| {
+            if (inst.dest) |dest| {
+                if (!def_pos.contains(dest)) {
+                    try def_pos.put(dest, global_idx);
+                    try def_type.put(dest, inst.type);
+                }
+            }
+            var use_ctx = LastUseCtx{
+                .last_use_pos = &last_use_pos,
+                .pos = global_idx,
+            };
+            try schedule.forEachUse(inst, &use_ctx, recordLastUse);
+            global_idx += 1;
+        }
+
+        if (liveness.getPtr(bid)) |bl| {
+            var lit = bl.live_out.iterator();
+            while (lit.next()) |entry| {
+                const vreg = entry.key_ptr.*;
+                const existing = last_use_pos.get(vreg) orelse 0;
+                try last_use_pos.put(vreg, @max(existing, global_idx -| 1));
+            }
+        }
+    }
+
+    var ranges: std.ArrayList(analysis.LiveRange) = .empty;
+    errdefer ranges.deinit(allocator);
+    var dit = def_pos.iterator();
+    while (dit.next()) |entry| {
+        const vreg = entry.key_ptr.*;
+        const start = entry.value_ptr.*;
+        const end = last_use_pos.get(vreg) orelse start;
+        try ranges.append(allocator, .{
+            .vreg = vreg,
+            .start = start,
+            .end = @max(start, end),
+            .type = def_type.get(vreg) orelse .i32,
+        });
+    }
+
+    std.mem.sort(analysis.LiveRange, ranges.items, {}, struct {
+        fn lessThan(_: void, a: analysis.LiveRange, b: analysis.LiveRange) bool {
+            return a.start < b.start;
+        }
+    }.lessThan);
+
+    return ranges.toOwnedSlice(allocator);
+}
+
 /// FP-relative slot offset (in bytes) for the VMContext pointer.
 const vmctx_slot_offset: u32 = 16;
 
@@ -901,12 +1161,22 @@ fn localSlotOffset(idx: u32) u32 {
     return (idx + 3) * 8;
 }
 
+fn alignForwardU32(value: u32, alignment: u32) u32 {
+    std.debug.assert(alignment != 0 and (alignment & (alignment - 1)) == 0);
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
 /// ABI register holding wasm parameter `i` (0-based). Parameter 0 is in x1
 /// because x0 carries the hidden VMContext pointer.
 fn paramAbiReg(i: u32) emit.Reg {
     return switch (i) {
-        0 => .x1, 1 => .x2, 2 => .x3, 3 => .x4,
-        4 => .x5, 5 => .x6, 6 => .x7,
+        0 => .x1,
+        1 => .x2,
+        2 => .x3,
+        3 => .x4,
+        4 => .x5,
+        5 => .x6,
+        6 => .x7,
         else => unreachable,
     };
 }
@@ -1074,14 +1344,133 @@ fn patchUnusedCalleeSaveSlots(
     }
 }
 
+fn isV128Inst(inst: ir.Inst) bool {
+    return switch (inst.op) {
+        .v128_const,
+        .v128_load,
+        .v128_store,
+        .v128_not,
+        .v128_bitwise,
+        .i32x4_binop,
+        .i32x4_shift,
+        .i32x4_splat,
+        .i32x4_extract_lane,
+        .i32x4_replace_lane,
+        => true,
+        else => false,
+    };
+}
+
+fn instRequiresV128Flush(inst: ir.Inst) bool {
+    if (isV128Inst(inst)) return false;
+    return switch (inst.op) {
+        .iconst_32,
+        .iconst_64,
+        .fconst_32,
+        .fconst_64,
+        => false,
+        .add,
+        .sub,
+        .mul,
+        .div_s,
+        .div_u,
+        .rem_s,
+        .rem_u,
+        .@"and",
+        .@"or",
+        .xor,
+        .shl,
+        .shr_s,
+        .shr_u,
+        .rotl,
+        .rotr,
+        .eq,
+        .ne,
+        .lt_s,
+        .lt_u,
+        .gt_s,
+        .gt_u,
+        .le_s,
+        .le_u,
+        .ge_s,
+        .ge_u,
+        .eqz,
+        .clz,
+        .ctz,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
+        .extend_i32_s,
+        .extend_i32_u,
+        .wrap_i64,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .popcnt,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .select,
+        .local_get,
+        .local_set,
+        .load,
+        .store,
+        .memory_size,
+        .reinterpret,
+        .global_get,
+        .global_set,
+        .atomic_load,
+        .atomic_store,
+        .atomic_rmw,
+        .atomic_cmpxchg,
+        .atomic_fence,
+        .memory_init,
+        .data_drop,
+        => false,
+        else => true,
+    };
+}
+
 fn compileInst(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
     frame_size: u32,
     patches: *std.ArrayListUnmanaged(BranchPatch),
     fctx: *FuncCompileCtx,
 ) !void {
+    if (instRequiresV128Flush(inst)) {
+        try v128_cache.flushAll(code, v128_map);
+    }
+
     switch (inst.op) {
         // ── Constants ────────────────────────────────────────────────
         .iconst_32 => |val| {
@@ -1108,6 +1497,16 @@ fn compileInst(
             try code.movImm64(info.reg, @bitCast(val));
             try destCommit(code, reg_map, info);
         },
+        .v128_const => |val| try emitV128Const(code, inst, val, v128_map, v128_cache),
+        .v128_load => |ld| try emitV128Load(code, inst, ld, reg_map, v128_map, v128_cache),
+        .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache),
+        .v128_not => |src| try emitV128Not(code, inst, src, v128_map, v128_cache, fctx),
+        .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
+        .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
+        .i32x4_shift => |shift| try emitI32x4Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
+        .i32x4_splat => |src| try emitI32x4Splat(code, inst, src, reg_map, v128_map, v128_cache),
+        .i32x4_extract_lane => |lane| try emitI32x4ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
+        .i32x4_replace_lane => |lane| try emitI32x4ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
 
         .add => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .add)
@@ -1364,6 +1763,280 @@ fn useReg(reg_map: *const RegMap, vreg: ir.VReg) ?emit.Reg {
     };
 }
 
+const v128_tmp0: u5 = 0;
+const v128_tmp1: u5 = 1;
+
+fn storeV128SlotAbs(
+    code: *emit.CodeBuffer,
+    slot_off: u32,
+    vt: u5,
+) !void {
+    try frameAddr(code, RegMap.tmp0, slot_off);
+    try code.strQ(vt, RegMap.tmp0);
+}
+
+fn isCurrentKill(fctx: *const FuncCompileCtx, vreg: ir.VReg) bool {
+    for (fctx.current_kills) |killed| {
+        if (killed == vreg) return true;
+    }
+    return false;
+}
+
+fn prepareV128UnaryDest(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    src_reg: u5,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !u5 {
+    const dest = inst.dest orelse return src_reg;
+    try v128_cache.prepareOverwrite(code, v128_map, src_reg, isCurrentKill(fctx, src));
+    try v128_cache.defineInReg(v128_map, dest, src_reg);
+    return src_reg;
+}
+
+fn prepareV128BinaryDest(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lhs: ir.VReg,
+    lhs_reg: u5,
+    rhs: ir.VReg,
+    rhs_reg: u5,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !u5 {
+    const dest = inst.dest orelse return lhs_reg;
+    const dest_reg = if (isCurrentKill(fctx, lhs))
+        lhs_reg
+    else if (isCurrentKill(fctx, rhs))
+        rhs_reg
+    else
+        lhs_reg;
+    const drop_existing = (dest_reg == lhs_reg and isCurrentKill(fctx, lhs)) or
+        (dest_reg == rhs_reg and isCurrentKill(fctx, rhs));
+    try v128_cache.prepareOverwrite(code, v128_map, dest_reg, drop_existing);
+    try v128_cache.defineInReg(v128_map, dest, dest_reg);
+    return dest_reg;
+}
+
+fn emitV128Const(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    val: u128,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    const lo: u64 = @truncate(val);
+    const hi: u64 = @truncate(val >> 64);
+    try code.movImm64(RegMap.tmp0, lo);
+    try code.fmovDFromGp64(dest_reg, RegMap.tmp0);
+    try code.movImm64(RegMap.tmp0, hi);
+    try code.insDFromGp64(dest_reg, 1, RegMap.tmp0);
+}
+
+fn emitV128Load(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    ld: ir.Inst.V128Mem,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + 16;
+    if (ld.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
+    } else {
+        try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
+    }
+    try code.ldrQ(dest_reg, RegMap.tmp0);
+}
+
+fn emitV128Store(
+    code: *emit.CodeBuffer,
+    st: ir.Inst.V128Store,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const val_reg = try v128_cache.ensure(code, v128_map, st.val, null);
+    const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + 16;
+    if (st.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, st.base, st.offset);
+    } else {
+        try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
+    }
+    try code.strQ(val_reg, RegMap.tmp0);
+}
+
+fn emitV128Not(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const src_reg = try v128_cache.ensure(code, v128_map, src, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, src, src_reg, v128_map, v128_cache, fctx);
+    try code.mvn16b(dest_reg, src_reg);
+}
+
+fn emitV128Bitwise(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.V128Bitwise,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, bin.lhs, null);
+    const rhs_reg = if (bin.rhs == bin.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, bin.rhs, lhs_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        bin.lhs,
+        lhs_reg,
+        bin.rhs,
+        rhs_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
+    const op: emit.CodeBuffer.V128BitwiseOp = switch (bin.op) {
+        .@"and" => .@"and",
+        .andnot => .bic,
+        .@"or" => .orr,
+        .xor => .eor,
+    };
+    try code.bitwise16b(op, dest_reg, lhs_reg, rhs_reg);
+}
+
+fn emitI32x4BinOp(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    bin: ir.Inst.I32x4BinOp,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, bin.lhs, null);
+    const rhs_reg = if (bin.rhs == bin.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, bin.rhs, lhs_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        bin.lhs,
+        lhs_reg,
+        bin.rhs,
+        rhs_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
+    switch (bin.op) {
+        .add => try code.i32x4Op(.add, dest_reg, lhs_reg, rhs_reg),
+        .sub => try code.i32x4Op(.sub, dest_reg, lhs_reg, rhs_reg),
+        .mul => try code.i32x4Op(.mul, dest_reg, lhs_reg, rhs_reg),
+        .eq => try code.i32x4Op(.cmeq, dest_reg, lhs_reg, rhs_reg),
+        .ne => {
+            try code.i32x4Op(.cmeq, dest_reg, lhs_reg, rhs_reg);
+            try code.mvn16b(dest_reg, dest_reg);
+        },
+        .gt_s => try code.i32x4Op(.cmgt, dest_reg, lhs_reg, rhs_reg),
+        .ge_s => try code.i32x4Op(.cmge, dest_reg, lhs_reg, rhs_reg),
+        .lt_s => try code.i32x4Op(.cmgt, dest_reg, rhs_reg, lhs_reg),
+        .le_s => try code.i32x4Op(.cmge, dest_reg, rhs_reg, lhs_reg),
+        .gt_u => try code.i32x4Op(.cmhi, dest_reg, lhs_reg, rhs_reg),
+        .ge_u => try code.i32x4Op(.cmhs, dest_reg, lhs_reg, rhs_reg),
+        .lt_u => try code.i32x4Op(.cmhi, dest_reg, rhs_reg, lhs_reg),
+        .le_u => try code.i32x4Op(.cmhs, dest_reg, rhs_reg, lhs_reg),
+    }
+}
+
+fn emitI32x4Shift(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    shift: ir.Inst.I32x4Shift,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, shift.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, shift.vector, vector_reg, v128_map, v128_cache, fctx);
+    const count_reg = try useInto(code, reg_map, shift.count, RegMap.tmp0);
+    try code.andImm32Mask31(RegMap.tmp0, count_reg);
+    const shift_reg = v128_tmp1;
+    try code.dup4sFromGp32(shift_reg, RegMap.tmp0);
+    switch (shift.op) {
+        .shl => try code.sshl4s(dest_reg, vector_reg, shift_reg),
+        .shr_s => {
+            try code.neg4s(shift_reg, shift_reg);
+            try code.sshl4s(dest_reg, vector_reg, shift_reg);
+        },
+        .shr_u => {
+            try code.neg4s(shift_reg, shift_reg);
+            try code.ushl4s(dest_reg, vector_reg, shift_reg);
+        },
+    }
+}
+
+fn emitI32x4Splat(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    const src_reg = try useInto(code, reg_map, src, RegMap.tmp0);
+    try code.dup4sFromGp32(dest_reg, src_reg);
+}
+
+fn emitI32x4ExtractLane(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lane: ir.Inst.I32x4ExtractLane,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+    try code.umovWFromS(info.reg, vector_reg, lane.lane);
+    try destCommit(code, reg_map, info);
+}
+
+fn emitI32x4ReplaceLane(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lane: ir.Inst.I32x4ReplaceLane,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, lane.vector, vector_reg, v128_map, v128_cache, fctx);
+    const val_reg = try useInto(code, reg_map, lane.val, RegMap.tmp0);
+    try code.insSFromGp32(dest_reg, lane.lane, val_reg);
+}
+
 const ExtendWidth = enum { b, h, w };
 
 fn emitEqz(
@@ -1598,11 +2271,9 @@ fn emitFSqrt(
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     const is64 = (inst.type == .f64);
-    if (is64) try code.fmovDFromGp64(0, src)
-    else try code.fmovSFromGp32(0, src);
+    if (is64) try code.fmovDFromGp64(0, src) else try code.fmovSFromGp32(0, src);
     try code.fsqrtScalar(is64, 0, 0);
-    if (is64) try code.fmovGpFromD64(info.reg, 0)
-    else try code.fmovGpFromS32(info.reg, 0);
+    if (is64) try code.fmovGpFromD64(info.reg, 0) else try code.fmovGpFromS32(info.reg, 0);
     try destCommit(code, reg_map, info);
 }
 
@@ -1619,11 +2290,9 @@ fn emitFRint(
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     const is64 = (inst.type == .f64);
-    if (is64) try code.fmovDFromGp64(0, src)
-    else try code.fmovSFromGp32(0, src);
+    if (is64) try code.fmovDFromGp64(0, src) else try code.fmovSFromGp32(0, src);
     try code.frintScalar(is64, mode, 0, 0);
-    if (is64) try code.fmovGpFromD64(info.reg, 0)
-    else try code.fmovGpFromS32(info.reg, 0);
+    if (is64) try code.fmovGpFromD64(info.reg, 0) else try code.fmovGpFromS32(info.reg, 0);
     try destCommit(code, reg_map, info);
 }
 
@@ -1799,8 +2468,7 @@ fn emitConvertIntToFloat(
     } else {
         try code.ucvtfFromGp(is_f64, src_is_i64, 0, src);
     }
-    if (is_f64) try code.fmovGpFromD64(info.reg, 0)
-    else try code.fmovGpFromS32(info.reg, 0);
+    if (is_f64) try code.fmovGpFromD64(info.reg, 0) else try code.fmovGpFromS32(info.reg, 0);
     try destCommit(code, reg_map, info);
 }
 
@@ -1878,8 +2546,7 @@ fn emitTruncTrapping(
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
 
     // 1. Move source into V0 (S or D lane).
-    if (src_is_f32) try code.fmovSFromGp32(0, src)
-    else try code.fmovDFromGp64(0, src);
+    if (src_is_f32) try code.fmovSFromGp32(0, src) else try code.fmovDFromGp64(0, src);
 
     // 2. NaN check: FCMP V0, V0 sets V=1 on unordered.
     //    Skip the trap when ordered: B.VC skip; trap; skip:
@@ -1995,8 +2662,7 @@ fn emitTruncSat(
     };
 
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
-    if (src_is_f32) try code.fmovSFromGp32(0, src)
-    else try code.fmovDFromGp64(0, src);
+    if (src_is_f32) try code.fmovSFromGp32(0, src) else try code.fmovDFromGp64(0, src);
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     const dst_is_x = !dst_is_i32;
@@ -2094,8 +2760,13 @@ fn emitBr(
 /// ABI arg register for the i-th user argument (i=0 → x1 because x0 = vmctx).
 fn callArgReg(i: u32) emit.Reg {
     return switch (i) {
-        0 => .x1, 1 => .x2, 2 => .x3, 3 => .x4,
-        4 => .x5, 5 => .x6, 6 => .x7,
+        0 => .x1,
+        1 => .x2,
+        2 => .x3,
+        3 => .x4,
+        4 => .x5,
+        5 => .x6,
+        6 => .x7,
         else => unreachable,
     };
 }
@@ -2351,24 +3022,24 @@ fn emitMemAddrImpl(
 }
 
 /// VmCtx field offsets. Must match `runtime/aot/runtime.zig::VmCtx`.
-const vmctx_memsize_slot: u12 = 1;       // byte 8, scale 8
-const vmctx_globals_slot: u12 = 2;       // byte 16, scale 8
-const vmctx_host_functions_slot: u12 = 3;// byte 24, scale 8
-const vmctx_mem_pages_slot_w: u12 = 14;  // byte 56 (u32), scale 4
-const vmctx_mem_grow_fn_slot: u12 = 8;   // byte 64, scale 8
-const vmctx_mem_fill_fn_slot: u12 = 28;  // byte 224, scale 8
-const vmctx_mem_copy_fn_slot: u12 = 29;  // byte 232, scale 8
-const vmctx_trap_oob_fn_slot: u12 = 10;  // byte 80, scale 8
+const vmctx_memsize_slot: u12 = 1; // byte 8, scale 8
+const vmctx_globals_slot: u12 = 2; // byte 16, scale 8
+const vmctx_host_functions_slot: u12 = 3; // byte 24, scale 8
+const vmctx_mem_pages_slot_w: u12 = 14; // byte 56 (u32), scale 4
+const vmctx_mem_grow_fn_slot: u12 = 8; // byte 64, scale 8
+const vmctx_mem_fill_fn_slot: u12 = 28; // byte 224, scale 8
+const vmctx_mem_copy_fn_slot: u12 = 29; // byte 232, scale 8
+const vmctx_trap_oob_fn_slot: u12 = 10; // byte 80, scale 8
 const vmctx_trap_unreachable_fn_slot: u12 = 11; // byte 88, scale 8
 const vmctx_trap_idivz_fn_slot: u12 = 12; // byte 96, scale 8
-const vmctx_trap_iovf_fn_slot: u12 = 13;  // byte 104, scale 8
-const vmctx_funcptrs_slot: u12 = 15;     // byte 120, scale 8
-const vmctx_table_grow_fn_slot: u12 = 16;// byte 128, scale 8
-const vmctx_tables_info_slot: u12 = 17;  // byte 136, scale 8
-const vmctx_sig_table_slot: u12 = 20;    // byte 160, scale 8
+const vmctx_trap_iovf_fn_slot: u12 = 13; // byte 104, scale 8
+const vmctx_funcptrs_slot: u12 = 15; // byte 120, scale 8
+const vmctx_table_grow_fn_slot: u12 = 16; // byte 128, scale 8
+const vmctx_tables_info_slot: u12 = 17; // byte 136, scale 8
+const vmctx_sig_table_slot: u12 = 20; // byte 160, scale 8
 const vmctx_table_set_fn_slot: u12 = 24; // byte 192, scale 8
 const vmctx_table_init_fn_slot: u12 = 18; // byte 144, scale 8
-const vmctx_elem_drop_fn_slot: u12 = 19;  // byte 152, scale 8
+const vmctx_elem_drop_fn_slot: u12 = 19; // byte 152, scale 8
 const vmctx_futex_wait32_fn_slot: u12 = 25; // byte 200, scale 8
 const vmctx_futex_wait64_fn_slot: u12 = 26; // byte 208, scale 8
 const vmctx_futex_notify_fn_slot: u12 = 27; // byte 216, scale 8
@@ -2399,8 +3070,7 @@ fn emitGlobalGet(
     const is32 = (inst.type == .i32 or inst.type == .f32);
     // Byte offset = idx * 8. LDR scaled-imm requires idx fit in u12.
     if (idx > 0xFFF) return error.GlobalIndexOutOfRange;
-    if (is32) try code.ldrImm32(info.reg, RegMap.tmp0, @intCast(idx * 2))
-    else try code.ldrImm(info.reg, RegMap.tmp0, @intCast(idx));
+    if (is32) try code.ldrImm32(info.reg, RegMap.tmp0, @intCast(idx * 2)) else try code.ldrImm(info.reg, RegMap.tmp0, @intCast(idx));
     try destCommit(code, reg_map, info);
 }
 
@@ -3051,7 +3721,6 @@ fn emitRetMulti(
     try code.emitEpilogue(frame_size);
 }
 
-
 /// same caller-save snapshot pattern as `emitCall`: all currently-used
 /// scratch regs are spilled to the function's `call_save` region before
 /// arg staging, so the arg moves can read from stable stack slots
@@ -3275,18 +3944,15 @@ fn emitDivRem(
     // and tmp1 across the trap-helper calls.
     const lhs_loaded = try useInto(code, reg_map, bin.lhs, RegMap.tmp0);
     if (lhs_loaded != RegMap.tmp0) {
-        if (is64) try code.movRegReg(RegMap.tmp0, lhs_loaded)
-        else try code.movRegReg32(RegMap.tmp0, lhs_loaded);
+        if (is64) try code.movRegReg(RegMap.tmp0, lhs_loaded) else try code.movRegReg32(RegMap.tmp0, lhs_loaded);
     }
     const rhs_loaded = try useInto(code, reg_map, bin.rhs, RegMap.tmp1);
     if (rhs_loaded != RegMap.tmp1) {
-        if (is64) try code.movRegReg(RegMap.tmp1, rhs_loaded)
-        else try code.movRegReg32(RegMap.tmp1, rhs_loaded);
+        if (is64) try code.movRegReg(RegMap.tmp1, rhs_loaded) else try code.movRegReg32(RegMap.tmp1, rhs_loaded);
     }
 
     // Zero-divisor check: cmp rhs, #0; b.ne skip; call trap_idivz; skip:
-    if (is64) try code.cmpImm(RegMap.tmp1, 0)
-    else try code.cmpImm32(RegMap.tmp1, 0);
+    if (is64) try code.cmpImm(RegMap.tmp1, 0) else try code.cmpImm32(RegMap.tmp1, 0);
     const skip_idivz = code.len();
     try code.bCond(.ne, 0);
     try emitTrapHelperCall(code, vmctx_trap_idivz_fn_slot);
@@ -3340,15 +4006,12 @@ fn emitDivRem(
             // still writes tmp2=q, then MSUB reads q (tmp2) before writing
             // dest (tmp2) — single-instruction read-before-write, safe.
             if (kind == .rem_s) {
-                if (is64) try code.sdivRegReg(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1)
-                else try code.sdivRegReg32(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1);
+                if (is64) try code.sdivRegReg(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1) else try code.sdivRegReg32(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1);
             } else {
-                if (is64) try code.udivRegReg(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1)
-                else try code.udivRegReg32(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1);
+                if (is64) try code.udivRegReg(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1) else try code.udivRegReg32(RegMap.tmp2, RegMap.tmp0, RegMap.tmp1);
             }
             // MSUB dest, q, rhs, lhs  →  dest = lhs - q*rhs
-            if (is64) try code.msubRegReg(info.reg, RegMap.tmp2, RegMap.tmp1, RegMap.tmp0)
-            else try code.msubRegReg32(info.reg, RegMap.tmp2, RegMap.tmp1, RegMap.tmp0);
+            if (is64) try code.msubRegReg(info.reg, RegMap.tmp2, RegMap.tmp1, RegMap.tmp0) else try code.msubRegReg32(info.reg, RegMap.tmp2, RegMap.tmp1, RegMap.tmp0);
         },
     }
     try destCommit(code, reg_map, info);
@@ -3397,7 +4060,6 @@ fn emitBrTable(
     });
 }
 
-
 /// Scaled-immediate offset suitable for LDR/STR with given scale.
 /// Returns null if the offset isn't a multiple of `scale` within u12*scale range.
 fn scaledOffset(off: u32, scale: u32) ?u12 {
@@ -3442,10 +4104,8 @@ fn emitLoad(
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     if (ld.sign_extend) {
         switch (ld.size) {
-            1 => if (is64) try code.ldrsbImm64(info.reg, RegMap.tmp0, disp)
-                 else try code.ldrsbImm32(info.reg, RegMap.tmp0, disp),
-            2 => if (is64) try code.ldrshImm64(info.reg, RegMap.tmp0, disp)
-                 else try code.ldrshImm32(info.reg, RegMap.tmp0, disp),
+            1 => if (is64) try code.ldrsbImm64(info.reg, RegMap.tmp0, disp) else try code.ldrsbImm32(info.reg, RegMap.tmp0, disp),
+            2 => if (is64) try code.ldrshImm64(info.reg, RegMap.tmp0, disp) else try code.ldrshImm32(info.reg, RegMap.tmp0, disp),
             4 => try code.ldrswImm(info.reg, RegMap.tmp0, disp), // always X-form
             else => unreachable,
         }
@@ -3793,11 +4453,9 @@ fn emitAddSubImm(
         else => unreachable,
     };
     if (is_sub) {
-        if (enc.shift12) try code.subImmShift12(dst, src, enc.imm12)
-        else try code.subImm(dst, src, enc.imm12);
+        if (enc.shift12) try code.subImmShift12(dst, src, enc.imm12) else try code.subImm(dst, src, enc.imm12);
     } else {
-        if (enc.shift12) try code.addImmShift12(dst, src, enc.imm12)
-        else try code.addImm(dst, src, enc.imm12);
+        if (enc.shift12) try code.addImmShift12(dst, src, enc.imm12) else try code.addImm(dst, src, enc.imm12);
     }
 }
 
@@ -3901,6 +4559,14 @@ pub const CompileResult = struct {
 
 /// Compile all functions in an IR module to AArch64 machine code.
 pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator) !CompileResult {
+    return compileModuleWithOptions(ir_module, allocator, .{});
+}
+
+pub fn compileModuleWithOptions(
+    ir_module: *const ir.IrModule,
+    allocator: std.mem.Allocator,
+    options: CompileOptions,
+) !CompileResult {
     var all_code: std.ArrayListUnmanaged(u8) = .empty;
     errdefer all_code.deinit(allocator);
     var offsets: std.ArrayListUnmanaged(u32) = .empty;
@@ -3919,6 +4585,7 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         const ctx: FuncCompileCtx = .{
             .import_count = ir_module.import_count,
             .call_patches = &func_patches,
+            .options = options,
             .allocator = allocator,
         };
         const func_code = try compileFunctionImpl(&func, ctx, allocator);
@@ -3979,7 +4646,7 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
 /// x19..x28 (callee-saved). x16/x17 are `RegMap.tmp0/tmp1`, x18 is the
 /// platform register, x29/x30 are FP/LR, and x31 is SP — all excluded.
 pub const aarch64_alloc_regs = [_]regalloc.PhysReg{
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,
     19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
 };
 
@@ -4044,6 +4711,7 @@ pub fn aarch64RegSet(local_count: u32) regalloc.RegSet {
 pub fn collectClobberPoints(
     func: *const ir.IrFunction,
     block_order_opt: ?[]const ir.BlockId,
+    scheduled: ?*const schedule.FunctionSchedule,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(regalloc.ClobberPoint) {
     var clobbers: std.ArrayList(regalloc.ClobberPoint) = .empty;
@@ -4060,7 +4728,11 @@ pub fn collectClobberPoints(
 
     var pos: u32 = 0;
     for (block_order) |bo_bid| {
-        for (func.blocks.items[bo_bid].instructions.items) |ci| {
+        const insts = if (scheduled) |s|
+            s.instructions(bo_bid)
+        else
+            func.blocks.items[bo_bid].instructions.items;
+        for (insts) |ci| {
             switch (ci.op) {
                 .call,
                 .call_indirect,
@@ -4095,7 +4767,7 @@ pub fn collectClobberPoints(
 /// This is called unconditionally from `compileFunctionImpl` and will be
 /// deleted in Phase 3 (replaced by a real consumer of the allocation).
 fn shadowRunRegalloc(func: *const ir.IrFunction, allocator: std.mem.Allocator) !void {
-    var clobbers = try collectClobberPoints(func, null, allocator);
+    var clobbers = try collectClobberPoints(func, null, null, allocator);
     defer clobbers.deinit(allocator);
 
     var alloc_result = try regalloc.allocate(
@@ -4446,6 +5118,237 @@ test "load i32: unrepresentable offset falls back to movImm + add" {
     try std.testing.expect(code.len % 4 == 0);
 }
 
+test "compile: v128 first-family ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const x = func.newVReg();
+    const c = func.newVReg();
+    const sum = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0008_0000_0007_0000_0006_0000_0005 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = a, .rhs = b } },
+        .dest = x,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_000C_0000_000B_0000_000A_0000_0009 }, .dest = c, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_binop = .{ .op = .add, .lhs = x, .rhs = c } },
+        .dest = sum,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = sum, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_eor = false;
+    var found_add4s = false;
+    var found_umov = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0x6E201C00) found_eor = true;
+        if ((w & 0xFFE0FC00) == 0x4EA08400) found_add4s = true;
+        if ((w & 0x0FE0FC00) == 0x0E003C00) found_umov = true;
+    }
+
+    try std.testing.expect(found_eor);
+    try std.testing.expect(found_add4s);
+    try std.testing.expect(found_umov);
+}
+
+test "compile: i32x4 lane ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const scalar = func.newVReg();
+    const splat = func.newVReg();
+    const replacement = func.newVReg();
+    const replaced = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = scalar, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_splat = scalar }, .dest = splat, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 99 }, .dest = replacement, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_replace_lane = .{ .vector = splat, .val = replacement, .lane = 2 } },
+        .dest = replaced,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = replaced, .lane = 2 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_dup = false;
+    var found_ins = false;
+    var found_umov = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4E040C00) found_dup = true;
+        if ((w & 0xFFFFFC00) == 0x4E141C00) found_ins = true;
+        if ((w & 0x0FE0FC00) == 0x0E003C00) found_umov = true;
+    }
+
+    try std.testing.expect(found_dup);
+    try std.testing.expect(found_ins);
+    try std.testing.expect(found_umov);
+}
+
+test "compile: i32x4 cmp and mul ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const mul = func.newVReg();
+    const ne = func.newVReg();
+    const lt_s = func.newVReg();
+    const gt_s = func.newVReg();
+    const le_s = func.newVReg();
+    const ge_s = func.newVReg();
+    const lt_u = func.newVReg();
+    const gt_u = func.newVReg();
+    const le_u = func.newVReg();
+    const ge_u = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_8000_0000_FFFF_FFFF_0000_0002 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0003_8000_0000_0000_0001_0000_0003 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .mul, .lhs = a, .rhs = b } }, .dest = mul, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .ne, .lhs = a, .rhs = b } }, .dest = ne, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .lt_s, .lhs = a, .rhs = b } }, .dest = lt_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .gt_s, .lhs = a, .rhs = b } }, .dest = gt_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .le_s, .lhs = a, .rhs = b } }, .dest = le_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .ge_s, .lhs = a, .rhs = b } }, .dest = ge_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .lt_u, .lhs = a, .rhs = b } }, .dest = lt_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .gt_u, .lhs = a, .rhs = b } }, .dest = gt_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .le_u, .lhs = a, .rhs = b } }, .dest = le_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .ge_u, .lhs = a, .rhs = b } }, .dest = ge_u, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = ge_u, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_mul = false;
+    var found_cmeq = false;
+    var found_mvn = false;
+    var found_cmgt = false;
+    var found_cmge = false;
+    var found_cmhi = false;
+    var found_cmhs = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0x4EA09C00) found_mul = true;
+        if ((w & 0xFFE0FC00) == 0x6EA08C00) found_cmeq = true;
+        if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
+        if ((w & 0xFFE0FC00) == 0x4EA03400) found_cmgt = true;
+        if ((w & 0xFFE0FC00) == 0x4EA03C00) found_cmge = true;
+        if ((w & 0xFFE0FC00) == 0x6EA03400) found_cmhi = true;
+        if ((w & 0xFFE0FC00) == 0x6EA03C00) found_cmhs = true;
+    }
+
+    try std.testing.expect(found_mul);
+    try std.testing.expect(found_cmeq);
+    try std.testing.expect(found_mvn);
+    try std.testing.expect(found_cmgt);
+    try std.testing.expect(found_cmge);
+    try std.testing.expect(found_cmhi);
+    try std.testing.expect(found_cmhs);
+}
+
+test "compile: i32x4 scalar-count shifts emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const vector = func.newVReg();
+    const count_shl = func.newVReg();
+    const shl = func.newVReg();
+    const count_shr_s = func.newVReg();
+    const shr_s = func.newVReg();
+    const count_shr_u = func.newVReg();
+    const shr_u = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_7FFF_FFFF_FFFF_FFFF_0000_0001 }, .dest = vector, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 33 }, .dest = count_shl, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_shift = .{ .op = .shl, .vector = vector, .count = count_shl } }, .dest = shl, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 32 }, .dest = count_shr_s, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_shift = .{ .op = .shr_s, .vector = shl, .count = count_shr_s } }, .dest = shr_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 63 }, .dest = count_shr_u, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_shift = .{ .op = .shr_u, .vector = shr_s, .count = count_shr_u } }, .dest = shr_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = shr_u, .lane = 0 } }, .dest = lane, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_count_mask = false;
+    var found_dup = false;
+    var found_sshl = false;
+    var found_neg4s = false;
+    var found_ushl = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x12001000) found_count_mask = true;
+        if ((w & 0xFFFFFC00) == 0x4E040C00) found_dup = true;
+        if ((w & 0xFFE0FC00) == 0x4EA04400) found_sshl = true;
+        if ((w & 0xFFFFFC00) == 0x6EA0B800) found_neg4s = true;
+        if ((w & 0xFFE0FC00) == 0x6EA04400) found_ushl = true;
+    }
+
+    try std.testing.expect(found_count_mask);
+    try std.testing.expect(found_dup);
+    try std.testing.expect(found_sshl);
+    try std.testing.expect(found_neg4s);
+    try std.testing.expect(found_ushl);
+}
+
+test "compile: v128 locals remain unsupported before ABI support" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{.v128});
+    const bid = try func.newBlock();
+    const v = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v } });
+
+    try std.testing.expectError(error.UnsupportedV128, compileFunction(&func, allocator));
+}
+
 test "load: size 8 (i64) emits 64-bit LDR X" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
@@ -4467,7 +5370,10 @@ test "load: size 8 (i64) emits 64-bit LDR X" {
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
-        if ((w & 0xFFC00000) == 0xF9400000) { found = true; break; }
+        if ((w & 0xFFC00000) == 0xF9400000) {
+            found = true;
+            break;
+        }
     }
     try std.testing.expect(found);
 }
@@ -4493,7 +5399,10 @@ test "load: size 1 unsigned (i32.load8_u) emits LDRB" {
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
-        if ((w & 0xFFC00000) == 0x39400000) { found = true; break; }
+        if ((w & 0xFFC00000) == 0x39400000) {
+            found = true;
+            break;
+        }
     }
     try std.testing.expect(found);
 }
@@ -4519,7 +5428,10 @@ test "load: size 2 signed (i32.load16_s) emits LDRSH W" {
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
-        if ((w & 0xFFC00000) == 0x79C00000) { found = true; break; }
+        if ((w & 0xFFC00000) == 0x79C00000) {
+            found = true;
+            break;
+        }
     }
     try std.testing.expect(found);
 }
@@ -4581,7 +5493,10 @@ test "store: size 1 emits STRB" {
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
-        if ((w & 0xFFC00000) == 0x39000000) { found = true; break; }
+        if ((w & 0xFFC00000) == 0x39000000) {
+            found = true;
+            break;
+        }
     }
     try std.testing.expect(found);
 }
@@ -5011,6 +5926,291 @@ test "compileModule: multi-result call (ret_multi + call_result)" {
     try std.testing.expect(result.code.len % 4 == 0);
 }
 
+const QMemOpCounts = struct {
+    loads: u32 = 0,
+    stores: u32 = 0,
+};
+
+fn countQMemOps(code: []const u8) QMemOpCounts {
+    var counts = QMemOpCounts{};
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x3DC00000) counts.loads += 1;
+        if ((w & 0xFFFFFC00) == 0x3D800000) counts.stores += 1;
+    }
+    return counts;
+}
+
+test "compile: v128 cache keeps local unary chain in registers" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const inverted = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_not = vector },
+        .dest = inverted,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = inverted, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
+test "compile: v128 cache does not flush for float constants" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const float_const = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 4.0 },
+        .dest = float_const,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
+test "compile: v128 cache avoids stack traffic in memory add chain" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr_a = func.newVReg();
+    const addr_b = func.newVReg();
+    const addr_dst = func.newVReg();
+    const vec_a = func.newVReg();
+    const vec_b = func.newVReg();
+    const sum = func.newVReg();
+    const ret = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr_a, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_load = .{ .base = addr_a, .offset = 0, .alignment = 4, .bounds_known = true } },
+        .dest = vec_a,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 16 }, .dest = addr_b, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_load = .{ .base = addr_b, .offset = 0, .alignment = 4, .bounds_known = true } },
+        .dest = vec_b,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_binop = .{ .op = .add, .lhs = vec_a, .rhs = vec_b } },
+        .dest = sum,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 32 }, .dest = addr_dst, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_store = .{ .base = addr_dst, .offset = 0, .alignment = 4, .val = sum, .bounds_known = true } },
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = ret, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = ret } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 2), counts.loads);
+    try std.testing.expectEqual(@as(u32, 1), counts.stores);
+}
+
+test "compile: v128 register pool avoids stack traffic under local vector pressure" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const d = func.newVReg();
+    const e = func.newVReg();
+    const f = func.newVReg();
+    const g = func.newVReg();
+    const h = func.newVReg();
+    const sum_ab = func.newVReg();
+    const sum_cd = func.newVReg();
+    const sum_ef = func.newVReg();
+    const sum_gh = func.newVReg();
+    const sum_abcd = func.newVReg();
+    const sum_efgh = func.newVReg();
+    const total = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0008_0000_0007_0000_0006_0000_0005 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_000C_0000_000B_0000_000A_0000_0009 }, .dest = c, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0010_0000_000F_0000_000E_0000_000D }, .dest = d, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0014_0000_0013_0000_0012_0000_0011 }, .dest = e, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0018_0000_0017_0000_0016_0000_0015 }, .dest = f, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_001C_0000_001B_0000_001A_0000_0019 }, .dest = g, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0020_0000_001F_0000_001E_0000_001D }, .dest = h, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = a, .rhs = b } }, .dest = sum_ab, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = c, .rhs = d } }, .dest = sum_cd, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = e, .rhs = f } }, .dest = sum_ef, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = g, .rhs = h } }, .dest = sum_gh, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = sum_ab, .rhs = sum_cd } }, .dest = sum_abcd, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = sum_ef, .rhs = sum_gh } }, .dest = sum_efgh, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = sum_abcd, .rhs = sum_efgh } }, .dest = total, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = total, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
+test "compile: v128 cache flushes across block boundary" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const done = try func.newBlock();
+    const vector = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(entry).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(entry).append(.{ .op = .{ .br = done } });
+    try func.getBlock(done).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(done).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 1), counts.loads);
+    try std.testing.expectEqual(@as(u32, 1), counts.stores);
+}
+
+test "compile: v128 cache survives scalar FP scratch op without stack traffic" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const float_src = func.newVReg();
+    const float_result = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 4.0 },
+        .dest = float_src,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f_sqrt = float_src },
+        .dest = float_result,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
+test "compile: v128 cache survives float binop scratch ops without stack traffic" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const vector = func.newVReg();
+    const float_lhs = func.newVReg();
+    const float_rhs = func.newVReg();
+    const float_result = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 4.0 },
+        .dest = float_lhs,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .fconst_32 = 9.0 },
+        .dest = float_rhs,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .add = .{ .lhs = float_lhs, .rhs = float_rhs } },
+        .dest = float_result,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = vector, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
 test "compile: popcnt round-trips via CNT + ADDV" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
@@ -5215,7 +6415,9 @@ test "compile: binop with spilled operands emits LDR/STR via spill slots" {
     }
     try func.getBlock(bid).append(.{ .op = .{ .ret = acc } });
 
-    const code = try compileFunction(&func, allocator);
+    // Disable local scheduling here: the test targets spill codegen, and the
+    // scheduler can legally shorten this synthetic live-pressure pattern.
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_scheduler = false });
     defer allocator.free(code);
 
     // Scan for LDR Xt, [fp, #imm] (opcode pattern 0xF9400000 + rn=29<<5).
@@ -5283,7 +6485,7 @@ test "collectClobberPoints: no calls → empty" {
     try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = v1, .type = .i32 });
     try block.append(.{ .op = .{ .ret = v0 } });
 
-    var cps = try collectClobberPoints(&func, null, allocator);
+    var cps = try collectClobberPoints(&func, null, null, allocator);
     defer cps.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), cps.items.len);
 }
@@ -5298,12 +6500,12 @@ test "collectClobberPoints: one ClobberPoint per call, correct mask" {
     const v1 = func.newVReg();
     // Mix of clobbering and non-clobbering ops to verify positions.
     try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = v0, .type = .i32 }); // pos 0
-    try block.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v1 });    // pos 1
+    try block.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v1 }); // pos 1
     try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = func.newVReg(), .type = .i32 }); // pos 2
-    try block.append(.{ .op = .{ .memory_fill = .{ .dst = v0, .val = v0, .len = v0 } } });  // pos 3
-    try block.append(.{ .op = .{ .ret = v1 } });                                 // pos 4
+    try block.append(.{ .op = .{ .memory_fill = .{ .dst = v0, .val = v0, .len = v0 } } }); // pos 3
+    try block.append(.{ .op = .{ .ret = v1 } }); // pos 4
 
-    var cps = try collectClobberPoints(&func, null, allocator);
+    var cps = try collectClobberPoints(&func, null, null, allocator);
     defer cps.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cps.items.len);
@@ -5325,11 +6527,11 @@ test "collectClobberPoints: positions are monotonic across blocks" {
     const v0 = func.newVReg();
     try block0.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 }); // pos 0
     try block0.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = func.newVReg() }); // pos 1
-    try block0.append(.{ .op = .{ .br = b1 } });                   // pos 2
+    try block0.append(.{ .op = .{ .br = b1 } }); // pos 2
     try block1.append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = func.newVReg() }); // pos 3
-    try block1.append(.{ .op = .{ .ret = v0 } });                                 // pos 4
+    try block1.append(.{ .op = .{ .ret = v0 } }); // pos 4
 
-    var cps = try collectClobberPoints(&func, null, allocator);
+    var cps = try collectClobberPoints(&func, null, null, allocator);
     defer cps.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 2), cps.items.len);

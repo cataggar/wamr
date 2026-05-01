@@ -8,13 +8,34 @@ const std = @import("std");
 
 /// AArch64 general-purpose registers (64-bit X registers).
 pub const Reg = enum(u5) {
-    x0 = 0, x1 = 1, x2 = 2, x3 = 3,
-    x4 = 4, x5 = 5, x6 = 6, x7 = 7,
-    x8 = 8, x9 = 9, x10 = 10, x11 = 11,
-    x12 = 12, x13 = 13, x14 = 14, x15 = 15,
-    x16 = 16, x17 = 17, x18 = 18, x19 = 19,
-    x20 = 20, x21 = 21, x22 = 22, x23 = 23,
-    x24 = 24, x25 = 25, x26 = 26, x27 = 27,
+    x0 = 0,
+    x1 = 1,
+    x2 = 2,
+    x3 = 3,
+    x4 = 4,
+    x5 = 5,
+    x6 = 6,
+    x7 = 7,
+    x8 = 8,
+    x9 = 9,
+    x10 = 10,
+    x11 = 11,
+    x12 = 12,
+    x13 = 13,
+    x14 = 14,
+    x15 = 15,
+    x16 = 16,
+    x17 = 17,
+    x18 = 18,
+    x19 = 19,
+    x20 = 20,
+    x21 = 21,
+    x22 = 22,
+    x23 = 23,
+    x24 = 24,
+    x25 = 25,
+    x26 = 26,
+    x27 = 27,
     x28 = 28,
     fp = 29, // frame pointer (x29)
     lr = 30, // link register (x30)
@@ -92,6 +113,11 @@ pub const CodeBuffer = struct {
         // 1|00|01010|00|0|Rm|000000|Rn|Rd
         try self.emit32(0x8A000000 | (@as(u32, rm.encoding()) << 16) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
+    /// AND Wd, Wn, #0x1f — mask a scalar i32x4 shift count modulo 32.
+    pub fn andImm32Mask31(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
+        try self.emit32(0x12001000 | (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
     /// ORR Xd, Xn, Xm
@@ -421,7 +447,12 @@ pub const CodeBuffer = struct {
     /// LSLV/LSRV/ASRV/RORV Xd, Xn, Xm (variable shift, 64-bit)
     pub fn shiftRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, op: ShiftOp) !void {
         // 1|0|0|11010110|Rm|0010|op|Rn|Rd
-        const opc: u2 = switch (op) { .lsl => 0b00, .lsr => 0b01, .asr => 0b10, .ror => 0b11 };
+        const opc: u2 = switch (op) {
+            .lsl => 0b00,
+            .lsr => 0b01,
+            .asr => 0b10,
+            .ror => 0b11,
+        };
         try self.emit32(0x9AC02000 | (@as(u32, rm.encoding()) << 16) |
             (@as(u32, opc) << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
@@ -429,7 +460,12 @@ pub const CodeBuffer = struct {
 
     /// 32-bit variable shift (mask count by 5 per AArch64 semantics — matches wasm i32).
     pub fn shiftRegReg32(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg, op: ShiftOp) !void {
-        const opc: u2 = switch (op) { .lsl => 0b00, .lsr => 0b01, .asr => 0b10, .ror => 0b11 };
+        const opc: u2 = switch (op) {
+            .lsl => 0b00,
+            .lsr => 0b01,
+            .asr => 0b10,
+            .ror => 0b11,
+        };
         try self.emit32(0x1AC02000 | (@as(u32, rm.encoding()) << 16) |
             (@as(u32, opc) << 10) |
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
@@ -629,6 +665,107 @@ pub const CodeBuffer = struct {
         try self.emit32(0x0E31B800 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// LDR Qt, [Xn] — full-width 128-bit vector load.
+    pub fn ldrQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.emit32(0x3DC00000 | (@as(u32, rn.encoding()) << 5) | vt);
+    }
+
+    /// STR Qt, [Xn] — full-width 128-bit vector store.
+    pub fn strQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.emit32(0x3D800000 | (@as(u32, rn.encoding()) << 5) | vt);
+    }
+
+    /// INS Vd.D[lane], Xn (alias: MOV Vd.D[lane], Xn).
+    pub fn insDFromGp64(self: *CodeBuffer, vd: u5, lane: u1, rn: Reg) !void {
+        try self.emit32(0x4E081C00 |
+            (@as(u32, lane) << 20) |
+            (@as(u32, rn.encoding()) << 5) |
+            vd);
+    }
+
+    /// DUP Vd.4S, Wn.
+    pub fn dup4sFromGp32(self: *CodeBuffer, vd: u5, rn: Reg) !void {
+        try self.emit32(0x4E040C00 | (@as(u32, rn.encoding()) << 5) | vd);
+    }
+
+    /// INS Vd.S[lane], Wn (alias: MOV Vd.S[lane], Wn).
+    pub fn insSFromGp32(self: *CodeBuffer, vd: u5, lane: u2, rn: Reg) !void {
+        try self.emit32(0x4E041C00 |
+            (@as(u32, lane) << 19) |
+            (@as(u32, rn.encoding()) << 5) |
+            vd);
+    }
+
+    /// MVN Vd.16B, Vn.16B (alias for NOT).
+    pub fn mvn16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E205800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    pub const V128BitwiseOp = enum(u32) {
+        @"and" = 0x4E201C00,
+        bic = 0x4E601C00,
+        orr = 0x4EA01C00,
+        eor = 0x6E201C00,
+    };
+
+    /// AND/BIC/ORR/EOR Vd.16B, Vn.16B, Vm.16B.
+    pub fn bitwise16b(self: *CodeBuffer, op: V128BitwiseOp, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    pub const I32x4Op = enum(u32) {
+        add = 0x4EA08400,
+        sub = 0x6EA08400,
+        mul = 0x4EA09C00,
+        cmeq = 0x6EA08C00,
+        cmgt = 0x4EA03400,
+        cmge = 0x4EA03C00,
+        cmhi = 0x6EA03400,
+        cmhs = 0x6EA03C00,
+    };
+
+    /// Integer 4S binary vector op: ADD/SUB/MUL/CMEQ/CMGT/CMGE/CMHI/CMHS.
+    pub fn i32x4Op(self: *CodeBuffer, op: I32x4Op, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SSHL Vd.4S, Vn.4S, Vm.4S — signed variable shift.
+    pub fn sshl4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4EA04400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHL Vd.4S, Vn.4S, Vm.4S — unsigned variable shift.
+    pub fn ushl4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6EA04400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// NEG Vd.4S, Vn.4S.
+    pub fn neg4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6EA0B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMOV Wd, Vn.S[lane] (alias: MOV Wd, Vn.S[lane]).
+    pub fn umovWFromS(self: *CodeBuffer, rd: Reg, vn: u5, lane: u2) !void {
+        try self.emit32(0x0E043C00 |
+            (@as(u32, lane) << 19) |
+            (@as(u32, vn) << 5) |
+            rd.encoding());
+    }
+
     /// DMB ISH — full data memory barrier (inner shareable domain).
     /// Provides seq-cst ordering when paired around plain loads/stores.
     pub fn dmbIsh(self: *CodeBuffer) !void {
@@ -707,11 +844,11 @@ pub const CodeBuffer = struct {
     /// Size selects the base opcode (byte/half/word/dword); opcode12 is
     /// the operation selector in bits [15:12].
     pub const LseOp = enum(u32) {
-        add = 0x0000,   // LDADD  — new = old + Rs
-        clr = 0x1000,   // LDCLR  — new = old & ~Rs
-        eor = 0x2000,   // LDEOR  — new = old ^ Rs
-        set = 0x3000,   // LDSET  — new = old | Rs
-        swp = 0x8000,   // SWP    — new = Rs
+        add = 0x0000, // LDADD  — new = old + Rs
+        clr = 0x1000, // LDCLR  — new = old & ~Rs
+        eor = 0x2000, // LDEOR  — new = old ^ Rs
+        set = 0x3000, // LDSET  — new = old | Rs
+        swp = 0x8000, // SWP    — new = Rs
     };
 
     pub fn lseAtomic(
@@ -1167,6 +1304,13 @@ test "emit: ADD x3, x4, w5, UXTW #3" {
     try expectWord(0x8B254C83, &code);
 }
 
+test "emit: AND w3, w4, #31" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.andImm32Mask31(.x3, .x4);
+    try expectWord(0x12001083, &code);
+}
+
 fn expectWord(expected: u32, code: *const CodeBuffer) !void {
     try std.testing.expectEqual(expected, std.mem.readInt(u32, code.getCode()[0..4], .little));
 }
@@ -1415,6 +1559,134 @@ test "emit: ADDV b0, v1.8b" {
     defer code.deinit();
     try code.addvB8b(0, 1);
     try expectWord(0x0E31B820, &code);
+}
+
+test "emit: LDR q0, [x1]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.ldrQ(0, .x1);
+    try expectWord(0x3DC00020, &code);
+}
+
+test "emit: STR q0, [x1]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.strQ(0, .x1);
+    try expectWord(0x3D800020, &code);
+}
+
+test "emit: MOV v0.d[1], x17" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.insDFromGp64(0, 1, .x17);
+    try expectWord(0x4E181E20, &code);
+}
+
+test "emit: DUP v0.4s, w1" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.dup4sFromGp32(0, .x1);
+    try expectWord(0x4E040C20, &code);
+}
+
+test "emit: MOV v0.s[2], w17" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.insSFromGp32(0, 2, .x17);
+    try expectWord(0x4E141E20, &code);
+}
+
+test "emit: MVN v0.16b, v1.16b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.mvn16b(0, 1);
+    try expectWord(0x6E205820, &code);
+}
+
+test "emit: EOR v0.16b, v1.16b, v2.16b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.bitwise16b(.eor, 0, 1, 2);
+    try expectWord(0x6E221C20, &code);
+}
+
+test "emit: ADD v0.4s, v1.4s, v2.4s" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.i32x4Op(.add, 0, 1, 2);
+    try expectWord(0x4EA28420, &code);
+}
+
+test "emit: CMEQ v0.4s, v1.4s, v2.4s" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.i32x4Op(.cmeq, 0, 1, 2);
+    try expectWord(0x6EA28C20, &code);
+}
+
+test "emit: MUL v0.4s, v1.4s, v2.4s" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.i32x4Op(.mul, 0, 1, 2);
+    try expectWord(0x4EA29C20, &code);
+}
+
+test "emit: i32x4 variable shifts" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshl4s(16, 17, 30);
+        try expectWord(0x4EBE4630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg4s(30, 30);
+        try expectWord(0x6EA0BBDE, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ushl4s(20, 21, 30);
+        try expectWord(0x6EBE46B4, &code);
+    }
+}
+
+test "emit: signed i32x4 comparisons" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.cmgt, 0, 1, 2);
+        try expectWord(0x4EA23420, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.cmge, 0, 1, 2);
+        try expectWord(0x4EA23C20, &code);
+    }
+}
+
+test "emit: unsigned i32x4 comparisons" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.cmhi, 0, 1, 2);
+        try expectWord(0x6EA23420, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.cmhs, 0, 1, 2);
+        try expectWord(0x6EA23C20, &code);
+    }
+}
+
+test "emit: UMOV w0, v1.s[3]" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.umovWFromS(.x0, 1, 3);
+    try expectWord(0x0E1C3C20, &code);
 }
 
 test "emit: DMB ISH" {

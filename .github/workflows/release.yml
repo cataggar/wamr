@@ -63,6 +63,22 @@ jobs:
       - name: Build
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=${{ steps.version.outputs.version }}"
 
+      - name: Verify CLI version
+        if: matrix.name == 'linux-x64' || matrix.name == 'linux-arm64' || matrix.name == 'macos-arm64' || matrix.name == 'windows-x64'
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            *-windows) EXE="zig-out/bin/wamr.exe" ;;
+            *) EXE="zig-out/bin/wamr" ;;
+          esac
+          VERSION_OUTPUT="$("$EXE" --version 2>&1)"
+          EXPECTED="wamr ${{ steps.version.outputs.version }}"
+          if [ "$VERSION_OUTPUT" != "$EXPECTED" ]; then
+            echo "Expected: $EXPECTED"
+            echo "Actual:   $VERSION_OUTPUT"
+            exit 1
+          fi
+
       - name: Azure login (for signing)
         if: endsWith(matrix.target, '-windows')
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0

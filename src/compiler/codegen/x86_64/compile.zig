@@ -514,6 +514,8 @@ const CachedStack = struct {
 
 /// Compile an IR function to x86-64 machine code.
 pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
+    if (functionUsesV128(func)) return error.UnsupportedV128;
+
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
@@ -1005,8 +1007,12 @@ fn compileInst(
         },
 
         // ── Type conversions (pass-through for integer types) ─────────
-        .wrap_i64, .extend_i32_s, .extend_i32_u,
-        .extend8_s, .extend16_s, .extend32_s,
+        .wrap_i64,
+        .extend_i32_s,
+        .extend_i32_u,
+        .extend8_s,
+        .extend16_s,
+        .extend32_s,
         .reinterpret,
         => {
             // Pop, push back (value stays on stack, no-op for now)
@@ -1015,18 +1021,44 @@ fn compileInst(
         },
 
         // ── Float/conversion stubs (pop input, push placeholder) ──────
-        .trunc_f32_s, .trunc_f32_u, .trunc_f64_s, .trunc_f64_u,
-        .convert_s, .convert_u, .convert_i32_s, .convert_i64_s, .convert_i32_u, .convert_i64_u, .demote_f64, .promote_f32,
-        .trunc_sat_f32_s, .trunc_sat_f32_u, .trunc_sat_f64_s, .trunc_sat_f64_u,
-        .f_neg, .f_abs, .f_sqrt, .f_ceil, .f_floor, .f_trunc, .f_nearest,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
         => {
             try stack.pop(code, .rax);
             try stack.push(code, .rax);
         },
 
         // ── Float binary stubs ────────────────────────────────────────
-        .f_min, .f_max, .f_copysign,
-        .f_eq, .f_ne, .f_lt, .f_gt, .f_le, .f_ge,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
         => {
             try stack.pop(code, .rcx);
             try stack.pop(code, .rax);
@@ -1215,6 +1247,17 @@ fn compileInst(
             try code.movRegMem(.rax, .r10, @as(i32, @intCast(fidx * 8)));
             try stack.push(code, .rax);
         },
+        .v128_const,
+        .v128_load,
+        .v128_store,
+        .v128_not,
+        .v128_bitwise,
+        .i32x4_binop,
+        .i32x4_shift,
+        .i32x4_splat,
+        .i32x4_extract_lane,
+        .i32x4_replace_lane,
+        => return error.UnsupportedV128,
         // Phi must be lowered before codegen.
         .phi => unreachable,
     }
@@ -1379,6 +1422,7 @@ const GlobalCallPatch = struct {
 // ── Register-Allocated Compilation ────────────────────────────────────
 
 const regalloc = @import("../../ir/regalloc.zig");
+const analysis = @import("../../ir/analysis.zig");
 
 /// x86-64 allocatable GPR set: rdx(2), rbx(3), rsi(6), rdi(7), r8(8), r9(9),
 /// r12(12), r13(13), r14(14), r15(15). Order matches the legacy mask layout,
@@ -1421,18 +1465,52 @@ fn x86_64_reg_set(local_count: u32) regalloc.RegSet {
     };
 }
 
+fn functionUsesV128(func: *const ir.IrFunction) bool {
+    if (func.local_types) |local_types| {
+        for (local_types) |ty| if (ty == .v128) return true;
+    }
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.type == .v128) return true;
+            switch (inst.op) {
+                .v128_const,
+                .v128_load,
+                .v128_store,
+                .v128_not,
+                .v128_bitwise,
+                .i32x4_binop,
+                .i32x4_shift,
+                .i32x4_splat,
+                .i32x4_extract_lane,
+                .i32x4_replace_lane,
+                => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
 /// Compile an IR function using the linear scan register allocator.
 /// VRegs are assigned to physical registers; instructions operate directly
 /// on assigned registers without push/pop through a CachedStack.
 pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocator: std.mem.Allocator) !FuncCompileResult {
+    if (functionUsesV128(func)) return error.UnsupportedV128;
+
+    // Compute block emission order ONCE, before anything that uses global
+    // instruction numbering. Clobber points, live ranges, and code emission
+    // all must use THIS order (same fix as aarch64 — see PR #195 / #203).
+    const block_order = try passes.reorderBlocks(func, allocator);
+    defer allocator.free(block_order);
+
     // Collect clobber points: instructions that destroy specific registers.
-    // Uses the same sequential numbering as computeLiveRanges in analysis.zig.
+    // Uses block_order so numbering matches live-range computation.
     var clobber_points: std.ArrayList(regalloc.ClobberPoint) = .empty;
     defer clobber_points.deinit(allocator);
     {
         var pos: u32 = 0;
-        for (func.blocks.items) |block| {
-            for (block.instructions.items) |ci| {
+        for (block_order) |block_id| {
+            for (func.blocks.items[block_id].instructions.items) |ci| {
                 switch (ci.op) {
                     .call, .call_indirect, .call_ref, .memory_grow, .memory_copy, .table_grow, .table_set => {
                         // Calls clobber caller-saved allocatable regs.
@@ -1454,7 +1532,10 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         }
     }
 
-    var alloc_result = try regalloc.allocate(func, allocator, x86_64_reg_set(func.local_count), clobber_points.items);
+    // Compute live ranges using the SAME block_order, then allocate registers.
+    const live_ranges = try analysis.computeLiveRangesWithOrder(func, block_order, allocator);
+    defer allocator.free(live_ranges);
+    var alloc_result = try regalloc.allocateFromRanges(allocator, x86_64_reg_set(func.local_count), clobber_points.items, live_ranges);
     defer alloc_result.deinit();
 
     // Compute which caller-saved registers are actually used by this function.
@@ -1602,9 +1683,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     var table_patches: std.ArrayList(TablePatch) = .empty;
     defer table_patches.deinit(allocator);
 
-    // Compute block emission order: RPO with cold-block sinking.
-    const block_order = try passes.reorderBlocks(func, allocator);
-    defer allocator.free(block_order);
+    // block_order already computed above — reuse for emission.
 
     var last_was_ret = false;
     for (block_order, 0..) |block_id, order_idx| {
@@ -1889,8 +1968,12 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
             const bin = switch (inst.op) {
-                .add => |b| b, .sub => |b| b, .mul => |b| b,
-                .@"and" => |b| b, .@"or" => |b| b, .xor => |b| b,
+                .add => |b| b,
+                .sub => |b| b,
+                .mul => |b| b,
+                .@"and" => |b| b,
+                .@"or" => |b| b,
+                .xor => |b| b,
                 else => unreachable,
             };
 
@@ -2013,9 +2096,17 @@ fn compileInstRA(
                 try code.cmpRegReg(lhs_reg, rhs_reg);
             }
             const cc: u4 = comptime switch (tag) {
-                .eq => 0x4, .ne => 0x5, .lt_s => 0xC, .lt_u => 0x2,
-                .gt_s => 0xF, .gt_u => 0x7, .le_s => 0xE, .le_u => 0x6,
-                .ge_s => 0xD, .ge_u => 0x3, else => unreachable,
+                .eq => 0x4,
+                .ne => 0x5,
+                .lt_s => 0xC,
+                .lt_u => 0x2,
+                .gt_s => 0xF,
+                .gt_u => 0x7,
+                .le_s => 0xE,
+                .le_u => 0x6,
+                .ge_s => 0xD,
+                .ge_u => 0x3,
+                else => unreachable,
             };
             try code.setcc(cc, dr);
             try code.movzxByte(dr, dr);
@@ -2989,7 +3080,7 @@ fn compileInstRA(
                         var after_patch: usize = 0;
                         if (is_rem) {
                             try code.emitSlice(&.{ 0x31, 0xD2 }); // xor edx, edx
-                            try code.emitSlice(&.{ 0xE9 }); // jmp rel32
+                            try code.emitSlice(&.{0xE9}); // jmp rel32
                             after_patch = code.len();
                             try code.emitI32(0);
                         } else {
@@ -2998,7 +3089,7 @@ fn compileInstRA(
                         const dodiv_off = code.len();
                         code.patchI32(dodiv_patch, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch + 4))));
                         code.patchI32(dodiv_patch2, @intCast(@as(i64, @intCast(dodiv_off)) - @as(i64, @intCast(dodiv_patch2 + 4))));
-                        try code.emitSlice(&.{ 0x99 }); // cdq
+                        try code.emitSlice(&.{0x99}); // cdq
                         try code.emitSlice(&.{ 0xF7, 0xF9 }); // idiv ecx
                         if (is_rem) {
                             const after_off = code.len();
@@ -3018,7 +3109,7 @@ fn compileInstRA(
                         var after_patch: usize = 0;
                         if (is_rem) {
                             try code.emitSlice(&.{ 0x31, 0xD2 });
-                            try code.emitSlice(&.{ 0xE9 });
+                            try code.emitSlice(&.{0xE9});
                             after_patch = code.len();
                             try code.emitI32(0);
                         } else {
@@ -3371,24 +3462,24 @@ fn compileInstRA(
                 const minmax_byte: u8 = if (is_min) 0x5D else 0x5F; // MINSS=5D, MAXSS=5F
                 const or_and_byte: u8 = if (is_min) 0x09 else 0x21; // OR=09, AND=21
                 try code.emitSlice(&.{
-                    0x89, 0xC2,                               // mov edx, eax
-                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F,       // and edx, 0x7FFFFFFF
-                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F,       // cmp edx, 0x7F800000
-                    0x77, 0x2B,                               // ja nan (+43)
-                    0x89, 0xCA,                               // mov edx, ecx
-                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F,       // and edx, 0x7FFFFFFF
-                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F,       // cmp edx, 0x7F800000
-                    0x77, 0x1B,                               // ja nan (+27)
-                    0x66, 0x0F, 0x6E, 0xC0,                   // movd xmm0, eax
-                    0x66, 0x0F, 0x6E, 0xC9,                   // movd xmm1, ecx
-                    0x0F, 0x2E, 0xC1,                         // ucomiss xmm0, xmm1
-                    0x74, 0x0A,                               // je equal (+10)
-                    0xF3, 0x0F, minmax_byte, 0xC1,            // min/maxss xmm0, xmm1
-                    0x66, 0x0F, 0x7E, 0xC0,                   // movd eax, xmm0
-                    0xEB, 0x09,                               // jmp done (+9)
-                    or_and_byte, 0xC8,                        // or/and eax, ecx
-                    0xEB, 0x05,                               // jmp done (+5)
-                    0xB8, 0x00, 0x00, 0xC0, 0x7F,             // mov eax, 0x7FC00000
+                    0x89, 0xC2, // mov edx, eax
+                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F, // and edx, 0x7FFFFFFF
+                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F, // cmp edx, 0x7F800000
+                    0x77, 0x2B, // ja nan (+43)
+                    0x89, 0xCA, // mov edx, ecx
+                    0x81, 0xE2, 0xFF, 0xFF, 0xFF, 0x7F, // and edx, 0x7FFFFFFF
+                    0x81, 0xFA, 0x00, 0x00, 0x80, 0x7F, // cmp edx, 0x7F800000
+                    0x77, 0x1B, // ja nan (+27)
+                    0x66, 0x0F, 0x6E, 0xC0, // movd xmm0, eax
+                    0x66, 0x0F, 0x6E, 0xC9, // movd xmm1, ecx
+                    0x0F, 0x2E, 0xC1, // ucomiss xmm0, xmm1
+                    0x74, 0x0A, // je equal (+10)
+                    0xF3, 0x0F, minmax_byte, 0xC1, // min/maxss xmm0, xmm1
+                    0x66, 0x0F, 0x7E, 0xC0, // movd eax, xmm0
+                    0xEB, 0x09, // jmp done (+9)
+                    or_and_byte, 0xC8, // or/and eax, ecx
+                    0xEB, 0x05, // jmp done (+5)
+                    0xB8, 0x00, 0x00, 0xC0, 0x7F, // mov eax, 0x7FC00000
                 });
             } else {
                 // f64: same shape with UCOMISD for IEEE equality.
@@ -3419,28 +3510,28 @@ fn compileInstRA(
                 const minmax_byte: u8 = if (is_min) 0x5D else 0x5F;
                 const or_and_byte: u8 = if (is_min) 0x09 else 0x21;
                 try code.emitSlice(&.{
-                    0x48, 0x89, 0xC2,                                                   // mov rdx, rax
-                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,         // movabs r11, 0x7FFF...FF
-                    0x4C, 0x21, 0xDA,                                                   // and rdx, r11
-                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F,         // movabs r11, 0x7FF0...00
-                    0x4C, 0x39, 0xDA,                                                   // cmp rdx, r11
-                    0x77, 0x3F,                                                         // ja nan (+63)
-                    0x48, 0x89, 0xCA,                                                   // mov rdx, rcx
-                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,         // movabs r11, 0x7FFF...FF
-                    0x4C, 0x21, 0xDA,                                                   // and rdx, r11
-                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F,         // movabs r11, 0x7FF0...00
-                    0x4C, 0x39, 0xDA,                                                   // cmp rdx, r11
-                    0x77, 0x20,                                                         // ja nan (+32)
-                    0x66, 0x48, 0x0F, 0x6E, 0xC0,                                       // movq xmm0, rax
-                    0x66, 0x48, 0x0F, 0x6E, 0xC9,                                       // movq xmm1, rcx
-                    0x66, 0x0F, 0x2E, 0xC1,                                             // ucomisd xmm0, xmm1
-                    0x74, 0x0B,                                                         // je equal (+11)
-                    0xF2, 0x0F, minmax_byte, 0xC1,                                      // min/maxsd xmm0, xmm1
-                    0x66, 0x48, 0x0F, 0x7E, 0xC0,                                       // movq rax, xmm0
-                    0xEB, 0x0F,                                                         // jmp done (+15)
-                    0x48, or_and_byte, 0xC8,                                            // or/and rax, rcx
-                    0xEB, 0x0A,                                                         // jmp done (+10)
-                    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x7F,         // movabs rax, 0x7FF8...00
+                    0x48, 0x89, 0xC2, // mov rdx, rax
+                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, // movabs r11, 0x7FFF...FF
+                    0x4C, 0x21, 0xDA, // and rdx, r11
+                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F, // movabs r11, 0x7FF0...00
+                    0x4C, 0x39, 0xDA, // cmp rdx, r11
+                    0x77, 0x3F, // ja nan (+63)
+                    0x48, 0x89, 0xCA, // mov rdx, rcx
+                    0x49, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, // movabs r11, 0x7FFF...FF
+                    0x4C, 0x21, 0xDA, // and rdx, r11
+                    0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0, 0x7F, // movabs r11, 0x7FF0...00
+                    0x4C, 0x39, 0xDA, // cmp rdx, r11
+                    0x77, 0x20, // ja nan (+32)
+                    0x66, 0x48, 0x0F, 0x6E, 0xC0, // movq xmm0, rax
+                    0x66, 0x48, 0x0F, 0x6E, 0xC9, // movq xmm1, rcx
+                    0x66, 0x0F, 0x2E, 0xC1, // ucomisd xmm0, xmm1
+                    0x74, 0x0B, // je equal (+11)
+                    0xF2, 0x0F, minmax_byte, 0xC1, // min/maxsd xmm0, xmm1
+                    0x66, 0x48, 0x0F, 0x7E, 0xC0, // movq rax, xmm0
+                    0xEB, 0x0F, // jmp done (+15)
+                    0x48, or_and_byte, 0xC8, // or/and rax, rcx
+                    0xEB, 0x0A, // jmp done (+10)
+                    0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x7F, // movabs rax, 0x7FF8...00
                 });
             }
             try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
@@ -3771,8 +3862,7 @@ fn compileInstRA(
             // ── Overflow landing: result = MAX_INT ──
             const max_off = code.len();
             if (!is_signed) {
-                if (dst_is_i32) try code.movRegImm32(.rax, @bitCast(@as(u32, 0xFFFFFFFF)))
-                else try code.movRegImm64(.rax, 0xFFFFFFFFFFFFFFFF);
+                if (dst_is_i32) try code.movRegImm32(.rax, @bitCast(@as(u32, 0xFFFFFFFF))) else try code.movRegImm64(.rax, 0xFFFFFFFFFFFFFFFF);
             } else if (dst_is_i32) {
                 try code.movRegImm32(.rax, 0x7FFFFFFF);
             } else {
@@ -4452,7 +4542,10 @@ test "compileFunctionRA: add two constants" {
     // Should use ADD imm32 (0x81) since rhs is a constant
     var found_add_imm = false;
     for (code) |b| {
-        if (b == 0x81) { found_add_imm = true; break; }
+        if (b == 0x81) {
+            found_add_imm = true;
+            break;
+        }
     }
     try std.testing.expect(found_add_imm);
 }
@@ -4497,7 +4590,7 @@ test "compileFunctionRA: wrap_i64 emits mov eax,eax" {
 
     // wrap_i64 emits a 32-bit mov (opcode 0x89) for truncation.
     // The specific register encoding depends on allocation order.
-    try std.testing.expect(containsBytes(code, &.{ 0x89 }));
+    try std.testing.expect(containsBytes(code, &.{0x89}));
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
 
@@ -4521,7 +4614,7 @@ test "compileFunctionRA: extend_i32_s emits MOVSXD" {
 
     // MOVSXD (opcode 0x63) must be present for sign extension.
     // REX prefix varies by platform (destination register allocation).
-    try std.testing.expect(containsBytes(code, &.{ 0x63 }));
+    try std.testing.expect(containsBytes(code, &.{0x63}));
 }
 
 test "compileFunctionRA: memory_copy emits call via mem_copy_fn" {
@@ -4754,7 +4847,6 @@ test "compileFunctionRA: memory_size loads into allocated dest register" {
     try std.testing.expect(containsBytes(code, &.{ 0x41, 0x8B, 0x92, 0x38, 0x00, 0x00, 0x00 }));
 }
 
-
 test "compileFunctionRA: r12 allocated under register pressure" {
     // Seven simultaneously-live values (6 constants + one op) overflow the
     // first 5 alloc_regs (rdx, rsi, rdi, r8, r9). The 6th and 7th must go to
@@ -4825,7 +4917,6 @@ test "compileFunctionRA: low-pressure function does not save r12" {
     try std.testing.expect(!containsBytes(code, &.{ 0x41, 0x54 }));
     try std.testing.expect(!containsBytes(code, &.{ 0x41, 0x5C }));
 }
-
 
 test "compileFunctionRA: shift does not emit dead r11 save" {
     // Before B1, every shl emitted `mov r11, rax; ...; mov rax, r11` around
@@ -5020,7 +5111,6 @@ test "compileFunctionRA: div does not emit dead r11 save around operand load" {
     try std.testing.expect(!containsBytes(code, &.{ 0x4C, 0x89, 0xD8 }));
 }
 
-
 test "compileFunctionRA: load folds wasm offset into mov disp" {
     // Verifies B2: i32.load with offset=8 no longer emits `add rax, 8`
     // then `mov dst, [rax]`; instead a single `mov dst, [rax+8]`.
@@ -5077,7 +5167,6 @@ test "compileFunctionRA: store folds wasm offset into mov disp and omits r11 sav
     try std.testing.expect(containsBytes(code, &.{ 0x89, 0x88, 0x10, 0x00, 0x00, 0x00 }));
 }
 
-
 test "compileFunctionRA: add of two non-constant values emits LEA" {
     // Two local_get results then add — neither is in const_vals so the LEA
     // path should fire, producing a single `lea dst, [lhs + rhs]` instead
@@ -5102,12 +5191,11 @@ test "compileFunctionRA: add of two non-constant values emits LEA" {
     defer allocator.free(code);
 
     // Expect a LEA (opcode 0x8D). REX prefix varies by platform.
-    try std.testing.expect(containsBytes(code, &.{ 0x8D }));
+    try std.testing.expect(containsBytes(code, &.{0x8D}));
     // ADD reg,reg (opcode 01) must NOT appear — the LEA replaced it.
     // Check no standalone 01 in a REX+01 pattern. Just verify 0x8D is present.
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
-
 
 test "compileFunctionRA: br to next block is elided (C3 fallthrough)" {
     const allocator = std.testing.allocator;
@@ -5437,8 +5525,6 @@ test "emitCallRegArgMoves: regression — arg[1] source equals arg[0] target (co
     }
 }
 
-
-
 test "compileFunctionRA: i32.load emits inline memory bounds check" {
     // A wasm memory load must emit an inline bounds check before reading,
     // so out-of-bounds access traps cleanly via vmctx.trap_oob_fn() rather
@@ -5511,4 +5597,61 @@ test "compileFunctionRA: i32.store emits inline memory bounds check" {
     try std.testing.expect(containsBytes(code, &.{ 0x76, 0x0C }));
     // call rax (trap dispatch)
     try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
+}
+
+test "compileFunctionRA: block ordering consistency (clobbers match live ranges)" {
+    // Regression test for #209: clobber-point numbering must use the same
+    // block order as live-range computation. Construct a diamond CFG where
+    // RPO differs from raw block order and a call (clobber) sits in a block
+    // that moves position under reordering.
+    //
+    //   b0 → br_if → b1 (call) → b3 (ret)
+    //              ↘ b2 (nop)  ↗
+    //
+    // Raw order: b0, b1, b2, b3. RPO: b0, b1, b2, b3 or b0, b2, b1, b3
+    // depending on successor traversal. The key is that both clobbers and
+    // live ranges use the SAME order — if they don't, the allocator may
+    // place a vreg in a caller-saved register across a call.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 2, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const block0 = func.getBlock(b0);
+    const block1 = func.getBlock(b1);
+    const block2 = func.getBlock(b2);
+    const block3 = func.getBlock(b3);
+
+    const cond = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+
+    // b0: cond = local_get 0; br_if cond, then=b1, else=b2
+    try block0.append(.{ .op = .{ .local_get = 0 }, .dest = cond, .type = .i32 });
+    try block0.append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+
+    // b1: v1 = call func 0 (clobber point); br b3
+    try block1.append(.{ .op = .{ .call = .{ .func_idx = 0, .args = &.{} } }, .dest = v1, .type = .i32 });
+    try block1.append(.{ .op = .{ .br = b3 } });
+
+    // b2: v2 = iconst 42; br b3
+    try block2.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v2, .type = .i32 });
+    try block2.append(.{ .op = .{ .br = b3 } });
+
+    // b3: ret (void)
+    try block3.append(.{ .op = .{ .ret = null } });
+
+    // This should compile without errors — before the fix, mismatched
+    // clobber/live-range numbering could cause allocation failures or
+    // silent register conflicts.
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    defer allocator.free(compile_result.code);
+    defer allocator.free(compile_result.call_patches);
+
+    // Sanity: produced non-empty code.
+    try std.testing.expect(compile_result.code.len > 0);
 }

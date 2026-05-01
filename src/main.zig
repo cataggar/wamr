@@ -17,6 +17,7 @@ pub fn main(init: std.process.Init) !void {
     var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer wasm_args.deinit(allocator);
     var show_version = false;
+    var listen_address: ?std.Io.net.IpAddress = null;
     var stack_size: u32 = 64 * 1024;
     var past_options = false;
 
@@ -32,6 +33,12 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.startsWith(u8, arg, "--stack-size=")) {
                 stack_size = std.fmt.parseInt(u32, arg["--stack-size=".len..], 10) catch {
                     std.debug.print("Error: invalid --stack-size value\n", .{});
+                    std.process.exit(1);
+                };
+            } else if (std.mem.startsWith(u8, arg, "--listen=")) {
+                const spec = arg["--listen=".len..];
+                listen_address = parseListenAddress(spec) catch {
+                    std.debug.print("Error: invalid --listen address '{s}'\n", .{spec});
                     std.process.exit(1);
                 };
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
@@ -52,7 +59,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (show_version) {
-        std.debug.print("iwasm (Zig) {s}\n", .{wamr.version.string});
+        printVersion();
         if (wasm_path == null) return;
     }
 
@@ -72,6 +79,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Detect file type by magic bytes: AOT (\0aot) vs Wasm (\0asm)
     if (wasm_data.len >= 4 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.aot_magic) {
+        if (listen_address != null) {
+            std.debug.print("Error: --listen is only supported for WASI HTTP components\n", .{});
+            std.process.exit(1);
+        }
         runAot(wasm_data, allocator);
         return;
     }
@@ -89,13 +100,52 @@ pub fn main(init: std.process.Init) !void {
             while (it.next()) |kv| {
                 env_list.append(allocator, .{ .name = kv.key_ptr.*, .value = kv.value_ptr.* }) catch {};
             }
+            if (listen_address) |addr| {
+                runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr);
+                return;
+            }
             runComponent(wasm_data, allocator, io, path, wasm_args.items, env_list.items);
             return;
         }
     }
 
+    if (listen_address != null) {
+        std.debug.print("Error: --listen is only supported for WASI HTTP components\n", .{});
+        std.process.exit(1);
+    }
+
     // Wasm module (core)
     runWasm(wasm_data, stack_size, &wasm_args, allocator);
+}
+
+fn parseListenAddress(spec: []const u8) !std.Io.net.IpAddress {
+    if (spec.len == 0) return error.InvalidAddress;
+
+    var host: []const u8 = undefined;
+    var port_text: []const u8 = undefined;
+    if (spec[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, spec, ']') orelse return error.InvalidAddress;
+        if (close + 1 >= spec.len or spec[close + 1] != ':') return error.InvalidAddress;
+        host = spec[1..close];
+        port_text = spec[close + 2 ..];
+    } else {
+        var colon: ?usize = null;
+        var i = spec.len;
+        while (i > 0) {
+            i -= 1;
+            if (spec[i] == ':') {
+                colon = i;
+                break;
+            }
+        }
+        const c = colon orelse return error.InvalidAddress;
+        host = spec[0..c];
+        port_text = spec[c + 1 ..];
+    }
+
+    if (host.len == 0 or port_text.len == 0) return error.InvalidAddress;
+    const port = try std.fmt.parseInt(u16, port_text, 10);
+    return std.Io.net.IpAddress.parse(host, port);
 }
 
 fn runComponent(
@@ -149,6 +199,48 @@ fn runComponent(
     }
 
     std.process.exit(if (outcome.is_ok) 0 else 1);
+}
+
+fn runHttpComponent(
+    data: []const u8,
+    allocator: std.mem.Allocator,
+    wasm_path: []const u8,
+    wasm_args: []const []const u8,
+    env_vars: []const wamr.wasi_cli_adapter.EnvVar,
+    listen_address: std.Io.net.IpAddress,
+) void {
+    const adapter_mod = wamr.wasi_cli_adapter;
+    var adapter = adapter_mod.WasiCliAdapter.init(allocator);
+    defer adapter.deinit();
+
+    var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch
+        std.process.exit(1);
+    defer allocator.free(argv_buf);
+    argv_buf[0] = wasm_path;
+    for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
+    adapter.setArguments(argv_buf);
+    adapter.setEnvironment(env_vars);
+
+    adapter_mod.serveHttpComponentBytes(data, allocator, &adapter, .{
+        .listen_address = listen_address,
+    }) catch |err| {
+        switch (err) {
+            error.NoIncomingHandlerExport => std.debug.print(
+                "Error: component does not export `wasi:http/incoming-handler.handle`.\n",
+                .{},
+            ),
+            error.LinkFailed => std.debug.print(
+                "Error: component imports an unsupported WASI interface for HTTP server mode.\n",
+                .{},
+            ),
+            error.ListenFailed => std.debug.print("Error: failed to bind --listen address\n", .{}),
+            error.AcceptFailed => std.debug.print("Error: failed to accept HTTP connection\n", .{}),
+            error.LoadFailed => std.debug.print("Error: failed to load component\n", .{}),
+            error.InstantiateFailed => std.debug.print("Error: failed to instantiate component\n", .{}),
+            else => std.debug.print("Error: HTTP server failed: {}\n", .{err}),
+        }
+        std.process.exit(1);
+    };
 }
 
 fn runAot(data: []const u8, allocator: std.mem.Allocator) void {
@@ -243,9 +335,17 @@ fn runWasm(
     };
 }
 
+fn versionLine() []const u8 {
+    return "wamr " ++ wamr.version.string ++ "\n";
+}
+
+fn printVersion() void {
+    std.debug.print("{s}", .{versionLine()});
+}
+
 fn printUsage() void {
     std.debug.print(
-        \\iwasm (Zig) - WebAssembly Micro Runtime
+        \\wamr - WebAssembly Micro Runtime
         \\
         \\Usage: wamr [options] <file.wasm> [args...]
         \\
@@ -254,6 +354,11 @@ fn printUsage() void {
         \\  -h, --help              Show this help
         \\  --stack-size=<bytes>     Set stack size (default: 65536)
         \\  --heap-size=<bytes>     Set heap size (default: 262144)
+        \\  --listen=<ip:port>       Serve a WASI HTTP component on a TCP address
         \\
     , .{});
+}
+
+test "version line uses wamr name and build version" {
+    try std.testing.expectEqualStrings("wamr " ++ wamr.version.string ++ "\n", versionLine());
 }

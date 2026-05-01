@@ -10,6 +10,9 @@
 const builtin = @import("builtin");
 const build_options = @import("config");
 
+/// Product version string supplied by `zig build -Dversion=...`.
+pub const version: []const u8 = if (@hasDecl(build_options, "version")) build_options.version else "dev";
+
 // ---------------------------------------------------------------------------
 // Build mode
 // ---------------------------------------------------------------------------

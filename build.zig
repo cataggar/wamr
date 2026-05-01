@@ -21,7 +21,8 @@ pub fn build(b: *std.Build) void {
     // ── Build flags ────────────────────────────────────────────────────
     const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse false;
     const stack_protector = b.option(bool, "stack-protector", "Enable stack protector (requires libc)") orelse false;
-    const link_libc = b.option(bool, "link-libc", "Link libc") orelse stack_protector;
+    const link_libc = b.option(bool, "link-libc", "Link libc") orelse
+        (stack_protector or target.result.os.tag == .wasi);
     const version_string = b.option([]const u8, "version", "Version string") orelse "dev";
 
     // ── Feature flags ──────────────────────────────────────────────────
@@ -120,7 +121,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    // ── iwasm executable ───────────────────────────────────────────────
+    // ── wamr executable ────────────────────────────────────────────────
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -328,6 +329,35 @@ pub fn build(b: *std.Build) void {
     coremark_step.dependOn(&run_coremark_nofp.step);
     coremark_step.dependOn(&run_coremark_fp.step);
 
+    // ── SIMD benchmark runner ───────────────────────────────────────────
+    // Builds small in-memory SIMD modules and reports interpreter vs AOT
+    // status/timing. Optional runner args after `--` can enable external
+    // baselines such as Wasmtime.
+    const simd_bench_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/simd_bench_runner.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    simd_bench_module.addImport("wamr", lib_module);
+
+    const simd_bench_exe = b.addExecutable(.{
+        .name = "simd-bench-runner",
+        .root_module = simd_bench_module,
+    });
+    if (aot_executable_target) b.installArtifact(simd_bench_exe);
+
+    const simd_bench_step = b.step(
+        "simd-bench",
+        "Run SIMD interpreter/AOT benchmark status probes",
+    );
+    if (aot_executable_target) {
+        const run_simd_bench = b.addRunArtifact(simd_bench_exe);
+        run_simd_bench.addArg("--iterations");
+        run_simd_bench.addArg("10000");
+        if (b.args) |args| run_simd_bench.addArgs(args);
+        simd_bench_step.dependOn(&run_simd_bench.step);
+    }
+
     const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, interp, aot, diff)");
     inline for (.{ "loader", "interp", "aot", "diff" }) |tgt| {
         const fuzz_mod = b.createModule(.{
@@ -349,4 +379,3 @@ pub fn build(b: *std.Build) void {
         fuzz_step.dependOn(&install_fuzz.step);
     }
 }
-
