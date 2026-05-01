@@ -235,6 +235,7 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
+        .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
@@ -483,6 +484,10 @@ pub fn forEachUse(
         .i32x4_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
+        },
+        .i32x4_shift => |shift| {
+            try visit(context, shift.vector);
+            try visit(context, shift.count);
         },
         .i32x4_splat => |v| try visit(context, v),
         .i32x4_extract_lane => |lane| try visit(context, lane.vector),
