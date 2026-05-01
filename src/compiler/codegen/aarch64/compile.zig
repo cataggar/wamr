@@ -217,15 +217,39 @@ const V128StackMap = struct {
     }
 };
 
+const UseQueryCtx = struct {
+    target: ir.VReg,
+    found: bool = false,
+};
+
+fn recordUseQuery(ctx: *UseQueryCtx, vreg: ir.VReg) !void {
+    if (vreg == ctx.target) ctx.found = true;
+}
+
 const V128RegCache = struct {
     const Slot = struct {
         vreg: ?ir.VReg = null,
         dirty: bool = false,
     };
 
-    const regs = [_]u5{ v128_tmp0, v128_tmp1 };
+    // Use caller-saved vector registers that do not overlap scalar FP helper
+    // scratch V0/V1. Q8-Q15 are intentionally excluded because AAPCS64 only
+    // preserves their low 64 bits, not the full 128-bit SIMD value.
+    const regs = [_]u5{
+        16, 17, 18, 19,
+        20, 21, 22, 23,
+        24, 25, 26, 27,
+        28, 29, 30, 31,
+    };
 
     slots: [regs.len]Slot = [_]Slot{.{}} ** regs.len,
+    current_block_insts: []const ir.Inst = &.{},
+    current_inst_index: usize = 0,
+
+    fn beginInst(self: *V128RegCache, insts: []const ir.Inst, inst_index: usize) void {
+        self.current_block_insts = insts;
+        self.current_inst_index = inst_index;
+    }
 
     fn regForSlot(idx: usize) u5 {
         return regs[idx];
@@ -299,19 +323,65 @@ const V128RegCache = struct {
         v128_map: *V128StackMap,
         excluded_reg: ?u5,
     ) !usize {
-        if (self.chooseSlot(excluded_reg, true)) |idx| return idx;
-        const idx = self.chooseSlot(excluded_reg, false) orelse return error.OutOfV128ScratchRegs;
+        if (self.chooseFreeSlot(excluded_reg)) |idx| return idx;
+        const idx = self.chooseEvictionSlot(excluded_reg) orelse return error.OutOfV128ScratchRegs;
         try self.evictSlot(code, v128_map, idx, true);
         return idx;
     }
 
-    fn chooseSlot(self: *const V128RegCache, excluded_reg: ?u5, want_free: bool) ?usize {
+    fn chooseFreeSlot(self: *const V128RegCache, excluded_reg: ?u5) ?usize {
         for (self.slots, 0..) |slot, idx| {
             const reg = regForSlot(idx);
             if (excluded_reg != null and excluded_reg.? == reg) continue;
-            if ((slot.vreg == null) == want_free) return idx;
+            if (slot.vreg == null) return idx;
         }
         return null;
+    }
+
+    fn chooseEvictionSlot(self: *const V128RegCache, excluded_reg: ?u5) ?usize {
+        var best_idx: ?usize = null;
+        var best_category: u2 = 3;
+        var best_next: usize = 0;
+
+        for (self.slots, 0..) |slot, idx| {
+            const reg = regForSlot(idx);
+            if (excluded_reg != null and excluded_reg.? == reg) continue;
+            const vreg = slot.vreg orelse continue;
+            const maybe_next = self.nextUseIndex(vreg);
+            const next = maybe_next orelse std.math.maxInt(usize);
+            const category: u2 = if (maybe_next == null)
+                0
+            else if (!slot.dirty)
+                1
+            else
+                2;
+
+            if (best_idx == null or
+                category < best_category or
+                (category == best_category and next > best_next))
+            {
+                best_idx = idx;
+                best_category = category;
+                best_next = next;
+            }
+        }
+
+        return best_idx;
+    }
+
+    fn nextUseIndex(self: *const V128RegCache, vreg: ir.VReg) ?usize {
+        if (self.current_inst_index >= self.current_block_insts.len) return null;
+        var idx = self.current_inst_index;
+        while (idx < self.current_block_insts.len) : (idx += 1) {
+            if (instUsesVReg(self.current_block_insts[idx], vreg)) return idx;
+        }
+        return null;
+    }
+
+    fn instUsesVReg(inst: ir.Inst, vreg: ir.VReg) bool {
+        var ctx = UseQueryCtx{ .target = vreg };
+        schedule.forEachUse(inst, &ctx, recordUseQuery) catch unreachable;
+        return ctx.found;
     }
 
     fn defineFresh(
@@ -940,6 +1010,7 @@ pub fn compileFunctionImpl(
             last_was_ret = isRet(inst.op);
             const flat_idx = block_flat_base[bi] + ii;
             fctx.current_kills = kill_lists[flat_idx].items;
+            v128_cache.beginInst(scheduled.instructions(bi), ii);
             try compileInst(&code, inst, &reg_map, &v128_map, &v128_cache, frame_size, &patches, &fctx);
             // Release physregs of vregs whose last static use is this inst.
             for (kill_lists[flat_idx].items) |v| {
@@ -1299,7 +1370,6 @@ fn instRequiresV128Flush(inst: ir.Inst) bool {
         .sub,
         .mul,
         .div_s,
-        => inst.type == .f32 or inst.type == .f64,
         .div_u,
         .rem_s,
         .rem_u,
@@ -1330,6 +1400,39 @@ fn instRequiresV128Flush(inst: ir.Inst) bool {
         .extend_i32_s,
         .extend_i32_u,
         .wrap_i64,
+        .f_neg,
+        .f_abs,
+        .f_sqrt,
+        .f_ceil,
+        .f_floor,
+        .f_trunc,
+        .f_nearest,
+        .f_min,
+        .f_max,
+        .f_copysign,
+        .popcnt,
+        .f_eq,
+        .f_ne,
+        .f_lt,
+        .f_gt,
+        .f_le,
+        .f_ge,
+        .convert_s,
+        .convert_u,
+        .convert_i32_s,
+        .convert_i64_s,
+        .convert_i32_u,
+        .convert_i64_u,
+        .demote_f64,
+        .promote_f32,
+        .trunc_f32_s,
+        .trunc_f32_u,
+        .trunc_f64_s,
+        .trunc_f64_u,
+        .trunc_sat_f32_s,
+        .trunc_sat_f32_u,
+        .trunc_sat_f64_s,
+        .trunc_sat_f64_u,
         .select,
         .local_get,
         .local_set,
@@ -5865,6 +5968,57 @@ test "compile: v128 cache avoids stack traffic in memory add chain" {
     try std.testing.expectEqual(@as(u32, 1), counts.stores);
 }
 
+test "compile: v128 register pool avoids stack traffic under local vector pressure" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const d = func.newVReg();
+    const e = func.newVReg();
+    const f = func.newVReg();
+    const g = func.newVReg();
+    const h = func.newVReg();
+    const sum_ab = func.newVReg();
+    const sum_cd = func.newVReg();
+    const sum_ef = func.newVReg();
+    const sum_gh = func.newVReg();
+    const sum_abcd = func.newVReg();
+    const sum_efgh = func.newVReg();
+    const total = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0008_0000_0007_0000_0006_0000_0005 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_000C_0000_000B_0000_000A_0000_0009 }, .dest = c, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0010_0000_000F_0000_000E_0000_000D }, .dest = d, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0014_0000_0013_0000_0012_0000_0011 }, .dest = e, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0018_0000_0017_0000_0016_0000_0015 }, .dest = f, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_001C_0000_001B_0000_001A_0000_0019 }, .dest = g, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0020_0000_001F_0000_001E_0000_001D }, .dest = h, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = a, .rhs = b } }, .dest = sum_ab, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = c, .rhs = d } }, .dest = sum_cd, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = e, .rhs = f } }, .dest = sum_ef, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = g, .rhs = h } }, .dest = sum_gh, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = sum_ab, .rhs = sum_cd } }, .dest = sum_abcd, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = sum_ef, .rhs = sum_gh } }, .dest = sum_efgh, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = sum_abcd, .rhs = sum_efgh } }, .dest = total, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = total, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    const counts = countQMemOps(code);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
+}
+
 test "compile: v128 cache flushes across block boundary" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
@@ -5893,7 +6047,7 @@ test "compile: v128 cache flushes across block boundary" {
     try std.testing.expectEqual(@as(u32, 1), counts.stores);
 }
 
-test "compile: v128 cache flushes before scalar V-register clobber" {
+test "compile: v128 cache survives scalar FP scratch op without stack traffic" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -5927,11 +6081,11 @@ test "compile: v128 cache flushes before scalar V-register clobber" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
     const counts = countQMemOps(code);
-    try std.testing.expectEqual(@as(u32, 1), counts.loads);
-    try std.testing.expectEqual(@as(u32, 1), counts.stores);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
 }
 
-test "compile: v128 cache flushes before float binop clobber" {
+test "compile: v128 cache survives float binop scratch ops without stack traffic" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -5971,8 +6125,8 @@ test "compile: v128 cache flushes before float binop clobber" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
     const counts = countQMemOps(code);
-    try std.testing.expectEqual(@as(u32, 1), counts.loads);
-    try std.testing.expectEqual(@as(u32, 1), counts.stores);
+    try std.testing.expectEqual(@as(u32, 0), counts.loads);
+    try std.testing.expectEqual(@as(u32, 0), counts.stores);
 }
 
 test "compile: popcnt round-trips via CNT + ADDV" {
