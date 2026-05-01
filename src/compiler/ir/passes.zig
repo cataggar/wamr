@@ -143,6 +143,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .i32x4_shift => |shift| {
+            list.append(shift.vector);
+            list.append(shift.count);
+        },
 
         // Unary ops
         .clz,
@@ -382,6 +386,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .i32x4_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
+        },
+        .i32x4_shift => |*shift| {
+            if (shift.vector == old) shift.vector = new;
+            if (shift.count == old) shift.count = new;
         },
 
         .clz,
@@ -1616,6 +1624,7 @@ fn isPure(inst: ir.Inst) bool {
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
+        .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
@@ -1709,6 +1718,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .v128_not => |v| v == b.op.v128_not,
         .v128_bitwise => |bin| bin.op == b.op.v128_bitwise.op and bin.lhs == b.op.v128_bitwise.lhs and bin.rhs == b.op.v128_bitwise.rhs,
         .i32x4_binop => |bin| bin.op == b.op.i32x4_binop.op and bin.lhs == b.op.i32x4_binop.lhs and bin.rhs == b.op.i32x4_binop.rhs,
+        .i32x4_shift => |shift| shift.op == b.op.i32x4_shift.op and shift.vector == b.op.i32x4_shift.vector and shift.count == b.op.i32x4_shift.count,
         .i32x4_splat => |v| v == b.op.i32x4_splat,
         .i32x4_extract_lane => |lane| lane.vector == b.op.i32x4_extract_lane.vector and lane.lane == b.op.i32x4_extract_lane.lane,
         .i32x4_replace_lane => |lane| lane.vector == b.op.i32x4_replace_lane.vector and lane.val == b.op.i32x4_replace_lane.val and lane.lane == b.op.i32x4_replace_lane.lane,
@@ -3166,6 +3176,10 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .i32x4_binop => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;
+        },
+        .i32x4_shift => |*shift| {
+            shift.vector += offset;
+            shift.count += offset;
         },
 
         .clz,

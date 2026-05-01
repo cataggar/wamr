@@ -71,6 +71,7 @@ pub const Inst = struct {
         v128_not: VReg,
         v128_bitwise: V128Bitwise,
         i32x4_binop: I32x4BinOp,
+        i32x4_shift: I32x4Shift,
         i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
         i32x4_replace_lane: I32x4ReplaceLane,
@@ -264,6 +265,12 @@ pub const Inst = struct {
         mul,
     };
 
+    pub const I32x4ShiftOp = enum {
+        shl,
+        shr_s,
+        shr_u,
+    };
+
     pub const V128Mem = struct {
         base: VReg,
         offset: u32,
@@ -291,6 +298,12 @@ pub const Inst = struct {
         op: I32x4Op,
         lhs: VReg,
         rhs: VReg,
+    };
+
+    pub const I32x4Shift = struct {
+        op: I32x4ShiftOp,
+        vector: VReg,
+        count: VReg,
     };
 
     pub const I32x4ExtractLane = struct {
@@ -493,6 +506,15 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(VReg, 6), replace.op.i32x4_replace_lane.vector);
     try std.testing.expectEqual(@as(VReg, 7), replace.op.i32x4_replace_lane.val);
     try std.testing.expectEqual(@as(u2, 1), replace.op.i32x4_replace_lane.lane);
+
+    const shift = Inst{
+        .op = .{ .i32x4_shift = .{ .op = .shr_u, .vector = 8, .count = 9 } },
+        .dest = 10,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.I32x4ShiftOp.shr_u, shift.op.i32x4_shift.op);
+    try std.testing.expectEqual(@as(VReg, 8), shift.op.i32x4_shift.vector);
+    try std.testing.expectEqual(@as(VReg, 9), shift.op.i32x4_shift.count);
 }
 
 test "IrModule: add multiple functions" {

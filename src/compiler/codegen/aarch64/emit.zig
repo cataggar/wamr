@@ -115,6 +115,11 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | rd.encoding());
     }
 
+    /// AND Wd, Wn, #0x1f — mask a scalar i32x4 shift count modulo 32.
+    pub fn andImm32Mask31(self: *CodeBuffer, rd: Reg, rn: Reg) !void {
+        try self.emit32(0x12001000 | (@as(u32, rn.encoding()) << 5) | rd.encoding());
+    }
+
     /// ORR Xd, Xn, Xm
     pub fn orrRegReg(self: *CodeBuffer, rd: Reg, rn: Reg, rm: Reg) !void {
         // 1|01|01010|00|0|Rm|000000|Rn|Rd
@@ -730,6 +735,29 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// SSHL Vd.4S, Vn.4S, Vm.4S — signed variable shift.
+    pub fn sshl4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4EA04400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHL Vd.4S, Vn.4S, Vm.4S — unsigned variable shift.
+    pub fn ushl4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6EA04400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// NEG Vd.4S, Vn.4S.
+    pub fn neg4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6EA0B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// UMOV Wd, Vn.S[lane] (alias: MOV Wd, Vn.S[lane]).
     pub fn umovWFromS(self: *CodeBuffer, rd: Reg, vn: u5, lane: u2) !void {
         try self.emit32(0x0E043C00 |
@@ -1276,6 +1304,13 @@ test "emit: ADD x3, x4, w5, UXTW #3" {
     try expectWord(0x8B254C83, &code);
 }
 
+test "emit: AND w3, w4, #31" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.andImm32Mask31(.x3, .x4);
+    try expectWord(0x12001083, &code);
+}
+
 fn expectWord(expected: u32, code: *const CodeBuffer) !void {
     try std.testing.expectEqual(expected, std.mem.readInt(u32, code.getCode()[0..4], .little));
 }
@@ -1594,6 +1629,27 @@ test "emit: MUL v0.4s, v1.4s, v2.4s" {
     defer code.deinit();
     try code.i32x4Op(.mul, 0, 1, 2);
     try expectWord(0x4EA29C20, &code);
+}
+
+test "emit: i32x4 variable shifts" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshl4s(16, 17, 30);
+        try expectWord(0x4EBE4630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg4s(30, 30);
+        try expectWord(0x6EA0BBDE, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ushl4s(20, 21, 30);
+        try expectWord(0x6EBE46B4, &code);
+    }
 }
 
 test "emit: signed i32x4 comparisons" {
