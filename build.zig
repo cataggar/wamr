@@ -290,9 +290,11 @@ pub fn build(b: *std.Build) void {
 
     // ── Fuzz harnesses ────────────────────────────────────────────────
     // CLI binaries that replay corpus inputs through a specific
-    // pipeline (loader / interp / aot / interp-vs-aot diff) and leave
+    // pipeline (core loader / component loader / interp / aot /
+    // interp-vs-aot diff) and leave
     // a reproducer at <crashes>/in-flight.wasm if the process aborts.
-    // See src/tests/fuzz/common.zig and .github/workflows/fuzz.yml.
+    // See src/tests/fuzz/common.zig, tests/fuzz/README.md, and
+    // .github/workflows/fuzz.yml.
     const aot_harness_module = b.createModule(.{
         .root_source_file = b.path("src/tests/aot_harness.zig"),
         .target = target,
@@ -358,21 +360,27 @@ pub fn build(b: *std.Build) void {
         simd_bench_step.dependOn(&run_simd_bench.step);
     }
 
-    const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, interp, aot, diff)");
-    inline for (.{ "loader", "interp", "aot", "diff" }) |tgt| {
+    const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, component-loader, interp, aot, diff)");
+    inline for (.{
+        .{ .name = "loader", .file = "loader.zig", .needs_aot = false },
+        .{ .name = "component-loader", .file = "component_loader.zig", .needs_aot = false },
+        .{ .name = "interp", .file = "interp.zig", .needs_aot = false },
+        .{ .name = "aot", .file = "aot.zig", .needs_aot = true },
+        .{ .name = "diff", .file = "diff.zig", .needs_aot = true },
+    }) |tgt| {
         const fuzz_mod = b.createModule(.{
-            .root_source_file = b.path("src/tests/fuzz/" ++ tgt ++ ".zig"),
+            .root_source_file = b.path("src/tests/fuzz/" ++ tgt.file),
             .target = target,
             .optimize = optimize,
         });
         fuzz_mod.addImport("config", config_module);
         fuzz_mod.addImport("wamr", lib_module);
-        if (std.mem.eql(u8, tgt, "aot") or std.mem.eql(u8, tgt, "diff")) {
+        if (tgt.needs_aot) {
             fuzz_mod.addImport("aot_harness", aot_harness_module);
         }
 
         const fuzz_exe = b.addExecutable(.{
-            .name = "fuzz-" ++ tgt,
+            .name = "fuzz-" ++ tgt.name,
             .root_module = fuzz_mod,
         });
         const install_fuzz = b.addInstallArtifact(fuzz_exe, .{});

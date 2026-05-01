@@ -1,7 +1,8 @@
 //! Shared helpers for the fuzz harness CLIs.
 //!
-//! Each harness (loader, interp, aot, diff) links this module for
-//! argument parsing, corpus iteration, and crash-artifact writing.
+//! Each harness links this module for argument parsing, corpus
+//! iteration, and crash-artifact writing. See tests/fuzz/README.md
+//! for target-specific oracles and triage guidance.
 //!
 //! Crash detection uses a sentinel-file pattern: before each
 //! invocation we write the current input to `<crashes>/in-flight.wasm`.

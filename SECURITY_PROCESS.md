@@ -129,18 +129,19 @@ Existing CI provides these security-relevant signals:
 - ReleaseSafe builds and cross-target jobs provide platform coverage.
 - Spec tests exercise WebAssembly semantic compatibility.
 - The wasm32-wasi smoke job checks the self-hosted WASI build path.
-- The fuzz workflow runs for loader, interpreter, AOT, and differential harness
-  paths on schedule, on demand, and on PRs that touch runtime/compiler/fuzz
-  files.
+- The fuzz workflow runs core-loader, component-loader, interpreter, AOT, and
+  differential harness paths on schedule, on demand, and on PRs that touch
+  runtime, component, compiler, or fuzz files.
 
 Reviewer guidance:
 
 - For interpreter, compiler, runtime, or component boundary changes, expect
   `zig build test` and consider targeted spec, differential, AOT, or fuzz
   coverage.
-- For loader/runtime/compiler/fuzz harness changes, consider `zig build fuzz`
-  or the GitHub fuzz workflow when the change affects input parsing or execution
-  boundaries.
+- For loader/runtime/component/compiler/fuzz harness changes, consider
+  `zig build fuzz` or the GitHub fuzz workflow when the change affects input
+  parsing or execution boundaries. See [tests/fuzz/README.md](tests/fuzz/README.md)
+  for harness-specific oracles.
 - For documentation-only changes, a full Zig build is usually unnecessary; check
   links, wording, and whether the text avoids unsupported support promises.
 

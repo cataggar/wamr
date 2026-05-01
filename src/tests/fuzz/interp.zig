@@ -4,10 +4,9 @@
 //! Oracle: any panic, safety-checked UB, or unhandled error is a bug.
 //! Runtime traps surface as typed errors and are OK.
 //!
-//! This is a scaffold — the invocation step is best-effort and may
-//! need to be extended once the interp exposes a uniform "invoke
-//! by export and capture results" helper. Until then the value is
-//! mostly in loader + instantiate coverage.
+//! This is a scaffold. Until a bounded execution helper exists, this
+//! target deliberately stays on loader + validation coverage. See
+//! tests/fuzz/README.md for follow-up scope.
 
 const std = @import("std");
 const wamr = @import("wamr");
@@ -48,8 +47,6 @@ fn runOnce(allocator: std.mem.Allocator, bytes: []const u8) !void {
     const a = arena.allocator();
 
     // Just exercise loader + downstream validation for now. A full
-    // invocation path requires setting up ExecEnv + host imports,
-    // which the scaffold leaves as a TODO (tracked in
-    // plan_fuzz_security.md).
+    // invocation path requires bounded execution and host-import setup.
     _ = wamr.loader.load(bytes, a) catch return;
 }
