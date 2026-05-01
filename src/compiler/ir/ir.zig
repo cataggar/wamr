@@ -75,6 +75,10 @@ pub const Inst = struct {
         i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
         i32x4_replace_lane: I32x4ReplaceLane,
+        i8x16_binop: I8x16BinOp,
+        i8x16_splat: VReg,
+        i8x16_extract_lane: I8x16ExtractLane,
+        i8x16_replace_lane: I8x16ReplaceLane,
         i16x8_binop: I16x8BinOp,
         i16x8_shift: I16x8Shift,
         i16x8_splat: VReg,
@@ -270,6 +274,21 @@ pub const Inst = struct {
         mul,
     };
 
+    pub const I8x16Op = enum {
+        add,
+        sub,
+        eq,
+        ne,
+        lt_s,
+        lt_u,
+        gt_s,
+        gt_u,
+        le_s,
+        le_u,
+        ge_s,
+        ge_u,
+    };
+
     pub const I16x8Op = enum {
         add,
         sub,
@@ -327,6 +346,12 @@ pub const Inst = struct {
         rhs: VReg,
     };
 
+    pub const I8x16BinOp = struct {
+        op: I8x16Op,
+        lhs: VReg,
+        rhs: VReg,
+    };
+
     pub const I16x8BinOp = struct {
         op: I16x8Op,
         lhs: VReg,
@@ -350,6 +375,14 @@ pub const Inst = struct {
         lane: u2,
     };
 
+    pub const I8x16LaneSign = enum { signed, unsigned };
+
+    pub const I8x16ExtractLane = struct {
+        vector: VReg,
+        lane: u4,
+        sign: I8x16LaneSign,
+    };
+
     pub const I16x8LaneSign = enum { signed, unsigned };
 
     pub const I16x8ExtractLane = struct {
@@ -362,6 +395,12 @@ pub const Inst = struct {
         vector: VReg,
         val: VReg,
         lane: u2,
+    };
+
+    pub const I8x16ReplaceLane = struct {
+        vector: VReg,
+        val: VReg,
+        lane: u4,
     };
 
     pub const I16x8ReplaceLane = struct {
@@ -569,38 +608,63 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(VReg, 8), shift.op.i32x4_shift.vector);
     try std.testing.expectEqual(@as(VReg, 9), shift.op.i32x4_shift.count);
 
-    const i16_bin = Inst{
-        .op = .{ .i16x8_binop = .{ .op = .mul, .lhs = 11, .rhs = 12 } },
+    const i8_bin = Inst{
+        .op = .{ .i8x16_binop = .{ .op = .sub, .lhs = 11, .rhs = 12 } },
         .dest = 13,
         .type = .v128,
     };
-    try std.testing.expectEqual(Inst.I16x8Op.mul, i16_bin.op.i16x8_binop.op);
-    try std.testing.expectEqual(@as(VReg, 11), i16_bin.op.i16x8_binop.lhs);
+    try std.testing.expectEqual(Inst.I8x16Op.sub, i8_bin.op.i8x16_binop.op);
+    try std.testing.expectEqual(@as(VReg, 11), i8_bin.op.i8x16_binop.lhs);
 
-    const i16_shift = Inst{
-        .op = .{ .i16x8_shift = .{ .op = .shr_s, .vector = 13, .count = 14 } },
+    const i8_extract = Inst{
+        .op = .{ .i8x16_extract_lane = .{ .vector = 13, .lane = 15, .sign = .unsigned } },
+        .dest = 14,
+        .type = .i32,
+    };
+    try std.testing.expectEqual(@as(u4, 15), i8_extract.op.i8x16_extract_lane.lane);
+    try std.testing.expectEqual(Inst.I8x16LaneSign.unsigned, i8_extract.op.i8x16_extract_lane.sign);
+
+    const i8_replace = Inst{
+        .op = .{ .i8x16_replace_lane = .{ .vector = 13, .val = 14, .lane = 13 } },
         .dest = 15,
         .type = .v128,
     };
+    try std.testing.expectEqual(@as(VReg, 13), i8_replace.op.i8x16_replace_lane.vector);
+    try std.testing.expectEqual(@as(VReg, 14), i8_replace.op.i8x16_replace_lane.val);
+    try std.testing.expectEqual(@as(u4, 13), i8_replace.op.i8x16_replace_lane.lane);
+
+    const i16_bin = Inst{
+        .op = .{ .i16x8_binop = .{ .op = .mul, .lhs = 16, .rhs = 17 } },
+        .dest = 18,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.I16x8Op.mul, i16_bin.op.i16x8_binop.op);
+    try std.testing.expectEqual(@as(VReg, 16), i16_bin.op.i16x8_binop.lhs);
+
+    const i16_shift = Inst{
+        .op = .{ .i16x8_shift = .{ .op = .shr_s, .vector = 18, .count = 19 } },
+        .dest = 20,
+        .type = .v128,
+    };
     try std.testing.expectEqual(Inst.I16x8ShiftOp.shr_s, i16_shift.op.i16x8_shift.op);
-    try std.testing.expectEqual(@as(VReg, 13), i16_shift.op.i16x8_shift.vector);
-    try std.testing.expectEqual(@as(VReg, 14), i16_shift.op.i16x8_shift.count);
+    try std.testing.expectEqual(@as(VReg, 18), i16_shift.op.i16x8_shift.vector);
+    try std.testing.expectEqual(@as(VReg, 19), i16_shift.op.i16x8_shift.count);
 
     const i16_extract = Inst{
-        .op = .{ .i16x8_extract_lane = .{ .vector = 13, .lane = 5, .sign = .signed } },
-        .dest = 16,
+        .op = .{ .i16x8_extract_lane = .{ .vector = 18, .lane = 5, .sign = .signed } },
+        .dest = 21,
         .type = .i32,
     };
     try std.testing.expectEqual(@as(u3, 5), i16_extract.op.i16x8_extract_lane.lane);
     try std.testing.expectEqual(Inst.I16x8LaneSign.signed, i16_extract.op.i16x8_extract_lane.sign);
 
     const i16_replace = Inst{
-        .op = .{ .i16x8_replace_lane = .{ .vector = 13, .val = 16, .lane = 7 } },
-        .dest = 17,
+        .op = .{ .i16x8_replace_lane = .{ .vector = 18, .val = 21, .lane = 7 } },
+        .dest = 22,
         .type = .v128,
     };
-    try std.testing.expectEqual(@as(VReg, 13), i16_replace.op.i16x8_replace_lane.vector);
-    try std.testing.expectEqual(@as(VReg, 16), i16_replace.op.i16x8_replace_lane.val);
+    try std.testing.expectEqual(@as(VReg, 18), i16_replace.op.i16x8_replace_lane.vector);
+    try std.testing.expectEqual(@as(VReg, 21), i16_replace.op.i16x8_replace_lane.val);
     try std.testing.expectEqual(@as(u3, 7), i16_replace.op.i16x8_replace_lane.lane);
 }
 

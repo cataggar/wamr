@@ -1823,6 +1823,48 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i8x16_add,
+                    .i8x16_sub,
+                    .i8x16_eq,
+                    .i8x16_ne,
+                    .i8x16_lt_s,
+                    .i8x16_lt_u,
+                    .i8x16_gt_s,
+                    .i8x16_gt_u,
+                    .i8x16_le_s,
+                    .i8x16_le_u,
+                    .i8x16_ge_s,
+                    .i8x16_ge_u,
+                    => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const lane_op: ir.Inst.I8x16Op = switch (simd_op) {
+                            .i8x16_add => .add,
+                            .i8x16_sub => .sub,
+                            .i8x16_eq => .eq,
+                            .i8x16_ne => .ne,
+                            .i8x16_lt_s => .lt_s,
+                            .i8x16_lt_u => .lt_u,
+                            .i8x16_gt_s => .gt_s,
+                            .i8x16_gt_u => .gt_u,
+                            .i8x16_le_s => .le_s,
+                            .i8x16_le_u => .le_u,
+                            .i8x16_ge_s => .ge_s,
+                            .i8x16_ge_u => .ge_u,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i8x16_binop = .{
+                                .op = lane_op,
+                                .lhs = lhs,
+                                .rhs = rhs,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i16x8_add,
                     .i16x8_sub,
                     .i16x8_eq,
@@ -1948,6 +1990,56 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         const dest = ir_func.newVReg();
                         try ir_func.getBlock(current_block).append(.{
                             .op = .{ .i32x4_replace_lane = .{
+                                .vector = vector,
+                                .val = val,
+                                .lane = @intCast(lane_raw),
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i8x16_splat => {
+                        const val = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i8x16_splat = val },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i8x16_extract_lane_s,
+                    .i8x16_extract_lane_u,
+                    => {
+                        const lane_raw = try readByte(code, &ip);
+                        if (lane_raw >= 16) return error.InvalidBytecode;
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const sign: ir.Inst.I8x16LaneSign = switch (simd_op) {
+                            .i8x16_extract_lane_s => .signed,
+                            .i8x16_extract_lane_u => .unsigned,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i8x16_extract_lane = .{
+                                .vector = vector,
+                                .lane = @intCast(lane_raw),
+                                .sign = sign,
+                            } },
+                            .dest = dest,
+                            .type = .i32,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
+                    .i8x16_replace_lane => {
+                        const lane_raw = try readByte(code, &ip);
+                        if (lane_raw >= 16) return error.InvalidBytecode;
+                        const val = safePop(&vreg_stack);
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i8x16_replace_lane = .{
                                 .vector = vector,
                                 .val = val,
                                 .lane = @intCast(lane_raw),
@@ -2823,6 +2915,100 @@ test "lower i32x4 dynamic lane opcodes" {
     try std.testing.expect(insts[5].op.ret != null);
 }
 
+test "lower i8x16 dynamic lane opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0x41, 0x07, // i32.const 7
+        0xFD, 0x0F, // i8x16.splat
+        0x41, 0x80, 0x7F, // i32.const -128
+        0xFD, 0x17, 0x0D, // i8x16.replace_lane 13
+        0xFD, 0x15, 0x0D, // i8x16.extract_lane_s 13
+        0xFD, 0x0C, // v128.const
+        0x01, 0x02,
+        0x03, 0x04,
+        0x05, 0x06,
+        0x07, 0x08,
+        0x09, 0x0A,
+        0x0B, 0x0C,
+        0x0D, 0x0E,
+        0x0F, 0x80,
+        0xFD, 0x16, 0x0F, // i8x16.extract_lane_u 15
+        0x6A, // i32.add
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 9), insts.len);
+    try std.testing.expectEqual(@as(i32, 7), insts[0].op.iconst_32);
+    try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
+    try std.testing.expectEqual(insts[0].dest.?, insts[1].op.i8x16_splat);
+    try std.testing.expectEqual(@as(i32, -128), insts[2].op.iconst_32);
+    try std.testing.expectEqual(insts[1].dest.?, insts[3].op.i8x16_replace_lane.vector);
+    try std.testing.expectEqual(insts[2].dest.?, insts[3].op.i8x16_replace_lane.val);
+    try std.testing.expectEqual(@as(u4, 13), insts[3].op.i8x16_replace_lane.lane);
+    try std.testing.expectEqual(@as(u4, 13), insts[4].op.i8x16_extract_lane.lane);
+    try std.testing.expectEqual(ir.Inst.I8x16LaneSign.signed, insts[4].op.i8x16_extract_lane.sign);
+    try std.testing.expectEqual(@as(u4, 15), insts[6].op.i8x16_extract_lane.lane);
+    try std.testing.expectEqual(ir.Inst.I8x16LaneSign.unsigned, insts[6].op.i8x16_extract_lane.sign);
+    try std.testing.expectEqual(insts[4].dest.?, insts[7].op.add.lhs);
+    try std.testing.expectEqual(insts[6].dest.?, insts[7].op.add.rhs);
+    try std.testing.expect(insts[8].op.ret != null);
+}
+
+test "reject invalid i8x16 lane immediates" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const
+        0x01, 0x02,
+        0x03, 0x04,
+        0x05, 0x06,
+        0x07, 0x08,
+        0x09, 0x0A,
+        0x0B, 0x0C,
+        0x0D, 0x0E,
+        0x0F, 0x10,
+        0xFD, 0x16, 0x10, // i8x16.extract_lane_u 16
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    try std.testing.expectError(error.InvalidBytecode, lowerModule(&wasm_module, allocator));
+}
+
 test "lower i16x8 dynamic lane opcodes" {
     const allocator = std.testing.allocator;
 
@@ -3122,6 +3308,101 @@ test "lower i32x4 cmp and mul opcodes" {
         }
     }
     try std.testing.expectEqual(@as(u2, 0), insts[inst_idx].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[inst_idx + 1].op.ret != null);
+}
+
+test "lower i8x16 cmp and arithmetic opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Case = struct {
+        opcode: u32,
+        expected: ir.Inst.I8x16Op,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0x23, .expected = .eq },
+        .{ .opcode = 0x24, .expected = .ne },
+        .{ .opcode = 0x25, .expected = .lt_s },
+        .{ .opcode = 0x26, .expected = .lt_u },
+        .{ .opcode = 0x27, .expected = .gt_s },
+        .{ .opcode = 0x28, .expected = .gt_u },
+        .{ .opcode = 0x29, .expected = .le_s },
+        .{ .opcode = 0x2A, .expected = .le_u },
+        .{ .opcode = 0x2B, .expected = .ge_s },
+        .{ .opcode = 0x2C, .expected = .ge_u },
+        .{ .opcode = 0x6E, .expected = .add },
+        .{ .opcode = 0x71, .expected = .sub },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+    const appendConst = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, lanes: [16]u8) !void {
+            try appendSimd(buf, alloc, 0x0C);
+            try buf.appendSlice(alloc, &lanes);
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try appendConst(&code, allocator, .{ 0xFF, 1, 0x80, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 });
+    try appendConst(&code, allocator, .{ 1, 0xFF, 0x7F, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 });
+    for (cases, 0..) |case, idx| {
+        if (idx != 0) try appendConst(&code, allocator, .{ 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 });
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x16); // i8x16.extract_lane_u
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 2 + cases.len * 2 + 1), insts.len);
+    var inst_idx: usize = 2;
+    for (cases, 0..) |case, idx| {
+        try std.testing.expectEqual(case.expected, insts[inst_idx].op.i8x16_binop.op);
+        inst_idx += 1;
+        if (idx + 1 < cases.len) {
+            try std.testing.expectEqual(ir.IrType.v128, insts[inst_idx].type);
+            inst_idx += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u4, 0), insts[inst_idx].op.i8x16_extract_lane.lane);
+    try std.testing.expectEqual(ir.Inst.I8x16LaneSign.unsigned, insts[inst_idx].op.i8x16_extract_lane.sign);
     try std.testing.expect(insts[inst_idx + 1].op.ret != null);
 }
 
