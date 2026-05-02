@@ -159,6 +159,51 @@ const cases = [_]BenchCase{
         .build = buildSimdI8x16SubLane0Module,
     },
     .{
+        .name = "simd_i8x16_add_sat_s_lane0",
+        .simd = true,
+        .build = buildSimdI8x16AddSatSLane0Module,
+    },
+    .{
+        .name = "simd_i8x16_add_sat_u_lane0",
+        .simd = true,
+        .build = buildSimdI8x16AddSatULane0Module,
+    },
+    .{
+        .name = "simd_i8x16_sub_sat_s_lane0",
+        .simd = true,
+        .build = buildSimdI8x16SubSatSLane0Module,
+    },
+    .{
+        .name = "simd_i8x16_sub_sat_u_lane0",
+        .simd = true,
+        .build = buildSimdI8x16SubSatULane0Module,
+    },
+    .{
+        .name = "simd_i8x16_min_s_lane0",
+        .simd = true,
+        .build = buildSimdI8x16MinSLane0Module,
+    },
+    .{
+        .name = "simd_i8x16_min_u_lane0",
+        .simd = true,
+        .build = buildSimdI8x16MinULane0Module,
+    },
+    .{
+        .name = "simd_i8x16_max_s_lane0",
+        .simd = true,
+        .build = buildSimdI8x16MaxSLane0Module,
+    },
+    .{
+        .name = "simd_i8x16_max_u_lane0",
+        .simd = true,
+        .build = buildSimdI8x16MaxULane0Module,
+    },
+    .{
+        .name = "simd_i8x16_avgr_u_lane0",
+        .simd = true,
+        .build = buildSimdI8x16AvgrULane0Module,
+    },
+    .{
         .name = "simd_i8x16_eq_lane0",
         .simd = true,
         .build = buildSimdI8x16EqLane0Module,
@@ -287,6 +332,11 @@ const cases = [_]BenchCase{
         .name = "simd_i8x16_shift_mix_4k_loop",
         .simd = true,
         .build = buildSimdI8x16ShiftMix4kLoopModule,
+    },
+    .{
+        .name = "simd_i8x16_arith_extra_4k_loop",
+        .simd = true,
+        .build = buildSimdI8x16ArithExtra4kLoopModule,
     },
     .{
         .name = "simd_i64x2_mem_add_4k_loop",
@@ -835,6 +885,117 @@ fn buildSimdI8x16SubLane0Module(allocator: Allocator) ![]u8 {
     try appendV128ConstI8x16(&instr, allocator, .{ 7, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 });
     try appendSimdOpcode(&instr, allocator, 0x71); // i8x16.sub
     try appendI8x16ExtractLaneU(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI8x16AddSatSLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x6F,
+        .{ 0x7F, 0x80, 100, 0x90, 1, 2, 3, 4, 0x7F, 0x80, 5, 6, 7, 8, 9, 10 },
+        .{ 1, 0xFF, 50, 0x90, 11, 12, 13, 14, 1, 0xFF, 15, 16, 17, 18, 19, 20 },
+        .signed,
+    );
+}
+
+fn buildSimdI8x16AddSatULane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x70,
+        .{ 250, 0, 128, 255, 1, 2, 3, 4, 250, 0, 5, 6, 7, 8, 9, 10 },
+        .{ 20, 1, 128, 1, 11, 12, 13, 14, 20, 1, 15, 16, 17, 18, 19, 20 },
+        .unsigned,
+    );
+}
+
+fn buildSimdI8x16SubSatSLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x72,
+        .{ 0x80, 0x7F, 0x90, 100, 1, 2, 3, 4, 0x80, 0x7F, 5, 6, 7, 8, 9, 10 },
+        .{ 1, 0xFF, 100, 0x90, 11, 12, 13, 14, 1, 0xFF, 15, 16, 17, 18, 19, 20 },
+        .signed,
+    );
+}
+
+fn buildSimdI8x16SubSatULane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x73,
+        .{ 3, 0, 128, 255, 1, 2, 3, 4, 3, 0, 5, 6, 7, 8, 9, 10 },
+        .{ 7, 1, 129, 1, 11, 12, 13, 14, 7, 1, 15, 16, 17, 18, 19, 20 },
+        .unsigned,
+    );
+}
+
+fn buildSimdI8x16MinSLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x76,
+        .{ 0x80, 0x7F, 0xFF, 1, 2, 3, 4, 5, 0x80, 0x7F, 6, 7, 8, 9, 10, 11 },
+        .{ 0x7F, 0x80, 1, 0xFF, 12, 13, 14, 15, 0x7F, 0x80, 16, 17, 18, 19, 20, 21 },
+        .signed,
+    );
+}
+
+fn buildSimdI8x16MinULane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x77,
+        .{ 0x80, 0x7F, 0xFF, 1, 2, 3, 4, 5, 0x80, 0x7F, 6, 7, 8, 9, 10, 11 },
+        .{ 0x7F, 0x80, 1, 0xFF, 12, 13, 14, 15, 0x7F, 0x80, 16, 17, 18, 19, 20, 21 },
+        .unsigned,
+    );
+}
+
+fn buildSimdI8x16MaxSLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x78,
+        .{ 0x80, 0x7F, 0xFF, 1, 2, 3, 4, 5, 0x80, 0x7F, 6, 7, 8, 9, 10, 11 },
+        .{ 0x7F, 0x80, 1, 0xFF, 12, 13, 14, 15, 0x7F, 0x80, 16, 17, 18, 19, 20, 21 },
+        .signed,
+    );
+}
+
+fn buildSimdI8x16MaxULane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x79,
+        .{ 0x80, 0x7F, 0xFF, 1, 2, 3, 4, 5, 0x80, 0x7F, 6, 7, 8, 9, 10, 11 },
+        .{ 0x7F, 0x80, 1, 0xFF, 12, 13, 14, 15, 0x7F, 0x80, 16, 17, 18, 19, 20, 21 },
+        .unsigned,
+    );
+}
+
+fn buildSimdI8x16AvgrULane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI8x16BinaryLane0Module(
+        allocator,
+        0x7B,
+        .{ 5, 254, 0, 1, 2, 3, 4, 5, 5, 254, 6, 7, 8, 9, 10, 11 },
+        .{ 6, 255, 1, 2, 12, 13, 14, 15, 6, 255, 16, 17, 18, 19, 20, 21 },
+        .unsigned,
+    );
+}
+
+fn buildSimdI8x16BinaryLane0Module(
+    allocator: Allocator,
+    opcode: u32,
+    lhs: [16]u8,
+    rhs: [16]u8,
+    extract_sign: I8x16ExtractSign,
+) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI8x16(&instr, allocator, lhs);
+    try appendV128ConstI8x16(&instr, allocator, rhs);
+    try appendSimdOpcode(&instr, allocator, opcode);
+    switch (extract_sign) {
+        .signed => try appendI8x16ExtractLaneS(&instr, allocator, 0),
+        .unsigned => try appendI8x16ExtractLaneU(&instr, allocator, 0),
+    }
 
     return buildRunI32Module(allocator, instr.items, .{});
 }
@@ -1534,6 +1695,96 @@ fn buildSimdI8x16ShiftMix4kLoopModule(allocator: Allocator) ![]u8 {
     try appendI32Const(&instr, allocator, memory_loop_dst_base + memory_loop_bytes - 16);
     try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
     try appendI8x16ExtractLaneU(&instr, allocator, 14);
+
+    const data = try buildMemoryLoopDataI8(allocator);
+    defer allocator.free(data);
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data,
+        .local_i32_count = 1,
+    });
+}
+
+fn buildSimdI8x16ArithExtra4kLoopModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBlock(&instr, allocator);
+    try appendLoop(&instr, allocator);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, memory_loop_bytes);
+    try appendI32GeU(&instr, allocator);
+    try appendBrIf(&instr, allocator, 1);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+
+    try appendSimdOpcode(&instr, allocator, 0x70); // i8x16.add_sat_u
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0x73); // i8x16.sub_sat_u
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0x7B); // i8x16.avgr_u
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0x6F); // i8x16.add_sat_s
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0x72); // i8x16.sub_sat_s
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0x79); // i8x16.max_u
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0x76); // i8x16.min_s
+
+    try appendSimdMemOpcode(&instr, allocator, 0x0B, 4, 0); // v128.store
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, 16);
+    try appendI32Add(&instr, allocator);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBr(&instr, allocator, 0);
+
+    try appendEnd(&instr, allocator);
+    try appendEnd(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base + memory_loop_bytes - 16);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendI8x16ExtractLaneU(&instr, allocator, 15);
 
     const data = try buildMemoryLoopDataI8(allocator);
     defer allocator.free(data);

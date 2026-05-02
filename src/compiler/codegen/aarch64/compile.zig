@@ -2121,6 +2121,10 @@ fn emitI8x16BinOp(
     switch (bin.op) {
         .add => try code.i8x16Op(.add, dest_reg, lhs_reg, rhs_reg),
         .sub => try code.i8x16Op(.sub, dest_reg, lhs_reg, rhs_reg),
+        .add_sat_s => try code.i8x16Op(.sqadd, dest_reg, lhs_reg, rhs_reg),
+        .add_sat_u => try code.i8x16Op(.uqadd, dest_reg, lhs_reg, rhs_reg),
+        .sub_sat_s => try code.i8x16Op(.sqsub, dest_reg, lhs_reg, rhs_reg),
+        .sub_sat_u => try code.i8x16Op(.uqsub, dest_reg, lhs_reg, rhs_reg),
         .eq => try code.i8x16Op(.cmeq, dest_reg, lhs_reg, rhs_reg),
         .ne => {
             try code.i8x16Op(.cmeq, dest_reg, lhs_reg, rhs_reg);
@@ -2134,6 +2138,11 @@ fn emitI8x16BinOp(
         .ge_u => try code.i8x16Op(.cmhs, dest_reg, lhs_reg, rhs_reg),
         .lt_u => try code.i8x16Op(.cmhi, dest_reg, rhs_reg, lhs_reg),
         .le_u => try code.i8x16Op(.cmhs, dest_reg, rhs_reg, lhs_reg),
+        .min_s => try code.i8x16Op(.smin, dest_reg, lhs_reg, rhs_reg),
+        .min_u => try code.i8x16Op(.umin, dest_reg, lhs_reg, rhs_reg),
+        .max_s => try code.i8x16Op(.smax, dest_reg, lhs_reg, rhs_reg),
+        .max_u => try code.i8x16Op(.umax, dest_reg, lhs_reg, rhs_reg),
+        .avgr_u => try code.i8x16Op(.urhadd, dest_reg, lhs_reg, rhs_reg),
     }
 }
 
@@ -5871,6 +5880,10 @@ test "compile: i8x16 cmp and arithmetic ops emit NEON instructions" {
     const b = func.newVReg();
     const add = func.newVReg();
     const sub = func.newVReg();
+    const add_sat_s = func.newVReg();
+    const add_sat_u = func.newVReg();
+    const sub_sat_s = func.newVReg();
+    const sub_sat_u = func.newVReg();
     const ne = func.newVReg();
     const lt_s = func.newVReg();
     const gt_s = func.newVReg();
@@ -5880,12 +5893,21 @@ test "compile: i8x16 cmp and arithmetic ops emit NEON instructions" {
     const gt_u = func.newVReg();
     const le_u = func.newVReg();
     const ge_u = func.newVReg();
+    const min_s = func.newVReg();
+    const min_u = func.newVReg();
+    const max_s = func.newVReg();
+    const max_u = func.newVReg();
+    const avgr_u = func.newVReg();
     const lane = func.newVReg();
 
     try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0E0D_0C0B_0A09_0807_0605_0403_8001_FF00 }, .dest = a, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0F0E_0D0C_0B0A_0908_0706_0504_7F02_0100 }, .dest = b, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .add, .lhs = a, .rhs = b } }, .dest = add, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .sub, .lhs = a, .rhs = b } }, .dest = sub, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .add_sat_s, .lhs = a, .rhs = b } }, .dest = add_sat_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .add_sat_u, .lhs = a, .rhs = b } }, .dest = add_sat_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .sub_sat_s, .lhs = a, .rhs = b } }, .dest = sub_sat_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .sub_sat_u, .lhs = a, .rhs = b } }, .dest = sub_sat_u, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .ne, .lhs = a, .rhs = b } }, .dest = ne, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .lt_s, .lhs = a, .rhs = b } }, .dest = lt_s, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .gt_s, .lhs = a, .rhs = b } }, .dest = gt_s, .type = .v128 });
@@ -5895,6 +5917,11 @@ test "compile: i8x16 cmp and arithmetic ops emit NEON instructions" {
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .gt_u, .lhs = a, .rhs = b } }, .dest = gt_u, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .le_u, .lhs = a, .rhs = b } }, .dest = le_u, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .ge_u, .lhs = a, .rhs = b } }, .dest = ge_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .min_s, .lhs = a, .rhs = b } }, .dest = min_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .min_u, .lhs = a, .rhs = b } }, .dest = min_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .max_s, .lhs = a, .rhs = b } }, .dest = max_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .max_u, .lhs = a, .rhs = b } }, .dest = max_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_binop = .{ .op = .avgr_u, .lhs = a, .rhs = b } }, .dest = avgr_u, .type = .v128 });
     try func.getBlock(bid).append(.{
         .op = .{ .i8x16_extract_lane = .{ .vector = ge_u, .lane = 0, .sign = .unsigned } },
         .dest = lane,
@@ -5907,33 +5934,60 @@ test "compile: i8x16 cmp and arithmetic ops emit NEON instructions" {
 
     var found_add = false;
     var found_sub = false;
+    var found_sqadd = false;
+    var found_uqadd = false;
+    var found_sqsub = false;
+    var found_uqsub = false;
     var found_cmeq = false;
     var found_mvn = false;
     var found_cmgt = false;
     var found_cmge = false;
     var found_cmhi = false;
     var found_cmhs = false;
+    var found_smin = false;
+    var found_umin = false;
+    var found_smax = false;
+    var found_umax = false;
+    var found_urhadd = false;
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
         if ((w & 0xFFE0FC00) == 0x4E208400) found_add = true;
         if ((w & 0xFFE0FC00) == 0x6E208400) found_sub = true;
+        if ((w & 0xFFE0FC00) == 0x4E200C00) found_sqadd = true;
+        if ((w & 0xFFE0FC00) == 0x6E200C00) found_uqadd = true;
+        if ((w & 0xFFE0FC00) == 0x4E202C00) found_sqsub = true;
+        if ((w & 0xFFE0FC00) == 0x6E202C00) found_uqsub = true;
         if ((w & 0xFFE0FC00) == 0x6E208C00) found_cmeq = true;
         if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
         if ((w & 0xFFE0FC00) == 0x4E203400) found_cmgt = true;
         if ((w & 0xFFE0FC00) == 0x4E203C00) found_cmge = true;
         if ((w & 0xFFE0FC00) == 0x6E203400) found_cmhi = true;
         if ((w & 0xFFE0FC00) == 0x6E203C00) found_cmhs = true;
+        if ((w & 0xFFE0FC00) == 0x4E206C00) found_smin = true;
+        if ((w & 0xFFE0FC00) == 0x6E206C00) found_umin = true;
+        if ((w & 0xFFE0FC00) == 0x4E206400) found_smax = true;
+        if ((w & 0xFFE0FC00) == 0x6E206400) found_umax = true;
+        if ((w & 0xFFE0FC00) == 0x6E201400) found_urhadd = true;
     }
 
     try std.testing.expect(found_add);
     try std.testing.expect(found_sub);
+    try std.testing.expect(found_sqadd);
+    try std.testing.expect(found_uqadd);
+    try std.testing.expect(found_sqsub);
+    try std.testing.expect(found_uqsub);
     try std.testing.expect(found_cmeq);
     try std.testing.expect(found_mvn);
     try std.testing.expect(found_cmgt);
     try std.testing.expect(found_cmge);
     try std.testing.expect(found_cmhi);
     try std.testing.expect(found_cmhs);
+    try std.testing.expect(found_smin);
+    try std.testing.expect(found_umin);
+    try std.testing.expect(found_smax);
+    try std.testing.expect(found_umax);
+    try std.testing.expect(found_urhadd);
 }
 
 test "compile: i16x8 cmp and mul ops emit NEON instructions" {

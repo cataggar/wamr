@@ -785,14 +785,23 @@ pub const CodeBuffer = struct {
     pub const I8x16Op = enum(u32) {
         add = 0x4E208400,
         sub = 0x6E208400,
+        sqadd = 0x4E200C00,
+        uqadd = 0x6E200C00,
+        sqsub = 0x4E202C00,
+        uqsub = 0x6E202C00,
         cmeq = 0x6E208C00,
         cmgt = 0x4E203400,
         cmge = 0x4E203C00,
         cmhi = 0x6E203400,
         cmhs = 0x6E203C00,
+        smin = 0x4E206C00,
+        umin = 0x6E206C00,
+        smax = 0x4E206400,
+        umax = 0x6E206400,
+        urhadd = 0x6E201400,
     };
 
-    /// Integer 16B binary vector op: ADD/SUB/CMEQ/CMGT/CMGE/CMHI/CMHS.
+    /// Integer 16B binary vector op.
     pub fn i8x16Op(self: *CodeBuffer, op: I8x16Op, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(@intFromEnum(op) |
             (@as(u32, vm) << 16) |
@@ -1929,6 +1938,30 @@ test "emit: i8x16 vector ops" {
     {
         var code = CodeBuffer.init(std.testing.allocator);
         defer code.deinit();
+        try code.i8x16Op(.sqadd, 16, 17, 30);
+        try expectWord(0x4E3E0E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.uqadd, 16, 17, 30);
+        try expectWord(0x6E3E0E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.sqsub, 16, 17, 30);
+        try expectWord(0x4E3E2E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.uqsub, 16, 17, 30);
+        try expectWord(0x6E3E2E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
         try code.i8x16Op(.cmeq, 16, 17, 30);
         try expectWord(0x6E3E8E30, &code);
     }
@@ -1955,6 +1988,36 @@ test "emit: i8x16 vector ops" {
         defer code.deinit();
         try code.i8x16Op(.cmhs, 16, 17, 30);
         try expectWord(0x6E3E3E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.smin, 16, 17, 30);
+        try expectWord(0x4E3E6E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.umin, 16, 17, 30);
+        try expectWord(0x6E3E6E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.smax, 16, 17, 30);
+        try expectWord(0x4E3E6630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.umax, 16, 17, 30);
+        try expectWord(0x6E3E6630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i8x16Op(.urhadd, 16, 17, 30);
+        try expectWord(0x6E3E1630, &code);
     }
 }
 
