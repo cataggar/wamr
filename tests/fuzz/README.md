@@ -167,5 +167,5 @@ host-protection mechanism.
   guest-memory pointer/length pairs (#247).
 - Corpus minimization should preserve a small checked-in seed set while storing
   larger evolving corpora as workflow artifacts (#248).
-- OSS-Fuzz integration should be evaluated after the local targets are stable,
-  resource usage is bounded, and generated corpora are useful (#249).
+- OSS-Fuzz integration was evaluated in [`OSS_FUZZ.md`](OSS_FUZZ.md); the
+  decision is to defer until a documented prerequisite list is met (#249).
