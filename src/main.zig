@@ -183,6 +183,10 @@ fn runComponent(
             ),
             error.LoadFailed => std.debug.print("Error: failed to load component\n", .{}),
             error.InstantiateFailed => std.debug.print("Error: failed to instantiate component\n", .{}),
+            error.StartTrapped => std.debug.print(
+                "Error: component trapped during initialization (a core (start ...) directive — typically `_initialize` — failed; see [component init trap] line above for details)\n",
+                .{},
+            ),
             error.Trap => std.debug.print("Error: component trapped during run\n", .{}),
             else => std.debug.print("Error: component run failed: {}\n", .{err}),
         }
@@ -231,6 +235,10 @@ fn runHttpComponent(
             ),
             error.LinkFailed => std.debug.print(
                 "Error: component imports an unsupported WASI interface for HTTP server mode.\n",
+                .{},
+            ),
+            error.StartTrapped => std.debug.print(
+                "Error: component trapped during initialization (see [component init trap] line above)\n",
                 .{},
             ),
             error.ListenFailed => std.debug.print("Error: failed to bind --listen address\n", .{}),

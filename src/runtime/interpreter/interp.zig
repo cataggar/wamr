@@ -8,6 +8,7 @@ const std = @import("std");
 const types = @import("../common/types.zig");
 const ExecEnv = @import("../common/exec_env.zig").ExecEnv;
 const CallFrame = @import("../common/exec_env.zig").CallFrame;
+const HostTrapInfo = @import("../common/exec_env.zig").HostTrapInfo;
 
 // NaN canonicalization per Wasm spec
 inline fn canonF32(val: f32) f32 {
@@ -797,6 +798,48 @@ pub fn executeFunctionWithOptions(env: *ExecEnv, func_idx: u32, options: Execute
     return executeFunctionWithFuel(env, func_idx, &fuel);
 }
 
+/// Record diagnostic info for a host-fn dispatch trap. First-write-wins on
+/// `err_name` / `stage` so a deeper canon-lower trampoline that already
+/// captured the originating `WasiCliAdapter` error keeps it; we only fill
+/// the `core_func_idx` / import-name slots if the inner site left them
+/// unset. See `HostTrapInfo`.
+fn recordHostTrap(env: *ExecEnv, core_func_idx: u32, err: anyerror) void {
+    const module = env.module_inst.module;
+    const import = lookupCoreFuncImport(module, core_func_idx);
+    if (env.host_trap) |*ht| {
+        if (ht.core_func_idx == std.math.maxInt(u32)) ht.core_func_idx = core_func_idx;
+        if (import) |imp| {
+            if (ht.import_module_name.len == 0) ht.import_module_name = imp.module_name;
+            if (ht.import_field_name.len == 0) ht.import_field_name = imp.field_name;
+        }
+        return;
+    }
+    env.host_trap = .{
+        .core_func_idx = core_func_idx,
+        .err_name = @errorName(err),
+        .stage = .host_dispatch,
+        .import_module_name = if (import) |imp| imp.module_name else "",
+        .import_field_name = if (import) |imp| imp.field_name else "",
+    };
+}
+
+/// Walk a core module's imports and return the `ImportDesc` whose
+/// function-import index equals `core_func_idx`. Returns null if
+/// `core_func_idx` does not name an imported function in `module`.
+fn lookupCoreFuncImport(
+    module: *const types.WasmModule,
+    core_func_idx: u32,
+) ?types.ImportDesc {
+    var import_func_idx: u32 = 0;
+    for (module.imports) |imp| {
+        if (imp.kind == .function) {
+            if (import_func_idx == core_func_idx) return imp;
+            import_func_idx += 1;
+        }
+    }
+    return null;
+}
+
 fn executeFunctionWithFuel(env: *ExecEnv, func_idx: u32, fuel: *FuelBudget) TrapError!void {
     var current_func_idx = func_idx;
 
@@ -806,14 +849,20 @@ fn executeFunctionWithFuel(env: *ExecEnv, func_idx: u32, fuel: *FuelBudget) Trap
             // Prefer context-carrying host entries when present.
             if (current_func_idx < env.module_inst.host_func_entries.len) {
                 if (env.module_inst.host_func_entries[current_func_idx]) |entry| {
-                    entry.func(@ptrCast(env), entry.ctx) catch return error.Unreachable;
+                    entry.func(@ptrCast(env), entry.ctx) catch |err| {
+                        recordHostTrap(env, current_func_idx, err);
+                        return error.Unreachable;
+                    };
                     return;
                 }
             }
             // Fall back to legacy context-less host functions.
             if (current_func_idx < env.module_inst.host_functions.len) {
                 if (env.module_inst.host_functions[current_func_idx]) |host_fn| {
-                    host_fn(@ptrCast(env)) catch return error.Unreachable;
+                    host_fn(@ptrCast(env)) catch |err| {
+                        recordHostTrap(env, current_func_idx, err);
+                        return error.Unreachable;
+                    };
                     return;
                 }
             }

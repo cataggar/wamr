@@ -15,6 +15,47 @@ pub const ExceptionRef = struct {
     param_count: u32 = 0,
 };
 
+/// Diagnostic info for a host-fn / trampoline trap. Populated lazily on
+/// the trap path; consumers should treat empty / sentinel fields as "unknown".
+/// All string fields are static (e.g. `@errorName(err)` or slices borrowed
+/// from the WasmModule's imports list, which outlives the ExecEnv), so this
+/// struct is freely copyable and never owns memory.
+pub const HostTrapInfo = struct {
+    /// Core import-function index that was being dispatched, or
+    /// `std.math.maxInt(u32)` if not recorded by the interpreter loop.
+    core_func_idx: u32 = std.math.maxInt(u32),
+    /// Component-level function index for the canon-lower trampoline that
+    /// failed, or `std.math.maxInt(u32)` if not from a trampoline.
+    component_func_idx: u32 = std.math.maxInt(u32),
+    /// `@errorName(err)` of the original (unsquashed) error. Static.
+    err_name: []const u8 = "",
+    /// Core import module name (e.g. "wasi:io/streams"), borrowed from the
+    /// WasmModule's import list. Empty if not resolvable.
+    import_module_name: []const u8 = "",
+    /// Core import field name (e.g. "[method]output-stream.blocking-write-and-flush").
+    import_field_name: []const u8 = "",
+    /// Site within the canon-lower trampoline at which the trap occurred,
+    /// or `.host_dispatch` for the bare interpreter dispatch path.
+    stage: Stage = .host_dispatch,
+
+    pub const Stage = enum {
+        /// Host fn dispatched from the interp loop returned an error and
+        /// no inner trampoline recorded a more specific stage.
+        host_dispatch,
+        /// Failed before the host call: lifting args from the core stack
+        /// (pop, memory load, alloc).
+        lift_args,
+        /// The bound `HostFunc.call` returned an error.
+        host_call,
+        /// Failed after the host call while lowering results back onto the
+        /// core stack or into linear memory.
+        lower_results,
+        /// Spill path needed memory but `lower_opts.memory_idx` was unset
+        /// or the indexed memory could not be resolved.
+        memory_resolve,
+    };
+};
+
 /// A single call frame on the call stack.
 pub const CallFrame = struct {
     /// Index of the function being executed.
@@ -72,6 +113,16 @@ pub const ExecEnv = struct {
 
     /// Thread ID (0 for main thread).
     tid: i32 = 0,
+
+    /// Diagnostic info for the most recent host-fn or trampoline trap. Set by
+    /// the interpreter dispatch loop and the canon-lower trampoline before
+    /// they squash the underlying error to `error.Unreachable` / `error.Trap`.
+    /// First-write-wins: the deepest site (typically the `WasiCliAdapter`
+    /// host call inside the trampoline) records the most informative value,
+    /// and outer layers only fill in fields that were left unset.
+    /// Surfaces in `callComponentFunc` so a `TrapInCoreFunction` is no longer
+    /// an opaque "Unreachable" — see issue #308.
+    host_trap: ?HostTrapInfo = null,
 
     /// Create a new execution environment.
     pub fn create(
