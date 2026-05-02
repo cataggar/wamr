@@ -237,6 +237,7 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .i32x4_binop,
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
+        .i32x4_extend_i16x8,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
@@ -250,12 +251,14 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .i16x8_binop,
         .i16x8_unop,
         .i16x8_extadd_pairwise_i8x16,
+        .i16x8_extend_i8x16,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_extract_lane,
         .i16x8_replace_lane,
         .i64x2_binop,
         .i64x2_unop,
+        .i64x2_extend_i32x4,
         .i64x2_shift,
         .i64x2_splat,
         .i64x2_extract_lane,
@@ -508,6 +511,7 @@ pub fn forEachUse(
         },
         .i32x4_unop => |un| try visit(context, un.vector),
         .i32x4_extadd_pairwise_i16x8 => |op| try visit(context, op.vector),
+        .i32x4_extend_i16x8 => |op| try visit(context, op.vector),
         .i8x16_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
@@ -523,11 +527,13 @@ pub fn forEachUse(
         },
         .i16x8_unop => |un| try visit(context, un.vector),
         .i16x8_extadd_pairwise_i8x16 => |op| try visit(context, op.vector),
+        .i16x8_extend_i8x16 => |op| try visit(context, op.vector),
         .i64x2_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
         .i64x2_unop => |un| try visit(context, un.vector),
+        .i64x2_extend_i32x4 => |op| try visit(context, op.vector),
         .i64x2_shift => |shift| {
             try visit(context, shift.vector);
             try visit(context, shift.count);

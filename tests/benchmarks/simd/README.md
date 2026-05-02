@@ -47,6 +47,8 @@ The `simd_int_absneg_4k_loop` row exercises integer SIMD unary absolute-value an
 
 The `simd_extadd_pairwise_4k_loop` row exercises pairwise extended-add operations. It walks high-bit byte and halfword input data, runs signed and unsigned `i16x8.extadd_pairwise_i8x16_*` plus `i32x4.extadd_pairwise_i16x8_*`, combines the results with `v128.xor`, stores the output, and returns one scalar checksum lane.
 
+The `simd_extend_lowhigh_4k_loop` row exercises the 12 widening lane-extension operations. It walks the same 4 KiB byte and halfword input shape, runs `i16x8.extend_low/high_i8x16_s/u`, `i32x4.extend_low/high_i16x8_s/u`, and `i64x2.extend_low/high_i32x4_s/u`, combines the results with `v128.xor`, stores the output, and returns one scalar checksum lane.
+
 The small `simd_i32x4_*_lane0`, `simd_i16x8_*_lane0`, `simd_i8x16_*`, and `simd_i64x2_*` rows are coverage/status probes for individual opcode families. They intentionally return one scalar lane so interpreter, AOT, and optional Wasmtime rows can be compared before the runtime supports direct exported v128 values. The i16x8 and i8x16 comparison and replace-lane rows cover signed vs unsigned extraction of all-ones masks and high-bit lane values; the i64x2 rows wrap extracted i64 lanes to i32 for the exported checksum.
 
 Wasmtime can be included as an external baseline:

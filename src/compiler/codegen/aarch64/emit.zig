@@ -932,6 +932,34 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// SSHLL Vd.4S, Vn.4H, #0 — sign-extend low half (i32x4 <- low i16x8).
+    pub fn sshll4s4h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0F10A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHLL Vd.4S, Vn.4H, #0 — zero-extend low half (i32x4 <- low i16x8).
+    pub fn ushll4s4h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x2F10A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SSHLL2 Vd.4S, Vn.8H, #0 — sign-extend high half (i32x4 <- high i16x8).
+    pub fn sshll2_4s8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4F10A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHLL2 Vd.4S, Vn.8H, #0 — zero-extend high half (i32x4 <- high i16x8).
+    pub fn ushll2_4s8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6F10A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// SSHL Vd.8H, Vn.8H, Vm.8H — signed variable shift.
     pub fn sshl8h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4E604400 |
@@ -972,6 +1000,62 @@ pub const CodeBuffer = struct {
     /// UADDLP Vd.8H, Vn.16B.
     pub fn uaddlp8h16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x6E202800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SSHLL Vd.8H, Vn.8B, #0 — sign-extend low half (i16x8 <- low i8x16).
+    pub fn sshll8h8b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0F08A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHLL Vd.8H, Vn.8B, #0 — zero-extend low half (i16x8 <- low i8x16).
+    pub fn ushll8h8b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x2F08A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SSHLL2 Vd.8H, Vn.16B, #0 — sign-extend high half (i16x8 <- high i8x16).
+    pub fn sshll2_8h16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4F08A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHLL2 Vd.8H, Vn.16B, #0 — zero-extend high half (i16x8 <- high i8x16).
+    pub fn ushll2_8h16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6F08A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SSHLL Vd.2D, Vn.2S, #0 — sign-extend low half (i64x2 <- low i32x4).
+    pub fn sshll2d2s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0F20A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHLL Vd.2D, Vn.2S, #0 — zero-extend low half (i64x2 <- low i32x4).
+    pub fn ushll2d2s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x2F20A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SSHLL2 Vd.2D, Vn.4S, #0 — sign-extend high half (i64x2 <- high i32x4).
+    pub fn sshll2_2d4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4F20A400 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// USHLL2 Vd.2D, Vn.4S, #0 — zero-extend high half (i64x2 <- high i32x4).
+    pub fn ushll2_2d4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6F20A400 |
             (@as(u32, vn) << 5) |
             vd);
     }
@@ -2421,6 +2505,29 @@ test "emit: integer SIMD pairwise extended add ops" {
         defer code.deinit();
         try code.uaddlp4s8h(16, 17);
         try expectWord(0x6E602A30, &code);
+    }
+}
+
+test "emit: integer SIMD widening extend low/high ops" {
+    const cases = [_]struct { name: []const u8, expected: u32 }{
+        .{ .name = "sshll8h8b", .expected = 0x0F08A630 },
+        .{ .name = "ushll8h8b", .expected = 0x2F08A630 },
+        .{ .name = "sshll2_8h16b", .expected = 0x4F08A630 },
+        .{ .name = "ushll2_8h16b", .expected = 0x6F08A630 },
+        .{ .name = "sshll4s4h", .expected = 0x0F10A630 },
+        .{ .name = "ushll4s4h", .expected = 0x2F10A630 },
+        .{ .name = "sshll2_4s8h", .expected = 0x4F10A630 },
+        .{ .name = "ushll2_4s8h", .expected = 0x6F10A630 },
+        .{ .name = "sshll2d2s", .expected = 0x0F20A630 },
+        .{ .name = "ushll2d2s", .expected = 0x2F20A630 },
+        .{ .name = "sshll2_2d4s", .expected = 0x4F20A630 },
+        .{ .name = "ushll2_2d4s", .expected = 0x6F20A630 },
+    };
+    inline for (cases) |c| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try @field(CodeBuffer, c.name)(&code, 16, 17);
+        try expectWord(c.expected, &code);
     }
 }
 
