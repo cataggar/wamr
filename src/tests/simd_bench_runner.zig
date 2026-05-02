@@ -64,6 +64,26 @@ const cases = [_]BenchCase{
         .build = buildSimdI32x4MulLane0Module,
     },
     .{
+        .name = "simd_i32x4_min_s_lane0",
+        .simd = true,
+        .build = buildSimdI32x4MinSLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_min_u_lane0",
+        .simd = true,
+        .build = buildSimdI32x4MinULane0Module,
+    },
+    .{
+        .name = "simd_i32x4_max_s_lane0",
+        .simd = true,
+        .build = buildSimdI32x4MaxSLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_max_u_lane0",
+        .simd = true,
+        .build = buildSimdI32x4MaxULane0Module,
+    },
+    .{
         .name = "simd_i32x4_ne_lane0",
         .simd = true,
         .build = buildSimdI32x4NeLane0Module,
@@ -362,6 +382,11 @@ const cases = [_]BenchCase{
         .name = "simd_i32x4_shift_mix_4k_loop",
         .simd = true,
         .build = buildSimdI32x4ShiftMix4kLoopModule,
+    },
+    .{
+        .name = "simd_i32x4_minmax_4k_loop",
+        .simd = true,
+        .build = buildSimdI32x4MinMax4kLoopModule,
     },
     .{
         .name = "simd_i16x8_mem_add_4k_loop",
@@ -717,6 +742,54 @@ fn buildSimdI32x4MulLane0Module(allocator: Allocator) ![]u8 {
     try appendV128ConstI32x4(&instr, allocator, .{ 50_000, -7, 3, 4 });
     try appendV128ConstI32x4(&instr, allocator, .{ 50_000, 6, 7, 8 });
     try appendSimdOpcode(&instr, allocator, 0xB5); // i32x4.mul
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4MinSLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.minInt(i32), -7, 500, -1 });
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.maxInt(i32), 6, -500, 1 });
+    try appendSimdOpcode(&instr, allocator, 0xB6); // i32x4.min_s
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4MinULane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.minInt(i32), -7, 500, -1 });
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.maxInt(i32), 6, -500, 1 });
+    try appendSimdOpcode(&instr, allocator, 0xB7); // i32x4.min_u
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4MaxSLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.minInt(i32), -7, 500, -1 });
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.maxInt(i32), 6, -500, 1 });
+    try appendSimdOpcode(&instr, allocator, 0xB8); // i32x4.max_s
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4MaxULane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.minInt(i32), -7, 500, -1 });
+    try appendV128ConstI32x4(&instr, allocator, .{ std.math.maxInt(i32), 6, -500, 1 });
+    try appendSimdOpcode(&instr, allocator, 0xB9); // i32x4.max_u
     try appendI32x4ExtractLane(&instr, allocator, 0);
 
     return buildRunI32Module(allocator, instr.items, .{});
@@ -1633,6 +1706,82 @@ fn buildSimdI32x4ShiftMix4kLoopModule(allocator: Allocator) ![]u8 {
     });
 }
 
+fn buildSimdI32x4MinMax4kLoopModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBlock(&instr, allocator);
+    try appendLoop(&instr, allocator);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, memory_loop_bytes);
+    try appendI32GeU(&instr, allocator);
+    try appendBrIf(&instr, allocator, 1);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0xB6); // i32x4.min_s
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0xB9); // i32x4.max_u
+    try appendSimdOpcode(&instr, allocator, 0xB8); // i32x4.max_s
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0xB7); // i32x4.min_u
+    try appendSimdOpcode(&instr, allocator, 0xB9); // i32x4.max_u
+    try appendSimdMemOpcode(&instr, allocator, 0x0B, 4, 0); // v128.store
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, 16);
+    try appendI32Add(&instr, allocator);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBr(&instr, allocator, 0);
+
+    try appendEnd(&instr, allocator);
+    try appendEnd(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base + memory_loop_bytes - 16);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendI32x4ExtractLane(&instr, allocator, 3);
+
+    const data = try buildMemoryLoopDataI32MinMax(allocator);
+    defer allocator.free(data);
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data,
+        .local_i32_count = 1,
+    });
+}
+
 fn buildSimdI16x8MemoryAdd4kLoopModule(allocator: Allocator) ![]u8 {
     var instr: std.ArrayList(u8) = .empty;
     defer instr.deinit(allocator);
@@ -2220,6 +2369,27 @@ fn buildMemoryLoopData(allocator: Allocator) ![]u8 {
         const b_pos: usize = @intCast(memory_loop_b_base + lane_offset);
         writeI32Lane(data[a_pos..][0..4], lane * 3 + 5);
         writeI32Lane(data[b_pos..][0..4], lane * 7 + 11);
+    }
+
+    return data;
+}
+
+fn buildMemoryLoopDataI32MinMax(allocator: Allocator) ![]u8 {
+    const data_len = memory_loop_b_base + memory_loop_bytes;
+    const data = try allocator.alloc(u8, data_len);
+    @memset(data, 0);
+
+    var lane: u32 = 0;
+    while (lane < memory_loop_lanes) : (lane += 1) {
+        const lane_offset = lane * @sizeOf(u32);
+        const a_pos: usize = @intCast(memory_loop_a_base + lane_offset);
+        const b_pos: usize = @intCast(memory_loop_b_base + lane_offset);
+        const a_mag = lane * 3 + 5;
+        const b_mag = lane * 7 + 11;
+        const a_value = if ((lane & 1) == 0) 0x8000_0000 | a_mag else a_mag;
+        const b_value = if ((lane & 1) == 0) b_mag else 0x8000_0000 | b_mag;
+        writeI32Lane(data[a_pos..][0..4], a_value);
+        writeI32Lane(data[b_pos..][0..4], b_value);
     }
 
     return data;

@@ -2006,6 +2006,10 @@ fn emitI32x4BinOp(
         .add => try code.i32x4Op(.add, dest_reg, lhs_reg, rhs_reg),
         .sub => try code.i32x4Op(.sub, dest_reg, lhs_reg, rhs_reg),
         .mul => try code.i32x4Op(.mul, dest_reg, lhs_reg, rhs_reg),
+        .min_s => try code.i32x4Op(.smin, dest_reg, lhs_reg, rhs_reg),
+        .min_u => try code.i32x4Op(.umin, dest_reg, lhs_reg, rhs_reg),
+        .max_s => try code.i32x4Op(.smax, dest_reg, lhs_reg, rhs_reg),
+        .max_u => try code.i32x4Op(.umax, dest_reg, lhs_reg, rhs_reg),
         .eq => try code.i32x4Op(.cmeq, dest_reg, lhs_reg, rhs_reg),
         .ne => {
             try code.i32x4Op(.cmeq, dest_reg, lhs_reg, rhs_reg);
@@ -5810,7 +5814,7 @@ test "compile: i64x2 lane ops emit NEON instructions" {
     try std.testing.expect(found_umov);
 }
 
-test "compile: i32x4 cmp and mul ops emit NEON instructions" {
+test "compile: i32x4 cmp and arithmetic ops emit NEON instructions" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -5819,6 +5823,10 @@ test "compile: i32x4 cmp and mul ops emit NEON instructions" {
     const a = func.newVReg();
     const b = func.newVReg();
     const mul = func.newVReg();
+    const min_s = func.newVReg();
+    const min_u = func.newVReg();
+    const max_s = func.newVReg();
+    const max_u = func.newVReg();
     const ne = func.newVReg();
     const lt_s = func.newVReg();
     const gt_s = func.newVReg();
@@ -5833,6 +5841,10 @@ test "compile: i32x4 cmp and mul ops emit NEON instructions" {
     try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_8000_0000_FFFF_FFFF_0000_0002 }, .dest = a, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0003_8000_0000_0000_0001_0000_0003 }, .dest = b, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .mul, .lhs = a, .rhs = b } }, .dest = mul, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .min_s, .lhs = a, .rhs = b } }, .dest = min_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .min_u, .lhs = a, .rhs = b } }, .dest = min_u, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .max_s, .lhs = a, .rhs = b } }, .dest = max_s, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .max_u, .lhs = a, .rhs = b } }, .dest = max_u, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .ne, .lhs = a, .rhs = b } }, .dest = ne, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .lt_s, .lhs = a, .rhs = b } }, .dest = lt_s, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i32x4_binop = .{ .op = .gt_s, .lhs = a, .rhs = b } }, .dest = gt_s, .type = .v128 });
@@ -5853,6 +5865,10 @@ test "compile: i32x4 cmp and mul ops emit NEON instructions" {
     defer allocator.free(code);
 
     var found_mul = false;
+    var found_smin = false;
+    var found_umin = false;
+    var found_smax = false;
+    var found_umax = false;
     var found_cmeq = false;
     var found_mvn = false;
     var found_cmgt = false;
@@ -5863,6 +5879,10 @@ test "compile: i32x4 cmp and mul ops emit NEON instructions" {
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
         if ((w & 0xFFE0FC00) == 0x4EA09C00) found_mul = true;
+        if ((w & 0xFFE0FC00) == 0x4EA06C00) found_smin = true;
+        if ((w & 0xFFE0FC00) == 0x6EA06C00) found_umin = true;
+        if ((w & 0xFFE0FC00) == 0x4EA06400) found_smax = true;
+        if ((w & 0xFFE0FC00) == 0x6EA06400) found_umax = true;
         if ((w & 0xFFE0FC00) == 0x6EA08C00) found_cmeq = true;
         if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
         if ((w & 0xFFE0FC00) == 0x4EA03400) found_cmgt = true;
@@ -5872,6 +5892,10 @@ test "compile: i32x4 cmp and mul ops emit NEON instructions" {
     }
 
     try std.testing.expect(found_mul);
+    try std.testing.expect(found_smin);
+    try std.testing.expect(found_umin);
+    try std.testing.expect(found_smax);
+    try std.testing.expect(found_umax);
     try std.testing.expect(found_cmeq);
     try std.testing.expect(found_mvn);
     try std.testing.expect(found_cmgt);

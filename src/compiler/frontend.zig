@@ -1792,6 +1792,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .i32x4_ge_s,
                     .i32x4_ge_u,
                     .i32x4_mul,
+                    .i32x4_min_s,
+                    .i32x4_min_u,
+                    .i32x4_max_s,
+                    .i32x4_max_u,
                     => {
                         const rhs = safePop(&vreg_stack);
                         const lhs = safePop(&vreg_stack);
@@ -1810,6 +1814,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .i32x4_ge_s => .ge_s,
                             .i32x4_ge_u => .ge_u,
                             .i32x4_mul => .mul,
+                            .i32x4_min_s => .min_s,
+                            .i32x4_min_u => .min_u,
+                            .i32x4_max_s => .max_s,
+                            .i32x4_max_u => .max_u,
                             else => unreachable,
                         };
                         try ir_func.getBlock(current_block).append(.{
@@ -3599,6 +3607,10 @@ test "lower i32x4 cmp and mul opcodes" {
         .{ .opcode = 0x3F, .expected = .ge_s },
         .{ .opcode = 0x40, .expected = .ge_u },
         .{ .opcode = 0xB5, .expected = .mul },
+        .{ .opcode = 0xB6, .expected = .min_s },
+        .{ .opcode = 0xB7, .expected = .min_u },
+        .{ .opcode = 0xB8, .expected = .max_s },
+        .{ .opcode = 0xB9, .expected = .max_u },
     };
 
     const appendULEB = struct {
