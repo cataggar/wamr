@@ -1430,11 +1430,41 @@ fn buildInstanceTypeExtension(
             slot_i += 1;
         },
         .alias => {
+            // `.alias outer N M (type)` introduces a slot that aliases an
+            // outer type indexspace. We don't currently plumb the parent's
+            // indexspace into this builder, so the slot remains unresolved.
+            // Type-uses that resolve through this slot will correctly fall
+            // through to the registry's null path. Tracked separately.
             idxspace_buf[slot_i] = null;
             slot_i += 1;
         },
         .@"export" => |e| if (e.desc == .type) {
-            idxspace_buf[slot_i] = null;
+            // `(export "X" (type ...))` adds a new type-indexspace slot
+            // whose semantics depend on the bound:
+            //   * `.eq{N}`: the new slot is alias-equal to local slot N.
+            //     Per the component-model spec (Binary.md `exportdecl`,
+            //     Explainer.md "Type definitions"), references to this
+            //     slot must resolve to whatever N resolves to. Without
+            //     this, canon-ABI lower/lift of values whose declared
+            //     type goes through such an export trips
+            //     `CompoundNeedsRegistry` (issue #310, e.g. TinyGo
+            //     `_initialize` calling `wasi:clocks/wall-clock.now`
+            //     whose result type is `(export "datetime" (type (eq 0)))`).
+            //   * `.sub_resource`: introduces a fresh resource type.
+            //     Resource handles (`.own`/`.borrow`) push i32 directly
+            //     without consulting the registry, so leaving this null
+            //     is correct.
+            switch (e.desc.type) {
+                .eq => |target| {
+                    // The .eq target must be a prior slot (type indexspace
+                    // is built in declaration order). If the target slot
+                    // itself was unresolved (.alias / .sub_resource), we
+                    // inherit null transitively — the right answer.
+                    std.debug.assert(target < slot_i);
+                    idxspace_buf[slot_i] = idxspace_buf[target];
+                },
+                .sub_resource => idxspace_buf[slot_i] = null,
+            }
             slot_i += 1;
         },
         else => {},
@@ -2515,4 +2545,65 @@ test "instantiate: core (start ...) calling host import without linkImports leav
     defer inst.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), inst.pending_core_starts.items.len);
+}
+
+test "instantiate: instance-type body export-of-type .eq aliases prior local slot (#310)" {
+    const loader_mod = @import("loader.zig");
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Regression for #310. Fixture imports a host instance whose
+    // instance-type body uses `(export "instant" (type (eq 0)))` to
+    // alias the prior `(type u64)`. Pre-fix, `buildInstanceTypeExtension`
+    // wrote `null` for the export-of-type slot, so when the canon-lower
+    // trampoline lowered `now()`'s `instant`-typed result through
+    // `pushInterfaceValue`'s `.type_idx => |idx|` arm, `registry.get(idx)`
+    // returned null and tripped `CompoundNeedsRegistry`. Post-fix, the
+    // export-of-type slot resolves to the same type_i as slot 0, so the
+    // u64 round-trips end-to-end.
+    //
+    // This is the synthetic shape of `wasi:clocks/wall-clock`,
+    // `monotonic-clock`, and similar wasi:io interfaces TinyGo's
+    // `_initialize` calls during startup.
+    const data = @embedFile("fixtures/h4-export-of-type-alias.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    const Host = struct {
+        const expected: u64 = 0xDEADBEEFCAFEBABE;
+        var calls: u32 = 0;
+        fn now(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            _: []const abi_mod.InterfaceValue,
+            results: []abi_mod.InterfaceValue,
+            _: std.mem.Allocator,
+        ) anyerror!void {
+            calls += 1;
+            results[0] = .{ .u64 = expected };
+        }
+    };
+    Host.calls = 0;
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    var clock_iface = HostInstance{};
+    defer clock_iface.members.deinit(std.testing.allocator);
+    try clock_iface.members.put(std.testing.allocator, "now", .{
+        .func = .{ .call = &Host.now },
+    });
+    try providers.put(std.testing.allocator, "host:test/clock", .{ .host_instance = &clock_iface });
+
+    try inst.linkImports(providers);
+
+    var args: [0]abi_mod.InterfaceValue = .{};
+    var results: [1]abi_mod.InterfaceValue = undefined;
+    try executor.callComponentFunc(inst, "call-now", &args, &results, std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, Host.expected), results[0].u64);
+    try std.testing.expectEqual(@as(u32, 1), Host.calls);
 }
