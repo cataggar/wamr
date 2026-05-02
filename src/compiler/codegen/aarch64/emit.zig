@@ -960,6 +960,102 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// SMULL Vd.8H, Vn.8B, Vm.8B — signed widening multiply low (i16x8 <- low i8x16 * low i8x16).
+    pub fn smull8h8b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x0E20C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMULL Vd.8H, Vn.8B, Vm.8B — unsigned widening multiply low (i16x8 <- low i8x16 * low i8x16).
+    pub fn umull8h8b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x2E20C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SMULL2 Vd.8H, Vn.16B, Vm.16B — signed widening multiply high (i16x8 <- high i8x16 * high i8x16).
+    pub fn smull2_8h16b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4E20C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMULL2 Vd.8H, Vn.16B, Vm.16B — unsigned widening multiply high.
+    pub fn umull2_8h16b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6E20C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SMULL Vd.4S, Vn.4H, Vm.4H — signed widening multiply low (i32x4 <- low i16x8 * low i16x8).
+    pub fn smull4s4h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x0E60C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMULL Vd.4S, Vn.4H, Vm.4H — unsigned widening multiply low.
+    pub fn umull4s4h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x2E60C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SMULL2 Vd.4S, Vn.8H, Vm.8H — signed widening multiply high.
+    pub fn smull2_4s8h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4E60C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMULL2 Vd.4S, Vn.8H, Vm.8H — unsigned widening multiply high.
+    pub fn umull2_4s8h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6E60C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SMULL Vd.2D, Vn.2S, Vm.2S — signed widening multiply low (i64x2 <- low i32x4 * low i32x4).
+    pub fn smull2d2s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x0EA0C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMULL Vd.2D, Vn.2S, Vm.2S — unsigned widening multiply low.
+    pub fn umull2d2s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x2EA0C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SMULL2 Vd.2D, Vn.4S, Vm.4S — signed widening multiply high.
+    pub fn smull2_2d4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4EA0C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UMULL2 Vd.2D, Vn.4S, Vm.4S — unsigned widening multiply high.
+    pub fn umull2_2d4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6EA0C000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// SSHL Vd.8H, Vn.8H, Vm.8H — signed variable shift.
     pub fn sshl8h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4E604400 |
@@ -2527,6 +2623,29 @@ test "emit: integer SIMD widening extend low/high ops" {
         var code = CodeBuffer.init(std.testing.allocator);
         defer code.deinit();
         try @field(CodeBuffer, c.name)(&code, 16, 17);
+        try expectWord(c.expected, &code);
+    }
+}
+
+test "emit: integer SIMD widening multiply low/high ops" {
+    const cases = [_]struct { name: []const u8, expected: u32 }{
+        .{ .name = "smull8h8b", .expected = 0x0E32C230 },
+        .{ .name = "umull8h8b", .expected = 0x2E32C230 },
+        .{ .name = "smull2_8h16b", .expected = 0x4E32C230 },
+        .{ .name = "umull2_8h16b", .expected = 0x6E32C230 },
+        .{ .name = "smull4s4h", .expected = 0x0E72C230 },
+        .{ .name = "umull4s4h", .expected = 0x2E72C230 },
+        .{ .name = "smull2_4s8h", .expected = 0x4E72C230 },
+        .{ .name = "umull2_4s8h", .expected = 0x6E72C230 },
+        .{ .name = "smull2d2s", .expected = 0x0EB2C230 },
+        .{ .name = "umull2d2s", .expected = 0x2EB2C230 },
+        .{ .name = "smull2_2d4s", .expected = 0x4EB2C230 },
+        .{ .name = "umull2_2d4s", .expected = 0x6EB2C230 },
+    };
+    inline for (cases) |c| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try @field(CodeBuffer, c.name)(&code, 16, 17, 18);
         try expectWord(c.expected, &code);
     }
 }

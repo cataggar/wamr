@@ -559,6 +559,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
         .i32x4_extend_i16x8,
+        .i32x4_extmul_i16x8,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_replace_lane,
@@ -571,12 +572,14 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i16x8_unop,
         .i16x8_extadd_pairwise_i8x16,
         .i16x8_extend_i8x16,
+        .i16x8_extmul_i8x16,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_replace_lane,
         .i64x2_binop,
         .i64x2_unop,
         .i64x2_extend_i32x4,
+        .i64x2_extmul_i32x4,
         .i64x2_shift,
         .i64x2_splat,
         .i64x2_replace_lane,
@@ -603,6 +606,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i32x4_unop,
                 .i32x4_extadd_pairwise_i16x8,
                 .i32x4_extend_i16x8,
+                .i32x4_extmul_i16x8,
                 .i32x4_shift,
                 .i32x4_splat,
                 .i32x4_replace_lane,
@@ -615,12 +619,14 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i16x8_unop,
                 .i16x8_extadd_pairwise_i8x16,
                 .i16x8_extend_i8x16,
+                .i16x8_extmul_i8x16,
                 .i16x8_shift,
                 .i16x8_splat,
                 .i16x8_replace_lane,
                 .i64x2_binop,
                 .i64x2_unop,
                 .i64x2_extend_i32x4,
+                .i64x2_extmul_i32x4,
                 .i64x2_shift,
                 .i64x2_splat,
                 .i64x2_replace_lane,
@@ -1400,6 +1406,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
         .i32x4_extend_i16x8,
+        .i32x4_extmul_i16x8,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
@@ -1414,6 +1421,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i16x8_unop,
         .i16x8_extadd_pairwise_i8x16,
         .i16x8_extend_i8x16,
+        .i16x8_extmul_i8x16,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_extract_lane,
@@ -1421,6 +1429,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i64x2_binop,
         .i64x2_unop,
         .i64x2_extend_i32x4,
+        .i64x2_extmul_i32x4,
         .i64x2_shift,
         .i64x2_splat,
         .i64x2_extract_lane,
@@ -1575,6 +1584,7 @@ fn compileInst(
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .i32x4_extadd_pairwise_i16x8 => |op| try emitI32x4ExtAddPairwiseI16x8(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_extend_i16x8 => |op| try emitI32x4ExtendI16x8(code, inst, op, v128_map, v128_cache, fctx),
+        .i32x4_extmul_i16x8 => |op| try emitI32x4ExtMulI16x8(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_shift => |shift| try emitI32x4Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
         .i32x4_splat => |src| try emitI32x4Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i32x4_extract_lane => |lane| try emitI32x4ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
@@ -1589,6 +1599,7 @@ fn compileInst(
         .i16x8_unop => |un| try emitI16x8UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .i16x8_extadd_pairwise_i8x16 => |op| try emitI16x8ExtAddPairwiseI8x16(code, inst, op, v128_map, v128_cache, fctx),
         .i16x8_extend_i8x16 => |op| try emitI16x8ExtendI8x16(code, inst, op, v128_map, v128_cache, fctx),
+        .i16x8_extmul_i8x16 => |op| try emitI16x8ExtMulI8x16(code, inst, op, v128_map, v128_cache, fctx),
         .i16x8_shift => |shift| try emitI16x8Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
         .i16x8_splat => |src| try emitI16x8Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i16x8_extract_lane => |lane| try emitI16x8ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
@@ -1596,6 +1607,7 @@ fn compileInst(
         .i64x2_binop => |bin| try emitI64x2BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i64x2_unop => |un| try emitI64x2UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .i64x2_extend_i32x4 => |op| try emitI64x2ExtendI32x4(code, inst, op, v128_map, v128_cache, fctx),
+        .i64x2_extmul_i32x4 => |op| try emitI64x2ExtMulI32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i64x2_shift => |shift| try emitI64x2Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
         .i64x2_splat => |src| try emitI64x2Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i64x2_extract_lane => |lane| try emitI64x2ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
@@ -2156,6 +2168,114 @@ fn emitI64x2ExtendI32x4(
         .high => switch (op.sign) {
             .signed => try code.sshll2_2d4s(dest_reg, vector_reg),
             .unsigned => try code.ushll2_2d4s(dest_reg, vector_reg),
+        },
+    }
+}
+
+fn emitI16x8ExtMulI8x16(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdExtMul,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, op.lhs, null);
+    const rhs_reg = if (op.rhs == op.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.rhs, lhs_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        op.lhs,
+        lhs_reg,
+        op.rhs,
+        rhs_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
+    switch (op.half) {
+        .low => switch (op.sign) {
+            .signed => try code.smull8h8b(dest_reg, lhs_reg, rhs_reg),
+            .unsigned => try code.umull8h8b(dest_reg, lhs_reg, rhs_reg),
+        },
+        .high => switch (op.sign) {
+            .signed => try code.smull2_8h16b(dest_reg, lhs_reg, rhs_reg),
+            .unsigned => try code.umull2_8h16b(dest_reg, lhs_reg, rhs_reg),
+        },
+    }
+}
+
+fn emitI32x4ExtMulI16x8(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdExtMul,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, op.lhs, null);
+    const rhs_reg = if (op.rhs == op.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.rhs, lhs_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        op.lhs,
+        lhs_reg,
+        op.rhs,
+        rhs_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
+    switch (op.half) {
+        .low => switch (op.sign) {
+            .signed => try code.smull4s4h(dest_reg, lhs_reg, rhs_reg),
+            .unsigned => try code.umull4s4h(dest_reg, lhs_reg, rhs_reg),
+        },
+        .high => switch (op.sign) {
+            .signed => try code.smull2_4s8h(dest_reg, lhs_reg, rhs_reg),
+            .unsigned => try code.umull2_4s8h(dest_reg, lhs_reg, rhs_reg),
+        },
+    }
+}
+
+fn emitI64x2ExtMulI32x4(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdExtMul,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, op.lhs, null);
+    const rhs_reg = if (op.rhs == op.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.rhs, lhs_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        op.lhs,
+        lhs_reg,
+        op.rhs,
+        rhs_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
+    switch (op.half) {
+        .low => switch (op.sign) {
+            .signed => try code.smull2d2s(dest_reg, lhs_reg, rhs_reg),
+            .unsigned => try code.umull2d2s(dest_reg, lhs_reg, rhs_reg),
+        },
+        .high => switch (op.sign) {
+            .signed => try code.smull2_2d4s(dest_reg, lhs_reg, rhs_reg),
+            .unsigned => try code.umull2_2d4s(dest_reg, lhs_reg, rhs_reg),
         },
     }
 }
@@ -6578,6 +6698,90 @@ test "compile: integer SIMD widening extend low/high ops emit NEON instructions"
         .{ .mask = 0xFFFFFC00, .base = 0x2F20A400, .name = "ushll2d2s" },
         .{ .mask = 0xFFFFFC00, .base = 0x4F20A400, .name = "sshll2_2d4s" },
         .{ .mask = 0xFFFFFC00, .base = 0x6F20A400, .name = "ushll2_2d4s" },
+    };
+
+    inline for (expected) |e| {
+        var found = false;
+        var i: usize = 0;
+        while (i + 4 <= code.len) : (i += 4) {
+            const w = std.mem.readInt(u32, code[i..][0..4], .little);
+            if ((w & e.mask) == e.base) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("missing NEON op {s} (base 0x{X})\n", .{ e.name, e.base });
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "compile: integer SIMD widening multiply low/high ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const lhs = func.newVReg();
+    const rhs = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8001_7FFE_8000_7FFF_0180_7F80_01FF_8001 }, .dest = lhs, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x1234_5678_9ABC_DEF0_0123_4567_89AB_CDEF }, .dest = rhs, .type = .v128 });
+
+    const Variant = struct {
+        sign: ir.Inst.SimdExtendSign,
+        half: ir.Inst.SimdExtendHalfSelect,
+    };
+    const variants = [_]Variant{
+        .{ .sign = .signed, .half = .low },
+        .{ .sign = .signed, .half = .high },
+        .{ .sign = .unsigned, .half = .low },
+        .{ .sign = .unsigned, .half = .high },
+    };
+
+    inline for (.{ "i16x8_extmul_i8x16", "i32x4_extmul_i16x8", "i64x2_extmul_i32x4" }) |op_name| {
+        for (variants) |v| {
+            const dest = func.newVReg();
+            try func.getBlock(bid).append(.{
+                .op = @unionInit(ir.Inst.Op, op_name, .{ .sign = v.sign, .half = v.half, .lhs = lhs, .rhs = rhs }),
+                .dest = dest,
+                .type = .v128,
+            });
+        }
+    }
+
+    // Force a use so the extmul results aren't fully dead-code-eliminated; pick the
+    // last one through an extract.
+    const last_extmul = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .i64x2_extmul_i32x4 = .{ .sign = .unsigned, .half = .high, .lhs = lhs, .rhs = rhs } },
+        .dest = last_extmul,
+        .type = .v128,
+    });
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = last_extmul, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    const expected = [_]struct { mask: u32, base: u32, name: []const u8 }{
+        .{ .mask = 0xFFE0FC00, .base = 0x0E20C000, .name = "smull8h8b" },
+        .{ .mask = 0xFFE0FC00, .base = 0x2E20C000, .name = "umull8h8b" },
+        .{ .mask = 0xFFE0FC00, .base = 0x4E20C000, .name = "smull2_8h16b" },
+        .{ .mask = 0xFFE0FC00, .base = 0x6E20C000, .name = "umull2_8h16b" },
+        .{ .mask = 0xFFE0FC00, .base = 0x0E60C000, .name = "smull4s4h" },
+        .{ .mask = 0xFFE0FC00, .base = 0x2E60C000, .name = "umull4s4h" },
+        .{ .mask = 0xFFE0FC00, .base = 0x4E60C000, .name = "smull2_4s8h" },
+        .{ .mask = 0xFFE0FC00, .base = 0x6E60C000, .name = "umull2_4s8h" },
+        .{ .mask = 0xFFE0FC00, .base = 0x0EA0C000, .name = "smull2d2s" },
+        .{ .mask = 0xFFE0FC00, .base = 0x2EA0C000, .name = "umull2d2s" },
+        .{ .mask = 0xFFE0FC00, .base = 0x4EA0C000, .name = "smull2_2d4s" },
+        .{ .mask = 0xFFE0FC00, .base = 0x6EA0C000, .name = "umull2_2d4s" },
     };
 
     inline for (expected) |e| {

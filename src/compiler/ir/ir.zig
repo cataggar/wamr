@@ -74,6 +74,7 @@ pub const Inst = struct {
         i32x4_unop: SimdUnary,
         i32x4_extadd_pairwise_i16x8: SimdExtAddPairwise,
         i32x4_extend_i16x8: SimdExtendHalf,
+        i32x4_extmul_i16x8: SimdExtMul,
         i32x4_shift: I32x4Shift,
         i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
@@ -88,6 +89,7 @@ pub const Inst = struct {
         i16x8_unop: SimdUnary,
         i16x8_extadd_pairwise_i8x16: SimdExtAddPairwise,
         i16x8_extend_i8x16: SimdExtendHalf,
+        i16x8_extmul_i8x16: SimdExtMul,
         i16x8_shift: I16x8Shift,
         i16x8_splat: VReg,
         i16x8_extract_lane: I16x8ExtractLane,
@@ -95,6 +97,7 @@ pub const Inst = struct {
         i64x2_binop: I64x2BinOp,
         i64x2_unop: SimdUnary,
         i64x2_extend_i32x4: SimdExtendHalf,
+        i64x2_extmul_i32x4: SimdExtMul,
         i64x2_shift: I64x2Shift,
         i64x2_splat: VReg,
         i64x2_extract_lane: I64x2ExtractLane,
@@ -419,6 +422,13 @@ pub const Inst = struct {
         sign: SimdExtendSign,
         half: SimdExtendHalfSelect,
         vector: VReg,
+    };
+
+    pub const SimdExtMul = struct {
+        sign: SimdExtendSign,
+        half: SimdExtendHalfSelect,
+        lhs: VReg,
+        rhs: VReg,
     };
 
     pub const I32x4BinOp = struct {
@@ -835,6 +845,32 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.SimdExtendSign.signed, i64_extend.op.i64x2_extend_i32x4.sign);
     try std.testing.expectEqual(Inst.SimdExtendHalfSelect.low, i64_extend.op.i64x2_extend_i32x4.half);
     try std.testing.expectEqual(@as(VReg, 25), i64_extend.op.i64x2_extend_i32x4.vector);
+
+    const i16_extmul = Inst{
+        .op = .{ .i16x8_extmul_i8x16 = .{ .sign = .signed, .half = .high, .lhs = 27, .rhs = 28 } },
+        .dest = 29,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdExtendSign.signed, i16_extmul.op.i16x8_extmul_i8x16.sign);
+    try std.testing.expectEqual(Inst.SimdExtendHalfSelect.high, i16_extmul.op.i16x8_extmul_i8x16.half);
+    try std.testing.expectEqual(@as(VReg, 27), i16_extmul.op.i16x8_extmul_i8x16.lhs);
+    try std.testing.expectEqual(@as(VReg, 28), i16_extmul.op.i16x8_extmul_i8x16.rhs);
+
+    const i32_extmul = Inst{
+        .op = .{ .i32x4_extmul_i16x8 = .{ .sign = .unsigned, .half = .low, .lhs = 30, .rhs = 31 } },
+        .dest = 32,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdExtendSign.unsigned, i32_extmul.op.i32x4_extmul_i16x8.sign);
+    try std.testing.expectEqual(Inst.SimdExtendHalfSelect.low, i32_extmul.op.i32x4_extmul_i16x8.half);
+
+    const i64_extmul = Inst{
+        .op = .{ .i64x2_extmul_i32x4 = .{ .sign = .signed, .half = .high, .lhs = 33, .rhs = 34 } },
+        .dest = 35,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdExtendSign.signed, i64_extmul.op.i64x2_extmul_i32x4.sign);
+    try std.testing.expectEqual(Inst.SimdExtendHalfSelect.high, i64_extmul.op.i64x2_extmul_i32x4.half);
 
     const i16_extract = Inst{
         .op = .{ .i16x8_extract_lane = .{ .vector = 18, .lane = 5, .sign = .signed } },

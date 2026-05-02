@@ -1934,6 +1934,87 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i16x8_extmul_low_i8x16_s,
+                    .i16x8_extmul_high_i8x16_s,
+                    .i16x8_extmul_low_i8x16_u,
+                    .i16x8_extmul_high_i8x16_u,
+                    .i32x4_extmul_low_i16x8_s,
+                    .i32x4_extmul_high_i16x8_s,
+                    .i32x4_extmul_low_i16x8_u,
+                    .i32x4_extmul_high_i16x8_u,
+                    .i64x2_extmul_low_i32x4_s,
+                    .i64x2_extmul_high_i32x4_s,
+                    .i64x2_extmul_low_i32x4_u,
+                    .i64x2_extmul_high_i32x4_u,
+                    => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const sign: ir.Inst.SimdExtendSign = switch (simd_op) {
+                            .i16x8_extmul_low_i8x16_s,
+                            .i16x8_extmul_high_i8x16_s,
+                            .i32x4_extmul_low_i16x8_s,
+                            .i32x4_extmul_high_i16x8_s,
+                            .i64x2_extmul_low_i32x4_s,
+                            .i64x2_extmul_high_i32x4_s,
+                            => .signed,
+                            .i16x8_extmul_low_i8x16_u,
+                            .i16x8_extmul_high_i8x16_u,
+                            .i32x4_extmul_low_i16x8_u,
+                            .i32x4_extmul_high_i16x8_u,
+                            .i64x2_extmul_low_i32x4_u,
+                            .i64x2_extmul_high_i32x4_u,
+                            => .unsigned,
+                            else => unreachable,
+                        };
+                        const half: ir.Inst.SimdExtendHalfSelect = switch (simd_op) {
+                            .i16x8_extmul_low_i8x16_s,
+                            .i16x8_extmul_low_i8x16_u,
+                            .i32x4_extmul_low_i16x8_s,
+                            .i32x4_extmul_low_i16x8_u,
+                            .i64x2_extmul_low_i32x4_s,
+                            .i64x2_extmul_low_i32x4_u,
+                            => .low,
+                            .i16x8_extmul_high_i8x16_s,
+                            .i16x8_extmul_high_i8x16_u,
+                            .i32x4_extmul_high_i16x8_s,
+                            .i32x4_extmul_high_i16x8_u,
+                            .i64x2_extmul_high_i32x4_s,
+                            .i64x2_extmul_high_i32x4_u,
+                            => .high,
+                            else => unreachable,
+                        };
+                        const extmul = ir.Inst.SimdExtMul{
+                            .sign = sign,
+                            .half = half,
+                            .lhs = lhs,
+                            .rhs = rhs,
+                        };
+                        const inst_op: ir.Inst.Op = switch (simd_op) {
+                            .i16x8_extmul_low_i8x16_s,
+                            .i16x8_extmul_high_i8x16_s,
+                            .i16x8_extmul_low_i8x16_u,
+                            .i16x8_extmul_high_i8x16_u,
+                            => .{ .i16x8_extmul_i8x16 = extmul },
+                            .i32x4_extmul_low_i16x8_s,
+                            .i32x4_extmul_high_i16x8_s,
+                            .i32x4_extmul_low_i16x8_u,
+                            .i32x4_extmul_high_i16x8_u,
+                            => .{ .i32x4_extmul_i16x8 = extmul },
+                            .i64x2_extmul_low_i32x4_s,
+                            .i64x2_extmul_high_i32x4_s,
+                            .i64x2_extmul_low_i32x4_u,
+                            .i64x2_extmul_high_i32x4_u,
+                            => .{ .i64x2_extmul_i32x4 = extmul },
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = inst_op,
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i32x4_add,
                     .i32x4_sub,
                     .i32x4_eq,
@@ -4013,6 +4094,118 @@ test "lower integer SIMD widening extend low/high opcodes" {
         prev_dest = inst.dest.?;
     }
     const extract_idx = 1 + cases.len;
+    try std.testing.expectEqual(@as(u2, 0), insts[extract_idx].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[extract_idx + 1].op.ret != null);
+}
+
+test "lower integer SIMD widening multiply low/high opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Family = enum { i16_from_i8, i32_from_i16, i64_from_i32 };
+    const Case = struct {
+        opcode: u32,
+        family: Family,
+        sign: ir.Inst.SimdExtendSign,
+        half: ir.Inst.SimdExtendHalfSelect,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0x9C, .family = .i16_from_i8, .sign = .signed, .half = .low },
+        .{ .opcode = 0x9D, .family = .i16_from_i8, .sign = .signed, .half = .high },
+        .{ .opcode = 0x9E, .family = .i16_from_i8, .sign = .unsigned, .half = .low },
+        .{ .opcode = 0x9F, .family = .i16_from_i8, .sign = .unsigned, .half = .high },
+        .{ .opcode = 0xBC, .family = .i32_from_i16, .sign = .signed, .half = .low },
+        .{ .opcode = 0xBD, .family = .i32_from_i16, .sign = .signed, .half = .high },
+        .{ .opcode = 0xBE, .family = .i32_from_i16, .sign = .unsigned, .half = .low },
+        .{ .opcode = 0xBF, .family = .i32_from_i16, .sign = .unsigned, .half = .high },
+        .{ .opcode = 0xDC, .family = .i64_from_i32, .sign = .signed, .half = .low },
+        .{ .opcode = 0xDD, .family = .i64_from_i32, .sign = .signed, .half = .high },
+        .{ .opcode = 0xDE, .family = .i64_from_i32, .sign = .unsigned, .half = .low },
+        .{ .opcode = 0xDF, .family = .i64_from_i32, .sign = .unsigned, .half = .high },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    // Emit cases.len + 1 v128.const operands so each binary extmul reduces stack by 1.
+    var const_idx: usize = 0;
+    while (const_idx < cases.len + 1) : (const_idx += 1) {
+        try appendSimd(&code, allocator, 0x0C); // v128.const
+        for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF } ** 4) |byte| {
+            try code.append(allocator, byte);
+        }
+    }
+    for (cases) |case| {
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x1B); // i32x4.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, (cases.len + 1) + cases.len + 2), insts.len);
+    // Track the most-recent dest; each extmul pops 2 v128s (the previous extmul result
+    // and the next v128.const) and produces a new v128.
+    const prev_const_dest = insts[cases.len].dest.?; // last v128.const before extmuls
+    var prev_extmul_dest: ?ir.VReg = null;
+    for (cases, 0..) |case, idx| {
+        const inst = insts[(cases.len + 1) + idx];
+        const op = switch (case.family) {
+            .i16_from_i8 => inst.op.i16x8_extmul_i8x16,
+            .i32_from_i16 => inst.op.i32x4_extmul_i16x8,
+            .i64_from_i32 => inst.op.i64x2_extmul_i32x4,
+        };
+        try std.testing.expectEqual(case.sign, op.sign);
+        try std.testing.expectEqual(case.half, op.half);
+        try std.testing.expectEqual(ir.IrType.v128, inst.type);
+        // The first extmul's lhs is the second-to-last v128.const, rhs is the last;
+        // every subsequent extmul re-uses an earlier const as lhs and the previous
+        // extmul result as rhs.
+        if (prev_extmul_dest) |prev| {
+            try std.testing.expectEqual(prev, op.rhs);
+        } else {
+            try std.testing.expectEqual(prev_const_dest, op.rhs);
+        }
+        prev_extmul_dest = inst.dest.?;
+    }
+    const extract_idx = (cases.len + 1) + cases.len;
     try std.testing.expectEqual(@as(u2, 0), insts[extract_idx].op.i32x4_extract_lane.lane);
     try std.testing.expect(insts[extract_idx + 1].op.ret != null);
 }
