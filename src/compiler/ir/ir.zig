@@ -72,6 +72,7 @@ pub const Inst = struct {
         v128_bitwise: V128Bitwise,
         i32x4_binop: I32x4BinOp,
         i32x4_unop: SimdUnary,
+        i32x4_extadd_pairwise_i16x8: SimdExtAddPairwise,
         i32x4_shift: I32x4Shift,
         i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
@@ -84,6 +85,7 @@ pub const Inst = struct {
         i8x16_replace_lane: I8x16ReplaceLane,
         i16x8_binop: I16x8BinOp,
         i16x8_unop: SimdUnary,
+        i16x8_extadd_pairwise_i8x16: SimdExtAddPairwise,
         i16x8_shift: I16x8Shift,
         i16x8_splat: VReg,
         i16x8_extract_lane: I16x8ExtractLane,
@@ -268,6 +270,7 @@ pub const Inst = struct {
 
     pub const V128BitwiseOp = enum { @"and", andnot, @"or", xor };
     pub const SimdUnaryOp = enum { abs, neg };
+    pub const SimdExtAddPairwiseSign = enum { signed, unsigned };
 
     pub const I32x4Op = enum {
         add,
@@ -399,6 +402,11 @@ pub const Inst = struct {
 
     pub const SimdUnary = struct {
         op: SimdUnaryOp,
+        vector: VReg,
+    };
+
+    pub const SimdExtAddPairwise = struct {
+        sign: SimdExtAddPairwiseSign,
         vector: VReg,
     };
 
@@ -707,6 +715,14 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.SimdUnaryOp.abs, i32_un.op.i32x4_unop.op);
     try std.testing.expectEqual(@as(VReg, 10), i32_un.op.i32x4_unop.vector);
 
+    const i32_extadd = Inst{
+        .op = .{ .i32x4_extadd_pairwise_i16x8 = .{ .sign = .unsigned, .vector = 11 } },
+        .dest = 12,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdExtAddPairwiseSign.unsigned, i32_extadd.op.i32x4_extadd_pairwise_i16x8.sign);
+    try std.testing.expectEqual(@as(VReg, 11), i32_extadd.op.i32x4_extadd_pairwise_i16x8.vector);
+
     const i8_bin = Inst{
         .op = .{ .i8x16_binop = .{ .op = .sub, .lhs = 11, .rhs = 12 } },
         .dest = 13,
@@ -773,6 +789,14 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.SimdUnaryOp.abs, i16_un.op.i16x8_unop.op);
     try std.testing.expectEqual(@as(VReg, 20), i16_un.op.i16x8_unop.vector);
+
+    const i16_extadd = Inst{
+        .op = .{ .i16x8_extadd_pairwise_i8x16 = .{ .sign = .signed, .vector = 21 } },
+        .dest = 22,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdExtAddPairwiseSign.signed, i16_extadd.op.i16x8_extadd_pairwise_i8x16.sign);
+    try std.testing.expectEqual(@as(VReg, 21), i16_extadd.op.i16x8_extadd_pairwise_i8x16.vector);
 
     const i16_extract = Inst{
         .op = .{ .i16x8_extract_lane = .{ .vector = 18, .lane = 5, .sign = .signed } },

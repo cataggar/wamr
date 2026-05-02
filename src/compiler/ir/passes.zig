@@ -144,6 +144,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.rhs);
         },
         .i32x4_unop => |un| list.append(un.vector),
+        .i32x4_extadd_pairwise_i16x8 => |op| list.append(op.vector),
         .i8x16_binop => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
@@ -158,6 +159,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.rhs);
         },
         .i16x8_unop => |un| list.append(un.vector),
+        .i16x8_extadd_pairwise_i8x16 => |op| list.append(op.vector),
         .i64x2_binop => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
@@ -436,6 +438,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .i32x4_unop => |*un| if (un.vector == old) {
             un.vector = new;
         },
+        .i32x4_extadd_pairwise_i16x8 => |*op| if (op.vector == old) {
+            op.vector = new;
+        },
         .i8x16_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
@@ -453,6 +458,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         },
         .i16x8_unop => |*un| if (un.vector == old) {
             un.vector = new;
+        },
+        .i16x8_extadd_pairwise_i8x16 => |*op| if (op.vector == old) {
+            op.vector = new;
         },
         .i64x2_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
@@ -1731,6 +1739,7 @@ fn isPure(inst: ir.Inst) bool {
         .v128_bitwise,
         .i32x4_binop,
         .i32x4_unop,
+        .i32x4_extadd_pairwise_i16x8,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
@@ -1743,6 +1752,7 @@ fn isPure(inst: ir.Inst) bool {
         .i8x16_replace_lane,
         .i16x8_binop,
         .i16x8_unop,
+        .i16x8_extadd_pairwise_i8x16,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_extract_lane,
@@ -1844,6 +1854,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .v128_bitwise => |bin| bin.op == b.op.v128_bitwise.op and bin.lhs == b.op.v128_bitwise.lhs and bin.rhs == b.op.v128_bitwise.rhs,
         .i32x4_binop => |bin| bin.op == b.op.i32x4_binop.op and bin.lhs == b.op.i32x4_binop.lhs and bin.rhs == b.op.i32x4_binop.rhs,
         .i32x4_unop => |un| un.op == b.op.i32x4_unop.op and un.vector == b.op.i32x4_unop.vector,
+        .i32x4_extadd_pairwise_i16x8 => |op| op.sign == b.op.i32x4_extadd_pairwise_i16x8.sign and op.vector == b.op.i32x4_extadd_pairwise_i16x8.vector,
         .i32x4_shift => |shift| shift.op == b.op.i32x4_shift.op and shift.vector == b.op.i32x4_shift.vector and shift.count == b.op.i32x4_shift.count,
         .i32x4_splat => |v| v == b.op.i32x4_splat,
         .i32x4_extract_lane => |lane| lane.vector == b.op.i32x4_extract_lane.vector and lane.lane == b.op.i32x4_extract_lane.lane,
@@ -1856,6 +1867,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .i8x16_replace_lane => |lane| lane.vector == b.op.i8x16_replace_lane.vector and lane.val == b.op.i8x16_replace_lane.val and lane.lane == b.op.i8x16_replace_lane.lane,
         .i16x8_binop => |bin| bin.op == b.op.i16x8_binop.op and bin.lhs == b.op.i16x8_binop.lhs and bin.rhs == b.op.i16x8_binop.rhs,
         .i16x8_unop => |un| un.op == b.op.i16x8_unop.op and un.vector == b.op.i16x8_unop.vector,
+        .i16x8_extadd_pairwise_i8x16 => |op| op.sign == b.op.i16x8_extadd_pairwise_i8x16.sign and op.vector == b.op.i16x8_extadd_pairwise_i8x16.vector,
         .i16x8_shift => |shift| shift.op == b.op.i16x8_shift.op and shift.vector == b.op.i16x8_shift.vector and shift.count == b.op.i16x8_shift.count,
         .i16x8_splat => |v| v == b.op.i16x8_splat,
         .i16x8_extract_lane => |lane| lane.vector == b.op.i16x8_extract_lane.vector and lane.lane == b.op.i16x8_extract_lane.lane and lane.sign == b.op.i16x8_extract_lane.sign,
@@ -3322,6 +3334,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             bin.rhs += offset;
         },
         .i32x4_unop => |*un| un.vector += offset,
+        .i32x4_extadd_pairwise_i16x8 => |*op| op.vector += offset,
         .i8x16_binop => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;
@@ -3336,6 +3349,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             bin.rhs += offset;
         },
         .i16x8_unop => |*un| un.vector += offset,
+        .i16x8_extadd_pairwise_i8x16 => |*op| op.vector += offset,
         .i64x2_binop => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;

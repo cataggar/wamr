@@ -557,6 +557,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .v128_bitwise,
         .i32x4_binop,
         .i32x4_unop,
+        .i32x4_extadd_pairwise_i16x8,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_replace_lane,
@@ -567,6 +568,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i8x16_replace_lane,
         .i16x8_binop,
         .i16x8_unop,
+        .i16x8_extadd_pairwise_i8x16,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_replace_lane,
@@ -596,6 +598,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .v128_bitwise,
                 .i32x4_binop,
                 .i32x4_unop,
+                .i32x4_extadd_pairwise_i16x8,
                 .i32x4_shift,
                 .i32x4_splat,
                 .i32x4_replace_lane,
@@ -606,6 +609,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i8x16_replace_lane,
                 .i16x8_binop,
                 .i16x8_unop,
+                .i16x8_extadd_pairwise_i8x16,
                 .i16x8_shift,
                 .i16x8_splat,
                 .i16x8_replace_lane,
@@ -1388,6 +1392,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .v128_bitwise,
         .i32x4_binop,
         .i32x4_unop,
+        .i32x4_extadd_pairwise_i16x8,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
@@ -1400,6 +1405,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i8x16_replace_lane,
         .i16x8_binop,
         .i16x8_unop,
+        .i16x8_extadd_pairwise_i8x16,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_extract_lane,
@@ -1558,6 +1564,7 @@ fn compileInst(
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
         .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
+        .i32x4_extadd_pairwise_i16x8 => |op| try emitI32x4ExtAddPairwiseI16x8(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_shift => |shift| try emitI32x4Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
         .i32x4_splat => |src| try emitI32x4Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i32x4_extract_lane => |lane| try emitI32x4ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
@@ -1570,6 +1577,7 @@ fn compileInst(
         .i8x16_replace_lane => |lane| try emitI8x16ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
         .i16x8_binop => |bin| try emitI16x8BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i16x8_unop => |un| try emitI16x8UnOp(code, inst, un, v128_map, v128_cache, fctx),
+        .i16x8_extadd_pairwise_i8x16 => |op| try emitI16x8ExtAddPairwiseI8x16(code, inst, op, v128_map, v128_cache, fctx),
         .i16x8_shift => |shift| try emitI16x8Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
         .i16x8_splat => |src| try emitI16x8Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i16x8_extract_lane => |lane| try emitI16x8ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
@@ -2010,6 +2018,22 @@ fn emitI32x4UnOp(
     }
 }
 
+fn emitI32x4ExtAddPairwiseI16x8(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdExtAddPairwise,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, op.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, op.vector, vector_reg, v128_map, v128_cache, fctx);
+    switch (op.sign) {
+        .signed => try code.saddlp4s8h(dest_reg, vector_reg),
+        .unsigned => try code.uaddlp4s8h(dest_reg, vector_reg),
+    }
+}
+
 fn emitI8x16UnOp(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -2039,6 +2063,22 @@ fn emitI16x8UnOp(
     switch (un.op) {
         .abs => try code.abs8h(dest_reg, vector_reg),
         .neg => try code.neg8h(dest_reg, vector_reg),
+    }
+}
+
+fn emitI16x8ExtAddPairwiseI8x16(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdExtAddPairwise,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, op.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, op.vector, vector_reg, v128_map, v128_cache, fctx);
+    switch (op.sign) {
+        .signed => try code.saddlp8h16b(dest_reg, vector_reg),
+        .unsigned => try code.uaddlp8h16b(dest_reg, vector_reg),
     }
 }
 
@@ -6352,6 +6392,55 @@ test "compile: integer SIMD abs and neg ops emit NEON instructions" {
     try std.testing.expect(found_neg4s);
     try std.testing.expect(found_abs2d);
     try std.testing.expect(found_neg2d);
+}
+
+test "compile: integer SIMD pairwise extended add ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const source = func.newVReg();
+    const i16_signed = func.newVReg();
+    const i16_unsigned = func.newVReg();
+    const i32_signed = func.newVReg();
+    const i32_unsigned = func.newVReg();
+    const combined = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8001_7FFE_8000_7FFF_0180_7F80_01FF_8001 }, .dest = source, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i16x8_extadd_pairwise_i8x16 = .{ .sign = .signed, .vector = source } }, .dest = i16_signed, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i16x8_extadd_pairwise_i8x16 = .{ .sign = .unsigned, .vector = source } }, .dest = i16_unsigned, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_extadd_pairwise_i16x8 = .{ .sign = .signed, .vector = i16_signed } }, .dest = i32_signed, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_extadd_pairwise_i16x8 = .{ .sign = .unsigned, .vector = i16_unsigned } }, .dest = i32_unsigned, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = i32_signed, .rhs = i32_unsigned } }, .dest = combined, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = combined, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_saddlp8h = false;
+    var found_uaddlp8h = false;
+    var found_saddlp4s = false;
+    var found_uaddlp4s = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4E202800) found_saddlp8h = true;
+        if ((w & 0xFFFFFC00) == 0x6E202800) found_uaddlp8h = true;
+        if ((w & 0xFFFFFC00) == 0x4E602800) found_saddlp4s = true;
+        if ((w & 0xFFFFFC00) == 0x6E602800) found_uaddlp4s = true;
+    }
+
+    try std.testing.expect(found_saddlp8h);
+    try std.testing.expect(found_uaddlp8h);
+    try std.testing.expect(found_saddlp4s);
+    try std.testing.expect(found_uaddlp4s);
 }
 
 test "compile: i64x2 scalar-count shifts emit NEON instructions" {
