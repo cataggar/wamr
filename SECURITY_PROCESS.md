@@ -141,7 +141,8 @@ Reviewer guidance:
 - For loader/runtime/component/compiler/fuzz harness changes, consider
   `zig build fuzz` or the GitHub fuzz workflow when the change affects input
   parsing or execution boundaries. See [tests/fuzz/README.md](tests/fuzz/README.md)
-  for harness-specific oracles and
+  for harness-specific oracles, `scripts/fuzz_reduce.py` for crash
+  minimization, and
   [tests/fuzz/OSS_FUZZ.md](tests/fuzz/OSS_FUZZ.md) for the OSS-Fuzz integration
   decision and prerequisites.
 - For documentation-only changes, a full Zig build is usually unnecessary; check

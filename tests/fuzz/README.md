@@ -116,13 +116,57 @@ To reproduce a crash:
    an unfixed security issue. Use the private reporting flow in `SECURITY.md`
    and `SECURITY_PROCESS.md` for sensitive payloads.
 
+## Reducing a crasher
+
+Use `scripts/fuzz_reduce.py` to shrink a reproducer to a small deterministic
+form before triage:
+
+```sh
+zig build fuzz -Doptimize=ReleaseSafe
+scripts/fuzz_reduce.py <target> <crasher.wasm> [--duration 2] [--extra --fuel --extra 100000]
+```
+
+The script verifies the input still reproduces, optionally invokes
+`wasm-tools shrink` if it is on `PATH`, then runs a built-in byte-level
+delta-debug pass. The smallest reproducer is written next to the input as
+`<crasher>.reduced.wasm` (override with `--out`).
+
+A candidate "still reproduces" when the harness exits non-zero (process
+abort) or leaves a named crasher file like `diff-mismatch-*.wasm`. Pass
+target-specific flags through with `--extra`, e.g.
+`--extra --fuel --extra 100000` for `fuzz-interp`/`fuzz-diff`.
+
+Loader and validator crashers usually reduce to under 100 bytes; runtime
+or codegen crashers may stay larger. Reduce on the same architecture you
+intend to share the seed for; AArch64 vs x86_64 AOT codegen differences
+can change reproduction.
+
+## Regression seeds vs private reports
+
+A reduced crasher can take one of two paths:
+
+- **Public regression seed** (`tests/fuzz/regression/<target>/`): only for
+  bugs that have already been **fixed** in this repository. The committed
+  seed locks in coverage so the same path can never silently regress.
+  Each file must be deterministic, ≤ 4 KB, and free of PII/proprietary
+  content. See `tests/fuzz/regression/README.md` for the full policy.
+- **Private security attachment**: any reproducer that still exposes a
+  panic, safety-checked UB, abort, oversize allocation, or potentially
+  exploitable behaviour goes through the private reporting flow in
+  `SECURITY.md` and `SECURITY_PROCESS.md`. Do not open a public PR or
+  issue with the bytes attached.
+
+If you are unsure, treat the reproducer as private until a maintainer
+confirms otherwise.
+
 ## CI workflow
 
 `.github/workflows/fuzz.yml` runs on a daily schedule, on demand, and on PRs that
 touch runtime/compiler/component/fuzz code. The workflow:
 
 - builds all harnesses with `zig build fuzz -Doptimize=ReleaseSafe`;
-- seeds per-target corpora from `tests/malformed/fuzz` and `tests/spec-json`;
+- seeds per-target corpora from `tests/malformed/fuzz`, `tests/spec-json`,
+  and any committed regression seeds in `tests/fuzz/regression/<target>/`;
 - adds a generated minimal component seed for `fuzz-component-loader`;
 - adds a generated nullary scalar export seed for `fuzz-interp` and `fuzz-diff`;
 - uploads `.fuzz-crashes` artifacts with 30-day retention;
@@ -166,6 +210,7 @@ host-protection mechanism.
   model for resource tables, paths, descriptors, sockets, HTTP streams, and
   guest-memory pointer/length pairs (#247).
 - Corpus minimization should preserve a small checked-in seed set while storing
-  larger evolving corpora as workflow artifacts (#248).
+  larger evolving corpora as workflow artifacts (#248). See `scripts/fuzz_reduce.py`
+  and `tests/fuzz/regression/README.md`.
 - OSS-Fuzz integration was evaluated in [`OSS_FUZZ.md`](OSS_FUZZ.md); the
   decision is to defer until a documented prerequisite list is met (#249).
