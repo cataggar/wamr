@@ -767,6 +767,10 @@ pub const CodeBuffer = struct {
         add = 0x4EA08400,
         sub = 0x6EA08400,
         mul = 0x4EA09C00,
+        smin = 0x4EA06C00,
+        umin = 0x6EA06C00,
+        smax = 0x4EA06400,
+        umax = 0x6EA06400,
         cmeq = 0x6EA08C00,
         cmgt = 0x4EA03400,
         cmge = 0x4EA03C00,
@@ -774,7 +778,7 @@ pub const CodeBuffer = struct {
         cmhs = 0x6EA03C00,
     };
 
-    /// Integer 4S binary vector op: ADD/SUB/MUL/CMEQ/CMGT/CMGE/CMHI/CMHS.
+    /// Integer 4S binary vector op: ADD/SUB/MUL/SMIN/UMIN/SMAX/UMAX/CMEQ/CMGT/CMGE/CMHI/CMHS.
     pub fn i32x4Op(self: *CodeBuffer, op: I32x4Op, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(@intFromEnum(op) |
             (@as(u32, vm) << 16) |
@@ -1930,6 +1934,33 @@ test "emit: MUL v0.4s, v1.4s, v2.4s" {
     defer code.deinit();
     try code.i32x4Op(.mul, 0, 1, 2);
     try expectWord(0x4EA29C20, &code);
+}
+
+test "emit: i32x4 min/max vector ops" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.smin, 16, 17, 30);
+        try expectWord(0x4EBE6E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.umin, 16, 17, 30);
+        try expectWord(0x6EBE6E30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.smax, 16, 17, 30);
+        try expectWord(0x4EBE6630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.i32x4Op(.umax, 16, 17, 30);
+        try expectWord(0x6EBE6630, &code);
+    }
 }
 
 test "emit: i8x16 vector ops" {

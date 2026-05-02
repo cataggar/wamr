@@ -25,6 +25,8 @@ The `simd_i32x4_mem_sum8_4k_loop` row is a v128 register-pressure probe. Each lo
 
 The `simd_i32x4_shift_mix_4k_loop` row is a dynamic-shift throughput probe. Each loop iteration derives the scalar shift count from the loop index, exercises `i32x4.shl`, `i32x4.shr_u`, and `i32x4.shr_s`, stores a vector result, and returns one scalar checksum lane. This keeps shift counts data-dependent and above the lane width so modulo masking is covered in the AOT path.
 
+The `simd_i32x4_minmax_4k_loop` row extends the 32-bit lane memory probe with signed and unsigned min/max operations. It uses alternating high-bit lane data so signed and unsigned `i32x4.min_*`/`max_*` paths produce distinct intermediate values while still returning a stable scalar checksum.
+
 The `simd_i16x8_mem_add_4k_loop` row is the 16-bit lane counterpart to the i32x4 memory-add loop. It walks two 4 KiB arrays as packed 16-bit lanes with `v128.load`, `i16x8.add`, and `v128.store`, then returns the final unsigned 16-bit lane as a scalar checksum.
 
 The `simd_i16x8_shift_mix_4k_loop` row is the 16-bit dynamic-shift counterpart to the i32x4 shift probe. Each loop iteration derives scalar counts from the loop index, exercises `i16x8.shl`, `i16x8.shr_u`, and `i16x8.shr_s`, stores a vector result, and returns one unsigned 16-bit checksum lane.

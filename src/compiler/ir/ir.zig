@@ -278,6 +278,10 @@ pub const Inst = struct {
         ge_s,
         ge_u,
         mul,
+        min_s,
+        min_u,
+        max_s,
+        max_u,
     };
 
     pub const I8x16Op = enum {
