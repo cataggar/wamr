@@ -33,6 +33,8 @@ The `simd_i8x16_mem_add_4k_loop` row is the byte-lane memory-add probe. It walks
 
 The `simd_i8x16_shift_mix_4k_loop` row is the byte-lane dynamic-shift counterpart to the i16/i32 shift probes. Each loop iteration derives scalar counts from the vector index, exercises `i8x16.shl`, `i8x16.shr_u`, and `i8x16.shr_s`, stores a vector result, and returns one unsigned byte checksum lane. The derived counts intentionally exceed 8 so AOT modulo-8 count masking is covered.
 
+The `simd_i8x16_arith_extra_4k_loop` row extends the byte-lane memory probe with saturated add/subtract, signed/unsigned min/max, and unsigned rounding average operations. It uses high-bit byte data so signed and unsigned arithmetic paths produce distinct checksums.
+
 The `simd_i64x2_mem_add_4k_loop` row is the 64-bit lane counterpart to the integer memory-add probes. It walks the same 4 KiB input shape as packed 64-bit lanes with `v128.load`, wrapping `i64x2.add`, and `v128.store`, then extracts an `i64` checksum lane and returns it via `i32.wrap_i64`.
 
 The `simd_i64x2_shift_mix_4k_loop` row is the 64-bit dynamic-shift counterpart to the narrower shift probes. Each loop iteration derives scalar counts from the vector index, exercises `i64x2.shl`, `i64x2.shr_u`, and `i64x2.shr_s`, stores a vector result, then extracts and wraps an `i64` checksum lane. The derived counts intentionally exceed 64 so AOT modulo-64 count masking is covered.
