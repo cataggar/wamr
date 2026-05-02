@@ -9155,6 +9155,11 @@ pub const RunComponentError = error{
     LoadFailed,
     InstantiateFailed,
     LinkFailed,
+    /// A deferred core-module `(start ...)` directive trapped while
+    /// `linkImports` was draining the pending starts — typically a
+    /// `_initialize`-style fixup that reaches an import wamr does not
+    /// fully support (issue #308 surfaces this distinct from `LinkFailed`).
+    StartTrapped,
     NoRunExport,
     Trap,
     OutOfMemory,
@@ -9490,7 +9495,14 @@ pub fn runLoadedComponent(
     defer providers.deinit(adapter.allocator);
 
     populateWasiProviders(adapter, component, &providers) catch return error.OutOfMemory;
-    inst.linkImports(providers) catch return error.LinkFailed;
+    inst.linkImports(providers) catch |err| switch (err) {
+        // Distinguish a deferred-start trap from a true import-wiring
+        // failure so the CLI can produce a clearer diagnostic. The
+        // `[component init trap] ...` line was already printed from
+        // `runDeferredCoreStarts` before we got here.
+        error.StartFunctionFailed => return error.StartTrapped,
+        else => return error.LinkFailed,
+    };
 
     if (inst.getExport("run") == null) return error.NoRunExport;
 
@@ -9566,7 +9578,10 @@ pub fn serveLoadedHttpComponent(
     defer providers.deinit(adapter.allocator);
 
     populateWasiProviders(adapter, component, &providers) catch return error.OutOfMemory;
-    inst.linkImports(providers) catch return error.LinkFailed;
+    inst.linkImports(providers) catch |err| switch (err) {
+        error.StartFunctionFailed => return error.StartTrapped,
+        else => return error.LinkFailed,
+    };
 
     const handler_name = (try findHttpIncomingHandlerExportName(component, inst, allocator)) orelse
         return error.NoIncomingHandlerExport;

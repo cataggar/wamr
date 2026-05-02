@@ -15,6 +15,7 @@ const abi = @import("canonical_abi.zig");
 const instance_mod = @import("instance.zig");
 const core_types = @import("../runtime/common/types.zig");
 const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+const HostTrapInfo = @import("../runtime/common/exec_env.zig").HostTrapInfo;
 const interp = @import("../runtime/interpreter/interp.zig");
 const indexspace = @import("indexspace.zig");
 const Allocator = std.mem.Allocator;
@@ -180,7 +181,23 @@ pub fn callComponentFunc(
     }
 
     // 5. Call the core function
-    interp.executeFunction(env, exported.core_func_idx) catch return error.TrapInCoreFunction;
+    interp.executeFunction(env, exported.core_func_idx) catch {
+        if (env.host_trap) |ht| {
+            std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
+            if (ht.component_func_idx != std.math.maxInt(u32))
+                std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
+            if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+                std.debug.print(
+                    " import='{s}.{s}'",
+                    .{ ht.import_module_name, ht.import_field_name },
+                );
+            std.debug.print(
+                " stage={s} error={s}\n",
+                .{ @tagName(ht.stage), ht.err_name },
+            );
+        }
+        return error.TrapInCoreFunction;
+    };
 
     // 6. Lift results
     var result_ptr_for_post_return: u32 = 0;
@@ -1002,29 +1019,32 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     // mandatory whenever spilling occurs, and we need a non-empty
     // core_instances list to actually own a memory.
     if (params_spill or results_spill) {
-        if (ctx.lower_opts.memory_idx == null) return error.Trap;
-        if (ctx.comp_inst.core_instances.len == 0) return error.Trap;
+        if (ctx.lower_opts.memory_idx == null) return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
+        if (ctx.comp_inst.core_instances.len == 0) return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
     }
 
     // Pop result-destination pointer first if results spill (it was pushed
     // last by the caller).
     var result_dest_ptr: u32 = 0;
     if (results_spill) {
-        result_dest_ptr = @bitCast(env.popI32() catch return error.Trap);
+        result_dest_ptr = @bitCast(env.popI32() catch |err| return trampolineTrap(env, ctx, err, .lift_args));
     }
 
     // Lift args.
-    const args = allocator.alloc(InterfaceValue, ctx.param_types.len) catch return error.Trap;
+    const args = allocator.alloc(InterfaceValue, ctx.param_types.len) catch |err|
+        return trampolineTrap(env, ctx, err, .lift_args);
     defer allocator.free(args);
     if (params_spill) {
-        const params_ptr: u32 = @bitCast(env.popI32() catch return error.Trap);
+        const params_ptr: u32 = @bitCast(env.popI32() catch |err| return trampolineTrap(env, ctx, err, .lift_args));
         const mem_idx = ctx.lower_opts.memory_idx.?;
-        const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse return error.Trap;
+        const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse
+            return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
         var offset: u32 = params_ptr;
         for (ctx.param_types, 0..) |pt, i| {
             const al = typeAlign(registry, pt);
             offset = abi.alignUp(offset, al);
-            args[i] = loadInterfaceValue(mem.data, offset, pt, registry, allocator) catch return error.Trap;
+            args[i] = loadInterfaceValue(mem.data, offset, pt, registry, allocator) catch |err|
+                return trampolineTrap(env, ctx, err, .lift_args);
             offset += typeSize(registry, pt);
         }
     } else {
@@ -1033,30 +1053,33 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         var i: usize = ctx.param_types.len;
         while (i > 0) {
             i -= 1;
-            args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch return error.Trap;
+            args[i] = popInterfaceValue(env, ctx.param_types[i], registry, allocator) catch |err|
+                return trampolineTrap(env, ctx, err, .lift_args);
         }
     }
 
     // Invoke host. Host owns allocation of any compound result values via
     // `allocator`; we deinit each result after lowering so payloads
     // (e.g. `.result_val.payload` for input-stream.blocking-read) don't leak.
-    const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch return error.Trap;
+    const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch |err|
+        return trampolineTrap(env, ctx, err, .lift_args);
     defer {
         for (results) |r| r.deinit(allocator);
         allocator.free(results);
     }
     const call = ctx.host_func.call orelse {
-        return error.Trap;
+        return trampolineTrap(env, ctx, error.HostFuncNotBound, .host_call);
     };
-    call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch {
-        return error.Trap;
+    call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch |err| {
+        return trampolineTrap(env, ctx, err, .host_call);
     };
 
     // Lower results.
     if (results_spill) {
         const mem_idx = ctx.lower_opts.memory_idx.?;
         const mem_via_resolve = ctx.comp_inst.resolveTopLevelMemory(mem_idx);
-        const mem = mem_via_resolve orelse return error.Trap;
+        const mem = mem_via_resolve orelse
+            return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
         var offset: u32 = result_dest_ptr;
         for (results, ctx.result_types) |r, t| {
             const al = typeAlign(registry, t);
@@ -1066,11 +1089,31 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         }
     } else {
         for (results, ctx.result_types) |r, t| {
-            pushInterfaceValue(env, r, t, registry) catch {
-                return error.Trap;
+            pushInterfaceValue(env, r, t, registry) catch |err| {
+                return trampolineTrap(env, ctx, err, .lower_results);
             };
         }
     }
+}
+
+/// Record `HostTrapInfo` on the env and return `error.Trap` so the canon-lower
+/// trampoline collapses to a single trap-shaped failure for the interp loop.
+/// First-write-wins so the deepest captured site survives `recordHostTrap`'s
+/// later top-up of `core_func_idx`.
+fn trampolineTrap(
+    env: *ExecEnv,
+    ctx: *const ComponentTrampolineCtx,
+    err: anyerror,
+    stage: HostTrapInfo.Stage,
+) error{Trap} {
+    if (env.host_trap == null) {
+        env.host_trap = .{
+            .component_func_idx = ctx.component_func_idx,
+            .err_name = @errorName(err),
+            .stage = stage,
+        };
+    }
+    return error.Trap;
 }
 
 // ── Trampoline tests ────────────────────────────────────────────────────────

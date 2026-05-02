@@ -34,6 +34,19 @@ pub const ImportContext = struct {
     tags: []const *types.TagInstance = &.{},
 };
 
+/// Optional knobs for `instantiateWithOptions`. The bare `instantiate` /
+/// `instantiateWithImports` entry points are equivalent to passing the
+/// default-valued options struct.
+pub const InstantiateOptions = struct {
+    import_ctx: ?ImportContext = null,
+    /// When true, the module's `start` function (if any) is NOT executed
+    /// during instantiation; the caller must invoke `runStartFunction`
+    /// later. Used by the component-model instantiation path so canon-lower
+    /// trampoline `host_funcs` can be wired by `linkImports` BEFORE any
+    /// core `(start ...)` directive fires (issue #308).
+    defer_start: bool = false,
+};
+
 /// Instantiate a module, producing a runnable ModuleInstance.
 /// If the module has imports and no `import_ctx` is provided, returns ImportResolutionFailed.
 pub fn instantiate(module: *const types.WasmModule, allocator: std.mem.Allocator) InstantiationError!*types.ModuleInstance {
@@ -46,7 +59,33 @@ pub fn instantiateWithImports(
     allocator: std.mem.Allocator,
     import_ctx: ?ImportContext,
 ) InstantiationError!*types.ModuleInstance {
-    return instantiateImpl(module, allocator, import_ctx, null);
+    return instantiateImpl(module, allocator, import_ctx, null, false);
+}
+
+/// Instantiate a module with the given options. Currently the only
+/// non-import option is `defer_start`; see `InstantiateOptions`.
+pub fn instantiateWithOptions(
+    module: *const types.WasmModule,
+    allocator: std.mem.Allocator,
+    options: InstantiateOptions,
+) InstantiationError!*types.ModuleInstance {
+    return instantiateImpl(module, allocator, options.import_ctx, null, options.defer_start);
+}
+
+/// Run the module's `start` function if one is defined. Used by callers
+/// that instantiated with `defer_start = true`. Safe to call when no start
+/// function is present (no-op).
+///
+/// NOT idempotent: there is no `started` bit on `ModuleInstance`, so a
+/// second call will execute the start function again. Callers that need
+/// idempotency must track that themselves (e.g. `ComponentInstance` drains
+/// `pending_core_starts` exactly once from `linkImports`).
+pub fn runStartFunction(inst: *types.ModuleInstance) InstantiationError!void {
+    const module = inst.module;
+    const start_idx = module.start_function orelse return;
+    var env = ExecEnv.create(inst, 4096, inst.allocator) catch return error.StartFunctionFailed;
+    defer env.destroy();
+    interp.executeFunction(env, start_idx) catch return error.StartFunctionFailed;
 }
 
 /// Instantiate a module with host (native) functions from a comptime HostImports table.
@@ -56,7 +95,7 @@ pub fn instantiateWithHosts(
     allocator: std.mem.Allocator,
     comptime HostImportsT: type,
 ) InstantiationError!*types.ModuleInstance {
-    return instantiateImpl(module, allocator, null, HostImportsT);
+    return instantiateImpl(module, allocator, null, HostImportsT, false);
 }
 
 fn instantiateImpl(
@@ -64,6 +103,7 @@ fn instantiateImpl(
     allocator: std.mem.Allocator,
     import_ctx: ?ImportContext,
     comptime HostImportsT: ?type,
+    defer_start: bool,
 ) InstantiationError!*types.ModuleInstance {
     const has_non_func_imports =
         module.import_global_count > 0 or
@@ -229,9 +269,12 @@ fn instantiateImpl(
         @memset(inst.dropped_data, false);
     }
 
-    // Execute start function if present (§4.5.4 step 15)
-    if (module.start_function) |start_idx| {
-        if (start_idx >= module.import_function_count) {
+    // Execute start function if present (§4.5.4 step 15) unless deferred.
+    // The component-model instantiation path defers start so canon-lower
+    // trampoline host_funcs can be bound via `linkImports` before any
+    // core `(start ...)` directive fires (issue #308).
+    if (!defer_start) {
+        if (module.start_function) |start_idx| {
             var env = ExecEnv.create(inst, 4096, allocator) catch return error.StartFunctionFailed;
             defer env.destroy();
             interp.executeFunction(env, start_idx) catch return error.StartFunctionFailed;

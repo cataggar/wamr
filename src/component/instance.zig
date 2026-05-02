@@ -184,6 +184,11 @@ pub const ComponentInstance = struct {
     /// module instance; we keep the slice here so lifetimes are tied to the
     /// `ComponentInstance` and freed together on `deinit`.
     trampoline_ctxs: std.ArrayListUnmanaged(*executor_mod.ComponentTrampolineCtx) = .empty,
+    /// Pending core-module start functions whose execution was deferred
+    /// during `instantiate` so canon-lower trampoline `host_funcs` can be
+    /// bound by `linkImports` first. Drained by `linkImports` in core-instance
+    /// order; see `runDeferredCoreStarts` (issue #308).
+    pending_core_starts: std.ArrayListUnmanaged(*core_types.ModuleInstance) = .empty,
     /// Whether the start function has been executed.
     started: bool = false,
     /// Allocator for instance lifetime.
@@ -385,6 +390,17 @@ pub const ComponentInstance = struct {
     /// binding a `host_func` to an instance-typed import) fail with
     /// `error.ImportKindMismatch`. Pure `.type` imports are satisfied by the
     /// type system and require no runtime binding.
+    ///
+    /// Side effect: after binding, this drains `pending_core_starts` and
+    /// runs each deferred core-module `(start ...)` directive in original
+    /// declaration order. This means `linkImports` can return guest-trap
+    /// errors (surfaced as `error.StartFunctionFailed` plus a
+    /// `[component init trap] ...` line on stderr), and a failure leaves
+    /// the instance only partially started — callers should treat such an
+    /// instance as poisoned and `deinit` it. The deferral exists so that
+    /// trampoline `host_funcs` are bound before any `(start)` runs;
+    /// otherwise wasi-using `_initialize` traps with `HostFuncNotBound`
+    /// (issue #308).
     pub fn linkImports(
         self: *ComponentInstance,
         providers: std.StringHashMapUnmanaged(ImportBinding),
@@ -403,11 +419,55 @@ pub const ComponentInstance = struct {
         // Fill in trampoline host_funcs now that bindings are in place.
         // Each trampoline records the component func index it lowers; we
         // walk the component's imports to find the matching host binding.
+        //
+        // Note: `resolveComponentFuncToHostFunc` only resolves bindings of
+        // kind `.host_func` and `.host_instance.members.func`. Imports bound
+        // via `.component_export` (cross-component composition) leave the
+        // trampoline `host_func` unset, which would surface as
+        // `error.HostFuncNotBound` if a deferred core start calls them.
+        // Cross-component composition with deferred starts is not currently
+        // exercised by any caller; revisit when that combination is wired.
         for (self.trampoline_ctxs.items) |ctx| {
             if (resolveComponentFuncToHostFunc(self, self.component, ctx.component_func_idx)) |hf| {
                 ctx.host_func = hf;
             } else {
             }
+        }
+
+        // Now run any core-module `(start ...)` directives that were
+        // deferred during `instantiate`. Trampoline `host_funcs` are bound
+        // above, so wasi imports invoked from within `_initialize` etc.
+        // resolve correctly (issue #308).
+        try self.runDeferredCoreStarts();
+    }
+
+    /// Execute any core-module `(start ...)` directives whose dispatch was
+    /// deferred during `instantiate`, in the original core-instance order.
+    /// Drains `pending_core_starts`. Surfaces the underlying trap as
+    /// `error.StartFunctionFailed` (with the diagnostic on `env.host_trap`
+    /// preserved on the per-start `ExecEnv` printed by `callComponentFunc`
+    /// downstream — but for instantiation-time failures the diagnostic is
+    /// printed here so a failed `_initialize` doesn't masquerade as a
+    /// later runtime error).
+    fn runDeferredCoreStarts(self: *ComponentInstance) !void {
+        const inst_mod = @import("../runtime/interpreter/instance.zig");
+        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+        const interp = @import("../runtime/interpreter/interp.zig");
+        defer self.pending_core_starts.clearRetainingCapacity();
+
+        for (self.pending_core_starts.items) |mi| {
+            const start_idx = mi.module.start_function orelse continue;
+            const env = ExecEnv.create(mi, 4096, self.allocator) catch return error.OutOfMemory;
+            defer env.destroy();
+            interp.executeFunction(env, start_idx) catch {
+                if (env.host_trap) |ht| {
+                    std.debug.print(
+                        "[component init trap] core_func_idx={d} import='{s}.{s}' stage={s} error={s}\n",
+                        .{ ht.core_func_idx, ht.import_module_name, ht.import_field_name, @tagName(ht.stage), ht.err_name },
+                    );
+                }
+                return inst_mod.InstantiationError.StartFunctionFailed;
+            };
         }
     }
 
@@ -449,6 +509,7 @@ pub const ComponentInstance = struct {
             self.allocator.destroy(ctx);
         }
         self.trampoline_ctxs.deinit(self.allocator);
+        self.pending_core_starts.deinit(self.allocator);
         if (self.core_instances.len > 0) {
             const inst_mod = @import("../runtime/interpreter/instance.zig");
             for (self.core_instances) |entry| {
@@ -881,7 +942,13 @@ pub fn instantiate(
                                 .tables = tbls_buf,
                                 .globals = globs_buf,
                             };
-                            break :blk inst_mod.instantiateWithImports(module_ptr, allocator, ctx) catch {
+                            // Defer core `(start ...)` execution so canon-lower
+                            // trampoline `host_funcs` are bound by `linkImports`
+                            // before any start runs (issue #308).
+                            break :blk inst_mod.instantiateWithOptions(module_ptr, allocator, .{
+                                .import_ctx = ctx,
+                                .defer_start = true,
+                            }) catch {
                                 if (entries.len > 0) allocator.free(entries);
                                 if (imps_buf.len > 0) allocator.free(imps_buf);
                                 if (is_cross.len > 0) allocator.free(is_cross);
@@ -891,7 +958,9 @@ pub fn instantiate(
                                 continue;
                             };
                         }
-                        break :blk inst_mod.instantiate(module_ptr, allocator) catch {
+                        break :blk inst_mod.instantiateWithOptions(module_ptr, allocator, .{
+                            .defer_start = true,
+                        }) catch {
                             if (entries.len > 0) allocator.free(entries);
                             if (imps_buf.len > 0) allocator.free(imps_buf);
                             if (is_cross.len > 0) allocator.free(is_cross);
@@ -904,6 +973,18 @@ pub fn instantiate(
                     cis[ci_idx] = .{ .module_inst = mi };
 
                     if (entries.len > 0) inst_mod.attachHostFuncEntries(mi, entries);
+                    if (module_ptr.start_function != null) {
+                        inst.pending_core_starts.append(allocator, mi) catch {
+                            // OOM here is fatal — without the start running,
+                            // the component cannot reach a usable state.
+                            if (imps_buf.len > 0) allocator.free(imps_buf);
+                            if (is_cross.len > 0) allocator.free(is_cross);
+                            if (mems_buf.len > 0) allocator.free(mems_buf);
+                            if (tbls_buf.len > 0) allocator.free(tbls_buf);
+                            if (globs_buf.len > 0) allocator.free(globs_buf);
+                            return error.OutOfMemory;
+                        };
+                    }
                     {
                         var nset: u32 = 0;
                         for (entries) |e| if (e != null) { nset += 1; };
@@ -2351,4 +2432,87 @@ test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)
     const dotted = inst.getExport("wasi:cli/run@0.2.6/run") orelse return error.TestFailed;
     try std.testing.expectEqual(@as(u32, 0), dotted.core_instance_idx);
     try std.testing.expectEqual(@as(u32, 0), dotted.core_func_idx);
+}
+
+test "instantiate: core (start ...) calling canon-lowered host import sees bound host_func (#308)" {
+    const loader_mod = @import("loader.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Regression for #308. The fixture has a core module whose
+    // `(start ...)` directive calls a canon-lowered host import.
+    //   (component
+    //     (import "host:nop/run" (func $run (param "x" u32)))
+    //     (core module $A
+    //       (import "host" "f" (func $f (param i32)))
+    //       (start $start)
+    //       (func $start  i32.const 42  call $f))
+    //     (core func $f_low (canon lower (func $run)))
+    //     (core instance $args (export "f" (func $f_low)))
+    //     (core instance $a (instantiate $A (with "host" (instance $args)))))
+    //
+    // Before the deferred-start fix the (start) ran during instantiate(),
+    // before linkImports() bound the trampoline `host_func` — and trapped
+    // with `HostFuncNotBound`. After the fix, instantiate() defers the
+    // start; linkImports() binds the trampoline and then drains the
+    // pending starts, so the host fn is invoked with 42 exactly once.
+    const data = @embedFile("fixtures/h3-start-host-call.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    // ─ Before linkImports: the deferred start has NOT run yet.
+    try std.testing.expect(inst.pending_core_starts.items.len == 1);
+
+    const Host = struct {
+        var calls: u32 = 0;
+        var last_arg: u32 = 0;
+        fn run(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            args: []const abi_mod.InterfaceValue,
+            _: []abi_mod.InterfaceValue,
+            _: std.mem.Allocator,
+        ) anyerror!void {
+            calls += 1;
+            last_arg = args[0].u32;
+        }
+    };
+    Host.calls = 0;
+    Host.last_arg = 0;
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(std.testing.allocator);
+    try providers.put(std.testing.allocator, "host:nop/run", .{ .host_func = .{ .call = &Host.run } });
+
+    // linkImports binds the trampoline AND drains pending starts.
+    try inst.linkImports(providers);
+
+    try std.testing.expectEqual(@as(u32, 1), Host.calls);
+    try std.testing.expectEqual(@as(u32, 42), Host.last_arg);
+    try std.testing.expectEqual(@as(usize, 0), inst.pending_core_starts.items.len);
+}
+
+test "instantiate: core (start ...) calling host import without linkImports leaves start un-run (#308)" {
+    const loader_mod = @import("loader.zig");
+
+    // Same fixture — but the caller never invokes linkImports, so the
+    // pending start remains queued. We just verify that instantiate()
+    // alone does NOT trap and that the deferred start is observable.
+    // This is the contract `WasiCliAdapter.runLoadedComponent` relies on
+    // (instantiate must succeed even when the core start would call a
+    // not-yet-bound host import).
+    const data = @embedFile("fixtures/h3-start-host-call.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const component_owned = try loader_mod.load(data, arena.allocator());
+    var component = component_owned;
+
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), inst.pending_core_starts.items.len);
 }
