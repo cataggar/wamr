@@ -29,6 +29,7 @@ abort, or small-input OOM is a bug.
 | `fuzz-interp` | Interpreter load, instantiate, and bounded nullary export invocation | Loader/validation/instantiation errors, guest traps, fuel exhaustion, and unsupported signatures are OK. Panics, aborts, or result-stack shape mismatches are bugs. |
 | `fuzz-aot` | AOT compile, AOT loader, and instantiate path | Compile/instantiate errors are OK. The harness deliberately sets `invoke_start = false` and does not execute attacker-supplied start functions. |
 | `fuzz-diff` | Interpreter vs AOT result oracle for a statically safe straight-line scalar subset | Loader/instantiate errors, interpreter traps, fuel exhaustion, unsupported signatures, and exports whose bytecode is outside the safe subset are OK. A result-shape, tag, or value mismatch is saved as `diff-mismatch-<hash>.wasm` and is a bug. |
+| `fuzz-canon` | Canonical ABI lift and string codecs over attacker-controlled guest memory | Typed errors and silent zero-fill on out-of-bounds reads are OK. Panics, safety-checked UB, oversize allocations, or process aborts are bugs. |
 
 ## Local use
 
@@ -64,6 +65,23 @@ mkdir -p /tmp/wamr-interp-corpus /tmp/wamr-fuzz-crashes
 printf '\000asm\001\000\000\000\001\005\001\140\000\001\177\003\002\001\000\007\007\001\003run\000\000\012\006\001\004\000\101\052\013' > /tmp/wamr-interp-corpus/minimal-interp-run.wasm
 ./zig-out/bin/fuzz-interp --corpus /tmp/wamr-interp-corpus --crashes /tmp/wamr-fuzz-crashes --duration 5 --fuel 100000
 ```
+
+For `fuzz-canon` smoke (pointer/length and string-codec exercise):
+
+```sh
+rm -rf /tmp/wamr-canon-corpus /tmp/wamr-fuzz-crashes
+mkdir -p /tmp/wamr-canon-corpus /tmp/wamr-fuzz-crashes
+# mode=load_primitive, prim=string, ptr=0, len=8, body 16B.
+printf '\x00\x0e\x00\x00\x00\x00\x08\x00\x00\x00Hello, world!\x00\x00\x00' > /tmp/wamr-canon-corpus/seed-load-string.wasm
+# mode=validate_utf8, ptr=0, len=11, body "hello world".
+printf '\x01\x00\x00\x00\x00\x00\x0b\x00\x00\x00hello world' > /tmp/wamr-canon-corpus/seed-validate-utf8.wasm
+./zig-out/bin/fuzz-canon --corpus /tmp/wamr-canon-corpus --crashes /tmp/wamr-fuzz-crashes --duration 5
+```
+
+`fuzz-canon` reads a small fixed header from each input (`mode`, primitive
+selector, `ptr`, `len`) and treats the rest as guest memory. It exercises
+`canonical_abi.loadVal` for primitive types and the UTF-8/UTF-16/Latin-1
+string codecs against attacker-controlled bytes.
 
 The harnesses replay every `.wasm` file under `--corpus` until the duration
 expires. They are not coverage-guided mutators by themselves; use them as stable
@@ -111,9 +129,9 @@ touch runtime/compiler/component/fuzz code. The workflow:
 - uploads per-target corpus artifacts with 7-day retention;
 - fails the job when any crash artifact remains.
 
-Manual runs can choose `all`, `loader`, `component-loader`, `interp`, `aot`, or
-`diff`, set a per-target duration, and set the per-export interpreter fuel
-budget shared by `fuzz-interp` and `fuzz-diff`.
+Manual runs can choose `all`, `loader`, `component-loader`, `interp`, `aot`,
+`diff`, or `canon`, set a per-target duration, and set the per-export
+interpreter fuel budget shared by `fuzz-interp` and `fuzz-diff`.
 
 ## Current limitations and follow-ups
 
@@ -133,6 +151,17 @@ host-protection mechanism.
   exports, parameterized exports, native trap differential) needs subprocess
   isolation because the AOT runtime only converts traps to typed errors on
   Windows x86_64; on Linux/AArch64 a native AOT trap can terminate the host.
+- `fuzz-canon` exercises only primitive `loadVal` and the string codecs
+  (`validateUtf8`, `utf8ToUtf16`, `utf16ToUtf8`, `decodeLatin1Utf16`,
+  `encodeUtf16ToMem`). Compound types (record, variant, list, tuple, flags,
+  enum, option, result) and the storeVal round-trip are intentionally out of
+  scope here; covering them needs a controlled `TypeRegistry` builder driven
+  from the same input bytes.
+- WASI/component resource-table command-model fuzzing — descriptor lifecycle,
+  preopen escape checks, stream drops, socket option get/set on disconnected
+  sockets, and HTTP stream lifetimes — is a follow-up that needs a thin
+  test wrapper around `WasiCliAdapter` so the fuzzer can drive the host
+  surface without a guest module.
 - Direct WASI and component-adapter fuzzing needs a deterministic byte-command
   model for resource tables, paths, descriptors, sockets, HTTP streams, and
   guest-memory pointer/length pairs (#247).
