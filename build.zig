@@ -360,7 +360,7 @@ pub fn build(b: *std.Build) void {
         simd_bench_step.dependOn(&run_simd_bench.step);
     }
 
-    const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, component-loader, interp, aot, diff, canon)");
+    const fuzz_step = b.step("fuzz", "Build fuzz harnesses (loader, component-loader, interp, aot, diff, canon, wasi)");
     inline for (.{
         .{ .name = "loader", .file = "loader.zig", .needs_aot = false },
         .{ .name = "component-loader", .file = "component_loader.zig", .needs_aot = false },
@@ -368,6 +368,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "aot", .file = "aot.zig", .needs_aot = true },
         .{ .name = "diff", .file = "diff.zig", .needs_aot = true },
         .{ .name = "canon", .file = "canon.zig", .needs_aot = false },
+        .{ .name = "wasi", .file = "wasi.zig", .needs_aot = false },
     }) |tgt| {
         const fuzz_mod = b.createModule(.{
             .root_source_file = b.path("src/tests/fuzz/" ++ tgt.file),

@@ -19,7 +19,7 @@ on:
         required: false
         default: "100000"
       target:
-        description: "Fuzz target (all, loader, component-loader, interp, aot, diff, canon)"
+        description: "Fuzz target (all, loader, component-loader, interp, aot, diff, canon, wasi)"
         required: false
         default: "all"
   pull_request:
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [loader, component-loader, interp, aot, diff, canon]
+        target: [loader, component-loader, interp, aot, diff, canon, wasi]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -99,6 +99,14 @@ jobs:
             printf '\x00\x0e\x00\x00\x00\x00\x08\x00\x00\x00Hello, world!\x00\x00\x00' > .fuzz-corpus/${{ matrix.target }}/seed-load-string.wasm
             # mode=validate_utf8, ptr=0, len=11, body "hello world".
             printf '\x01\x00\x00\x00\x00\x00\x0b\x00\x00\x00hello world' > .fuzz-corpus/${{ matrix.target }}/seed-validate-utf8.wasm
+          fi
+          if [ "${{ matrix.target }}" = "wasi" ]; then
+            # validate-sandbox-path on "../escape" (op 0x08, len 0x09).
+            printf '\x08\x09../escape' > .fuzz-corpus/${{ matrix.target }}/seed-sandbox.wasm
+            # get-directories (op 0x07).
+            printf '\x07' > .fuzz-corpus/${{ matrix.target }}/seed-get-dirs.wasm
+            # get-type on handle 0 (op 0x00, handle byte 0x00).
+            printf '\x00\x00' > .fuzz-corpus/${{ matrix.target }}/seed-get-type.wasm
           fi
           ls .fuzz-corpus/${{ matrix.target }} | wc -l
 

@@ -30,6 +30,7 @@ abort, or small-input OOM is a bug.
 | `fuzz-aot` | AOT compile, AOT loader, and instantiate path | Compile/instantiate errors are OK. The harness deliberately sets `invoke_start = false` and does not execute attacker-supplied start functions. |
 | `fuzz-diff` | Interpreter vs AOT result oracle for a statically safe straight-line scalar subset | Loader/instantiate errors, interpreter traps, fuel exhaustion, unsupported signatures, and exports whose bytecode is outside the safe subset are OK. A result-shape, tag, or value mismatch is saved as `diff-mismatch-<hash>.wasm` and is a bug. |
 | `fuzz-canon` | Canonical ABI lift and string codecs over attacker-controlled guest memory | Typed errors and silent zero-fill on out-of-bounds reads are OK. Panics, safety-checked UB, oversize allocations, or process aborts are bugs. |
+| `fuzz-wasi` | `WasiCliAdapter` host bindings (filesystem descriptors, preopens, sandbox path validation, stream-drop) under a per-process temp preopen | Typed `result<_, error-code>` failures, reads/writes against bad handles, and rejected sandbox-escape paths are OK. Panics, aborts, allocator leaks, or any path resolution that escapes the temp root are bugs. No real network or arbitrary-fs IO. |
 
 ## Local use
 
@@ -90,6 +91,27 @@ entry points for CI and future mutation/generation infrastructure.
 `fuzz-interp` and `fuzz-diff` accept `--fuel <instructions>` as a per-export
 interpreter instruction budget. Fuel exhaustion is an expected outcome and is
 reported separately from a guest `unreachable` trap.
+
+For `fuzz-wasi` smoke (host-binding command model — no guest wasm executed):
+
+```sh
+rm -rf /tmp/wamr-wasi-corpus /tmp/wamr-fuzz-crashes
+mkdir -p /tmp/wamr-wasi-corpus /tmp/wamr-fuzz-crashes
+# op=validate-sandbox-path (0x08), len=9, "../escape".
+printf '\x08\x09../escape' > /tmp/wamr-wasi-corpus/seed-sandbox.wasm
+# op=get-directories (0x07).
+printf '\x07' > /tmp/wamr-wasi-corpus/seed-get-dirs.wasm
+./zig-out/bin/fuzz-wasi --corpus /tmp/wamr-wasi-corpus --crashes /tmp/wamr-fuzz-crashes --duration 5
+```
+
+`fuzz-wasi` decodes each input as a stream of bounded ops (op byte modulo
+the op count, then op-specific argument bytes) and dispatches each op
+against the bound host function on `WasiCliAdapter` looked up by its WIT
+member name (e.g. `[method]descriptor.open-at`). The descriptor table is
+seeded with one ephemeral preopen at `/tmp/fuzz-wasi-<pid>/` containing
+two small fixture files; the adapter, stub `ComponentInstance`, and stub
+guest memory are reconstructed each iteration so cross-input state
+cannot mask use-after-free or table-leak bugs.
 
 For `fuzz-diff` smoke with the same minimal seed:
 
@@ -201,6 +223,11 @@ host-protection mechanism.
   enum, option, result) and the storeVal round-trip are intentionally out of
   scope here; covering them needs a controlled `TypeRegistry` builder driven
   from the same input bytes.
+- `fuzz-wasi` covers Phase 1 of the WASI/component resource-table command
+  model: filesystem descriptor methods, preopens, and `validateSandboxPath`.
+  Explicit input/output stream allocation ops, sockets, and HTTP outgoing /
+  incoming streams are intentionally deferred to Phase 2/3 follow-up issues
+  so the scaffolding (stub `ComponentInstance` + invariants) lands first.
 - WASI/component resource-table command-model fuzzing — descriptor lifecycle,
   preopen escape checks, stream drops, socket option get/set on disconnected
   sockets, and HTTP stream lifetimes — is a follow-up that needs a thin
