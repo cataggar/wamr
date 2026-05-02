@@ -1779,6 +1779,47 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i8x16_abs,
+                    .i8x16_neg,
+                    .i16x8_abs,
+                    .i16x8_neg,
+                    .i32x4_abs,
+                    .i32x4_neg,
+                    .i64x2_abs,
+                    .i64x2_neg,
+                    => {
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const unary = ir.Inst.SimdUnary{
+                            .op = switch (simd_op) {
+                                .i8x16_abs,
+                                .i16x8_abs,
+                                .i32x4_abs,
+                                .i64x2_abs,
+                                => .abs,
+                                .i8x16_neg,
+                                .i16x8_neg,
+                                .i32x4_neg,
+                                .i64x2_neg,
+                                => .neg,
+                                else => unreachable,
+                            },
+                            .vector = vector,
+                        };
+                        const inst_op: ir.Inst.Op = switch (simd_op) {
+                            .i8x16_abs, .i8x16_neg => .{ .i8x16_unop = unary },
+                            .i16x8_abs, .i16x8_neg => .{ .i16x8_unop = unary },
+                            .i32x4_abs, .i32x4_neg => .{ .i32x4_unop = unary },
+                            .i64x2_abs, .i64x2_neg => .{ .i64x2_unop = unary },
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = inst_op,
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i32x4_add,
                     .i32x4_sub,
                     .i32x4_eq,
@@ -3582,6 +3623,99 @@ test "lower i64x2 scalar-count shift opcodes" {
     try std.testing.expectEqual(ir.IrType.i64, insts[7].type);
     try std.testing.expectEqual(insts[7].dest.?, insts[8].op.wrap_i64);
     try std.testing.expect(insts[9].op.ret != null);
+}
+
+test "lower integer SIMD abs and neg opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Family = enum { i8x16, i16x8, i32x4, i64x2 };
+    const Case = struct {
+        opcode: u32,
+        family: Family,
+        expected: ir.Inst.SimdUnaryOp,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0x60, .family = .i8x16, .expected = .abs },
+        .{ .opcode = 0x61, .family = .i8x16, .expected = .neg },
+        .{ .opcode = 0x80, .family = .i16x8, .expected = .abs },
+        .{ .opcode = 0x81, .family = .i16x8, .expected = .neg },
+        .{ .opcode = 0xA0, .family = .i32x4, .expected = .abs },
+        .{ .opcode = 0xA1, .family = .i32x4, .expected = .neg },
+        .{ .opcode = 0xC0, .family = .i64x2, .expected = .abs },
+        .{ .opcode = 0xC1, .family = .i64x2, .expected = .neg },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try appendSimd(&code, allocator, 0x0C); // v128.const
+    for ([_]u8{ 0x80, 0x81, 0x7F, 0x01 } ** 4) |byte| {
+        try code.append(allocator, byte);
+    }
+    for (cases) |case| {
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x1B); // i32x4.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 1 + cases.len + 2), insts.len);
+    var prev_dest = insts[0].dest.?;
+    for (cases, 0..) |case, idx| {
+        const inst = insts[1 + idx];
+        const un = switch (case.family) {
+            .i8x16 => inst.op.i8x16_unop,
+            .i16x8 => inst.op.i16x8_unop,
+            .i32x4 => inst.op.i32x4_unop,
+            .i64x2 => inst.op.i64x2_unop,
+        };
+        try std.testing.expectEqual(case.expected, un.op);
+        try std.testing.expectEqual(prev_dest, un.vector);
+        try std.testing.expectEqual(ir.IrType.v128, inst.type);
+        prev_dest = inst.dest.?;
+    }
+    const extract_idx = 1 + cases.len;
+    try std.testing.expectEqual(@as(u2, 0), insts[extract_idx].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[extract_idx + 1].op.ret != null);
 }
 
 test "lower i32x4 cmp and mul opcodes" {
