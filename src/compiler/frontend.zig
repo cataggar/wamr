@@ -1820,6 +1820,41 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i16x8_extadd_pairwise_i8x16_s,
+                    .i16x8_extadd_pairwise_i8x16_u,
+                    .i32x4_extadd_pairwise_i16x8_s,
+                    .i32x4_extadd_pairwise_i16x8_u,
+                    => {
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const extadd = ir.Inst.SimdExtAddPairwise{
+                            .sign = switch (simd_op) {
+                                .i16x8_extadd_pairwise_i8x16_s,
+                                .i32x4_extadd_pairwise_i16x8_s,
+                                => .signed,
+                                .i16x8_extadd_pairwise_i8x16_u,
+                                .i32x4_extadd_pairwise_i16x8_u,
+                                => .unsigned,
+                                else => unreachable,
+                            },
+                            .vector = vector,
+                        };
+                        const inst_op: ir.Inst.Op = switch (simd_op) {
+                            .i16x8_extadd_pairwise_i8x16_s,
+                            .i16x8_extadd_pairwise_i8x16_u,
+                            => .{ .i16x8_extadd_pairwise_i8x16 = extadd },
+                            .i32x4_extadd_pairwise_i16x8_s,
+                            .i32x4_extadd_pairwise_i16x8_u,
+                            => .{ .i32x4_extadd_pairwise_i16x8 = extadd },
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = inst_op,
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i32x4_add,
                     .i32x4_sub,
                     .i32x4_eq,
@@ -3710,6 +3745,93 @@ test "lower integer SIMD abs and neg opcodes" {
         };
         try std.testing.expectEqual(case.expected, un.op);
         try std.testing.expectEqual(prev_dest, un.vector);
+        try std.testing.expectEqual(ir.IrType.v128, inst.type);
+        prev_dest = inst.dest.?;
+    }
+    const extract_idx = 1 + cases.len;
+    try std.testing.expectEqual(@as(u2, 0), insts[extract_idx].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[extract_idx + 1].op.ret != null);
+}
+
+test "lower integer SIMD pairwise extended add opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Family = enum { i16_from_i8, i32_from_i16 };
+    const Case = struct {
+        opcode: u32,
+        family: Family,
+        expected: ir.Inst.SimdExtAddPairwiseSign,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0x7C, .family = .i16_from_i8, .expected = .signed },
+        .{ .opcode = 0x7D, .family = .i16_from_i8, .expected = .unsigned },
+        .{ .opcode = 0x7E, .family = .i32_from_i16, .expected = .signed },
+        .{ .opcode = 0x7F, .family = .i32_from_i16, .expected = .unsigned },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try appendSimd(&code, allocator, 0x0C); // v128.const
+    for ([_]u8{ 0x80, 0x7F, 0x01, 0xFF } ** 4) |byte| {
+        try code.append(allocator, byte);
+    }
+    for (cases) |case| {
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x1B); // i32x4.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 1 + cases.len + 2), insts.len);
+    var prev_dest = insts[0].dest.?;
+    for (cases, 0..) |case, idx| {
+        const inst = insts[1 + idx];
+        const op = switch (case.family) {
+            .i16_from_i8 => inst.op.i16x8_extadd_pairwise_i8x16,
+            .i32_from_i16 => inst.op.i32x4_extadd_pairwise_i16x8,
+        };
+        try std.testing.expectEqual(case.expected, op.sign);
+        try std.testing.expectEqual(prev_dest, op.vector);
         try std.testing.expectEqual(ir.IrType.v128, inst.type);
         prev_dest = inst.dest.?;
     }
