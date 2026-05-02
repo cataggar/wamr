@@ -307,6 +307,10 @@ pub const Inst = struct {
     pub const I16x8Op = enum {
         add,
         sub,
+        add_sat_s,
+        add_sat_u,
+        sub_sat_s,
+        sub_sat_u,
         eq,
         ne,
         lt_s,
@@ -318,6 +322,12 @@ pub const Inst = struct {
         ge_s,
         ge_u,
         mul,
+        q15mulr_sat_s,
+        min_s,
+        min_u,
+        max_s,
+        max_u,
+        avgr_u,
     };
 
     pub const I64x2Op = enum {

@@ -1885,6 +1885,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     },
                     .i16x8_add,
                     .i16x8_sub,
+                    .i16x8_add_sat_s,
+                    .i16x8_add_sat_u,
+                    .i16x8_sub_sat_s,
+                    .i16x8_sub_sat_u,
                     .i16x8_eq,
                     .i16x8_ne,
                     .i16x8_lt_s,
@@ -1896,6 +1900,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .i16x8_ge_s,
                     .i16x8_ge_u,
                     .i16x8_mul,
+                    .i16x8_q15mulr_sat_s,
+                    .i16x8_min_s,
+                    .i16x8_min_u,
+                    .i16x8_max_s,
+                    .i16x8_max_u,
+                    .i16x8_avgr_u,
                     => {
                         const rhs = safePop(&vreg_stack);
                         const lhs = safePop(&vreg_stack);
@@ -1903,6 +1913,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         const lane_op: ir.Inst.I16x8Op = switch (simd_op) {
                             .i16x8_add => .add,
                             .i16x8_sub => .sub,
+                            .i16x8_add_sat_s => .add_sat_s,
+                            .i16x8_add_sat_u => .add_sat_u,
+                            .i16x8_sub_sat_s => .sub_sat_s,
+                            .i16x8_sub_sat_u => .sub_sat_u,
                             .i16x8_eq => .eq,
                             .i16x8_ne => .ne,
                             .i16x8_lt_s => .lt_s,
@@ -1914,6 +1928,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .i16x8_ge_s => .ge_s,
                             .i16x8_ge_u => .ge_u,
                             .i16x8_mul => .mul,
+                            .i16x8_q15mulr_sat_s => .q15mulr_sat_s,
+                            .i16x8_min_s => .min_s,
+                            .i16x8_min_u => .min_u,
+                            .i16x8_max_s => .max_s,
+                            .i16x8_max_u => .max_u,
+                            .i16x8_avgr_u => .avgr_u,
                             else => unreachable,
                         };
                         try ir_func.getBlock(current_block).append(.{
@@ -3778,9 +3798,19 @@ test "lower i16x8 cmp and arithmetic opcodes" {
         .{ .opcode = 0x34, .expected = .le_u },
         .{ .opcode = 0x35, .expected = .ge_s },
         .{ .opcode = 0x36, .expected = .ge_u },
+        .{ .opcode = 0x82, .expected = .q15mulr_sat_s },
         .{ .opcode = 0x8E, .expected = .add },
+        .{ .opcode = 0x8F, .expected = .add_sat_s },
+        .{ .opcode = 0x90, .expected = .add_sat_u },
         .{ .opcode = 0x91, .expected = .sub },
+        .{ .opcode = 0x92, .expected = .sub_sat_s },
+        .{ .opcode = 0x93, .expected = .sub_sat_u },
         .{ .opcode = 0x95, .expected = .mul },
+        .{ .opcode = 0x96, .expected = .min_s },
+        .{ .opcode = 0x97, .expected = .min_u },
+        .{ .opcode = 0x98, .expected = .max_s },
+        .{ .opcode = 0x99, .expected = .max_u },
+        .{ .opcode = 0x9B, .expected = .avgr_u },
     };
 
     const appendULEB = struct {
