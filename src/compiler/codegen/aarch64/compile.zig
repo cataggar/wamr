@@ -568,6 +568,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i8x16_shift,
         .i8x16_splat,
         .i8x16_replace_lane,
+        .i8x16_narrow_i16x8,
         .i16x8_binop,
         .i16x8_unop,
         .i16x8_extadd_pairwise_i8x16,
@@ -576,6 +577,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_replace_lane,
+        .i16x8_narrow_i32x4,
         .i64x2_binop,
         .i64x2_unop,
         .i64x2_extend_i32x4,
@@ -615,6 +617,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i8x16_shift,
                 .i8x16_splat,
                 .i8x16_replace_lane,
+                .i8x16_narrow_i16x8,
                 .i16x8_binop,
                 .i16x8_unop,
                 .i16x8_extadd_pairwise_i8x16,
@@ -623,6 +626,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i16x8_shift,
                 .i16x8_splat,
                 .i16x8_replace_lane,
+                .i16x8_narrow_i32x4,
                 .i64x2_binop,
                 .i64x2_unop,
                 .i64x2_extend_i32x4,
@@ -1417,6 +1421,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i8x16_splat,
         .i8x16_extract_lane,
         .i8x16_replace_lane,
+        .i8x16_narrow_i16x8,
         .i16x8_binop,
         .i16x8_unop,
         .i16x8_extadd_pairwise_i8x16,
@@ -1426,6 +1431,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i16x8_splat,
         .i16x8_extract_lane,
         .i16x8_replace_lane,
+        .i16x8_narrow_i32x4,
         .i64x2_binop,
         .i64x2_unop,
         .i64x2_extend_i32x4,
@@ -1595,6 +1601,7 @@ fn compileInst(
         .i8x16_splat => |src| try emitI8x16Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i8x16_extract_lane => |lane| try emitI8x16ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
         .i8x16_replace_lane => |lane| try emitI8x16ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
+        .i8x16_narrow_i16x8 => |op| try emitI8x16NarrowI16x8(code, inst, op, v128_map, v128_cache, fctx),
         .i16x8_binop => |bin| try emitI16x8BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i16x8_unop => |un| try emitI16x8UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .i16x8_extadd_pairwise_i8x16 => |op| try emitI16x8ExtAddPairwiseI8x16(code, inst, op, v128_map, v128_cache, fctx),
@@ -1604,6 +1611,7 @@ fn compileInst(
         .i16x8_splat => |src| try emitI16x8Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .i16x8_extract_lane => |lane| try emitI16x8ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
         .i16x8_replace_lane => |lane| try emitI16x8ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
+        .i16x8_narrow_i32x4 => |op| try emitI16x8NarrowI32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i64x2_binop => |bin| try emitI64x2BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i64x2_unop => |un| try emitI64x2UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .i64x2_extend_i32x4 => |op| try emitI64x2ExtendI32x4(code, inst, op, v128_map, v128_cache, fctx),
@@ -2276,6 +2284,75 @@ fn emitI64x2ExtMulI32x4(
         .high => switch (op.sign) {
             .signed => try code.smull2_2d4s(dest_reg, lhs_reg, rhs_reg),
             .unsigned => try code.umull2_2d4s(dest_reg, lhs_reg, rhs_reg),
+        },
+    }
+}
+
+fn emitI8x16NarrowI16x8(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdNarrow,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, op.lhs, null);
+    const rhs_reg = if (op.rhs == op.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.rhs, lhs_reg);
+    const dest = inst.dest orelse return;
+    // XTN writes Vd's low 64 bits and zeroes the upper; XTN2 then writes the
+    // upper 64 bits while preserving the low half. The XTN2 reads rhs after
+    // dest has been written, so dest_reg must NOT alias rhs_reg.
+    const dest_reg = if (op.rhs == op.lhs)
+        try v128_cache.defineFresh(code, v128_map, dest, lhs_reg)
+    else blk: {
+        try v128_cache.prepareOverwrite(code, v128_map, lhs_reg, isCurrentKill(fctx, op.lhs));
+        try v128_cache.defineInReg(v128_map, dest, lhs_reg);
+        break :blk lhs_reg;
+    };
+    switch (op.sign) {
+        .signed => {
+            try code.sqxtn8b8h(dest_reg, lhs_reg);
+            try code.sqxtn2_16b8h(dest_reg, rhs_reg);
+        },
+        .unsigned => {
+            try code.sqxtun8b8h(dest_reg, lhs_reg);
+            try code.sqxtun2_16b8h(dest_reg, rhs_reg);
+        },
+    }
+}
+
+fn emitI16x8NarrowI32x4(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdNarrow,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, op.lhs, null);
+    const rhs_reg = if (op.rhs == op.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.rhs, lhs_reg);
+    const dest = inst.dest orelse return;
+    const dest_reg = if (op.rhs == op.lhs)
+        try v128_cache.defineFresh(code, v128_map, dest, lhs_reg)
+    else blk: {
+        try v128_cache.prepareOverwrite(code, v128_map, lhs_reg, isCurrentKill(fctx, op.lhs));
+        try v128_cache.defineInReg(v128_map, dest, lhs_reg);
+        break :blk lhs_reg;
+    };
+    switch (op.sign) {
+        .signed => {
+            try code.sqxtn4h4s(dest_reg, lhs_reg);
+            try code.sqxtn2_8h4s(dest_reg, rhs_reg);
+        },
+        .unsigned => {
+            try code.sqxtun4h4s(dest_reg, lhs_reg);
+            try code.sqxtun2_8h4s(dest_reg, rhs_reg);
         },
     }
 }
@@ -6782,6 +6859,77 @@ test "compile: integer SIMD widening multiply low/high ops emit NEON instruction
         .{ .mask = 0xFFE0FC00, .base = 0x2EA0C000, .name = "umull2d2s" },
         .{ .mask = 0xFFE0FC00, .base = 0x4EA0C000, .name = "smull2_2d4s" },
         .{ .mask = 0xFFE0FC00, .base = 0x6EA0C000, .name = "umull2_2d4s" },
+    };
+
+    inline for (expected) |e| {
+        var found = false;
+        var i: usize = 0;
+        while (i + 4 <= code.len) : (i += 4) {
+            const w = std.mem.readInt(u32, code[i..][0..4], .little);
+            if ((w & e.mask) == e.base) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("missing NEON op {s} (base 0x{X})\n", .{ e.name, e.base });
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "compile: integer SIMD narrow saturating ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const lhs = func.newVReg();
+    const rhs = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8001_7FFE_8000_7FFF_0180_7F80_01FF_8001 }, .dest = lhs, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x1234_5678_9ABC_DEF0_0123_4567_89AB_CDEF }, .dest = rhs, .type = .v128 });
+
+    const signs = [_]ir.Inst.SimdNarrowSign{ .signed, .unsigned };
+
+    inline for (.{ "i8x16_narrow_i16x8", "i16x8_narrow_i32x4" }) |op_name| {
+        for (signs) |sign| {
+            const dest = func.newVReg();
+            try func.getBlock(bid).append(.{
+                .op = @unionInit(ir.Inst.Op, op_name, .{ .sign = sign, .lhs = lhs, .rhs = rhs }),
+                .dest = dest,
+                .type = .v128,
+            });
+        }
+    }
+
+    // Force a use so the narrow results aren't dead-code-eliminated; pick the
+    // last one through an extract.
+    const last_narrow = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .i16x8_narrow_i32x4 = .{ .sign = .unsigned, .lhs = lhs, .rhs = rhs } },
+        .dest = last_narrow,
+        .type = .v128,
+    });
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = last_narrow, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    const expected = [_]struct { mask: u32, base: u32, name: []const u8 }{
+        .{ .mask = 0xFFFFFC00, .base = 0x0E214800, .name = "sqxtn8b8h" },
+        .{ .mask = 0xFFFFFC00, .base = 0x4E214800, .name = "sqxtn2_16b8h" },
+        .{ .mask = 0xFFFFFC00, .base = 0x2E212800, .name = "sqxtun8b8h" },
+        .{ .mask = 0xFFFFFC00, .base = 0x6E212800, .name = "sqxtun2_16b8h" },
+        .{ .mask = 0xFFFFFC00, .base = 0x0E614800, .name = "sqxtn4h4s" },
+        .{ .mask = 0xFFFFFC00, .base = 0x4E614800, .name = "sqxtn2_8h4s" },
+        .{ .mask = 0xFFFFFC00, .base = 0x2E612800, .name = "sqxtun4h4s" },
+        .{ .mask = 0xFFFFFC00, .base = 0x6E612800, .name = "sqxtun2_8h4s" },
     };
 
     inline for (expected) |e| {
