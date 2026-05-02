@@ -71,21 +71,25 @@ pub const Inst = struct {
         v128_not: VReg,
         v128_bitwise: V128Bitwise,
         i32x4_binop: I32x4BinOp,
+        i32x4_unop: SimdUnary,
         i32x4_shift: I32x4Shift,
         i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
         i32x4_replace_lane: I32x4ReplaceLane,
         i8x16_binop: I8x16BinOp,
+        i8x16_unop: SimdUnary,
         i8x16_shift: I8x16Shift,
         i8x16_splat: VReg,
         i8x16_extract_lane: I8x16ExtractLane,
         i8x16_replace_lane: I8x16ReplaceLane,
         i16x8_binop: I16x8BinOp,
+        i16x8_unop: SimdUnary,
         i16x8_shift: I16x8Shift,
         i16x8_splat: VReg,
         i16x8_extract_lane: I16x8ExtractLane,
         i16x8_replace_lane: I16x8ReplaceLane,
         i64x2_binop: I64x2BinOp,
+        i64x2_unop: SimdUnary,
         i64x2_shift: I64x2Shift,
         i64x2_splat: VReg,
         i64x2_extract_lane: I64x2ExtractLane,
@@ -263,6 +267,7 @@ pub const Inst = struct {
     pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };
 
     pub const V128BitwiseOp = enum { @"and", andnot, @"or", xor };
+    pub const SimdUnaryOp = enum { abs, neg };
 
     pub const I32x4Op = enum {
         add,
@@ -390,6 +395,11 @@ pub const Inst = struct {
         op: V128BitwiseOp,
         lhs: VReg,
         rhs: VReg,
+    };
+
+    pub const SimdUnary = struct {
+        op: SimdUnaryOp,
+        vector: VReg,
     };
 
     pub const I32x4BinOp = struct {
@@ -689,6 +699,14 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(VReg, 8), shift.op.i32x4_shift.vector);
     try std.testing.expectEqual(@as(VReg, 9), shift.op.i32x4_shift.count);
 
+    const i32_un = Inst{
+        .op = .{ .i32x4_unop = .{ .op = .abs, .vector = 10 } },
+        .dest = 11,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdUnaryOp.abs, i32_un.op.i32x4_unop.op);
+    try std.testing.expectEqual(@as(VReg, 10), i32_un.op.i32x4_unop.vector);
+
     const i8_bin = Inst{
         .op = .{ .i8x16_binop = .{ .op = .sub, .lhs = 11, .rhs = 12 } },
         .dest = 13,
@@ -705,6 +723,14 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.I8x16ShiftOp.shr_s, i8_shift.op.i8x16_shift.op);
     try std.testing.expectEqual(@as(VReg, 13), i8_shift.op.i8x16_shift.vector);
     try std.testing.expectEqual(@as(VReg, 14), i8_shift.op.i8x16_shift.count);
+
+    const i8_un = Inst{
+        .op = .{ .i8x16_unop = .{ .op = .neg, .vector = 15 } },
+        .dest = 16,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdUnaryOp.neg, i8_un.op.i8x16_unop.op);
+    try std.testing.expectEqual(@as(VReg, 15), i8_un.op.i8x16_unop.vector);
 
     const i8_extract = Inst{
         .op = .{ .i8x16_extract_lane = .{ .vector = 13, .lane = 15, .sign = .unsigned } },
@@ -740,6 +766,14 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(VReg, 18), i16_shift.op.i16x8_shift.vector);
     try std.testing.expectEqual(@as(VReg, 19), i16_shift.op.i16x8_shift.count);
 
+    const i16_un = Inst{
+        .op = .{ .i16x8_unop = .{ .op = .abs, .vector = 20 } },
+        .dest = 21,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdUnaryOp.abs, i16_un.op.i16x8_unop.op);
+    try std.testing.expectEqual(@as(VReg, 20), i16_un.op.i16x8_unop.vector);
+
     const i16_extract = Inst{
         .op = .{ .i16x8_extract_lane = .{ .vector = 18, .lane = 5, .sign = .signed } },
         .dest = 21,
@@ -765,6 +799,14 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.I64x2ShiftOp.shr_u, i64_shift.op.i64x2_shift.op);
     try std.testing.expectEqual(@as(VReg, 22), i64_shift.op.i64x2_shift.vector);
     try std.testing.expectEqual(@as(VReg, 23), i64_shift.op.i64x2_shift.count);
+
+    const i64_un = Inst{
+        .op = .{ .i64x2_unop = .{ .op = .neg, .vector = 24 } },
+        .dest = 25,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdUnaryOp.neg, i64_un.op.i64x2_unop.op);
+    try std.testing.expectEqual(@as(VReg, 24), i64_un.op.i64x2_unop.vector);
 
     const i64_bin = Inst{
         .op = .{ .i64x2_binop = .{ .op = .gt_s, .lhs = 23, .rhs = 24 } },

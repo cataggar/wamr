@@ -143,10 +143,12 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .i32x4_unop => |un| list.append(un.vector),
         .i8x16_binop => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .i8x16_unop => |un| list.append(un.vector),
         .i8x16_shift => |shift| {
             list.append(shift.vector);
             list.append(shift.count);
@@ -155,10 +157,12 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .i16x8_unop => |un| list.append(un.vector),
         .i64x2_binop => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .i64x2_unop => |un| list.append(un.vector),
         .i64x2_shift => |shift| {
             list.append(shift.vector);
             list.append(shift.count);
@@ -429,9 +433,15 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
         },
+        .i32x4_unop => |*un| if (un.vector == old) {
+            un.vector = new;
+        },
         .i8x16_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
+        },
+        .i8x16_unop => |*un| if (un.vector == old) {
+            un.vector = new;
         },
         .i8x16_shift => |*shift| {
             if (shift.vector == old) shift.vector = new;
@@ -441,9 +451,15 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
         },
+        .i16x8_unop => |*un| if (un.vector == old) {
+            un.vector = new;
+        },
         .i64x2_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
+        },
+        .i64x2_unop => |*un| if (un.vector == old) {
+            un.vector = new;
         },
         .i64x2_shift => |*shift| {
             if (shift.vector == old) shift.vector = new;
@@ -1714,21 +1730,25 @@ fn isPure(inst: ir.Inst) bool {
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
+        .i32x4_unop,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
         .i8x16_binop,
+        .i8x16_unop,
         .i8x16_shift,
         .i8x16_splat,
         .i8x16_extract_lane,
         .i8x16_replace_lane,
         .i16x8_binop,
+        .i16x8_unop,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_extract_lane,
         .i16x8_replace_lane,
         .i64x2_binop,
+        .i64x2_unop,
         .i64x2_shift,
         .i64x2_splat,
         .i64x2_extract_lane,
@@ -1823,21 +1843,25 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .v128_not => |v| v == b.op.v128_not,
         .v128_bitwise => |bin| bin.op == b.op.v128_bitwise.op and bin.lhs == b.op.v128_bitwise.lhs and bin.rhs == b.op.v128_bitwise.rhs,
         .i32x4_binop => |bin| bin.op == b.op.i32x4_binop.op and bin.lhs == b.op.i32x4_binop.lhs and bin.rhs == b.op.i32x4_binop.rhs,
+        .i32x4_unop => |un| un.op == b.op.i32x4_unop.op and un.vector == b.op.i32x4_unop.vector,
         .i32x4_shift => |shift| shift.op == b.op.i32x4_shift.op and shift.vector == b.op.i32x4_shift.vector and shift.count == b.op.i32x4_shift.count,
         .i32x4_splat => |v| v == b.op.i32x4_splat,
         .i32x4_extract_lane => |lane| lane.vector == b.op.i32x4_extract_lane.vector and lane.lane == b.op.i32x4_extract_lane.lane,
         .i32x4_replace_lane => |lane| lane.vector == b.op.i32x4_replace_lane.vector and lane.val == b.op.i32x4_replace_lane.val and lane.lane == b.op.i32x4_replace_lane.lane,
         .i8x16_binop => |bin| bin.op == b.op.i8x16_binop.op and bin.lhs == b.op.i8x16_binop.lhs and bin.rhs == b.op.i8x16_binop.rhs,
+        .i8x16_unop => |un| un.op == b.op.i8x16_unop.op and un.vector == b.op.i8x16_unop.vector,
         .i8x16_shift => |shift| shift.op == b.op.i8x16_shift.op and shift.vector == b.op.i8x16_shift.vector and shift.count == b.op.i8x16_shift.count,
         .i8x16_splat => |v| v == b.op.i8x16_splat,
         .i8x16_extract_lane => |lane| lane.vector == b.op.i8x16_extract_lane.vector and lane.lane == b.op.i8x16_extract_lane.lane and lane.sign == b.op.i8x16_extract_lane.sign,
         .i8x16_replace_lane => |lane| lane.vector == b.op.i8x16_replace_lane.vector and lane.val == b.op.i8x16_replace_lane.val and lane.lane == b.op.i8x16_replace_lane.lane,
         .i16x8_binop => |bin| bin.op == b.op.i16x8_binop.op and bin.lhs == b.op.i16x8_binop.lhs and bin.rhs == b.op.i16x8_binop.rhs,
+        .i16x8_unop => |un| un.op == b.op.i16x8_unop.op and un.vector == b.op.i16x8_unop.vector,
         .i16x8_shift => |shift| shift.op == b.op.i16x8_shift.op and shift.vector == b.op.i16x8_shift.vector and shift.count == b.op.i16x8_shift.count,
         .i16x8_splat => |v| v == b.op.i16x8_splat,
         .i16x8_extract_lane => |lane| lane.vector == b.op.i16x8_extract_lane.vector and lane.lane == b.op.i16x8_extract_lane.lane and lane.sign == b.op.i16x8_extract_lane.sign,
         .i16x8_replace_lane => |lane| lane.vector == b.op.i16x8_replace_lane.vector and lane.val == b.op.i16x8_replace_lane.val and lane.lane == b.op.i16x8_replace_lane.lane,
         .i64x2_binop => |bin| bin.op == b.op.i64x2_binop.op and bin.lhs == b.op.i64x2_binop.lhs and bin.rhs == b.op.i64x2_binop.rhs,
+        .i64x2_unop => |un| un.op == b.op.i64x2_unop.op and un.vector == b.op.i64x2_unop.vector,
         .i64x2_shift => |shift| shift.op == b.op.i64x2_shift.op and shift.vector == b.op.i64x2_shift.vector and shift.count == b.op.i64x2_shift.count,
         .i64x2_splat => |v| v == b.op.i64x2_splat,
         .i64x2_extract_lane => |lane| lane.vector == b.op.i64x2_extract_lane.vector and lane.lane == b.op.i64x2_extract_lane.lane,
@@ -3297,10 +3321,12 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             bin.lhs += offset;
             bin.rhs += offset;
         },
+        .i32x4_unop => |*un| un.vector += offset,
         .i8x16_binop => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;
         },
+        .i8x16_unop => |*un| un.vector += offset,
         .i8x16_shift => |*shift| {
             shift.vector += offset;
             shift.count += offset;
@@ -3309,10 +3335,12 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             bin.lhs += offset;
             bin.rhs += offset;
         },
+        .i16x8_unop => |*un| un.vector += offset,
         .i64x2_binop => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;
         },
+        .i64x2_unop => |*un| un.vector += offset,
         .i64x2_shift => |*shift| {
             shift.vector += offset;
             shift.count += offset;

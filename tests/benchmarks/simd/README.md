@@ -43,6 +43,8 @@ The `simd_i64x2_mem_add_4k_loop` row is the 64-bit lane counterpart to the integ
 
 The `simd_i64x2_shift_mix_4k_loop` row is the 64-bit dynamic-shift counterpart to the narrower shift probes. Each loop iteration derives scalar counts from the vector index, exercises `i64x2.shl`, `i64x2.shr_u`, and `i64x2.shr_s`, stores a vector result, then extracts and wraps an `i64` checksum lane. The derived counts intentionally exceed 64 so AOT modulo-64 count masking is covered.
 
+The `simd_int_absneg_4k_loop` row exercises integer SIMD unary absolute-value and negation across byte, halfword, word, and doubleword lane views. It uses high-bit input data, applies `abs`/`neg` pairs over two 4 KiB vectors, combines the results with `v128.xor`, stores the output, and returns one scalar checksum lane.
+
 The small `simd_i32x4_*_lane0`, `simd_i16x8_*_lane0`, `simd_i8x16_*`, and `simd_i64x2_*` rows are coverage/status probes for individual opcode families. They intentionally return one scalar lane so interpreter, AOT, and optional Wasmtime rows can be compared before the runtime supports direct exported v128 values. The i16x8 and i8x16 comparison and replace-lane rows cover signed vs unsigned extraction of all-ones masks and high-bit lane values; the i64x2 rows wrap extracted i64 lanes to i32 for the exported checksum.
 
 Wasmtime can be included as an external baseline:

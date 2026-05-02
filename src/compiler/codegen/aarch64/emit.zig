@@ -874,6 +874,13 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// ABS Vd.2D, Vn.2D.
+    pub fn abs2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4EE0B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// NEG Vd.2D, Vn.2D.
     pub fn neg2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x6EE0B800 |
@@ -893,6 +900,13 @@ pub const CodeBuffer = struct {
     pub fn ushl4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x6EA04400 |
             (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// ABS Vd.4S, Vn.4S.
+    pub fn abs4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4EA0B800 |
             (@as(u32, vn) << 5) |
             vd);
     }
@@ -920,6 +934,13 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// ABS Vd.8H, Vn.8H.
+    pub fn abs8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4E60B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// NEG Vd.8H, Vn.8H.
     pub fn neg8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x6E60B800 |
@@ -939,6 +960,13 @@ pub const CodeBuffer = struct {
     pub fn ushl16b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x6E204400 |
             (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// ABS Vd.16B, Vn.16B.
+    pub fn abs16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4E20B800 |
             (@as(u32, vn) << 5) |
             vd);
     }
@@ -2287,6 +2315,57 @@ test "emit: i8x16 variable shifts" {
         defer code.deinit();
         try code.ushl16b(20, 21, 30);
         try expectWord(0x6E3E46B4, &code);
+    }
+}
+
+test "emit: integer SIMD abs and neg ops" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.abs16b(16, 17);
+        try expectWord(0x4E20BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg16b(16, 17);
+        try expectWord(0x6E20BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.abs8h(16, 17);
+        try expectWord(0x4E60BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg8h(16, 17);
+        try expectWord(0x6E60BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.abs4s(16, 17);
+        try expectWord(0x4EA0BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg4s(16, 17);
+        try expectWord(0x6EA0BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.abs2d(16, 17);
+        try expectWord(0x4EE0BA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.neg2d(16, 17);
+        try expectWord(0x6EE0BA30, &code);
     }
 }
 

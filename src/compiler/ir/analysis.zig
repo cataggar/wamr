@@ -184,10 +184,12 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
         },
+        .i32x4_unop => |un| live.put(un.vector, {}) catch {},
         .i8x16_binop => |bin| {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
         },
+        .i8x16_unop => |un| live.put(un.vector, {}) catch {},
         .i8x16_shift => |shift| {
             live.put(shift.vector, {}) catch {};
             live.put(shift.count, {}) catch {};
@@ -196,10 +198,12 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
         },
+        .i16x8_unop => |un| live.put(un.vector, {}) catch {},
         .i64x2_binop => |bin| {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
         },
+        .i64x2_unop => |un| live.put(un.vector, {}) catch {},
         .i64x2_shift => |shift| {
             live.put(shift.vector, {}) catch {};
             live.put(shift.count, {}) catch {};
@@ -550,10 +554,12 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
         },
+        .i32x4_unop => |un| last_use.put(un.vector, pos) catch {},
         .i8x16_binop => |bin| {
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
         },
+        .i8x16_unop => |un| last_use.put(un.vector, pos) catch {},
         .i8x16_shift => |shift| {
             last_use.put(shift.vector, pos) catch {};
             last_use.put(shift.count, pos) catch {};
@@ -562,10 +568,12 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
         },
+        .i16x8_unop => |un| last_use.put(un.vector, pos) catch {},
         .i64x2_binop => |bin| {
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
         },
+        .i64x2_unop => |un| last_use.put(un.vector, pos) catch {},
         .i64x2_shift => |shift| {
             last_use.put(shift.vector, pos) catch {};
             last_use.put(shift.count, pos) catch {};

@@ -235,21 +235,25 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
+        .i32x4_unop,
         .i32x4_shift,
         .i32x4_splat,
         .i32x4_extract_lane,
         .i32x4_replace_lane,
         .i8x16_binop,
+        .i8x16_unop,
         .i8x16_shift,
         .i8x16_splat,
         .i8x16_extract_lane,
         .i8x16_replace_lane,
         .i16x8_binop,
+        .i16x8_unop,
         .i16x8_shift,
         .i16x8_splat,
         .i16x8_extract_lane,
         .i16x8_replace_lane,
         .i64x2_binop,
+        .i64x2_unop,
         .i64x2_shift,
         .i64x2_splat,
         .i64x2_extract_lane,
@@ -500,10 +504,12 @@ pub fn forEachUse(
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .i32x4_unop => |un| try visit(context, un.vector),
         .i8x16_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .i8x16_unop => |un| try visit(context, un.vector),
         .i8x16_shift => |shift| {
             try visit(context, shift.vector);
             try visit(context, shift.count);
@@ -512,10 +518,12 @@ pub fn forEachUse(
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .i16x8_unop => |un| try visit(context, un.vector),
         .i64x2_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .i64x2_unop => |un| try visit(context, un.vector),
         .i64x2_shift => |shift| {
             try visit(context, shift.vector);
             try visit(context, shift.count);
