@@ -83,6 +83,9 @@ jobs:
           if [ -d tests/spec-json ]; then
             find tests/spec-json -maxdepth 1 -name '*.wasm' -exec cp -n {} .fuzz-corpus/${{ matrix.target }}/ \; || true
           fi
+          if [ -d tests/fuzz/regression/${{ matrix.target }} ]; then
+            cp -n tests/fuzz/regression/${{ matrix.target }}/*.wasm .fuzz-corpus/${{ matrix.target }}/ 2>/dev/null || true
+          fi
           if [ "${{ matrix.target }}" = "component-loader" ]; then
             # Minimal component: "\0asm" plus version/layer 0x0001000d.
             printf '\000asm\015\000\001\000' > .fuzz-corpus/${{ matrix.target }}/minimal-component.wasm
