@@ -29,6 +29,8 @@ The `simd_i16x8_mem_add_4k_loop` row is the 16-bit lane counterpart to the i32x4
 
 The `simd_i16x8_shift_mix_4k_loop` row is the 16-bit dynamic-shift counterpart to the i32x4 shift probe. Each loop iteration derives scalar counts from the loop index, exercises `i16x8.shl`, `i16x8.shr_u`, and `i16x8.shr_s`, stores a vector result, and returns one unsigned 16-bit checksum lane.
 
+The `simd_i16x8_arith_extra_4k_loop` row extends the halfword-lane memory probe with Q15 saturating rounded multiply, saturated add/subtract, signed/unsigned min/max, and unsigned rounding average operations. It uses high-bit halfword data so signed and unsigned arithmetic paths produce distinct checksums.
+
 The `simd_i8x16_mem_add_4k_loop` row is the byte-lane memory-add probe. It walks the same 4 KiB input shape as the wider-lane rows using packed unsigned bytes, `v128.load`, wrapping `i8x16.add`, and `v128.store`, then returns the final byte lane as an unsigned scalar checksum.
 
 The `simd_i8x16_shift_mix_4k_loop` row is the byte-lane dynamic-shift counterpart to the i16/i32 shift probes. Each loop iteration derives scalar counts from the vector index, exercises `i8x16.shl`, `i8x16.shr_u`, and `i8x16.shr_s`, stores a vector result, and returns one unsigned byte checksum lane. The derived counts intentionally exceed 8 so AOT modulo-8 count masking is covered.
