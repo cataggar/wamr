@@ -19,7 +19,7 @@ on:
         required: false
         default: "100000"
       target:
-        description: "Fuzz target (all, loader, component-loader, interp, aot, diff)"
+        description: "Fuzz target (all, loader, component-loader, interp, aot, diff, canon)"
         required: false
         default: "all"
   pull_request:
@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [loader, component-loader, interp, aot, diff]
+        target: [loader, component-loader, interp, aot, diff, canon]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -90,6 +90,12 @@ jobs:
           if [ "${{ matrix.target }}" = "interp" ] || [ "${{ matrix.target }}" = "diff" ]; then
             # Minimal core module exporting `run: () -> i32`.
             printf '\000asm\001\000\000\000\001\005\001\140\000\001\177\003\002\001\000\007\007\001\003run\000\000\012\006\001\004\000\101\052\013' > .fuzz-corpus/${{ matrix.target }}/minimal-interp-run.wasm
+          fi
+          if [ "${{ matrix.target }}" = "canon" ]; then
+            # Header: mode=load_primitive, prim=string, ptr=0, len=8 + 16B "Hello, world!\0\0\0".
+            printf '\x00\x0e\x00\x00\x00\x00\x08\x00\x00\x00Hello, world!\x00\x00\x00' > .fuzz-corpus/${{ matrix.target }}/seed-load-string.wasm
+            # mode=validate_utf8, ptr=0, len=11, body "hello world".
+            printf '\x01\x00\x00\x00\x00\x00\x0b\x00\x00\x00hello world' > .fuzz-corpus/${{ matrix.target }}/seed-validate-utf8.wasm
           fi
           ls .fuzz-corpus/${{ matrix.target }} | wc -l
 
