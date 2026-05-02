@@ -3223,7 +3223,7 @@ pub const WasiCliAdapter = struct {
     /// Reject paths that would escape the preopen sandbox: any `..` path
     /// component, any `\\` separator, any `:` (Windows drive prefix), or
     /// a leading `/` (absolute). Returns `.access` on rejection.
-    fn validateSandboxPath(path: []const u8) ?FsErrorCode {
+    pub fn validateSandboxPath(path: []const u8) ?FsErrorCode {
         if (path.len == 0) return null;
         if (path[0] == '/') return .access;
         for (path) |c| {
