@@ -1056,6 +1056,62 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// SQXTN Vd.8B, Vn.8H — signed saturating narrow (lower half).
+    pub fn sqxtn8b8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0E214800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTN2 Vd.16B, Vn.8H — signed saturating narrow (upper half).
+    pub fn sqxtn2_16b8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4E214800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTUN Vd.8B, Vn.8H — signed-to-unsigned saturating narrow (lower half).
+    pub fn sqxtun8b8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x2E212800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTUN2 Vd.16B, Vn.8H — signed-to-unsigned saturating narrow (upper half).
+    pub fn sqxtun2_16b8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E212800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTN Vd.4H, Vn.4S — signed saturating narrow (lower half).
+    pub fn sqxtn4h4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0E614800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTN2 Vd.8H, Vn.4S — signed saturating narrow (upper half).
+    pub fn sqxtn2_8h4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4E614800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTUN Vd.4H, Vn.4S — signed-to-unsigned saturating narrow (lower half).
+    pub fn sqxtun4h4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x2E612800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTUN2 Vd.8H, Vn.4S — signed-to-unsigned saturating narrow (upper half).
+    pub fn sqxtun2_8h4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E612800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// SSHL Vd.8H, Vn.8H, Vm.8H — signed variable shift.
     pub fn sshl8h(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4E604400 |
@@ -2646,6 +2702,25 @@ test "emit: integer SIMD widening multiply low/high ops" {
         var code = CodeBuffer.init(std.testing.allocator);
         defer code.deinit();
         try @field(CodeBuffer, c.name)(&code, 16, 17, 18);
+        try expectWord(c.expected, &code);
+    }
+}
+
+test "emit: integer SIMD narrow saturating ops" {
+    const cases = [_]struct { name: []const u8, expected: u32 }{
+        .{ .name = "sqxtn8b8h", .expected = 0x0E214A30 },
+        .{ .name = "sqxtn2_16b8h", .expected = 0x4E214A30 },
+        .{ .name = "sqxtun8b8h", .expected = 0x2E212A30 },
+        .{ .name = "sqxtun2_16b8h", .expected = 0x6E212A30 },
+        .{ .name = "sqxtn4h4s", .expected = 0x0E614A30 },
+        .{ .name = "sqxtn2_8h4s", .expected = 0x4E614A30 },
+        .{ .name = "sqxtun4h4s", .expected = 0x2E612A30 },
+        .{ .name = "sqxtun2_8h4s", .expected = 0x6E612A30 },
+    };
+    inline for (cases) |c| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try @field(CodeBuffer, c.name)(&code, 16, 17);
         try expectWord(c.expected, &code);
     }
 }

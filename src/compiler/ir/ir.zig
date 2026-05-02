@@ -85,11 +85,13 @@ pub const Inst = struct {
         i8x16_splat: VReg,
         i8x16_extract_lane: I8x16ExtractLane,
         i8x16_replace_lane: I8x16ReplaceLane,
+        i8x16_narrow_i16x8: SimdNarrow,
         i16x8_binop: I16x8BinOp,
         i16x8_unop: SimdUnary,
         i16x8_extadd_pairwise_i8x16: SimdExtAddPairwise,
         i16x8_extend_i8x16: SimdExtendHalf,
         i16x8_extmul_i8x16: SimdExtMul,
+        i16x8_narrow_i32x4: SimdNarrow,
         i16x8_shift: I16x8Shift,
         i16x8_splat: VReg,
         i16x8_extract_lane: I16x8ExtractLane,
@@ -427,6 +429,14 @@ pub const Inst = struct {
     pub const SimdExtMul = struct {
         sign: SimdExtendSign,
         half: SimdExtendHalfSelect,
+        lhs: VReg,
+        rhs: VReg,
+    };
+
+    pub const SimdNarrowSign = enum { signed, unsigned };
+
+    pub const SimdNarrow = struct {
+        sign: SimdNarrowSign,
         lhs: VReg,
         rhs: VReg,
     };
@@ -871,6 +881,22 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.SimdExtendSign.signed, i64_extmul.op.i64x2_extmul_i32x4.sign);
     try std.testing.expectEqual(Inst.SimdExtendHalfSelect.high, i64_extmul.op.i64x2_extmul_i32x4.half);
+
+    const i8_narrow = Inst{
+        .op = .{ .i8x16_narrow_i16x8 = .{ .sign = .signed, .lhs = 36, .rhs = 37 } },
+        .dest = 38,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdNarrowSign.signed, i8_narrow.op.i8x16_narrow_i16x8.sign);
+    try std.testing.expectEqual(@as(VReg, 36), i8_narrow.op.i8x16_narrow_i16x8.lhs);
+    try std.testing.expectEqual(@as(VReg, 37), i8_narrow.op.i8x16_narrow_i16x8.rhs);
+
+    const i16_narrow = Inst{
+        .op = .{ .i16x8_narrow_i32x4 = .{ .sign = .unsigned, .lhs = 39, .rhs = 40 } },
+        .dest = 41,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdNarrowSign.unsigned, i16_narrow.op.i16x8_narrow_i32x4.sign);
 
     const i16_extract = Inst{
         .op = .{ .i16x8_extract_lane = .{ .vector = 18, .lane = 5, .sign = .signed } },
