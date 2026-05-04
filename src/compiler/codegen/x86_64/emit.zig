@@ -288,6 +288,13 @@ pub const CodeBuffer = struct {
         try self.emitI32(rel);
     }
 
+    /// JBE rel32 (unsigned below or equal).
+    pub fn jbe(self: *CodeBuffer, rel: i32) !void {
+        try self.emitByte(0x0F);
+        try self.emitByte(0x86);
+        try self.emitI32(rel);
+    }
+
     // ── Memory access ─────────────────────────────────────────────────
 
     /// MOV reg, [base + disp32] (64-bit load from memory).

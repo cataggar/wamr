@@ -6,30 +6,52 @@
 //! Run with: zig build bench
 
 const std = @import("std");
+const builtin = @import("builtin");
 const ir = @import("ir/ir.zig");
 const passes = @import("ir/passes.zig");
 const compile = @import("codegen/x86_64/compile.zig");
 
-/// Read the CPU timestamp counter (RDTSC) for cycle-accurate timing.
-inline fn rdtsc() u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [lo] "={eax}" (lo),
-          [hi] "={edx}" (hi),
-    );
-    return (@as(u64, hi) << 32) | lo;
+fn usesCycleCounter() bool {
+    return switch (builtin.cpu.arch) {
+        .x86, .x86_64 => true,
+        else => false,
+    };
+}
+
+fn sampleUnit() []const u8 {
+    return if (comptime usesCycleCounter()) "cycles/op" else "ns/op";
+}
+
+/// Read the fastest available monotonic-ish sample source for benchmark timing.
+inline fn sampleTicks() u64 {
+    if (comptime usesCycleCounter()) {
+        var lo: u32 = undefined;
+        var hi: u32 = undefined;
+        asm volatile ("rdtsc"
+            : [lo] "={eax}" (lo),
+              [hi] "={edx}" (hi),
+        );
+        return (@as(u64, hi) << 32) | lo;
+    }
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var ts: linux.timespec = undefined;
+        const rc = linux.clock_gettime(.MONOTONIC, &ts);
+        if (rc != 0) @panic("clock_gettime(CLOCK_MONOTONIC) failed");
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+    @compileError("codegen benchmark needs a portable timer for this non-x86 target");
 }
 
 const BenchResult = struct {
     name: []const u8,
     iterations: u64,
-    total_cycles: u64,
+    total_ticks: u64,
     code_size: usize,
 
-    fn cyclesPerOp(self: BenchResult) u64 {
+    fn ticksPerOp(self: BenchResult) u64 {
         if (self.iterations == 0) return 0;
-        return self.total_cycles / self.iterations;
+        return self.total_ticks / self.iterations;
     }
 };
 
@@ -68,7 +90,7 @@ fn runBench(
 
     // Timed iterations (fixed count for consistency)
     const iterations: u64 = 10_000;
-    const start = rdtsc();
+    const start = sampleTicks();
 
     for (0..iterations) |_| {
         const r = try compile.compileFunctionRA(&func, 0, allocator);
@@ -76,12 +98,12 @@ fn runBench(
         allocator.free(r.call_patches);
     }
 
-    const end = rdtsc();
+    const end = sampleTicks();
 
     return .{
         .name = name,
         .iterations = iterations,
-        .total_cycles = end - start,
+        .total_ticks = end - start,
         .code_size = code_size,
     };
 }
@@ -420,6 +442,60 @@ fn bodyLoadStoreMulti(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = sum3 } }) catch unreachable;
 }
 
+fn bodyMemoryCopyFixed(func: *ir.IrFunction, block: *ir.BasicBlock, comptime len_value: i32) void {
+    const dst = func.newVReg();
+    const src = func.newVReg();
+    const len = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = dst, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 0x1100 }, .dest = src, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = len_value }, .dest = len, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .memory_copy = .{ .dst = dst, .src = src, .len = len } } }) catch unreachable;
+    block.append(.{ .op = .{ .ret = null } }) catch unreachable;
+}
+
+fn bodyMemoryCopy8(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryCopyFixed(func, block, 8);
+}
+
+fn bodyMemoryCopy16(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryCopyFixed(func, block, 16);
+}
+
+fn bodyMemoryCopy32(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryCopyFixed(func, block, 32);
+}
+
+fn bodyMemoryCopy64(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryCopyFixed(func, block, 64);
+}
+
+fn bodyMemoryFillFixed(func: *ir.IrFunction, block: *ir.BasicBlock, comptime len_value: i32) void {
+    const dst = func.newVReg();
+    const val = func.newVReg();
+    const len = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = dst, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 0x5a }, .dest = val, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = len_value }, .dest = len, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } }) catch unreachable;
+    block.append(.{ .op = .{ .ret = null } }) catch unreachable;
+}
+
+fn bodyMemoryFill8(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryFillFixed(func, block, 8);
+}
+
+fn bodyMemoryFill16(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryFillFixed(func, block, 16);
+}
+
+fn bodyMemoryFill32(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryFillFixed(func, block, 32);
+}
+
+fn bodyMemoryFill64(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    bodyMemoryFillFixed(func, block, 64);
+}
+
 // ── Call benchmark bodies ────────────────────────────────────────────
 
 /// call + ret — exercises call ABI, caller-saved save/restore.
@@ -502,7 +578,7 @@ fn runBenchWithPasses(
 
     // Timed iterations
     const iterations: u64 = 10_000;
-    const start = rdtsc();
+    const start = sampleTicks();
 
     for (0..iterations) |_| {
         const r = try compile.compileFunctionRA(&module.functions.items[0], 0, allocator);
@@ -510,18 +586,19 @@ fn runBenchWithPasses(
         allocator.free(r.call_patches);
     }
 
-    const end = rdtsc();
+    const end = sampleTicks();
 
     return .{
         .name = name,
         .iterations = iterations,
-        .total_cycles = end - start,
+        .total_ticks = end - start,
         .code_size = code_size,
     };
 }
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
+    const metric_label = sampleUnit();
 
     std.debug.print("\n", .{});
     std.debug.print("  x86-64 Codegen Benchmark (10,000 iterations each)\n", .{});
@@ -529,7 +606,7 @@ pub fn main() !void {
 
     // ── Atomic operations (raw codegen, no passes) ──────────────────
     std.debug.print("  Atomic operations\n", .{});
-    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", metric_label, "code bytes" });
     std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
 
     const atomic_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
@@ -546,12 +623,12 @@ pub fn main() !void {
     };
     for (atomic_benchmarks) |b| {
         const result = try runBench(allocator, b.name, b.body);
-        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.cyclesPerOp(), result.code_size });
+        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
     }
 
     // ── Arithmetic (raw codegen) ────────────────────────────────────
     std.debug.print("\n  Arithmetic\n", .{});
-    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", metric_label, "code bytes" });
     std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
 
     const arith_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
@@ -562,12 +639,12 @@ pub fn main() !void {
     };
     for (arith_benchmarks) |b| {
         const result = try runBench(allocator, b.name, b.body);
-        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.cyclesPerOp(), result.code_size });
+        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
     }
 
     // ── Branches + control flow (raw codegen) ──────────────────────
     std.debug.print("\n  Branches + control flow\n", .{});
-    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", metric_label, "code bytes" });
     std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
 
     const branch_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
@@ -577,26 +654,34 @@ pub fn main() !void {
     };
     for (branch_benchmarks) |b| {
         const result = try runBench(allocator, b.name, b.body);
-        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.cyclesPerOp(), result.code_size });
+        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
     }
 
     // ── Memory (raw codegen) ───────────────────────────────────────
     std.debug.print("\n  Memory\n", .{});
-    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", metric_label, "code bytes" });
     std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
 
     const memory_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
         .{ .name = "load + add + store", .body = &bodyLoadStore },
         .{ .name = "4× load + sum + store", .body = &bodyLoadStoreMulti },
+        .{ .name = "memory.copy fixed 8", .body = &bodyMemoryCopy8 },
+        .{ .name = "memory.copy fixed 16", .body = &bodyMemoryCopy16 },
+        .{ .name = "memory.copy fixed 32", .body = &bodyMemoryCopy32 },
+        .{ .name = "memory.copy fixed 64", .body = &bodyMemoryCopy64 },
+        .{ .name = "memory.fill fixed 8", .body = &bodyMemoryFill8 },
+        .{ .name = "memory.fill fixed 16", .body = &bodyMemoryFill16 },
+        .{ .name = "memory.fill fixed 32", .body = &bodyMemoryFill32 },
+        .{ .name = "memory.fill fixed 64", .body = &bodyMemoryFill64 },
     };
     for (memory_benchmarks) |b| {
         const result = try runBench(allocator, b.name, b.body);
-        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.cyclesPerOp(), result.code_size });
+        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
     }
 
     // ── Calls (raw codegen) ────────────────────────────────────────
     std.debug.print("\n  Calls\n", .{});
-    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", metric_label, "code bytes" });
     std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
 
     const call_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
@@ -604,12 +689,12 @@ pub fn main() !void {
     };
     for (call_benchmarks) |b| {
         const result = try runBench(allocator, b.name, b.body);
-        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.cyclesPerOp(), result.code_size });
+        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
     }
 
     // ── Float (raw codegen) ────────────────────────────────────────
     std.debug.print("\n  Float\n", .{});
-    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", metric_label, "code bytes" });
     std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
 
     const float_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
@@ -618,12 +703,12 @@ pub fn main() !void {
     };
     for (float_benchmarks) |b| {
         const result = try runBench(allocator, b.name, b.body);
-        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.cyclesPerOp(), result.code_size });
+        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
     }
 
     // ── Optimization passes (codegen after default_passes) ─────────
     std.debug.print("\n  Optimization passes (codegen after default_passes)\n", .{});
-    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", "cycles/op", "code bytes" });
+    std.debug.print("  {s:<34} {s:>12} {s:>10}\n", .{ "operation", metric_label, "code bytes" });
     std.debug.print("  {s:-<34} {s:->12} {s:->10}\n", .{ "", "", "" });
 
     const pass_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
@@ -637,7 +722,7 @@ pub fn main() !void {
     };
     for (pass_benchmarks) |b| {
         const result = try runBenchWithPasses(allocator, b.name, b.body);
-        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.cyclesPerOp(), result.code_size });
+        std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
     }
 
     std.debug.print("\n", .{});
