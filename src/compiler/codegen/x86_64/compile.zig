@@ -35,6 +35,8 @@ const callee_saved_alloc = if (builtin.os.tag == .windows)
 else
     [_]emit.Reg{ .rbx, .r12, .r13, .r14, .r15 };
 
+const small_bulk_mem_max_len = 64;
+
 /// Fixed frame offset for the VMContext pointer.
 /// Stored at [rbp - 8] by compileFunctionRA at function entry.
 /// Points to a VmCtx struct with memory_base at +0, globals_base at +16.
@@ -1309,16 +1311,27 @@ fn dumpFuncIRAlloc(func: *const ir.IrFunction, fi: u32, import_count: u32, alloc
     p("=== IR DUMP func[{d}] param_count={d} local_count={d} blocks={d} ===\n", .{ fi, func.param_count, func.local_count, func.blocks.items.len });
 
     // Rebuild clobber points (same logic as compileFunctionRA) so allocation matches.
+    var const_vals = try buildConstVals(func, allocator);
+    defer const_vals.deinit();
     var clobbers: std.ArrayList(regalloc.ClobberPoint) = .empty;
     defer clobbers.deinit(allocator);
     var cp_pos: u32 = 0;
     for (func.blocks.items) |block| {
         for (block.instructions.items) |ci| {
             switch (ci.op) {
-                .call, .call_indirect, .call_ref, .memory_grow, .memory_copy, .table_grow, .table_set => {
+                .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
                     try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = x86_64_call_clobber_mask });
                 },
-                .memory_fill => try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = @as(u64, 1) << 3 }),
+                .memory_copy => |mc| {
+                    if (smallFixedBulkMemLen(&const_vals, mc.len) == null) {
+                        try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = x86_64_call_clobber_mask });
+                    }
+                },
+                .memory_fill => |mf| {
+                    if (smallFixedBulkMemLen(&const_vals, mf.len) == null) {
+                        try clobbers.append(allocator, .{ .pos = cp_pos, .regs_clobbered = @as(u64, 1) << 3 });
+                    }
+                },
                 else => {},
             }
             cp_pos += 1;
@@ -1494,6 +1507,29 @@ fn x86_64_reg_set(local_count: u32) regalloc.RegSet {
     };
 }
 
+fn buildConstVals(func: *const ir.IrFunction, allocator: std.mem.Allocator) !std.AutoHashMap(ir.VReg, i64) {
+    var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
+    errdefer const_vals.deinit();
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            if (inst.dest) |dest| {
+                switch (inst.op) {
+                    .iconst_32 => |v| try const_vals.put(dest, v),
+                    .iconst_64 => |v| try const_vals.put(dest, v),
+                    else => {},
+                }
+            }
+        }
+    }
+    return const_vals;
+}
+
+fn smallFixedBulkMemLen(const_vals: *const std.AutoHashMap(ir.VReg, i64), len: ir.VReg) ?u8 {
+    const val = const_vals.get(len) orelse return null;
+    if (val < 0 or val > small_bulk_mem_max_len) return null;
+    return @intCast(val);
+}
+
 fn functionUsesV128(func: *const ir.IrFunction) bool {
     if (func.local_types) |local_types| {
         for (local_types) |ty| if (ty == .v128) return true;
@@ -1561,6 +1597,9 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
     const block_order = try passes.reorderBlocks(func, allocator);
     defer allocator.free(block_order);
 
+    var const_vals = try buildConstVals(func, allocator);
+    defer const_vals.deinit();
+
     // Collect clobber points: instructions that destroy specific registers.
     // Uses block_order so numbering matches live-range computation.
     var clobber_points: std.ArrayList(regalloc.ClobberPoint) = .empty;
@@ -1570,18 +1609,26 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (block_order) |block_id| {
             for (func.blocks.items[block_id].instructions.items) |ci| {
                 switch (ci.op) {
-                    .call, .call_indirect, .call_ref, .memory_grow, .memory_copy, .table_grow, .table_set => {
+                    .call, .call_indirect, .call_ref, .memory_grow, .table_grow, .table_set => {
                         // Calls clobber caller-saved allocatable regs.
-                        // memory.grow / memory.copy are compiled as host calls (same ABI),
-                        // so they clobber the same set of caller-saved registers.
+                        // memory.grow and table helpers are compiled as host calls
+                        // (same ABI), so they clobber caller-saved registers.
                         try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = x86_64_call_clobber_mask });
                     },
-                    .memory_fill => {
-                        // REP STOSB clobbers rdi (index 3 in alloc_regs).
-                        try clobber_points.append(allocator, .{
-                            .pos = pos,
-                            .regs_clobbered = @as(u64, 1) << 3,
-                        });
+                    .memory_copy => |mc| {
+                        if (smallFixedBulkMemLen(&const_vals, mc.len) == null) {
+                            // Variable/large memory.copy is compiled as a host call.
+                            try clobber_points.append(allocator, .{ .pos = pos, .regs_clobbered = x86_64_call_clobber_mask });
+                        }
+                    },
+                    .memory_fill => |mf| {
+                        if (smallFixedBulkMemLen(&const_vals, mf.len) == null) {
+                            // REP STOSB clobbers rdi (index 3 in alloc_regs).
+                            try clobber_points.append(allocator, .{
+                                .pos = pos,
+                                .regs_clobbered = @as(u64, 1) << 3,
+                            });
+                        }
                     },
                     else => {},
                 }
@@ -1624,9 +1671,11 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         for (func.blocks.items) |block| {
             for (block.instructions.items) |blk_inst| {
                 switch (blk_inst.op) {
-                    .memory_fill => {
-                        for (callee_saved_alloc, 0..) |cs_reg, i| {
-                            if (cs_reg == .rdi) used_callee_saved[i] = true;
+                    .memory_fill => |mf| {
+                        if (smallFixedBulkMemLen(&const_vals, mf.len) == null) {
+                            for (callee_saved_alloc, 0..) |cs_reg, i| {
+                                if (cs_reg == .rdi) used_callee_saved[i] = true;
+                            }
                         }
                     },
                     else => {},
@@ -1717,21 +1766,6 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         if (used_callee_saved[i]) try code.pushReg(reg);
     }
 
-    // Build constant value table for immediate folding
-    var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
-    defer const_vals.deinit();
-    for (func.blocks.items) |block| {
-        for (block.instructions.items) |inst| {
-            if (inst.dest) |dest| {
-                switch (inst.op) {
-                    .iconst_32 => |v| try const_vals.put(dest, v),
-                    .iconst_64 => |v| try const_vals.put(dest, v),
-                    else => {},
-                }
-            }
-        }
-    }
-
     var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
     defer block_offsets.deinit();
     var branch_patches: std.ArrayList(BranchPatch) = .empty;
@@ -1812,6 +1846,133 @@ fn useVReg(
             return scratch;
         },
     }
+}
+
+fn loadWasmU32Addr(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    vreg: ir.VReg,
+    dst: emit.Reg,
+) !void {
+    const src_reg = try useVReg(code, alloc_result, vreg, dst);
+    if (src_reg != dst) try code.movRegReg(dst, src_reg);
+    try code.zeroExtend32(dst);
+}
+
+fn emitStaticBulkMemBoundsCheck(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    addr: ir.VReg,
+    len: u8,
+) !void {
+    try code.movRegMem(.r10, .rbp, vmctx_offset);
+    try loadWasmU32Addr(code, alloc_result, addr, .rax);
+    try emitMemBoundsCheck(code, len);
+}
+
+const CopyDirection = enum { forward, backward };
+
+fn copyChunkSize(remaining: u8) u8 {
+    if (remaining >= 8) return 8;
+    if (remaining >= 4) return 4;
+    if (remaining >= 2) return 2;
+    return 1;
+}
+
+fn emitUnrolledCopy(
+    code: *emit.CodeBuffer,
+    dst: emit.Reg,
+    src: emit.Reg,
+    len: u8,
+    direction: CopyDirection,
+) !void {
+    var remaining = len;
+    var forward_offset: u8 = 0;
+    while (remaining > 0) {
+        const chunk = copyChunkSize(remaining);
+        const offset: u8 = switch (direction) {
+            .forward => forward_offset,
+            .backward => remaining - chunk,
+        };
+        const disp: i32 = @intCast(offset);
+        try code.movRegMemSized(.r11, src, disp, chunk);
+        try code.movMemRegSized(dst, disp, .r11, chunk);
+        switch (direction) {
+            .forward => forward_offset += chunk,
+            .backward => {},
+        }
+        remaining -= chunk;
+    }
+}
+
+fn emitUnrolledFill(code: *emit.CodeBuffer, dst: emit.Reg, len: u8) !void {
+    var remaining = len;
+    var offset: u8 = 0;
+    while (remaining > 0) {
+        const chunk = copyChunkSize(remaining);
+        try code.movMemRegSized(dst, @intCast(offset), .r11, chunk);
+        offset += chunk;
+        remaining -= chunk;
+    }
+}
+
+fn patchRel32ToHere(code: *emit.CodeBuffer, imm_offset: usize) void {
+    const rel: i32 = @intCast(@as(i64, @intCast(code.len())) - @as(i64, @intCast(imm_offset + 4)));
+    code.patchI32(imm_offset, rel);
+}
+
+fn emitSmallMemoryCopy(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    dst: ir.VReg,
+    src: ir.VReg,
+    len: u8,
+) !void {
+    try emitStaticBulkMemBoundsCheck(code, alloc_result, dst, len);
+    try emitStaticBulkMemBoundsCheck(code, alloc_result, src, len);
+    if (len == 0) return;
+
+    try code.movRegMem(.r10, .rbp, vmctx_offset);
+    try loadWasmU32Addr(code, alloc_result, dst, .rax);
+    try code.movRegMem(.r10, .r10, vmctx_membase_field);
+    try code.addRegReg(.rax, .r10);
+    try loadWasmU32Addr(code, alloc_result, src, .rcx);
+    try code.addRegReg(.rcx, .r10);
+
+    try code.cmpRegReg(.rax, .rcx);
+    const forward_jcc = code.len();
+    try code.jbe(0);
+    try emitUnrolledCopy(code, .rax, .rcx, len, .backward);
+    const end_jmp = code.len();
+    try code.jmpRel32(0);
+    patchRel32ToHere(code, forward_jcc + 2);
+    try emitUnrolledCopy(code, .rax, .rcx, len, .forward);
+    patchRel32ToHere(code, end_jmp + 1);
+}
+
+fn emitSmallMemoryFill(
+    code: *emit.CodeBuffer,
+    alloc_result: *const regalloc.AllocResult,
+    dst: ir.VReg,
+    val: ir.VReg,
+    len: u8,
+) !void {
+    try emitStaticBulkMemBoundsCheck(code, alloc_result, dst, len);
+    if (len == 0) return;
+
+    try code.movRegMem(.r10, .rbp, vmctx_offset);
+    try loadWasmU32Addr(code, alloc_result, dst, .rax);
+    try code.movRegMem(.r10, .r10, vmctx_membase_field);
+    try code.addRegReg(.rax, .r10);
+
+    const val_reg = try useVReg(code, alloc_result, val, .r11);
+    if (val_reg != .r11) try code.movRegReg(.r11, val_reg);
+    try code.andRegImm32(.r11, 0xFF);
+    if (len > 1) {
+        try code.movRegImm64(.rcx, 0x0101010101010101);
+        try code.imulRegReg(.r11, .rcx);
+    }
+    try emitUnrolledFill(code, .rax, len);
 }
 
 /// Emit parallel move of wasm call args into Win64/SysV param_regs[1..].
@@ -2779,6 +2940,10 @@ fn compileInstRA(
             try code.movMemRegSized(.rax, st_disp, .rcx, st.size);
         },
         .memory_copy => |mc| {
+            if (smallFixedBulkMemLen(const_vals, mc.len)) |len| {
+                try emitSmallMemoryCopy(code, alloc_result, mc.dst, mc.src, len);
+                return;
+            }
             // Call the host helper via vmctx.mem_copy_fn(vmctx, dst, src, len).
             // The helper handles bounds-check + overlapping memmove semantics.
             // ABI-portable via param_regs.
@@ -2800,6 +2965,10 @@ fn compileInstRA(
             if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
         },
         .memory_fill => |mf| {
+            if (smallFixedBulkMemLen(const_vals, mf.len)) |len| {
+                try emitSmallMemoryFill(code, alloc_result, mf.dst, mf.val, len);
+                return;
+            }
             // REP STOSB: rdi=dst, al=val, rcx=len
             //
             // Bounds check semantics (wasm spec): trap if dst + len > mem_size.
@@ -4675,7 +4844,7 @@ test "compileFunctionRA: extend_i32_s emits MOVSXD" {
     try std.testing.expect(containsBytes(code, &.{0x63}));
 }
 
-test "compileFunctionRA: memory_copy emits call via mem_copy_fn" {
+test "compileFunctionRA: small fixed memory_copy emits inline directional copy" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -4687,7 +4856,7 @@ test "compileFunctionRA: memory_copy emits call via mem_copy_fn" {
     const len = func.newVReg();
     try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = dst });
     try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = src });
-    try block.append(.{ .op = .{ .iconst_32 = 50 }, .dest = len });
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = len });
     try block.append(.{ .op = .{ .memory_copy = .{ .dst = dst, .src = src, .len = len } } });
     try block.append(.{ .op = .{ .ret = null } });
 
@@ -4696,15 +4865,44 @@ test "compileFunctionRA: memory_copy emits call via mem_copy_fn" {
     defer allocator.free(compile_result.call_patches);
     defer allocator.free(code);
 
-    // Must NOT contain REP MOVSB (F3 A4): the inline path was buggy on overlap,
-    // we now dispatch through the vmctx.mem_copy_fn host helper which implements
-    // memmove semantics.
+    const mem_copy_field: [4]u8 = @bitCast(vmctx_mem_copy_fn_field);
+
+    // Must not use REP MOVSB: overlap-safe inline copy chooses direction first.
     try std.testing.expect(!containsBytes(code, &.{ 0xF3, 0xA4 }));
-    // Must contain CALL reg (FF /2): dispatch to the helper via rax.
+    try std.testing.expect(!containsBytes(code, &mem_copy_field));
+    // JBE rel32 selects the forward path when dst <= src.
+    try std.testing.expect(containsBytes(code, &.{ 0x0F, 0x86 }));
+}
+
+test "compileFunctionRA: large memory_copy emits call via mem_copy_fn" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const dst = func.newVReg();
+    const src = func.newVReg();
+    const len = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = dst });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = src });
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = len });
+    try block.append(.{ .op = .{ .memory_copy = .{ .dst = dst, .src = src, .len = len } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    const mem_copy_field: [4]u8 = @bitCast(vmctx_mem_copy_fn_field);
+
+    // Variable/large copies still dispatch to the helper for memmove semantics.
+    try std.testing.expect(containsBytes(code, &mem_copy_field));
     try std.testing.expect(containsBytes(code, &.{ 0xFF, 0xD0 }));
 }
 
-test "compileFunctionRA: memory_fill emits REP STOSB" {
+test "compileFunctionRA: large memory_fill emits REP STOSB" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -4727,6 +4925,32 @@ test "compileFunctionRA: memory_fill emits REP STOSB" {
 
     // Should contain REP STOSB (F3 AA)
     try std.testing.expect(containsBytes(code, &.{ 0xF3, 0xAA }));
+}
+
+test "compileFunctionRA: small fixed memory_fill emits unrolled stores" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const dst = func.newVReg();
+    const val = func.newVReg();
+    const len = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = dst });
+    try block.append(.{ .op = .{ .iconst_32 = 0xFF }, .dest = val });
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = len });
+    try block.append(.{ .op = .{ .memory_fill = .{ .dst = dst, .val = val, .len = len } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    try std.testing.expect(!containsBytes(code, &.{ 0xF3, 0xAA }));
+    // MOV rcx, 0x0101010101010101 builds the repeated fill byte pattern.
+    try std.testing.expect(containsBytes(code, &.{ 0x48, 0xB9, 0x01, 0x01, 0x01, 0x01 }));
 }
 
 test "compileFunctionRA: division uses rax/rdx" {

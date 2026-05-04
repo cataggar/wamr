@@ -5,18 +5,17 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Whether the selected target CPU can execute AOT code natively.
-    // Test/bench binaries that exercise AOT execution (codegen-bench,
-    // spec-test-runner, coremark-aot-runner) are only installed on these
-    // arches so cross-compiled release builds for e.g. riscv64 don't try
-    // to compile x86-only inline asm or the AOT execution path.
+    // Test/bench binaries tied to native AOT support are only installed on
+    // these arches so cross-compiled release builds for e.g. riscv64 don't
+    // try to compile or run the AOT execution path.
     const target_arch = target.result.cpu.arch;
     const aot_executable_target = switch (target_arch) {
         .x86_64, .aarch64 => true,
         else => false,
     };
-    // codegen-bench uses x86-specific `rdtsc` inline asm and only
-    // exercises the x86-64 codegen path.
-    const bench_target = target_arch == .x86_64;
+    // codegen-bench emits x86-64 machine code but does not execute it. It can
+    // run on the native AOT arches with a portable timer fallback.
+    const bench_target = aot_executable_target;
 
     // ── Build flags ────────────────────────────────────────────────────
     const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse false;
