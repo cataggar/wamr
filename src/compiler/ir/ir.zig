@@ -80,6 +80,7 @@ pub const Inst = struct {
         i32x4_extract_lane: I32x4ExtractLane,
         i32x4_replace_lane: I32x4ReplaceLane,
         i8x16_binop: I8x16BinOp,
+        i8x16_shuffle: I8x16Shuffle,
         i8x16_unop: SimdUnary,
         i8x16_shift: I8x16Shift,
         i8x16_splat: VReg,
@@ -408,6 +409,12 @@ pub const Inst = struct {
         op: V128BitwiseOp,
         lhs: VReg,
         rhs: VReg,
+    };
+
+    pub const I8x16Shuffle = struct {
+        lhs: VReg,
+        rhs: VReg,
+        lanes: [16]u8,
     };
 
     pub const SimdUnary = struct {
@@ -770,6 +777,19 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.I8x16Op.sub, i8_bin.op.i8x16_binop.op);
     try std.testing.expectEqual(@as(VReg, 11), i8_bin.op.i8x16_binop.lhs);
+
+    const i8_shuffle = Inst{
+        .op = .{ .i8x16_shuffle = .{
+            .lhs = 13,
+            .rhs = 14,
+            .lanes = .{ 0, 1, 2, 3, 4, 5, 6, 7, 31, 30, 29, 28, 27, 26, 25, 24 },
+        } },
+        .dest = 15,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 13), i8_shuffle.op.i8x16_shuffle.lhs);
+    try std.testing.expectEqual(@as(VReg, 14), i8_shuffle.op.i8x16_shuffle.rhs);
+    try std.testing.expectEqual(@as(u8, 31), i8_shuffle.op.i8x16_shuffle.lanes[8]);
 
     const i8_shift = Inst{
         .op = .{ .i8x16_shift = .{ .op = .shr_s, .vector = 13, .count = 14 } },

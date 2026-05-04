@@ -259,6 +259,7 @@ fn opClass(inst: ir.Inst) Class {
         .i32x4_extract_lane,
         .i32x4_replace_lane,
         .i8x16_binop,
+        .i8x16_shuffle,
         .i8x16_unop,
         .i8x16_shift,
         .i8x16_splat,
@@ -549,6 +550,10 @@ pub fn forEachUse(
         .i8x16_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
+        },
+        .i8x16_shuffle => |op| {
+            try visit(context, op.lhs);
+            try visit(context, op.rhs);
         },
         .i8x16_narrow_i16x8 => |op| {
             try visit(context, op.lhs);

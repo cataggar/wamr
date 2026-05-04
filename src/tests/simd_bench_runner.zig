@@ -54,6 +54,11 @@ const cases = [_]BenchCase{
         .build = buildSimdV128XorLane0Module,
     },
     .{
+        .name = "simd_i8x16_shuffle_lane0",
+        .simd = true,
+        .build = buildSimdI8x16ShuffleLane0Module,
+    },
+    .{
         .name = "simd_i32x4_eq_lane0",
         .simd = true,
         .build = buildSimdI32x4EqLane0Module,
@@ -944,6 +949,18 @@ fn buildSimdV128XorLane0Module(allocator: Allocator) ![]u8 {
     try appendV128ConstI32x4(&instr, allocator, .{ 0x0102_0304, 6, 7, 8 });
     try appendSimdOpcode(&instr, allocator, 0x51); // v128.xor
     try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI8x16ShuffleLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI8x16(&instr, allocator, .{ 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F });
+    try appendV128ConstI8x16(&instr, allocator, .{ 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xAB, 0xAC, 0xAD, 0xAE, 0xAF });
+    try appendI8x16Shuffle(&instr, allocator, .{ 16, 1, 18, 3, 20, 5, 22, 7, 24, 9, 26, 11, 28, 13, 30, 15 });
+    try appendI8x16ExtractLaneU(&instr, allocator, 0);
 
     return buildRunI32Module(allocator, instr.items, .{});
 }
@@ -3699,6 +3716,11 @@ fn appendV128ConstI16x8(buf: *std.ArrayList(u8), allocator: Allocator, lanes: [8
 
 fn appendV128ConstI8x16(buf: *std.ArrayList(u8), allocator: Allocator, lanes: [16]u8) !void {
     try appendSimdOpcode(buf, allocator, 0x0C); // v128.const
+    try buf.appendSlice(allocator, &lanes);
+}
+
+fn appendI8x16Shuffle(buf: *std.ArrayList(u8), allocator: Allocator, lanes: [16]u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x0D); // i8x16.shuffle
     try buf.appendSlice(allocator, &lanes);
 }
 

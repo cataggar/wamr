@@ -763,6 +763,14 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// TBL Vd.16B, { Vn.16B, Vn+1.16B }, Vm.16B.
+    pub fn tbl2_16b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4E002000 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     pub const I32x4Op = enum(u32) {
         add = 0x4EA08400,
         sub = 0x6EA08400,

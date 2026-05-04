@@ -564,6 +564,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i32x4_splat,
         .i32x4_replace_lane,
         .i8x16_binop,
+        .i8x16_shuffle,
         .i8x16_unop,
         .i8x16_shift,
         .i8x16_splat,
@@ -613,6 +614,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i32x4_splat,
                 .i32x4_replace_lane,
                 .i8x16_binop,
+                .i8x16_shuffle,
                 .i8x16_unop,
                 .i8x16_shift,
                 .i8x16_splat,
@@ -1416,6 +1418,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i32x4_extract_lane,
         .i32x4_replace_lane,
         .i8x16_binop,
+        .i8x16_shuffle,
         .i8x16_unop,
         .i8x16_shift,
         .i8x16_splat,
@@ -1596,6 +1599,7 @@ fn compileInst(
         .i32x4_extract_lane => |lane| try emitI32x4ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
         .i32x4_replace_lane => |lane| try emitI32x4ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
         .i8x16_binop => |bin| try emitI8x16BinOp(code, inst, bin, v128_map, v128_cache, fctx),
+        .i8x16_shuffle => |op| try emitI8x16Shuffle(code, inst, op, v128_map, v128_cache),
         .i8x16_unop => |un| try emitI8x16UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .i8x16_shift => |shift| try emitI8x16Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
         .i8x16_splat => |src| try emitI8x16Splat(code, inst, src, reg_map, v128_map, v128_cache),
@@ -1878,6 +1882,7 @@ fn useReg(reg_map: *const RegMap, vreg: ir.VReg) ?emit.Reg {
 
 const v128_tmp0: u5 = 0;
 const v128_tmp1: u5 = 1;
+const v128_tmp2: u5 = 2;
 
 fn storeV128SlotAbs(
     code: *emit.CodeBuffer,
@@ -1944,6 +1949,14 @@ fn emitV128Const(
 ) !void {
     const dest = inst.dest orelse return;
     const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    try emitV128ImmediateIntoReg(code, dest_reg, val);
+}
+
+fn emitV128ImmediateIntoReg(
+    code: *emit.CodeBuffer,
+    dest_reg: u5,
+    val: u128,
+) !void {
     const lo: u64 = @truncate(val);
     const hi: u64 = @truncate(val >> 64);
     try code.movImm64(RegMap.tmp0, lo);
@@ -2543,6 +2556,30 @@ fn emitI8x16BinOp(
         .max_u => try code.i8x16Op(.umax, dest_reg, lhs_reg, rhs_reg),
         .avgr_u => try code.i8x16Op(.urhadd, dest_reg, lhs_reg, rhs_reg),
     }
+}
+
+fn emitI8x16Shuffle(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.I8x16Shuffle,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const lhs_reg = try v128_cache.ensure(code, v128_map, op.lhs, null);
+    const rhs_reg = if (op.rhs == op.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.rhs, lhs_reg);
+
+    // TBL's two-register table operand must be a consecutive register pair.
+    // Keep cached values in Q16-Q31 and use Q0/Q1/Q2 only as per-instruction scratch.
+    try code.bitwise16b(.orr, v128_tmp0, lhs_reg, lhs_reg);
+    try code.bitwise16b(.orr, v128_tmp1, rhs_reg, rhs_reg);
+    try emitV128ImmediateIntoReg(code, v128_tmp2, std.mem.readInt(u128, &op.lanes, .little));
+
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    try code.tbl2_16b(dest_reg, v128_tmp0, v128_tmp2);
 }
 
 fn emitI8x16Shift(
@@ -6098,6 +6135,54 @@ test "compile: i8x16 lane ops emit NEON instructions" {
     try std.testing.expect(found_ins);
     try std.testing.expect(found_smov);
     try std.testing.expect(found_umov);
+}
+
+test "compile: i8x16.shuffle emits TBL instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const lhs = func.newVReg();
+    const rhs = func.newVReg();
+    const mixed = func.newVReg();
+    const same = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0F0E_0D0C_0B0A_0908_0706_0504_0302_0100 }, .dest = lhs, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x1F1E_1D1C_1B1A_1918_1716_1514_1312_1110 }, .dest = rhs, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i8x16_shuffle = .{
+            .lhs = lhs,
+            .rhs = rhs,
+            .lanes = .{ 16, 1, 18, 3, 20, 5, 22, 7, 24, 9, 26, 11, 28, 13, 30, 15 },
+        } },
+        .dest = mixed,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i8x16_shuffle = .{
+            .lhs = mixed,
+            .rhs = mixed,
+            .lanes = .{ 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15 },
+        } },
+        .dest = same,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_extract_lane = .{ .vector = same, .lane = 0, .sign = .unsigned } }, .dest = lane, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var tbl_count: u32 = 0;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0x4E002000) tbl_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, 2), tbl_count);
 }
 
 test "compile: i16x8 lane ops emit NEON instructions" {
