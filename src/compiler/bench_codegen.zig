@@ -1,8 +1,7 @@
-//! x86-64 Codegen Microbenchmark
+//! Codegen Microbenchmark
 //!
-//! Measures compilation throughput and generated code size for atomics,
-//! arithmetic, branches, memory, calls, floats, register pressure, and
-//! the effect of IR optimization passes.
+//! Measures compilation throughput and generated code size for x86-64
+//! codegen, IR optimization passes, and AArch64 scheduler-focused kernels.
 //! Run with: zig build bench
 
 const std = @import("std");
@@ -10,6 +9,7 @@ const builtin = @import("builtin");
 const ir = @import("ir/ir.zig");
 const passes = @import("ir/passes.zig");
 const compile = @import("codegen/x86_64/compile.zig");
+const aarch64_compile = @import("codegen/aarch64/compile.zig");
 
 fn usesCycleCounter() bool {
     return switch (builtin.cpu.arch) {
@@ -552,6 +552,152 @@ fn bodyRegPressure(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block.append(.{ .op = .{ .ret = acc } }) catch unreachable;
 }
 
+// ── AArch64 scheduler benchmark bodies ───────────────────────────────
+
+fn bodySchedLoadUse(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const base = func.newVReg();
+    const loaded = func.newVReg();
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const mul = func.newVReg();
+    const c = func.newVReg();
+    const independent = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } }, .dest = loaded, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 13 }, .dest = a, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 17 }, .dest = b, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = a, .rhs = b } }, .dest = mul, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 19 }, .dest = c, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = mul, .rhs = c } }, .dest = independent, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = loaded, .rhs = independent } }, .dest = result, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
+fn bodySchedIndependentAlu(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const a0 = func.newVReg();
+    const a1 = func.newVReg();
+    const b0 = func.newVReg();
+    const b1 = func.newVReg();
+    const c0 = func.newVReg();
+    const c1 = func.newVReg();
+    const a2 = func.newVReg();
+    const b2 = func.newVReg();
+    const c2 = func.newVReg();
+    const ab = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = a0, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = a1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = b0, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = b1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = c0, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 6 }, .dest = c1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = a0, .rhs = a1 } }, .dest = a2, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .xor = .{ .lhs = b0, .rhs = b1 } }, .dest = b2, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .@"or" = .{ .lhs = c0, .rhs = c1 } }, .dest = c2, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = a2, .rhs = b2 } }, .dest = ab, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = ab, .rhs = c2 } }, .dest = result, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
+fn bodySchedMulLatency(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const d = func.newVReg();
+    const m0 = func.newVReg();
+    const m1 = func.newVReg();
+    const sum = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = a, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 11 }, .dest = b, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = a, .rhs = b } }, .dest = m0, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 13 }, .dest = c, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 17 }, .dest = d, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = c, .rhs = d } }, .dest = m1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = m0, .rhs = m1 } }, .dest = sum, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = sum, .rhs = b } }, .dest = result, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
+fn bodySchedLoopCarriedLike(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const base = func.newVReg();
+    const step = func.newVReg();
+    const addr1 = func.newVReg();
+    const addr2 = func.newVReg();
+    const l0 = func.newVReg();
+    const l1 = func.newVReg();
+    const l2 = func.newVReg();
+    const s0 = func.newVReg();
+    const s1 = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 4 }, .dest = step, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = base, .rhs = step } }, .dest = addr1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = addr1, .rhs = step } }, .dest = addr2, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = base, .offset = 0, .size = 4 } }, .dest = l0, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = addr1, .offset = 0, .size = 4 } }, .dest = l1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = addr2, .offset = 0, .size = 4 } }, .dest = l2, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = l0, .rhs = l1 } }, .dest = s0, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = s0, .rhs = l2 } }, .dest = s1, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = s1, .rhs = step } }, .dest = result, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
+fn bodySchedStoreWithAlu(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const base = func.newVReg();
+    const val = func.newVReg();
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const mul = func.newVReg();
+    const load = func.newVReg();
+    const result = func.newVReg();
+    block.append(.{ .op = .{ .iconst_32 = 0x1000 }, .dest = base, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 23 }, .dest = val, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .size = 4, .val = val } }, .type = .void }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 29 }, .dest = a, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .iconst_32 = 31 }, .dest = b, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .mul = .{ .lhs = a, .rhs = b } }, .dest = mul, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .load = .{ .base = base, .offset = 4, .size = 4 } }, .dest = load, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .add = .{ .lhs = load, .rhs = mul } }, .dest = result, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .ret = result } }) catch unreachable;
+}
+
+fn runAarch64Bench(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    buildBody: BuildBodyFn,
+    enable_scheduler: bool,
+) !BenchResult {
+    var func = try buildTestFunc(allocator, buildBody);
+    defer func.deinit();
+
+    const options = aarch64_compile.CompileOptions{ .enable_scheduler = enable_scheduler };
+    const sample_code = try aarch64_compile.compileFunctionWithOptions(&func, allocator, options);
+    const code_size = sample_code.len;
+    defer allocator.free(sample_code);
+
+    for (0..100) |_| {
+        const code = try aarch64_compile.compileFunctionWithOptions(&func, allocator, options);
+        allocator.free(code);
+    }
+
+    const iterations: u64 = 5_000;
+    const start = sampleTicks();
+    for (0..iterations) |_| {
+        const code = try aarch64_compile.compileFunctionWithOptions(&func, allocator, options);
+        allocator.free(code);
+    }
+    const end = sampleTicks();
+
+    return .{
+        .name = name,
+        .iterations = iterations,
+        .total_ticks = end - start,
+        .code_size = code_size,
+    };
+}
+
 fn runBenchWithPasses(
     allocator: std.mem.Allocator,
     name: []const u8,
@@ -723,6 +869,36 @@ pub fn main() !void {
     for (pass_benchmarks) |b| {
         const result = try runBenchWithPasses(allocator, b.name, b.body);
         std.debug.print("  {s:<34} {d:>12} {d:>10}\n", .{ result.name, result.ticksPerOp(), result.code_size });
+    }
+
+    // ── AArch64 local scheduler (raw codegen, scheduler off/on) ─────
+    std.debug.print("\n  AArch64 scheduler microbenchmarks ({s})\n", .{metric_label});
+    std.debug.print("  {s:<34} {s:>12} {s:>12} {s:>10} {s:>10}\n", .{
+        "operation",
+        "sched off",
+        "sched on",
+        "off bytes",
+        "on bytes",
+    });
+    std.debug.print("  {s:-<34} {s:->12} {s:->12} {s:->10} {s:->10}\n", .{ "", "", "", "", "" });
+
+    const scheduler_benchmarks = [_]struct { name: []const u8, body: BuildBodyFn }{
+        .{ .name = "load/use + independent mul", .body = &bodySchedLoadUse },
+        .{ .name = "independent ALU chains", .body = &bodySchedIndependentAlu },
+        .{ .name = "independent mul latency", .body = &bodySchedMulLatency },
+        .{ .name = "loop-carried-like loads", .body = &bodySchedLoopCarriedLike },
+        .{ .name = "store/load + independent mul", .body = &bodySchedStoreWithAlu },
+    };
+    for (scheduler_benchmarks) |b| {
+        const off = try runAarch64Bench(allocator, b.name, b.body, false);
+        const on = try runAarch64Bench(allocator, b.name, b.body, true);
+        std.debug.print("  {s:<34} {d:>12} {d:>12} {d:>10} {d:>10}\n", .{
+            b.name,
+            off.ticksPerOp(),
+            on.ticksPerOp(),
+            off.code_size,
+            on.code_size,
+        });
     }
 
     std.debug.print("\n", .{});
