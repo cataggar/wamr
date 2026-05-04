@@ -1779,6 +1779,25 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i8x16_shuffle => {
+                        if (code.len -| ip < 16) return error.InvalidBytecode;
+                        var lanes: [16]u8 = undefined;
+                        @memcpy(&lanes, code[ip..][0..16]);
+                        ip += 16;
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i8x16_shuffle = .{
+                                .lhs = lhs,
+                                .rhs = rhs,
+                                .lanes = lanes,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i8x16_abs,
                     .i8x16_neg,
                     .i16x8_abs,
@@ -3309,6 +3328,70 @@ test "lower selected SIMD first-family opcodes" {
     try std.testing.expectEqual(ir.Inst.I32x4Op.add, insts[4].op.i32x4_binop.op);
     try std.testing.expectEqual(@as(u2, 0), insts[5].op.i32x4_extract_lane.lane);
     try std.testing.expect(insts[6].op.ret != null);
+}
+
+test "lower i8x16.shuffle parses lane immediates and operands" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const lhs
+        0x00, 0x01,
+        0x02, 0x03,
+        0x04, 0x05,
+        0x06, 0x07,
+        0x08, 0x09,
+        0x0A, 0x0B,
+        0x0C, 0x0D,
+        0x0E, 0x0F,
+        0xFD, 0x0C, // v128.const rhs
+        0x10, 0x11,
+        0x12, 0x13,
+        0x14, 0x15,
+        0x16, 0x17,
+        0x18, 0x19,
+        0x1A, 0x1B,
+        0x1C, 0x1D,
+        0x1E, 0x1F,
+        0xFD, 0x0D, // i8x16.shuffle
+        0x00, 0x11,
+        0x02, 0x13,
+        0x04, 0x15,
+        0x06, 0x17,
+        0x08, 0x19,
+        0x0A, 0x1B,
+        0x0C, 0x1D,
+        0x0E, 0x1F,
+        0xFD, 0x16, 0x01, // i8x16.extract_lane_u 1
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 5), insts.len);
+    try std.testing.expectEqual(insts[0].dest.?, insts[2].op.i8x16_shuffle.lhs);
+    try std.testing.expectEqual(insts[1].dest.?, insts[2].op.i8x16_shuffle.rhs);
+    try std.testing.expectEqual(@as(u8, 0x11), insts[2].op.i8x16_shuffle.lanes[1]);
+    try std.testing.expectEqual(@as(u8, 0x1F), insts[2].op.i8x16_shuffle.lanes[15]);
+    try std.testing.expectEqual(insts[2].dest.?, insts[3].op.i8x16_extract_lane.vector);
+    try std.testing.expectEqual(@as(u4, 1), insts[3].op.i8x16_extract_lane.lane);
+    try std.testing.expect(insts[4].op.ret != null);
 }
 
 test "lower i32x4 dynamic lane opcodes" {
