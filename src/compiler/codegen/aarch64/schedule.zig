@@ -29,6 +29,12 @@ pub const Metadata = struct {
     def: ?ir.VReg,
 };
 
+pub const OpInfo = struct {
+    class: Class,
+    latency: u8,
+    ordered_memory: bool,
+};
+
 pub const FunctionSchedule = struct {
     allocator: std.mem.Allocator,
     blocks: []BlockSchedule,
@@ -225,13 +231,22 @@ fn better(a: Node, b: Node) bool {
     return a.original_index < b.original_index;
 }
 
-pub fn metadata(inst: ir.Inst) Metadata {
+pub fn opInfo(inst: ir.Inst) OpInfo {
+    const class = opClass(inst);
+    return .{
+        .class = class,
+        .latency = classLatency(class),
+        .ordered_memory = isOrderedMemoryOp(inst.op) and class != .barrier,
+    };
+}
+
+fn opClass(inst: ir.Inst) Class {
     const def = inst.dest;
-    const class: Class = switch (inst.op) {
+    return switch (inst.op) {
         .iconst_32, .iconst_64 => if (def != null) .constant else .barrier,
         .v128_const => if (def != null) .constant else .barrier,
         .v128_load => if (def != null) .load else .barrier,
-        .v128_store => .store,
+        .store, .v128_store => .store,
         .v128_not,
         .v128_bitwise,
         .i32x4_binop,
@@ -312,19 +327,25 @@ pub fn metadata(inst: ir.Inst) Metadata {
 
         else => .barrier,
     };
+}
 
-    const latency: u8 = switch (class) {
+fn classLatency(class: Class) u8 {
+    return switch (class) {
         .load => 4,
         .mul => 3,
         .constant, .alu, .compare, .store => 1,
         .barrier => 0,
     };
+}
 
+pub fn metadata(inst: ir.Inst) Metadata {
+    const def = inst.dest;
+    const info = opInfo(inst);
     return .{
-        .class = class,
-        .latency = latency,
-        .barrier = class == .barrier,
-        .def = switch (class) {
+        .class = info.class,
+        .latency = info.latency,
+        .barrier = info.class == .barrier,
+        .def = switch (info.class) {
             .barrier, .store => null,
             else => def,
         },
@@ -336,8 +357,12 @@ fn isIntegerType(ty: ir.IrType) bool {
 }
 
 fn isOrderedMemory(inst: ir.Inst) bool {
-    return switch (inst.op) {
-        .load, .v128_load, .v128_store => true,
+    return opInfo(inst).ordered_memory;
+}
+
+fn isOrderedMemoryOp(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .load, .store, .v128_load, .v128_store => true,
         else => false,
     };
 }
@@ -599,6 +624,32 @@ pub fn forEachUse(
     }
 }
 
+test "op info exposes scheduler class latency and memory ordering" {
+    const load = ir.Inst{ .op = .{ .load = .{ .base = 1, .offset = 0, .size = 4 } }, .dest = 2, .type = .i32 };
+    const load_info = opInfo(load);
+    try std.testing.expectEqual(Class.load, load_info.class);
+    try std.testing.expectEqual(@as(u8, 4), load_info.latency);
+    try std.testing.expect(load_info.ordered_memory);
+
+    const store = ir.Inst{ .op = .{ .store = .{ .base = 1, .offset = 0, .size = 4, .val = 2 } }, .type = .void };
+    const store_info = opInfo(store);
+    try std.testing.expectEqual(Class.store, store_info.class);
+    try std.testing.expectEqual(@as(u8, 1), store_info.latency);
+    try std.testing.expect(store_info.ordered_memory);
+
+    const mul = ir.Inst{ .op = .{ .mul = .{ .lhs = 1, .rhs = 2 } }, .dest = 3, .type = .i64 };
+    const mul_info = opInfo(mul);
+    try std.testing.expectEqual(Class.mul, mul_info.class);
+    try std.testing.expectEqual(@as(u8, 3), mul_info.latency);
+    try std.testing.expect(!mul_info.ordered_memory);
+
+    const call = ir.Inst{ .op = .{ .call = .{ .func_idx = 0, .args = &.{1} } }, .dest = 4, .type = .i32 };
+    const call_info = opInfo(call);
+    try std.testing.expectEqual(Class.barrier, call_info.class);
+    try std.testing.expectEqual(@as(u8, 0), call_info.latency);
+    try std.testing.expect(!call_info.ordered_memory);
+}
+
 test "metadata marks pure integer ops schedulable and hazards as barriers" {
     const c = ir.Inst{ .op = .{ .iconst_32 = 1 }, .dest = 1, .type = .i32 };
     try std.testing.expect(!metadata(c).barrier);
@@ -611,6 +662,11 @@ test "metadata marks pure integer ops schedulable and hazards as barriers" {
     const load = ir.Inst{ .op = .{ .load = .{ .base = 1, .offset = 0, .size = 4 } }, .dest = 2, .type = .i32 };
     try std.testing.expect(!metadata(load).barrier);
     try std.testing.expectEqual(Class.load, metadata(load).class);
+
+    const store = ir.Inst{ .op = .{ .store = .{ .base = 1, .offset = 0, .size = 4, .val = 2 } }, .type = .void };
+    try std.testing.expect(!metadata(store).barrier);
+    try std.testing.expectEqual(Class.store, metadata(store).class);
+    try std.testing.expectEqual(@as(?ir.VReg, null), metadata(store).def);
 
     const call = ir.Inst{ .op = .{ .call = .{ .func_idx = 0, .args = &.{1} } }, .dest = 2, .type = .i32 };
     try std.testing.expect(metadata(call).barrier);
@@ -828,4 +884,33 @@ test "local scheduler preserves mixed scalar and v128 memory order" {
 
     try std.testing.expect(v128_load_pos < v128_store_pos);
     try std.testing.expect(v128_store_pos < scalar_load_pos);
+}
+
+fn findScalarStore(insts: []const ir.Inst) ?usize {
+    for (insts, 0..) |inst, idx| {
+        switch (inst.op) {
+            .store => return idx,
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "local scheduler preserves scalar store/load order" {
+    const insts = [_]ir.Inst{
+        .{ .op = .{ .iconst_32 = 0 }, .dest = 1, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 42 }, .dest = 2, .type = .i32 },
+        .{ .op = .{ .store = .{ .base = 1, .offset = 0, .size = 4, .val = 2 } }, .type = .void },
+        .{ .op = .{ .iconst_32 = 4 }, .dest = 3, .type = .i32 },
+        .{ .op = .{ .load = .{ .base = 3, .offset = 0, .size = 4 } }, .dest = 4, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 4, .rhs = 2 } }, .dest = 5, .type = .i32 },
+    };
+
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    defer std.testing.allocator.free(scheduled);
+
+    const store_pos = findScalarStore(scheduled).?;
+    const load_pos = findDest(scheduled, 4).?;
+
+    try std.testing.expect(store_pos < load_pos);
 }
