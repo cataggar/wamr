@@ -54,6 +54,11 @@ const cases = [_]BenchCase{
         .build = buildSimdV128XorLane0Module,
     },
     .{
+        .name = "simd_v128_bitselect_lane0",
+        .simd = true,
+        .build = buildSimdV128BitselectLane0Module,
+    },
+    .{
         .name = "simd_i8x16_shuffle_lane0",
         .simd = true,
         .build = buildSimdI8x16ShuffleLane0Module,
@@ -973,6 +978,19 @@ fn buildSimdV128XorLane0Module(allocator: Allocator) ![]u8 {
     try appendV128ConstI32x4(&instr, allocator, .{ 0x1357_9BDF, 2, 3, 4 });
     try appendV128ConstI32x4(&instr, allocator, .{ 0x0102_0304, 6, 7, 8 });
     try appendSimdOpcode(&instr, allocator, 0x51); // v128.xor
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdV128BitselectLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ -1, 2, 3, 4 });
+    try appendV128ConstI32x4(&instr, allocator, .{ 0, 6, 7, 8 });
+    try appendV128ConstI32x4(&instr, allocator, .{ -1, 0, 0, 0 });
+    try appendSimdOpcode(&instr, allocator, 0x52); // v128.bitselect
     try appendI32x4ExtractLane(&instr, allocator, 0);
 
     return buildRunI32Module(allocator, instr.items, .{});

@@ -249,6 +249,7 @@ fn opClass(inst: ir.Inst) Class {
         .store, .v128_store => .store,
         .v128_not,
         .v128_bitwise,
+        .v128_bitselect,
         .i32x4_binop,
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
@@ -539,6 +540,11 @@ pub fn forEachUse(
         .v128_bitwise => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
+        },
+        .v128_bitselect => |sel| {
+            try visit(context, sel.a);
+            try visit(context, sel.b);
+            try visit(context, sel.mask);
         },
         .i32x4_binop => |bin| {
             try visit(context, bin.lhs);
