@@ -82,6 +82,7 @@ pub const Inst = struct {
         i32x4_binop: I32x4BinOp,
         i32x4_unop: SimdUnary,
         i32x4_extadd_pairwise_i16x8: SimdExtAddPairwise,
+        i32x4_dot_i16x8_s: BinOp,
         i32x4_extend_i16x8: SimdExtendHalf,
         i32x4_extmul_i16x8: SimdExtMul,
         f32x4_convert_i32x4: SimdIntToFloatConvert,

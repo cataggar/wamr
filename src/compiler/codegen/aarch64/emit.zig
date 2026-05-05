@@ -695,6 +695,14 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// ADDP Vd.4S, Vn.4S, Vm.4S — pairwise add words.
+    pub fn addp4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4EA0BC00 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// ADDV Hd, Vn.8H — sum all 8 halfwords into the low halfword of Vd.
     pub fn addvH8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x4E71B800 | (@as(u32, vn) << 5) | vd);
@@ -2399,6 +2407,13 @@ test "emit: ADDV b0, v1.8b" {
     defer code.deinit();
     try code.addvB8b(0, 1);
     try expectWord(0x0E31B820, &code);
+}
+
+test "emit: ADDP v16.4s, v17.4s, v30.4s" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.addp4s(16, 17, 30);
+    try expectWord(0x4EBEBE30, &code);
 }
 
 test "emit: UMAXV b0, v1.16b" {

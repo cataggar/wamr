@@ -164,6 +164,11 @@ const cases = [_]BenchCase{
         .build = buildSimdI32x4ExtAddPairwiseI16x8ULane0Module,
     },
     .{
+        .name = "simd_i32x4_dot_i16x8_s_lane0",
+        .simd = true,
+        .build = buildSimdI32x4DotI16x8SLane0Module,
+    },
+    .{
         .name = "simd_i32x4_extend_low_i16x8_s_lane0",
         .simd = true,
         .build = buildSimdI32x4ExtendLowI16x8SLane0Module,
@@ -829,6 +834,11 @@ const cases = [_]BenchCase{
         .build = buildSimdExtMulLowHigh4kLoopModule,
     },
     .{
+        .name = "simd_i32x4_dot_i16x8_s_4k_loop",
+        .simd = true,
+        .build = buildSimdI32x4DotI16x8S4kLoopModule,
+    },
+    .{
         .name = "simd_narrow_4k_loop",
         .simd = true,
         .build = buildSimdNarrow4kLoopModule,
@@ -1386,6 +1396,18 @@ fn buildSimdI32x4ExtAddPairwiseI16x8ULane0Module(allocator: Allocator) ![]u8 {
 
     try appendV128ConstI16x8(&instr, allocator, .{ 0x8000, 0x7FFF, 0xFFFF, 2, 3, 4, 5, 6 });
     try appendSimdOpcode(&instr, allocator, 0x7F); // i32x4.extadd_pairwise_i16x8_u
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4DotI16x8SLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI16x8(&instr, allocator, .{ 1, 0xFFFE, 300, 0xFE70, 0x8000, 7, 1234, 0xFFFB });
+    try appendV128ConstI16x8(&instr, allocator, .{ 3, 4, 0xFFFB, 0xFFFA, 0xFFFF, 0xFFFE, 8, 9 });
+    try appendSimdOpcode(&instr, allocator, 0xBA); // i32x4.dot_i16x8_s
     try appendI32x4ExtractLane(&instr, allocator, 0);
 
     return buildRunI32Module(allocator, instr.items, .{});
@@ -3954,6 +3976,57 @@ fn buildSimdExtMulLowHigh4kLoopModule(allocator: Allocator) ![]u8 {
     try appendSimdOpcode(&instr, allocator, 0xDF); // i64x2.extmul_high_i32x4_u
     try appendSimdOpcode(&instr, allocator, 0x51); // v128.xor
 
+    try appendSimdMemOpcode(&instr, allocator, 0x0B, 4, 0); // v128.store
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, 16);
+    try appendI32Add(&instr, allocator);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBr(&instr, allocator, 0);
+
+    try appendEnd(&instr, allocator);
+    try appendEnd(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base + memory_loop_bytes - 16);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendI32x4ExtractLane(&instr, allocator, 3);
+
+    const data = try buildMemoryLoopDataExtAddPairwise(allocator);
+    defer allocator.free(data);
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data,
+        .local_i32_count = 1,
+    });
+}
+
+fn buildSimdI32x4DotI16x8S4kLoopModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendLocalSet(&instr, allocator, 0);
+    try appendBlock(&instr, allocator);
+    try appendLoop(&instr, allocator);
+
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, memory_loop_bytes);
+    try appendI32GeU(&instr, allocator);
+    try appendBrIf(&instr, allocator, 1);
+
+    try appendI32Const(&instr, allocator, memory_loop_dst_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+
+    try appendI32Const(&instr, allocator, memory_loop_a_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendI32Const(&instr, allocator, memory_loop_b_base);
+    try appendLocalGet(&instr, allocator, 0);
+    try appendI32Add(&instr, allocator);
+    try appendSimdMemOpcode(&instr, allocator, 0x00, 4, 0); // v128.load
+    try appendSimdOpcode(&instr, allocator, 0xBA); // i32x4.dot_i16x8_s
     try appendSimdMemOpcode(&instr, allocator, 0x0B, 4, 0); // v128.store
 
     try appendLocalGet(&instr, allocator, 0);

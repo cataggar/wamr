@@ -313,6 +313,49 @@ test "differential SIMD: i32x4.sub extracts lane 0" {
     try expectSimdDiffI32(wasm, "f", 4);
 }
 
+test "differential SIMD: i32x4.dot_i16x8_s signed pair lanes" {
+    const lhs: [8]u16 = .{ 1, 0xFFFE, 300, 0xFE70, 0x8000, 7, 1234, 0xFFFB };
+    const rhs: [8]u16 = .{ 3, 4, 0xFFFB, 0xFFFA, 0xFFFF, 0xFFFE, 8, 9 };
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+
+    try appendV128ConstI16x8(&body, testing.allocator, lhs);
+    try appendV128ConstI16x8(&body, testing.allocator, rhs);
+    try appendSimdOpcode(&body, testing.allocator, 0xBA);
+    try appendI32x4ExtractLane(&body, testing.allocator, 0);
+
+    try appendV128ConstI16x8(&body, testing.allocator, lhs);
+    try appendV128ConstI16x8(&body, testing.allocator, rhs);
+    try appendSimdOpcode(&body, testing.allocator, 0xBA);
+    try appendI32x4ExtractLane(&body, testing.allocator, 1);
+    try appendI32Const(&body, testing.allocator, 3);
+    try body.append(testing.allocator, 0x6C);
+    try body.append(testing.allocator, 0x6A);
+
+    try appendV128ConstI16x8(&body, testing.allocator, lhs);
+    try appendV128ConstI16x8(&body, testing.allocator, rhs);
+    try appendSimdOpcode(&body, testing.allocator, 0xBA);
+    try appendI32x4ExtractLane(&body, testing.allocator, 2);
+    try appendI32Const(&body, testing.allocator, 5);
+    try body.append(testing.allocator, 0x6C);
+    try body.append(testing.allocator, 0x6A);
+
+    try appendV128ConstI16x8(&body, testing.allocator, lhs);
+    try appendV128ConstI16x8(&body, testing.allocator, rhs);
+    try appendSimdOpcode(&body, testing.allocator, 0xBA);
+    try appendI32x4ExtractLane(&body, testing.allocator, 3);
+    try appendI32Const(&body, testing.allocator, 7);
+    try body.append(testing.allocator, 0x6C);
+    try body.append(testing.allocator, 0x6A);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 235_254);
+}
+
 test "differential SIMD: i32x4.eq extracts all-ones lane" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
