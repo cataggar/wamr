@@ -763,6 +763,14 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// BSL Vd.16B, Vn.16B, Vm.16B — bitwise select using Vd as mask.
+    pub fn bsl16b(self: *CodeBuffer, vd_mask: u5, vn_true: u5, vm_false: u5) !void {
+        try self.emit32(0x6E601C00 |
+            (@as(u32, vm_false) << 16) |
+            (@as(u32, vn_true) << 5) |
+            vd_mask);
+    }
+
     /// TBL Vd.16B, { Vn.16B }, Vm.16B.
     pub fn tbl1_16b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4E000000 |
@@ -2290,6 +2298,13 @@ test "emit: EOR v0.16b, v1.16b, v2.16b" {
     defer code.deinit();
     try code.bitwise16b(.eor, 0, 1, 2);
     try expectWord(0x6E221C20, &code);
+}
+
+test "emit: BSL v0.16b, v1.16b, v2.16b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.bsl16b(0, 1, 2);
+    try expectWord(0x6E621C20, &code);
 }
 
 test "emit: ADD v0.4s, v1.4s, v2.4s" {

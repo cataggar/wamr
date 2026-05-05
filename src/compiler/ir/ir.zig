@@ -400,6 +400,8 @@ pub const Inst = struct {
         div,
         min,
         max,
+        pmin,
+        pmax,
         eq,
         ne,
         lt,

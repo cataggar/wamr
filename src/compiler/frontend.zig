@@ -2333,6 +2333,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f64x2_div,
                     .f64x2_min,
                     .f64x2_max,
+                    .f64x2_pmin,
+                    .f64x2_pmax,
                     .f64x2_eq,
                     .f64x2_ne,
                     .f64x2_lt,
@@ -2350,6 +2352,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .f64x2_div => .div,
                             .f64x2_min => .min,
                             .f64x2_max => .max,
+                            .f64x2_pmin => .pmin,
+                            .f64x2_pmax => .pmax,
                             .f64x2_eq => .eq,
                             .f64x2_ne => .ne,
                             .f64x2_lt => .lt,
@@ -5092,6 +5096,8 @@ test "lower f64x2 arithmetic and comparison opcodes" {
         .{ .opcode = 0xF3, .expected = .div },
         .{ .opcode = 0xF4, .expected = .min },
         .{ .opcode = 0xF5, .expected = .max },
+        .{ .opcode = 0xF6, .expected = .pmin },
+        .{ .opcode = 0xF7, .expected = .pmax },
     };
 
     const appendULEB = struct {

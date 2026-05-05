@@ -2923,6 +2923,16 @@ fn emitF64x2BinOp(
         try emitF64x2MinMax(code, inst, bin, lhs_reg, rhs_reg, v128_map, v128_cache, fctx);
         return;
     }
+    if (bin.op == .pmin or bin.op == .pmax) {
+        const dest = inst.dest orelse return;
+        const cmp_lhs = if (bin.op == .pmin) lhs_reg else rhs_reg;
+        const cmp_rhs = if (bin.op == .pmin) rhs_reg else lhs_reg;
+        try code.fcmgt2d(v128_tmp0, cmp_lhs, cmp_rhs);
+        try code.bsl16b(v128_tmp0, rhs_reg, lhs_reg);
+        const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+        try code.bitwise16b(.orr, dest_reg, v128_tmp0, v128_tmp0);
+        return;
+    }
     const dest_reg = try prepareV128BinaryDest(
         code,
         inst,
@@ -2949,6 +2959,7 @@ fn emitF64x2BinOp(
         .lt => try code.fcmgt2d(dest_reg, rhs_reg, lhs_reg),
         .le => try code.fcmge2d(dest_reg, rhs_reg, lhs_reg),
         .min, .max => unreachable,
+        .pmin, .pmax => unreachable,
     }
 }
 
@@ -6911,6 +6922,8 @@ test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
     const gt = func.newVReg();
     const le = func.newVReg();
     const ge = func.newVReg();
+    const pmin = func.newVReg();
+    const pmax = func.newVReg();
     const lane = func.newVReg();
     const wrapped = func.newVReg();
 
@@ -6928,8 +6941,10 @@ test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .gt, .lhs = b, .rhs = a } }, .dest = gt, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .le, .lhs = a, .rhs = b } }, .dest = le, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .ge, .lhs = b, .rhs = a } }, .dest = ge, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .pmin, .lhs = ge, .rhs = b } }, .dest = pmin, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .pmax, .lhs = pmin, .rhs = a } }, .dest = pmax, .type = .v128 });
     try func.getBlock(bid).append(.{
-        .op = .{ .i64x2_extract_lane = .{ .vector = ge, .lane = 0 } },
+        .op = .{ .i64x2_extract_lane = .{ .vector = pmax, .lane = 0 } },
         .dest = lane,
         .type = .i64,
     });
@@ -6949,6 +6964,7 @@ test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
     var found_fcmgt = false;
     var found_fcmge = false;
     var found_mvn = false;
+    var bsl_count: u32 = 0;
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
@@ -6962,6 +6978,7 @@ test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
         if ((w & 0xFFE0FC00) == 0x6EE0E400) found_fcmgt = true;
         if ((w & 0xFFE0FC00) == 0x6E60E400) found_fcmge = true;
         if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
+        if ((w & 0xFFE0FC00) == 0x6E601C00) bsl_count += 1;
     }
 
     try std.testing.expect(found_fadd);
@@ -6974,6 +6991,7 @@ test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
     try std.testing.expect(found_fcmgt);
     try std.testing.expect(found_fcmge);
     try std.testing.expect(found_mvn);
+    try std.testing.expect(bsl_count >= 2);
 }
 
 test "compile: SIMD int-to-float conversions emit NEON instructions" {
