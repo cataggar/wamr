@@ -555,6 +555,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .v128_load,
         .v128_not,
         .v128_bitwise,
+        .v128_bitselect,
         .i32x4_binop,
         .i32x4_unop,
         .f32x4_convert_i32x4,
@@ -609,6 +610,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .v128_load,
                 .v128_not,
                 .v128_bitwise,
+                .v128_bitselect,
                 .i32x4_binop,
                 .i32x4_unop,
                 .f32x4_convert_i32x4,
@@ -1416,6 +1418,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .v128_store,
         .v128_not,
         .v128_bitwise,
+        .v128_bitselect,
         .i32x4_binop,
         .i32x4_unop,
         .f32x4_convert_i32x4,
@@ -1601,6 +1604,7 @@ fn compileInst(
         .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache),
         .v128_not => |src| try emitV128Not(code, inst, src, v128_map, v128_cache, fctx),
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
+        .v128_bitselect => |sel| try emitV128Bitselect(code, inst, sel, v128_map, v128_cache, fctx),
         .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
@@ -2061,6 +2065,40 @@ fn emitV128Bitwise(
         .xor => .eor,
     };
     try code.bitwise16b(op, dest_reg, lhs_reg, rhs_reg);
+}
+
+fn emitV128Bitselect(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    sel: ir.Inst.V128Bitselect,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const mask_reg = try v128_cache.ensure(code, v128_map, sel.mask, null);
+    const dest = inst.dest orelse return;
+    const dest_reg = if (isCurrentKill(fctx, sel.mask)) blk: {
+        try v128_cache.prepareOverwrite(code, v128_map, mask_reg, true);
+        try v128_cache.defineInReg(v128_map, dest, mask_reg);
+        break :blk mask_reg;
+    } else blk: {
+        const reg = try v128_cache.defineFresh(code, v128_map, dest, mask_reg);
+        try code.bitwise16b(.orr, reg, mask_reg, mask_reg);
+        break :blk reg;
+    };
+
+    const a_reg = if (sel.a == sel.mask)
+        dest_reg
+    else
+        try v128_cache.ensure(code, v128_map, sel.a, dest_reg);
+    const b_reg = if (sel.b == sel.mask)
+        dest_reg
+    else if (sel.b == sel.a)
+        a_reg
+    else
+        try v128_cache.ensure(code, v128_map, sel.b, dest_reg);
+
+    try code.bsl16b(dest_reg, a_reg, b_reg);
 }
 
 fn emitI32x4UnOp(
@@ -6210,6 +6248,39 @@ test "compile: v128 first-family ops emit NEON instructions" {
     try std.testing.expect(found_eor);
     try std.testing.expect(found_add4s);
     try std.testing.expect(found_umov);
+}
+
+test "compile: v128 bitselect emits BSL and preserves live mask" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const mask = func.newVReg();
+    const selected = func.newVReg();
+    const reused_mask = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_1111_1111 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0008_0000_0007_0000_0006_5555_5555 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0000_0000_0000_0000_0000_FFFF_FFFF }, .dest = mask, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_bitselect = .{ .a = a, .b = b, .mask = mask } }, .dest = selected, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = selected, .rhs = mask } }, .dest = reused_mask, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = reused_mask, .lane = 0 } }, .dest = lane, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_bsl = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0x6E601C00) found_bsl = true;
+    }
+    try std.testing.expect(found_bsl);
 }
 
 test "compile: i32x4 lane ops emit NEON instructions" {

@@ -1703,6 +1703,18 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const sub = readU32(code, &ip);
                 const simd_op: SimdOpcode = @enumFromInt(sub);
                 switch (simd_op) {
+                    .v128_bitselect => {
+                        const mask = safePop(&vreg_stack);
+                        const b = safePop(&vreg_stack);
+                        const a = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_bitselect = .{ .a = a, .b = b, .mask = mask } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .v128_const => {
                         const val = try readV128(code, &ip);
                         const dest = ir_func.newVReg();
@@ -3425,6 +3437,58 @@ test "lower selected SIMD first-family opcodes" {
     try std.testing.expectEqual(ir.Inst.I32x4Op.add, insts[4].op.i32x4_binop.op);
     try std.testing.expectEqual(@as(u2, 0), insts[5].op.i32x4_extract_lane.lane);
     try std.testing.expect(insts[6].op.ret != null);
+}
+
+test "lower v128.bitselect pops mask b a" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const a
+        0x11, 0x11, 0x11, 0x11,
+        0x02, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x00,
+        0x04, 0x00, 0x00, 0x00,
+        0xFD, 0x0C, // v128.const b
+        0x55, 0x55, 0x55, 0x55,
+        0x06, 0x00, 0x00, 0x00,
+        0x07, 0x00, 0x00, 0x00,
+        0x08, 0x00, 0x00, 0x00,
+        0xFD, 0x0C, // v128.const mask
+        0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0xFD, 0x52, // v128.bitselect
+        0xFD, 0x1B, 0x00, // i32x4.extract_lane 0
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 6), insts.len);
+    try std.testing.expectEqual(insts[0].dest.?, insts[3].op.v128_bitselect.a);
+    try std.testing.expectEqual(insts[1].dest.?, insts[3].op.v128_bitselect.b);
+    try std.testing.expectEqual(insts[2].dest.?, insts[3].op.v128_bitselect.mask);
+    try std.testing.expectEqual(ir.IrType.v128, insts[3].type);
+    try std.testing.expectEqual(@as(u2, 0), insts[4].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[5].op.ret != null);
 }
 
 test "lower i8x16.shuffle parses lane immediates and operands" {

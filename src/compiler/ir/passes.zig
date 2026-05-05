@@ -139,6 +139,11 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .v128_bitselect => |sel| {
+            list.append(sel.a);
+            list.append(sel.b);
+            list.append(sel.mask);
+        },
         .i32x4_binop => |bin| {
             list.append(bin.lhs);
             list.append(bin.rhs);
@@ -467,6 +472,11 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .v128_bitwise => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
+        },
+        .v128_bitselect => |*sel| {
+            if (sel.a == old) sel.a = new;
+            if (sel.b == old) sel.b = new;
+            if (sel.mask == old) sel.mask = new;
         },
         .i32x4_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
@@ -1821,6 +1831,7 @@ fn isPure(inst: ir.Inst) bool {
         .trunc_sat_f64_u,
         .v128_not,
         .v128_bitwise,
+        .v128_bitselect,
         .i32x4_binop,
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
@@ -1949,6 +1960,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .trunc_sat_f64_u => |v| v == b.op.trunc_sat_f64_u,
         .v128_not => |v| v == b.op.v128_not,
         .v128_bitwise => |bin| bin.op == b.op.v128_bitwise.op and bin.lhs == b.op.v128_bitwise.lhs and bin.rhs == b.op.v128_bitwise.rhs,
+        .v128_bitselect => |sel| sel.a == b.op.v128_bitselect.a and sel.b == b.op.v128_bitselect.b and sel.mask == b.op.v128_bitselect.mask,
         .i32x4_binop => |bin| bin.op == b.op.i32x4_binop.op and bin.lhs == b.op.i32x4_binop.lhs and bin.rhs == b.op.i32x4_binop.rhs,
         .i32x4_unop => |un| un.op == b.op.i32x4_unop.op and un.vector == b.op.i32x4_unop.vector,
         .i32x4_extadd_pairwise_i16x8 => |op| op.sign == b.op.i32x4_extadd_pairwise_i16x8.sign and op.vector == b.op.i32x4_extadd_pairwise_i16x8.vector,
@@ -3502,6 +3514,11 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .v128_bitwise => |*bin| {
             bin.lhs += offset;
             bin.rhs += offset;
+        },
+        .v128_bitselect => |*sel| {
+            sel.a += offset;
+            sel.b += offset;
+            sel.mask += offset;
         },
         .i32x4_binop => |*bin| {
             bin.lhs += offset;

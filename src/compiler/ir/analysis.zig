@@ -180,6 +180,11 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
         },
+        .v128_bitselect => |sel| {
+            live.put(sel.a, {}) catch {};
+            live.put(sel.b, {}) catch {};
+            live.put(sel.mask, {}) catch {};
+        },
         .i32x4_binop => |bin| {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
@@ -588,6 +593,11 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .v128_bitwise => |bin| {
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
+        },
+        .v128_bitselect => |sel| {
+            last_use.put(sel.a, pos) catch {};
+            last_use.put(sel.b, pos) catch {};
+            last_use.put(sel.mask, pos) catch {};
         },
         .i32x4_binop => |bin| {
             last_use.put(bin.lhs, pos) catch {};
