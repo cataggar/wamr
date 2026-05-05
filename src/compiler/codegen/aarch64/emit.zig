@@ -879,11 +879,21 @@ pub const CodeBuffer = struct {
         sub = 0x4EE0D400,
         mul = 0x6E60DC00,
         div = 0x6E60FC00,
+        max = 0x4E60F400,
+        min = 0x4EE0F400,
     };
 
-    /// Floating-point 2D binary vector op: FADD/FSUB/FMUL/FDIV.
+    /// Floating-point 2D binary vector op: FADD/FSUB/FMUL/FDIV/FMAX/FMIN.
     pub fn f64x2Op(self: *CodeBuffer, op: F64x2Op, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FCMEQ Vd.2D, Vn.2D, Vm.2D — floating-point compare equal per lane.
+    pub fn fcmeq2d(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4E60E400 |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -2553,6 +2563,24 @@ test "emit: f64x2 vector arithmetic ops" {
         defer code.deinit();
         try code.f64x2Op(.div, 16, 17, 30);
         try expectWord(0x6E7EFE30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f64x2Op(.min, 16, 17, 30);
+        try expectWord(0x4EFEF630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f64x2Op(.max, 16, 17, 30);
+        try expectWord(0x4E7EF630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fcmeq2d(16, 17, 30);
+        try expectWord(0x4E7EE630, &code);
     }
 }
 

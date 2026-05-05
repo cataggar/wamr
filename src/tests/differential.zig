@@ -392,7 +392,7 @@ test "differential SIMD: i32x4.splat feeds i32x4.add" {
     try expectSimdDiffI32(wasm, "f", 9);
 }
 
-fn expectF64x2ArithmeticLane0High(opcode: u32, lhs: [2]u64, rhs: [2]u64, expected: i32) !void {
+fn expectF64x2Lane0Part(opcode: u32, lhs: [2]u64, rhs: [2]u64, shift: u6, expected: i32) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
     try body.append(testing.allocator, 0x00);
@@ -400,14 +400,28 @@ fn expectF64x2ArithmeticLane0High(opcode: u32, lhs: [2]u64, rhs: [2]u64, expecte
     try appendV128ConstI64x2(&body, testing.allocator, rhs);
     try appendSimdOpcode(&body, testing.allocator, opcode);
     try appendI64x2ExtractLane(&body, testing.allocator, 0);
-    try appendI64Const(&body, testing.allocator, 32);
-    try appendI64ShrU(&body, testing.allocator);
+    if (shift != 0) {
+        try appendI64Const(&body, testing.allocator, shift);
+        try appendI64ShrU(&body, testing.allocator);
+    }
     try appendI32WrapI64(&body, testing.allocator);
     try body.append(testing.allocator, 0x0B);
 
     const wasm = try buildCustomModule(testing.allocator, body.items);
     defer testing.allocator.free(wasm);
     try expectSimdDiffI32(wasm, "f", expected);
+}
+
+fn expectF64x2Lane0Low(opcode: u32, lhs: [2]u64, rhs: [2]u64, expected: i32) !void {
+    try expectF64x2Lane0Part(opcode, lhs, rhs, 0, expected);
+}
+
+fn expectF64x2Lane0High(opcode: u32, lhs: [2]u64, rhs: [2]u64, expected: i32) !void {
+    try expectF64x2Lane0Part(opcode, lhs, rhs, 32, expected);
+}
+
+fn expectF64x2ArithmeticLane0High(opcode: u32, lhs: [2]u64, rhs: [2]u64, expected: i32) !void {
+    try expectF64x2Lane0High(opcode, lhs, rhs, expected);
 }
 
 test "differential SIMD: f64x2.add lane 0 matches interpreter" {
@@ -444,6 +458,56 @@ test "differential SIMD: f64x2.div lane 0 matches interpreter" {
         .{ 0x4000_0000_0000_0000, 0x4000_0000_0000_0000 },
         0x4012_0000,
     );
+}
+
+test "differential SIMD: f64x2.min lane 0 matches interpreter" {
+    try expectF64x2Lane0High(
+        0xF4,
+        .{ 0x400c_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0xc000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        @bitCast(@as(u32, 0xc000_0000)),
+    );
+}
+
+test "differential SIMD: f64x2.max lane 0 matches interpreter" {
+    try expectF64x2Lane0High(
+        0xF5,
+        .{ 0x400c_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0xc000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        0x400c_0000,
+    );
+}
+
+test "differential SIMD: f64x2.min preserves negative zero" {
+    try expectF64x2Lane0High(
+        0xF4,
+        .{ 0x0000_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0x8000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        @bitCast(@as(u32, 0x8000_0000)),
+    );
+}
+
+test "differential SIMD: f64x2.max preserves positive zero" {
+    try expectF64x2Lane0High(
+        0xF5,
+        .{ 0x8000_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0x0000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        0,
+    );
+}
+
+test "differential SIMD: f64x2.min canonicalizes lhs NaN" {
+    const lhs = [2]u64{ 0x7ff8_0000_0000_0001, 0x3ff0_0000_0000_0000 };
+    const rhs = [2]u64{ 0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000 };
+    try expectF64x2Lane0High(0xF4, lhs, rhs, 0x7ff8_0000);
+    try expectF64x2Lane0Low(0xF4, lhs, rhs, 0);
+}
+
+test "differential SIMD: f64x2.max canonicalizes rhs NaN" {
+    const lhs = [2]u64{ 0x3ff0_0000_0000_0000, 0x3ff0_0000_0000_0000 };
+    const rhs = [2]u64{ 0x7ff8_0000_0000_0001, 0x4000_0000_0000_0000 };
+    try expectF64x2Lane0High(0xF5, lhs, rhs, 0x7ff8_0000);
+    try expectF64x2Lane0Low(0xF5, lhs, rhs, 0);
 }
 
 test "differential SIMD: i8x16.shuffle selects bytes from both inputs" {

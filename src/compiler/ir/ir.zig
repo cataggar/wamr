@@ -395,6 +395,8 @@ pub const Inst = struct {
         sub,
         mul,
         div,
+        min,
+        max,
     };
 
     pub const V128Mem = struct {
