@@ -249,6 +249,26 @@ const cases = [_]BenchCase{
         .build = buildSimdI64x2ExtendHighI32x4ULane0Module,
     },
     .{
+        .name = "simd_f32x4_convert_i32x4_s_lane0",
+        .simd = true,
+        .build = buildSimdF32x4ConvertI32x4SLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_convert_i32x4_u_lane0",
+        .simd = true,
+        .build = buildSimdF32x4ConvertI32x4ULane0Module,
+    },
+    .{
+        .name = "simd_f64x2_convert_low_i32x4_s_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2ConvertLowI32x4SLane0HighModule,
+    },
+    .{
+        .name = "simd_f64x2_convert_low_i32x4_u_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2ConvertLowI32x4ULane0HighModule,
+    },
+    .{
         .name = "simd_i16x8_extmul_low_i8x16_s_lane0",
         .simd = true,
         .build = buildSimdI16x8ExtMulLowI8x16SLane0Module,
@@ -1370,6 +1390,54 @@ fn buildSimdI64x2ExtendLowI32x4ULane0Module(allocator: Allocator) ![]u8 {
 
 fn buildSimdI64x2ExtendHighI32x4ULane0Module(allocator: Allocator) ![]u8 {
     return buildSimdI64x2ExtendLane0Module(allocator, 0xCA);
+}
+
+const int_to_float_convert_source_i32: [4]i32 = .{
+    @as(i32, @bitCast(@as(u32, 0x8000_0000))),
+    1,
+    2,
+    3,
+};
+
+fn buildSimdF32x4ConvertI32x4Lane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, int_to_float_convert_source_i32);
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdF32x4ConvertI32x4SLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4ConvertI32x4Lane0Module(allocator, 0xFA);
+}
+
+fn buildSimdF32x4ConvertI32x4ULane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4ConvertI32x4Lane0Module(allocator, 0xFB);
+}
+
+fn buildSimdF64x2ConvertLowI32x4Lane0HighModule(allocator: Allocator, simd_opcode: u32) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, int_to_float_convert_source_i32);
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI64x2ExtractLane(&instr, allocator, 0);
+    try appendI64Const(&instr, allocator, 32);
+    try appendI64ShrU(&instr, allocator);
+    try appendI32WrapI64(&instr, allocator);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdF64x2ConvertLowI32x4SLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2ConvertLowI32x4Lane0HighModule(allocator, 0xFE);
+}
+
+fn buildSimdF64x2ConvertLowI32x4ULane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2ConvertLowI32x4Lane0HighModule(allocator, 0xFF);
 }
 
 const i16_extmul_lhs_i8: [16]u8 = .{ 0x01, 0xFE, 0x03, 0xFC, 0x05, 0xFA, 0x07, 0xF8, 0x09, 0xF6, 0x0B, 0xF4, 0x0D, 0xF2, 0x0F, 0xF0 };
@@ -3819,6 +3887,10 @@ fn appendI32Const(buf: *std.ArrayList(u8), allocator: Allocator, value: i64) !vo
 fn appendI64Const(buf: *std.ArrayList(u8), allocator: Allocator, value: i64) !void {
     try buf.append(allocator, 0x42); // i64.const
     try encodeSLEB128(buf, allocator, value);
+}
+
+fn appendI64ShrU(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try buf.append(allocator, 0x88); // i64.shr_u
 }
 
 fn appendI32WrapI64(buf: *std.ArrayList(u8), allocator: Allocator) !void {

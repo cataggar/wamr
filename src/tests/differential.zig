@@ -392,6 +392,69 @@ test "differential SIMD: i32x4.splat feeds i32x4.add" {
     try expectSimdDiffI32(wasm, "f", 9);
 }
 
+fn expectF32x4ConvertLane0(opcode: u32, lanes: [4]i32, expected_bits: i32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI32x4ExtractLane(&body, testing.allocator, 0);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", expected_bits);
+}
+
+fn expectF64x2ConvertLowLane0High(opcode: u32, lanes: [4]i32, expected_high_bits: i32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI64x2ExtractLane(&body, testing.allocator, 0);
+    try appendI64Const(&body, testing.allocator, 32);
+    try appendI64ShrU(&body, testing.allocator);
+    try appendI32WrapI64(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", expected_high_bits);
+}
+
+test "differential SIMD: f32x4.convert_i32x4_s lane 0 matches interpreter" {
+    try expectF32x4ConvertLane0(
+        0xFA,
+        .{ @bitCast(@as(u32, 0x8000_0000)), 1, 2, 3 },
+        @bitCast(@as(u32, 0xcf00_0000)),
+    );
+}
+
+test "differential SIMD: f32x4.convert_i32x4_u lane 0 matches interpreter" {
+    try expectF32x4ConvertLane0(
+        0xFB,
+        .{ @bitCast(@as(u32, 0x8000_0000)), 1, 2, 3 },
+        0x4f00_0000,
+    );
+}
+
+test "differential SIMD: f64x2.convert_low_i32x4_s lane 0 matches interpreter" {
+    try expectF64x2ConvertLowLane0High(
+        0xFE,
+        .{ @bitCast(@as(u32, 0x8000_0000)), 1, 2, 3 },
+        @bitCast(@as(u32, 0xc1e0_0000)),
+    );
+}
+
+test "differential SIMD: f64x2.convert_low_i32x4_u lane 0 matches interpreter" {
+    try expectF64x2ConvertLowLane0High(
+        0xFF,
+        .{ @bitCast(@as(u32, 0x8000_0000)), 1, 2, 3 },
+        0x41e0_0000,
+    );
+}
+
 fn expectF64x2Lane0Part(opcode: u32, lhs: [2]u64, rhs: [2]u64, shift: u6, expected: i32) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);

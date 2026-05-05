@@ -1529,6 +1529,34 @@ pub const CodeBuffer = struct {
             (@as(u32, rn.encoding()) << 5) | vd);
     }
 
+    /// SCVTF Vd.4S, Vn.4S — signed i32 lanes to f32 lanes.
+    pub fn scvtf4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4E21D800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UCVTF Vd.4S, Vn.4S — unsigned i32 lanes to f32 lanes.
+    pub fn ucvtf4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E21D800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SCVTF Vd.2D, Vn.2D — signed i64 lanes to f64 lanes.
+    pub fn scvtf2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4E61D800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UCVTF Vd.2D, Vn.2D — unsigned i64 lanes to f64 lanes.
+    pub fn ucvtf2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E61D800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// FCVT Dd, Sn — promote single-precision to double-precision.
     pub fn fcvtPromoteSToD(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x1E22C000 | (@as(u32, vn) << 5) | vd);
@@ -2788,6 +2816,21 @@ test "emit: integer SIMD widening extend low/high ops" {
         .{ .name = "ushll2d2s", .expected = 0x2F20A630 },
         .{ .name = "sshll2_2d4s", .expected = 0x4F20A630 },
         .{ .name = "ushll2_2d4s", .expected = 0x6F20A630 },
+    };
+    inline for (cases) |c| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try @field(CodeBuffer, c.name)(&code, 16, 17);
+        try expectWord(c.expected, &code);
+    }
+}
+
+test "emit: SIMD int-to-float conversion ops" {
+    const cases = [_]struct { name: []const u8, expected: u32 }{
+        .{ .name = "scvtf4s", .expected = 0x4E21DA30 },
+        .{ .name = "ucvtf4s", .expected = 0x6E21DA30 },
+        .{ .name = "scvtf2d", .expected = 0x4E61DA30 },
+        .{ .name = "ucvtf2d", .expected = 0x6E61DA30 },
     };
     inline for (cases) |c| {
         var code = CodeBuffer.init(std.testing.allocator);

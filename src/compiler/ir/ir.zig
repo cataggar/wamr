@@ -75,6 +75,7 @@ pub const Inst = struct {
         i32x4_extadd_pairwise_i16x8: SimdExtAddPairwise,
         i32x4_extend_i16x8: SimdExtendHalf,
         i32x4_extmul_i16x8: SimdExtMul,
+        f32x4_convert_i32x4: SimdIntToFloatConvert,
         i32x4_shift: I32x4Shift,
         i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
@@ -107,6 +108,7 @@ pub const Inst = struct {
         i64x2_extract_lane: I64x2ExtractLane,
         i64x2_replace_lane: I64x2ReplaceLane,
         f64x2_binop: F64x2BinOp,
+        f64x2_convert_low_i32x4: SimdIntToFloatConvert,
 
         // Binary arithmetic (dest = lhs op rhs)
         add: BinOp,
@@ -284,6 +286,7 @@ pub const Inst = struct {
     pub const SimdExtAddPairwiseSign = enum { signed, unsigned };
     pub const SimdExtendSign = enum { signed, unsigned };
     pub const SimdExtendHalfSelect = enum { low, high };
+    pub const SimdIntToFloatSign = enum { signed, unsigned };
 
     pub const I32x4Op = enum {
         add,
@@ -460,6 +463,11 @@ pub const Inst = struct {
         half: SimdExtendHalfSelect,
         lhs: VReg,
         rhs: VReg,
+    };
+
+    pub const SimdIntToFloatConvert = struct {
+        sign: SimdIntToFloatSign,
+        vector: VReg,
     };
 
     pub const SimdNarrowSign = enum { signed, unsigned };
@@ -912,6 +920,14 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.SimdExtendHalfSelect.low, i64_extend.op.i64x2_extend_i32x4.half);
     try std.testing.expectEqual(@as(VReg, 25), i64_extend.op.i64x2_extend_i32x4.vector);
 
+    const f32_convert = Inst{
+        .op = .{ .f32x4_convert_i32x4 = .{ .sign = .unsigned, .vector = 26 } },
+        .dest = 27,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdIntToFloatSign.unsigned, f32_convert.op.f32x4_convert_i32x4.sign);
+    try std.testing.expectEqual(@as(VReg, 26), f32_convert.op.f32x4_convert_i32x4.vector);
+
     const i16_extmul = Inst{
         .op = .{ .i16x8_extmul_i8x16 = .{ .sign = .signed, .half = .high, .lhs = 27, .rhs = 28 } },
         .dest = 29,
@@ -1003,6 +1019,14 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.F64x2Op.div, f64_bin.op.f64x2_binop.op);
     try std.testing.expectEqual(@as(VReg, 24), f64_bin.op.f64x2_binop.lhs);
+
+    const f64_convert = Inst{
+        .op = .{ .f64x2_convert_low_i32x4 = .{ .sign = .signed, .vector = 26 } },
+        .dest = 27,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.SimdIntToFloatSign.signed, f64_convert.op.f64x2_convert_low_i32x4.sign);
+    try std.testing.expectEqual(@as(VReg, 26), f64_convert.op.f64x2_convert_low_i32x4.vector);
 
     const i64_splat = Inst{
         .op = .{ .i64x2_splat = 26 },

@@ -253,6 +253,7 @@ fn opClass(inst: ir.Inst) Class {
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
         .i32x4_extend_i16x8,
+        .f32x4_convert_i32x4,
         .i32x4_extmul_i16x8,
         .i32x4_shift,
         .i32x4_splat,
@@ -286,6 +287,7 @@ fn opClass(inst: ir.Inst) Class {
         .i64x2_extract_lane,
         .i64x2_replace_lane,
         .f64x2_binop,
+        .f64x2_convert_low_i32x4,
         => if (def != null) .alu else .barrier,
 
         .mul => if (def != null and isIntegerType(inst.type)) .mul else .barrier,
@@ -545,6 +547,7 @@ pub fn forEachUse(
         .i32x4_unop => |un| try visit(context, un.vector),
         .i32x4_extadd_pairwise_i16x8 => |op| try visit(context, op.vector),
         .i32x4_extend_i16x8 => |op| try visit(context, op.vector),
+        .f32x4_convert_i32x4 => |op| try visit(context, op.vector),
         .i32x4_extmul_i16x8 => |op| {
             try visit(context, op.lhs);
             try visit(context, op.rhs);
@@ -593,6 +596,7 @@ pub fn forEachUse(
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .f64x2_convert_low_i32x4 => |op| try visit(context, op.vector),
         .i64x2_unop => |un| try visit(context, un.vector),
         .i64x2_extend_i32x4 => |op| try visit(context, op.vector),
         .i64x2_extmul_i32x4 => |op| {
