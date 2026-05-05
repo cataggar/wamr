@@ -2296,6 +2296,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f64x2_sub,
                     .f64x2_mul,
                     .f64x2_div,
+                    .f64x2_min,
+                    .f64x2_max,
                     => {
                         const rhs = safePop(&vreg_stack);
                         const lhs = safePop(&vreg_stack);
@@ -2305,6 +2307,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .f64x2_sub => .sub,
                             .f64x2_mul => .mul,
                             .f64x2_div => .div,
+                            .f64x2_min => .min,
+                            .f64x2_max => .max,
                             else => unreachable,
                         };
                         try ir_func.getBlock(current_block).append(.{
@@ -4940,6 +4944,8 @@ test "lower f64x2 arithmetic opcodes" {
         .{ .opcode = 0xF1, .expected = .sub },
         .{ .opcode = 0xF2, .expected = .mul },
         .{ .opcode = 0xF3, .expected = .div },
+        .{ .opcode = 0xF4, .expected = .min },
+        .{ .opcode = 0xF5, .expected = .max },
     };
 
     const appendULEB = struct {
