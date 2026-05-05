@@ -1821,6 +1821,39 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .v128_load8_lane,
+                    .v128_load16_lane,
+                    .v128_load32_lane,
+                    .v128_load64_lane,
+                    => {
+                        const alignment = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const lane = try readByte(code, &ip);
+                        const width: ir.Inst.V128LaneWidth = switch (simd_op) {
+                            .v128_load8_lane => .i8,
+                            .v128_load16_lane => .i16,
+                            .v128_load32_lane => .i32,
+                            .v128_load64_lane => .i64,
+                            else => unreachable,
+                        };
+                        if (lane >= width.laneCount()) return error.InvalidBytecode;
+                        const vector = safePop(&vreg_stack);
+                        const base = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_load_lane = .{
+                                .width = width,
+                                .base = base,
+                                .offset = offset,
+                                .alignment = alignment,
+                                .vector = vector,
+                                .lane = lane,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .v128_store => {
                         const alignment = readU32(code, &ip);
                         const offset = readU32(code, &ip);
@@ -3861,6 +3894,108 @@ test "lower v128.loadN_splat opcodes preserve memarg offsets" {
         try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
         try std.testing.expect(insts[2].op.ret != null);
     }
+}
+
+test "lower v128.loadN_lane opcodes parse memarg lane and operands" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.v128},
+    };
+    const cases = [_]struct {
+        opcode: u8,
+        alignment: u8,
+        offset: u8,
+        lane: u8,
+        width: ir.Inst.V128LaneWidth,
+    }{
+        .{ .opcode = 0x54, .alignment = 0, .offset = 3, .lane = 5, .width = .i8 },
+        .{ .opcode = 0x55, .alignment = 1, .offset = 4, .lane = 2, .width = .i16 },
+        .{ .opcode = 0x56, .alignment = 2, .offset = 8, .lane = 1, .width = .i32 },
+        .{ .opcode = 0x57, .alignment = 3, .offset = 16, .lane = 1, .width = .i64 },
+    };
+
+    for (cases) |case| {
+        const code = [_]u8{
+            0x41, 0x0B, // i32.const 11
+            0xFD,           0x0C, // v128.const
+            0x00,           0x01,
+            0x02,           0x03,
+            0x04,           0x05,
+            0x06,           0x07,
+            0x08,           0x09,
+            0x0A,           0x0B,
+            0x0C,           0x0D,
+            0x0E,           0x0F,
+            0xFD,           case.opcode,
+            case.alignment, case.offset,
+            case.lane,      0x0B,
+        };
+        const func = types.WasmFunction{
+            .type_idx = 0,
+            .func_type = func_type,
+            .local_count = 0,
+            .locals = &.{},
+            .code = &code,
+        };
+        const wasm_module = types.WasmModule{
+            .types = &[_]types.FuncType{func_type},
+            .functions = &[_]types.WasmFunction{func},
+        };
+
+        var ir_module = try lowerModule(&wasm_module, allocator);
+        defer ir_module.deinit();
+
+        const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+        try std.testing.expectEqual(@as(usize, 4), insts.len);
+        try std.testing.expectEqual(@as(i32, 11), insts[0].op.iconst_32);
+        const ld = insts[2].op.v128_load_lane;
+        try std.testing.expectEqual(case.width, ld.width);
+        try std.testing.expectEqual(insts[0].dest.?, ld.base);
+        try std.testing.expectEqual(insts[1].dest.?, ld.vector);
+        try std.testing.expectEqual(@as(u32, @intCast(case.offset)), ld.offset);
+        try std.testing.expectEqual(@as(u32, @intCast(case.alignment)), ld.alignment);
+        try std.testing.expectEqual(case.lane, ld.lane);
+        try std.testing.expectEqual(ir.IrType.v128, insts[2].type);
+        try std.testing.expectEqual(insts[2].dest.?, insts[3].op.ret.?);
+    }
+}
+
+test "reject invalid v128.loadN_lane lane immediates" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.v128},
+    };
+    const code = [_]u8{
+        0x41, 0x00, // i32.const 0
+        0xFD, 0x0C, // v128.const
+        0x00, 0x01,
+        0x02, 0x03,
+        0x04, 0x05,
+        0x06, 0x07,
+        0x08, 0x09,
+        0x0A, 0x0B,
+        0x0C, 0x0D,
+        0x0E, 0x0F,
+        0xFD, 0x55, 0x01, 0x00, 0x08, // v128.load16_lane lane 8
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    try std.testing.expectError(error.InvalidBytecode, lowerModule(&wasm_module, allocator));
 }
 
 test "lower i8x16.shuffle parses lane immediates and operands" {

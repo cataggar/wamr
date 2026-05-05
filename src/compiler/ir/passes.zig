@@ -290,6 +290,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .load => |ld| list.append(ld.base),
         .v128_load => |ld| list.append(ld.base),
         .v128_load_splat => |ld| list.append(ld.base),
+        .v128_load_lane => |ld| {
+            list.append(ld.base);
+            list.append(ld.vector);
+        },
         .store => |st| {
             list.append(st.base);
             list.append(st.val);
@@ -672,6 +676,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         },
         .v128_load_splat => |*ld| if (ld.base == old) {
             ld.base = new;
+        },
+        .v128_load_lane => |*ld| {
+            if (ld.base == old) ld.base = new;
+            if (ld.vector == old) ld.vector = new;
         },
         .store => |*st| {
             if (st.base == old) st.base = new;
@@ -1645,6 +1653,7 @@ fn hasSideEffect(inst: ir.Inst) bool {
         .load,
         .v128_load,
         .v128_load_splat,
+        .v128_load_lane,
         .table_get,
         .div_u,
         .rem_u,
@@ -3686,6 +3695,10 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .load => |*ld| ld.base += offset,
         .v128_load => |*ld| ld.base += offset,
         .v128_load_splat => |*ld| ld.base += offset,
+        .v128_load_lane => |*ld| {
+            ld.base += offset;
+            ld.vector += offset;
+        },
         .store => |*st| {
             st.base += offset;
             st.val += offset;

@@ -782,6 +782,49 @@ pub const CodeBuffer = struct {
         try self.ld1r(vt, rn, 3);
     }
 
+    const Ld1LaneWidth = enum { b, h, s, d };
+
+    fn ld1Lane(self: *CodeBuffer, vt: u5, width: Ld1LaneWidth, lane: u8, rn: Reg) !void {
+        const lane_u32: u32 = @intCast(lane);
+        const q: u32 = switch (width) {
+            .b => lane_u32 >> 3,
+            .h => lane_u32 >> 2,
+            .s => lane_u32 >> 1,
+            .d => lane_u32,
+        };
+        const index_bits: u32 = switch (width) {
+            .b => (lane_u32 & 0x7) << 10,
+            .h => 0x4000 | ((lane_u32 & 0x3) << 11),
+            .s => 0x8000 | ((lane_u32 & 0x1) << 12),
+            .d => 0x8400,
+        };
+        try self.emit32(0x0D400000 |
+            (q << 30) |
+            index_bits |
+            (@as(u32, rn.encoding()) << 5) |
+            vt);
+    }
+
+    /// LD1 { Vt.B }[lane], [Xn] — load one byte lane, preserving other lanes.
+    pub fn ld1LaneB(self: *CodeBuffer, vt: u5, lane: u4, rn: Reg) !void {
+        try self.ld1Lane(vt, .b, lane, rn);
+    }
+
+    /// LD1 { Vt.H }[lane], [Xn] — load one halfword lane, preserving other lanes.
+    pub fn ld1LaneH(self: *CodeBuffer, vt: u5, lane: u3, rn: Reg) !void {
+        try self.ld1Lane(vt, .h, lane, rn);
+    }
+
+    /// LD1 { Vt.S }[lane], [Xn] — load one word lane, preserving other lanes.
+    pub fn ld1LaneS(self: *CodeBuffer, vt: u5, lane: u2, rn: Reg) !void {
+        try self.ld1Lane(vt, .s, lane, rn);
+    }
+
+    /// LD1 { Vt.D }[lane], [Xn] — load one doubleword lane, preserving other lanes.
+    pub fn ld1LaneD(self: *CodeBuffer, vt: u5, lane: u1, rn: Reg) !void {
+        try self.ld1Lane(vt, .d, lane, rn);
+    }
+
     /// STR Qt, [Xn] — full-width 128-bit vector store.
     pub fn strQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
         try self.emit32(0x3D800000 | (@as(u32, rn.encoding()) << 5) | vt);
@@ -2415,6 +2458,57 @@ test "emit: LD1R vector broadcast load forms" {
         defer code.deinit();
         try code.ld1r2d(3, .x12);
         try expectWord(0x4D40CD83, &code);
+    }
+}
+
+test "emit: LD1 lane loads" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneB(0, 0, .x1);
+        try expectWord(0x0D400020, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneB(0, 15, .x1);
+        try expectWord(0x4D401C20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneH(2, 0, .x3);
+        try expectWord(0x0D404062, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneH(2, 7, .x3);
+        try expectWord(0x4D405862, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneS(4, 0, .x5);
+        try expectWord(0x0D4080A4, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneS(4, 3, .x5);
+        try expectWord(0x4D4090A4, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneD(6, 0, .x7);
+        try expectWord(0x0D4084E6, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1LaneD(6, 1, .x7);
+        try expectWord(0x4D4084E6, &code);
     }
 }
 

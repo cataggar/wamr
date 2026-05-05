@@ -330,6 +330,10 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .load => |ld| live.put(ld.base, {}) catch {},
         .v128_load => |ld| live.put(ld.base, {}) catch {},
         .v128_load_splat => |ld| live.put(ld.base, {}) catch {},
+        .v128_load_lane => |ld| {
+            live.put(ld.base, {}) catch {};
+            live.put(ld.vector, {}) catch {};
+        },
         .store => |st| {
             live.put(st.base, {}) catch {};
             live.put(st.val, {}) catch {};
@@ -748,6 +752,10 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .load => |ld| last_use.put(ld.base, pos) catch {},
         .v128_load => |ld| last_use.put(ld.base, pos) catch {},
         .v128_load_splat => |ld| last_use.put(ld.base, pos) catch {},
+        .v128_load_lane => |ld| {
+            last_use.put(ld.base, pos) catch {};
+            last_use.put(ld.vector, pos) catch {};
+        },
         .store => |st| {
             last_use.put(st.base, pos) catch {};
             last_use.put(st.val, pos) catch {};
