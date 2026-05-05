@@ -104,7 +104,7 @@ jobs:
 
       - name: Install wasmtime
         run: |
-          curl https://wasmtime.dev/install.sh -sSf | bash
+          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v36.0.9
           echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
 
       - name: Build for wasm32-wasi
