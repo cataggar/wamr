@@ -1020,6 +1020,45 @@ test "differential SIMD: v128.loadN_lane updates one lane and preserves others" 
     try expectSimdDiffI32(wasm, "f", 18_114);
 }
 
+test "differential SIMD: v128.storeN_lane writes selected lanes only" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 1, 2, 3, 4, 5, 122, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 });
+    try appendSimdMemLaneOpcode(&body, testing.allocator, 0x58, 0, 3, 5);
+    try appendI32Const(&body, testing.allocator, 3);
+    try appendScalarMemOpcode(&body, testing.allocator, 0x2D, 0, 0);
+
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendV128ConstI16x8(&body, testing.allocator, .{ 1, 2, 0x1234, 4, 5, 6, 7, 8 });
+    try appendSimdMemLaneOpcode(&body, testing.allocator, 0x59, 1, 4, 2);
+    try appendI32Const(&body, testing.allocator, 4);
+    try appendScalarMemOpcode(&body, testing.allocator, 0x2F, 1, 0);
+    try body.append(testing.allocator, 0x6A);
+
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 1, 0x0102_0304, 3, 4 });
+    try appendSimdMemLaneOpcode(&body, testing.allocator, 0x5A, 2, 8, 1);
+    try appendI32Const(&body, testing.allocator, 8);
+    try appendScalarMemOpcode(&body, testing.allocator, 0x28, 2, 0);
+    try body.append(testing.allocator, 0x6A);
+
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendV128ConstI64x2(&body, testing.allocator, .{ 0, 239 });
+    try appendSimdMemLaneOpcode(&body, testing.allocator, 0x5B, 3, 16, 1);
+    try appendI32Const(&body, testing.allocator, 16);
+    try appendScalarMemOpcode(&body, testing.allocator, 0x29, 3, 0);
+    try appendI32WrapI64(&body, testing.allocator);
+    try body.append(testing.allocator, 0x6A);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 16_914_081);
+}
+
 test "differential SIMD: v128.load out-of-bounds traps" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -1090,6 +1129,34 @@ test "differential SIMD: v128.loadN_lane out-of-bounds traps" {
                 try appendI32WrapI64(&body, testing.allocator);
             },
         }
+        try body.append(testing.allocator, 0x0B);
+
+        const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+        defer testing.allocator.free(wasm);
+        try expectSimdMemoryTrap(wasm, "f");
+    }
+}
+
+test "differential SIMD: v128.storeN_lane out-of-bounds traps" {
+    const cases = [_]struct {
+        opcode: u32,
+        alignment: u32,
+        addr: i64,
+        lane: u8,
+    }{
+        .{ .opcode = 0x58, .alignment = 0, .addr = 65_536, .lane = 0 },
+        .{ .opcode = 0x59, .alignment = 1, .addr = 65_535, .lane = 0 },
+        .{ .opcode = 0x5A, .alignment = 2, .addr = 65_533, .lane = 0 },
+        .{ .opcode = 0x5B, .alignment = 3, .addr = 65_529, .lane = 0 },
+    };
+    for (cases) |case| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(testing.allocator);
+        try body.append(testing.allocator, 0x00);
+        try appendI32Const(&body, testing.allocator, case.addr);
+        try appendV128ConstI64x2(&body, testing.allocator, .{ 0, 0 });
+        try appendSimdMemLaneOpcode(&body, testing.allocator, case.opcode, case.alignment, 0, case.lane);
+        try appendI32Const(&body, testing.allocator, 0);
         try body.append(testing.allocator, 0x0B);
 
         const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
@@ -1282,6 +1349,18 @@ fn appendI64ShrU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
 
 fn appendI32WrapI64(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     try buf.append(allocator, 0xA7);
+}
+
+fn appendScalarMemOpcode(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    opcode: u8,
+    alignment: u32,
+    offset: u32,
+) !void {
+    try buf.append(allocator, opcode);
+    try encodeULEB128(buf, allocator, alignment);
+    try encodeULEB128(buf, allocator, offset);
 }
 
 fn appendSimdMemOpcode(
