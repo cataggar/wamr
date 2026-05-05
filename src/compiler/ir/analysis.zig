@@ -199,6 +199,10 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(op.lhs, {}) catch {};
             live.put(op.rhs, {}) catch {};
         },
+        .i8x16_swizzle => |op| {
+            live.put(op.vector, {}) catch {};
+            live.put(op.indices, {}) catch {};
+        },
         .i8x16_narrow_i16x8 => |op| {
             live.put(op.lhs, {}) catch {};
             live.put(op.rhs, {}) catch {};
@@ -597,6 +601,10 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .i8x16_shuffle => |op| {
             last_use.put(op.lhs, pos) catch {};
             last_use.put(op.rhs, pos) catch {};
+        },
+        .i8x16_swizzle => |op| {
+            last_use.put(op.vector, pos) catch {};
+            last_use.put(op.indices, pos) catch {};
         },
         .i8x16_narrow_i16x8 => |op| {
             last_use.put(op.lhs, pos) catch {};
