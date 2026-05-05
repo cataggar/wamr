@@ -546,7 +546,7 @@ test "differential SIMD: f64x2.ge lane 0 matches interpreter for NaN false" {
 }
 
 test "differential SIMD: f64x2.add lane 0 matches interpreter" {
-    try expectF64x2ArithmeticLane0High(
+    try expectF64x2Lane0High(
         0xF0,
         .{ 0x3ff4_0000_0000_0000, 0x4008_0000_0000_0000 },
         .{ 0x4004_0000_0000_0000, 0x4010_0000_0000_0000 },
@@ -555,7 +555,7 @@ test "differential SIMD: f64x2.add lane 0 matches interpreter" {
 }
 
 test "differential SIMD: f64x2.sub lane 0 matches interpreter" {
-    try expectF64x2ArithmeticLane0High(
+    try expectF64x2Lane0High(
         0xF1,
         .{ 0x4023_0000_0000_0000, 0x4010_0000_0000_0000 },
         .{ 0x4002_0000_0000_0000, 0x4000_0000_0000_0000 },
@@ -564,7 +564,7 @@ test "differential SIMD: f64x2.sub lane 0 matches interpreter" {
 }
 
 test "differential SIMD: f64x2.mul lane 0 matches interpreter" {
-    try expectF64x2ArithmeticLane0High(
+    try expectF64x2Lane0High(
         0xF2,
         .{ 0x4008_0000_0000_0000, 0x3ff0_0000_0000_0000 },
         .{ 0xc004_0000_0000_0000, 0x4000_0000_0000_0000 },
@@ -573,7 +573,7 @@ test "differential SIMD: f64x2.mul lane 0 matches interpreter" {
 }
 
 test "differential SIMD: f64x2.div lane 0 matches interpreter" {
-    try expectF64x2ArithmeticLane0High(
+    try expectF64x2Lane0High(
         0xF3,
         .{ 0x4022_0000_0000_0000, 0x4010_0000_0000_0000 },
         .{ 0x4000_0000_0000_0000, 0x4000_0000_0000_0000 },
@@ -629,6 +629,42 @@ test "differential SIMD: f64x2.max canonicalizes rhs NaN" {
     const rhs = [2]u64{ 0x7ff8_0000_0000_0001, 0x4000_0000_0000_0000 };
     try expectF64x2Lane0High(0xF5, lhs, rhs, 0x7ff8_0000);
     try expectF64x2Lane0Low(0xF5, lhs, rhs, 0);
+}
+
+test "differential SIMD: f64x2.pmin lane 0 matches interpreter" {
+    try expectF64x2Lane0High(
+        0xF6,
+        .{ 0x4008_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0xc000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        @bitCast(@as(u32, 0xc000_0000)),
+    );
+}
+
+test "differential SIMD: f64x2.pmin keeps lhs when rhs is NaN" {
+    try expectF64x2Lane0High(
+        0xF6,
+        .{ 0x3ff0_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0x7ff8_0000_0000_0001, 0x4000_0000_0000_0000 },
+        0x3ff0_0000,
+    );
+}
+
+test "differential SIMD: f64x2.pmax lane 0 matches interpreter" {
+    try expectF64x2Lane0High(
+        0xF7,
+        .{ 0xbff8_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0x4004_0000_0000_0000, 0x4000_0000_0000_0000 },
+        0x4004_0000,
+    );
+}
+
+test "differential SIMD: f64x2.pmax keeps lhs signed zero on ties" {
+    try expectF64x2Lane0High(
+        0xF7,
+        .{ 0x8000_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0x0000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        @bitCast(@as(u32, 0x8000_0000)),
+    );
 }
 
 test "differential SIMD: i8x16.shuffle selects bytes from both inputs" {
