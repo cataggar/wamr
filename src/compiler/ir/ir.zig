@@ -67,6 +67,7 @@ pub const Inst = struct {
         // wasm SIMD coverage or exported v128 ABI support.
         v128_const: u128,
         v128_load: V128Mem,
+        v128_load_splat: V128LoadSplat,
         v128_store: V128Store,
         v128_not: VReg,
         v128_bitwise: V128Bitwise,
@@ -420,6 +421,35 @@ pub const Inst = struct {
         alignment: u32,
         bounds_known: bool = false,
         checked_end: u64 = 0,
+    };
+
+    pub const V128LoadSplatWidth = enum {
+        i8x16,
+        i16x8,
+        i32x4,
+        i64x2,
+
+        pub fn accessSize(self: V128LoadSplatWidth) u8 {
+            return switch (self) {
+                .i8x16 => 1,
+                .i16x8 => 2,
+                .i32x4 => 4,
+                .i64x2 => 8,
+            };
+        }
+    };
+
+    pub const V128LoadSplat = struct {
+        width: V128LoadSplatWidth,
+        base: VReg,
+        offset: u32,
+        alignment: u32,
+        bounds_known: bool = false,
+        checked_end: u64 = 0,
+
+        pub fn accessSize(self: V128LoadSplat) u8 {
+            return self.width.accessSize();
+        }
     };
 
     pub const V128Store = struct {
@@ -795,6 +825,22 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.SimdBitmaskWidth.i16x8, bitmask.op.simd_bitmask.width);
     try std.testing.expectEqual(@as(VReg, 7), bitmask.op.simd_bitmask.vector);
+
+    const load_splat = Inst{
+        .op = .{ .v128_load_splat = .{
+            .width = .i32x4,
+            .base = 6,
+            .offset = 12,
+            .alignment = 2,
+        } },
+        .dest = 8,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.V128LoadSplatWidth.i32x4, load_splat.op.v128_load_splat.width);
+    try std.testing.expectEqual(@as(VReg, 6), load_splat.op.v128_load_splat.base);
+    try std.testing.expectEqual(@as(u32, 12), load_splat.op.v128_load_splat.offset);
+    try std.testing.expectEqual(@as(u32, 2), load_splat.op.v128_load_splat.alignment);
+    try std.testing.expectEqual(@as(u8, 4), load_splat.op.v128_load_splat.accessSize());
 
     const c = Inst{ .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF }, .dest = 1, .type = .v128 };
     try std.testing.expectEqual(IrType.v128, c.type);

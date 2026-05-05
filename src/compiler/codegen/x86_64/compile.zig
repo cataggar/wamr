@@ -1251,6 +1251,7 @@ fn compileInst(
         },
         .v128_const,
         .v128_load,
+        .v128_load_splat,
         .v128_store,
         .v128_not,
         .v128_bitwise,
@@ -1549,6 +1550,7 @@ fn functionUsesV128(func: *const ir.IrFunction) bool {
             switch (inst.op) {
                 .v128_const,
                 .v128_load,
+                .v128_load_splat,
                 .v128_store,
                 .v128_not,
                 .v128_bitwise,

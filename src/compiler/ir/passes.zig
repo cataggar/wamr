@@ -289,6 +289,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .global_set => |gs| list.append(gs.val),
         .load => |ld| list.append(ld.base),
         .v128_load => |ld| list.append(ld.base),
+        .v128_load_splat => |ld| list.append(ld.base),
         .store => |st| {
             list.append(st.base);
             list.append(st.val);
@@ -667,6 +668,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             ld.base = new;
         },
         .v128_load => |*ld| if (ld.base == old) {
+            ld.base = new;
+        },
+        .v128_load_splat => |*ld| if (ld.base == old) {
             ld.base = new;
         },
         .store => |*st| {
@@ -1640,6 +1644,7 @@ fn hasSideEffect(inst: ir.Inst) bool {
         // Trapping ops: must not be removed even if result is unused.
         .load,
         .v128_load,
+        .v128_load_splat,
         .table_get,
         .div_u,
         .rem_u,
@@ -3680,6 +3685,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .global_set => |*gs| gs.val += offset,
         .load => |*ld| ld.base += offset,
         .v128_load => |*ld| ld.base += offset,
+        .v128_load_splat => |*ld| ld.base += offset,
         .store => |*st| {
             st.base += offset;
             st.val += offset;

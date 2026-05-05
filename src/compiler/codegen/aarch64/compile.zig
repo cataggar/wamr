@@ -553,6 +553,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
     return switch (inst.op) {
         .v128_const,
         .v128_load,
+        .v128_load_splat,
         .v128_not,
         .v128_bitwise,
         .v128_bitselect,
@@ -608,6 +609,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
             switch (inst.op) {
                 .v128_const,
                 .v128_load,
+                .v128_load_splat,
                 .v128_not,
                 .v128_bitwise,
                 .v128_bitselect,
@@ -1415,6 +1417,7 @@ fn isV128Inst(inst: ir.Inst) bool {
     return switch (inst.op) {
         .v128_const,
         .v128_load,
+        .v128_load_splat,
         .v128_store,
         .v128_not,
         .v128_bitwise,
@@ -1604,6 +1607,7 @@ fn compileInst(
         },
         .v128_const => |val| try emitV128Const(code, inst, val, v128_map, v128_cache),
         .v128_load => |ld| try emitV128Load(code, inst, ld, reg_map, v128_map, v128_cache),
+        .v128_load_splat => |ld| try emitV128LoadSplat(code, inst, ld, reg_map, v128_map, v128_cache),
         .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache),
         .v128_not => |src| try emitV128Not(code, inst, src, v128_map, v128_cache, fctx),
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
@@ -2008,6 +2012,30 @@ fn emitV128Load(
         try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
     }
     try code.ldrQ(dest_reg, RegMap.tmp0);
+}
+
+fn emitV128LoadSplat(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    ld: ir.Inst.V128LoadSplat,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
+    if (ld.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
+    } else {
+        try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
+    }
+    switch (ld.width) {
+        .i8x16 => try code.ld1r16b(dest_reg, RegMap.tmp0),
+        .i16x8 => try code.ld1r8h(dest_reg, RegMap.tmp0),
+        .i32x4 => try code.ld1r4s(dest_reg, RegMap.tmp0),
+        .i64x2 => try code.ld1r2d(dest_reg, RegMap.tmp0),
+    }
 }
 
 fn emitV128Store(
@@ -8099,6 +8127,73 @@ test "load: bounds check emits B.LS + trap BLR + BRK" {
         if ((w & 0xFFFFFC1F) == 0xD63F0000) found_blr = true;
         if ((w & 0xFFE0001F) == 0xD4200000) found_brk = true;
     }
+    try std.testing.expect(found_bls);
+    try std.testing.expect(found_blr);
+    try std.testing.expect(found_brk);
+}
+
+test "compile: v128.load_splat emits LD1R forms with bounds trap" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+
+    const cases = [_]struct {
+        width: ir.Inst.V128LoadSplatWidth,
+        offset: u32,
+        alignment: u32,
+    }{
+        .{ .width = .i8x16, .offset = 0, .alignment = 0 },
+        .{ .width = .i16x8, .offset = 2, .alignment = 1 },
+        .{ .width = .i32x4, .offset = 4, .alignment = 2 },
+        .{ .width = .i64x2, .offset = 8, .alignment = 3 },
+    };
+    for (cases) |case| {
+        const vec = func.newVReg();
+        try func.getBlock(bid).append(.{
+            .op = .{ .v128_load_splat = .{
+                .width = case.width,
+                .base = addr,
+                .offset = case.offset,
+                .alignment = case.alignment,
+            } },
+            .dest = vec,
+            .type = .v128,
+        });
+    }
+
+    const ret = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = ret, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = ret } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_ld1r_16b = false;
+    var found_ld1r_8h = false;
+    var found_ld1r_4s = false;
+    var found_ld1r_2d = false;
+    var found_bls = false;
+    var found_blr = false;
+    var found_brk = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4D40C000) found_ld1r_16b = true;
+        if ((w & 0xFFFFFC00) == 0x4D40C400) found_ld1r_8h = true;
+        if ((w & 0xFFFFFC00) == 0x4D40C800) found_ld1r_4s = true;
+        if ((w & 0xFFFFFC00) == 0x4D40CC00) found_ld1r_2d = true;
+        if ((w & 0xFF000010) == 0x54000000 and (w & 0xF) == 0x9) found_bls = true;
+        if ((w & 0xFFFFFC1F) == 0xD63F0000) found_blr = true;
+        if ((w & 0xFFE0001F) == 0xD4200000) found_brk = true;
+    }
+
+    try std.testing.expect(found_ld1r_16b);
+    try std.testing.expect(found_ld1r_8h);
+    try std.testing.expect(found_ld1r_4s);
+    try std.testing.expect(found_ld1r_2d);
     try std.testing.expect(found_bls);
     try std.testing.expect(found_blr);
     try std.testing.expect(found_brk);
