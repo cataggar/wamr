@@ -565,6 +565,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i32x4_replace_lane,
         .i8x16_binop,
         .i8x16_shuffle,
+        .i8x16_swizzle,
         .i8x16_unop,
         .i8x16_shift,
         .i8x16_splat,
@@ -615,6 +616,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i32x4_replace_lane,
                 .i8x16_binop,
                 .i8x16_shuffle,
+                .i8x16_swizzle,
                 .i8x16_unop,
                 .i8x16_shift,
                 .i8x16_splat,
@@ -1419,6 +1421,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i32x4_replace_lane,
         .i8x16_binop,
         .i8x16_shuffle,
+        .i8x16_swizzle,
         .i8x16_unop,
         .i8x16_shift,
         .i8x16_splat,
@@ -1606,6 +1609,7 @@ fn compileInst(
         .i8x16_extract_lane => |lane| try emitI8x16ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
         .i8x16_replace_lane => |lane| try emitI8x16ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
         .i8x16_narrow_i16x8 => |op| try emitI8x16NarrowI16x8(code, inst, op, v128_map, v128_cache, fctx),
+        .i8x16_swizzle => |op| try emitI8x16Swizzle(code, inst, op, v128_map, v128_cache, fctx),
         .i16x8_binop => |bin| try emitI16x8BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i16x8_unop => |un| try emitI16x8UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .i16x8_extadd_pairwise_i8x16 => |op| try emitI16x8ExtAddPairwiseI8x16(code, inst, op, v128_map, v128_cache, fctx),
@@ -2580,6 +2584,33 @@ fn emitI8x16Shuffle(
 
     const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
     try code.tbl2_16b(dest_reg, v128_tmp0, v128_tmp2);
+}
+
+fn emitI8x16Swizzle(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.I8x16Swizzle,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, op.vector, null);
+    const indices_reg = if (op.indices == op.vector)
+        vector_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.indices, vector_reg);
+    const dest_reg = try prepareV128BinaryDest(
+        code,
+        inst,
+        op.vector,
+        vector_reg,
+        op.indices,
+        indices_reg,
+        v128_map,
+        v128_cache,
+        fctx,
+    );
+    try code.tbl1_16b(dest_reg, vector_reg, indices_reg);
 }
 
 fn emitI8x16Shift(
@@ -6183,6 +6214,43 @@ test "compile: i8x16.shuffle emits TBL instructions" {
     }
 
     try std.testing.expectEqual(@as(u32, 2), tbl_count);
+}
+
+test "compile: i8x16.swizzle emits single-register TBL instruction" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const vector = func.newVReg();
+    const indices = func.newVReg();
+    const swizzled = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0F0E_0D0C_0B0A_0908_0706_0504_0302_0100 }, .dest = vector, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0010_0F0E_0D0C_0B0A_0908_0706_0504_0302 }, .dest = indices, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i8x16_swizzle = .{
+            .vector = vector,
+            .indices = indices,
+        } },
+        .dest = swizzled,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_extract_lane = .{ .vector = swizzled, .lane = 0, .sign = .unsigned } }, .dest = lane, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var tbl1_count: u32 = 0;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC00) == 0x4E000000) tbl1_count += 1;
+    }
+
+    try std.testing.expectEqual(@as(u32, 1), tbl1_count);
 }
 
 test "compile: i16x8 lane ops emit NEON instructions" {

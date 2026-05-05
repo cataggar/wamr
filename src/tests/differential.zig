@@ -437,6 +437,36 @@ test "differential SIMD: i8x16.shuffle handles repeated lanes" {
     try expectSimdDiffI32(wasm, "f", 97);
 }
 
+test "differential SIMD: i8x16.swizzle selects dynamic byte indices" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F });
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6 });
+    try appendI8x16Swizzle(&body, testing.allocator);
+    try appendI8x16ExtractLaneU(&body, testing.allocator, 0);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 0x25);
+}
+
+test "differential SIMD: i8x16.swizzle zeroes out-of-range indices" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F });
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 16, 17, 18, 19, 20, 21, 22, 23, 0xFF, 15, 14, 13, 12, 11, 10, 9 });
+    try appendI8x16Swizzle(&body, testing.allocator);
+    try appendI8x16ExtractLaneU(&body, testing.allocator, 0);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 0);
+}
+
 test "differential SIMD: v128 bitwise xor extracts lane 0" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -632,6 +662,10 @@ fn appendV128ConstI8x16(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, l
 fn appendI8x16Shuffle(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lanes: [16]u8) !void {
     try appendSimdOpcode(buf, allocator, 0x0D);
     try buf.appendSlice(allocator, &lanes);
+}
+
+fn appendI8x16Swizzle(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try appendSimdOpcode(buf, allocator, 0x0E);
 }
 
 fn appendI8x16ExtractLaneU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
