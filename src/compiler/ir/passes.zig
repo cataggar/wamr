@@ -291,6 +291,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .v128_load => |ld| list.append(ld.base),
         .v128_load_splat => |ld| list.append(ld.base),
         .v128_load_zero => |ld| list.append(ld.base),
+        .v128_load_extend => |ld| list.append(ld.base),
         .v128_load_lane => |ld| {
             list.append(ld.base);
             list.append(ld.vector);
@@ -683,6 +684,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             ld.base = new;
         },
         .v128_load_zero => |*ld| if (ld.base == old) {
+            ld.base = new;
+        },
+        .v128_load_extend => |*ld| if (ld.base == old) {
             ld.base = new;
         },
         .v128_load_lane => |*ld| {
@@ -1667,6 +1671,7 @@ fn hasSideEffect(inst: ir.Inst) bool {
         .v128_load,
         .v128_load_splat,
         .v128_load_zero,
+        .v128_load_extend,
         .v128_load_lane,
         .table_get,
         .div_u,
@@ -2261,6 +2266,14 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
                     const gop = try base_max.getOrPut(ld.base);
                     if (!gop.found_existing) gop.value_ptr.* = end else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
                 },
+                .v128_load_extend => |ld| {
+                    if (ld.bounds_known) continue;
+                    const db = def_block.get(ld.base) orelse continue;
+                    if (loop.containsBlock(db)) continue; // not loop-invariant
+                    const end: u64 = @as(u64, ld.offset) + ld.accessSize();
+                    const gop = try base_max.getOrPut(ld.base);
+                    if (!gop.found_existing) gop.value_ptr.* = end else if (end > gop.value_ptr.*) gop.value_ptr.* = end;
+                },
                 .store => |st| {
                     if (st.bounds_known) continue;
                     const db = def_block.get(st.base) orelse continue;
@@ -2304,6 +2317,15 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
                             if (ld.bounds_known) continue;
                             if (ld.base != base) continue;
                             const end: u64 = @as(u64, ld.offset) + @as(u64, ld.size);
+                            if (end <= max_end) {
+                                ld.bounds_known = true;
+                                changed = true;
+                            }
+                        },
+                        .v128_load_extend => |*ld| {
+                            if (ld.bounds_known) continue;
+                            if (ld.base != base) continue;
+                            const end: u64 = @as(u64, ld.offset) + ld.accessSize();
                             if (end <= max_end) {
                                 ld.bounds_known = true;
                                 changed = true;
@@ -2544,6 +2566,25 @@ pub fn elideRedundantBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Alloc
                         try seg_first.put(ld.base, .{ .inst = inst, .max_end = end });
                     }
                 },
+                .v128_load_extend => |*ld| {
+                    const end: u64 = @as(u64, ld.offset) + ld.accessSize();
+                    const dom_max = domMaxEnd(table.items, valid_start, ld.base);
+
+                    if (end <= dom_max) {
+                        if (!ld.bounds_known) {
+                            ld.bounds_known = true;
+                            changed = true;
+                        }
+                    } else if (seg_first.getPtr(ld.base)) |se| {
+                        if (!ld.bounds_known) {
+                            ld.bounds_known = true;
+                            changed = true;
+                        }
+                        if (end > se.max_end) se.max_end = end;
+                    } else {
+                        try seg_first.put(ld.base, .{ .inst = inst, .max_end = end });
+                    }
+                },
                 .store => |*st| {
                     const end: u64 = @as(u64, st.offset) + @as(u64, st.size);
                     const dom_max = domMaxEnd(table.items, valid_start, st.base);
@@ -2626,12 +2667,14 @@ fn patchSegment(seg_first: *std.AutoHashMap(ir.VReg, SegEntry)) bool {
         const se = kv.value_ptr;
         const own_end: u64 = switch (se.inst.op) {
             .load => |ld| @as(u64, ld.offset) + @as(u64, ld.size),
+            .v128_load_extend => |ld| @as(u64, ld.offset) + ld.accessSize(),
             .store => |st| @as(u64, st.offset) + @as(u64, st.size),
             else => unreachable,
         };
         if (se.max_end > own_end) {
             switch (se.inst.op) {
                 .load => |*ld| ld.checked_end = se.max_end,
+                .v128_load_extend => |*ld| ld.checked_end = se.max_end,
                 .store => |*st| st.checked_end = se.max_end,
                 else => unreachable,
             }
@@ -2747,6 +2790,31 @@ pub fn foldLoadStoreOffset(func: *ir.IrFunction, allocator: std.mem.Allocator) !
                     }
                     if (!ld.bounds_known) {
                         const end = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
+                        const gop = try block_checked.getOrPut(ld.base);
+                        if (!gop.found_existing or end > gop.value_ptr.*) gop.value_ptr.* = end;
+                    }
+                },
+                .v128_load_extend => |*ld| {
+                    if (add_info.get(ld.base)) |info| {
+                        const access_end = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
+                        const new_end: ?u64 = std.math.add(u64, @as(u64, info.offset), access_end) catch null;
+                        const new_offset: ?u64 = std.math.add(u64, @as(u64, info.offset), @as(u64, ld.offset)) catch null;
+                        if (new_end) |end| {
+                            if (new_offset) |off| {
+                                const block_max = block_checked.get(info.base) orelse 0;
+                                const dom_max = domMaxEnd(table.items, valid_start, info.base);
+                                const proof = @max(block_max, dom_max);
+                                if (end <= proof and off <= std.math.maxInt(i32)) {
+                                    ld.base = info.base;
+                                    ld.offset = @intCast(off);
+                                    if (ld.checked_end > 0) ld.checked_end = end;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if (!ld.bounds_known) {
+                        const end = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
                         const gop = try block_checked.getOrPut(ld.base);
                         if (!gop.found_existing or end > gop.value_ptr.*) gop.value_ptr.* = end;
                     }
@@ -3710,6 +3778,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .v128_load => |*ld| ld.base += offset,
         .v128_load_splat => |*ld| ld.base += offset,
         .v128_load_zero => |*ld| ld.base += offset,
+        .v128_load_extend => |*ld| ld.base += offset,
         .v128_load_lane => |*ld| {
             ld.base += offset;
             ld.vector += offset;
