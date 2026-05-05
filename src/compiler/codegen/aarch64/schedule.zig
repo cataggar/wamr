@@ -248,6 +248,7 @@ fn opClass(inst: ir.Inst) Class {
         .v128_load => if (def != null) .load else .barrier,
         .store, .v128_store => .store,
         .v128_not,
+        .v128_any_true,
         .v128_bitwise,
         .v128_bitselect,
         .i32x4_binop,
@@ -532,6 +533,7 @@ pub fn forEachUse(
         },
         .phi => |edges| for (edges) |edge| try visit(context, edge.val),
         .v128_not => |v| try visit(context, v),
+        .v128_any_true => |v| try visit(context, v),
         .v128_load => |ld| try visit(context, ld.base),
         .v128_store => |st| {
             try visit(context, st.base);

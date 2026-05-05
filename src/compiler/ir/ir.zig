@@ -71,6 +71,7 @@ pub const Inst = struct {
         v128_not: VReg,
         v128_bitwise: V128Bitwise,
         v128_bitselect: V128Bitselect,
+        v128_any_true: VReg,
         i32x4_binop: I32x4BinOp,
         i32x4_unop: SimdUnary,
         i32x4_extadd_pairwise_i16x8: SimdExtAddPairwise,
@@ -755,6 +756,13 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(u32, 1), bitselect.op.v128_bitselect.a);
     try std.testing.expectEqual(@as(u32, 2), bitselect.op.v128_bitselect.b);
     try std.testing.expectEqual(@as(u32, 3), bitselect.op.v128_bitselect.mask);
+
+    const any_true = Inst{
+        .op = .{ .v128_any_true = 5 },
+        .dest = 6,
+        .type = .i32,
+    };
+    try std.testing.expectEqual(@as(VReg, 5), any_true.op.v128_any_true);
 
     const c = Inst{ .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF }, .dest = 1, .type = .v128 };
     try std.testing.expectEqual(IrType.v128, c.type);
