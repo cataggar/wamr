@@ -1421,6 +1421,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .v128_bitselect,
         .v128_any_true,
         .simd_all_true,
+        .simd_bitmask,
         .i32x4_binop,
         .i32x4_unop,
         .f32x4_convert_i32x4,
@@ -1609,6 +1610,7 @@ fn compileInst(
         .v128_bitselect => |sel| try emitV128Bitselect(code, inst, sel, v128_map, v128_cache, fctx),
         .v128_any_true => |src| try emitV128AnyTrue(code, inst, src, reg_map, v128_map, v128_cache),
         .simd_all_true => |op| try emitSimdAllTrue(code, inst, op, reg_map, v128_map, v128_cache),
+        .simd_bitmask => |op| try emitSimdBitmask(code, inst, op, reg_map, v128_map, v128_cache),
         .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
@@ -2161,6 +2163,60 @@ fn emitSimdAllTrue(
             try code.cmpImm(RegMap.tmp1, 0);
             try code.cset32(RegMap.tmp1, .ne);
             try code.andRegReg(info.reg, RegMap.tmp0, RegMap.tmp1);
+        },
+    }
+    try destCommit(code, reg_map, info);
+}
+
+const bitmask_i8x16_weights: u128 = 0x8040_2010_0804_0201_8040_2010_0804_0201;
+const bitmask_i16x8_weights: u128 = 0x0080_0040_0020_0010_0008_0004_0002_0001;
+const bitmask_i32x4_weights: u128 = 0x0000_0008_0000_0004_0000_0002_0000_0001;
+const bitmask_i64x2_weights: u128 = 0x0000_0000_0000_0002_0000_0000_0000_0001;
+
+fn emitSimdBitmask(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdBitmask,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+    const src_reg = try v128_cache.ensure(code, v128_map, op.vector, null);
+    switch (op.width) {
+        .i8x16 => {
+            try code.sshr16b7(v128_tmp0, src_reg);
+            try emitV128ImmediateIntoReg(code, v128_tmp1, bitmask_i8x16_weights);
+            try code.bitwise16b(.@"and", v128_tmp0, v128_tmp0, v128_tmp1);
+            try code.addp16b(v128_tmp0, v128_tmp0, v128_tmp0);
+            try code.addp16b(v128_tmp0, v128_tmp0, v128_tmp0);
+            try code.addp16b(v128_tmp0, v128_tmp0, v128_tmp0);
+            try code.umovWFromB(info.reg, v128_tmp0, 0);
+            try code.umovWFromB(RegMap.tmp0, v128_tmp0, 1);
+            try code.lslImm(RegMap.tmp0, RegMap.tmp0, 8);
+            try code.orrRegReg(info.reg, info.reg, RegMap.tmp0);
+        },
+        .i16x8 => {
+            try code.sshr8h15(v128_tmp0, src_reg);
+            try emitV128ImmediateIntoReg(code, v128_tmp1, bitmask_i16x8_weights);
+            try code.bitwise16b(.@"and", v128_tmp0, v128_tmp0, v128_tmp1);
+            try code.addvH8h(v128_tmp0, v128_tmp0);
+            try code.umovWFromH(info.reg, v128_tmp0, 0);
+        },
+        .i32x4 => {
+            try code.sshr4s31(v128_tmp0, src_reg);
+            try emitV128ImmediateIntoReg(code, v128_tmp1, bitmask_i32x4_weights);
+            try code.bitwise16b(.@"and", v128_tmp0, v128_tmp0, v128_tmp1);
+            try code.addvS4s(v128_tmp0, v128_tmp0);
+            try code.umovWFromS(info.reg, v128_tmp0, 0);
+        },
+        .i64x2 => {
+            try code.sshr2d63(v128_tmp0, src_reg);
+            try emitV128ImmediateIntoReg(code, v128_tmp1, bitmask_i64x2_weights);
+            try code.bitwise16b(.@"and", v128_tmp0, v128_tmp0, v128_tmp1);
+            try code.addpDScalar(v128_tmp0, v128_tmp0);
+            try code.umovXFromD(info.reg, v128_tmp0, 0);
         },
     }
     try destCommit(code, reg_map, info);
@@ -6431,6 +6487,70 @@ test "compile: SIMD all_true emits reductions and scalar bools" {
     try std.testing.expect(found_umov_d);
     try std.testing.expect(found_cset);
     try std.testing.expect(found_and);
+}
+
+test "compile: SIMD bitmask emits sign-bit reductions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const v8 = func.newVReg();
+    const m8 = func.newVReg();
+    const v16 = func.newVReg();
+    const m16 = func.newVReg();
+    const sum16 = func.newVReg();
+    const v32 = func.newVReg();
+    const m32 = func.newVReg();
+    const sum32 = func.newVReg();
+    const v64 = func.newVReg();
+    const m64 = func.newVReg();
+    const sum64 = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_0000_0000_0000_0000_0000_0080 }, .dest = v8, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_bitmask = .{ .width = .i8x16, .vector = v8 } }, .dest = m8, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_0000_0000_0000_0000_0000_8000 }, .dest = v16, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_bitmask = .{ .width = .i16x8, .vector = v16 } }, .dest = m16, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = m8, .rhs = m16 } }, .dest = sum16, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_0000_0000_0000_0000_8000_0000 }, .dest = v32, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_bitmask = .{ .width = .i32x4, .vector = v32 } }, .dest = m32, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = sum16, .rhs = m32 } }, .dest = sum32, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_0000_0000_8000_0000_0000_0000 }, .dest = v64, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_bitmask = .{ .width = .i64x2, .vector = v64 } }, .dest = m64, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = sum32, .rhs = m64 } }, .dest = sum64, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = sum64 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_sshr8 = false;
+    var found_sshr16 = false;
+    var found_sshr32 = false;
+    var found_sshr64 = false;
+    var found_addp8 = false;
+    var found_addv16 = false;
+    var found_addv32 = false;
+    var found_addp64 = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4F090400) found_sshr8 = true;
+        if ((w & 0xFFFFFC00) == 0x4F110400) found_sshr16 = true;
+        if ((w & 0xFFFFFC00) == 0x4F210400) found_sshr32 = true;
+        if ((w & 0xFFFFFC00) == 0x4F410400) found_sshr64 = true;
+        if ((w & 0xFFE0FC00) == 0x4E20BC00) found_addp8 = true;
+        if ((w & 0xFFFFFC00) == 0x4E71B800) found_addv16 = true;
+        if ((w & 0xFFFFFC00) == 0x4EB1B800) found_addv32 = true;
+        if ((w & 0xFFFFFC00) == 0x5EF1B800) found_addp64 = true;
+    }
+    try std.testing.expect(found_sshr8);
+    try std.testing.expect(found_sshr16);
+    try std.testing.expect(found_sshr32);
+    try std.testing.expect(found_sshr64);
+    try std.testing.expect(found_addp8);
+    try std.testing.expect(found_addv16);
+    try std.testing.expect(found_addv32);
+    try std.testing.expect(found_addp64);
 }
 
 test "compile: i32x4 lane ops emit NEON instructions" {

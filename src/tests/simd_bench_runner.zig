@@ -84,6 +84,26 @@ const cases = [_]BenchCase{
         .build = buildSimdI64x2AllTrueMixedModule,
     },
     .{
+        .name = "simd_i8x16_bitmask_mixed",
+        .simd = true,
+        .build = buildSimdI8x16BitmaskMixedModule,
+    },
+    .{
+        .name = "simd_i16x8_bitmask_mixed",
+        .simd = true,
+        .build = buildSimdI16x8BitmaskMixedModule,
+    },
+    .{
+        .name = "simd_i32x4_bitmask_mixed",
+        .simd = true,
+        .build = buildSimdI32x4BitmaskMixedModule,
+    },
+    .{
+        .name = "simd_i64x2_bitmask_mixed",
+        .simd = true,
+        .build = buildSimdI64x2BitmaskMixedModule,
+    },
+    .{
         .name = "simd_i8x16_shuffle_lane0",
         .simd = true,
         .build = buildSimdI8x16ShuffleLane0Module,
@@ -1087,6 +1107,46 @@ fn buildSimdI64x2AllTrueMixedModule(allocator: Allocator) ![]u8 {
     try appendAllTrueScoreTrue(&instr, allocator, 0xC3); // i64x2.all_true
     try appendV128ConstI64x2(&instr, allocator, .{ 1, 0 });
     try appendAllTrueScoreFalse(&instr, allocator, 0xC3); // i64x2.all_true
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI8x16BitmaskMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI8x16(&instr, allocator, .{ 0x80, 0x7F, 0xFF, 1, 0, 0x40, 0, 0x81, 0xFE, 2, 3, 4, 5, 6, 7, 0x80 });
+    try appendSimdOpcode(&instr, allocator, 0x64); // i8x16.bitmask
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI16x8BitmaskMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI16x8(&instr, allocator, .{ 0x8000, 0x7FFF, 0xFFFF, 1, 2, 0x8001, 3, 0xFFFF });
+    try appendSimdOpcode(&instr, allocator, 0x84); // i16x8.bitmask
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4BitmaskMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ 1, -1, 0x7FFF_FFFF, std.math.minInt(i32) });
+    try appendSimdOpcode(&instr, allocator, 0xA4); // i32x4.bitmask
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI64x2BitmaskMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI64x2(&instr, allocator, .{ 123, 0x8000_0000_0000_0000 });
+    try appendSimdOpcode(&instr, allocator, 0xC4); // i64x2.bitmask
 
     return buildRunI32Module(allocator, instr.items, .{});
 }

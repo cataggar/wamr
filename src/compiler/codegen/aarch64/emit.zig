@@ -687,9 +687,52 @@ pub const CodeBuffer = struct {
         try self.emit32(0x0E31B800 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// ADDP Vd.16B, Vn.16B, Vm.16B — pairwise add bytes.
+    pub fn addp16b(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4E20BC00 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// ADDV Hd, Vn.8H — sum all 8 halfwords into the low halfword of Vd.
+    pub fn addvH8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4E71B800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// ADDV Sd, Vn.4S — sum all 4 words into the low word of Vd.
+    pub fn addvS4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4EB1B800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// ADDP Dd, Vn.2D — pairwise add two doublewords into scalar Dd.
+    pub fn addpDScalar(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x5EF1B800 | (@as(u32, vn) << 5) | vd);
+    }
+
     /// UMAXV Bd, Vn.16B — unsigned maximum across all 16 bytes.
     pub fn umaxvB16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x6E30A800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// SSHR Vd.16B, Vn.16B, #7 — copy each byte sign bit to all lane bits.
+    pub fn sshr16b7(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4F090400 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// SSHR Vd.8H, Vn.8H, #15 — copy each halfword sign bit to all lane bits.
+    pub fn sshr8h15(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4F110400 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// SSHR Vd.4S, Vn.4S, #31 — copy each word sign bit to all lane bits.
+    pub fn sshr4s31(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4F210400 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// SSHR Vd.2D, Vn.2D, #63 — copy each doubleword sign bit to all lane bits.
+    pub fn sshr2d63(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4F410400 | (@as(u32, vn) << 5) | vd);
     }
 
     /// UMINV Bd, Vn.16B — unsigned minimum across all 16 bytes.
@@ -2240,6 +2283,57 @@ test "emit: UMAXV b0, v1.16b" {
     defer code.deinit();
     try code.umaxvB16b(0, 1);
     try expectWord(0x6E30A820, &code);
+}
+
+test "emit: SIMD bitmask reduction helpers" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshr16b7(0, 1);
+        try expectWord(0x4F090420, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshr8h15(2, 3);
+        try expectWord(0x4F110462, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshr4s31(4, 5);
+        try expectWord(0x4F2104A4, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.sshr2d63(6, 7);
+        try expectWord(0x4F4104E6, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.addp16b(0, 0, 0);
+        try expectWord(0x4E20BC00, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.addvH8h(0, 1);
+        try expectWord(0x4E71B820, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.addvS4s(2, 3);
+        try expectWord(0x4EB1B862, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.addpDScalar(4, 5);
+        try expectWord(0x5EF1B8A4, &code);
+    }
 }
 
 test "emit: UMINV lane-width all_true reductions" {
