@@ -245,7 +245,7 @@ fn opClass(inst: ir.Inst) Class {
     return switch (inst.op) {
         .iconst_32, .iconst_64 => if (def != null) .constant else .barrier,
         .v128_const => if (def != null) .constant else .barrier,
-        .v128_load, .v128_load_splat, .v128_load_zero, .v128_load_lane => if (def != null) .load else .barrier,
+        .v128_load, .v128_load_splat, .v128_load_zero, .v128_load_extend, .v128_load_lane => if (def != null) .load else .barrier,
         .store, .v128_store, .v128_store_lane => .store,
         .v128_not,
         .v128_any_true,
@@ -371,7 +371,7 @@ fn isOrderedMemory(inst: ir.Inst) bool {
 
 fn isOrderedMemoryOp(op: ir.Inst.Op) bool {
     return switch (op) {
-        .load, .store, .v128_load, .v128_load_splat, .v128_load_zero, .v128_load_lane, .v128_store, .v128_store_lane => true,
+        .load, .store, .v128_load, .v128_load_splat, .v128_load_zero, .v128_load_extend, .v128_load_lane, .v128_store, .v128_store_lane => true,
         else => false,
     };
 }
@@ -539,6 +539,7 @@ pub fn forEachUse(
         .v128_load => |ld| try visit(context, ld.base),
         .v128_load_splat => |ld| try visit(context, ld.base),
         .v128_load_zero => |ld| try visit(context, ld.base),
+        .v128_load_extend => |ld| try visit(context, ld.base),
         .v128_load_lane => |ld| {
             try visit(context, ld.base);
             try visit(context, ld.vector);
@@ -733,6 +734,12 @@ test "metadata models supported v128 ops as schedulable" {
     try std.testing.expectEqual(Class.load, metadata(load).class);
     try std.testing.expectEqual(@as(u8, 4), metadata(load).latency);
     try std.testing.expectEqual(@as(?ir.VReg, 3), metadata(load).def);
+
+    const load_extend = ir.Inst{ .op = .{ .v128_load_extend = .{ .src_width = .i8x8, .sign = .signed, .base = 2, .offset = 0, .alignment = 3 } }, .dest = 4, .type = .v128 };
+    const load_extend_info = opInfo(load_extend);
+    try std.testing.expect(!metadata(load_extend).barrier);
+    try std.testing.expectEqual(Class.load, load_extend_info.class);
+    try std.testing.expect(load_extend_info.ordered_memory);
 
     const store = ir.Inst{ .op = .{ .v128_store = .{ .base = 4, .offset = 16, .alignment = 4, .val = 3 } }, .type = .void };
     try std.testing.expect(!metadata(store).barrier);

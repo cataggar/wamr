@@ -555,6 +555,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .v128_load,
         .v128_load_splat,
         .v128_load_zero,
+        .v128_load_extend,
         .v128_load_lane,
         .v128_not,
         .v128_bitwise,
@@ -613,6 +614,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .v128_load,
                 .v128_load_splat,
                 .v128_load_zero,
+                .v128_load_extend,
                 .v128_load_lane,
                 .v128_not,
                 .v128_bitwise,
@@ -1424,6 +1426,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .v128_load,
         .v128_load_splat,
         .v128_load_zero,
+        .v128_load_extend,
         .v128_load_lane,
         .v128_store,
         .v128_store_lane,
@@ -1617,6 +1620,7 @@ fn compileInst(
         .v128_load => |ld| try emitV128Load(code, inst, ld, reg_map, v128_map, v128_cache),
         .v128_load_splat => |ld| try emitV128LoadSplat(code, inst, ld, reg_map, v128_map, v128_cache),
         .v128_load_zero => |ld| try emitV128LoadZero(code, inst, ld, reg_map, v128_map, v128_cache),
+        .v128_load_extend => |ld| try emitV128LoadExtend(code, inst, ld, reg_map, v128_map, v128_cache),
         .v128_load_lane => |ld| try emitV128LoadLane(code, inst, ld, reg_map, v128_map, v128_cache, fctx),
         .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache),
         .v128_store_lane => |st| try emitV128StoreLane(code, st, reg_map, v128_map, v128_cache),
@@ -2068,6 +2072,39 @@ fn emitV128LoadZero(
     switch (ld.width) {
         .i32 => try code.ldrS(dest_reg, RegMap.tmp0),
         .i64 => try code.ldrD(dest_reg, RegMap.tmp0),
+    }
+}
+
+fn emitV128LoadExtend(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    ld: ir.Inst.V128LoadExtend,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    const end_offset: u64 = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + ld.accessSize();
+    if (ld.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, ld.base, ld.offset);
+    } else {
+        try emitMemAddr(code, reg_map, ld.base, ld.offset, end_offset);
+    }
+    try code.ldrD(dest_reg, RegMap.tmp0);
+    switch (ld.src_width) {
+        .i8x8 => switch (ld.sign) {
+            .signed => try code.sshll8h8b(dest_reg, dest_reg),
+            .unsigned => try code.ushll8h8b(dest_reg, dest_reg),
+        },
+        .i16x4 => switch (ld.sign) {
+            .signed => try code.sshll4s4h(dest_reg, dest_reg),
+            .unsigned => try code.ushll4s4h(dest_reg, dest_reg),
+        },
+        .i32x2 => switch (ld.sign) {
+            .signed => try code.sshll2d2s(dest_reg, dest_reg),
+            .unsigned => try code.ushll2d2s(dest_reg, dest_reg),
+        },
     }
 }
 
@@ -8348,6 +8385,100 @@ test "compile: v128.load_zero emits scalar LDR forms with access-size bounds" {
     try std.testing.expect(found_bls);
     try std.testing.expect(found_blr);
     try std.testing.expect(found_brk);
+}
+
+test "compile: v128.load_extend emits 64-bit load then low-half widening" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+
+    const cases = [_]struct {
+        width: ir.Inst.V128LoadExtendWidth,
+        sign: ir.Inst.SimdExtendSign,
+    }{
+        .{ .width = .i8x8, .sign = .signed },
+        .{ .width = .i8x8, .sign = .unsigned },
+        .{ .width = .i16x4, .sign = .signed },
+        .{ .width = .i16x4, .sign = .unsigned },
+        .{ .width = .i32x2, .sign = .signed },
+        .{ .width = .i32x2, .sign = .unsigned },
+    };
+    var last_vec: ir.VReg = addr;
+    for (cases) |case| {
+        const vec = func.newVReg();
+        try func.getBlock(bid).append(.{
+            .op = .{ .v128_load_extend = .{
+                .src_width = case.width,
+                .sign = case.sign,
+                .base = addr,
+                .offset = 0,
+                .alignment = 3,
+            } },
+            .dest = vec,
+            .type = .v128,
+        });
+        last_vec = vec;
+    }
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{
+        .op = .{ .i64x2_extract_lane = .{ .vector = last_vec, .lane = 0 } },
+        .dest = result,
+        .type = .i64,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_ldr_d = false;
+    var found_sshll8 = false;
+    var found_ushll8 = false;
+    var found_sshll16 = false;
+    var found_ushll16 = false;
+    var found_sshll32 = false;
+    var found_ushll32 = false;
+    var found_add_end_8 = false;
+    var found_bls = false;
+    var found_blr = false;
+    var found_brk = false;
+    var first_bls: ?usize = null;
+    var first_ldr_d: ?usize = null;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFC00000) == 0xFD400000) {
+            found_ldr_d = true;
+            if (first_ldr_d == null) first_ldr_d = i;
+        }
+        if ((w & 0xFFFFFC00) == 0x0F08A400) found_sshll8 = true;
+        if ((w & 0xFFFFFC00) == 0x2F08A400) found_ushll8 = true;
+        if ((w & 0xFFFFFC00) == 0x0F10A400) found_sshll16 = true;
+        if ((w & 0xFFFFFC00) == 0x2F10A400) found_ushll16 = true;
+        if ((w & 0xFFFFFC00) == 0x0F20A400) found_sshll32 = true;
+        if ((w & 0xFFFFFC00) == 0x2F20A400) found_ushll32 = true;
+        if (w == 0x910021F1) found_add_end_8 = true; // add x17, x15, #8
+        if ((w & 0xFF000010) == 0x54000000 and (w & 0xF) == 0x9) {
+            found_bls = true;
+            if (first_bls == null) first_bls = i;
+        }
+        if ((w & 0xFFFFFC1F) == 0xD63F0000) found_blr = true;
+        if ((w & 0xFFE0001F) == 0xD4200000) found_brk = true;
+    }
+    try std.testing.expect(found_ldr_d);
+    try std.testing.expect(found_sshll8);
+    try std.testing.expect(found_ushll8);
+    try std.testing.expect(found_sshll16);
+    try std.testing.expect(found_ushll16);
+    try std.testing.expect(found_sshll32);
+    try std.testing.expect(found_ushll32);
+    try std.testing.expect(found_add_end_8);
+    try std.testing.expect(found_bls);
+    try std.testing.expect(found_blr);
+    try std.testing.expect(found_brk);
+    try std.testing.expect((first_bls orelse code.len) < (first_ldr_d orelse 0));
 }
 
 test "v128.loadN_lane emits checked LD1 lane loads and preserves live vector" {

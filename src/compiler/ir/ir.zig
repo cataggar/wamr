@@ -69,6 +69,7 @@ pub const Inst = struct {
         v128_load: V128Mem,
         v128_load_splat: V128LoadSplat,
         v128_load_zero: V128LoadZero,
+        v128_load_extend: V128LoadExtend,
         v128_load_lane: V128LoadLane,
         v128_store: V128Store,
         v128_store_lane: V128StoreLane,
@@ -477,6 +478,30 @@ pub const Inst = struct {
 
         pub fn accessSize(self: V128LoadZero) u8 {
             return self.width.accessSize();
+        }
+    };
+
+    pub const V128LoadExtendWidth = enum {
+        i8x8,
+        i16x4,
+        i32x2,
+
+        pub fn accessSize(_: V128LoadExtendWidth) u8 {
+            return 8;
+        }
+    };
+
+    pub const V128LoadExtend = struct {
+        src_width: V128LoadExtendWidth,
+        sign: SimdExtendSign,
+        base: VReg,
+        offset: u32,
+        alignment: u32,
+        bounds_known: bool = false,
+        checked_end: u64 = 0,
+
+        pub fn accessSize(self: V128LoadExtend) u8 {
+            return self.src_width.accessSize();
         }
     };
 
@@ -958,6 +983,24 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(u32, 20), load_zero.op.v128_load_zero.offset);
     try std.testing.expectEqual(@as(u32, 3), load_zero.op.v128_load_zero.alignment);
     try std.testing.expectEqual(@as(u8, 8), load_zero.op.v128_load_zero.accessSize());
+
+    const load_extend = Inst{
+        .op = .{ .v128_load_extend = .{
+            .src_width = .i16x4,
+            .sign = .signed,
+            .base = 8,
+            .offset = 24,
+            .alignment = 3,
+        } },
+        .dest = 10,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.V128LoadExtendWidth.i16x4, load_extend.op.v128_load_extend.src_width);
+    try std.testing.expectEqual(Inst.SimdExtendSign.signed, load_extend.op.v128_load_extend.sign);
+    try std.testing.expectEqual(@as(VReg, 8), load_extend.op.v128_load_extend.base);
+    try std.testing.expectEqual(@as(u32, 24), load_extend.op.v128_load_extend.offset);
+    try std.testing.expectEqual(@as(u32, 3), load_extend.op.v128_load_extend.alignment);
+    try std.testing.expectEqual(@as(u8, 8), load_extend.op.v128_load_extend.accessSize());
 
     const c = Inst{ .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF }, .dest = 1, .type = .v128 };
     try std.testing.expectEqual(IrType.v128, c.type);

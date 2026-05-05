@@ -1793,6 +1793,47 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .v128_load8x8_s,
+                    .v128_load8x8_u,
+                    .v128_load16x4_s,
+                    .v128_load16x4_u,
+                    .v128_load32x2_s,
+                    .v128_load32x2_u,
+                    => {
+                        const alignment = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const base = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const src_width: ir.Inst.V128LoadExtendWidth = switch (simd_op) {
+                            .v128_load8x8_s, .v128_load8x8_u => .i8x8,
+                            .v128_load16x4_s, .v128_load16x4_u => .i16x4,
+                            .v128_load32x2_s, .v128_load32x2_u => .i32x2,
+                            else => unreachable,
+                        };
+                        const sign: ir.Inst.SimdExtendSign = switch (simd_op) {
+                            .v128_load8x8_s,
+                            .v128_load16x4_s,
+                            .v128_load32x2_s,
+                            => .signed,
+                            .v128_load8x8_u,
+                            .v128_load16x4_u,
+                            .v128_load32x2_u,
+                            => .unsigned,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_load_extend = .{
+                                .src_width = src_width,
+                                .sign = sign,
+                                .base = base,
+                                .offset = offset,
+                                .alignment = alignment,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .v128_load8_splat,
                     .v128_load16_splat,
                     .v128_load32_splat,
@@ -3947,6 +3988,82 @@ test "lower v128.loadN_splat opcodes preserve memarg offsets" {
         try std.testing.expectEqual(case.offset, insts[1].op.v128_load_splat.offset);
         try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
         try std.testing.expect(insts[2].op.ret != null);
+    }
+}
+
+test "lower v128.loadNxM_s/u opcodes parse memarg and pop address" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.v128},
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+
+    const cases = [_]struct {
+        opcode: u32,
+        src_width: ir.Inst.V128LoadExtendWidth,
+        sign: ir.Inst.SimdExtendSign,
+        alignment: u32,
+        offset: u32,
+    }{
+        .{ .opcode = 0x01, .src_width = .i8x8, .sign = .signed, .alignment = 0, .offset = 0 },
+        .{ .opcode = 0x02, .src_width = .i8x8, .sign = .unsigned, .alignment = 0, .offset = 5 },
+        .{ .opcode = 0x03, .src_width = .i16x4, .sign = .signed, .alignment = 1, .offset = 130 },
+        .{ .opcode = 0x04, .src_width = .i16x4, .sign = .unsigned, .alignment = 1, .offset = 260 },
+        .{ .opcode = 0x05, .src_width = .i32x2, .sign = .signed, .alignment = 2, .offset = 1024 },
+        .{ .opcode = 0x06, .src_width = .i32x2, .sign = .unsigned, .alignment = 2, .offset = 4096 },
+    };
+
+    for (cases) |case| {
+        var code: std.ArrayList(u8) = .empty;
+        defer code.deinit(allocator);
+        try code.appendSlice(allocator, &[_]u8{ 0x41, 0x0B, 0xFD }); // i32.const 11; simd prefix
+        try appendULEB(&code, allocator, case.opcode);
+        try appendULEB(&code, allocator, case.alignment);
+        try appendULEB(&code, allocator, case.offset);
+        try code.append(allocator, 0x0B);
+
+        const func = types.WasmFunction{
+            .type_idx = 0,
+            .func_type = func_type,
+            .local_count = 0,
+            .locals = &.{},
+            .code = code.items,
+        };
+        const wasm_module = types.WasmModule{
+            .types = &[_]types.FuncType{func_type},
+            .functions = &[_]types.WasmFunction{func},
+        };
+
+        var ir_module = try lowerModule(&wasm_module, allocator);
+        defer ir_module.deinit();
+
+        const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+        try std.testing.expectEqual(@as(usize, 3), insts.len);
+        try std.testing.expectEqual(@as(i32, 11), insts[0].op.iconst_32);
+        try std.testing.expectEqual(.v128_load_extend, std.meta.activeTag(insts[1].op));
+        const ld = insts[1].op.v128_load_extend;
+        try std.testing.expectEqual(case.src_width, ld.src_width);
+        try std.testing.expectEqual(case.sign, ld.sign);
+        try std.testing.expectEqual(insts[0].dest.?, ld.base);
+        try std.testing.expectEqual(case.alignment, ld.alignment);
+        try std.testing.expectEqual(case.offset, ld.offset);
+        try std.testing.expectEqual(@as(u8, 8), ld.accessSize());
+        try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
+        try std.testing.expectEqual(insts[1].dest.?, insts[2].op.ret.?);
     }
 }
 
