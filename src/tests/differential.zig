@@ -530,6 +530,20 @@ test "differential SIMD: f32x4 arithmetic normal lanes match interpreter" {
         0,
         0x4040_0000,
     );
+    try expectF32x4BinLaneBits(
+        0xE8,
+        .{ 0x3f80_0000, 0x4040_0000, 0x42c8_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x4000_0000, 0x41b8_0000, 0x4100_0000 },
+        2,
+        0x41b8_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE9,
+        .{ 0x3f80_0000, 0x4040_0000, 0x42c8_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x4000_0000, 0x41b8_0000, 0x4100_0000 },
+        3,
+        0x4100_0000,
+    );
 }
 
 test "differential SIMD: f32x4 arithmetic preserves subnormals" {
@@ -598,6 +612,65 @@ test "differential SIMD: f32x4 arithmetic signed zero and division edges match i
         .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
         0,
         0xff80_0000,
+    );
+}
+
+test "differential SIMD: f32x4 minmax NaN zero and infinity edges match interpreter" {
+    try expectF32x4BinLaneBits(
+        0xE8,
+        .{ 0x7fc1_2345, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x4000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x7fc0_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE9,
+        .{ 0x3f80_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x7fc1_2345, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x7fc0_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE8,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x0000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE9,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x0000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x0000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE8,
+        .{ 0x0000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE9,
+        .{ 0x0000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x0000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE8,
+        .{ 0x7f80_0000, 0xff80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x3f80_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        1,
+        0xff80_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE9,
+        .{ 0x7f80_0000, 0xff80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x3f80_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x7f80_0000,
     );
 }
 

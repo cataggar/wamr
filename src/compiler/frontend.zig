@@ -2567,6 +2567,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f32x4_sub,
                     .f32x4_mul,
                     .f32x4_div,
+                    .f32x4_min,
+                    .f32x4_max,
                     => {
                         const rhs = safePop(&vreg_stack);
                         const lhs = safePop(&vreg_stack);
@@ -2576,6 +2578,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .f32x4_sub => .sub,
                             .f32x4_mul => .mul,
                             .f32x4_div => .div,
+                            .f32x4_min => .min,
+                            .f32x4_max => .max,
                             else => unreachable,
                         };
                         try ir_func.getBlock(current_block).append(.{
@@ -6216,7 +6220,7 @@ test "lower f64x2 arithmetic and comparison opcodes" {
     try std.testing.expect(insts[inst_idx + 2].op.ret != null);
 }
 
-test "lower f32x4 arithmetic opcodes" {
+test "lower f32x4 arithmetic/minmax opcodes" {
     const allocator = std.testing.allocator;
 
     const func_type = types.FuncType{
@@ -6233,6 +6237,8 @@ test "lower f32x4 arithmetic opcodes" {
         .{ .opcode = 0xE5, .expected = .sub },
         .{ .opcode = 0xE6, .expected = .mul },
         .{ .opcode = 0xE7, .expected = .div },
+        .{ .opcode = 0xE8, .expected = .min },
+        .{ .opcode = 0xE9, .expected = .max },
     };
 
     const appendULEB = struct {

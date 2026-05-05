@@ -334,6 +334,16 @@ const cases = [_]BenchCase{
         .build = buildSimdF32x4DivLane0Module,
     },
     .{
+        .name = "simd_f32x4_min_lane0",
+        .simd = true,
+        .build = buildSimdF32x4MinLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_max_lane0",
+        .simd = true,
+        .build = buildSimdF32x4MaxLane0Module,
+    },
+    .{
         .name = "simd_f64x2_convert_low_i32x4_s_lane0_high",
         .simd = true,
         .build = buildSimdF64x2ConvertLowI32x4SLane0HighModule,
@@ -1762,6 +1772,14 @@ fn buildSimdF32x4MulLane0Module(allocator: Allocator) ![]u8 {
 
 fn buildSimdF32x4DivLane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4BinLane0Module(allocator, 0xE7);
+}
+
+fn buildSimdF32x4MinLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4BinLane0Module(allocator, 0xE8);
+}
+
+fn buildSimdF32x4MaxLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4BinLane0Module(allocator, 0xE9);
 }
 
 fn buildSimdF64x2ConvertLowI32x4Lane0HighModule(allocator: Allocator, simd_opcode: u32) ![]u8 {
