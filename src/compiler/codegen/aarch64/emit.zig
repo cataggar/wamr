@@ -1088,11 +1088,21 @@ pub const CodeBuffer = struct {
         sub = 0x4EA0D400,
         mul = 0x6E20DC00,
         div = 0x6E20FC00,
+        max = 0x4E20F400,
+        min = 0x4EA0F400,
     };
 
-    /// Floating-point 4S binary vector op: FADD/FSUB/FMUL/FDIV.
+    /// Floating-point 4S binary vector op: FADD/FSUB/FMUL/FDIV/FMAX/FMIN.
     pub fn f32x4Op(self: *CodeBuffer, op: F32x4Op, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FCMEQ Vd.4S, Vn.4S, Vm.4S — floating-point compare equal per lane.
+    pub fn fcmeq4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x4E20E400 |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -3051,7 +3061,7 @@ test "emit: i64x2 vector ops" {
     }
 }
 
-test "emit: f32x4 vector arithmetic ops" {
+test "emit: f32x4 vector arithmetic/minmax ops" {
     {
         var code = CodeBuffer.init(std.testing.allocator);
         defer code.deinit();
@@ -3075,6 +3085,24 @@ test "emit: f32x4 vector arithmetic ops" {
         defer code.deinit();
         try code.f32x4Op(.div, 16, 17, 30);
         try expectWord(0x6E3EFE30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f32x4Op(.min, 16, 17, 30);
+        try expectWord(0x4EBEF630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f32x4Op(.max, 16, 17, 30);
+        try expectWord(0x4E3EF630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fcmeq4s(16, 17, 30);
+        try expectWord(0x4E3EE630, &code);
     }
 }
 
