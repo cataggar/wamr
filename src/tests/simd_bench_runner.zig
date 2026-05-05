@@ -664,6 +664,16 @@ const cases = [_]BenchCase{
         .build = buildSimdV128Load64SplatLane0Module,
     },
     .{
+        .name = "simd_v128_load32_zero_lanes",
+        .simd = true,
+        .build = buildSimdV128Load32ZeroLanesModule,
+    },
+    .{
+        .name = "simd_v128_load64_zero_lanes",
+        .simd = true,
+        .build = buildSimdV128Load64ZeroLanesModule,
+    },
+    .{
         .name = "simd_v128_load8_lane5",
         .simd = true,
         .build = buildSimdLoad8Lane5Module,
@@ -2477,6 +2487,59 @@ fn buildSimdV128LoadSplatLane0Module(
     writeI32Lane(data[8..][0..4], 291);
     writeI64Lane(data[16..][0..8], 17_767);
 
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data[0..],
+    });
+}
+
+fn buildSimdV128Load32ZeroLanesModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendSimdMemOpcode(&instr, allocator, 0x5C, 2, 4);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+    try appendI32Const(&instr, allocator, 0);
+    try appendSimdMemOpcode(&instr, allocator, 0x5C, 2, 4);
+    try appendI32x4ExtractLane(&instr, allocator, 1);
+    try appendI32Add(&instr, allocator);
+    try appendI32Const(&instr, allocator, 0);
+    try appendSimdMemOpcode(&instr, allocator, 0x5C, 2, 4);
+    try appendI32x4ExtractLane(&instr, allocator, 3);
+    try appendI32Add(&instr, allocator);
+
+    var data = [_]u8{0xA5} ** 24;
+    writeI32Lane(data[4..][0..4], 291);
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = data[0..],
+    });
+}
+
+fn buildSimdV128Load64ZeroLanesModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendSimdMemOpcode(&instr, allocator, 0x5D, 3, 16);
+    try appendI64x2ExtractLane(&instr, allocator, 0);
+    try appendI32WrapI64(&instr, allocator);
+    try appendI32Const(&instr, allocator, 0);
+    try appendSimdMemOpcode(&instr, allocator, 0x5D, 3, 16);
+    try appendI64x2ExtractLane(&instr, allocator, 0);
+    try appendI64Const(&instr, allocator, 32);
+    try appendI64ShrU(&instr, allocator);
+    try appendI32WrapI64(&instr, allocator);
+    try appendI32Add(&instr, allocator);
+    try appendI32Const(&instr, allocator, 0);
+    try appendSimdMemOpcode(&instr, allocator, 0x5D, 3, 16);
+    try appendI64x2ExtractLane(&instr, allocator, 1);
+    try appendI32WrapI64(&instr, allocator);
+    try appendI32Add(&instr, allocator);
+
+    var data = [_]u8{0xA5} ** 32;
+    writeI64Lane(data[16..][0..8], (@as(u64, 17) << 32) | 7);
     return buildRunI32Module(allocator, instr.items, .{
         .memory_min = 1,
         .data = data[0..],
