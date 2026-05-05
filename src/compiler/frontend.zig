@@ -1793,6 +1793,34 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .v128_load8_splat,
+                    .v128_load16_splat,
+                    .v128_load32_splat,
+                    .v128_load64_splat,
+                    => {
+                        const alignment = readU32(code, &ip);
+                        const offset = readU32(code, &ip);
+                        const base = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const width: ir.Inst.V128LoadSplatWidth = switch (simd_op) {
+                            .v128_load8_splat => .i8x16,
+                            .v128_load16_splat => .i16x8,
+                            .v128_load32_splat => .i32x4,
+                            .v128_load64_splat => .i64x2,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_load_splat = .{
+                                .width = width,
+                                .base = base,
+                                .offset = offset,
+                                .alignment = alignment,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .v128_store => {
                         const alignment = readU32(code, &ip);
                         const offset = readU32(code, &ip);
@@ -3759,6 +3787,80 @@ test "lower integer SIMD bitmask opcodes produce i32" {
         try std.testing.expectEqual(ir.IrType.i32, inst.type);
     }
     try std.testing.expect(insts[11].op.ret != null);
+}
+
+test "lower v128.loadN_splat opcodes preserve memarg offsets" {
+    const allocator = std.testing.allocator;
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimdMem = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32, alignment: u32, offset: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+            try appendULEB(buf, alloc, alignment);
+            try appendULEB(buf, alloc, offset);
+        }
+    }.call;
+
+    const cases = [_]struct {
+        opcode: u32,
+        width: ir.Inst.V128LoadSplatWidth,
+        alignment: u32,
+        offset: u32,
+    }{
+        .{ .opcode = 0x07, .width = .i8x16, .alignment = 0, .offset = 17 },
+        .{ .opcode = 0x08, .width = .i16x8, .alignment = 1, .offset = 130 },
+        .{ .opcode = 0x09, .width = .i32x4, .alignment = 2, .offset = 1024 },
+        .{ .opcode = 0x0A, .width = .i64x2, .alignment = 3, .offset = 4096 },
+    };
+
+    for (cases) |case| {
+        var code: std.ArrayList(u8) = .empty;
+        defer code.deinit(allocator);
+        try code.appendSlice(allocator, &[_]u8{ 0x41, 0x00 }); // i32.const 0
+        try appendSimdMem(&code, allocator, case.opcode, case.alignment, case.offset);
+        try code.append(allocator, 0x0B);
+
+        const func_type = types.FuncType{
+            .params = &.{},
+            .results = &.{.v128},
+        };
+        const func = types.WasmFunction{
+            .type_idx = 0,
+            .func_type = func_type,
+            .local_count = 0,
+            .locals = &.{},
+            .code = code.items,
+        };
+        const wasm_module = types.WasmModule{
+            .types = &[_]types.FuncType{func_type},
+            .functions = &[_]types.WasmFunction{func},
+        };
+
+        var ir_module = try lowerModule(&wasm_module, allocator);
+        defer ir_module.deinit();
+
+        const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+        try std.testing.expectEqual(@as(usize, 3), insts.len);
+        try std.testing.expectEqual(.v128_load_splat, std.meta.activeTag(insts[1].op));
+        try std.testing.expectEqual(case.width, insts[1].op.v128_load_splat.width);
+        try std.testing.expectEqual(insts[0].dest.?, insts[1].op.v128_load_splat.base);
+        try std.testing.expectEqual(case.alignment, insts[1].op.v128_load_splat.alignment);
+        try std.testing.expectEqual(case.offset, insts[1].op.v128_load_splat.offset);
+        try std.testing.expectEqual(ir.IrType.v128, insts[1].type);
+        try std.testing.expect(insts[2].op.ret != null);
+    }
 }
 
 test "lower i8x16.shuffle parses lane immediates and operands" {

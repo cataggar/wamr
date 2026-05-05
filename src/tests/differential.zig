@@ -929,6 +929,35 @@ test "differential SIMD: v128.load/store round trip extracts lane 0" {
     try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x1122_3344)));
 }
 
+test "differential SIMD: v128.loadN_splat lane0 values" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendLoadSplatLane0I32(&body, testing.allocator, 0x07, 0, 3);
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendLoadSplatLane0I32(&body, testing.allocator, 0x08, 1, 4);
+    try body.append(testing.allocator, 0x6A);
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendLoadSplatLane0I32(&body, testing.allocator, 0x09, 2, 8);
+    try body.append(testing.allocator, 0x6A);
+    try appendI32Const(&body, testing.allocator, 0);
+    try appendLoadSplatLane0I32(&body, testing.allocator, 0x0A, 3, 16);
+    try body.append(testing.allocator, 0x6A);
+    try body.append(testing.allocator, 0x0B);
+
+    var data = [_]u8{0} ** 24;
+    data[3] = 7;
+    std.mem.writeInt(u16, data[4..][0..2], 17, .little);
+    std.mem.writeInt(u32, data[8..][0..4], 291, .little);
+    std.mem.writeInt(u64, data[16..][0..8], 17_767, .little);
+
+    const wasm = try buildCustomMemoryModule(testing.allocator, body.items, data[0..]);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 18_082);
+}
+
 test "differential SIMD: v128.load out-of-bounds traps" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -942,6 +971,32 @@ test "differential SIMD: v128.load out-of-bounds traps" {
     const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
     defer testing.allocator.free(wasm);
     try expectSimdMemoryTrap(wasm, "f");
+}
+
+test "differential SIMD: v128.loadN_splat out-of-bounds traps" {
+    const cases = [_]struct {
+        opcode: u32,
+        alignment: u32,
+        access_size: u32,
+    }{
+        .{ .opcode = 0x07, .alignment = 0, .access_size = 1 },
+        .{ .opcode = 0x08, .alignment = 1, .access_size = 2 },
+        .{ .opcode = 0x09, .alignment = 2, .access_size = 4 },
+        .{ .opcode = 0x0A, .alignment = 3, .access_size = 8 },
+    };
+
+    for (cases) |case| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(testing.allocator);
+        try body.append(testing.allocator, 0x00);
+        try appendI32Const(&body, testing.allocator, 65_536 - case.access_size + 1);
+        try appendLoadSplatLane0I32(&body, testing.allocator, case.opcode, case.alignment, 0);
+        try body.append(testing.allocator, 0x0B);
+
+        const wasm = try buildCustomMemoryModule(testing.allocator, body.items, &.{});
+        defer testing.allocator.free(wasm);
+        try expectSimdMemoryTrap(wasm, "f");
+    }
 }
 
 /// Build a wasm module with a custom bytecode body for a `() -> i32` function.
@@ -1092,8 +1147,18 @@ fn appendI32x4Splat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void
     try appendSimdOpcode(buf, allocator, 0x11);
 }
 
+fn appendI32Const(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i64) !void {
+    try buf.append(allocator, 0x41);
+    try encodeSLEB128(buf, allocator, value);
+}
+
 fn appendI32x4ExtractLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1B);
+    try buf.append(allocator, lane);
+}
+
+fn appendI16x8ExtractLaneU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x19);
     try buf.append(allocator, lane);
 }
 
@@ -1130,6 +1195,26 @@ fn appendSimdMemOpcode(
     try appendSimdOpcode(buf, allocator, opcode);
     try encodeULEB128(buf, allocator, alignment);
     try encodeULEB128(buf, allocator, offset);
+}
+
+fn appendLoadSplatLane0I32(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    opcode: u32,
+    alignment: u32,
+    offset: u32,
+) !void {
+    try appendSimdMemOpcode(buf, allocator, opcode, alignment, offset);
+    switch (opcode) {
+        0x07 => try appendI8x16ExtractLaneU(buf, allocator, 0),
+        0x08 => try appendI16x8ExtractLaneU(buf, allocator, 0),
+        0x09 => try appendI32x4ExtractLane(buf, allocator, 0),
+        0x0A => {
+            try appendI64x2ExtractLane(buf, allocator, 0);
+            try appendI32WrapI64(buf, allocator);
+        },
+        else => unreachable,
+    }
 }
 
 fn writeI32Lane(dst: []u8, value: u32) void {

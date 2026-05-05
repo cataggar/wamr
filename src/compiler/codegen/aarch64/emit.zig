@@ -755,6 +755,33 @@ pub const CodeBuffer = struct {
         try self.emit32(0x3DC00000 | (@as(u32, rn.encoding()) << 5) | vt);
     }
 
+    fn ld1r(self: *CodeBuffer, vt: u5, rn: Reg, size: u2) !void {
+        try self.emit32(0x4D40C000 |
+            (@as(u32, size) << 10) |
+            (@as(u32, rn.encoding()) << 5) |
+            vt);
+    }
+
+    /// LD1R { Vt.16B }, [Xn] — load one byte and broadcast to all lanes.
+    pub fn ld1r16b(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.ld1r(vt, rn, 0);
+    }
+
+    /// LD1R { Vt.8H }, [Xn] — load one halfword and broadcast to all lanes.
+    pub fn ld1r8h(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.ld1r(vt, rn, 1);
+    }
+
+    /// LD1R { Vt.4S }, [Xn] — load one word and broadcast to all lanes.
+    pub fn ld1r4s(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.ld1r(vt, rn, 2);
+    }
+
+    /// LD1R { Vt.2D }, [Xn] — load one doubleword and broadcast to all lanes.
+    pub fn ld1r2d(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.ld1r(vt, rn, 3);
+    }
+
     /// STR Qt, [Xn] — full-width 128-bit vector store.
     pub fn strQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
         try self.emit32(0x3D800000 | (@as(u32, rn.encoding()) << 5) | vt);
@@ -2362,6 +2389,33 @@ test "emit: LDR q0, [x1]" {
     defer code.deinit();
     try code.ldrQ(0, .x1);
     try expectWord(0x3DC00020, &code);
+}
+
+test "emit: LD1R vector broadcast load forms" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1r16b(0, .x9);
+        try expectWord(0x4D40C120, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1r8h(1, .x10);
+        try expectWord(0x4D40C541, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1r4s(2, .x11);
+        try expectWord(0x4D40C962, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ld1r2d(3, .x12);
+        try expectWord(0x4D40CD83, &code);
+    }
 }
 
 test "emit: STR q0, [x1]" {
