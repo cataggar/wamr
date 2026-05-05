@@ -68,6 +68,7 @@ pub const Inst = struct {
         v128_const: u128,
         v128_load: V128Mem,
         v128_load_splat: V128LoadSplat,
+        v128_load_lane: V128LoadLane,
         v128_store: V128Store,
         v128_not: VReg,
         v128_bitwise: V128Bitwise,
@@ -448,6 +449,46 @@ pub const Inst = struct {
         checked_end: u64 = 0,
 
         pub fn accessSize(self: V128LoadSplat) u8 {
+            return self.width.accessSize();
+        }
+    };
+
+    pub const V128LaneWidth = enum {
+        i8,
+        i16,
+        i32,
+        i64,
+
+        pub fn accessSize(self: V128LaneWidth) u8 {
+            return switch (self) {
+                .i8 => 1,
+                .i16 => 2,
+                .i32 => 4,
+                .i64 => 8,
+            };
+        }
+
+        pub fn laneCount(self: V128LaneWidth) u8 {
+            return switch (self) {
+                .i8 => 16,
+                .i16 => 8,
+                .i32 => 4,
+                .i64 => 2,
+            };
+        }
+    };
+
+    pub const V128LoadLane = struct {
+        width: V128LaneWidth,
+        base: VReg,
+        offset: u32,
+        alignment: u32,
+        vector: VReg,
+        lane: u8,
+        bounds_known: bool = false,
+        checked_end: u64 = 0,
+
+        pub fn accessSize(self: V128LoadLane) u8 {
             return self.width.accessSize();
         }
     };
