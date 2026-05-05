@@ -674,6 +674,13 @@ pub const CodeBuffer = struct {
         try self.emit32(0x0E205800 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// CNT Vd.16B, Vn.16B — population count per byte in a 128-bit vector.
+    /// Each destination byte holds popcount(0..=8) of the corresponding source byte.
+    pub fn cnt16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        // 0 Q 1 01110 size 10000 00101 10 Rn Rd, Q=1 (16B), size=00
+        try self.emit32(0x4E205800 | (@as(u32, vn) << 5) | vd);
+    }
+
     /// ADDV Bd, Vn.8B — sum all 8 bytes of Vn into the low byte of Vd.
     pub fn addvB8b(self: *CodeBuffer, vd: u5, vn: u5) !void {
         // 0 Q 0 01110 size 11000 11011 10 Rn Rd, Q=0, size=00
@@ -2192,6 +2199,13 @@ test "emit: CNT v0.8b, v1.8b" {
     defer code.deinit();
     try code.cnt8b(0, 1);
     try expectWord(0x0E205820, &code);
+}
+
+test "emit: CNT v0.16b, v1.16b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.cnt16b(0, 1);
+    try expectWord(0x4E205820, &code);
 }
 
 test "emit: ADDV b0, v1.8b" {
