@@ -790,6 +790,66 @@ test "differential SIMD: v128 and/or/andnot extracts lane 0" {
     try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x0FF0_0F00)));
 }
 
+test "differential SIMD: i8x16.all_true true and false lanes" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 1, 2, 3, 4, 5, 6, 7, 8, 0x80, 0xFF, 11, 12, 13, 14, 15, 16 });
+    try appendAllTrueScoreTrue(&body, testing.allocator, 0x63);
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 1, 2, 3, 4, 5, 0, 7, 8, 0x80, 0xFF, 11, 12, 13, 14, 15, 16 });
+    try appendAllTrueScoreFalse(&body, testing.allocator, 0x63);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 2);
+}
+
+test "differential SIMD: i16x8.all_true true and false lanes" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI16x8(&body, testing.allocator, .{ 1, 2, 0x8000, 0xFFFF, 5, 6, 7, 8 });
+    try appendAllTrueScoreTrue(&body, testing.allocator, 0x83);
+    try appendV128ConstI16x8(&body, testing.allocator, .{ 1, 2, 0x8000, 0, 5, 6, 7, 8 });
+    try appendAllTrueScoreFalse(&body, testing.allocator, 0x83);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 2);
+}
+
+test "differential SIMD: i32x4.all_true true and false lanes" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 1, -1, std.math.minInt(i32), 42 });
+    try appendAllTrueScoreTrue(&body, testing.allocator, 0xA3);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 1, -1, 0, 42 });
+    try appendAllTrueScoreFalse(&body, testing.allocator, 0xA3);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 2);
+}
+
+test "differential SIMD: i64x2.all_true true and false lanes" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI64x2(&body, testing.allocator, .{ 1, 0x8000_0000_0000_0000 });
+    try appendAllTrueScoreTrue(&body, testing.allocator, 0xC3);
+    try appendV128ConstI64x2(&body, testing.allocator, .{ 1, 0 });
+    try appendAllTrueScoreFalse(&body, testing.allocator, 0xC3);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 2);
+}
+
 test "differential SIMD: v128.load/store round trip extracts lane 0" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -937,9 +997,29 @@ fn appendV128ConstI64x2(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, l
     }
 }
 
+fn appendV128ConstI16x8(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lanes: [8]u16) !void {
+    try appendSimdOpcode(buf, allocator, 0x0C);
+    for (lanes) |lane| {
+        var le = std.mem.nativeToLittle(u16, lane);
+        try buf.appendSlice(allocator, std.mem.asBytes(&le));
+    }
+}
+
 fn appendV128ConstI8x16(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lanes: [16]u8) !void {
     try appendSimdOpcode(buf, allocator, 0x0C);
     try buf.appendSlice(allocator, &lanes);
+}
+
+fn appendAllTrueScoreTrue(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, opcode: u32) !void {
+    try appendSimdOpcode(buf, allocator, opcode);
+    try buf.append(allocator, 0x41); // i32.const
+    try encodeSLEB128(buf, allocator, 2);
+    try buf.append(allocator, 0x6C); // i32.mul
+}
+
+fn appendAllTrueScoreFalse(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, opcode: u32) !void {
+    try appendSimdOpcode(buf, allocator, opcode);
+    try buf.append(allocator, 0x6A); // i32.add
 }
 
 fn appendI8x16Shuffle(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lanes: [16]u8) !void {

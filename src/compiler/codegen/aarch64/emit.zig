@@ -692,6 +692,21 @@ pub const CodeBuffer = struct {
         try self.emit32(0x6E30A800 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// UMINV Bd, Vn.16B — unsigned minimum across all 16 bytes.
+    pub fn uminvB16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E31A800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// UMINV Hd, Vn.8H — unsigned minimum across all 8 halfwords.
+    pub fn uminvH8h(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E71A800 | (@as(u32, vn) << 5) | vd);
+    }
+
+    /// UMINV Sd, Vn.4S — unsigned minimum across all 4 words.
+    pub fn uminvS4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6EB1A800 | (@as(u32, vn) << 5) | vd);
+    }
+
     /// LDR Qt, [Xn] — full-width 128-bit vector load.
     pub fn ldrQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
         try self.emit32(0x3DC00000 | (@as(u32, rn.encoding()) << 5) | vt);
@@ -2225,6 +2240,27 @@ test "emit: UMAXV b0, v1.16b" {
     defer code.deinit();
     try code.umaxvB16b(0, 1);
     try expectWord(0x6E30A820, &code);
+}
+
+test "emit: UMINV lane-width all_true reductions" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.uminvB16b(0, 1);
+        try expectWord(0x6E31A820, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.uminvH8h(2, 3);
+        try expectWord(0x6E71A862, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.uminvS4s(4, 5);
+        try expectWord(0x6EB1A8A4, &code);
+    }
 }
 
 test "emit: LDR q0, [x1]" {
