@@ -2076,6 +2076,7 @@ fn emitI32x4UnOp(
     switch (un.op) {
         .abs => try code.abs4s(dest_reg, vector_reg),
         .neg => try code.neg4s(dest_reg, vector_reg),
+        .popcnt => unreachable,
     }
 }
 
@@ -2124,6 +2125,7 @@ fn emitI8x16UnOp(
     switch (un.op) {
         .abs => try code.abs16b(dest_reg, vector_reg),
         .neg => try code.neg16b(dest_reg, vector_reg),
+        .popcnt => try code.cnt16b(dest_reg, vector_reg),
     }
 }
 
@@ -2140,6 +2142,7 @@ fn emitI16x8UnOp(
     switch (un.op) {
         .abs => try code.abs8h(dest_reg, vector_reg),
         .neg => try code.neg8h(dest_reg, vector_reg),
+        .popcnt => unreachable,
     }
 }
 
@@ -2437,6 +2440,7 @@ fn emitI64x2UnOp(
     switch (un.op) {
         .abs => try code.abs2d(dest_reg, vector_reg),
         .neg => try code.neg2d(dest_reg, vector_reg),
+        .popcnt => unreachable,
     }
 }
 
@@ -7067,7 +7071,7 @@ test "compile: SIMD int-to-float conversions emit NEON instructions" {
     try std.testing.expect(found_ucvtf2d);
 }
 
-test "compile: integer SIMD abs and neg ops emit NEON instructions" {
+test "compile: integer SIMD unary ops emit NEON instructions" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -7087,7 +7091,10 @@ test "compile: integer SIMD abs and neg ops emit NEON instructions" {
     try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_0000_0000_8000_0000_807F_0180 }, .dest = source, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_unop = .{ .op = .abs, .vector = source } }, .dest = i8_abs, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i8x16_unop = .{ .op = .neg, .vector = i8_abs } }, .dest = i8_neg, .type = .v128 });
-    try func.getBlock(bid).append(.{ .op = .{ .i16x8_unop = .{ .op = .abs, .vector = i8_neg } }, .dest = i16_abs, .type = .v128 });
+    const i8_popcnt = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .i8x16_unop = .{ .op = .popcnt, .vector = source } }, .dest = i8_popcnt, .type = .v128 });
+
+    try func.getBlock(bid).append(.{ .op = .{ .i16x8_unop = .{ .op = .abs, .vector = i8_popcnt } }, .dest = i16_abs, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i16x8_unop = .{ .op = .neg, .vector = i16_abs } }, .dest = i16_neg, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i32x4_unop = .{ .op = .abs, .vector = i16_neg } }, .dest = i32_abs, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i32x4_unop = .{ .op = .neg, .vector = i32_abs } }, .dest = i32_neg, .type = .v128 });
@@ -7111,6 +7118,7 @@ test "compile: integer SIMD abs and neg ops emit NEON instructions" {
     var found_neg4s = false;
     var found_abs2d = false;
     var found_neg2d = false;
+    var found_cnt16b = false;
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
@@ -7122,6 +7130,7 @@ test "compile: integer SIMD abs and neg ops emit NEON instructions" {
         if ((w & 0xFFFFFC00) == 0x6EA0B800) found_neg4s = true;
         if ((w & 0xFFFFFC00) == 0x4EE0B800) found_abs2d = true;
         if ((w & 0xFFFFFC00) == 0x6EE0B800) found_neg2d = true;
+        if ((w & 0xFFFFFC00) == 0x4E205800) found_cnt16b = true;
     }
 
     try std.testing.expect(found_abs16b);
@@ -7132,6 +7141,7 @@ test "compile: integer SIMD abs and neg ops emit NEON instructions" {
     try std.testing.expect(found_neg4s);
     try std.testing.expect(found_abs2d);
     try std.testing.expect(found_neg2d);
+    try std.testing.expect(found_cnt16b);
 }
 
 test "compile: integer SIMD pairwise extended add ops emit NEON instructions" {

@@ -1814,6 +1814,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     },
                     .i8x16_abs,
                     .i8x16_neg,
+                    .i8x16_popcnt,
                     .i16x8_abs,
                     .i16x8_neg,
                     .i32x4_abs,
@@ -1835,12 +1836,13 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                                 .i32x4_neg,
                                 .i64x2_neg,
                                 => .neg,
+                                .i8x16_popcnt => .popcnt,
                                 else => unreachable,
                             },
                             .vector = vector,
                         };
                         const inst_op: ir.Inst.Op = switch (simd_op) {
-                            .i8x16_abs, .i8x16_neg => .{ .i8x16_unop = unary },
+                            .i8x16_abs, .i8x16_neg, .i8x16_popcnt => .{ .i8x16_unop = unary },
                             .i16x8_abs, .i16x8_neg => .{ .i16x8_unop = unary },
                             .i32x4_abs, .i32x4_neg => .{ .i32x4_unop = unary },
                             .i64x2_abs, .i64x2_neg => .{ .i64x2_unop = unary },
@@ -4086,7 +4088,7 @@ test "lower i64x2 scalar-count shift opcodes" {
     try std.testing.expect(insts[9].op.ret != null);
 }
 
-test "lower integer SIMD abs and neg opcodes" {
+test "lower integer SIMD unary opcodes" {
     const allocator = std.testing.allocator;
 
     const func_type = types.FuncType{
@@ -4103,6 +4105,7 @@ test "lower integer SIMD abs and neg opcodes" {
     const cases = [_]Case{
         .{ .opcode = 0x60, .family = .i8x16, .expected = .abs },
         .{ .opcode = 0x61, .family = .i8x16, .expected = .neg },
+        .{ .opcode = 0x62, .family = .i8x16, .expected = .popcnt },
         .{ .opcode = 0x80, .family = .i16x8, .expected = .abs },
         .{ .opcode = 0x81, .family = .i16x8, .expected = .neg },
         .{ .opcode = 0xA0, .family = .i32x4, .expected = .abs },

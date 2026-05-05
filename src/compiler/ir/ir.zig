@@ -282,7 +282,7 @@ pub const Inst = struct {
     pub const AtomicRmwOp = enum { add, sub, @"and", @"or", xor, xchg };
 
     pub const V128BitwiseOp = enum { @"and", andnot, @"or", xor };
-    pub const SimdUnaryOp = enum { abs, neg };
+    pub const SimdUnaryOp = enum { abs, neg, popcnt };
     pub const SimdExtAddPairwiseSign = enum { signed, unsigned };
     pub const SimdExtendSign = enum { signed, unsigned };
     pub const SimdExtendHalfSelect = enum { low, high };
