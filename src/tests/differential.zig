@@ -482,6 +482,125 @@ test "differential SIMD: f32x4.convert_i32x4_u lane 0 matches interpreter" {
     );
 }
 
+fn bitsI32(bits: u32) i32 {
+    return @bitCast(bits);
+}
+
+fn expectF32x4BinLaneBits(opcode: u32, lhs: [4]u32, rhs: [4]u32, lane: u8, expected_bits: u32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, lhs);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, rhs);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI32x4ExtractLane(&body, testing.allocator, lane);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", bitsI32(expected_bits));
+}
+
+test "differential SIMD: f32x4 arithmetic normal lanes match interpreter" {
+    try expectF32x4BinLaneBits(
+        0xE4,
+        .{ 0x3f80_0000, 0x4000_0000, 0x42c8_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x4040_0000, 0x41b8_0000, 0x4100_0000 },
+        2,
+        0x42f6_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE5,
+        .{ 0x4120_0000, 0x4140_0000, 0x4160_0000, 0x4110_0000 },
+        .{ 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4040_0000 },
+        3,
+        0x40c0_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE6,
+        .{ 0x3f80_0000, 0x4040_0000, 0x4080_0000, 0x40a0_0000 },
+        .{ 0x4000_0000, 0x4080_0000, 0x40c0_0000, 0x4100_0000 },
+        1,
+        0x4140_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE7,
+        .{ 0x4140_0000, 0x4180_0000, 0x41a0_0000, 0x41c0_0000 },
+        .{ 0x4080_0000, 0x4000_0000, 0x40a0_0000, 0x40c0_0000 },
+        0,
+        0x4040_0000,
+    );
+}
+
+test "differential SIMD: f32x4 arithmetic preserves subnormals" {
+    try expectF32x4BinLaneBits(
+        0xE4,
+        .{ 0x0000_0001, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x0000_0001, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x0000_0002,
+    );
+    try expectF32x4BinLaneBits(
+        0xE5,
+        .{ 0x0000_0003, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x0000_0001, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x0000_0002,
+    );
+    try expectF32x4BinLaneBits(
+        0xE6,
+        .{ 0x0000_0001, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x4000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x0000_0002,
+    );
+    try expectF32x4BinLaneBits(
+        0xE7,
+        .{ 0x0000_0002, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x4000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x0000_0001,
+    );
+}
+
+test "differential SIMD: f32x4 arithmetic signed zero and division edges match interpreter" {
+    try expectF32x4BinLaneBits(
+        0xE4,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE5,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x0000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE6,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x4000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE7,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x4000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xE7,
+        .{ 0x3f80_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0xff80_0000,
+    );
+}
+
 test "differential SIMD: f64x2.convert_low_i32x4_s lane 0 matches interpreter" {
     try expectF64x2ConvertLowLane0High(
         0xFE,
@@ -1475,6 +1594,14 @@ fn appendV128ConstI32x4(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, l
     try appendSimdOpcode(buf, allocator, 0x0C);
     for (lanes) |lane| {
         var le = std.mem.nativeToLittle(u32, @bitCast(lane));
+        try buf.appendSlice(allocator, std.mem.asBytes(&le));
+    }
+}
+
+fn appendV128ConstF32x4Bits(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lanes: [4]u32) !void {
+    try appendSimdOpcode(buf, allocator, 0x0C);
+    for (lanes) |lane| {
+        var le = std.mem.nativeToLittle(u32, lane);
         try buf.appendSlice(allocator, std.mem.asBytes(&le));
     }
 }

@@ -2563,6 +2563,32 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .f32x4_add,
+                    .f32x4_sub,
+                    .f32x4_mul,
+                    .f32x4_div,
+                    => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const lane_op: ir.Inst.F32x4Op = switch (simd_op) {
+                            .f32x4_add => .add,
+                            .f32x4_sub => .sub,
+                            .f32x4_mul => .mul,
+                            .f32x4_div => .div,
+                            else => unreachable,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .f32x4_binop = .{
+                                .op = lane_op,
+                                .lhs = lhs,
+                                .rhs = rhs,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .f64x2_add,
                     .f64x2_sub,
                     .f64x2_mul,
@@ -6188,6 +6214,96 @@ test "lower f64x2 arithmetic and comparison opcodes" {
     try std.testing.expectEqual(ir.IrType.i64, insts[inst_idx].type);
     try std.testing.expectEqual(insts[inst_idx].dest.?, insts[inst_idx + 1].op.wrap_i64);
     try std.testing.expect(insts[inst_idx + 2].op.ret != null);
+}
+
+test "lower f32x4 arithmetic opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Case = struct {
+        opcode: u32,
+        expected: ir.Inst.F32x4Op,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0xE4, .expected = .add },
+        .{ .opcode = 0xE5, .expected = .sub },
+        .{ .opcode = 0xE6, .expected = .mul },
+        .{ .opcode = 0xE7, .expected = .div },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+    const appendConst = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, lanes: [4]u32) !void {
+            try appendSimd(buf, alloc, 0x0C);
+            for (lanes) |lane| {
+                var le = std.mem.nativeToLittle(u32, lane);
+                try buf.appendSlice(alloc, std.mem.asBytes(&le));
+            }
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try appendConst(&code, allocator, .{ 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 });
+    try appendConst(&code, allocator, .{ 0x40a0_0000, 0x40c0_0000, 0x40e0_0000, 0x4100_0000 });
+    for (cases, 0..) |case, idx| {
+        if (idx != 0) try appendConst(&code, allocator, .{ 0x3f80_0000, 0x3f80_0000, 0x3f80_0000, 0x3f80_0000 });
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x1B); // i32x4.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 2 + cases.len * 2 + 1), insts.len);
+    var inst_idx: usize = 2;
+    for (cases, 0..) |case, idx| {
+        try std.testing.expectEqual(case.expected, insts[inst_idx].op.f32x4_binop.op);
+        inst_idx += 1;
+        if (idx + 1 < cases.len) {
+            try std.testing.expectEqual(ir.IrType.v128, insts[inst_idx].type);
+            inst_idx += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u2, 0), insts[inst_idx].op.i32x4_extract_lane.lane);
+    try std.testing.expectEqual(ir.IrType.i32, insts[inst_idx].type);
+    try std.testing.expect(insts[inst_idx + 1].op.ret != null);
 }
 
 test "lower unreachable" {
