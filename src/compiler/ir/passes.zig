@@ -263,6 +263,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .i64x2_splat,
         => |vreg| list.append(vreg),
         .simd_all_true => |op| list.append(op.vector),
+        .simd_bitmask => |op| list.append(op.vector),
         .i32x4_extract_lane => |lane| list.append(lane.vector),
         .i8x16_extract_lane => |lane| list.append(lane.vector),
         .i16x8_extract_lane => |lane| list.append(lane.vector),
@@ -622,6 +623,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             vreg.* = new;
         },
         .simd_all_true => |*op| if (op.vector == old) {
+            op.vector = new;
+        },
+        .simd_bitmask => |*op| if (op.vector == old) {
             op.vector = new;
         },
         .i32x4_extract_lane => |*lane| if (lane.vector == old) {
@@ -1838,6 +1842,7 @@ fn isPure(inst: ir.Inst) bool {
         .v128_not,
         .v128_any_true,
         .simd_all_true,
+        .simd_bitmask,
         .v128_bitwise,
         .v128_bitselect,
         .i32x4_binop,
@@ -1969,6 +1974,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .v128_not => |v| v == b.op.v128_not,
         .v128_any_true => |v| v == b.op.v128_any_true,
         .simd_all_true => |op| op.width == b.op.simd_all_true.width and op.vector == b.op.simd_all_true.vector,
+        .simd_bitmask => |op| op.width == b.op.simd_bitmask.width and op.vector == b.op.simd_bitmask.vector,
         .v128_bitwise => |bin| bin.op == b.op.v128_bitwise.op and bin.lhs == b.op.v128_bitwise.lhs and bin.rhs == b.op.v128_bitwise.rhs,
         .v128_bitselect => |sel| sel.a == b.op.v128_bitselect.a and sel.b == b.op.v128_bitselect.b and sel.mask == b.op.v128_bitselect.mask,
         .i32x4_binop => |bin| bin.op == b.op.i32x4_binop.op and bin.lhs == b.op.i32x4_binop.lhs and bin.rhs == b.op.i32x4_binop.rhs,
@@ -3648,6 +3654,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .i64x2_splat,
         => |*vreg| vreg.* += offset,
         .simd_all_true => |*op| op.vector += offset,
+        .simd_bitmask => |*op| op.vector += offset,
         .i32x4_extract_lane => |*lane| lane.vector += offset,
         .i8x16_extract_lane => |*lane| lane.vector += offset,
         .i16x8_extract_lane => |*lane| lane.vector += offset,

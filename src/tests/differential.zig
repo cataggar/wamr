@@ -850,6 +850,58 @@ test "differential SIMD: i64x2.all_true true and false lanes" {
     try expectSimdDiffI32(wasm, "f", 2);
 }
 
+test "differential SIMD: i8x16.bitmask uses lane sign bits" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI8x16(&body, testing.allocator, .{ 0x80, 0x7F, 0xFF, 1, 0, 0x40, 0, 0x81, 0xFE, 2, 3, 4, 5, 6, 7, 0x80 });
+    try appendSimdOpcode(&body, testing.allocator, 0x64);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 33157);
+}
+
+test "differential SIMD: i16x8.bitmask uses lane sign bits" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI16x8(&body, testing.allocator, .{ 0x8000, 0x7FFF, 0xFFFF, 1, 2, 0x8001, 3, 0xFFFF });
+    try appendSimdOpcode(&body, testing.allocator, 0x84);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 165);
+}
+
+test "differential SIMD: i32x4.bitmask uses lane sign bits" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 1, -1, 0x7FFF_FFFF, std.math.minInt(i32) });
+    try appendSimdOpcode(&body, testing.allocator, 0xA4);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 10);
+}
+
+test "differential SIMD: i64x2.bitmask uses lane sign bits" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI64x2(&body, testing.allocator, .{ 123, 0x8000_0000_0000_0000 });
+    try appendSimdOpcode(&body, testing.allocator, 0xC4);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 2);
+}
+
 test "differential SIMD: v128.load/store round trip extracts lane 0" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);

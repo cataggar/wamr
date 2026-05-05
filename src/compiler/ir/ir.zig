@@ -73,6 +73,7 @@ pub const Inst = struct {
         v128_bitselect: V128Bitselect,
         v128_any_true: VReg,
         simd_all_true: SimdAllTrue,
+        simd_bitmask: SimdBitmask,
         i32x4_binop: I32x4BinOp,
         i32x4_unop: SimdUnary,
         i32x4_extadd_pairwise_i16x8: SimdExtAddPairwise,
@@ -449,6 +450,13 @@ pub const Inst = struct {
         vector: VReg,
     };
 
+    pub const SimdBitmaskWidth = enum { i8x16, i16x8, i32x4, i64x2 };
+
+    pub const SimdBitmask = struct {
+        width: SimdBitmaskWidth,
+        vector: VReg,
+    };
+
     pub const I8x16Shuffle = struct {
         lhs: VReg,
         rhs: VReg,
@@ -779,6 +787,14 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.SimdAllTrueWidth.i16x8, all_true.op.simd_all_true.width);
     try std.testing.expectEqual(@as(VReg, 5), all_true.op.simd_all_true.vector);
+
+    const bitmask = Inst{
+        .op = .{ .simd_bitmask = .{ .width = .i16x8, .vector = 7 } },
+        .dest = 8,
+        .type = .i32,
+    };
+    try std.testing.expectEqual(Inst.SimdBitmaskWidth.i16x8, bitmask.op.simd_bitmask.width);
+    try std.testing.expectEqual(@as(VReg, 7), bitmask.op.simd_bitmask.vector);
 
     const c = Inst{ .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF }, .dest = 1, .type = .v128 };
     try std.testing.expectEqual(IrType.v128, c.type);

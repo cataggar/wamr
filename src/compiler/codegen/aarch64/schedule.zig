@@ -252,6 +252,7 @@ fn opClass(inst: ir.Inst) Class {
         .v128_bitwise,
         .v128_bitselect,
         .simd_all_true,
+        .simd_bitmask,
         .i32x4_binop,
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
@@ -550,6 +551,7 @@ pub fn forEachUse(
             try visit(context, sel.mask);
         },
         .simd_all_true => |op| try visit(context, op.vector),
+        .simd_bitmask => |op| try visit(context, op.vector),
         .i32x4_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
