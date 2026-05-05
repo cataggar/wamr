@@ -359,6 +359,31 @@ fn bodyBrIf(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     block2.append(.{ .op = .{ .ret = r2 } }) catch unreachable;
 }
 
+/// Chained br_if on the same condition — exercises IR branch threading.
+fn bodyChainedBrIfSameCond(func: *ir.IrFunction, block: *ir.BasicBlock) void {
+    const cond = func.newVReg();
+    const r_else = func.newVReg();
+    const r_true = func.newVReg();
+    const r_false = func.newVReg();
+
+    const mid = func.newBlock() catch unreachable;
+    const source_else = func.newBlock() catch unreachable;
+    const inner_true = func.newBlock() catch unreachable;
+    const inner_false = func.newBlock() catch unreachable;
+
+    block.append(.{ .op = .memory_size, .dest = cond, .type = .i32 }) catch unreachable;
+    block.append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = mid, .else_block = source_else } } }) catch unreachable;
+
+    func.getBlock(mid).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = inner_true, .else_block = inner_false } } }) catch unreachable;
+
+    func.getBlock(source_else).append(.{ .op = .{ .iconst_32 = 0 }, .dest = r_else, .type = .i32 }) catch unreachable;
+    func.getBlock(source_else).append(.{ .op = .{ .ret = r_else } }) catch unreachable;
+    func.getBlock(inner_true).append(.{ .op = .{ .iconst_32 = 1 }, .dest = r_true, .type = .i32 }) catch unreachable;
+    func.getBlock(inner_true).append(.{ .op = .{ .ret = r_true } }) catch unreachable;
+    func.getBlock(inner_false).append(.{ .op = .{ .iconst_32 = 2 }, .dest = r_false, .type = .i32 }) catch unreachable;
+    func.getBlock(inner_false).append(.{ .op = .{ .ret = r_false } }) catch unreachable;
+}
+
 /// br_table with 4 targets — exercises jump table codegen.
 fn bodyBrTable(func: *ir.IrFunction, block: *ir.BasicBlock) void {
     const idx = func.newVReg();
@@ -863,6 +888,7 @@ pub fn main() !void {
         .{ .name = "3× load same base (hoisted)", .body = &bodyConsecutiveLoads },
         .{ .name = "div_u by const 7 (magic mul)", .body = &bodyDivByConst },
         .{ .name = "add base,const → load offset", .body = &bodyAddIntoLoad },
+        .{ .name = "chained br_if same cond", .body = &bodyChainedBrIfSameCond },
         .{ .name = "4× load + sum (bounds elide)", .body = &bodyLoadStoreMulti },
         .{ .name = "reg pressure (12 live vals)", .body = &bodyRegPressure },
     };

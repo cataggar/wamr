@@ -2822,6 +2822,70 @@ pub fn foldConstantBranches(func: *ir.IrFunction, allocator: std.mem.Allocator) 
     return changed;
 }
 
+// ── Branch threading ────────────────────────────────────────────────────────
+
+/// Thread `br_if` edges through a one-instruction `br_if` block that tests
+/// the same condition. If block A's true edge reaches block B, then at B the
+/// same condition is known true, so A can jump directly to B's true target.
+/// Similarly, A's false edge can jump directly to B's false target.
+pub fn threadChainedConditionalBranches(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    _ = allocator;
+    var changed = false;
+
+    for (func.blocks.items) |*block| {
+        if (block.instructions.items.len == 0) continue;
+        const term = &block.instructions.items[block.instructions.items.len - 1];
+        switch (term.op) {
+            .br_if => |bi| {
+                var threaded = bi;
+                var term_changed = false;
+
+                if (threadedBrIfTarget(func, bi.cond, bi.then_block, true)) |target| {
+                    if (target != threaded.then_block) {
+                        threaded.then_block = target;
+                        term_changed = true;
+                    }
+                }
+                if (threadedBrIfTarget(func, bi.cond, bi.else_block, false)) |target| {
+                    if (target != threaded.else_block) {
+                        threaded.else_block = target;
+                        term_changed = true;
+                    }
+                }
+
+                if (term_changed) {
+                    term.op = .{ .br_if = threaded };
+                    changed = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    return changed;
+}
+
+fn threadedBrIfTarget(
+    func: *const ir.IrFunction,
+    cond: ir.VReg,
+    target: ir.BlockId,
+    take_then: bool,
+) ?ir.BlockId {
+    const target_idx: usize = @intCast(target);
+    if (target_idx >= func.blocks.items.len) return null;
+
+    const target_block = &func.blocks.items[target_idx];
+    if (target_block.instructions.items.len != 1) return null;
+
+    return switch (target_block.instructions.items[0].op) {
+        .br_if => |bi| if (bi.cond == cond)
+            (if (take_then) bi.then_block else bi.else_block)
+        else
+            null,
+        else => null,
+    };
+}
+
 // ── Branch-on-Eqz folding ───────────────────────────────────────────────────
 
 /// Collapse `br_if(cond=eqz(x), then=A, else=B)` into
@@ -4423,6 +4487,7 @@ pub const default_passes: []const PassFn = &.{
     &foldConstantBranches,
     &foldInverseCompareEqz,
     &foldBranchOnEqz,
+    &threadChainedConditionalBranches,
     &foldSelectOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
@@ -6996,6 +7061,136 @@ test "foldBranchOnEqz: pipeline drops dead eqz after DCE" {
     // eqz should be gone; only the br_if remains.
     try std.testing.expectEqual(@as(usize, 1), func.getBlock(b0).instructions.items.len);
     try std.testing.expect(func.getBlock(b0).instructions.items[0].op == .br_if);
+}
+
+test "threadChainedConditionalBranches: true edge jumps to inner true target" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const mid = try func.newBlock();
+    const source_else = try func.newBlock();
+    const inner_true = try func.newBlock();
+    const inner_false = try func.newBlock();
+
+    const v_c = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = mid, .else_block = source_else } } });
+    try func.getBlock(mid).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = inner_true, .else_block = inner_false } } });
+    try func.getBlock(source_else).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(inner_true).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(inner_false).append(.{ .op = .{ .ret = null } });
+
+    const changed = try threadChainedConditionalBranches(&func, allocator);
+    try std.testing.expect(changed);
+
+    const term = func.getBlock(entry).instructions.items[1];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_c, bi.cond);
+            try std.testing.expectEqual(inner_true, bi.then_block);
+            try std.testing.expectEqual(source_else, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "threadChainedConditionalBranches: false edge jumps to inner false target" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const source_then = try func.newBlock();
+    const mid = try func.newBlock();
+    const inner_true = try func.newBlock();
+    const inner_false = try func.newBlock();
+
+    const v_c = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = source_then, .else_block = mid } } });
+    try func.getBlock(source_then).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(mid).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = inner_true, .else_block = inner_false } } });
+    try func.getBlock(inner_true).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(inner_false).append(.{ .op = .{ .ret = null } });
+
+    const changed = try threadChainedConditionalBranches(&func, allocator);
+    try std.testing.expect(changed);
+
+    const term = func.getBlock(entry).instructions.items[1];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(v_c, bi.cond);
+            try std.testing.expectEqual(source_then, bi.then_block);
+            try std.testing.expectEqual(inner_false, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "threadChainedConditionalBranches: skips mismatched inner condition" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const mid = try func.newBlock();
+    const source_else = try func.newBlock();
+    const inner_true = try func.newBlock();
+    const inner_false = try func.newBlock();
+
+    const v_c = func.newVReg();
+    const v_other = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_other, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = mid, .else_block = source_else } } });
+    try func.getBlock(mid).append(.{ .op = .{ .br_if = .{ .cond = v_other, .then_block = inner_true, .else_block = inner_false } } });
+    try func.getBlock(source_else).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(inner_true).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(inner_false).append(.{ .op = .{ .ret = null } });
+
+    const changed = try threadChainedConditionalBranches(&func, allocator);
+    try std.testing.expect(!changed);
+
+    const term = func.getBlock(entry).instructions.items[2];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(mid, bi.then_block);
+            try std.testing.expectEqual(source_else, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "threadChainedConditionalBranches: skips non-empty intermediate block" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const entry = try func.newBlock();
+    const mid = try func.newBlock();
+    const source_else = try func.newBlock();
+    const inner_true = try func.newBlock();
+    const inner_false = try func.newBlock();
+
+    const v_c = func.newVReg();
+    const v_dead = func.newVReg();
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_c, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = mid, .else_block = source_else } } });
+    try func.getBlock(mid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_dead, .type = .i32 });
+    try func.getBlock(mid).append(.{ .op = .{ .br_if = .{ .cond = v_c, .then_block = inner_true, .else_block = inner_false } } });
+    try func.getBlock(source_else).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(inner_true).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(inner_false).append(.{ .op = .{ .ret = null } });
+
+    const changed = try threadChainedConditionalBranches(&func, allocator);
+    try std.testing.expect(!changed);
+
+    const term = func.getBlock(entry).instructions.items[1];
+    switch (term.op) {
+        .br_if => |bi| {
+            try std.testing.expectEqual(mid, bi.then_block);
+            try std.testing.expectEqual(source_else, bi.else_block);
+        },
+        else => try std.testing.expect(false),
+    }
 }
 
 test "foldInverseCompareEqz: eqz(eq) becomes ne" {
