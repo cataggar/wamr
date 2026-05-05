@@ -392,6 +392,60 @@ test "differential SIMD: i32x4.splat feeds i32x4.add" {
     try expectSimdDiffI32(wasm, "f", 9);
 }
 
+fn expectF64x2ArithmeticLane0High(opcode: u32, lhs: [2]u64, rhs: [2]u64, expected: i32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI64x2(&body, testing.allocator, lhs);
+    try appendV128ConstI64x2(&body, testing.allocator, rhs);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI64x2ExtractLane(&body, testing.allocator, 0);
+    try appendI64Const(&body, testing.allocator, 32);
+    try appendI64ShrU(&body, testing.allocator);
+    try appendI32WrapI64(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", expected);
+}
+
+test "differential SIMD: f64x2.add lane 0 matches interpreter" {
+    try expectF64x2ArithmeticLane0High(
+        0xF0,
+        .{ 0x3ff4_0000_0000_0000, 0x4008_0000_0000_0000 },
+        .{ 0x4004_0000_0000_0000, 0x4010_0000_0000_0000 },
+        0x400e_0000,
+    );
+}
+
+test "differential SIMD: f64x2.sub lane 0 matches interpreter" {
+    try expectF64x2ArithmeticLane0High(
+        0xF1,
+        .{ 0x4023_0000_0000_0000, 0x4010_0000_0000_0000 },
+        .{ 0x4002_0000_0000_0000, 0x4000_0000_0000_0000 },
+        0x401d_0000,
+    );
+}
+
+test "differential SIMD: f64x2.mul lane 0 matches interpreter" {
+    try expectF64x2ArithmeticLane0High(
+        0xF2,
+        .{ 0x4008_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        .{ 0xc004_0000_0000_0000, 0x4000_0000_0000_0000 },
+        @bitCast(@as(u32, 0xc01e_0000)),
+    );
+}
+
+test "differential SIMD: f64x2.div lane 0 matches interpreter" {
+    try expectF64x2ArithmeticLane0High(
+        0xF3,
+        .{ 0x4022_0000_0000_0000, 0x4010_0000_0000_0000 },
+        .{ 0x4000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        0x4012_0000,
+    );
+}
+
 test "differential SIMD: i8x16.shuffle selects bytes from both inputs" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -654,6 +708,14 @@ fn appendV128ConstI32x4(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, l
     }
 }
 
+fn appendV128ConstI64x2(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lanes: [2]u64) !void {
+    try appendSimdOpcode(buf, allocator, 0x0C);
+    for (lanes) |lane| {
+        var le = std.mem.nativeToLittle(u64, lane);
+        try buf.appendSlice(allocator, std.mem.asBytes(&le));
+    }
+}
+
 fn appendV128ConstI8x16(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lanes: [16]u8) !void {
     try appendSimdOpcode(buf, allocator, 0x0C);
     try buf.appendSlice(allocator, &lanes);
@@ -682,9 +744,27 @@ fn appendI32x4ExtractLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator,
     try buf.append(allocator, lane);
 }
 
+fn appendI64x2ExtractLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x1D);
+    try buf.append(allocator, lane);
+}
+
 fn appendI32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1C);
     try buf.append(allocator, lane);
+}
+
+fn appendI64Const(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i64) !void {
+    try buf.append(allocator, 0x42);
+    try encodeSLEB128(buf, allocator, value);
+}
+
+fn appendI64ShrU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try buf.append(allocator, 0x88);
+}
+
+fn appendI32WrapI64(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try buf.append(allocator, 0xA7);
 }
 
 fn appendSimdMemOpcode(
