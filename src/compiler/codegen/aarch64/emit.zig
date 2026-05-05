@@ -755,6 +755,16 @@ pub const CodeBuffer = struct {
         try self.emit32(0x3DC00000 | (@as(u32, rn.encoding()) << 5) | vt);
     }
 
+    /// LDR St, [Xn] — 32-bit SIMD&FP scalar load; upper Q bits are zeroed.
+    pub fn ldrS(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.emit32(0xBD400000 | (@as(u32, rn.encoding()) << 5) | vt);
+    }
+
+    /// LDR Dt, [Xn] — 64-bit SIMD&FP scalar load; upper Q bits are zeroed.
+    pub fn ldrD(self: *CodeBuffer, vt: u5, rn: Reg) !void {
+        try self.emit32(0xFD400000 | (@as(u32, rn.encoding()) << 5) | vt);
+    }
+
     fn ld1r(self: *CodeBuffer, vt: u5, rn: Reg, size: u2) !void {
         try self.emit32(0x4D40C000 |
             (@as(u32, size) << 10) |
@@ -2475,6 +2485,21 @@ test "emit: LDR q0, [x1]" {
     defer code.deinit();
     try code.ldrQ(0, .x1);
     try expectWord(0x3DC00020, &code);
+}
+
+test "emit: LDR s0 and d2 scalar vector loads" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ldrS(0, .x1);
+        try expectWord(0xBD400020, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.ldrD(2, .x3);
+        try expectWord(0xFD400062, &code);
+    }
 }
 
 test "emit: LD1R vector broadcast load forms" {
