@@ -899,6 +899,22 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// FCMGT Vd.2D, Vn.2D, Vm.2D — floating-point compare greater-than per lane.
+    pub fn fcmgt2d(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6EE0E400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FCMGE Vd.2D, Vn.2D, Vm.2D — floating-point compare greater-or-equal per lane.
+    pub fn fcmge2d(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6E60E400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// SSHL Vd.2D, Vn.2D, Vm.2D — signed variable shift.
     pub fn sshl2d(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4EE04400 |
@@ -2581,6 +2597,18 @@ test "emit: f64x2 vector arithmetic ops" {
         defer code.deinit();
         try code.fcmeq2d(16, 17, 30);
         try expectWord(0x4E7EE630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fcmgt2d(16, 17, 30);
+        try expectWord(0x6EFEE630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fcmge2d(16, 17, 30);
+        try expectWord(0x6E7EE630, &code);
     }
 }
 

@@ -2298,6 +2298,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f64x2_div,
                     .f64x2_min,
                     .f64x2_max,
+                    .f64x2_eq,
+                    .f64x2_ne,
+                    .f64x2_lt,
+                    .f64x2_gt,
+                    .f64x2_le,
+                    .f64x2_ge,
                     => {
                         const rhs = safePop(&vreg_stack);
                         const lhs = safePop(&vreg_stack);
@@ -2309,6 +2315,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .f64x2_div => .div,
                             .f64x2_min => .min,
                             .f64x2_max => .max,
+                            .f64x2_eq => .eq,
+                            .f64x2_ne => .ne,
+                            .f64x2_lt => .lt,
+                            .f64x2_gt => .gt,
+                            .f64x2_le => .le,
+                            .f64x2_ge => .ge,
                             else => unreachable,
                         };
                         try ir_func.getBlock(current_block).append(.{
@@ -4927,7 +4939,7 @@ test "lower i64x2 cmp and arithmetic opcodes" {
     try std.testing.expect(insts[inst_idx + 2].op.ret != null);
 }
 
-test "lower f64x2 arithmetic opcodes" {
+test "lower f64x2 arithmetic and comparison opcodes" {
     const allocator = std.testing.allocator;
 
     const func_type = types.FuncType{
@@ -4940,6 +4952,12 @@ test "lower f64x2 arithmetic opcodes" {
         expected: ir.Inst.F64x2Op,
     };
     const cases = [_]Case{
+        .{ .opcode = 0x47, .expected = .eq },
+        .{ .opcode = 0x48, .expected = .ne },
+        .{ .opcode = 0x49, .expected = .lt },
+        .{ .opcode = 0x4A, .expected = .gt },
+        .{ .opcode = 0x4B, .expected = .le },
+        .{ .opcode = 0x4C, .expected = .ge },
         .{ .opcode = 0xF0, .expected = .add },
         .{ .opcode = 0xF1, .expected = .sub },
         .{ .opcode = 0xF2, .expected = .mul },

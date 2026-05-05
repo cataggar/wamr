@@ -424,6 +424,64 @@ fn expectF64x2ArithmeticLane0High(opcode: u32, lhs: [2]u64, rhs: [2]u64, expecte
     try expectF64x2Lane0High(opcode, lhs, rhs, expected);
 }
 
+fn expectF64x2ComparisonLane0(opcode: u32, lhs: [2]u64, rhs: [2]u64, expected: i32) !void {
+    try expectF64x2Lane0Low(opcode, lhs, rhs, expected);
+}
+
+test "differential SIMD: f64x2.eq lane 0 matches interpreter" {
+    try expectF64x2ComparisonLane0(
+        0x47,
+        .{ 0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000 },
+        .{ 0x3ff0_0000_0000_0000, 0x4008_0000_0000_0000 },
+        -1,
+    );
+}
+
+test "differential SIMD: f64x2.ne lane 0 matches interpreter for NaN" {
+    try expectF64x2ComparisonLane0(
+        0x48,
+        .{ 0x7ff8_0000_0000_0001, 0x4000_0000_0000_0000 },
+        .{ 0x3ff0_0000_0000_0000, 0x4008_0000_0000_0000 },
+        -1,
+    );
+}
+
+test "differential SIMD: f64x2.lt lane 0 matches interpreter" {
+    try expectF64x2ComparisonLane0(
+        0x49,
+        .{ 0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000 },
+        .{ 0x4000_0000_0000_0000, 0x4008_0000_0000_0000 },
+        -1,
+    );
+}
+
+test "differential SIMD: f64x2.gt lane 0 matches interpreter" {
+    try expectF64x2ComparisonLane0(
+        0x4A,
+        .{ 0x4008_0000_0000_0000, 0x4000_0000_0000_0000 },
+        .{ 0x4000_0000_0000_0000, 0x4008_0000_0000_0000 },
+        -1,
+    );
+}
+
+test "differential SIMD: f64x2.le lane 0 matches interpreter" {
+    try expectF64x2ComparisonLane0(
+        0x4B,
+        .{ 0x4000_0000_0000_0000, 0x4000_0000_0000_0000 },
+        .{ 0x4000_0000_0000_0000, 0x4008_0000_0000_0000 },
+        -1,
+    );
+}
+
+test "differential SIMD: f64x2.ge lane 0 matches interpreter for NaN false" {
+    try expectF64x2ComparisonLane0(
+        0x4C,
+        .{ 0x7ff8_0000_0000_0001, 0x4000_0000_0000_0000 },
+        .{ 0x4000_0000_0000_0000, 0x4008_0000_0000_0000 },
+        0,
+    );
+}
+
 test "differential SIMD: f64x2.add lane 0 matches interpreter" {
     try expectF64x2ArithmeticLane0High(
         0xF0,

@@ -2893,6 +2893,15 @@ fn emitF64x2BinOp(
         .sub => try code.f64x2Op(.sub, dest_reg, lhs_reg, rhs_reg),
         .mul => try code.f64x2Op(.mul, dest_reg, lhs_reg, rhs_reg),
         .div => try code.f64x2Op(.div, dest_reg, lhs_reg, rhs_reg),
+        .eq => try code.fcmeq2d(dest_reg, lhs_reg, rhs_reg),
+        .ne => {
+            try code.fcmeq2d(dest_reg, lhs_reg, rhs_reg);
+            try code.mvn16b(dest_reg, dest_reg);
+        },
+        .gt => try code.fcmgt2d(dest_reg, lhs_reg, rhs_reg),
+        .ge => try code.fcmge2d(dest_reg, lhs_reg, rhs_reg),
+        .lt => try code.fcmgt2d(dest_reg, rhs_reg, lhs_reg),
+        .le => try code.fcmge2d(dest_reg, rhs_reg, lhs_reg),
         .min, .max => unreachable,
     }
 }
@@ -6836,7 +6845,7 @@ test "compile: i64x2 cmp and arithmetic ops emit NEON instructions" {
     try std.testing.expect(found_cmge);
 }
 
-test "compile: f64x2 arithmetic ops emit NEON instructions" {
+test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -6850,6 +6859,12 @@ test "compile: f64x2 arithmetic ops emit NEON instructions" {
     const div = func.newVReg();
     const min = func.newVReg();
     const max = func.newVReg();
+    const eq = func.newVReg();
+    const ne = func.newVReg();
+    const lt = func.newVReg();
+    const gt = func.newVReg();
+    const le = func.newVReg();
+    const ge = func.newVReg();
     const lane = func.newVReg();
     const wrapped = func.newVReg();
 
@@ -6861,8 +6876,14 @@ test "compile: f64x2 arithmetic ops emit NEON instructions" {
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .div, .lhs = mul, .rhs = b } }, .dest = div, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .min, .lhs = div, .rhs = b } }, .dest = min, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .max, .lhs = min, .rhs = b } }, .dest = max, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .eq, .lhs = a, .rhs = b } }, .dest = eq, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .ne, .lhs = eq, .rhs = b } }, .dest = ne, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .lt, .lhs = a, .rhs = b } }, .dest = lt, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .gt, .lhs = b, .rhs = a } }, .dest = gt, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .le, .lhs = a, .rhs = b } }, .dest = le, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .ge, .lhs = b, .rhs = a } }, .dest = ge, .type = .v128 });
     try func.getBlock(bid).append(.{
-        .op = .{ .i64x2_extract_lane = .{ .vector = max, .lane = 0 } },
+        .op = .{ .i64x2_extract_lane = .{ .vector = ge, .lane = 0 } },
         .dest = lane,
         .type = .i64,
     });
@@ -6879,6 +6900,9 @@ test "compile: f64x2 arithmetic ops emit NEON instructions" {
     var found_fmin = false;
     var found_fmax = false;
     var found_fcmeq = false;
+    var found_fcmgt = false;
+    var found_fcmge = false;
+    var found_mvn = false;
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
@@ -6889,6 +6913,9 @@ test "compile: f64x2 arithmetic ops emit NEON instructions" {
         if ((w & 0xFFE0FC00) == 0x4EE0F400) found_fmin = true;
         if ((w & 0xFFE0FC00) == 0x4E60F400) found_fmax = true;
         if ((w & 0xFFE0FC00) == 0x4E60E400) found_fcmeq = true;
+        if ((w & 0xFFE0FC00) == 0x6EE0E400) found_fcmgt = true;
+        if ((w & 0xFFE0FC00) == 0x6E60E400) found_fcmge = true;
+        if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
     }
 
     try std.testing.expect(found_fadd);
@@ -6898,6 +6925,9 @@ test "compile: f64x2 arithmetic ops emit NEON instructions" {
     try std.testing.expect(found_fmin);
     try std.testing.expect(found_fmax);
     try std.testing.expect(found_fcmeq);
+    try std.testing.expect(found_fcmgt);
+    try std.testing.expect(found_fcmge);
+    try std.testing.expect(found_mvn);
 }
 
 test "compile: integer SIMD abs and neg ops emit NEON instructions" {
