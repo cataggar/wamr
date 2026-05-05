@@ -106,6 +106,7 @@ pub const Inst = struct {
         i64x2_splat: VReg,
         i64x2_extract_lane: I64x2ExtractLane,
         i64x2_replace_lane: I64x2ReplaceLane,
+        f64x2_binop: F64x2BinOp,
 
         // Binary arithmetic (dest = lhs op rhs)
         add: BinOp,
@@ -389,6 +390,13 @@ pub const Inst = struct {
         shr_u,
     };
 
+    pub const F64x2Op = enum {
+        add,
+        sub,
+        mul,
+        div,
+    };
+
     pub const V128Mem = struct {
         base: VReg,
         offset: u32,
@@ -474,6 +482,12 @@ pub const Inst = struct {
 
     pub const I64x2BinOp = struct {
         op: I64x2Op,
+        lhs: VReg,
+        rhs: VReg,
+    };
+
+    pub const F64x2BinOp = struct {
+        op: F64x2Op,
         lhs: VReg,
         rhs: VReg,
     };
@@ -973,6 +987,14 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.I64x2Op.gt_s, i64_bin.op.i64x2_binop.op);
     try std.testing.expectEqual(@as(VReg, 23), i64_bin.op.i64x2_binop.lhs);
+
+    const f64_bin = Inst{
+        .op = .{ .f64x2_binop = .{ .op = .div, .lhs = 24, .rhs = 25 } },
+        .dest = 26,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.F64x2Op.div, f64_bin.op.f64x2_binop.op);
+    try std.testing.expectEqual(@as(VReg, 24), f64_bin.op.f64x2_binop.lhs);
 
     const i64_splat = Inst{
         .op = .{ .i64x2_splat = 26 },

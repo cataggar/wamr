@@ -285,6 +285,7 @@ fn opClass(inst: ir.Inst) Class {
         .i64x2_splat,
         .i64x2_extract_lane,
         .i64x2_replace_lane,
+        .f64x2_binop,
         => if (def != null) .alu else .barrier,
 
         .mul => if (def != null and isIntegerType(inst.type)) .mul else .barrier,
@@ -585,6 +586,10 @@ pub fn forEachUse(
             try visit(context, op.rhs);
         },
         .i64x2_binop => |bin| {
+            try visit(context, bin.lhs);
+            try visit(context, bin.rhs);
+        },
+        .f64x2_binop => |bin| {
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },

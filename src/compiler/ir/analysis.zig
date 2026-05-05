@@ -231,6 +231,10 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(bin.lhs, {}) catch {};
             live.put(bin.rhs, {}) catch {};
         },
+        .f64x2_binop => |bin| {
+            live.put(bin.lhs, {}) catch {};
+            live.put(bin.rhs, {}) catch {};
+        },
         .i64x2_unop => |un| live.put(un.vector, {}) catch {},
         .i64x2_extend_i32x4 => |op| live.put(op.vector, {}) catch {},
         .i64x2_extmul_i32x4 => |op| {
@@ -631,6 +635,10 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(op.rhs, pos) catch {};
         },
         .i64x2_binop => |bin| {
+            last_use.put(bin.lhs, pos) catch {};
+            last_use.put(bin.rhs, pos) catch {};
+        },
+        .f64x2_binop => |bin| {
             last_use.put(bin.lhs, pos) catch {};
             last_use.put(bin.rhs, pos) catch {};
         },

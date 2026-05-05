@@ -874,6 +874,21 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    pub const F64x2Op = enum(u32) {
+        add = 0x4E60D400,
+        sub = 0x4EE0D400,
+        mul = 0x6E60DC00,
+        div = 0x6E60FC00,
+    };
+
+    /// Floating-point 2D binary vector op: FADD/FSUB/FMUL/FDIV.
+    pub fn f64x2Op(self: *CodeBuffer, op: F64x2Op, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// SSHL Vd.2D, Vn.2D, Vm.2D — signed variable shift.
     pub fn sshl2d(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4EE04400 |
@@ -2511,6 +2526,33 @@ test "emit: i64x2 vector ops" {
         defer code.deinit();
         try code.i64x2Op(.cmge, 16, 17, 30);
         try expectWord(0x4EFE3E30, &code);
+    }
+}
+
+test "emit: f64x2 vector arithmetic ops" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f64x2Op(.add, 16, 17, 30);
+        try expectWord(0x4E7ED630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f64x2Op(.sub, 16, 17, 30);
+        try expectWord(0x4EFED630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f64x2Op(.mul, 16, 17, 30);
+        try expectWord(0x6E7EDE30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f64x2Op(.div, 16, 17, 30);
+        try expectWord(0x6E7EFE30, &code);
     }
 }
 
