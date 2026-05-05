@@ -246,7 +246,7 @@ fn opClass(inst: ir.Inst) Class {
         .iconst_32, .iconst_64 => if (def != null) .constant else .barrier,
         .v128_const => if (def != null) .constant else .barrier,
         .v128_load, .v128_load_splat, .v128_load_lane => if (def != null) .load else .barrier,
-        .store, .v128_store => .store,
+        .store, .v128_store, .v128_store_lane => .store,
         .v128_not,
         .v128_any_true,
         .v128_bitwise,
@@ -371,7 +371,7 @@ fn isOrderedMemory(inst: ir.Inst) bool {
 
 fn isOrderedMemoryOp(op: ir.Inst.Op) bool {
     return switch (op) {
-        .load, .store, .v128_load, .v128_load_splat, .v128_load_lane, .v128_store => true,
+        .load, .store, .v128_load, .v128_load_splat, .v128_load_lane, .v128_store, .v128_store_lane => true,
         else => false,
     };
 }
@@ -545,6 +545,10 @@ pub fn forEachUse(
         .v128_store => |st| {
             try visit(context, st.base);
             try visit(context, st.val);
+        },
+        .v128_store_lane => |st| {
+            try visit(context, st.base);
+            try visit(context, st.vector);
         },
         .v128_bitwise => |bin| {
             try visit(context, bin.lhs);

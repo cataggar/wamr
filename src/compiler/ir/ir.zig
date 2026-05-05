@@ -70,6 +70,7 @@ pub const Inst = struct {
         v128_load_splat: V128LoadSplat,
         v128_load_lane: V128LoadLane,
         v128_store: V128Store,
+        v128_store_lane: V128StoreLane,
         v128_not: VReg,
         v128_bitwise: V128Bitwise,
         v128_bitselect: V128Bitselect,
@@ -502,6 +503,21 @@ pub const Inst = struct {
         checked_end: u64 = 0,
     };
 
+    pub const V128StoreLane = struct {
+        width: V128LaneWidth,
+        base: VReg,
+        offset: u32,
+        alignment: u32,
+        vector: VReg,
+        lane: u8,
+        bounds_known: bool = false,
+        checked_end: u64 = 0,
+
+        pub fn accessSize(self: V128StoreLane) u8 {
+            return self.width.accessSize();
+        }
+    };
+
     pub const V128Bitwise = struct {
         op: V128BitwiseOp,
         lhs: VReg,
@@ -882,6 +898,24 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(u32, 12), load_splat.op.v128_load_splat.offset);
     try std.testing.expectEqual(@as(u32, 2), load_splat.op.v128_load_splat.alignment);
     try std.testing.expectEqual(@as(u8, 4), load_splat.op.v128_load_splat.accessSize());
+
+    const store_lane = Inst{
+        .op = .{ .v128_store_lane = .{
+            .width = .i16,
+            .base = 9,
+            .offset = 14,
+            .alignment = 1,
+            .vector = 10,
+            .lane = 7,
+        } },
+        .type = .void,
+    };
+    try std.testing.expectEqual(Inst.V128LaneWidth.i16, store_lane.op.v128_store_lane.width);
+    try std.testing.expectEqual(@as(VReg, 9), store_lane.op.v128_store_lane.base);
+    try std.testing.expectEqual(@as(VReg, 10), store_lane.op.v128_store_lane.vector);
+    try std.testing.expectEqual(@as(u8, 7), store_lane.op.v128_store_lane.lane);
+    try std.testing.expectEqual(@as(u8, 2), store_lane.op.v128_store_lane.accessSize());
+    try std.testing.expectEqual(@as(u8, 8), Inst.V128LaneWidth.i16.laneCount());
 
     const c = Inst{ .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF }, .dest = 1, .type = .v128 };
     try std.testing.expectEqual(IrType.v128, c.type);

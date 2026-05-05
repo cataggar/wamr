@@ -302,6 +302,10 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(st.base);
             list.append(st.val);
         },
+        .v128_store_lane => |st| {
+            list.append(st.base);
+            list.append(st.vector);
+        },
         .br_if => |bi| list.append(bi.cond),
         .br_table => |bt| list.append(bt.index),
         .ret => |maybe_vreg| if (maybe_vreg) |v| list.append(v),
@@ -688,6 +692,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .v128_store => |*st| {
             if (st.base == old) st.base = new;
             if (st.val == old) st.val = new;
+        },
+        .v128_store_lane => |*st| {
+            if (st.base == old) st.base = new;
+            if (st.vector == old) st.vector = new;
         },
         .br_if => |*bi| if (bi.cond == old) {
             bi.cond = new;
@@ -1621,6 +1629,7 @@ fn hasSideEffect(inst: ir.Inst) bool {
     return switch (inst.op) {
         .store,
         .v128_store,
+        .v128_store_lane,
         .local_set,
         .global_set,
         .call,
@@ -3706,6 +3715,10 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .v128_store => |*st| {
             st.base += offset;
             st.val += offset;
+        },
+        .v128_store_lane => |*st| {
+            st.base += offset;
+            st.vector += offset;
         },
         .br_if => |*bi| bi.cond += offset,
         .br_table => |*bt| bt.index += offset,

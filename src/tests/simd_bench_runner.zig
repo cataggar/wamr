@@ -684,6 +684,26 @@ const cases = [_]BenchCase{
         .build = buildSimdLoad64Lane1Module,
     },
     .{
+        .name = "simd_v128_store8_lane5",
+        .simd = true,
+        .build = buildSimdStore8Lane5Module,
+    },
+    .{
+        .name = "simd_v128_store16_lane2",
+        .simd = true,
+        .build = buildSimdStore16Lane2Module,
+    },
+    .{
+        .name = "simd_v128_store32_lane1",
+        .simd = true,
+        .build = buildSimdStore32Lane1Module,
+    },
+    .{
+        .name = "simd_v128_store64_lane1",
+        .simd = true,
+        .build = buildSimdStore64Lane1Module,
+    },
+    .{
         .name = "scalar_i32_mem_add_4k_loop",
         .simd = false,
         .build = buildScalarI32MemoryAdd4kLoopModule,
@@ -2532,6 +2552,71 @@ fn buildSimdLoad64Lane1Module(allocator: Allocator) ![]u8 {
     });
 }
 
+fn buildSimdStore8Lane5Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendV128ConstI8x16(&instr, allocator, .{ 1, 2, 3, 4, 5, 122, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 });
+    try appendSimdMemLaneOpcode(&instr, allocator, 0x58, 0, 3, 5);
+    try appendI32Const(&instr, allocator, 3);
+    try appendScalarMemOpcode(&instr, allocator, 0x2D, 0, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = &.{},
+    });
+}
+
+fn buildSimdStore16Lane2Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendV128ConstI16x8(&instr, allocator, .{ 1, 2, 0x1234, 4, 5, 6, 7, 8 });
+    try appendSimdMemLaneOpcode(&instr, allocator, 0x59, 1, 4, 2);
+    try appendI32Const(&instr, allocator, 4);
+    try appendScalarMemOpcode(&instr, allocator, 0x2F, 1, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = &.{},
+    });
+}
+
+fn buildSimdStore32Lane1Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendV128ConstI32x4(&instr, allocator, .{ 1, 0x0102_0304, 3, 4 });
+    try appendSimdMemLaneOpcode(&instr, allocator, 0x5A, 2, 8, 1);
+    try appendI32Const(&instr, allocator, 8);
+    try appendI32Load(&instr, allocator, 2, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = &.{},
+    });
+}
+
+fn buildSimdStore64Lane1Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendI32Const(&instr, allocator, 0);
+    try appendV128ConstI64x2(&instr, allocator, .{ 0, 239 });
+    try appendSimdMemLaneOpcode(&instr, allocator, 0x5B, 3, 16, 1);
+    try appendI32Const(&instr, allocator, 16);
+    try appendScalarMemOpcode(&instr, allocator, 0x29, 3, 0);
+    try appendI32WrapI64(&instr, allocator);
+
+    return buildRunI32Module(allocator, instr.items, .{
+        .memory_min = 1,
+        .data = &.{},
+    });
+}
+
 const memory_loop_lanes: u32 = 1024;
 const memory_loop_bytes: u32 = memory_loop_lanes * @sizeOf(u32);
 const memory_loop_a_base: u32 = 0;
@@ -4290,6 +4375,18 @@ fn appendI32Store(
     offset: u32,
 ) !void {
     try buf.append(allocator, 0x36); // i32.store
+    try encodeULEB128(buf, allocator, alignment);
+    try encodeULEB128(buf, allocator, offset);
+}
+
+fn appendScalarMemOpcode(
+    buf: *std.ArrayList(u8),
+    allocator: Allocator,
+    opcode: u8,
+    alignment: u32,
+    offset: u32,
+) !void {
+    try buf.append(allocator, opcode);
     try encodeULEB128(buf, allocator, alignment);
     try encodeULEB128(buf, allocator, offset);
 }

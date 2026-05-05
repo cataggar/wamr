@@ -654,6 +654,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                     if (!isSupportedV128Def(inst)) return true;
                 },
                 .v128_store,
+                .v128_store_lane,
                 .i32x4_extract_lane,
                 .i8x16_extract_lane,
                 .i16x8_extract_lane,
@@ -1422,6 +1423,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .v128_load_splat,
         .v128_load_lane,
         .v128_store,
+        .v128_store_lane,
         .v128_not,
         .v128_bitwise,
         .v128_bitselect,
@@ -1613,6 +1615,7 @@ fn compileInst(
         .v128_load_splat => |ld| try emitV128LoadSplat(code, inst, ld, reg_map, v128_map, v128_cache),
         .v128_load_lane => |ld| try emitV128LoadLane(code, inst, ld, reg_map, v128_map, v128_cache, fctx),
         .v128_store => |st| try emitV128Store(code, st, reg_map, v128_map, v128_cache),
+        .v128_store_lane => |st| try emitV128StoreLane(code, st, reg_map, v128_map, v128_cache),
         .v128_not => |src| try emitV128Not(code, inst, src, v128_map, v128_cache, fctx),
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
         .v128_bitselect => |sel| try emitV128Bitselect(code, inst, sel, v128_map, v128_cache, fctx),
@@ -2094,6 +2097,30 @@ fn emitV128Store(
         try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
     }
     try code.strQ(val_reg, RegMap.tmp0);
+}
+
+fn emitV128StoreLane(
+    code: *emit.CodeBuffer,
+    st: ir.Inst.V128StoreLane,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    if (st.lane >= st.width.laneCount()) return error.InvalidSimdLane;
+
+    const vector_reg = try v128_cache.ensure(code, v128_map, st.vector, null);
+    const end_offset: u64 = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + st.accessSize();
+    if (st.bounds_known) {
+        try emitMemAddrSkipBounds(code, reg_map, st.base, st.offset);
+    } else {
+        try emitMemAddr(code, reg_map, st.base, st.offset, end_offset);
+    }
+    switch (st.width) {
+        .i8 => try code.st1LaneB(vector_reg, @intCast(st.lane), RegMap.tmp0),
+        .i16 => try code.st1LaneH(vector_reg, @intCast(st.lane), RegMap.tmp0),
+        .i32 => try code.st1LaneS(vector_reg, @intCast(st.lane), RegMap.tmp0),
+        .i64 => try code.st1LaneD(vector_reg, @intCast(st.lane), RegMap.tmp0),
+    }
 }
 
 fn emitV128Not(
@@ -8316,6 +8343,86 @@ test "v128.loadN_lane emits checked LD1 lane loads and preserves live vector" {
     try std.testing.expect(found_blr);
     try std.testing.expect(found_brk);
     try std.testing.expect(found_orr_copy);
+}
+
+test "v128.storeN_lane emits checked ST1 lane stores" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const addr = func.newVReg();
+    const vector = func.newVReg();
+    const result = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = addr, .type = .i32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_const = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .dest = vector,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_store_lane = .{ .width = .i8, .base = addr, .offset = 3, .alignment = 0, .vector = vector, .lane = 5 } },
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_store_lane = .{ .width = .i16, .base = addr, .offset = 4, .alignment = 1, .vector = vector, .lane = 2 } },
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_store_lane = .{ .width = .i32, .base = addr, .offset = 8, .alignment = 2, .vector = vector, .lane = 1 } },
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .v128_store_lane = .{ .width = .i64, .base = addr, .offset = 16, .alignment = 3, .vector = vector, .lane = 1 } },
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = result, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = result } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_st1_b = false;
+    var found_st1_h = false;
+    var found_st1_s = false;
+    var found_st1_d = false;
+    var found_bls = false;
+    var found_blr = false;
+    var found_brk = false;
+    var first_st1_pos: ?usize = null;
+    var first_bls_pos: ?usize = null;
+    var first_blr_pos: ?usize = null;
+    var first_brk_pos: ?usize = null;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        const is_st1_b = (w & 0xFFFFFC00) == 0x0D001400;
+        const is_st1_h = (w & 0xFFFFFC00) == 0x0D005000;
+        const is_st1_s = (w & 0xFFFFFC00) == 0x0D009000;
+        const is_st1_d = (w & 0xFFFFFC00) == 0x4D008400;
+        if (is_st1_b) found_st1_b = true;
+        if (is_st1_h) found_st1_h = true;
+        if (is_st1_s) found_st1_s = true;
+        if (is_st1_d) found_st1_d = true;
+        if ((is_st1_b or is_st1_h or is_st1_s or is_st1_d) and first_st1_pos == null) first_st1_pos = i;
+        if ((w & 0xFF000010) == 0x54000000 and (w & 0xF) == 0x9) {
+            found_bls = true;
+            if (first_bls_pos == null) first_bls_pos = i;
+        }
+        if ((w & 0xFFFFFC1F) == 0xD63F0000) {
+            found_blr = true;
+            if (first_blr_pos == null) first_blr_pos = i;
+        }
+        if ((w & 0xFFE0001F) == 0xD4200000) {
+            found_brk = true;
+            if (first_brk_pos == null) first_brk_pos = i;
+        }
+    }
+    try std.testing.expect(found_st1_b);
+    try std.testing.expect(found_st1_h);
+    try std.testing.expect(found_st1_s);
+    try std.testing.expect(found_st1_d);
+    try std.testing.expect(found_bls);
+    try std.testing.expect(found_blr);
+    try std.testing.expect(found_brk);
+    try std.testing.expect(first_bls_pos.? < first_st1_pos.?);
+    try std.testing.expect(first_blr_pos.? < first_st1_pos.?);
+    try std.testing.expect(first_brk_pos.? < first_st1_pos.?);
 }
 
 test "store: size 1 emits STRB" {
