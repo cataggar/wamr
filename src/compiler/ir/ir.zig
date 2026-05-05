@@ -85,6 +85,7 @@ pub const Inst = struct {
         i32x4_dot_i16x8_s: BinOp,
         i32x4_extend_i16x8: SimdExtendHalf,
         i32x4_extmul_i16x8: SimdExtMul,
+        f32x4_binop: F32x4BinOp,
         f32x4_convert_i32x4: SimdIntToFloatConvert,
         i32x4_shift: I32x4Shift,
         i32x4_splat: VReg,
@@ -420,6 +421,13 @@ pub const Inst = struct {
         ge,
     };
 
+    pub const F32x4Op = enum {
+        add,
+        sub,
+        mul,
+        div,
+    };
+
     pub const V128Mem = struct {
         base: VReg,
         offset: u32,
@@ -663,6 +671,12 @@ pub const Inst = struct {
 
     pub const I64x2BinOp = struct {
         op: I64x2Op,
+        lhs: VReg,
+        rhs: VReg,
+    };
+
+    pub const F32x4BinOp = struct {
+        op: F32x4Op,
         lhs: VReg,
         rhs: VReg,
     };
@@ -1194,15 +1208,24 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.SimdIntToFloatSign.unsigned, f32_convert.op.f32x4_convert_i32x4.sign);
     try std.testing.expectEqual(@as(VReg, 26), f32_convert.op.f32x4_convert_i32x4.vector);
 
-    const i16_extmul = Inst{
-        .op = .{ .i16x8_extmul_i8x16 = .{ .sign = .signed, .half = .high, .lhs = 27, .rhs = 28 } },
+    const f32_bin = Inst{
+        .op = .{ .f32x4_binop = .{ .op = .div, .lhs = 27, .rhs = 28 } },
         .dest = 29,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.F32x4Op.div, f32_bin.op.f32x4_binop.op);
+    try std.testing.expectEqual(@as(VReg, 27), f32_bin.op.f32x4_binop.lhs);
+    try std.testing.expectEqual(@as(VReg, 28), f32_bin.op.f32x4_binop.rhs);
+
+    const i16_extmul = Inst{
+        .op = .{ .i16x8_extmul_i8x16 = .{ .sign = .signed, .half = .high, .lhs = 30, .rhs = 31 } },
+        .dest = 32,
         .type = .v128,
     };
     try std.testing.expectEqual(Inst.SimdExtendSign.signed, i16_extmul.op.i16x8_extmul_i8x16.sign);
     try std.testing.expectEqual(Inst.SimdExtendHalfSelect.high, i16_extmul.op.i16x8_extmul_i8x16.half);
-    try std.testing.expectEqual(@as(VReg, 27), i16_extmul.op.i16x8_extmul_i8x16.lhs);
-    try std.testing.expectEqual(@as(VReg, 28), i16_extmul.op.i16x8_extmul_i8x16.rhs);
+    try std.testing.expectEqual(@as(VReg, 30), i16_extmul.op.i16x8_extmul_i8x16.lhs);
+    try std.testing.expectEqual(@as(VReg, 31), i16_extmul.op.i16x8_extmul_i8x16.rhs);
 
     const i32_extmul = Inst{
         .op = .{ .i32x4_extmul_i16x8 = .{ .sign = .unsigned, .half = .low, .lhs = 30, .rhs = 31 } },

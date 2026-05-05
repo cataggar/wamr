@@ -314,6 +314,26 @@ const cases = [_]BenchCase{
         .build = buildSimdF32x4ConvertI32x4ULane0Module,
     },
     .{
+        .name = "simd_f32x4_add_lane0",
+        .simd = true,
+        .build = buildSimdF32x4AddLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_sub_lane0",
+        .simd = true,
+        .build = buildSimdF32x4SubLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_mul_lane0",
+        .simd = true,
+        .build = buildSimdF32x4MulLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_div_lane0",
+        .simd = true,
+        .build = buildSimdF32x4DivLane0Module,
+    },
+    .{
         .name = "simd_f64x2_convert_low_i32x4_s_lane0_high",
         .simd = true,
         .build = buildSimdF64x2ConvertLowI32x4SLane0HighModule,
@@ -1711,6 +1731,37 @@ fn buildSimdF32x4ConvertI32x4SLane0Module(allocator: Allocator) ![]u8 {
 
 fn buildSimdF32x4ConvertI32x4ULane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4ConvertI32x4Lane0Module(allocator, 0xFB);
+}
+
+const f32x4_arith_lhs_bits: [4]u32 = .{ 0x4140_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 };
+const f32x4_arith_rhs_bits: [4]u32 = .{ 0x4080_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 };
+
+fn buildSimdF32x4BinLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstF32x4Bits(&instr, allocator, f32x4_arith_lhs_bits);
+    try appendV128ConstF32x4Bits(&instr, allocator, f32x4_arith_rhs_bits);
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdF32x4AddLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4BinLane0Module(allocator, 0xE4);
+}
+
+fn buildSimdF32x4SubLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4BinLane0Module(allocator, 0xE5);
+}
+
+fn buildSimdF32x4MulLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4BinLane0Module(allocator, 0xE6);
+}
+
+fn buildSimdF32x4DivLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4BinLane0Module(allocator, 0xE7);
 }
 
 fn buildSimdF64x2ConvertLowI32x4Lane0HighModule(allocator: Allocator, simd_opcode: u32) ![]u8 {
@@ -4410,6 +4461,14 @@ fn appendV128ConstI32x4(buf: *std.ArrayList(u8), allocator: Allocator, lanes: [4
     try appendSimdOpcode(buf, allocator, 0x0C); // v128.const
     for (lanes) |lane| {
         var le = std.mem.nativeToLittle(u32, @bitCast(lane));
+        try buf.appendSlice(allocator, std.mem.asBytes(&le));
+    }
+}
+
+fn appendV128ConstF32x4Bits(buf: *std.ArrayList(u8), allocator: Allocator, lanes: [4]u32) !void {
+    try appendSimdOpcode(buf, allocator, 0x0C); // v128.const
+    for (lanes) |lane| {
+        var le = std.mem.nativeToLittle(u32, lane);
         try buf.appendSlice(allocator, std.mem.asBytes(&le));
     }
 }

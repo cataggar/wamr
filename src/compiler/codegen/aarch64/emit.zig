@@ -1083,6 +1083,21 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    pub const F32x4Op = enum(u32) {
+        add = 0x4E20D400,
+        sub = 0x4EA0D400,
+        mul = 0x6E20DC00,
+        div = 0x6E20FC00,
+    };
+
+    /// Floating-point 4S binary vector op: FADD/FSUB/FMUL/FDIV.
+    pub fn f32x4Op(self: *CodeBuffer, op: F32x4Op, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     pub const F64x2Op = enum(u32) {
         add = 0x4E60D400,
         sub = 0x4EE0D400,
@@ -3033,6 +3048,33 @@ test "emit: i64x2 vector ops" {
         defer code.deinit();
         try code.i64x2Op(.cmge, 16, 17, 30);
         try expectWord(0x4EFE3E30, &code);
+    }
+}
+
+test "emit: f32x4 vector arithmetic ops" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f32x4Op(.add, 16, 17, 30);
+        try expectWord(0x4E3ED630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f32x4Op(.sub, 16, 17, 30);
+        try expectWord(0x4EBED630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f32x4Op(.mul, 16, 17, 30);
+        try expectWord(0x6E3EDE30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.f32x4Op(.div, 16, 17, 30);
+        try expectWord(0x6E3EFE30, &code);
     }
 }
 
