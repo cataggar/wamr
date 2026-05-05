@@ -256,6 +256,7 @@ fn opClass(inst: ir.Inst) Class {
         .i32x4_binop,
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
+        .i32x4_dot_i16x8_s,
         .i32x4_extend_i16x8,
         .f32x4_convert_i32x4,
         .i32x4_extmul_i16x8,
@@ -569,6 +570,10 @@ pub fn forEachUse(
         },
         .i32x4_unop => |un| try visit(context, un.vector),
         .i32x4_extadd_pairwise_i16x8 => |op| try visit(context, op.vector),
+        .i32x4_dot_i16x8_s => |bin| {
+            try visit(context, bin.lhs);
+            try visit(context, bin.rhs);
+        },
         .i32x4_extend_i16x8 => |op| try visit(context, op.vector),
         .f32x4_convert_i32x4 => |op| try visit(context, op.vector),
         .i32x4_extmul_i16x8 => |op| {

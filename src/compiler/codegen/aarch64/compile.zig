@@ -564,6 +564,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i32x4_unop,
         .f32x4_convert_i32x4,
         .i32x4_extadd_pairwise_i16x8,
+        .i32x4_dot_i16x8_s,
         .i32x4_extend_i16x8,
         .i32x4_extmul_i16x8,
         .i32x4_shift,
@@ -623,6 +624,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i32x4_unop,
                 .f32x4_convert_i32x4,
                 .i32x4_extadd_pairwise_i16x8,
+                .i32x4_dot_i16x8_s,
                 .i32x4_extend_i16x8,
                 .i32x4_extmul_i16x8,
                 .i32x4_shift,
@@ -1440,6 +1442,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i32x4_unop,
         .f32x4_convert_i32x4,
         .i32x4_extadd_pairwise_i16x8,
+        .i32x4_dot_i16x8_s,
         .i32x4_extend_i16x8,
         .i32x4_extmul_i16x8,
         .i32x4_shift,
@@ -1634,6 +1637,7 @@ fn compileInst(
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_extadd_pairwise_i16x8 => |op| try emitI32x4ExtAddPairwiseI16x8(code, inst, op, v128_map, v128_cache, fctx),
+        .i32x4_dot_i16x8_s => |bin| try emitI32x4DotI16x8S(code, inst, bin, v128_map, v128_cache),
         .i32x4_extend_i16x8 => |op| try emitI32x4ExtendI16x8(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_extmul_i16x8 => |op| try emitI32x4ExtMulI16x8(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_shift => |shift| try emitI32x4Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
@@ -2638,6 +2642,27 @@ fn emitI32x4ExtMulI16x8(
             .unsigned => try code.umull2_4s8h(dest_reg, lhs_reg, rhs_reg),
         },
     }
+}
+
+fn emitI32x4DotI16x8S(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.BinOp,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const lhs_reg = try v128_cache.ensure(code, v128_map, op.lhs, null);
+    const rhs_reg = if (op.rhs == op.lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, op.rhs, lhs_reg);
+
+    try code.smull4s4h(v128_tmp0, lhs_reg, rhs_reg);
+    try code.smull2_4s8h(v128_tmp1, lhs_reg, rhs_reg);
+
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    try code.addp4s(dest_reg, v128_tmp0, v128_tmp1);
 }
 
 fn emitI64x2ExtMulI32x4(
@@ -7834,6 +7859,52 @@ test "compile: integer SIMD widening multiply low/high ops emit NEON instruction
         .{ .mask = 0xFFE0FC00, .base = 0x2EA0C000, .name = "umull2d2s" },
         .{ .mask = 0xFFE0FC00, .base = 0x4EA0C000, .name = "smull2_2d4s" },
         .{ .mask = 0xFFE0FC00, .base = 0x6EA0C000, .name = "umull2_2d4s" },
+    };
+
+    inline for (expected) |e| {
+        var found = false;
+        var i: usize = 0;
+        while (i + 4 <= code.len) : (i += 4) {
+            const w = std.mem.readInt(u32, code[i..][0..4], .little);
+            if ((w & e.mask) == e.base) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("missing NEON op {s} (base 0x{X})\n", .{ e.name, e.base });
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "compile: i32x4.dot_i16x8_s emits SMULL, SMULL2, ADDP" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const lhs = func.newVReg();
+    const rhs = func.newVReg();
+    const dot = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0006_0005_0004_0003_FFFE_FFFD_0002_0001 }, .dest = lhs, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x000E_000D_FFF8_0007_0006_0005_0004_0003 }, .dest = rhs, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_dot_i16x8_s = .{ .lhs = lhs, .rhs = rhs } }, .dest = dot, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = dot, .lane = 3 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    const expected = [_]struct { mask: u32, base: u32, name: []const u8 }{
+        .{ .mask = 0xFFE0FC00, .base = 0x0E60C000, .name = "smull4s4h" },
+        .{ .mask = 0xFFE0FC00, .base = 0x4E60C000, .name = "smull2_4s8h" },
+        .{ .mask = 0xFFE0FC00, .base = 0x4EA0BC00, .name = "addp4s" },
     };
 
     inline for (expected) |e| {

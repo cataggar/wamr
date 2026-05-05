@@ -2339,6 +2339,20 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i32x4_dot_i16x8_s => {
+                        const rhs = safePop(&vreg_stack);
+                        const lhs = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_dot_i16x8_s = .{
+                                .lhs = lhs,
+                                .rhs = rhs,
+                            } },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i32x4_add,
                     .i32x4_sub,
                     .i32x4_eq,
@@ -5198,6 +5212,75 @@ test "lower integer SIMD pairwise extended add opcodes" {
     const extract_idx = 1 + cases.len;
     try std.testing.expectEqual(@as(u2, 0), insts[extract_idx].op.i32x4_extract_lane.lane);
     try std.testing.expect(insts[extract_idx + 1].op.ret != null);
+}
+
+test "lower i32x4.dot_i16x8_s opcode" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try appendSimd(&code, allocator, 0x0C); // v128.const
+    for ([_]u8{ 1, 0, 0xFE, 0xFF } ** 4) |byte| {
+        try code.append(allocator, byte);
+    }
+    try appendSimd(&code, allocator, 0x0C); // v128.const
+    for ([_]u8{ 3, 0, 4, 0 } ** 4) |byte| {
+        try code.append(allocator, byte);
+    }
+    try appendSimd(&code, allocator, 0xBA); // i32x4.dot_i16x8_s
+    try appendSimd(&code, allocator, 0x1B); // i32x4.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 5), insts.len);
+    const lhs = insts[0].dest.?;
+    const rhs = insts[1].dest.?;
+    try std.testing.expectEqual(lhs, insts[2].op.i32x4_dot_i16x8_s.lhs);
+    try std.testing.expectEqual(rhs, insts[2].op.i32x4_dot_i16x8_s.rhs);
+    try std.testing.expectEqual(ir.IrType.v128, insts[2].type);
+    try std.testing.expectEqual(insts[2].dest.?, insts[3].op.i32x4_extract_lane.vector);
+    try std.testing.expectEqual(@as(u2, 0), insts[3].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[4].op.ret != null);
 }
 
 test "lower integer SIMD widening extend low/high opcodes" {
