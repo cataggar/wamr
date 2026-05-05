@@ -1028,6 +1028,70 @@ test "differential SIMD: i8x16.swizzle zeroes out-of-range indices" {
     try expectSimdDiffI32(wasm, "f", 0);
 }
 
+fn appendI8x16AvgrUExtractLane(
+    body: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    lhs: [16]u8,
+    rhs: [16]u8,
+    lane: u8,
+) !void {
+    try appendV128ConstI8x16(body, allocator, lhs);
+    try appendV128ConstI8x16(body, allocator, rhs);
+    try appendSimdOpcode(body, allocator, 0x7B);
+    try appendI8x16ExtractLaneU(body, allocator, lane);
+}
+
+test "differential SIMD: i8x16.avgr_u is unsigned rounded byte-wise non-saturating" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+
+    const lhs = [16]u8{ 0xFF, 0xFF, 0x80, 250, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const rhs = [16]u8{ 1, 0, 0x7F, 250, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const lanes = [_]u8{ 0, 2, 3, 4 };
+    for (lanes, 0..) |lane, idx| {
+        try appendI8x16AvgrUExtractLane(&body, testing.allocator, lhs, rhs, lane);
+        if (idx != 0) try body.append(testing.allocator, 0x6A);
+    }
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 512);
+}
+
+fn appendI16x8AvgrUExtractLane(
+    body: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    lhs: [8]u16,
+    rhs: [8]u16,
+    lane: u8,
+) !void {
+    try appendV128ConstI16x8(body, allocator, lhs);
+    try appendV128ConstI16x8(body, allocator, rhs);
+    try appendSimdOpcode(body, allocator, 0x9B);
+    try appendI16x8ExtractLaneU(body, allocator, lane);
+}
+
+test "differential SIMD: i16x8.avgr_u is unsigned rounded halfword-wise non-saturating" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+
+    const lhs = [8]u16{ 0xFFFF, 0xFFFF, 0x8000, 65000, 5, 0, 0, 0 };
+    const rhs = [8]u16{ 1, 0, 0x7FFF, 65000, 6, 0, 0, 0 };
+    const lanes = [_]u8{ 0, 2, 3, 4 };
+    for (lanes, 0..) |lane, idx| {
+        try appendI16x8AvgrUExtractLane(&body, testing.allocator, lhs, rhs, lane);
+        if (idx != 0) try body.append(testing.allocator, 0x6A);
+    }
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 130_542);
+}
+
 test "differential SIMD: v128 bitwise xor extracts lane 0" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
