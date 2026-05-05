@@ -1419,6 +1419,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .v128_not,
         .v128_bitwise,
         .v128_bitselect,
+        .v128_any_true,
         .i32x4_binop,
         .i32x4_unop,
         .f32x4_convert_i32x4,
@@ -1605,6 +1606,7 @@ fn compileInst(
         .v128_not => |src| try emitV128Not(code, inst, src, v128_map, v128_cache, fctx),
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
         .v128_bitselect => |sel| try emitV128Bitselect(code, inst, sel, v128_map, v128_cache, fctx),
+        .v128_any_true => |src| try emitV128AnyTrue(code, inst, src, reg_map, v128_map, v128_cache),
         .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
@@ -2099,6 +2101,24 @@ fn emitV128Bitselect(
         try v128_cache.ensure(code, v128_map, sel.b, dest_reg);
 
     try code.bsl16b(dest_reg, a_reg, b_reg);
+}
+
+fn emitV128AnyTrue(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+    const src_reg = try v128_cache.ensure(code, v128_map, src, null);
+    try code.umaxvB16b(v128_tmp0, src_reg);
+    try code.umovWFromB(info.reg, v128_tmp0, 0);
+    try code.cmpImm32(info.reg, 0);
+    try code.cset32(info.reg, .ne);
+    try destCommit(code, reg_map, info);
 }
 
 fn emitI32x4UnOp(
@@ -6281,6 +6301,33 @@ test "compile: v128 bitselect emits BSL and preserves live mask" {
         if ((w & 0xFFE0FC00) == 0x6E601C00) found_bsl = true;
     }
     try std.testing.expect(found_bsl);
+}
+
+test "compile: v128 any_true emits UMAXV and scalar bool" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const vector = func.newVReg();
+    const any = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0000_0000_0000_0000_0000_0000_0001 }, .dest = vector, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_any_true = vector }, .dest = any, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = any } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_umaxv = false;
+    var found_cset = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x6E30A800) found_umaxv = true;
+        if ((w & 0xFFFFFFE0) == 0x1A9F07E0) found_cset = true;
+    }
+    try std.testing.expect(found_umaxv);
+    try std.testing.expect(found_cset);
 }
 
 test "compile: i32x4 lane ops emit NEON instructions" {

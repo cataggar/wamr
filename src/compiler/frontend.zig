@@ -1715,6 +1715,16 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .v128_any_true => {
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .v128_any_true = vector },
+                            .dest = dest,
+                            .type = .i32,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .v128_const => {
                         const val = try readV128(code, &ip);
                         const dest = ir_func.newVReg();
@@ -3489,6 +3499,44 @@ test "lower v128.bitselect pops mask b a" {
     try std.testing.expectEqual(ir.IrType.v128, insts[3].type);
     try std.testing.expectEqual(@as(u2, 0), insts[4].op.i32x4_extract_lane.lane);
     try std.testing.expect(insts[5].op.ret != null);
+}
+
+test "lower v128.any_true produces i32" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const code = [_]u8{
+        0xFD, 0x0C, // v128.const
+        0x00, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0xFD, 0x53, // v128.any_true
+        0x0B,
+    };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &code,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 3), insts.len);
+    try std.testing.expectEqual(insts[0].dest.?, insts[1].op.v128_any_true);
+    try std.testing.expectEqual(ir.IrType.i32, insts[1].type);
+    try std.testing.expect(insts[2].op.ret != null);
 }
 
 test "lower i8x16.shuffle parses lane immediates and operands" {

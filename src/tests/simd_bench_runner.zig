@@ -59,6 +59,11 @@ const cases = [_]BenchCase{
         .build = buildSimdV128BitselectLane0Module,
     },
     .{
+        .name = "simd_v128_any_true_mixed",
+        .simd = true,
+        .build = buildSimdV128AnyTrueMixedModule,
+    },
+    .{
         .name = "simd_i8x16_shuffle_lane0",
         .simd = true,
         .build = buildSimdI8x16ShuffleLane0Module,
@@ -992,6 +997,16 @@ fn buildSimdV128BitselectLane0Module(allocator: Allocator) ![]u8 {
     try appendV128ConstI32x4(&instr, allocator, .{ -1, 0, 0, 0 });
     try appendSimdOpcode(&instr, allocator, 0x52); // v128.bitselect
     try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdV128AnyTrueMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ 0, 0, 1, 0 });
+    try appendSimdOpcode(&instr, allocator, 0x53); // v128.any_true
 
     return buildRunI32Module(allocator, instr.items, .{});
 }

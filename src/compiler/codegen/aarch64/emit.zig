@@ -687,6 +687,11 @@ pub const CodeBuffer = struct {
         try self.emit32(0x0E31B800 | (@as(u32, vn) << 5) | vd);
     }
 
+    /// UMAXV Bd, Vn.16B — unsigned maximum across all 16 bytes.
+    pub fn umaxvB16b(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6E30A800 | (@as(u32, vn) << 5) | vd);
+    }
+
     /// LDR Qt, [Xn] — full-width 128-bit vector load.
     pub fn ldrQ(self: *CodeBuffer, vt: u5, rn: Reg) !void {
         try self.emit32(0x3DC00000 | (@as(u32, rn.encoding()) << 5) | vt);
@@ -2213,6 +2218,13 @@ test "emit: ADDV b0, v1.8b" {
     defer code.deinit();
     try code.addvB8b(0, 1);
     try expectWord(0x0E31B820, &code);
+}
+
+test "emit: UMAXV b0, v1.16b" {
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.umaxvB16b(0, 1);
+    try expectWord(0x6E30A820, &code);
 }
 
 test "emit: LDR q0, [x1]" {
