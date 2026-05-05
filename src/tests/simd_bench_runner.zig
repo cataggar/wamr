@@ -64,6 +64,26 @@ const cases = [_]BenchCase{
         .build = buildSimdV128AnyTrueMixedModule,
     },
     .{
+        .name = "simd_i8x16_all_true_mixed",
+        .simd = true,
+        .build = buildSimdI8x16AllTrueMixedModule,
+    },
+    .{
+        .name = "simd_i16x8_all_true_mixed",
+        .simd = true,
+        .build = buildSimdI16x8AllTrueMixedModule,
+    },
+    .{
+        .name = "simd_i32x4_all_true_mixed",
+        .simd = true,
+        .build = buildSimdI32x4AllTrueMixedModule,
+    },
+    .{
+        .name = "simd_i64x2_all_true_mixed",
+        .simd = true,
+        .build = buildSimdI64x2AllTrueMixedModule,
+    },
+    .{
         .name = "simd_i8x16_shuffle_lane0",
         .simd = true,
         .build = buildSimdI8x16ShuffleLane0Module,
@@ -1007,6 +1027,66 @@ fn buildSimdV128AnyTrueMixedModule(allocator: Allocator) ![]u8 {
 
     try appendV128ConstI32x4(&instr, allocator, .{ 0, 0, 1, 0 });
     try appendSimdOpcode(&instr, allocator, 0x53); // v128.any_true
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn appendAllTrueScoreTrue(buf: *std.ArrayList(u8), allocator: Allocator, opcode: u32) !void {
+    try appendSimdOpcode(buf, allocator, opcode);
+    try buf.append(allocator, 0x41); // i32.const
+    try encodeSLEB128(buf, allocator, 2);
+    try buf.append(allocator, 0x6C); // i32.mul
+}
+
+fn appendAllTrueScoreFalse(buf: *std.ArrayList(u8), allocator: Allocator, opcode: u32) !void {
+    try appendSimdOpcode(buf, allocator, opcode);
+    try buf.append(allocator, 0x6A); // i32.add
+}
+
+fn buildSimdI8x16AllTrueMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI8x16(&instr, allocator, .{ 1, 2, 3, 4, 5, 6, 7, 8, 0x80, 0xFF, 11, 12, 13, 14, 15, 16 });
+    try appendAllTrueScoreTrue(&instr, allocator, 0x63); // i8x16.all_true
+    try appendV128ConstI8x16(&instr, allocator, .{ 1, 2, 3, 4, 5, 0, 7, 8, 0x80, 0xFF, 11, 12, 13, 14, 15, 16 });
+    try appendAllTrueScoreFalse(&instr, allocator, 0x63); // i8x16.all_true
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI16x8AllTrueMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI16x8(&instr, allocator, .{ 1, 2, 0x8000, 0xFFFF, 5, 6, 7, 8 });
+    try appendAllTrueScoreTrue(&instr, allocator, 0x83); // i16x8.all_true
+    try appendV128ConstI16x8(&instr, allocator, .{ 1, 2, 0x8000, 0, 5, 6, 7, 8 });
+    try appendAllTrueScoreFalse(&instr, allocator, 0x83); // i16x8.all_true
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4AllTrueMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI32x4(&instr, allocator, .{ 1, -1, std.math.minInt(i32), 42 });
+    try appendAllTrueScoreTrue(&instr, allocator, 0xA3); // i32x4.all_true
+    try appendV128ConstI32x4(&instr, allocator, .{ 1, -1, 0, 42 });
+    try appendAllTrueScoreFalse(&instr, allocator, 0xA3); // i32x4.all_true
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI64x2AllTrueMixedModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI64x2(&instr, allocator, .{ 1, 0x8000_0000_0000_0000 });
+    try appendAllTrueScoreTrue(&instr, allocator, 0xC3); // i64x2.all_true
+    try appendV128ConstI64x2(&instr, allocator, .{ 1, 0 });
+    try appendAllTrueScoreFalse(&instr, allocator, 0xC3); // i64x2.all_true
 
     return buildRunI32Module(allocator, instr.items, .{});
 }

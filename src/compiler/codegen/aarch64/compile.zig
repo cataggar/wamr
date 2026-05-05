@@ -1420,6 +1420,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .v128_bitwise,
         .v128_bitselect,
         .v128_any_true,
+        .simd_all_true,
         .i32x4_binop,
         .i32x4_unop,
         .f32x4_convert_i32x4,
@@ -1607,6 +1608,7 @@ fn compileInst(
         .v128_bitwise => |bin| try emitV128Bitwise(code, inst, bin, v128_map, v128_cache, fctx),
         .v128_bitselect => |sel| try emitV128Bitselect(code, inst, sel, v128_map, v128_cache, fctx),
         .v128_any_true => |src| try emitV128AnyTrue(code, inst, src, reg_map, v128_map, v128_cache),
+        .simd_all_true => |op| try emitSimdAllTrue(code, inst, op, reg_map, v128_map, v128_cache),
         .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
@@ -2118,6 +2120,49 @@ fn emitV128AnyTrue(
     try code.umovWFromB(info.reg, v128_tmp0, 0);
     try code.cmpImm32(info.reg, 0);
     try code.cset32(info.reg, .ne);
+    try destCommit(code, reg_map, info);
+}
+
+fn emitSimdAllTrue(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdAllTrue,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const info = try destBegin(reg_map, dest, RegMap.tmp2);
+    const src_reg = try v128_cache.ensure(code, v128_map, op.vector, null);
+    switch (op.width) {
+        .i8x16 => {
+            try code.uminvB16b(v128_tmp0, src_reg);
+            try code.umovWFromB(info.reg, v128_tmp0, 0);
+            try code.cmpImm32(info.reg, 0);
+            try code.cset32(info.reg, .ne);
+        },
+        .i16x8 => {
+            try code.uminvH8h(v128_tmp0, src_reg);
+            try code.umovWFromH(info.reg, v128_tmp0, 0);
+            try code.cmpImm32(info.reg, 0);
+            try code.cset32(info.reg, .ne);
+        },
+        .i32x4 => {
+            try code.uminvS4s(v128_tmp0, src_reg);
+            try code.umovWFromS(info.reg, v128_tmp0, 0);
+            try code.cmpImm32(info.reg, 0);
+            try code.cset32(info.reg, .ne);
+        },
+        .i64x2 => {
+            try code.umovXFromD(RegMap.tmp0, src_reg, 0);
+            try code.umovXFromD(RegMap.tmp1, src_reg, 1);
+            try code.cmpImm(RegMap.tmp0, 0);
+            try code.cset32(RegMap.tmp0, .ne);
+            try code.cmpImm(RegMap.tmp1, 0);
+            try code.cset32(RegMap.tmp1, .ne);
+            try code.andRegReg(info.reg, RegMap.tmp0, RegMap.tmp1);
+        },
+    }
     try destCommit(code, reg_map, info);
 }
 
@@ -6328,6 +6373,64 @@ test "compile: v128 any_true emits UMAXV and scalar bool" {
     }
     try std.testing.expect(found_umaxv);
     try std.testing.expect(found_cset);
+}
+
+test "compile: SIMD all_true emits reductions and scalar bools" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const v8 = func.newVReg();
+    const v16 = func.newVReg();
+    const v32 = func.newVReg();
+    const v64 = func.newVReg();
+    const all8 = func.newVReg();
+    const all16 = func.newVReg();
+    const all32 = func.newVReg();
+    const all64 = func.newVReg();
+    const sum0 = func.newVReg();
+    const sum1 = func.newVReg();
+    const sum2 = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x1011_1213_1415_1617_1819_1A1B_1C1D_1E1F }, .dest = v8, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_all_true = .{ .width = .i8x16, .vector = v8 } }, .dest = all8, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0001_0002_0003_0004_0005_0006_0007_0008 }, .dest = v16, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_all_true = .{ .width = .i16x8, .vector = v16 } }, .dest = all16, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0001_FFFF_FFFF_8000_0000_0000_002A }, .dest = v32, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_all_true = .{ .width = .i32x4, .vector = v32 } }, .dest = all32, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x8000_0000_0000_0000_0000_0000_0000_0001 }, .dest = v64, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .simd_all_true = .{ .width = .i64x2, .vector = v64 } }, .dest = all64, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = all8, .rhs = all16 } }, .dest = sum0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = sum0, .rhs = all32 } }, .dest = sum1, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = sum1, .rhs = all64 } }, .dest = sum2, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = sum2 } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_uminv_b = false;
+    var found_uminv_h = false;
+    var found_uminv_s = false;
+    var found_umov_d = false;
+    var found_cset = false;
+    var found_and = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x6E31A800) found_uminv_b = true;
+        if ((w & 0xFFFFFC00) == 0x6E71A800) found_uminv_h = true;
+        if ((w & 0xFFFFFC00) == 0x6EB1A800) found_uminv_s = true;
+        if ((w & 0xFFE0FC00) == 0x4E003C00) found_umov_d = true;
+        if ((w & 0xFFFFFFE0) == 0x1A9F07E0) found_cset = true;
+        if ((w & 0xFFE0FC00) == 0x8A000000) found_and = true;
+    }
+    try std.testing.expect(found_uminv_b);
+    try std.testing.expect(found_uminv_h);
+    try std.testing.expect(found_uminv_s);
+    try std.testing.expect(found_umov_d);
+    try std.testing.expect(found_cset);
+    try std.testing.expect(found_and);
 }
 
 test "compile: i32x4 lane ops emit NEON instructions" {
