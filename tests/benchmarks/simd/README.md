@@ -53,7 +53,7 @@ The `simd_extmul_lowhigh_4k_loop` row exercises the 12 widening lane-multiply op
 
 The `simd_narrow_4k_loop` row exercises the 4 saturating lane-narrowing operations. It walks paired 4 KiB input streams whose lanes deliberately exceed both signed and unsigned destination ranges, runs `i8x16.narrow_i16x8_s/u` and `i16x8.narrow_i32x4_s/u`, combines the results with `v128.xor`, stores the output, and returns one scalar checksum lane.
 
-The small `simd_i32x4_*_lane0`, `simd_i16x8_*_lane0`, `simd_i8x16_*`, and `simd_i64x2_*` rows are coverage/status probes for individual opcode families. They intentionally return one scalar lane so interpreter, AOT, and optional Wasmtime rows can be compared before the runtime supports direct exported v128 values. The i16x8 and i8x16 comparison and replace-lane rows cover signed vs unsigned extraction of all-ones masks and high-bit lane values; the i64x2 rows wrap extracted i64 lanes to i32 for the exported checksum.
+The small `simd_i32x4_*_lane0`, `simd_i16x8_*_lane0`, `simd_i8x16_*`, `simd_i64x2_*`, `simd_f32x4_convert_*`, and `simd_f64x2_convert_*` rows are coverage/status probes for individual opcode families. They intentionally return one scalar lane so interpreter, AOT, and optional Wasmtime rows can be compared before the runtime supports direct exported v128 values. The i16x8 and i8x16 comparison and replace-lane rows cover signed vs unsigned extraction of all-ones masks and high-bit lane values; the i64x2 and f64x2 rows wrap extracted i64 lanes to i32 for the exported checksum.
 
 Wasmtime can be included as an external baseline:
 

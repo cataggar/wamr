@@ -146,6 +146,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .i32x4_unop => |un| list.append(un.vector),
         .i32x4_extadd_pairwise_i16x8 => |op| list.append(op.vector),
         .i32x4_extend_i16x8 => |op| list.append(op.vector),
+        .f32x4_convert_i32x4 => |op| list.append(op.vector),
         .i32x4_extmul_i16x8 => |op| {
             list.append(op.lhs);
             list.append(op.rhs);
@@ -199,6 +200,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .f64x2_convert_low_i32x4 => |op| list.append(op.vector),
         .i64x2_unop => |un| list.append(un.vector),
         .i64x2_shift => |shift| {
             list.append(shift.vector);
@@ -479,6 +481,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .i32x4_extend_i16x8 => |*op| if (op.vector == old) {
             op.vector = new;
         },
+        .f32x4_convert_i32x4 => |*op| if (op.vector == old) {
+            op.vector = new;
+        },
         .i32x4_extmul_i16x8 => |*op| {
             if (op.lhs == old) op.lhs = new;
             if (op.rhs == old) op.rhs = new;
@@ -534,6 +539,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .f64x2_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
+        },
+        .f64x2_convert_low_i32x4 => |*op| if (op.vector == old) {
+            op.vector = new;
         },
         .i64x2_unop => |*un| if (un.vector == old) {
             un.vector = new;
@@ -1817,6 +1825,7 @@ fn isPure(inst: ir.Inst) bool {
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
         .i32x4_extend_i16x8,
+        .f32x4_convert_i32x4,
         .i32x4_extmul_i16x8,
         .i32x4_shift,
         .i32x4_splat,
@@ -1843,6 +1852,7 @@ fn isPure(inst: ir.Inst) bool {
         .i16x8_replace_lane,
         .i64x2_binop,
         .f64x2_binop,
+        .f64x2_convert_low_i32x4,
         .i64x2_unop,
         .i64x2_extend_i32x4,
         .i64x2_extmul_i32x4,
@@ -1943,6 +1953,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .i32x4_unop => |un| un.op == b.op.i32x4_unop.op and un.vector == b.op.i32x4_unop.vector,
         .i32x4_extadd_pairwise_i16x8 => |op| op.sign == b.op.i32x4_extadd_pairwise_i16x8.sign and op.vector == b.op.i32x4_extadd_pairwise_i16x8.vector,
         .i32x4_extend_i16x8 => |op| op.sign == b.op.i32x4_extend_i16x8.sign and op.half == b.op.i32x4_extend_i16x8.half and op.vector == b.op.i32x4_extend_i16x8.vector,
+        .f32x4_convert_i32x4 => |op| op.sign == b.op.f32x4_convert_i32x4.sign and op.vector == b.op.f32x4_convert_i32x4.vector,
         .i32x4_extmul_i16x8 => |op| op.sign == b.op.i32x4_extmul_i16x8.sign and op.half == b.op.i32x4_extmul_i16x8.half and op.lhs == b.op.i32x4_extmul_i16x8.lhs and op.rhs == b.op.i32x4_extmul_i16x8.rhs,
         .i32x4_shift => |shift| shift.op == b.op.i32x4_shift.op and shift.vector == b.op.i32x4_shift.vector and shift.count == b.op.i32x4_shift.count,
         .i32x4_splat => |v| v == b.op.i32x4_splat,
@@ -1969,6 +1980,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .i16x8_replace_lane => |lane| lane.vector == b.op.i16x8_replace_lane.vector and lane.val == b.op.i16x8_replace_lane.val and lane.lane == b.op.i16x8_replace_lane.lane,
         .i64x2_binop => |bin| bin.op == b.op.i64x2_binop.op and bin.lhs == b.op.i64x2_binop.lhs and bin.rhs == b.op.i64x2_binop.rhs,
         .f64x2_binop => |bin| bin.op == b.op.f64x2_binop.op and bin.lhs == b.op.f64x2_binop.lhs and bin.rhs == b.op.f64x2_binop.rhs,
+        .f64x2_convert_low_i32x4 => |op| op.sign == b.op.f64x2_convert_low_i32x4.sign and op.vector == b.op.f64x2_convert_low_i32x4.vector,
         .i64x2_unop => |un| un.op == b.op.i64x2_unop.op and un.vector == b.op.i64x2_unop.vector,
         .i64x2_extend_i32x4 => |op| op.sign == b.op.i64x2_extend_i32x4.sign and op.half == b.op.i64x2_extend_i32x4.half and op.vector == b.op.i64x2_extend_i32x4.vector,
         .i64x2_extmul_i32x4 => |op| op.sign == b.op.i64x2_extmul_i32x4.sign and op.half == b.op.i64x2_extmul_i32x4.half and op.lhs == b.op.i64x2_extmul_i32x4.lhs and op.rhs == b.op.i64x2_extmul_i32x4.rhs,
@@ -3498,6 +3510,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .i32x4_unop => |*un| un.vector += offset,
         .i32x4_extadd_pairwise_i16x8 => |*op| op.vector += offset,
         .i32x4_extend_i16x8 => |*op| op.vector += offset,
+        .f32x4_convert_i32x4 => |*op| op.vector += offset,
         .i32x4_extmul_i16x8 => |*op| {
             op.lhs += offset;
             op.rhs += offset;
@@ -3546,6 +3559,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             bin.lhs += offset;
             bin.rhs += offset;
         },
+        .f64x2_convert_low_i32x4 => |*op| op.vector += offset,
         .i64x2_unop => |*un| un.vector += offset,
         .i64x2_extend_i32x4 => |*op| op.vector += offset,
         .i64x2_extmul_i32x4 => |*op| {
