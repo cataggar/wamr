@@ -315,6 +315,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .i8x16_splat,
         .i16x8_splat,
         .i64x2_splat,
+        .f64x2_splat,
         => |vreg| live.put(vreg, {}) catch {},
         .simd_all_true => |op| live.put(op.vector, {}) catch {},
         .simd_bitmask => |op| live.put(op.vector, {}) catch {},
@@ -323,6 +324,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .i8x16_extract_lane => |lane| live.put(lane.vector, {}) catch {},
         .i16x8_extract_lane => |lane| live.put(lane.vector, {}) catch {},
         .i64x2_extract_lane => |lane| live.put(lane.vector, {}) catch {},
+        .f64x2_extract_lane => |lane| live.put(lane.vector, {}) catch {},
         .i32x4_replace_lane => |lane| {
             live.put(lane.vector, {}) catch {};
             live.put(lane.val, {}) catch {};
@@ -340,6 +342,10 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(lane.val, {}) catch {};
         },
         .i64x2_replace_lane => |lane| {
+            live.put(lane.vector, {}) catch {};
+            live.put(lane.val, {}) catch {};
+        },
+        .f64x2_replace_lane => |lane| {
             live.put(lane.vector, {}) catch {};
             live.put(lane.val, {}) catch {};
         },
@@ -762,6 +768,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .i8x16_splat,
         .i16x8_splat,
         .i64x2_splat,
+        .f64x2_splat,
         => |vreg| last_use.put(vreg, pos) catch {},
         .simd_all_true => |op| last_use.put(op.vector, pos) catch {},
         .simd_bitmask => |op| last_use.put(op.vector, pos) catch {},
@@ -770,6 +777,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .i8x16_extract_lane => |lane| last_use.put(lane.vector, pos) catch {},
         .i16x8_extract_lane => |lane| last_use.put(lane.vector, pos) catch {},
         .i64x2_extract_lane => |lane| last_use.put(lane.vector, pos) catch {},
+        .f64x2_extract_lane => |lane| last_use.put(lane.vector, pos) catch {},
         .i32x4_replace_lane => |lane| {
             last_use.put(lane.vector, pos) catch {};
             last_use.put(lane.val, pos) catch {};
@@ -787,6 +795,10 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(lane.val, pos) catch {};
         },
         .i64x2_replace_lane => |lane| {
+            last_use.put(lane.vector, pos) catch {};
+            last_use.put(lane.val, pos) catch {};
+        },
+        .f64x2_replace_lane => |lane| {
             last_use.put(lane.vector, pos) catch {};
             last_use.put(lane.val, pos) catch {};
         },

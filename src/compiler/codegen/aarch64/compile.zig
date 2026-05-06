@@ -604,6 +604,8 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i64x2_replace_lane,
         .f64x2_unop,
         .f64x2_binop,
+        .f64x2_splat,
+        .f64x2_replace_lane,
         => inst.type == .v128,
         else => false,
     };
@@ -672,6 +674,8 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i64x2_replace_lane,
                 .f64x2_unop,
                 .f64x2_binop,
+                .f64x2_splat,
+                .f64x2_replace_lane,
                 => {
                     if (!isSupportedV128Def(inst)) return true;
                 },
@@ -682,6 +686,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i8x16_extract_lane,
                 .i16x8_extract_lane,
                 .i64x2_extract_lane,
+                .f64x2_extract_lane,
                 => {},
                 else => {},
             }
@@ -1504,6 +1509,9 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i64x2_replace_lane,
         .f64x2_unop,
         .f64x2_binop,
+        .f64x2_splat,
+        .f64x2_extract_lane,
+        .f64x2_replace_lane,
         => true,
         else => false,
     };
@@ -1708,6 +1716,9 @@ fn compileInst(
         .i64x2_replace_lane => |lane| try emitI64x2ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
         .f64x2_unop => |un| try emitF64x2UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f64x2_binop => |bin| try emitF64x2BinOp(code, inst, bin, v128_map, v128_cache, fctx),
+        .f64x2_splat => |src| try emitF64x2Splat(code, inst, src, reg_map, v128_map, v128_cache),
+        .f64x2_extract_lane => |lane| try emitF64x2ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
+        .f64x2_replace_lane => |lane| try emitF64x2ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
 
         .add => |bin| if (inst.type == .f32 or inst.type == .f64)
             try emitFBinOp(code, inst, bin, reg_map, .add)
@@ -3726,6 +3737,50 @@ fn emitI64x2ReplaceLane(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     lane: ir.Inst.I64x2ReplaceLane,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, lane.vector, vector_reg, v128_map, v128_cache, fctx);
+    const val_reg = try useInto(code, reg_map, lane.val, RegMap.tmp0);
+    try code.insDFromGp64(dest_reg, lane.lane, val_reg);
+}
+
+fn emitF64x2Splat(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    const src_reg = try useInto(code, reg_map, src, RegMap.tmp0);
+    try code.dup2dFromGp64(dest_reg, src_reg);
+}
+
+fn emitF64x2ExtractLane(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lane: ir.Inst.F64x2ExtractLane,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+    try code.umovXFromD(info.reg, vector_reg, lane.lane);
+    try destCommit(code, reg_map, info);
+}
+
+fn emitF64x2ReplaceLane(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lane: ir.Inst.F64x2ReplaceLane,
     reg_map: *const RegMap,
     v128_map: *V128StackMap,
     v128_cache: *V128RegCache,
@@ -7378,6 +7433,56 @@ test "compile: i64x2 lane ops emit NEON instructions" {
         .type = .i64,
     });
     try func.getBlock(bid).append(.{ .op = .{ .wrap_i64 = lane }, .dest = wrapped, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = wrapped } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_dup = false;
+    var found_ins = false;
+    var found_umov = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4E080C00) found_dup = true;
+        if ((w & 0xFFFFFC00) == 0x4E181C00) found_ins = true;
+        if ((w & 0xFFFFFC00) == 0x4E183C00) found_umov = true;
+    }
+
+    try std.testing.expect(found_dup);
+    try std.testing.expect(found_ins);
+    try std.testing.expect(found_umov);
+}
+
+test "compile: f64x2 lane ops emit bit-preserving NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const scalar = func.newVReg();
+    const splat = func.newVReg();
+    const replacement = func.newVReg();
+    const replaced = func.newVReg();
+    const lane = func.newVReg();
+    const bits = func.newVReg();
+    const wrapped = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .fconst_64 = @bitCast(@as(u64, 0x7FF8_0123_4567_89AB)) }, .dest = scalar, .type = .f64 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_splat = scalar }, .dest = splat, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .fconst_64 = @bitCast(@as(u64, 0x8000_0000_0000_0000)) }, .dest = replacement, .type = .f64 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f64x2_replace_lane = .{ .vector = splat, .val = replacement, .lane = 1 } },
+        .dest = replaced,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f64x2_extract_lane = .{ .vector = replaced, .lane = 1 } },
+        .dest = lane,
+        .type = .f64,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .reinterpret = lane }, .dest = bits, .type = .i64 });
+    try func.getBlock(bid).append(.{ .op = .{ .wrap_i64 = bits }, .dest = wrapped, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = wrapped } });
 
     const code = try compileFunction(&func, allocator);

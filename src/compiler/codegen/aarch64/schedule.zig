@@ -300,6 +300,9 @@ fn opClass(inst: ir.Inst) Class {
         .i64x2_replace_lane,
         .f64x2_unop,
         .f64x2_binop,
+        .f64x2_splat,
+        .f64x2_extract_lane,
+        .f64x2_replace_lane,
         .f64x2_convert_low_i32x4,
         .f64x2_promote_low_f32x4,
         => if (def != null) .alu else .barrier,
@@ -688,6 +691,12 @@ pub fn forEachUse(
         .i64x2_splat => |v| try visit(context, v),
         .i64x2_extract_lane => |lane| try visit(context, lane.vector),
         .i64x2_replace_lane => |lane| {
+            try visit(context, lane.vector);
+            try visit(context, lane.val);
+        },
+        .f64x2_splat => |v| try visit(context, v),
+        .f64x2_extract_lane => |lane| try visit(context, lane.vector),
+        .f64x2_replace_lane => |lane| {
             try visit(context, lane.vector);
             try visit(context, lane.val);
         },

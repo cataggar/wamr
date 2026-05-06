@@ -126,6 +126,9 @@ pub const Inst = struct {
         i64x2_replace_lane: I64x2ReplaceLane,
         f64x2_unop: F64x2UnOp,
         f64x2_binop: F64x2BinOp,
+        f64x2_splat: VReg,
+        f64x2_extract_lane: F64x2ExtractLane,
+        f64x2_replace_lane: F64x2ReplaceLane,
         f64x2_convert_low_i32x4: SimdIntToFloatConvert,
         f64x2_promote_low_f32x4: SimdFloatPrecisionConvert,
 
@@ -797,6 +800,11 @@ pub const Inst = struct {
         lane: u1,
     };
 
+    pub const F64x2ExtractLane = struct {
+        vector: VReg,
+        lane: u1,
+    };
+
     pub const I32x4ReplaceLane = struct {
         vector: VReg,
         val: VReg,
@@ -822,6 +830,12 @@ pub const Inst = struct {
     };
 
     pub const I64x2ReplaceLane = struct {
+        vector: VReg,
+        val: VReg,
+        lane: u1,
+    };
+
+    pub const F64x2ReplaceLane = struct {
         vector: VReg,
         val: VReg,
         lane: u1,
@@ -1445,6 +1459,30 @@ test "Inst: first v128 op family preserves operand shape" {
         .type = .v128,
     };
     try std.testing.expectEqual(@as(VReg, 26), f64_promote.op.f64x2_promote_low_f32x4.vector);
+
+    const f64_splat = Inst{
+        .op = .{ .f64x2_splat = 28 },
+        .dest = 29,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 28), f64_splat.op.f64x2_splat);
+
+    const f64_extract = Inst{
+        .op = .{ .f64x2_extract_lane = .{ .vector = 29, .lane = 1 } },
+        .dest = 30,
+        .type = .f64,
+    };
+    try std.testing.expectEqual(@as(VReg, 29), f64_extract.op.f64x2_extract_lane.vector);
+    try std.testing.expectEqual(@as(u1, 1), f64_extract.op.f64x2_extract_lane.lane);
+
+    const f64_replace = Inst{
+        .op = .{ .f64x2_replace_lane = .{ .vector = 29, .val = 30, .lane = 0 } },
+        .dest = 31,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 29), f64_replace.op.f64x2_replace_lane.vector);
+    try std.testing.expectEqual(@as(VReg, 30), f64_replace.op.f64x2_replace_lane.val);
+    try std.testing.expectEqual(@as(u1, 0), f64_replace.op.f64x2_replace_lane.lane);
 
     const i64_splat = Inst{
         .op = .{ .i64x2_splat = 26 },
