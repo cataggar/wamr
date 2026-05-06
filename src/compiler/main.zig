@@ -10,7 +10,7 @@ const x86_64_compile = wamr.x86_64_compile;
 const aarch64_compile = wamr.aarch64_compile;
 const passes = wamr.passes;
 
-const TargetArch = enum { x86_64, aarch64 };
+const TargetArch = passes.TargetArch;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 4. Optimize IR (unless -O0)
     if (optimize) {
-        const opt_changes = passes.runPasses(&ir_module, passes.default_passes, allocator) catch |err| {
+        const opt_changes = passes.runPasses(&ir_module, passes.defaultPassesForTarget(target_arch), allocator) catch |err| {
             std.debug.print("Error optimizing IR: {}\n", .{err});
             std.process.exit(1);
         };
