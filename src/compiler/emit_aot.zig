@@ -59,7 +59,8 @@ pub const MemoryEntry = struct {
 pub const GlobalEntry = struct {
     val_type: u8,
     mutability: u8,
-    init_i64: i64,
+    init_i64: i64 = 0,
+    init_v128: u128 = 0,
 };
 
 pub const ElemEntry = struct {
@@ -208,7 +209,8 @@ pub fn emit(
         }
     }
 
-    // Section 10: globals (val_type, mutability, init_i64 per entry)
+    // Section 10: globals (val_type, mutability, init payload per entry).
+    // Scalar/reference globals carry 8 bytes; v128 globals carry 16 bytes.
     if (globals) |global_list| {
         if (global_list.len > 0) {
             var tmp: std.ArrayList(u8) = .empty;
@@ -217,7 +219,11 @@ pub fn emit(
             for (global_list) |g| {
                 try tmp.append(allocator, g.val_type);
                 try tmp.append(allocator, g.mutability);
-                try tmp.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(i64, g.init_i64)));
+                if (g.val_type == 0x7B) {
+                    try tmp.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(u128, g.init_v128)));
+                } else {
+                    try tmp.appendSlice(allocator, &std.mem.toBytes(std.mem.nativeToLittle(i64, g.init_i64)));
+                }
             }
             try emitSection(allocator, &buf, 10, tmp.items);
         }
@@ -451,6 +457,29 @@ test "emit: memory section round-trip" {
     try std.testing.expect(module.memories[0].limits.max == null);
     try std.testing.expectEqual(@as(u64, 1), module.memories[1].limits.min);
     try std.testing.expectEqual(@as(u64, 256), module.memories[1].limits.max.?);
+}
+
+test "emit: v128 global init payload round-trip" {
+    const allocator = std.testing.allocator;
+    const aot_loader = @import("../runtime/aot/loader.zig");
+
+    const init_bits: u128 = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF;
+    const globals = [_]GlobalEntry{
+        .{ .val_type = 0x7F, .mutability = 0, .init_i64 = 0x1234 },
+        .{ .val_type = 0x7B, .mutability = 1, .init_v128 = init_bits },
+    };
+    const data = try emit(allocator, &.{}, &.{}, &.{}, .{}, null, null, null, &globals, null, null, null, null);
+    defer allocator.free(data);
+
+    const module = try aot_loader.load(data, allocator);
+    defer aot_loader.unload(&module, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), module.global_inits.len);
+    try std.testing.expectEqual(@as(u8, 0x7F), module.global_inits[0].val_type);
+    try std.testing.expectEqual(@as(i64, 0x1234), module.global_inits[0].init_i64);
+    try std.testing.expectEqual(@as(u8, 0x7B), module.global_inits[1].val_type);
+    try std.testing.expectEqual(@as(u8, 1), module.global_inits[1].mutability);
+    try std.testing.expectEqual(init_bits, module.global_inits[1].init_v128);
 }
 
 test "emit: type section and function type indices round-trip" {

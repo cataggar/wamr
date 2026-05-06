@@ -23,7 +23,7 @@ pub const AotSectionType = enum(u32) {
     data = 5,
     relocation = 6,
     name = 7,
-    @"import" = 8,
+    import = 8,
     memory = 9,
     global = 10,
     elem = 11,
@@ -66,7 +66,8 @@ pub const AotImportDesc = struct {
 pub const AotGlobalInit = struct {
     val_type: u8,
     mutability: u8,
-    init_i64: i64,
+    init_i64: i64 = 0,
+    init_v128: u128 = 0,
 };
 
 /// An element segment parsed from the AOT element section.
@@ -211,7 +212,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!AotModule 
             .data => {
                 try parseDataSection(&reader, section_size, &module, allocator);
             },
-            .@"import" => {
+            .import => {
                 try parseImportSection(&reader, section_size, &module, allocator);
             },
             .memory => {
@@ -507,12 +508,20 @@ fn parseGlobalSection(reader: *BinaryReader, section_size: u32, module: *AotModu
     for (0..count) |i| {
         const val_type = try reader.readByte();
         const mutability = try reader.readByte();
-        const init_bytes = try reader.readBytes(8);
-        const init_i64 = std.mem.readInt(i64, init_bytes[0..8], .little);
+        var init_i64: i64 = 0;
+        var init_v128: u128 = 0;
+        if (val_type == 0x7B) {
+            const init_bytes = try reader.readBytes(16);
+            init_v128 = std.mem.readInt(u128, init_bytes[0..16], .little);
+        } else {
+            const init_bytes = try reader.readBytes(8);
+            init_i64 = std.mem.readInt(i64, init_bytes[0..8], .little);
+        }
         inits[i] = .{
             .val_type = val_type,
             .mutability = mutability,
             .init_i64 = init_i64,
+            .init_v128 = init_v128,
         };
     }
 

@@ -451,6 +451,11 @@ const FuncCompileCtx = struct {
     /// Per-local type table, params first. Missing entries are treated as
     /// scalar 8-byte slots for compatibility with hand-built IR tests.
     local_types: []const ir.IrType = &.{},
+    /// Wasm-flat global types and byte offsets (imports first, then locals).
+    /// Missing entries fall back to the legacy 8-byte-per-index layout used by
+    /// older hand-built IR tests.
+    global_types: []const ir.IrType = &.{},
+    global_offsets: []const u32 = &.{},
     /// FP-relative byte offset of the call-save region where caller-save
     /// physregs (x0..x15) are spilled around BL instructions.
     call_save_base: u32 = 0,
@@ -557,6 +562,7 @@ pub fn compileFunctionWithOptions(
 fn isSupportedV128Def(inst: ir.Inst) bool {
     return switch (inst.op) {
         .local_get,
+        .global_get,
         .v128_const,
         .v128_load,
         .v128_load_splat,
@@ -711,7 +717,6 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .ret_multi => |vals| {
                     for (vals) |v| if ((vreg_types.get(v) orelse .void) == .v128) return true;
                 },
-                .global_set => |gs| if ((vreg_types.get(gs.val) orelse .void) == .v128) return true,
                 .select => |sel| {
                     if ((vreg_types.get(sel.if_true) orelse .void) == .v128 or
                         (vreg_types.get(sel.if_false) orelse .void) == .v128)
@@ -1908,8 +1913,8 @@ fn compileInst(
         .ret_multi => |vregs| try emitRetMulti(code, vregs, reg_map, fctx, frame_size),
         .call_result => |idx| try emitCallResult(code, inst, idx, reg_map, fctx),
         .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot),
-        .global_get => |idx| try emitGlobalGet(code, inst, idx, reg_map),
-        .global_set => |gs| try emitGlobalSet(code, gs, reg_map),
+        .global_get => |idx| try emitGlobalGet(code, inst, idx, reg_map, v128_map, v128_cache, fctx),
+        .global_set => |gs| try emitGlobalSet(code, inst, gs, reg_map, v128_map, v128_cache, fctx),
         .memory_size => try emitMemorySize(code, inst, reg_map),
         .memory_grow => |pages_vreg| try emitMemoryGrow(code, inst, pages_vreg, reg_map, fctx),
         .memory_fill => |mf| try emitMemoryFill(code, mf, reg_map, fctx),
@@ -4909,43 +4914,105 @@ const table_info_ptr_off: u32 = 0;
 const table_info_len_off: u32 = 8;
 const table_info_type_backing_off: u32 = 16;
 
-/// Globals are a packed array of 8-byte slots indexed by global index.
-/// For i32/f32 we read/write the low 32 bits with W-form LDR/STR; for
-/// i64/f64 we use the 64-bit forms. This matches x86-64 which uses an
-/// 8-byte slot per global.
+fn globalTypeAt(fctx: *const FuncCompileCtx, idx: u32, fallback: ir.IrType) ir.IrType {
+    const i: usize = @intCast(idx);
+    if (i < fctx.global_types.len) return fctx.global_types[i];
+    return fallback;
+}
+
+fn globalByteOffset(fctx: *const FuncCompileCtx, idx: u32) !u32 {
+    const i: usize = @intCast(idx);
+    if (i < fctx.global_offsets.len) return fctx.global_offsets[i];
+    if (idx > std.math.maxInt(u32) / 8) return error.GlobalIndexOutOfRange;
+    return idx * 8;
+}
+
+fn addGlobalByteOffset(code: *emit.CodeBuffer, base: emit.Reg, offset: u32, scratch: emit.Reg) !void {
+    if (offset == 0) return;
+    if (offset <= 4095) {
+        try code.addImm(base, base, @intCast(offset));
+    } else if ((offset & 0xFFF) == 0 and (offset >> 12) <= 4095) {
+        try code.addImmShift12(base, base, @intCast(offset >> 12));
+    } else {
+        try emitMovImm64(code, scratch, offset);
+        try code.addRegReg(base, base, scratch);
+    }
+}
+
+/// Globals are a byte-addressed storage area. Scalar/reference globals keep
+/// 8-byte slots; v128 globals are 16-byte aligned and 16 bytes wide.
 fn emitGlobalGet(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     idx: u32,
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
+    const ty = globalTypeAt(fctx, idx, inst.type);
+    const byte_offset = try globalByteOffset(fctx, idx);
+    if (ty == .v128) {
+        const vt = try v128_cache.defineFresh(code, v128_map, dest, null);
+        try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+        try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, RegMap.tmp1);
+        try code.ldrQ(vt, RegMap.tmp0);
+        return;
+    }
+
     // tmp0 = vmctx; tmp0 = globals_base
     try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
-    const is32 = (inst.type == .i32 or inst.type == .f32);
-    // Byte offset = idx * 8. LDR scaled-imm requires idx fit in u12.
-    if (idx > 0xFFF) return error.GlobalIndexOutOfRange;
-    if (is32) try code.ldrImm32(info.reg, RegMap.tmp0, @intCast(idx * 2)) else try code.ldrImm(info.reg, RegMap.tmp0, @intCast(idx));
+    const is32 = (ty == .i32 or ty == .f32);
+    if (is32 and byte_offset % 4 == 0 and byte_offset / 4 <= 0xFFF) {
+        try code.ldrImm32(info.reg, RegMap.tmp0, @intCast(byte_offset / 4));
+    } else if (!is32 and byte_offset % 8 == 0 and byte_offset / 8 <= 0xFFF) {
+        try code.ldrImm(info.reg, RegMap.tmp0, @intCast(byte_offset / 8));
+    } else {
+        const scratch = if (info.reg == RegMap.tmp1) RegMap.tmp2 else RegMap.tmp1;
+        try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, scratch);
+        if (is32) try code.ldrImm32(info.reg, RegMap.tmp0, 0) else try code.ldrImm(info.reg, RegMap.tmp0, 0);
+    }
     try destCommit(code, reg_map, info);
 }
 
 fn emitGlobalSet(
     code: *emit.CodeBuffer,
+    inst: ir.Inst,
     gs: @TypeOf(@as(ir.Inst.Op, undefined).global_set),
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
 ) !void {
+    const ty = globalTypeAt(fctx, gs.idx, inst.type);
+    const byte_offset = try globalByteOffset(fctx, gs.idx);
+    if (ty == .v128) {
+        const vt = try v128_cache.ensure(code, v128_map, gs.val, null);
+        try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
+        try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, RegMap.tmp1);
+        try code.strQ(vt, RegMap.tmp0);
+        return;
+    }
+
     const val_r = try useInto(code, reg_map, gs.val, RegMap.tmp1);
     // tmp0 = vmctx; tmp0 = globals_base
     try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
-    if (gs.idx > 0xFFF) return error.GlobalIndexOutOfRange;
-    // Type width inferred from the val's IR type is not available here;
-    // always store 8 bytes (safe: the interpreter allocates 8 bytes per
-    // global slot, and i32/f32 are zero-extended or host-padded).
-    try code.strImm(val_r, RegMap.tmp0, @intCast(gs.idx));
+    // Scalar/reference globals use 8-byte slots. i32/f32 consumers read the
+    // low 32 bits, matching the pre-v128 layout and preserving old behaviour.
+    if (byte_offset % 8 == 0 and byte_offset / 8 <= 0xFFF) {
+        try code.strImm(val_r, RegMap.tmp0, @intCast(byte_offset / 8));
+    } else {
+        const scratch = if (val_r == RegMap.tmp1) RegMap.tmp2 else RegMap.tmp1;
+        try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, scratch);
+        try code.strImm(val_r, RegMap.tmp0, 0);
+    }
 }
 
 /// `memory.size` — 32-bit load of VmCtx.memory_pages.
@@ -6443,6 +6510,8 @@ pub fn compileModuleWithOptions(
         const ctx: FuncCompileCtx = .{
             .import_count = ir_module.import_count,
             .call_patches = &func_patches,
+            .global_types = ir_module.global_types orelse &.{},
+            .global_offsets = ir_module.global_offsets orelse &.{},
             .options = options,
             .allocator = allocator,
         };
@@ -6725,6 +6794,39 @@ test "compileFunction: global_get then global_set round-trips" {
     defer allocator.free(code);
     try std.testing.expect(code.len > 0);
     try std.testing.expect(code.len % 4 == 0);
+}
+
+test "compileFunction: v128 global_get/global_set emit Q loads and stores" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .global_get = 1 }, .dest = v0, .type = .v128 });
+    try block.append(.{ .op = .{ .global_set = .{ .idx = 3, .val = v0 } }, .type = .v128 });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const global_types = [_]ir.IrType{ .i32, .v128, .i64, .v128 };
+    const global_offsets = [_]u32{ 0, 16, 32, 48 };
+    const code = try compileFunctionImpl(&func, .{
+        .allocator = allocator,
+        .global_types = &global_types,
+        .global_offsets = &global_offsets,
+    }, allocator);
+    defer allocator.free(code);
+
+    var saw_ldr_q = false;
+    var saw_str_q = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const word = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((word & 0xFFC00000) == 0x3DC00000) saw_ldr_q = true;
+        if ((word & 0xFFC00000) == 0x3D800000) saw_str_q = true;
+    }
+    try std.testing.expect(saw_ldr_q);
+    try std.testing.expect(saw_str_q);
 }
 
 test "compileFunction: div_s by zero codegen produces trap path" {

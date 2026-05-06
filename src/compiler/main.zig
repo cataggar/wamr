@@ -185,21 +185,39 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    // Build global entries from the parsed wasm module
+    // Build global entries in wasm-flat order (imported globals first, then
+    // local globals) so codegen offsets match runtime storage.
     var global_entries: std.ArrayList(emit_aot.GlobalEntry) = .empty;
     defer global_entries.deinit(allocator);
+    var tmp_globals: std.ArrayList(*wamr.types.GlobalInstance) = .empty;
+    defer {
+        for (tmp_globals.items) |g| allocator.destroy(g);
+        tmp_globals.deinit(allocator);
+    }
+    for (module.imports) |imp| {
+        if (imp.kind != .global) continue;
+        const gt = imp.global_type orelse continue;
+        const val = defaultZeroValue(gt.val_type);
+        const gi = try allocator.create(wamr.types.GlobalInstance);
+        gi.* = .{ .global_type = gt, .value = val };
+        try tmp_globals.append(allocator, gi);
+        try global_entries.append(allocator, .{
+            .val_type = @intFromEnum(gt.val_type),
+            .mutability = if (gt.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
+            .init_i64 = valueToI64(val),
+            .init_v128 = valueToV128(val),
+        });
+    }
     for (module.globals) |g| {
-        const init_val: i64 = switch (g.init_expr) {
-            .i32_const => |v| @as(i64, v),
-            .i64_const => |v| v,
-            .f32_const => |v| @as(i64, @as(i32, @bitCast(v))),
-            .f64_const => |v| @bitCast(v),
-            else => 0,
-        };
+        const val = wamr.instance.evalInitExpr(g.init_expr, tmp_globals.items, null) catch defaultZeroValue(g.global_type.val_type);
+        const gi = try allocator.create(wamr.types.GlobalInstance);
+        gi.* = .{ .global_type = g.global_type, .value = val };
+        try tmp_globals.append(allocator, gi);
         try global_entries.append(allocator, .{
             .val_type = @intFromEnum(g.global_type.val_type),
             .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
-            .init_i64 = init_val,
+            .init_i64 = valueToI64(val),
+            .init_v128 = valueToV128(val),
         });
     }
 
@@ -291,4 +309,38 @@ pub fn main(init: std.process.Init) !void {
     };
 
     std.debug.print("Written {s} ({d} bytes)\n", .{ out_path, aot_binary.len });
+}
+
+fn defaultZeroValue(vt: wamr.types.ValType) wamr.types.Value {
+    return switch (vt) {
+        .i32 => .{ .i32 = 0 },
+        .i64 => .{ .i64 = 0 },
+        .f32 => .{ .f32 = 0 },
+        .f64 => .{ .f64 = 0 },
+        .v128 => .{ .v128 = 0 },
+        .funcref => .{ .funcref = null },
+        .externref => .{ .externref = null },
+        .nonfuncref => .{ .nonfuncref = null },
+        .nonexternref => .{ .nonexternref = null },
+        else => .{ .i64 = 0 },
+    };
+}
+
+fn valueToI64(v: wamr.types.Value) i64 {
+    return switch (v) {
+        .i32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .i64 => |x| x,
+        .f32 => |x| @as(i64, @as(u32, @bitCast(x))),
+        .f64 => |x| @as(i64, @bitCast(x)),
+        .funcref, .nonfuncref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
+        .externref, .nonexternref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
+        else => 0,
+    };
+}
+
+fn valueToV128(v: wamr.types.Value) u128 {
+    return switch (v) {
+        .v128 => |x| x,
+        else => 0,
+    };
 }

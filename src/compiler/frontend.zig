@@ -93,12 +93,62 @@ fn globalValTypeByIdx(wasm_module: *const types.WasmModule, idx: u32) ?types.Val
     return wasm_module.globals[local_idx].global_type.val_type;
 }
 
+fn globalSlotAlignment(ty: ir.IrType) u32 {
+    return switch (ty) {
+        .v128 => 16,
+        .void => 8,
+        else => 8,
+    };
+}
+
+fn globalSlotSize(ty: ir.IrType) u32 {
+    return switch (ty) {
+        .v128 => 16,
+        .void => 0,
+        else => 8,
+    };
+}
+
+fn alignForwardU32(value: u32, alignment: u32) u32 {
+    std.debug.assert(alignment != 0 and (alignment & (alignment - 1)) == 0);
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
 /// Lower an entire Wasm module into IR.
 pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allocator) LowerError!ir.IrModule {
     var ir_module = ir.IrModule.init(allocator);
     errdefer ir_module.deinit();
 
     ir_module.import_count = wasm_module.import_function_count;
+
+    var global_types: std.ArrayList(ir.IrType) = .empty;
+    errdefer global_types.deinit(allocator);
+    for (wasm_module.imports) |imp| {
+        if (imp.kind != .global) continue;
+        const gt = imp.global_type orelse continue;
+        try global_types.append(allocator, valTypeToIr(gt.val_type));
+    }
+    for (wasm_module.globals) |g| {
+        try global_types.append(allocator, valTypeToIr(g.global_type.val_type));
+    }
+    if (global_types.items.len > 0) {
+        const owned_types = try global_types.toOwnedSlice(allocator);
+        errdefer allocator.free(owned_types);
+
+        const offsets = try allocator.alloc(u32, owned_types.len);
+        errdefer allocator.free(offsets);
+
+        var next: u32 = 0;
+        for (owned_types, 0..) |ty, i| {
+            next = alignForwardU32(next, globalSlotAlignment(ty));
+            offsets[i] = next;
+            next += globalSlotSize(ty);
+        }
+
+        ir_module.global_types = owned_types;
+        ir_module.global_offsets = offsets;
+        ir_module.global_storage_size = next;
+    }
 
     for (wasm_module.functions) |func| {
         const func_type = wasm_module.types[func.type_idx];
@@ -840,7 +890,9 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .global_set => {
                 const idx = readU32(code, &ip);
                 const val = safePop(&vreg_stack);
-                try ir_func.getBlock(current_block).append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } } });
+                const gt = globalValTypeByIdx(wasm_module, idx) orelse .i32;
+                const ir_ty = valTypeToIr(gt);
+                try ir_func.getBlock(current_block).append(.{ .op = .{ .global_set = .{ .idx = idx, .val = val } }, .type = ir_ty });
             },
             // ── Load variants ────────────────────────────────────────────
             .i32_load,
@@ -3886,6 +3938,76 @@ test "lower declared v128 local get and tee preserve v128 type" {
     try std.testing.expectEqual(@as(u32, 0), insts[1].op.local_set.idx);
     try std.testing.expectEqual(insts[0].dest.?, insts[1].op.local_set.val);
     try std.testing.expectEqual(insts[0].dest.?, insts[2].op.i32x4_extract_lane.vector);
+}
+
+test "lower v128 globals preserve types and aligned wasm-flat layout" {
+    const allocator = std.testing.allocator;
+
+    const import_global_type = types.GlobalType{ .val_type = .i32, .mutability = .immutable };
+    const local_v128_type = types.GlobalType{ .val_type = .v128, .mutability = .mutable };
+    const local_i64_type = types.GlobalType{ .val_type = .i64, .mutability = .immutable };
+    const imports = [_]types.ImportDesc{.{
+        .module_name = "env",
+        .field_name = "g",
+        .kind = .global,
+        .global_type = import_global_type,
+    }};
+    const v128_init = [_]u8{
+        0xFD, 0x0C,
+        0x11, 0x00,
+        0x00, 0x00,
+        0x22, 0x00,
+        0x00, 0x00,
+        0x33, 0x00,
+        0x00, 0x00,
+        0x44, 0x00,
+        0x00, 0x00,
+    };
+    const globals = [_]types.WasmGlobal{
+        .{ .global_type = local_v128_type, .init_expr = .{ .bytecode = &v128_init } },
+        .{ .global_type = local_i64_type, .init_expr = .{ .i64_const = 99 } },
+    };
+    const func_type = types.FuncType{ .params = &.{}, .results = &.{.i32} };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = &[_]u8{
+            0x23, 0x01, // global.get 1 (local v128; imported global is index 0)
+            0xFD, 0x1B, 0x02, // i32x4.extract_lane 2
+            0xFD, 0x0C, // v128.const
+            0x55, 0x00,
+            0x00, 0x00,
+            0x66, 0x00,
+            0x00, 0x00,
+            0x77, 0x00,
+            0x00, 0x00,
+            0x88, 0x00,
+            0x00, 0x00,
+            0x24, 0x01, // global.set 1
+            0x0B,
+        },
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .imports = &imports,
+        .globals = &globals,
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    try std.testing.expectEqualSlices(ir.IrType, &.{ .i32, .v128, .i64 }, ir_module.global_types.?);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 16, 32 }, ir_module.global_offsets.?);
+    try std.testing.expectEqual(@as(u32, 40), ir_module.global_storage_size);
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
+    try std.testing.expectEqual(@as(u32, 1), insts[0].op.global_get);
+    try std.testing.expectEqual(ir.IrType.v128, insts[3].type);
+    try std.testing.expectEqual(@as(u32, 1), insts[3].op.global_set.idx);
 }
 
 test "lower selected SIMD first-family opcodes" {
