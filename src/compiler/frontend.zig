@@ -2219,6 +2219,41 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .i32x4_trunc_sat_f32x4_s,
+                    .i32x4_trunc_sat_f32x4_u,
+                    .i32x4_trunc_sat_f64x2_s_zero,
+                    .i32x4_trunc_sat_f64x2_u_zero,
+                    => {
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const trunc = ir.Inst.SimdFloatToIntTruncSat{
+                            .src_width = switch (simd_op) {
+                                .i32x4_trunc_sat_f32x4_s,
+                                .i32x4_trunc_sat_f32x4_u,
+                                => .f32x4,
+                                .i32x4_trunc_sat_f64x2_s_zero,
+                                .i32x4_trunc_sat_f64x2_u_zero,
+                                => .f64x2,
+                                else => unreachable,
+                            },
+                            .sign = switch (simd_op) {
+                                .i32x4_trunc_sat_f32x4_s,
+                                .i32x4_trunc_sat_f64x2_s_zero,
+                                => .signed,
+                                .i32x4_trunc_sat_f32x4_u,
+                                .i32x4_trunc_sat_f64x2_u_zero,
+                                => .unsigned,
+                                else => unreachable,
+                            },
+                            .vector = vector,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .i32x4_trunc_sat = trunc },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .f32x4_convert_i32x4_s,
                     .f32x4_convert_i32x4_u,
                     .f64x2_convert_low_i32x4_s,
@@ -5875,6 +5910,96 @@ test "lower SIMD int-to-float conversion opcodes" {
             .f32x4_from_i32x4 => inst.op.f32x4_convert_i32x4,
             .f64x2_low_from_i32x4 => inst.op.f64x2_convert_low_i32x4,
         };
+        try std.testing.expectEqual(case.sign, op.sign);
+        try std.testing.expectEqual(insts[const_idx].dest.?, op.vector);
+        try std.testing.expectEqual(ir.IrType.v128, inst.type);
+    }
+    const extract_idx = cases.len * 2;
+    try std.testing.expectEqual(@as(u2, 0), insts[extract_idx].op.i32x4_extract_lane.lane);
+    try std.testing.expect(insts[extract_idx + 1].op.ret != null);
+}
+
+test "lower SIMD trunc_sat float-to-int opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Case = struct {
+        opcode: u32,
+        src_width: ir.Inst.SimdFloatToIntSrcWidth,
+        sign: ir.Inst.SimdFloatToIntSign,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0xF8, .src_width = .f32x4, .sign = .signed },
+        .{ .opcode = 0xF9, .src_width = .f32x4, .sign = .unsigned },
+        .{ .opcode = 0xFC, .src_width = .f64x2, .sign = .signed },
+        .{ .opcode = 0xFD, .src_width = .f64x2, .sign = .unsigned },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+    const appendConst = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator) !void {
+            try appendSimd(buf, alloc, 0x0C);
+            const lanes = [_]u32{ 0x7fc0_0000, 0xbf80_0000, 0x4f00_0000, 0xff80_0000 };
+            for (lanes) |lane| {
+                var le = std.mem.nativeToLittle(u32, lane);
+                try buf.appendSlice(alloc, std.mem.asBytes(&le));
+            }
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    for (cases) |case| {
+        try appendConst(&code, allocator);
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x1B); // i32x4.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, cases.len * 2 + 2), insts.len);
+    for (cases, 0..) |case, idx| {
+        const const_idx = idx * 2;
+        const inst = insts[const_idx + 1];
+        const op = inst.op.i32x4_trunc_sat;
+        try std.testing.expectEqual(case.src_width, op.src_width);
         try std.testing.expectEqual(case.sign, op.sign);
         try std.testing.expectEqual(insts[const_idx].dest.?, op.vector);
         try std.testing.expectEqual(ir.IrType.v128, inst.type);

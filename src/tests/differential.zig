@@ -559,6 +559,158 @@ test "differential SIMD: f32x4.convert_i32x4_u lane 0 matches interpreter" {
     );
 }
 
+fn expectI32x4TruncSatF32Lane(opcode: u32, lanes: [4]u32, lane: u8, expected: i32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI32x4ExtractLane(&body, testing.allocator, lane);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", expected);
+}
+
+fn expectI32x4TruncSatF64Lane(opcode: u32, lanes: [2]u64, lane: u8, expected: i32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI64x2(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI32x4ExtractLane(&body, testing.allocator, lane);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", expected);
+}
+
+test "differential SIMD: i32x4.trunc_sat_f32x4_s handles NaN infinities range and fractions" {
+    try expectI32x4TruncSatF32Lane(
+        0xF8,
+        .{ 0x7fc0_0001, 0x7f80_0000, 0xff80_0000, f32Bits(1.9) },
+        0,
+        0,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF8,
+        .{ 0x7fc0_0001, 0x7f80_0000, 0xff80_0000, f32Bits(1.9) },
+        1,
+        2147483647,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF8,
+        .{ 0x7fc0_0001, 0x7f80_0000, 0xff80_0000, f32Bits(1.9) },
+        2,
+        -2147483648,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF8,
+        .{ f32Bits(2147483648.0), f32Bits(-2147483904.0), f32Bits(0.0), f32Bits(-1.9) },
+        0,
+        2147483647,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF8,
+        .{ f32Bits(2147483648.0), f32Bits(-2147483904.0), f32Bits(0.0), f32Bits(-1.9) },
+        1,
+        -2147483648,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF8,
+        .{ f32Bits(2147483648.0), f32Bits(-2147483904.0), f32Bits(0.0), f32Bits(-1.9) },
+        2,
+        0,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF8,
+        .{ f32Bits(2147483648.0), f32Bits(-2147483904.0), f32Bits(0.0), f32Bits(-1.9) },
+        3,
+        -1,
+    );
+}
+
+test "differential SIMD: i32x4.trunc_sat_f32x4_u handles NaN infinities range and fractions" {
+    try expectI32x4TruncSatF32Lane(
+        0xF9,
+        .{ 0x7fc0_0001, 0x7f80_0000, 0xff80_0000, f32Bits(1.9) },
+        0,
+        0,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF9,
+        .{ 0x7fc0_0001, 0x7f80_0000, 0xff80_0000, f32Bits(1.9) },
+        1,
+        bitsI32(0xffff_ffff),
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF9,
+        .{ 0x7fc0_0001, 0x7f80_0000, 0xff80_0000, f32Bits(1.9) },
+        2,
+        0,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF9,
+        .{ f32Bits(4294967296.0), f32Bits(-1.0), f32Bits(-0.0), f32Bits(1.9) },
+        0,
+        bitsI32(0xffff_ffff),
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF9,
+        .{ f32Bits(4294967296.0), f32Bits(-1.0), f32Bits(-0.0), f32Bits(1.9) },
+        1,
+        0,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF9,
+        .{ f32Bits(4294967296.0), f32Bits(-1.0), f32Bits(-0.0), f32Bits(1.9) },
+        2,
+        0,
+    );
+    try expectI32x4TruncSatF32Lane(
+        0xF9,
+        .{ f32Bits(4294967296.0), f32Bits(-1.0), f32Bits(-0.0), f32Bits(1.9) },
+        3,
+        1,
+    );
+}
+
+test "differential SIMD: i32x4.trunc_sat_f64x2_s_zero handles edges and zeroes upper lanes" {
+    try expectI32x4TruncSatF64Lane(0xFC, .{ 0x7ff8_0000_0000_0001, 0x7ff0_0000_0000_0000 }, 0, 0);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ 0x7ff8_0000_0000_0001, 0x7ff0_0000_0000_0000 }, 1, 2147483647);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ 0xfff0_0000_0000_0000, f64Bits(-1.9) }, 0, -2147483648);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ 0xfff0_0000_0000_0000, f64Bits(-1.9) }, 1, -1);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ f64Bits(2147483648.0), f64Bits(-2147483649.0) }, 0, 2147483647);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ f64Bits(2147483648.0), f64Bits(-2147483649.0) }, 1, -2147483648);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ f64Bits(0.0), f64Bits(-0.0) }, 0, 0);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ f64Bits(0.0), f64Bits(-0.0) }, 1, 0);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ f64Bits(123.0), f64Bits(456.0) }, 2, 0);
+    try expectI32x4TruncSatF64Lane(0xFC, .{ f64Bits(123.0), f64Bits(456.0) }, 3, 0);
+}
+
+test "differential SIMD: i32x4.trunc_sat_f64x2_u_zero handles edges and zeroes upper lanes" {
+    try expectI32x4TruncSatF64Lane(0xFD, .{ 0x7ff8_0000_0000_0001, 0x7ff0_0000_0000_0000 }, 0, 0);
+    try expectI32x4TruncSatF64Lane(0xFD, .{ 0x7ff8_0000_0000_0001, 0x7ff0_0000_0000_0000 }, 1, bitsI32(0xffff_ffff));
+    try expectI32x4TruncSatF64Lane(0xFD, .{ 0xfff0_0000_0000_0000, f64Bits(1.9) }, 0, 0);
+    try expectI32x4TruncSatF64Lane(0xFD, .{ 0xfff0_0000_0000_0000, f64Bits(1.9) }, 1, 1);
+    try expectI32x4TruncSatF64Lane(0xFD, .{ f64Bits(4294967296.0), f64Bits(-1.0) }, 0, bitsI32(0xffff_ffff));
+    try expectI32x4TruncSatF64Lane(0xFD, .{ f64Bits(4294967296.0), f64Bits(-1.0) }, 1, 0);
+    try expectI32x4TruncSatF64Lane(0xFD, .{ f64Bits(0.0), f64Bits(-0.0) }, 0, 0);
+    try expectI32x4TruncSatF64Lane(0xFD, .{ f64Bits(0.0), f64Bits(-0.0) }, 1, 0);
+    try expectI32x4TruncSatF64Lane(0xFD, .{ f64Bits(123.0), f64Bits(456.0) }, 2, 0);
+    try expectI32x4TruncSatF64Lane(0xFD, .{ f64Bits(123.0), f64Bits(456.0) }, 3, 0);
+}
+
+fn f32Bits(value: f32) u32 {
+    return @bitCast(value);
+}
+
+fn f64Bits(value: f64) u64 {
+    return @bitCast(value);
+}
+
 fn bitsI32(bits: u32) i32 {
     return @bitCast(bits);
 }

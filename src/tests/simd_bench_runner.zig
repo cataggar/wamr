@@ -304,6 +304,26 @@ const cases = [_]BenchCase{
         .build = buildSimdI64x2ExtendHighI32x4ULane0Module,
     },
     .{
+        .name = "simd_i32x4_trunc_sat_f32x4_s_lane0",
+        .simd = true,
+        .build = buildSimdI32x4TruncSatF32x4SLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_trunc_sat_f32x4_u_lane0",
+        .simd = true,
+        .build = buildSimdI32x4TruncSatF32x4ULane0Module,
+    },
+    .{
+        .name = "simd_i32x4_trunc_sat_f64x2_s_zero_lane0",
+        .simd = true,
+        .build = buildSimdI32x4TruncSatF64x2SZeroLane0Module,
+    },
+    .{
+        .name = "simd_i32x4_trunc_sat_f64x2_u_zero_lane0",
+        .simd = true,
+        .build = buildSimdI32x4TruncSatF64x2UZeroLane0Module,
+    },
+    .{
         .name = "simd_f32x4_convert_i32x4_s_lane0",
         .simd = true,
         .build = buildSimdF32x4ConvertI32x4SLane0Module,
@@ -1813,6 +1833,47 @@ const int_to_float_convert_source_i32: [4]i32 = .{
     2,
     3,
 };
+
+const trunc_sat_f32_source_bits: [4]u32 = .{ 0x7fc0_0001, 0x7f80_0000, 0xff80_0000, 0x3ff3_3333 };
+const trunc_sat_f64_source_bits: [2]u64 = .{ 0x7ff8_0000_0000_0001, 0x7ff0_0000_0000_0000 };
+
+fn buildSimdI32x4TruncSatF32x4Lane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstF32x4Bits(&instr, allocator, trunc_sat_f32_source_bits);
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4TruncSatF32x4SLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI32x4TruncSatF32x4Lane0Module(allocator, 0xF8);
+}
+
+fn buildSimdI32x4TruncSatF32x4ULane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI32x4TruncSatF32x4Lane0Module(allocator, 0xF9);
+}
+
+fn buildSimdI32x4TruncSatF64x2ZeroLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI64x2(&instr, allocator, trunc_sat_f64_source_bits);
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdI32x4TruncSatF64x2SZeroLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI32x4TruncSatF64x2ZeroLane0Module(allocator, 0xFC);
+}
+
+fn buildSimdI32x4TruncSatF64x2UZeroLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdI32x4TruncSatF64x2ZeroLane0Module(allocator, 0xFD);
+}
 
 fn buildSimdF32x4ConvertI32x4Lane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
     var instr: std.ArrayList(u8) = .empty;

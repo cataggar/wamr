@@ -1870,6 +1870,53 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// FCVTZS Vd.4S, Vn.4S — f32 lanes to signed i32 lanes, round toward zero.
+    pub fn fcvtzs4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4EA1B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FCVTZU Vd.4S, Vn.4S — f32 lanes to unsigned i32 lanes, round toward zero.
+    pub fn fcvtzu4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6EA1B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FCVTZS Vd.2D, Vn.2D — f64 lanes to signed i64 lanes, round toward zero.
+    pub fn fcvtzs2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x4EE1B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FCVTZU Vd.2D, Vn.2D — f64 lanes to unsigned i64 lanes, round toward zero.
+    pub fn fcvtzu2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x6EE1B800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// SQXTN Vd.2S, Vn.2D — signed saturating narrow i64 lanes to i32.
+    pub fn sqxtn2s2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0EA14800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// UQXTN Vd.2S, Vn.2D — unsigned saturating narrow u64 lanes to u32.
+    pub fn uqxtn2s2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x2EA14800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// MOVI Vd.2D, #0 — zero all 128 bits of a vector register.
+    pub fn movi2dZero(self: *CodeBuffer, vd: u5) !void {
+        try self.emit32(0x6F00E400 | @as(u32, vd));
+    }
+
     /// FCVT Dd, Sn — promote single-precision to double-precision.
     pub fn fcvtPromoteSToD(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x1E22C000 | (@as(u32, vn) << 5) | vd);
@@ -3297,6 +3344,28 @@ test "emit: f64x2 vector arithmetic ops" {
         try code.fcmge2d(16, 17, 30);
         try expectWord(0x6E7EE630, &code);
     }
+}
+
+test "emit: SIMD float-to-int trunc_sat building blocks" {
+    const cases = [_]struct { name: []const u8, expected: u32 }{
+        .{ .name = "fcvtzs4s", .expected = 0x4EA1BA30 },
+        .{ .name = "fcvtzu4s", .expected = 0x6EA1BA30 },
+        .{ .name = "fcvtzs2d", .expected = 0x4EE1BA30 },
+        .{ .name = "fcvtzu2d", .expected = 0x6EE1BA30 },
+        .{ .name = "sqxtn2s2d", .expected = 0x0EA14A30 },
+        .{ .name = "uqxtn2s2d", .expected = 0x2EA14A30 },
+    };
+    inline for (cases) |c| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try @field(CodeBuffer, c.name)(&code, 16, 17);
+        try expectWord(c.expected, &code);
+    }
+
+    var code = CodeBuffer.init(std.testing.allocator);
+    defer code.deinit();
+    try code.movi2dZero(16);
+    try expectWord(0x6F00E410, &code);
 }
 
 test "emit: i32x4 variable shifts" {

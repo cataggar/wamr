@@ -88,6 +88,7 @@ pub const Inst = struct {
         f32x4_unop: F32x4UnOp,
         f32x4_binop: F32x4BinOp,
         f32x4_convert_i32x4: SimdIntToFloatConvert,
+        i32x4_trunc_sat: SimdFloatToIntTruncSat,
         f32x4_splat: VReg,
         f32x4_extract_lane: F32x4ExtractLane,
         f32x4_replace_lane: F32x4ReplaceLane,
@@ -302,6 +303,8 @@ pub const Inst = struct {
     pub const SimdExtendSign = enum { signed, unsigned };
     pub const SimdExtendHalfSelect = enum { low, high };
     pub const SimdIntToFloatSign = enum { signed, unsigned };
+    pub const SimdFloatToIntSign = enum { signed, unsigned };
+    pub const SimdFloatToIntSrcWidth = enum { f32x4, f64x2 };
 
     pub const I32x4Op = enum {
         add,
@@ -664,6 +667,12 @@ pub const Inst = struct {
 
     pub const SimdIntToFloatConvert = struct {
         sign: SimdIntToFloatSign,
+        vector: VReg,
+    };
+
+    pub const SimdFloatToIntTruncSat = struct {
+        src_width: SimdFloatToIntSrcWidth,
+        sign: SimdFloatToIntSign,
         vector: VReg,
     };
 
@@ -1272,22 +1281,31 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.SimdIntToFloatSign.unsigned, f32_convert.op.f32x4_convert_i32x4.sign);
     try std.testing.expectEqual(@as(VReg, 26), f32_convert.op.f32x4_convert_i32x4.vector);
 
-    const f32_un = Inst{
-        .op = .{ .f32x4_unop = .{ .op = .sqrt, .vector = 27 } },
+    const i32_trunc = Inst{
+        .op = .{ .i32x4_trunc_sat = .{ .src_width = .f64x2, .sign = .signed, .vector = 27 } },
         .dest = 28,
         .type = .v128,
     };
+    try std.testing.expectEqual(Inst.SimdFloatToIntSrcWidth.f64x2, i32_trunc.op.i32x4_trunc_sat.src_width);
+    try std.testing.expectEqual(Inst.SimdFloatToIntSign.signed, i32_trunc.op.i32x4_trunc_sat.sign);
+    try std.testing.expectEqual(@as(VReg, 27), i32_trunc.op.i32x4_trunc_sat.vector);
+
+    const f32_un = Inst{
+        .op = .{ .f32x4_unop = .{ .op = .sqrt, .vector = 28 } },
+        .dest = 29,
+        .type = .v128,
+    };
     try std.testing.expectEqual(Inst.F32x4UnaryOp.sqrt, f32_un.op.f32x4_unop.op);
-    try std.testing.expectEqual(@as(VReg, 27), f32_un.op.f32x4_unop.vector);
+    try std.testing.expectEqual(@as(VReg, 28), f32_un.op.f32x4_unop.vector);
 
     const f32_bin = Inst{
-        .op = .{ .f32x4_binop = .{ .op = .pmax, .lhs = 28, .rhs = 29 } },
-        .dest = 30,
+        .op = .{ .f32x4_binop = .{ .op = .pmax, .lhs = 29, .rhs = 30 } },
+        .dest = 31,
         .type = .v128,
     };
     try std.testing.expectEqual(Inst.F32x4Op.pmax, f32_bin.op.f32x4_binop.op);
-    try std.testing.expectEqual(@as(VReg, 28), f32_bin.op.f32x4_binop.lhs);
-    try std.testing.expectEqual(@as(VReg, 29), f32_bin.op.f32x4_binop.rhs);
+    try std.testing.expectEqual(@as(VReg, 29), f32_bin.op.f32x4_binop.lhs);
+    try std.testing.expectEqual(@as(VReg, 30), f32_bin.op.f32x4_binop.rhs);
 
     const i16_extmul = Inst{
         .op = .{ .i16x8_extmul_i8x16 = .{ .sign = .signed, .half = .high, .lhs = 30, .rhs = 31 } },
