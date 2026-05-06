@@ -387,4 +387,241 @@ pub fn build(b: *std.Build) void {
         const install_fuzz = b.addInstallArtifact(fuzz_exe, .{});
         fuzz_step.dependOn(&install_fuzz.step);
     }
+
+    // ── Component-model examples ─────────────────────────────────────
+    // Reproducible Zig (and one mixed Zig+Rust) WebAssembly component
+    // examples under `tests/component/src/`. Opt-in: not reachable from
+    // the default `zig build` or `zig build test` graphs. See
+    // `tests/component/README.md` for prereqs and runtime status.
+    addComponentExamples(b, exe);
+}
+
+/// Wires up the Component-Model example pipeline (sources under
+/// `tests/component/src/`). Two opt-in steps are exposed:
+///   * `zig build component-examples`     — build + validate all four
+///   * `zig build component-examples-run` — runs `zig-hello` through `wamr`
+/// Neither is reachable from `zig build` or `zig build test`.
+///
+/// Pinned versions:
+///   * Wasmtime preview1 → component adapter v36.0.9 (sha256 verified)
+///   * `wasm-tools` ≥ 1.220 expected on PATH (also provides `validate`/`compose`)
+///   * `cargo` with `wasm32-wasip1` target for the mixed example
+fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
+    const adapter_url =
+        "https://github.com/bytecodealliance/wasmtime/releases/download/v36.0.9/wasi_snapshot_preview1.command.wasm";
+    const adapter_sha256 =
+        "2b0afc5edd1301716580c2df9d14b350529d770b54804def60c69807ed7600e0";
+
+    // Fetch + sha256-verify the wasi-preview1 → component adapter.
+    // sh -c "<script>" -- $1=output-path
+    const fetch_script = b.fmt(
+        "set -eu\n" ++
+            "curl --fail --silent --show-error --location --output \"$1\" \"{s}\"\n" ++
+            "echo \"{s}  $1\" | sha256sum -c -\n",
+        .{ adapter_url, adapter_sha256 },
+    );
+    const fetch_adapter = b.addSystemCommand(&.{ "sh", "-c", fetch_script, "--" });
+    fetch_adapter.setName("fetch wasi-preview1 adapter (v36.0.9)");
+    const adapter = fetch_adapter.addOutputFileArg("wasi_snapshot_preview1.command.wasm");
+
+    const examples_step = b.step(
+        "component-examples",
+        "Build the WebAssembly Component examples in tests/component/src/",
+    );
+    const run_step = b.step(
+        "component-examples-run",
+        "Run the runnable component examples (zig-hello) through ./zig-out/bin/wamr",
+    );
+
+    // ── zig-hello ──────────────────────────────────────────────────
+    // Pure-Zig WASI command: `_start` writes a greeting via fd_write.
+    const hello_core = compileZigWasm(b, .{
+        .source = "tests/component/src/zig-hello/src/main.zig",
+        .target_triple = "wasm32-wasi",
+        .exports = &.{"_start"},
+        .output = "zig-hello.core.wasm",
+    });
+    const hello = makeCommandComponent(b, .{
+        .name = "zig-hello",
+        .core = hello_core,
+        .adapter = adapter,
+    });
+    installAndValidate(b, examples_step, hello, "zig-hello.component.wasm");
+
+    // The hello component is the only example that runs end-to-end on
+    // wamr today; wire it into `component-examples-run`. wamr's
+    // component-model CLI captures stdout via the wasi-cli adapter and
+    // currently flushes it to the host's *stderr* fd (the captured
+    // bytes go through `init.io`'s File-write dispatch which lands on
+    // fd 2 today; tracking issue separate from this PR). Pin the
+    // assertion to the observed behaviour so the run step is stable.
+    const run_hello = b.addRunArtifact(wamr_exe);
+    run_hello.addFileArg(hello);
+    run_hello.expectExitCode(0);
+    run_hello.expectStdErrEqual("hello from zig component\n");
+    run_step.dependOn(&run_hello.step);
+
+    // ── zig-adder ──────────────────────────────────────────────────
+    // Library component (no `run`): exports `docs:adder/add@0.1.0`.
+    const adder_core = compileZigWasm(b, .{
+        .source = "tests/component/src/zig-adder/src/main.zig",
+        .target_triple = "wasm32-freestanding",
+        .exports = &.{"docs:adder/add@0.1.0#add"},
+        .output = "zig-adder.core.wasm",
+    });
+    const adder_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "adder" });
+    adder_embed.addDirectoryArg(b.path("tests/component/src/zig-adder/wit"));
+    adder_embed.addFileArg(adder_core);
+    adder_embed.addArg("-o");
+    const adder_embedded = adder_embed.addOutputFileArg("zig-adder.embed.wasm");
+
+    const adder_new = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    adder_new.addFileArg(adder_embedded);
+    adder_new.addArg("-o");
+    // `wasm-tools compose` requires kebab-case file basenames (no dots
+    // before the .wasm extension). Emit `zig-adder.wasm` for use as a
+    // compose dependency below; the install copy uses the more
+    // descriptive `.component.wasm` suffix for end-user discoverability.
+    const adder = adder_new.addOutputFileArg("zig-adder.wasm");
+    installAndValidate(b, examples_step, adder, "zig-adder.component.wasm");
+
+    // ── zig-calculator-cmd (Zig command importing zig-adder) ───────
+    const calc_core = compileZigWasm(b, .{
+        .source = "tests/component/src/zig-calculator-cmd/src/main.zig",
+        .target_triple = "wasm32-wasi",
+        .exports = &.{"_start"},
+        .output = "zig-calculator-cmd.core.wasm",
+    });
+    const calc_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "app" });
+    calc_embed.addDirectoryArg(b.path("tests/component/src/zig-calculator-cmd/wit"));
+    calc_embed.addFileArg(calc_core);
+    calc_embed.addArg("-o");
+    const calc_embedded = calc_embed.addOutputFileArg("zig-calculator-cmd.embed.wasm");
+
+    const calc_new = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    calc_new.addFileArg(calc_embedded);
+    calc_new.addArg("--adapt");
+    calc_new.addPrefixedFileArg("wasi_snapshot_preview1=", adapter);
+    calc_new.addArg("-o");
+    // Kebab-case basename for `wasm-tools compose` consumption.
+    const calc_cmd = calc_new.addOutputFileArg("zig-calculator-cmd.wasm");
+
+    // Compose: link `docs:adder/add@0.1.0` import against the Zig adder.
+    // wasm-tools compose is deprecated upstream in favour of `wac`; we use
+    // it because it ships with wasm-tools 1.220.
+    const calc_compose = b.addSystemCommand(&.{ "wasm-tools", "compose", "-d" });
+    calc_compose.addFileArg(adder);
+    calc_compose.addFileArg(calc_cmd);
+    calc_compose.addArg("-o");
+    const calc_final = calc_compose.addOutputFileArg("zig-calculator-cmd.composed.wasm");
+    installAndValidate(b, examples_step, calc_final, "zig-calculator-cmd.composed.wasm");
+
+    // ── mixed-zig-rust-calc (Zig adder + Rust command, composed) ───
+    // Rust command builds via cargo on `wasm32-wasip1`; we then run the
+    // standard wasm-tools embed/new pipeline and compose against the
+    // Zig adder. Build is opt-in — failure mode if cargo / target not
+    // present is a clear cargo error.
+    const cargo = b.addSystemCommand(&.{
+        "cargo",           "build",
+        "--release",       "--target",
+        "wasm32-wasip1",   "--manifest-path",
+        "tests/component/src/mixed-zig-rust-calc/command/Cargo.toml",
+    });
+    cargo.setName("cargo build (mixed-zig-rust-calc command)");
+    // Cargo writes its outputs to a deterministic path; we surface the
+    // wasm via a follow-up `cp` so downstream addFileArg gets a
+    // build-graph-tracked LazyPath.
+    const cargo_pickup = b.addSystemCommand(&.{
+        "cp",
+        "tests/component/src/mixed-zig-rust-calc/command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm",
+    });
+    cargo_pickup.step.dependOn(&cargo.step);
+    const rust_core = cargo_pickup.addOutputFileArg("mixed_zig_rust_command.core.wasm");
+
+    const rust_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "app" });
+    rust_embed.addDirectoryArg(b.path("tests/component/src/mixed-zig-rust-calc/command/wit"));
+    rust_embed.addFileArg(rust_core);
+    rust_embed.addArg("-o");
+    const rust_embedded = rust_embed.addOutputFileArg("mixed-rust-command.embed.wasm");
+
+    const rust_new = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    rust_new.addFileArg(rust_embedded);
+    rust_new.addArg("--adapt");
+    rust_new.addPrefixedFileArg("wasi_snapshot_preview1=", adapter);
+    rust_new.addArg("-o");
+    // Kebab-case basename for `wasm-tools compose`.
+    const rust_cmd = rust_new.addOutputFileArg("mixed-rust-command.wasm");
+
+    const mixed_compose = b.addSystemCommand(&.{ "wasm-tools", "compose", "-d" });
+    mixed_compose.addFileArg(adder);
+    mixed_compose.addFileArg(rust_cmd);
+    mixed_compose.addArg("-o");
+    const mixed_final = mixed_compose.addOutputFileArg("mixed-zig-rust-calc.composed.wasm");
+    installAndValidate(b, examples_step, mixed_final, "mixed-zig-rust-calc.composed.wasm");
+}
+
+const ZigWasmCompile = struct {
+    source: []const u8,
+    /// `wasm32-wasi` for command components, `wasm32-freestanding` for
+    /// library components without WASI imports.
+    target_triple: []const u8,
+    /// Names of symbols passed via `--export=<name>`. The first element
+    /// also names the entrypoint when `_start` is the only export.
+    exports: []const []const u8,
+    output: []const u8,
+};
+
+/// Invokes `zig build-exe -target <…> -O ReleaseSmall -fno-entry --export=<…>`
+/// via `b.graph.zig_exe`, capturing the output as a build-graph LazyPath.
+fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{
+        b.graph.zig_exe, "build-exe",
+        "-target",       opts.target_triple,
+        "-O",            "ReleaseSmall",
+        "-fno-entry",
+    });
+    for (opts.exports) |sym| {
+        cmd.addArg(b.fmt("--export={s}", .{sym}));
+    }
+    cmd.addFileArg(b.path(opts.source));
+    const out = cmd.addPrefixedOutputFileArg("-femit-bin=", opts.output);
+    cmd.setName(b.fmt("zig build-exe {s}", .{opts.output}));
+    return out;
+}
+
+const CommandComponent = struct {
+    name: []const u8,
+    core: std.Build.LazyPath,
+    adapter: std.Build.LazyPath,
+};
+
+/// Wraps `wasm-tools component new --adapt wasi_snapshot_preview1=<adapter>`.
+fn makeCommandComponent(b: *std.Build, opts: CommandComponent) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    cmd.addFileArg(opts.core);
+    cmd.addArg("--adapt");
+    cmd.addPrefixedFileArg("wasi_snapshot_preview1=", opts.adapter);
+    cmd.addArg("-o");
+    return cmd.addOutputFileArg(b.fmt("{s}.component.wasm", .{opts.name}));
+}
+
+/// Validates the component and installs it under
+/// `zig-out/component-examples/<basename>`.
+fn installAndValidate(
+    b: *std.Build,
+    parent: *std.Build.Step,
+    component: std.Build.LazyPath,
+    install_basename: []const u8,
+) void {
+    const validate = b.addSystemCommand(&.{ "wasm-tools", "validate" });
+    validate.addFileArg(component);
+    validate.setName(b.fmt("wasm-tools validate {s}", .{install_basename}));
+
+    const install = b.addInstallFileWithDir(
+        component,
+        .{ .custom = "component-examples" },
+        install_basename,
+    );
+    install.step.dependOn(&validate.step);
+    parent.dependOn(&install.step);
 }

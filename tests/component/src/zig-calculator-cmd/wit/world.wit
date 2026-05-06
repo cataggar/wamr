@@ -1,0 +1,7 @@
+package docs:zigcalc@0.1.0;
+
+/// World for the Zig calculator-command example: imports the adder
+/// interface and lets the wasi-preview1 adapter satisfy WASI.
+world app {
+    import docs:adder/add@0.1.0;
+}
