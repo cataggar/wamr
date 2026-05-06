@@ -3995,16 +3995,65 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
     }
 }
 
+const inline_small_max_blocks: u32 = 16;
+const inline_small_max_insts: u32 = 64;
+
+fn localTypeOf(func: *const ir.IrFunction, idx: u32) ir.IrType {
+    if (func.local_types) |lt| {
+        if (idx < lt.len) return lt[idx];
+    }
+    return .i32;
+}
+
+fn hasLocalSet(func: *const ir.IrFunction) bool {
+    for (func.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            if (inst.op == .local_set) return true;
+        }
+    }
+    return false;
+}
+
+fn extendCallerLocalsForInline(caller: *ir.IrFunction, callee: *const ir.IrFunction) !u32 {
+    const base = caller.local_count;
+    const new_count = base + callee.local_count;
+    if (callee.local_count == 0) return base;
+
+    if (caller.local_types != null or callee.local_types != null) {
+        const new_types = try caller.allocator.alloc(ir.IrType, new_count);
+        errdefer caller.allocator.free(new_types);
+
+        for (0..base) |i| new_types[i] = localTypeOf(caller, @intCast(i));
+        for (0..callee.local_count) |i| {
+            new_types[base + i] = localTypeOf(callee, @intCast(i));
+        }
+
+        if (caller.local_types) |old_types| caller.allocator.free(old_types);
+        caller.local_types = new_types;
+    }
+
+    caller.local_count = new_count;
+    return base;
+}
+
+fn zeroOpForType(local_type: ir.IrType) ir.Inst.Op {
+    return switch (local_type) {
+        .i32 => .{ .iconst_32 = 0 },
+        .i64 => .{ .iconst_64 = 0 },
+        .f32 => .{ .fconst_32 = 0 },
+        .f64 => .{ .fconst_64 = 0 },
+        .v128 => .{ .v128_const = 0 },
+        .void => .{ .iconst_32 = 0 },
+    };
+}
+
 /// Is this callee eligible for the inliner?
 ///   - Non-empty, ≤ `max_blocks` blocks
 ///   - Total instructions ≤ `max_insts`
 ///   - No calls (direct/indirect/ref), no call_result
 ///   - No memory_grow, no atomics, no bulk memory/table ops
-///   - No `br_table` (avoid cloning the targets slice)
 ///   - No `ret_multi`
-///   - local_count == param_count (no extra declared locals)
-///   - No `local_set` anywhere (params aren't mutated)
-///   - Every `local_get` targets a param (idx < param_count)
+///   - Every `local_get`/`local_set` targets an existing callee local
 ///   - `result_count` ∈ {0, 1}
 ///   - If result_count == 1: exactly one `ret` (so the returned value
 ///     is unambiguous; phi would be required otherwise)
@@ -4015,7 +4064,6 @@ fn isInlinable(callee: *const ir.IrFunction, max_insts: u32, max_blocks: u32) bo
     if (nblocks == 0) return false;
     if (nblocks > max_blocks) return false;
     if (callee.result_count > 1) return false;
-    if (callee.local_count != callee.param_count) return false;
 
     var total_insts: u32 = 0;
     var ret_count: u32 = 0;
@@ -4046,11 +4094,10 @@ fn isInlinable(callee: *const ir.IrFunction, max_insts: u32, max_blocks: u32) bo
                 .table_grow,
                 .data_drop,
                 .elem_drop,
-                .br_table,
                 .ret_multi,
-                .local_set,
                 => return false,
-                .local_get => |idx| if (idx >= callee.param_count) return false,
+                .local_get => |idx| if (idx >= callee.local_count) return false,
+                .local_set => |ls| if (ls.idx >= callee.local_count) return false,
                 .ret => ret_count += 1,
                 else => {},
             }
@@ -4065,9 +4112,8 @@ fn isInlinable(callee: *const ir.IrFunction, max_insts: u32, max_blocks: u32) bo
     return true;
 }
 
-/// Shift every `BlockId` referenced by `inst` (br / br_if targets) by
-/// `+offset`. br_table is excluded by `isInlinable` so we don't handle
-/// it here.
+/// Shift every inline `BlockId` referenced by `inst` by `+offset`.
+/// br_table target slices are deep-cloned by the inliner before append.
 fn shiftBlockIdsInInst(inst: *ir.Inst, offset: ir.BlockId) void {
     switch (inst.op) {
         .br => |*t| t.* += offset,
@@ -4075,6 +4121,7 @@ fn shiftBlockIdsInInst(inst: *ir.Inst, offset: ir.BlockId) void {
             bi.then_block += offset;
             bi.else_block += offset;
         },
+        .br_table => |*bt| bt.default += offset,
         else => {},
     }
 }
@@ -4099,15 +4146,12 @@ fn shiftBlockIdsInInst(inst: *ir.Inst, offset: ir.BlockId) void {
 /// result, its (single) `ret` value is translated through local renames
 /// (to cover the `local.get; ret` identity case) and the call's dest is
 /// rewritten to it.
-pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) !bool {
-    const max_blocks: u32 = 8;
-    const max_insts: u32 = 32;
-
+fn inlineSmallFunctionsCount(module: *ir.IrModule, allocator: std.mem.Allocator) !u32 {
     var eligible = try allocator.alloc(bool, module.functions.items.len);
     defer allocator.free(eligible);
-    for (module.functions.items, 0..) |*f, i| eligible[i] = isInlinable(f, max_insts, max_blocks);
+    for (module.functions.items, 0..) |*f, i| eligible[i] = isInlinable(f, inline_small_max_insts, inline_small_max_blocks);
 
-    var any_inlined = false;
+    var inlined_count: u32 = 0;
     for (module.functions.items, 0..) |*caller, caller_idx| {
         // Only scan blocks that existed at the start of this pass. Newly
         // created clone blocks can't contain eligible calls (isInlinable
@@ -4149,9 +4193,20 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
             const call_args = call.args;
             const callee_ref_idx: usize = @intCast(call.func_idx - module.import_count);
             const callee = &module.functions.items[callee_ref_idx];
+            const needs_synthetic_locals = callee.local_count != callee.param_count or hasLocalSet(callee);
 
             const vreg_offset: ir.VReg = caller.next_vreg;
             caller.next_vreg += callee.next_vreg;
+
+            var local_map: []u32 = &.{};
+            defer if (local_map.len != 0) allocator.free(local_map);
+            if (needs_synthetic_locals) {
+                const local_base = try extendCallerLocalsForInline(caller, callee);
+                local_map = try allocator.alloc(u32, callee.local_count);
+                for (local_map, 0..) |*mapped, local_idx| {
+                    mapped.* = local_base + @as(u32, @intCast(local_idx));
+                }
+            }
 
             // Allocate clone blocks, then B_after last, so storage order
             // matches execution order (B → clones → B_after). `computeLiveRanges`
@@ -4189,14 +4244,46 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
 
             for (callee.blocks.items, 0..) |callee_block, cidx| {
                 const clone_id: ir.BlockId = clone_offset + @as(ir.BlockId, @intCast(cidx));
+                if (needs_synthetic_locals and cidx == 0) {
+                    for (0..callee.param_count) |param_idx| {
+                        try caller.blocks.items[clone_id].instructions.append(caller.allocator, .{
+                            .op = .{ .local_set = .{
+                                .idx = local_map[param_idx],
+                                .val = call_args[param_idx],
+                            } },
+                        });
+                    }
+                    for (callee.param_count..callee.local_count) |local_idx| {
+                        const local_type = localTypeOf(callee, @intCast(local_idx));
+                        const zero = caller.newVReg();
+                        try caller.blocks.items[clone_id].instructions.append(caller.allocator, .{
+                            .op = zeroOpForType(local_type),
+                            .dest = zero,
+                            .type = local_type,
+                        });
+                        try caller.blocks.items[clone_id].instructions.append(caller.allocator, .{
+                            .op = .{ .local_set = .{
+                                .idx = local_map[local_idx],
+                                .val = zero,
+                            } },
+                        });
+                    }
+                }
                 for (callee_block.instructions.items) |citem| {
                     switch (citem.op) {
                         .local_get => |idx| {
-                            const shifted_dest = (citem.dest orelse continue) + vreg_offset;
-                            try local_renames.append(allocator, .{
-                                .from = shifted_dest,
-                                .to = call_args[idx],
-                            });
+                            if (needs_synthetic_locals) {
+                                var cloned = citem;
+                                cloned.op = .{ .local_get = local_map[idx] };
+                                shiftVRegsInInst(&cloned, vreg_offset);
+                                try caller.blocks.items[clone_id].instructions.append(caller.allocator, cloned);
+                            } else {
+                                const shifted_dest = (citem.dest orelse continue) + vreg_offset;
+                                try local_renames.append(allocator, .{
+                                    .from = shifted_dest,
+                                    .to = call_args[idx],
+                                });
+                            }
                         },
                         .ret => |maybe_v| {
                             if (maybe_v) |v| {
@@ -4211,8 +4298,25 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
                         },
                         else => {
                             var cloned = citem;
+                            if (needs_synthetic_locals and cloned.op == .local_set) {
+                                cloned.op.local_set.idx = local_map[cloned.op.local_set.idx];
+                            }
                             shiftVRegsInInst(&cloned, vreg_offset);
-                            shiftBlockIdsInInst(&cloned, clone_offset);
+                            if (cloned.op == .br_table) {
+                                const old_targets = cloned.op.br_table.targets;
+                                const new_targets = try caller.allocator.alloc(ir.BlockId, old_targets.len);
+                                var targets_owned = false;
+                                errdefer if (!targets_owned) caller.allocator.free(new_targets);
+                                for (old_targets, 0..) |target, target_idx| {
+                                    new_targets[target_idx] = target + clone_offset;
+                                }
+                                try caller.owned_br_table_targets.append(caller.allocator, new_targets);
+                                targets_owned = true;
+                                cloned.op.br_table.targets = new_targets;
+                                cloned.op.br_table.default += clone_offset;
+                            } else {
+                                shiftBlockIdsInInst(&cloned, clone_offset);
+                            }
                             try caller.blocks.items[clone_id].instructions.append(caller.allocator, cloned);
                         },
                     }
@@ -4244,10 +4348,14 @@ pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) 
                 }
             }
 
-            any_inlined = true;
+            inlined_count += 1;
         }
     }
-    return any_inlined;
+    return inlined_count;
+}
+
+pub fn inlineSmallFunctions(module: *ir.IrModule, allocator: std.mem.Allocator) !bool {
+    return (try inlineSmallFunctionsCount(module, allocator)) != 0;
 }
 
 // ── SSA Promotion (mem2reg) ─────────────────────────────────────────────
@@ -4749,9 +4857,15 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
     // Module-level: inline small leaf callees before per-function passes.
     // Iterate to fixpoint so callers of callers also benefit.
     var inline_iter: u32 = 0;
+    var inlined_count: u32 = 0;
     while (inline_iter < 4) : (inline_iter += 1) {
-        if (!(try inlineSmallFunctions(module, allocator))) break;
+        const iter_inlined = try inlineSmallFunctionsCount(module, allocator);
+        if (iter_inlined == 0) break;
+        inlined_count += iter_inlined;
         total_changes += 1;
+    }
+    if (inlined_count != 0) {
+        std.log.debug("inlineSmallFunctions: inlined {d} call(s) over {d} iteration(s)", .{ inlined_count, inline_iter });
     }
     for (module.functions.items) |*func| {
         // SSA promotion: run once before the fixpoint loop.
@@ -6393,6 +6507,180 @@ test "inlineSmallFunctions: multi-block if/else callee is inlined" {
     for (caller.blocks.items) |blk| {
         for (blk.instructions.items) |inst| try std.testing.expect(inst.op != .call);
     }
+}
+
+test "inlineSmallFunctions: local_set callee gets inlined with synthetic local renumbering" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // Callee: fn set_param(x) -> i32 { local.set 0, 7; local.get 0; return }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    {
+        const callee = &module.functions.items[0];
+        const cb = try callee.newBlock();
+        _ = callee.newVReg(); // param 0 placeholder
+        const v_new = callee.newVReg();
+        const v_get = callee.newVReg();
+        try callee.getBlock(cb).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_new, .type = .i32 });
+        try callee.getBlock(cb).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_new } } });
+        try callee.getBlock(cb).append(.{ .op = .{ .local_get = 0 }, .dest = v_get, .type = .i32 });
+        try callee.getBlock(cb).append(.{ .op = .{ .ret = v_get } });
+    }
+
+    // Caller has one original local; the inlined callee must not reuse local 0.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+    const caller_original_locals = module.functions.items[1].local_count;
+    {
+        const caller = &module.functions.items[1];
+        const mb = try caller.newBlock();
+        _ = caller.newVReg(); // param 0 placeholder
+        const v_arg = caller.newVReg();
+        const v_ret = caller.newVReg();
+        try caller.getBlock(mb).append(.{ .op = .{ .local_get = 0 }, .dest = v_arg, .type = .i32 });
+        args[0] = v_arg;
+        try caller.getBlock(mb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_ret, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    const inlined = try inlineSmallFunctions(&module, allocator);
+    try std.testing.expect(inlined);
+
+    const caller = &module.functions.items[1];
+    try std.testing.expectEqual(caller_original_locals + 1, caller.local_count);
+    const clone_entry = caller.blocks.items[1].instructions.items;
+    var saw_local_set = false;
+    var saw_local_get = false;
+    for (clone_entry) |inst| {
+        switch (inst.op) {
+            .local_set => |ls| {
+                try std.testing.expect(ls.idx >= caller_original_locals);
+                saw_local_set = true;
+            },
+            .local_get => |idx| {
+                try std.testing.expect(idx >= caller_original_locals);
+                saw_local_get = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_local_set);
+    try std.testing.expect(saw_local_get);
+}
+
+test "inlineSmallFunctions: multi-block callee with declared locals zero-inits synthetic local" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // Callee: fn read_declared(x) -> i32 { local.get 1; br tail; tail: ret }
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 2));
+    {
+        const callee = &module.functions.items[0];
+        const c_entry = try callee.newBlock();
+        const c_tail = try callee.newBlock();
+        _ = callee.newVReg(); // param 0 placeholder
+        const v_local = callee.newVReg();
+        try callee.getBlock(c_entry).append(.{ .op = .{ .local_get = 1 }, .dest = v_local, .type = .i32 });
+        try callee.getBlock(c_entry).append(.{ .op = .{ .br = c_tail } });
+        try callee.getBlock(c_tail).append(.{ .op = .{ .ret = v_local } });
+    }
+
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+    const caller_original_locals = module.functions.items[1].local_count;
+    {
+        const caller = &module.functions.items[1];
+        const mb = try caller.newBlock();
+        _ = caller.newVReg(); // param 0 placeholder
+        const v_arg = caller.newVReg();
+        const v_ret = caller.newVReg();
+        try caller.getBlock(mb).append(.{ .op = .{ .local_get = 0 }, .dest = v_arg, .type = .i32 });
+        args[0] = v_arg;
+        try caller.getBlock(mb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_ret, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    const inlined = try inlineSmallFunctions(&module, allocator);
+    try std.testing.expect(inlined);
+
+    const caller = &module.functions.items[1];
+    try std.testing.expectEqual(caller_original_locals + 2, caller.local_count);
+    const clone_entry = caller.blocks.items[1].instructions.items;
+    try std.testing.expect(clone_entry[0].op == .local_set);
+    try std.testing.expectEqual(caller_original_locals, clone_entry[0].op.local_set.idx);
+    try std.testing.expect(clone_entry[1].op == .iconst_32);
+    try std.testing.expectEqual(@as(i32, 0), clone_entry[1].op.iconst_32);
+    try std.testing.expect(clone_entry[2].op == .local_set);
+    try std.testing.expectEqual(caller_original_locals + 1, clone_entry[2].op.local_set.idx);
+    try std.testing.expectEqual(clone_entry[1].dest.?, clone_entry[2].op.local_set.val);
+    try std.testing.expect(clone_entry[3].op == .local_get);
+    try std.testing.expectEqual(caller_original_locals + 1, clone_entry[3].op.local_get);
+}
+
+test "inlineSmallFunctions: br_table callee gets inlined with remapped targets" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    const callee_targets = try allocator.alloc(ir.BlockId, 2);
+    defer allocator.free(callee_targets);
+
+    // Callee: br_table over two branch blocks plus a default tail, with one ret.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    {
+        const callee = &module.functions.items[0];
+        const c_entry = try callee.newBlock();
+        const c_t0 = try callee.newBlock();
+        const c_t1 = try callee.newBlock();
+        const c_tail = try callee.newBlock();
+        callee_targets[0] = c_t0;
+        callee_targets[1] = c_t1;
+        _ = callee.newVReg(); // param 0 placeholder
+        const v_idx = callee.newVReg();
+        const v_ret = callee.newVReg();
+        try callee.getBlock(c_entry).append(.{ .op = .{ .local_get = 0 }, .dest = v_idx, .type = .i32 });
+        try callee.getBlock(c_entry).append(.{ .op = .{ .br_table = .{
+            .index = v_idx,
+            .targets = callee_targets,
+            .default = c_tail,
+        } } });
+        try callee.getBlock(c_t0).append(.{ .op = .{ .br = c_tail } });
+        try callee.getBlock(c_t1).append(.{ .op = .{ .br = c_tail } });
+        try callee.getBlock(c_tail).append(.{ .op = .{ .iconst_32 = 11 }, .dest = v_ret, .type = .i32 });
+        try callee.getBlock(c_tail).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+    {
+        const caller = &module.functions.items[1];
+        const mb = try caller.newBlock();
+        _ = caller.newVReg(); // param 0 placeholder
+        const v_arg = caller.newVReg();
+        const v_ret = caller.newVReg();
+        try caller.getBlock(mb).append(.{ .op = .{ .local_get = 0 }, .dest = v_arg, .type = .i32 });
+        args[0] = v_arg;
+        try caller.getBlock(mb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = v_ret, .type = .i32 });
+        try caller.getBlock(mb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    const inlined = try inlineSmallFunctions(&module, allocator);
+    try std.testing.expect(inlined);
+
+    const caller = &module.functions.items[1];
+    const clone_offset: ir.BlockId = 1;
+    const br_table_inst = caller.blocks.items[clone_offset].instructions.items[0];
+    try std.testing.expect(br_table_inst.op == .br_table);
+    const bt = br_table_inst.op.br_table;
+    try std.testing.expectEqual(clone_offset + 1, bt.targets[0]);
+    try std.testing.expectEqual(clone_offset + 2, bt.targets[1]);
+    try std.testing.expectEqual(clone_offset + 3, bt.default);
+    try std.testing.expectEqual(module.functions.items[1].blocks.items[0].instructions.items[0].dest.?, bt.index);
 }
 
 test "foldConstantBranches: zero cond picks else block" {

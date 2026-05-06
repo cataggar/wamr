@@ -893,6 +893,7 @@ pub const IrFunction = struct {
     /// Per-local IR type (params first, then declared locals, then synthetic).
     /// Populated by the frontend; used by mem2reg for typed-zero seeding.
     local_types: ?[]const IrType = null,
+    owned_br_table_targets: std.ArrayList([]const BlockId) = .empty,
     blocks: std.ArrayList(BasicBlock) = .empty,
     next_vreg: VReg = 0,
     allocator: std.mem.Allocator,
@@ -909,6 +910,8 @@ pub const IrFunction = struct {
     pub fn deinit(self: *IrFunction) void {
         for (self.blocks.items) |*block| block.deinit();
         self.blocks.deinit(self.allocator);
+        for (self.owned_br_table_targets.items) |targets| self.allocator.free(targets);
+        self.owned_br_table_targets.deinit(self.allocator);
         if (self.local_types) |lt| self.allocator.free(lt);
     }
 
