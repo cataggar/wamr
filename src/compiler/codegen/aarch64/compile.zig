@@ -545,6 +545,10 @@ const FuncCompileCtx = struct {
     /// Map from add/sub dest vreg → (mul_lhs, mul_rhs, addend) source
     /// triple. Populated by the FMA pre-pass in lockstep with `mul_fused`.
     fma_info: ?*const std.AutoHashMap(ir.VReg, FmaInfo) = null,
+    /// SIMD f32x4/f64x2 mul dests consumed by a fused FMLA/FMLS.
+    simd_mul_fused: ?*const std.AutoHashMap(ir.VReg, void) = null,
+    /// SIMD add/sub dest vreg → fused FMLA/FMLS source triple.
+    simd_fma_info: ?*const std.AutoHashMap(ir.VReg, FmaInfo) = null,
     /// Byte offsets of every callee-save save/restore block emitted. Each
     /// entry is the 10 STR/LDR offsets for one `emitCalleeSaveStore` or
     /// `emitCalleeSaveRestore` call. After the body is compiled, offsets
@@ -565,6 +569,11 @@ const FmaInfo = struct {
     mul_rhs: ir.VReg,
     addend: ir.VReg,
     is_sub: bool,
+};
+
+const SimdFmaBin = union(enum) {
+    f32: ir.Inst.F32x4BinOp,
+    f64: ir.Inst.F64x2BinOp,
 };
 
 const KillUseCtx = struct {
@@ -929,6 +938,12 @@ pub fn compileFunctionImpl(
     // them at the add position.
     var fma_add_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer fma_add_pos.deinit();
+    var simd_mul_fused = std.AutoHashMap(ir.VReg, void).init(allocator);
+    defer simd_mul_fused.deinit();
+    var simd_fma_info = std.AutoHashMap(ir.VReg, FmaInfo).init(allocator);
+    defer simd_fma_info.deinit();
+    var simd_fma_add_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer simd_fma_add_pos.deinit();
     {
         var global_idx: u32 = 0;
         for (block_order) |bo_bid| {
@@ -939,18 +954,70 @@ pub fn compileFunctionImpl(
                 const add_inst = insts[i];
                 const is_add = add_inst.op == .add;
                 const is_sub = add_inst.op == .sub;
-                if (!is_add and !is_sub) continue;
-                if (add_inst.type != .i32 and add_inst.type != .i64) continue;
-                const bin: ir.Inst.BinOp = switch (add_inst.op) {
-                    .add => |b| b,
-                    .sub => |b| b,
-                    else => continue,
+                if ((is_add or is_sub) and (add_inst.type == .i32 or add_inst.type == .i64)) {
+                    const bin: ir.Inst.BinOp = switch (add_inst.op) {
+                        .add => |b| b,
+                        .sub => |b| b,
+                        else => unreachable,
+                    };
+                    const candidates: [2]?ir.VReg = if (is_add)
+                        .{ bin.rhs, bin.lhs }
+                    else
+                        .{ bin.rhs, null };
+                    for (candidates) |maybe_mul_dest| {
+                        const mul_dest = maybe_mul_dest orelse continue;
+                        const uc = use_counts.get(mul_dest) orelse continue;
+                        if (uc != 1) continue;
+                        var found_bin: ?ir.Inst.BinOp = null;
+                        var j: usize = i;
+                        while (j > 0) : (j -= 1) {
+                            const prev = insts[j - 1];
+                            if (prev.dest) |d| {
+                                if (d != mul_dest) continue;
+                                if (prev.op == .mul and prev.type == add_inst.type) {
+                                    found_bin = prev.op.mul;
+                                }
+                                break;
+                            }
+                        }
+                        const mul_bin = found_bin orelse continue;
+                        const addend = if (is_add and maybe_mul_dest.? == bin.lhs)
+                            bin.rhs
+                        else
+                            bin.lhs;
+                        try mul_fused.put(mul_dest, {});
+                        const dest = add_inst.dest orelse continue;
+                        try fma_info.put(dest, .{
+                            .mul_lhs = mul_bin.lhs,
+                            .mul_rhs = mul_bin.rhs,
+                            .addend = addend,
+                            .is_sub = is_sub,
+                        });
+                        try fma_add_pos.put(dest, global_idx);
+                        break;
+                    }
+                }
+
+                const maybe_simd_bin: ?SimdFmaBin = switch (add_inst.op) {
+                    .f32x4_binop => |b| .{ .f32 = b },
+                    .f64x2_binop => |b| .{ .f64 = b },
+                    else => null,
                 };
-                const candidates: [2]?ir.VReg = if (is_add)
-                    .{ bin.rhs, bin.lhs }
+                const simd_bin = maybe_simd_bin orelse continue;
+                const simd_is_add, const simd_is_sub = switch (simd_bin) {
+                    .f32 => |b| .{ b.op == .add, b.op == .sub },
+                    .f64 => |b| .{ b.op == .add, b.op == .sub },
+                };
+                if (!simd_is_add and !simd_is_sub) continue;
+                const simd_lhs, const simd_rhs = switch (simd_bin) {
+                    .f32 => |b| .{ b.lhs, b.rhs },
+                    .f64 => |b| .{ b.lhs, b.rhs },
+                };
+                const simd_candidates: [2]?ir.VReg = if (simd_is_add)
+                    .{ simd_rhs, simd_lhs }
                 else
-                    .{ bin.rhs, null };
-                for (candidates) |maybe_mul_dest| {
+                    .{ simd_rhs, null };
+                for (simd_candidates) |maybe_mul_dest| {
                     const mul_dest = maybe_mul_dest orelse continue;
                     const uc = use_counts.get(mul_dest) orelse continue;
                     if (uc != 1) continue;
@@ -960,26 +1027,35 @@ pub fn compileFunctionImpl(
                         const prev = insts[j - 1];
                         if (prev.dest) |d| {
                             if (d != mul_dest) continue;
-                            if (prev.op == .mul and prev.type == add_inst.type) {
-                                found_bin = prev.op.mul;
+                            switch (simd_bin) {
+                                .f32 => {
+                                    if (prev.op == .f32x4_binop and prev.op.f32x4_binop.op == .mul) {
+                                        found_bin = .{ .lhs = prev.op.f32x4_binop.lhs, .rhs = prev.op.f32x4_binop.rhs };
+                                    }
+                                },
+                                .f64 => {
+                                    if (prev.op == .f64x2_binop and prev.op.f64x2_binop.op == .mul) {
+                                        found_bin = .{ .lhs = prev.op.f64x2_binop.lhs, .rhs = prev.op.f64x2_binop.rhs };
+                                    }
+                                },
                             }
                             break;
                         }
                     }
                     const mul_bin = found_bin orelse continue;
-                    const addend = if (is_add and maybe_mul_dest.? == bin.lhs)
-                        bin.rhs
+                    const addend = if (simd_is_add and mul_dest == simd_lhs)
+                        simd_rhs
                     else
-                        bin.lhs;
-                    try mul_fused.put(mul_dest, {});
+                        simd_lhs;
+                    try simd_mul_fused.put(mul_dest, {});
                     const dest = add_inst.dest orelse continue;
-                    try fma_info.put(dest, .{
+                    try simd_fma_info.put(dest, .{
                         .mul_lhs = mul_bin.lhs,
                         .mul_rhs = mul_bin.rhs,
                         .addend = addend,
-                        .is_sub = is_sub,
+                        .is_sub = simd_is_sub,
                     });
-                    try fma_add_pos.put(dest, global_idx);
+                    try simd_fma_add_pos.put(dest, global_idx);
                     break;
                 }
             }
@@ -987,6 +1063,8 @@ pub fn compileFunctionImpl(
     }
     fctx.mul_fused = &mul_fused;
     fctx.fma_info = &fma_info;
+    fctx.simd_mul_fused = &simd_mul_fused;
+    fctx.simd_fma_info = &simd_fma_info;
 
     // Compute live ranges using the SAME block order as code emission.
     const live_ranges = try computeLiveRangesScheduled(func, block_order, &scheduled, allocator);
@@ -1004,6 +1082,27 @@ pub fn compileFunctionImpl(
             const add_dest = entry.key_ptr.*;
             const fi = entry.value_ptr.*;
             const add_pos = fma_add_pos.get(add_dest) orelse continue;
+            inline for (.{ fi.mul_lhs, fi.mul_rhs, fi.addend }) |src| {
+                if (range_idx.get(src)) |idx| {
+                    if (live_ranges[idx].end < add_pos) {
+                        live_ranges[idx].end = add_pos;
+                    }
+                }
+            }
+        }
+    }
+    if (simd_fma_info.count() > 0) {
+        var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
+        defer range_idx.deinit();
+        try range_idx.ensureTotalCapacity(@intCast(live_ranges.len));
+        for (live_ranges, 0..) |r, idx| {
+            range_idx.putAssumeCapacity(r.vreg, idx);
+        }
+        var it = simd_fma_info.iterator();
+        while (it.next()) |entry| {
+            const add_dest = entry.key_ptr.*;
+            const fi = entry.value_ptr.*;
+            const add_pos = simd_fma_add_pos.get(add_dest) orelse continue;
             inline for (.{ fi.mul_lhs, fi.mul_rhs, fi.addend }) |src| {
                 if (range_idx.get(src)) |idx| {
                     if (live_ranges[idx].end < add_pos) {
@@ -1169,13 +1268,22 @@ pub fn compileFunctionImpl(
                 // FMA fusion awareness: a fused mul has no effective reads
                 // (it doesn't emit); a fused add reads mul's sources + addend.
                 const is_fused_mul = if (inst.dest) |d|
-                    inst.op == .mul and mul_fused.contains(d)
+                    (inst.op == .mul and mul_fused.contains(d)) or
+                        ((inst.op == .f32x4_binop and inst.op.f32x4_binop.op == .mul) or
+                            (inst.op == .f64x2_binop and inst.op.f64x2_binop.op == .mul)) and
+                            simd_mul_fused.contains(d)
                 else
                     false;
                 if (is_fused_mul) continue;
 
                 if (inst.dest) |d| {
                     if (fma_info.get(d)) |fi| {
+                        try recordKill(&seen, kill_lists, allocator, fi.mul_lhs, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, fi.mul_rhs, flat_idx);
+                        try recordKill(&seen, kill_lists, allocator, fi.addend, flat_idx);
+                        continue;
+                    }
+                    if (simd_fma_info.get(d)) |fi| {
                         try recordKill(&seen, kill_lists, allocator, fi.mul_lhs, flat_idx);
                         try recordKill(&seen, kill_lists, allocator, fi.mul_rhs, flat_idx);
                         try recordKill(&seen, kill_lists, allocator, fi.addend, flat_idx);
@@ -4090,6 +4198,32 @@ fn emitI64x2BinOp(
     }
 }
 
+fn emitSimdFma(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    info: FmaInfo,
+    is_f32x4: bool,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const addend_reg = try v128_cache.ensure(code, v128_map, info.addend, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, info.addend, addend_reg, v128_map, v128_cache, fctx);
+    if (dest_reg != addend_reg) try code.bitwise16b(.orr, dest_reg, addend_reg, addend_reg);
+
+    const lhs_reg = try v128_cache.ensure(code, v128_map, info.mul_lhs, dest_reg);
+    const rhs_reg = if (info.mul_rhs == info.mul_lhs)
+        lhs_reg
+    else
+        try v128_cache.ensure(code, v128_map, info.mul_rhs, dest_reg);
+
+    if (is_f32x4) {
+        try code.fmla4s(info.is_sub, dest_reg, lhs_reg, rhs_reg);
+    } else {
+        try code.fmla2d(info.is_sub, dest_reg, lhs_reg, rhs_reg);
+    }
+}
+
 fn emitF32x4BinOp(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -4098,6 +4232,14 @@ fn emitF32x4BinOp(
     v128_cache: *V128RegCache,
     fctx: *const FuncCompileCtx,
 ) !void {
+    const dest = inst.dest orelse return;
+    if (bin.op == .mul and fctx.simd_mul_fused != null and fctx.simd_mul_fused.?.contains(dest)) return;
+    if ((bin.op == .add or bin.op == .sub) and fctx.simd_fma_info != null) {
+        if (fctx.simd_fma_info.?.get(dest)) |info| {
+            try emitSimdFma(code, inst, info, true, v128_map, v128_cache, fctx);
+            return;
+        }
+    }
     const lhs_reg = try v128_cache.ensure(code, v128_map, bin.lhs, null);
     const rhs_reg = if (bin.rhs == bin.lhs)
         lhs_reg
@@ -4108,7 +4250,6 @@ fn emitF32x4BinOp(
         return;
     }
     if (bin.op == .pmin or bin.op == .pmax) {
-        const dest = inst.dest orelse return;
         const cmp_lhs = if (bin.op == .pmin) lhs_reg else rhs_reg;
         const cmp_rhs = if (bin.op == .pmin) rhs_reg else lhs_reg;
         try code.fcmgt4s(v128_tmp0, cmp_lhs, cmp_rhs);
@@ -4195,6 +4336,14 @@ fn emitF64x2BinOp(
     v128_cache: *V128RegCache,
     fctx: *const FuncCompileCtx,
 ) !void {
+    const dest = inst.dest orelse return;
+    if (bin.op == .mul and fctx.simd_mul_fused != null and fctx.simd_mul_fused.?.contains(dest)) return;
+    if ((bin.op == .add or bin.op == .sub) and fctx.simd_fma_info != null) {
+        if (fctx.simd_fma_info.?.get(dest)) |info| {
+            try emitSimdFma(code, inst, info, false, v128_map, v128_cache, fctx);
+            return;
+        }
+    }
     const lhs_reg = try v128_cache.ensure(code, v128_map, bin.lhs, null);
     const rhs_reg = if (bin.rhs == bin.lhs)
         lhs_reg
@@ -4205,7 +4354,6 @@ fn emitF64x2BinOp(
         return;
     }
     if (bin.op == .pmin or bin.op == .pmax) {
-        const dest = inst.dest orelse return;
         const cmp_lhs = if (bin.op == .pmin) lhs_reg else rhs_reg;
         const cmp_rhs = if (bin.op == .pmin) rhs_reg else lhs_reg;
         try code.fcmgt2d(v128_tmp0, cmp_lhs, cmp_rhs);
@@ -10106,6 +10254,123 @@ test "compile: i32x4.dot_i16x8_s emits SMULL, SMULL2, ADDP" {
         }
         try std.testing.expect(found);
     }
+}
+
+fn codeContainsMaskedWord(code: []const u8, mask: u32, base: u32) bool {
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & mask) == base) return true;
+    }
+    return false;
+}
+
+test "compile: f32x4 add of mul emits FMLA" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const mul = func.newVReg();
+    const add = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4080_0000_4040_0000_4000_0000_3F80_0000 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4100_0000_40E0_0000_40C0_0000_40A0_0000 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x3F80_0000_3F80_0000_3F80_0000_3F80_0000 }, .dest = c, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .mul, .lhs = a, .rhs = b } }, .dest = mul, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .add, .lhs = mul, .rhs = c } }, .dest = add, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_extract_lane = .{ .vector = add, .lane = 0 } }, .dest = lane, .type = .f32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(codeContainsMaskedWord(code, 0xFFE0FC00, 0x4E20CC00));
+    try std.testing.expect(!codeContainsMaskedWord(code, 0xFFE0FC00, 0x6E20DC00));
+}
+
+test "compile: f32x4 commuted add of mul emits FMLA" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const mul = func.newVReg();
+    const add = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4080_0000_4040_0000_4000_0000_3F80_0000 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4100_0000_40E0_0000_40C0_0000_40A0_0000 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x3F80_0000_3F80_0000_3F80_0000_3F80_0000 }, .dest = c, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .mul, .lhs = a, .rhs = b } }, .dest = mul, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .add, .lhs = c, .rhs = mul } }, .dest = add, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_extract_lane = .{ .vector = add, .lane = 0 } }, .dest = lane, .type = .f32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(codeContainsMaskedWord(code, 0xFFE0FC00, 0x4E20CC00));
+    try std.testing.expect(!codeContainsMaskedWord(code, 0xFFE0FC00, 0x6E20DC00));
+}
+
+test "compile: f32x4 sub of mul emits FMLS" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const mul = func.newVReg();
+    const sub = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4080_0000_4040_0000_4000_0000_3F80_0000 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4100_0000_40E0_0000_40C0_0000_40A0_0000 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x3F80_0000_3F80_0000_3F80_0000_3F80_0000 }, .dest = c, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .mul, .lhs = a, .rhs = b } }, .dest = mul, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .sub, .lhs = c, .rhs = mul } }, .dest = sub, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_extract_lane = .{ .vector = sub, .lane = 0 } }, .dest = lane, .type = .f32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(codeContainsMaskedWord(code, 0xFFE0FC00, 0x4EA0CC00));
+    try std.testing.expect(!codeContainsMaskedWord(code, 0xFFE0FC00, 0x6E20DC00));
+}
+
+test "compile: f64x2 add of mul emits FMLA" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const c = func.newVReg();
+    const mul = func.newVReg();
+    const add = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4010_0000_0000_0000_4008_0000_0000_0000 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4020_0000_0000_0000_401C_0000_0000_0000 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x3FF0_0000_0000_0000_3FF0_0000_0000_0000 }, .dest = c, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .mul, .lhs = a, .rhs = b } }, .dest = mul, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_binop = .{ .op = .add, .lhs = mul, .rhs = c } }, .dest = add, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_extract_lane = .{ .vector = add, .lane = 0 } }, .dest = lane, .type = .f64 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(codeContainsMaskedWord(code, 0xFFE0FC00, 0x4E60CC00));
+    try std.testing.expect(!codeContainsMaskedWord(code, 0xFFE0FC00, 0x6E60DC00));
 }
 
 test "compile: integer SIMD narrow saturating ops emit NEON instructions" {
