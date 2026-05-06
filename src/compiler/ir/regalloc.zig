@@ -322,6 +322,28 @@ test "allocate: simple function gets registers" {
     try std.testing.expect(result.get(v2).? == .reg);
 }
 
+test "allocateFromRanges: non-overlapping intervals reuse a register" {
+    const allocator = std.testing.allocator;
+    const one_reg_set: RegSet = .{
+        .alloc_regs = &.{7},
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{0},
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 1, .type = .i64 },
+        .{ .vreg = 1, .start = 2, .end = 3, .type = .i64 },
+    };
+
+    var result = try allocateFromRanges(allocator, one_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
+    try std.testing.expectEqual(Allocation{ .reg = 7 }, result.get(0).?);
+    try std.testing.expectEqual(Allocation{ .reg = 7 }, result.get(1).?);
+}
+
 test "allocate: no spills with few live values" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
@@ -382,6 +404,31 @@ test "allocate: spills when pressure exceeds registers" {
     for (vregs) |v| {
         try std.testing.expect(result.get(v) != null);
     }
+}
+
+test "allocateFromRanges: call-spanning intervals avoid caller-saved registers" {
+    const allocator = std.testing.allocator;
+    const mixed_reg_set: RegSet = .{
+        .alloc_regs = &.{ 0, 19 },
+        .callee_saved_indices = &.{1},
+        .caller_saved_indices = &.{0},
+        .spill_base = 128,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 4, .type = .i64 },
+        .{ .vreg = 1, .start = 1, .end = 2, .type = .i64 },
+    };
+    const clobbers = [_]ClobberPoint{
+        .{ .pos = 3, .regs_clobbered = 0b01 },
+    };
+
+    var result = try allocateFromRanges(allocator, mixed_reg_set, &clobbers, &ranges);
+    defer result.deinit();
+
+    try std.testing.expectEqual(Allocation{ .reg = 19 }, result.get(0).?);
+    try std.testing.expectEqual(Allocation{ .reg = 0 }, result.get(1).?);
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
 }
 
 test "allocateFromRanges: v128 spills consume two aligned slots" {
