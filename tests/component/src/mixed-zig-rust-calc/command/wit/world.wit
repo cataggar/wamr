@@ -1,0 +1,9 @@
+package docs:rustcalc@0.1.0;
+
+/// World for the Rust half of the mixed-language example: imports
+/// `docs:adder/add@0.1.0` (satisfied at compose time by the Zig adder
+/// in ../../../zig-adder) and lets the wasi-preview1 adapter contribute
+/// the standard `wasi:cli/*` surface required for stdout / exit / env.
+world app {
+    import docs:adder/add@0.1.0;
+}
