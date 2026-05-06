@@ -9,6 +9,7 @@ const ir = @import("../../ir/ir.zig");
 
 pub const Options = struct {
     enabled: bool = true,
+    min_block_len: usize = 12,
     max_window_len: usize = 128,
 };
 
@@ -106,7 +107,7 @@ pub fn scheduleBlock(
     allocator: std.mem.Allocator,
     options: Options,
 ) ![]ir.Inst {
-    if (!options.enabled or insts.len <= 1) return allocator.dupe(ir.Inst, insts);
+    if (!options.enabled or insts.len <= 1 or insts.len < options.min_block_len) return allocator.dupe(ir.Inst, insts);
 
     var out: std.ArrayListUnmanaged(ir.Inst) = .empty;
     errdefer out.deinit(allocator);
@@ -133,7 +134,7 @@ fn appendScheduledWindow(
     options: Options,
 ) !void {
     if (window.len == 0) return;
-    if (window.len == 1 or window.len > options.max_window_len) {
+    if (window.len == 1 or window.len < options.min_block_len or window.len > options.max_window_len) {
         out.appendSliceAssumeCapacity(window);
         return;
     }
@@ -353,7 +354,11 @@ fn opClass(inst: ir.Inst) Class {
 
 fn classLatency(class: Class) u8 {
     return switch (class) {
+        // Arm Neoverse N1/N2 optimization guides put L1 integer load-to-use at
+        // 4-5 cycles; model the common L1-hit case so short chains are not
+        // over-prioritized.
         .load => 4,
+        // Neoverse N1/N2 integer multiply latency is 3 cycles.
         .mul => 3,
         .constant, .alu, .compare, .store => 1,
         .barrier => 0,
@@ -828,7 +833,7 @@ test "local scheduler prioritizes a long independent multiply chain" {
         .{ .op = .{ .add = .{ .lhs = 6, .rhs = 3 } }, .dest = 7, .type = .i32 },
     };
 
-    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{ .min_block_len = 2 });
     defer std.testing.allocator.free(scheduled);
 
     try std.testing.expectEqual(@as(?ir.VReg, 4), scheduled[0].dest);
@@ -840,6 +845,23 @@ test "local scheduler prioritizes a long independent multiply chain" {
     try std.testing.expectEqual(@as(?ir.VReg, 7), scheduled[6].dest);
 }
 
+test "local scheduler returns small blocks in input order" {
+    const insts = [_]ir.Inst{
+        .{ .op = .{ .iconst_32 = 10 }, .dest = 1, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 20 }, .dest = 2, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 1, .rhs = 2 } }, .dest = 3, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 3 }, .dest = 4, .type = .i32 },
+        .{ .op = .{ .iconst_32 = 4 }, .dest = 5, .type = .i32 },
+        .{ .op = .{ .mul = .{ .lhs = 4, .rhs = 5 } }, .dest = 6, .type = .i32 },
+        .{ .op = .{ .add = .{ .lhs = 6, .rhs = 3 } }, .dest = 7, .type = .i32 },
+    };
+
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    defer std.testing.allocator.free(scheduled);
+
+    try std.testing.expectEqualSlices(ir.Inst, &insts, scheduled);
+}
+
 test "local scheduler keeps barriers fixed" {
     const insts = [_]ir.Inst{
         .{ .op = .{ .iconst_32 = 1 }, .dest = 1, .type = .i32 },
@@ -849,7 +871,7 @@ test "local scheduler keeps barriers fixed" {
         .{ .op = .{ .mul = .{ .lhs = 3, .rhs = 4 } }, .dest = 5, .type = .i32 },
     };
 
-    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{ .min_block_len = 2 });
     defer std.testing.allocator.free(scheduled);
 
     try std.testing.expectEqual(@as(?ir.VReg, 1), scheduled[0].dest);
@@ -869,7 +891,7 @@ test "local scheduler can overlap load latency with independent ALU" {
         .{ .op = .{ .add = .{ .lhs = 5, .rhs = 3 } }, .dest = 6, .type = .i32 },
     };
 
-    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{ .min_block_len = 2 });
     defer std.testing.allocator.free(scheduled);
 
     try std.testing.expectEqual(@as(?ir.VReg, 4), scheduled[0].dest);
@@ -889,7 +911,7 @@ test "local scheduler preserves load trap order" {
         .{ .op = .{ .add = .{ .lhs = 4, .rhs = 2 } }, .dest = 5, .type = .i32 },
     };
 
-    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{ .min_block_len = 2 });
     defer std.testing.allocator.free(scheduled);
 
     var first_load_pos: ?usize = null;
@@ -933,7 +955,7 @@ test "local scheduler models v128 dependencies while moving independent scalar w
         .{ .op = .{ .add = .{ .lhs = 4, .rhs = 7 } }, .dest = 8, .type = .i32 },
     };
 
-    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{ .min_block_len = 2 });
     defer std.testing.allocator.free(scheduled);
 
     const load_pos = findDest(scheduled, 2).?;
@@ -961,7 +983,7 @@ test "local scheduler preserves mixed scalar and v128 memory order" {
         .{ .op = .{ .add = .{ .lhs = 5, .rhs = 3 } }, .dest = 6, .type = .i32 },
     };
 
-    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{ .min_block_len = 2 });
     defer std.testing.allocator.free(scheduled);
 
     const v128_load_pos = findDest(scheduled, 2).?;
@@ -992,7 +1014,7 @@ test "local scheduler preserves scalar store/load order" {
         .{ .op = .{ .add = .{ .lhs = 4, .rhs = 2 } }, .dest = 5, .type = .i32 },
     };
 
-    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{});
+    const scheduled = try scheduleBlock(&insts, std.testing.allocator, .{ .min_block_len = 2 });
     defer std.testing.allocator.free(scheduled);
 
     const store_pos = findScalarStore(scheduled).?;
