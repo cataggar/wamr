@@ -89,6 +89,22 @@ pub const CompInstanceRef = union(enum) {
 };
 
 pub fn resolveCompInstance(component: *const ctypes.Component, idx: u32) ?CompInstanceRef {
+    // Section-order-aware path: when the loader populated
+    // `comp_instance_indexspace`, dispatch directly. Composed
+    // components need this because instance-section and alias-section
+    // (sort .instance) entries interleave (issue #355).
+    if (component.comp_instance_indexspace.len > 0) {
+        if (idx >= component.comp_instance_indexspace.len) return null;
+        return switch (component.comp_instance_indexspace[idx]) {
+            .import => |i| .{ .imported = i },
+            .instance => |i| .{ .local = i },
+            .alias => |i| .{ .aliased = i },
+        };
+    }
+    // Legacy path: hand-authored fixtures (no loader) and old
+    // pre-#355 binaries that don't set the indexspace. Walk imports,
+    // then instances, then aliases — correct only when sections do
+    // not interleave.
     var n: u32 = 0;
     for (component.imports, 0..) |imp, i| {
         if (imp.desc != .instance) continue;
@@ -105,6 +121,105 @@ pub fn resolveCompInstance(component: *const ctypes.Component, idx: u32) ?CompIn
         n += 1;
     }
     return null;
+}
+
+/// What an `(alias export ...)` chain ultimately points at, for an entry
+/// in the component-instance index space. Used by `registerInstanceExport`
+/// (issue #355) to follow the `wasm-tools compose` pattern where the
+/// top-level `wasi:cli/run@0.2.x` export is an aliased export of a
+/// sub-component instance:
+///
+/// ```
+/// (instance (;10;) (instantiate 0 ...))
+/// (alias export 10 "wasi:cli/run@0.2.6" (instance (;11;)))
+/// (export "wasi:cli/run@0.2.6" (instance 11))
+/// ```
+///
+/// Resolving `instance 11` yields `.sub_export { source = .local{10},
+/// name = "wasi:cli/run@0.2.6" }`.
+pub const InstanceExprRef = union(enum) {
+    /// Parent component import; satisfied at link time.
+    imported: u32,
+    /// `component.instances[i]` directly — no alias hop in play.
+    local: u32,
+    /// The chain bottoms out by selecting a named instance export of
+    /// some other resolved component instance.
+    sub_export: SubExport,
+
+    pub const SubExport = struct {
+        /// Where the chain landed before the final name lookup.
+        source: Source,
+        /// The named instance export to look up on `source`.
+        name: []const u8,
+
+        pub const Source = union(enum) {
+            imported: u32,
+            local: u32,
+        };
+    };
+};
+
+pub const ResolveInstanceExprError = error{
+    /// The alias chain exceeded a defensive depth bound or contains
+    /// a cycle.
+    AliasDepthExceeded,
+    /// The alias chain has more than one hop. The wasm-tools compose
+    /// output that motivates #355 only ever produces single-hop alias
+    /// chains; deeper chains require a chain-of-names representation
+    /// that is not yet implemented.
+    MultiHopAliasUnsupported,
+    /// An alias in the chain has the wrong shape (e.g. `outer` alias
+    /// where `instance_export` is required, or non-instance sort).
+    InvalidAliasShape,
+};
+
+/// Walk an `(alias export ...)` chain in the component-instance index
+/// space until it bottoms out at an import, a local, or a named export
+/// of an import/local. Returns `null` if `idx` is out of range. Returns
+/// an error on cycle / multi-hop / malformed alias.
+pub fn resolveInstanceExpr(
+    component: *const ctypes.Component,
+    idx: u32,
+) ResolveInstanceExprError!?InstanceExprRef {
+    const initial = resolveCompInstance(component, idx) orelse return null;
+    return switch (initial) {
+        .imported => |i| .{ .imported = i },
+        .local => |i| .{ .local = i },
+        .aliased => |alias_idx| try followInstanceAlias(component, alias_idx),
+    };
+}
+
+fn followInstanceAlias(
+    component: *const ctypes.Component,
+    alias_idx: u32,
+) ResolveInstanceExprError!?InstanceExprRef {
+    if (alias_idx >= component.aliases.len) return error.InvalidAliasShape;
+    const alias = component.aliases[alias_idx];
+    const ie = switch (alias) {
+        .instance_export => |x| x,
+        .outer => return error.InvalidAliasShape,
+    };
+    if (ie.sort != .instance) return error.InvalidAliasShape;
+
+    const inner = resolveCompInstance(component, ie.instance_idx) orelse return null;
+    return switch (inner) {
+        .imported => |i| .{ .sub_export = .{
+            .source = .{ .imported = i },
+            .name = ie.name,
+        } },
+        .local => |i| .{ .sub_export = .{
+            .source = .{ .local = i },
+            .name = ie.name,
+        } },
+        // Multi-hop alias chains (alias of alias of …) require a chain
+        // of names. Real wasm-tools compose output only ever emits
+        // single-hop chains for the composition pattern that motivates
+        // #355, so refuse rather than silently truncate the chain.
+        .aliased => |next_alias_idx| {
+            if (next_alias_idx == alias_idx) return error.AliasDepthExceeded;
+            return error.MultiHopAliasUnsupported;
+        },
+    };
 }
 
 // ── Core-func index space ─────────────────────────────────────────────────
@@ -354,6 +469,201 @@ test "resolveCompInstance: imports → locals → aliases" {
     try testing.expect(resolveCompInstance(&comp, 1).? == .local);
     try testing.expect(resolveCompInstance(&comp, 2).? == .aliased);
     try testing.expect(resolveCompInstance(&comp, 3) == null);
+}
+
+test "resolveInstanceExpr: local instance returns .local" {
+    const inline_exp = [_]ctypes.InlineExport{
+        .{ .name = "run", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &inline_exp },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const got = (try resolveInstanceExpr(&comp, 0)).?;
+    try testing.expect(got == .local);
+    try testing.expectEqual(@as(u32, 0), got.local);
+}
+
+test "resolveInstanceExpr: imported instance returns .imported" {
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/streams", .desc = .{ .instance = 0 } },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+    const got = (try resolveInstanceExpr(&comp, 0)).?;
+    try testing.expect(got == .imported);
+    try testing.expectEqual(@as(u32, 0), got.imported);
+}
+
+test "resolveInstanceExpr: alias of local returns .sub_export over .local" {
+    // Mirrors `wasm-tools compose` shape:
+    //   instance 0: (instantiate sub-component)
+    //   alias  0:   (alias export 0 "wasi:cli/run@0.2.6" (instance 1))
+    //   instance-index space: 0=local, 1=aliased.
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .instantiate = .{ .component_idx = 0, .args = &.{} } },
+    };
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 0,
+            .name = "wasi:cli/run@0.2.6",
+        } },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &aliases,
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    const got = (try resolveInstanceExpr(&comp, 1)).?;
+    try testing.expect(got == .sub_export);
+    try testing.expect(got.sub_export.source == .local);
+    try testing.expectEqual(@as(u32, 0), got.sub_export.source.local);
+    try testing.expectEqualStrings("wasi:cli/run@0.2.6", got.sub_export.name);
+}
+
+test "resolveInstanceExpr: alias of imported returns .sub_export over .imported" {
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "host:bundle", .desc = .{ .instance = 0 } },
+    };
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 0,
+            .name = "inner",
+        } },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases,
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+    // index space: 0=imported, 1=aliased.
+    const got = (try resolveInstanceExpr(&comp, 1)).?;
+    try testing.expect(got == .sub_export);
+    try testing.expect(got.sub_export.source == .imported);
+    try testing.expectEqual(@as(u32, 0), got.sub_export.source.imported);
+    try testing.expectEqualStrings("inner", got.sub_export.name);
+}
+
+test "resolveInstanceExpr: alias of alias errors with MultiHopAliasUnsupported" {
+    // Two-hop chain: instance 1 = aliased(0), instance 2 = aliased(1).
+    // The chain `2 → alias 1 → alias 0 → local 0` is not yet supported;
+    // resolveInstanceExpr must surface a clear error rather than
+    // silently truncate the chain.
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .instantiate = .{ .component_idx = 0, .args = &.{} } },
+    };
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 0,
+            .name = "outer",
+        } },
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 1, // points at the prior alias
+            .name = "inner",
+        } },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &aliases,
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    // index space: 0=local, 1=alias[0], 2=alias[1].
+    try testing.expectError(
+        error.MultiHopAliasUnsupported,
+        resolveInstanceExpr(&comp, 2),
+    );
+}
+
+test "resolveInstanceExpr: self-referential alias errors with AliasDepthExceeded" {
+    // Pathological self-loop: alias 0 points at instance idx 1 which
+    // resolves back to alias 0.
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 1, // index space slot for this very alias
+            .name = "loop",
+        } },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases,
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{ .{ .name = "host", .desc = .{ .instance = 0 } } },
+        .exports = &.{},
+    };
+    // index space: 0=imported, 1=alias[0]. Resolving alias[0] looks up
+    // its instance_idx=1 which is the alias itself → cycle.
+    try testing.expectError(
+        error.AliasDepthExceeded,
+        resolveInstanceExpr(&comp, 1),
+    );
+}
+
+test "resolveInstanceExpr: out-of-range idx returns null" {
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    try testing.expect((try resolveInstanceExpr(&comp, 0)) == null);
 }
 
 test "resolveCoreFunc: canon.lowers → core(.func) aliases" {

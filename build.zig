@@ -516,6 +516,19 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     const calc_final = calc_compose.addOutputFileArg("zig-calculator-cmd.composed.wasm");
     installAndValidate(b, examples_step, calc_final, "zig-calculator-cmd.composed.wasm");
 
+    // Run the composed Zig calculator command. The wasi-cli adapter
+    // captures stdout into the adapter buffer and flushes via
+    // `std.Io.File.stdout().writeStreamingAll`; empirically this
+    // lands on host stderr (fd 2) — same as `zig-hello` above.
+    // Issue #355 wired the alias chain + sub-component instantiation
+    // that this composed command needs to reach its `wasi:cli/run`
+    // export.
+    const run_calc = b.addRunArtifact(wamr_exe);
+    run_calc.addFileArg(calc_final);
+    run_calc.expectExitCode(0);
+    run_calc.expectStdErrEqual("40 + 2 = 42\n100 + 200 = 300\n");
+    run_step.dependOn(&run_calc.step);
+
     // ── mixed-zig-rust-calc (Zig adder + Rust command, composed) ───
     // Rust command builds via cargo on `wasm32-wasip1`; we then run the
     // standard wasm-tools embed/new pipeline and compose against the
@@ -558,6 +571,15 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     mixed_compose.addArg("-o");
     const mixed_final = mixed_compose.addOutputFileArg("mixed-zig-rust-calc.composed.wasm");
     installAndValidate(b, examples_step, mixed_final, "mixed-zig-rust-calc.composed.wasm");
+
+    // Run the composed Rust-command + Zig-adder. Same alias-walking
+    // path as `zig-calculator-cmd` (issue #355); produces the same
+    // two-line output, again on host stderr.
+    const run_mixed = b.addRunArtifact(wamr_exe);
+    run_mixed.addFileArg(mixed_final);
+    run_mixed.expectExitCode(0);
+    run_mixed.expectStdErrEqual("40 + 2 = 42\n100 + 200 = 300\n");
+    run_step.dependOn(&run_mixed.step);
 }
 
 const ZigWasmCompile = struct {

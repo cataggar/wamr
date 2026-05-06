@@ -9504,7 +9504,9 @@ pub fn runLoadedComponent(
         else => return error.LinkFailed,
     };
 
-    if (inst.getExport("run") == null) return error.NoRunExport;
+    if (inst.getExport("run") == null) {
+        return error.NoRunExport;
+    }
 
     var results: [1]abi_root.InterfaceValue = undefined;
     if (executor_root.callComponentFunc(inst, "run", &.{}, &results, allocator)) |_| {

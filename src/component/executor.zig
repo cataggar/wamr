@@ -104,6 +104,41 @@ pub fn callRealloc(
 /// 4. Call the core Wasm function
 /// 5. Lift results: if > MAX_FLAT_RESULTS, read from memory pointer
 /// 6. Call post-return if defined
+/// Context for `forwardingHostFnCall` — a `HostFunc` adapter that
+/// dispatches a child component's import to a parent (or peer)
+/// component's lifted export. Sub-component imports declared as
+/// `(with "<name>" (func K))` or `(with "<name>" (instance J))` are
+/// wired during the parent's `linkImports` by constructing one of
+/// these contexts and storing it in a `ImportBinding.host_func` (or as
+/// the member of a synthetic `HostInstance`). See
+/// `instance.zig:wireSubComponentImports` (issue #355).
+///
+/// The forwarded target is given as a fully-resolved `(owner, local)`
+/// pair so dispatch does not depend on the target being registered as
+/// a top-level export under any name. The `local` value is the
+/// owner-relative `ExportedFunc.Local` produced by
+/// `flattenForwardedChain` — or built directly from a `canon.lift`
+/// when the parent's component-func-index resolves to `.lifted`.
+pub const ForwardingHostFnCtx = struct {
+    owner: *const ComponentInstance,
+    local: ComponentInstance.ExportedFunc.Local,
+};
+
+/// `HostFunc.call` adapter for forwarding contexts. Ignores the
+/// trampoline's `ci` (the child whose core call invoked the import)
+/// and dispatches against the recorded owner so the canonical-ABI
+/// lift uses the owner's type registry and core instances.
+pub fn forwardingHostFnCall(
+    ctx_opaque: ?*anyopaque,
+    _: *ComponentInstance,
+    args: []const InterfaceValue,
+    out_results: []InterfaceValue,
+    allocator: Allocator,
+) anyerror!void {
+    const ctx: *const ForwardingHostFnCtx = @ptrCast(@alignCast(ctx_opaque orelse return error.FunctionNotFound));
+    return callComponentFuncByLocal(ctx.owner, ctx.local, args, out_results, allocator);
+}
+
 pub fn callComponentFunc(
     comp_inst: *const ComponentInstance,
     func_name: []const u8,
@@ -111,20 +146,66 @@ pub fn callComponentFunc(
     out_results: []InterfaceValue,
     allocator: Allocator,
 ) ExecutionError!void {
-    // 1. Look up the exported function
-    const exported = comp_inst.getExport(func_name) orelse return error.FunctionNotFound;
+    const flat = flattenForwardedChain(comp_inst, func_name) orelse return error.FunctionNotFound;
+    return callComponentFuncByLocal(flat.owner, flat.local, args, out_results, allocator);
+}
 
+/// Walk an `ExportedFunc.forwarded` chain starting from `(comp_inst,
+/// func_name)` to the bottoming `(owner, .local)` pair. Returns null if
+/// the name does not resolve, or if the chain exceeds 16 hops (which is
+/// treated as a resolver bug since flattening at registration time is
+/// expected to keep chains shallow).
+pub const FlattenedExport = struct {
+    owner: *const ComponentInstance,
+    local: ComponentInstance.ExportedFunc.Local,
+};
+
+pub fn flattenForwardedChain(
+    comp_inst: *const ComponentInstance,
+    func_name: []const u8,
+) ?FlattenedExport {
+    const root = comp_inst.getExport(func_name) orelse return null;
+    var owner_inst = comp_inst;
+    var cursor = root;
+    var hops: u8 = 0;
+    while (true) : (hops += 1) {
+        if (hops > 16) return null;
+        switch (cursor) {
+            .local => |l| return .{ .owner = owner_inst, .local = l },
+            .forwarded => |f| {
+                owner_inst = f.owner;
+                cursor = f.owner.getExport(f.owner_export_name) orelse return null;
+            },
+        }
+    }
+}
+
+/// Invoke a component-level lifted export, given the owning instance and
+/// its already-resolved owner-relative indices. This is the common path
+/// shared between name-keyed dispatch (`callComponentFunc`) and the
+/// cross-component forwarding `HostFunc` adapter (#355): the latter holds
+/// an `ExportedFunc.Local` directly because the parent's `.lifted`
+/// component-funcs are not necessarily registered as top-level exports
+/// under any name.
+pub fn callComponentFuncByLocal(
+    owner_inst: *const ComponentInstance,
+    exported: ComponentInstance.ExportedFunc.Local,
+    args: []const InterfaceValue,
+    out_results: []InterfaceValue,
+    allocator: Allocator,
+) ExecutionError!void {
     // Get the core module instance
-    if (exported.core_instance_idx >= comp_inst.core_instances.len)
+    if (exported.core_instance_idx >= owner_inst.core_instances.len)
         return error.CoreInstanceNotAvailable;
-    const core_entry = comp_inst.core_instances[exported.core_instance_idx];
+    const core_entry = owner_inst.core_instances[exported.core_instance_idx];
     const module_inst = core_entry.module_inst orelse return error.CoreInstanceNotAvailable;
 
     // Parse canonical options
     const lift_opts = LiftOptions.fromOpts(exported.opts);
 
-    // Get the type registry
-    const registry = TypeRegistry.init(comp_inst.component);
+    // Get the type registry — must come from the owner so component-
+    // level type indices resolve in the owner's type-indexspace.
+    const registry = TypeRegistry.init(owner_inst.component);
 
     // Resolve the function type
     const func_type = blk: {
@@ -597,16 +678,20 @@ pub fn callComponentFuncAsync(
     }) catch return error.OutOfMemory;
     const handle = lift_result.subtask_handle;
 
-    // Look up the exported function to determine result count
-    const exported = comp_inst.getExport(func_name) orelse {
+    // Look up the exported function to determine result count.
+    // Resolve forwarded entries against the owning component so the
+    // type-registry lookup hits the correct types[] (#355).
+    const flat = flattenForwardedChain(comp_inst, func_name) orelse {
         task_manager.cancelTask(handle);
         return error.FunctionNotFound;
     };
+    const owner_for_type = flat.owner;
+    const exported_local = flat.local;
 
     // Get function type for result count
     const result_count: usize = blk: {
-        const reg = TypeRegistry.init(comp_inst.component);
-        if (reg.get(exported.func_type_idx)) |td| {
+        const reg = TypeRegistry.init(owner_for_type.component);
+        if (reg.get(exported_local.func_type_idx)) |td| {
             switch (td) {
                 .func => |ft| {
                     switch (ft.results) {
