@@ -440,6 +440,10 @@ pub const CallPatch = struct {
 pub const CompileOptions = struct {
     enable_scheduler: bool = true,
     enable_peephole: bool = true,
+    /// Use the Stage-A scalar X-register linear-scan allocator.
+    /// When disabled, codegen falls back to the legacy greedy RegMap path.
+    /// Stage B (full V-register allocation) is intentionally deferred.
+    enable_xreg_alloc: bool = true,
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -743,12 +747,13 @@ pub fn compileFunctionImpl(
 ) ![]u8 {
     if (try functionHasUnsupportedV128(func, allocator)) return error.UnsupportedV128;
 
-    // Phase 3 of regalloc adoption (issue #100): drive RegMap from a real
-    // linear-scan allocation. `RegMap.assign` consults `alloc_result` first;
-    // greedy scavenging remains as a fallback for vregs the allocator had no
-    // opinion on. This subsumes the earlier Phase 2 shadow-mode run that
-    // landed on `main` via #135 — the allocator now produces real assignments
-    // rather than being a no-op consistency check.
+    // Stage A of #359: drive scalar RegMap from a real linear-scan allocation
+    // when enabled. `RegMap.assign` consults `alloc_result` first; setting
+    // CompileOptions.enable_xreg_alloc=false keeps the legacy greedy
+    // stack-canonical path available as a correctness fallback.
+    //
+    // Stage B (full V-register allocation replacing V128RegCache) is deferred
+    // to a follow-up; v128 values still use V128StackMap/V128RegCache below.
     //
     // The actual `regalloc.allocate` call is deferred until after the FMA
     // fusion pre-pass below, because fused MADD/MSUB reads a mul's sources
@@ -981,19 +986,25 @@ pub fn compileFunctionImpl(
         }
     }
 
-    var alloc_result = try regalloc.allocateFromRanges(
-        allocator,
-        aarch64RegSetForSpillBase(spill_base),
-        clobbers.items,
-        scalar_live_ranges.items,
-    );
-    defer alloc_result.deinit();
+    var alloc_result_storage: ?regalloc.AllocResult = null;
+    defer if (alloc_result_storage) |*ar| ar.deinit();
+    if (ctx.options.enable_xreg_alloc) {
+        alloc_result_storage = try regalloc.allocateFromRanges(
+            allocator,
+            aarch64RegSetForSpillBase(spill_base),
+            clobbers.items,
+            scalar_live_ranges.items,
+        );
+    }
 
     // Finalize frame layout now that we know how many spill slots the
     // allocator actually consumed. Previously we pre-sized to
     // (next_vreg+16)*8 which was wasteful; using the allocator's exact
     // count shrinks frames and reduces I-cache pressure on entry.
-    const spill_capacity: u32 = @as(u32, @intCast(alloc_result.spill_count)) * 8;
+    const spill_capacity: u32 = if (alloc_result_storage) |ar|
+        @as(u32, @intCast(ar.spill_count)) * 8
+    else
+        (func.next_vreg + 16) * 8;
     const scalar_spill_end = spill_base + spill_capacity;
     const v128_spill_base: u32 = if (v128_spill_slots == 0)
         scalar_spill_end
@@ -1017,7 +1028,7 @@ pub fn compileFunctionImpl(
 
     var reg_map = RegMap.init(allocator, spill_base, spill_capacity);
     defer reg_map.deinit();
-    reg_map.alloc_result = &alloc_result;
+    if (alloc_result_storage) |*ar| reg_map.alloc_result = ar;
 
     var v128_map = V128StackMap.init(allocator, v128_spill_base, v128_spill_capacity);
     defer v128_map.deinit();
@@ -11841,6 +11852,24 @@ test "compile: binop with spilled operands emits LDR/STR via spill slots" {
         }
     }
     try std.testing.expect(found_ldr_from_fp);
+}
+
+test "compileFunction: enable_xreg_alloc false keeps legacy fallback working" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const lhs = func.newVReg();
+    const rhs = func.newVReg();
+    const sum = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_64 = 40 }, .dest = lhs, .type = .i64 });
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_64 = 2 }, .dest = rhs, .type = .i64 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = lhs, .rhs = rhs } }, .dest = sum, .type = .i64 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = sum } });
+
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_xreg_alloc = false });
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
 }
 
 test "compileFunction: FMA fusion does not skip mul with non-arith uses" {
