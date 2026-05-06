@@ -704,6 +704,156 @@ test "differential SIMD: indirect v128 param call" {
     try expectSimdDiffI32(wasm, "f", 123);
 }
 
+test "differential SIMD: direct v128 result preserves f32 signed zero bits" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&helper, testing.allocator, .{ 0x8000_0000, 0x3F80_0000, 0, 0 });
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try main.append(testing.allocator, 0x10); // call helper
+    try encodeULEB128(&main, testing.allocator, 0);
+    try appendI32x4ExtractLane(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &.{}, .results = &[_]u8{0x7B} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x8000_0000)));
+}
+
+test "differential SIMD: direct v128 result preserves f32 NaN payload bits" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&helper, testing.allocator, .{ 0x3F80_0000, 0x7FC1_2345, 0, 0 });
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try appendI32x4ExtractLane(&main, testing.allocator, 1);
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &.{}, .results = &[_]u8{0x7B} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x7FC1_2345)));
+}
+
+test "differential SIMD: indirect v128 result call" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&helper, testing.allocator, .{ 123, 0, 0, 0 });
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try appendI32Const(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x11); // call_indirect
+    try encodeULEB128(&main, testing.allocator, 0); // typeidx
+    try encodeULEB128(&main, testing.allocator, 0); // tableidx
+    try appendI32x4ExtractLane(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &.{}, .results = &[_]u8{0x7B} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, true);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 123);
+}
+
+test "differential SIMD: scalar primary plus v128 extra result" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendI32Const(&helper, testing.allocator, 7);
+    try appendV128ConstI32x4(&helper, testing.allocator, .{ 0, 0, 35, 0 });
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try appendI32x4ExtractLane(&main, testing.allocator, 2);
+    try main.append(testing.allocator, 0x6A); // i32.add
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &.{}, .results = &[_]u8{ 0x7F, 0x7B } },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 42);
+}
+
+test "differential SIMD: v128 primary plus scalar extra result" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&helper, testing.allocator, .{ 37, 0, 0, 0 });
+    try appendI32Const(&helper, testing.allocator, 5);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x01); // local decl groups
+    try encodeULEB128(&main, testing.allocator, 1);
+    try main.append(testing.allocator, 0x7F); // i32
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try appendLocalSet(&main, testing.allocator, 0);
+    try appendI32x4ExtractLane(&main, testing.allocator, 0);
+    try appendLocalGet(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x6A); // i32.add
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &.{}, .results = &[_]u8{ 0x7B, 0x7F } },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 42);
+}
+
 test "differential SIMD: v128 mutable global set/get" {
     var init: std.ArrayList(u8) = .empty;
     defer init.deinit(testing.allocator);

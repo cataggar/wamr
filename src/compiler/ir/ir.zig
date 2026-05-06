@@ -183,18 +183,19 @@ pub const Inst = struct {
         br_if: struct { cond: VReg, then_block: BlockId, else_block: BlockId },
         br_table: struct { index: VReg, targets: []const BlockId, default: BlockId },
         ret: ?VReg,
-        // Multi-value return: first VReg -> RAX, remaining written to
-        // memory via the hidden return pointer passed by the caller.
+        // Multi-value return: first VReg -> the platform primary result
+        // register, remaining values are written to memory via the hidden
+        // return pointer passed by the caller.
         ret_multi: []const VReg,
         @"unreachable": void,
 
         // Function calls. `extra_results` is the number of additional
-        // results beyond the one returned in RAX (i.e. callee.result_count - 1).
-        // When > 0, the caller passes a hidden return pointer as an implicit
-        // trailing argument; the callee writes extras into [hrp + i*8], and
-        // the caller retrieves them via `.call_result` ops emitted right
-        // after the call. The primary result is delivered in `inst.dest` as
-        // before (via RAX).
+        // results beyond the platform primary result register
+        // (i.e. callee.result_count - 1). When > 0, the caller passes a hidden
+        // return pointer as an implicit trailing argument; the callee writes
+        // extras into the target ABI's return area layout, and the caller
+        // retrieves them via `.call_result` ops emitted right after the call.
+        // The primary result is delivered in `inst.dest`.
         call: struct { func_idx: u32, args: []const VReg = &.{}, extra_results: u8 = 0, tail: bool = false },
         call_indirect: struct { type_idx: u32, elem_idx: VReg, args: []const VReg = &.{}, extra_results: u8 = 0, table_idx: u32 = 0, tail: bool = false },
         call_ref: struct { type_idx: u32, func_ref: VReg, args: []const VReg = &.{}, extra_results: u8 = 0, tail: bool = false },

@@ -474,10 +474,13 @@ const FuncCompileCtx = struct {
     /// prologue stashes it here so `ret_multi` can re-load it.
     hrp_save_off: u32 = 0,
     /// FP-relative byte offset of the caller-side scratch region where
-    /// extra results of calls (beyond the one returned in x0) are
-    /// written by the callee. Sized to `max_extra_results * 8` bytes.
-    /// `call_result` reads back from `[fp + scratch_base + idx*8]`.
+    /// extra results of calls (beyond the primary return register) are
+    /// written by the callee. Scalar slots keep the legacy 8-byte layout;
+    /// v128 slots are 16-byte aligned and 16 bytes wide.
     scratch_base: u32 = 0,
+    /// Precomputed `.call_result` dest vreg → byte offset within
+    /// `scratch_base`, using the callee's result type layout.
+    call_result_offsets: ?*const std.AutoHashMap(ir.VReg, u32) = null,
     /// Total frame size (in bytes). Needed by tail-call emitters to
     /// tear down the frame before branching to the target.
     frame_size: u32 = 0,
@@ -570,6 +573,10 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
     return switch (inst.op) {
         .local_get,
         .global_get,
+        .call,
+        .call_indirect,
+        .call_ref,
+        .call_result,
         .v128_const,
         .v128_load,
         .v128_load_splat,
@@ -714,12 +721,6 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
     for (func.blocks.items) |block| {
         for (block.instructions.items) |inst| {
             switch (inst.op) {
-                .ret => |maybe_v| {
-                    if (maybe_v) |v| if ((vreg_types.get(v) orelse .void) == .v128) return true;
-                },
-                .ret_multi => |vals| {
-                    for (vals) |v| if ((vreg_types.get(v) orelse .void) == .v128) return true;
-                },
                 .select => |sel| {
                     if ((vreg_types.get(sel.if_true) orelse .void) == .v128 or
                         (vreg_types.get(sel.if_false) orelse .void) == .v128)
@@ -803,25 +804,19 @@ pub fn compileFunctionImpl(
     // interleavings. Slots are 8 bytes.
     const spill_base: u32 = local_layout.end;
 
-    // Multi-result plumbing. Scan call sites for max `extra_results` and
-    // reserve caller-side scratch (`scratch_base`) + HRP save slot
-    // (`hrp_save_off`, only meaningful if result_count > 1).
-    var max_extra_results: u32 = 0;
-    for (0..func.blocks.items.len) |bid| {
-        for (scheduled.instructions(@intCast(bid))) |inst| {
-            switch (inst.op) {
-                .call => |cl| max_extra_results = @max(max_extra_results, cl.extra_results),
-                .call_indirect => |ci| max_extra_results = @max(max_extra_results, ci.extra_results),
-                .call_ref => |cr| max_extra_results = @max(max_extra_results, cr.extra_results),
-                else => {},
-            }
-        }
-    }
-
     // spill_capacity is finalized below after the allocator runs (we use
     // alloc_result.spill_count instead of a conservative next_vreg+16
     // estimate, which shrinks frames and reduces I-cache pressure).
     var fctx = ctx;
+
+    // Multi-result plumbing. Precompute the caller-side return-area layout for
+    // `.call_result` instructions. Scalar-only calls keep the old 8-byte slot
+    // offsets; mixed/v128 results use aligned 16-byte slots where needed.
+    var call_result_offsets = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer call_result_offsets.deinit();
+    const call_result_layout = try collectCallResultOffsets(&scheduled, &fctx, &call_result_offsets);
+    fctx.call_result_offsets = &call_result_offsets;
+
     fctx.local_offsets = local_layout.offsets;
     fctx.local_types = func.local_types orelse &.{};
 
@@ -1005,8 +1000,12 @@ pub fn compileFunctionImpl(
         alignForwardU32(scalar_spill_end, 16);
     const v128_spill_capacity: u32 = v128_spill_slots * 16;
     const hrp_save_off: u32 = v128_spill_base + v128_spill_capacity;
-    const scratch_base: u32 = hrp_save_off + 8;
-    const scratch_size: u32 = max_extra_results * 8;
+    const scratch_base_unaligned: u32 = hrp_save_off + 8;
+    const scratch_base: u32 = if (call_result_layout.needs_16_align)
+        alignForwardU32(scratch_base_unaligned, 16)
+    else
+        scratch_base_unaligned;
+    const scratch_size: u32 = call_result_layout.size;
     const call_save_base: u32 = scratch_base + scratch_size;
     const call_save_size: u32 = 128;
     const callee_save_base: u32 = call_save_base + call_save_size;
@@ -1448,6 +1447,146 @@ fn indexedParamTypes(fctx: *const FuncCompileCtx, type_idx: u32) []const ir.IrTy
     const ti: usize = @intCast(type_idx);
     if (ti >= fctx.func_types.len) return &.{};
     return fctx.func_types[ti].params;
+}
+
+fn funcResultTypes(fctx: *const FuncCompileCtx, func_idx: u32) []const ir.IrType {
+    const idx: usize = @intCast(func_idx);
+    if (idx >= fctx.func_type_indices.len) return &.{};
+    const type_idx = fctx.func_type_indices[idx];
+    const ti: usize = @intCast(type_idx);
+    if (ti >= fctx.func_types.len) return &.{};
+    return fctx.func_types[ti].results;
+}
+
+fn indexedResultTypes(fctx: *const FuncCompileCtx, type_idx: u32) []const ir.IrType {
+    const ti: usize = @intCast(type_idx);
+    if (ti >= fctx.func_types.len) return &.{};
+    return fctx.func_types[ti].results;
+}
+
+fn resultSlotAlignment(ty: ir.IrType) u32 {
+    return if (ty == .v128) 16 else 8;
+}
+
+fn resultSlotSize(ty: ir.IrType) u32 {
+    return switch (ty) {
+        .v128 => 16,
+        .void => 0,
+        else => 8,
+    };
+}
+
+fn extraResultAreaOffset(extra_types: []const ir.IrType, idx: u32) u32 {
+    var off: u32 = 0;
+    var i: u32 = 0;
+    while (i < extra_types.len) : (i += 1) {
+        const ty = extra_types[@intCast(i)];
+        off = alignForwardU32(off, resultSlotAlignment(ty));
+        if (i == idx) return off;
+        off += resultSlotSize(ty);
+    }
+    return idx * 8;
+}
+
+fn extraResultAreaSize(extra_types: []const ir.IrType) u32 {
+    var off: u32 = 0;
+    for (extra_types) |ty| {
+        off = alignForwardU32(off, resultSlotAlignment(ty));
+        off += resultSlotSize(ty);
+    }
+    return off;
+}
+
+fn extraResultAreaNeeds16(extra_types: []const ir.IrType) bool {
+    for (extra_types) |ty| if (ty == .v128) return true;
+    return false;
+}
+
+const CallResultScratchLayout = struct {
+    size: u32 = 0,
+    needs_16_align: bool = false,
+};
+
+fn noteCallResultSlot(layout: *CallResultScratchLayout, off: u32, ty: ir.IrType) void {
+    layout.size = @max(layout.size, off + resultSlotSize(ty));
+    if (ty == .v128) layout.needs_16_align = true;
+}
+
+fn noteTypedExtraResults(layout: *CallResultScratchLayout, extra_types: []const ir.IrType) void {
+    layout.size = @max(layout.size, extraResultAreaSize(extra_types));
+    if (extraResultAreaNeeds16(extra_types)) layout.needs_16_align = true;
+}
+
+fn collectCallResultOffsets(
+    scheduled: *const schedule.FunctionSchedule,
+    fctx: *const FuncCompileCtx,
+    offsets: *std.AutoHashMap(ir.VReg, u32),
+) !CallResultScratchLayout {
+    var layout = CallResultScratchLayout{};
+    var pending_extra_types: []const ir.IrType = &.{};
+    var fallback_next_idx: u32 = 0;
+    var fallback_next_off: u32 = 0;
+
+    for (0..scheduled.blocks.len) |bid| {
+        for (scheduled.instructions(@intCast(bid))) |inst| {
+            switch (inst.op) {
+                .call => |cl| {
+                    const results = funcResultTypes(fctx, cl.func_idx);
+                    pending_extra_types = if (results.len > 1) results[1..] else &.{};
+                    fallback_next_idx = 0;
+                    fallback_next_off = 0;
+                    if (pending_extra_types.len > 0) {
+                        noteTypedExtraResults(&layout, pending_extra_types);
+                    } else if (cl.extra_results > 0) {
+                        layout.size = @max(layout.size, @as(u32, cl.extra_results) * 8);
+                    }
+                },
+                .call_indirect => |ci| {
+                    const results = indexedResultTypes(fctx, ci.type_idx);
+                    pending_extra_types = if (results.len > 1) results[1..] else &.{};
+                    fallback_next_idx = 0;
+                    fallback_next_off = 0;
+                    if (pending_extra_types.len > 0) {
+                        noteTypedExtraResults(&layout, pending_extra_types);
+                    } else if (ci.extra_results > 0) {
+                        layout.size = @max(layout.size, @as(u32, ci.extra_results) * 8);
+                    }
+                },
+                .call_ref => |cr| {
+                    const results = indexedResultTypes(fctx, cr.type_idx);
+                    pending_extra_types = if (results.len > 1) results[1..] else &.{};
+                    fallback_next_idx = 0;
+                    fallback_next_off = 0;
+                    if (pending_extra_types.len > 0) {
+                        noteTypedExtraResults(&layout, pending_extra_types);
+                    } else if (cr.extra_results > 0) {
+                        layout.size = @max(layout.size, @as(u32, cr.extra_results) * 8);
+                    }
+                },
+                .call_result => |idx| {
+                    const dest = inst.dest orelse continue;
+                    const off: u32 = if (idx < pending_extra_types.len)
+                        extraResultAreaOffset(pending_extra_types, idx)
+                    else blk: {
+                        if (idx == fallback_next_idx) {
+                            fallback_next_off = alignForwardU32(fallback_next_off, resultSlotAlignment(inst.type));
+                            const computed = fallback_next_off;
+                            fallback_next_off += resultSlotSize(inst.type);
+                            fallback_next_idx += 1;
+                            break :blk computed;
+                        }
+                        const legacy = @as(u32, idx) * 8;
+                        break :blk if (inst.type == .v128) alignForwardU32(legacy, 16) else legacy;
+                    };
+                    try offsets.put(dest, off);
+                    noteCallResultSlot(&layout, off, inst.type);
+                },
+                else => {},
+            }
+        }
+    }
+
+    return layout;
 }
 
 fn callArgType(fctx: *const FuncCompileCtx, params: []const ir.IrType, args: []const ir.VReg, idx: usize) ir.IrType {
@@ -2032,9 +2171,9 @@ fn compileInst(
         .br_table => |bt| try emitBrTable(code, reg_map, patches, bt, fctx.allocator),
 
         // ── Direct function call ─────────────────────────────────────
-        .call => |cl| try emitCall(code, inst, cl, reg_map, v128_map, fctx),
-        .call_indirect => |ci| try emitCallIndirect(code, inst, ci, reg_map, v128_map, fctx),
-        .call_ref => |cr| try emitCallRef(code, inst, cr, reg_map, v128_map, fctx),
+        .call => |cl| try emitCall(code, inst, cl, reg_map, v128_map, v128_cache, fctx),
+        .call_indirect => |ci| try emitCallIndirect(code, inst, ci, reg_map, v128_map, v128_cache, fctx),
+        .call_ref => |cr| try emitCallRef(code, inst, cr, reg_map, v128_map, v128_cache, fctx),
 
         // ── Tables & function refs ───────────────────────────────────
         .table_size => |tidx| try emitTableSize(code, inst, tidx, reg_map),
@@ -2077,14 +2216,13 @@ fn compileInst(
 
         .ret => |maybe_val| {
             if (maybe_val) |val| {
-                const r = try useInto(code, reg_map, val, .x0);
-                if (r != .x0) try code.movRegReg(.x0, r);
+                try emitPrimaryReturnValue(code, val, reg_map, v128_map, v128_cache, fctx);
             }
             try emitCalleeSaveRestoreTracked(code, fctx);
             try code.emitEpilogue(frame_size);
         },
-        .ret_multi => |vregs| try emitRetMulti(code, vregs, reg_map, fctx, frame_size),
-        .call_result => |idx| try emitCallResult(code, inst, idx, reg_map, fctx),
+        .ret_multi => |vregs| try emitRetMulti(code, vregs, reg_map, v128_map, v128_cache, fctx, frame_size),
+        .call_result => |idx| try emitCallResult(code, inst, idx, reg_map, v128_map, v128_cache, fctx),
         .@"unreachable" => try emitTrapHelperCall(code, vmctx_trap_unreachable_fn_slot),
         .global_get => |idx| try emitGlobalGet(code, inst, idx, reg_map, v128_map, v128_cache, fctx),
         .global_set => |gs| try emitGlobalSet(code, inst, gs, reg_map, v128_map, v128_cache, fctx),
@@ -2243,6 +2381,7 @@ fn useReg(reg_map: *const RegMap, vreg: ir.VReg) ?emit.Reg {
 const v128_tmp0: u5 = 0;
 const v128_tmp1: u5 = 1;
 const v128_tmp2: u5 = 2;
+const v128_return_reg: u5 = 0;
 
 fn storeV128SlotAbs(
     code: *emit.CodeBuffer,
@@ -2251,6 +2390,95 @@ fn storeV128SlotAbs(
 ) !void {
     try frameAddr(code, RegMap.tmp0, slot_off);
     try code.strQ(vt, RegMap.tmp0);
+}
+
+fn vregType(fctx: *const FuncCompileCtx, vreg: ir.VReg) ir.IrType {
+    if (fctx.vreg_types) |vts| {
+        if (vts.get(vreg)) |ty| return ty;
+    }
+    return .i64;
+}
+
+fn addrFromBaseOffset(
+    code: *emit.CodeBuffer,
+    dst: emit.Reg,
+    base: emit.Reg,
+    offset: u32,
+) !void {
+    if (offset <= 4095) {
+        try code.addImm(dst, base, @intCast(offset));
+    } else if ((offset & 0xFFF) == 0 and (offset >> 12) <= 4095) {
+        try code.addImmShift12(dst, base, @intCast(offset >> 12));
+    } else {
+        try emitMovImm64(code, dst, offset);
+        try code.addRegReg(dst, dst, base);
+    }
+}
+
+fn storeScalarToBaseOffset(
+    code: *emit.CodeBuffer,
+    base: emit.Reg,
+    offset: u32,
+    src: emit.Reg,
+    addr_tmp: emit.Reg,
+) !void {
+    if (offset % 8 == 0 and offset / 8 <= 4095) {
+        try code.strImm(src, base, @intCast(offset / 8));
+        return;
+    }
+    if (src == addr_tmp) return error.ReturnAreaOffsetTooLarge;
+    try addrFromBaseOffset(code, addr_tmp, base, offset);
+    try code.strImm(src, addr_tmp, 0);
+}
+
+fn storeV128ToBaseOffset(
+    code: *emit.CodeBuffer,
+    base: emit.Reg,
+    offset: u32,
+    vt: u5,
+    addr_tmp: emit.Reg,
+) !void {
+    if (offset == 0) {
+        try code.strQ(vt, base);
+        return;
+    }
+    try addrFromBaseOffset(code, addr_tmp, base, offset);
+    try code.strQ(vt, addr_tmp);
+}
+
+fn emitPrimaryReturnValue(
+    code: *emit.CodeBuffer,
+    val: ir.VReg,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    if (vregType(fctx, val) == .v128) {
+        const vt = try v128_cache.ensure(code, v128_map, val, null);
+        if (vt != v128_return_reg) try code.bitwise16b(.orr, v128_return_reg, vt, vt);
+    } else {
+        const r = try useInto(code, reg_map, val, .x0);
+        if (r != .x0) try code.movRegReg(.x0, r);
+    }
+}
+
+fn emitCapturePrimaryCallResult(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    if (inst.type == .v128) {
+        const vt = try v128_cache.defineFresh(code, v128_map, dest, null);
+        try code.bitwise16b(.orr, vt, v128_return_reg, v128_return_reg);
+    } else {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
+        try destCommit(code, reg_map, info);
+    }
 }
 
 fn isCurrentKill(fctx: *const FuncCompileCtx, vreg: ir.VReg) bool {
@@ -4996,6 +5224,7 @@ fn emitCall(
     cl: @TypeOf(@as(ir.Inst.Op, undefined).call),
     reg_map: *RegMap,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
     fctx: *FuncCompileCtx,
 ) !void {
     var abi = try buildCallAbiPlan(fctx.allocator, fctx, cl.args, funcParamTypes(fctx, cl.func_idx), cl.extra_results > 0);
@@ -5096,14 +5325,10 @@ fn emitCall(
     }
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
-    // Commit result (in x0) to dest's location BEFORE restoring saved regs,
+    // Commit result (in x0 or q0) to dest's location BEFORE restoring saved regs,
     // so restoration can't clobber the result holder (dest.reg is always a
     // reg that was FREE at snapshot time — i.e. not in `used_snapshot`).
-    if (inst.dest) |dest| {
-        const info = try destBegin(reg_map, dest, RegMap.tmp0);
-        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
-        try destCommit(code, reg_map, info);
-    }
+    try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
     // Restore previously-saved caller-save regs, skipping those whose
     // vreg died at this call (the reg is dead after BL — nothing reads
@@ -5690,6 +5915,7 @@ fn emitCallIndirect(
     ci: @TypeOf(@as(ir.Inst.Op, undefined).call_indirect),
     reg_map: *RegMap,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
     fctx: *FuncCompileCtx,
 ) !void {
     var abi = try buildCallAbiPlan(fctx.allocator, fctx, ci.args, indexedParamTypes(fctx, ci.type_idx), ci.extra_results > 0);
@@ -5803,11 +6029,7 @@ fn emitCallIndirect(
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
-    if (inst.dest) |dest| {
-        const info = try destBegin(reg_map, dest, RegMap.tmp0);
-        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
-        try destCommit(code, reg_map, info);
-    }
+    try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
     for (used_snapshot, 0..) |used, i| {
         if (reg_map.alloc_result != null) break;
@@ -5829,6 +6051,7 @@ fn emitCallRef(
     cr: @TypeOf(@as(ir.Inst.Op, undefined).call_ref),
     reg_map: *RegMap,
     v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
     fctx: *FuncCompileCtx,
 ) !void {
     var abi = try buildCallAbiPlan(fctx.allocator, fctx, cr.args, indexedParamTypes(fctx, cr.type_idx), cr.extra_results > 0);
@@ -5887,11 +6110,7 @@ fn emitCallRef(
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
-    if (inst.dest) |dest| {
-        const info = try destBegin(reg_map, dest, RegMap.tmp0);
-        if (info.reg != .x0) try code.movRegReg(info.reg, .x0);
-        try destCommit(code, reg_map, info);
-    }
+    try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
     for (used_snapshot, 0..) |used, i| {
         if (reg_map.alloc_result != null) break;
@@ -5906,28 +6125,43 @@ fn emitCallRef(
 
 /// `.call_result idx` — read the `idx`-th extra result slot written by
 /// the preceding call into its dest vreg. Caller-side scratch lives at
-/// `[fp + scratch_base]`, with each result occupying 8 bytes.
+/// `[fp + scratch_base]`; scalar slots are 8 bytes, v128 slots are 16-byte
+/// aligned and 16 bytes wide.
 fn emitCallResult(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
     idx: u8,
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
     fctx: *FuncCompileCtx,
 ) !void {
     const dest = inst.dest orelse return;
-    const info = try destBegin(reg_map, dest, RegMap.tmp0);
-    const off: u32 = fctx.scratch_base + @as(u32, idx) * 8;
-    try frameLoad(code, info.reg, off);
-    try destCommit(code, reg_map, info);
+    const rel_off: u32 = if (fctx.call_result_offsets) |offsets|
+        offsets.get(dest) orelse @as(u32, idx) * 8
+    else
+        @as(u32, idx) * 8;
+    const off: u32 = fctx.scratch_base + rel_off;
+    if (inst.type == .v128) {
+        const vt = try v128_cache.defineFresh(code, v128_map, dest, null);
+        try frameAddr(code, RegMap.tmp0, off);
+        try code.ldrQ(vt, RegMap.tmp0);
+    } else {
+        const info = try destBegin(reg_map, dest, RegMap.tmp0);
+        try frameLoad(code, info.reg, off);
+        try destCommit(code, reg_map, info);
+    }
 }
 
-/// `.ret_multi [v0, v1, ...]` — first result → x0; remaining → written
-/// through the saved HRP at `[hrp + (i-1)*8]`. Emits the full epilogue
-/// (callee-save restore + emitEpilogue).
+/// `.ret_multi [v0, v1, ...]` — first scalar/v128 result → x0/q0; remaining
+/// results are written through the saved HRP using the same aligned return-area
+/// layout as `.call_result`. Emits the full epilogue.
 fn emitRetMulti(
     code: *emit.CodeBuffer,
     vregs: []const ir.VReg,
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
     fctx: *FuncCompileCtx,
     frame_size: u32,
 ) !void {
@@ -5937,19 +6171,28 @@ fn emitRetMulti(
         return;
     }
 
-    // First result → x0.
-    const first = try useInto(code, reg_map, vregs[0], .x0);
-    if (first != .x0) try code.movRegReg(.x0, first);
+    // First result → x0/q0.
+    try emitPrimaryReturnValue(code, vregs[0], reg_map, v128_map, v128_cache, fctx);
 
     if (vregs.len > 1) {
         // Load HRP into tmp0 (non-allocatable, stable across arg reads).
         try frameLoad(code, RegMap.tmp0, fctx.hrp_save_off);
         // Write extra results through HRP.
+        var extra_off: u32 = 0;
         var i: u32 = 1;
         while (i < vregs.len) : (i += 1) {
-            const src = try useInto(code, reg_map, vregs[i], RegMap.tmp1);
-            const scaled: u12 = @intCast(i - 1);
-            try code.strImm(src, RegMap.tmp0, scaled);
+            const ty = vregType(fctx, vregs[i]);
+            extra_off = alignForwardU32(extra_off, resultSlotAlignment(ty));
+            const off = extra_off;
+            if (ty == .v128) {
+                const vt = v128_tmp1;
+                try loadV128ArgFromSaved(code, v128_map, vregs[i], vt, RegMap.tmp1);
+                try storeV128ToBaseOffset(code, RegMap.tmp0, off, vt, RegMap.tmp1);
+            } else {
+                const src = try useInto(code, reg_map, vregs[i], RegMap.tmp1);
+                try storeScalarToBaseOffset(code, RegMap.tmp0, off, src, RegMap.tmp2);
+            }
+            extra_off += resultSlotSize(ty);
         }
     }
 
@@ -7512,6 +7755,141 @@ test "compileFunction: call_ref v128 call stages q0 and emits BLR" {
     defer allocator.free(code);
     try std.testing.expect(testCodeContainsWord(code, 0x3DC001E0)); // LDR Q0, [x15]
     try std.testing.expect(testCodeContainsWord(code, 0xD63F0200)); // BLR x16
+}
+
+test "compileModule: direct v128 result captures q0" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    var f0 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f0.newBlock();
+        const v = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = v, .type = .v128 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try module.addFunction(f0);
+
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f1.newBlock();
+        const v = f1.newVReg();
+        const lane = f1.newVReg();
+        try f1.getBlock(b).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v, .type = .v128 });
+        try f1.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = v, .lane = 1 } }, .dest = lane, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = lane } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    const f1_code = result.code[result.offsets[1]..];
+    try std.testing.expect(testCodeContainsMasked(f1_code, 0xFC000000, 0x94000000)); // BL
+    try std.testing.expect(testCodeContainsMasked(f1_code, 0xFFE0FC00, 0x4EA01C00)); // ORR Vd.16B, V0.16B, V0.16B
+}
+
+test "compileFunction: indirect v128 result captures q0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b = try func.newBlock();
+    const idx = func.newVReg();
+    const v = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .iconst_32 = 0 }, .dest = idx, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = idx } }, .dest = v, .type = .v128 });
+    try func.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = v, .lane = 0 } }, .dest = lane, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(testCodeContainsWord(code, 0xD63F0200)); // BLR x16
+    try std.testing.expect(testCodeContainsMasked(code, 0xFFE0FC00, 0x4EA01C00)); // ORR Vd.16B, V0.16B, V0.16B
+}
+
+test "compileFunction: call_ref v128 result captures q0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b = try func.newBlock();
+    const ref = func.newVReg();
+    const v = func.newVReg();
+    const lane = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .ref_func = 0 }, .dest = ref, .type = .i64 });
+    try func.getBlock(b).append(.{ .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = ref } }, .dest = v, .type = .v128 });
+    try func.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = v, .lane = 0 } }, .dest = lane, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(testCodeContainsWord(code, 0xD63F0200)); // BLR x16
+    try std.testing.expect(testCodeContainsMasked(code, 0xFFE0FC00, 0x4EA01C00)); // ORR Vd.16B, V0.16B, V0.16B
+}
+
+test "compileModule: v128 primary and aligned v128 extra multi-result" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+    const callee_type = try module.addFuncType(&[_]ir.IrType{}, &[_]ir.IrType{ .v128, .i32, .v128 });
+    const caller_type = try module.addFuncType(&[_]ir.IrType{}, &[_]ir.IrType{.i32});
+    try module.addFuncTypeIndex(callee_type);
+    try module.addFuncTypeIndex(caller_type);
+
+    var f0 = ir.IrFunction.init(allocator, 0, 3, 0);
+    const ret_vals = try allocator.alloc(ir.VReg, 3);
+    defer allocator.free(ret_vals);
+    {
+        const b = try f0.newBlock();
+        const primary = f0.newVReg();
+        const scalar = f0.newVReg();
+        const extra = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_000A }, .dest = primary, .type = .v128 });
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 5 }, .dest = scalar, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .v128_const = 0x0000_001E_0000_0014_0000_000F_0000_0001 }, .dest = extra, .type = .v128 });
+        ret_vals[0] = primary;
+        ret_vals[1] = scalar;
+        ret_vals[2] = extra;
+        try f0.getBlock(b).append(.{ .op = .{ .ret_multi = ret_vals } });
+    }
+    _ = try module.addFunction(f0);
+
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f1.newBlock();
+        const primary = f1.newVReg();
+        const scalar = f1.newVReg();
+        const extra = f1.newVReg();
+        const p_lane = f1.newVReg();
+        const e_lane = f1.newVReg();
+        const sum0 = f1.newVReg();
+        const sum1 = f1.newVReg();
+        try f1.getBlock(b).append(.{ .op = .{ .call = .{ .func_idx = 0, .extra_results = 2 } }, .dest = primary, .type = .v128 });
+        try f1.getBlock(b).append(.{ .op = .{ .call_result = 0 }, .dest = scalar, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .call_result = 1 }, .dest = extra, .type = .v128 });
+        try f1.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = primary, .lane = 0 } }, .dest = p_lane, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = extra, .lane = 2 } }, .dest = e_lane, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = p_lane, .rhs = scalar } }, .dest = sum0, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = sum0, .rhs = e_lane } }, .dest = sum1, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = sum1 } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    const f0_code = result.code[result.offsets[0]..result.offsets[1]];
+    const f1_code = result.code[result.offsets[1]..];
+    try std.testing.expect(testCodeContainsMasked(f0_code, 0xFFE0FC1F, 0x4EA01C00)); // primary v128 -> q0
+    try std.testing.expect(testCodeContainsWord(f0_code, 0x91004211)); // ADD x17, x16, #16 for aligned v128 extra
+    try std.testing.expect(testCodeContainsMasked(f0_code, 0xFFFFFFE0, 0x3D800220)); // STR Qn, [x17]
+    try std.testing.expect(testCodeContainsMasked(f1_code, 0xFFE0FC00, 0x4EA01C00)); // capture primary q0
+    try std.testing.expect(testCodeContainsMasked(f1_code, 0xFFFFFFE0, 0x3DC00200)); // LDR Qn, [x16]
 }
 
 // ── New handler tests (Phase 1a) ─────────────────────────────────────────────
@@ -9882,7 +10260,7 @@ test "compile: v128 param spills q0 into first local slot" {
     try std.testing.expect(found_entry_str_q0);
 }
 
-test "compile: v128 result remains unsupported" {
+test "compile: v128 result returns in q0" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -9891,7 +10269,16 @@ test "compile: v128 result remains unsupported" {
     try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0 }, .dest = v, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v } });
 
-    try std.testing.expectError(error.UnsupportedV128, compileFunction(&func, allocator));
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_orr_to_q0 = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFE0FC1F) == 0x4EA01C00) found_orr_to_q0 = true;
+    }
+    try std.testing.expect(found_orr_to_q0);
 }
 
 test "compile: local frame layout aligns v128 locals" {
