@@ -30,14 +30,39 @@ ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
 
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> str:
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd,
-        env=env,
-        check=True,
-        text=True,
-        capture_output=True,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        # The default str() on CalledProcessError omits the captured output,
+        # which makes CI failures of `zig build run-aot` (and similar) opaque.
+        # Surface stdout + stderr verbatim before re-raising so the actual
+        # error (e.g. a wasm trap printed by the underlying tool) is visible
+        # in the workflow log.
+        sys.stderr.write(
+            f"\n[harness] command failed (exit {exc.returncode}): "
+            f"{' '.join(str(c) for c in cmd)}\n"
+        )
+        if cwd is not None:
+            sys.stderr.write(f"[harness]   cwd: {cwd}\n")
+        if exc.stdout:
+            sys.stderr.write("[harness] --- stdout ---\n")
+            sys.stderr.write(exc.stdout)
+            if not exc.stdout.endswith("\n"):
+                sys.stderr.write("\n")
+        if exc.stderr:
+            sys.stderr.write("[harness] --- stderr ---\n")
+            sys.stderr.write(exc.stderr)
+            if not exc.stderr.endswith("\n"):
+                sys.stderr.write("\n")
+        sys.stderr.flush()
+        raise
     return proc.stdout + proc.stderr
 
 
