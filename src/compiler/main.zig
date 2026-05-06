@@ -27,7 +27,6 @@ pub fn main(init: std.process.Init) !void {
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var optimize = true;
-    var pass_options = passes.CompileOptions{};
     var enable_aarch64_scheduler = true;
     var enable_aarch64_xreg_alloc = true;
     var target_arch: TargetArch = switch (builtin.cpu.arch) {
@@ -42,10 +41,6 @@ pub fn main(init: std.process.Init) !void {
             output_path = args[i];
         } else if (std.mem.eql(u8, args[i], "-O0")) {
             optimize = false;
-        } else if (std.mem.eql(u8, args[i], "--no-iv-simplify")) {
-            pass_options.enable_iv_simplify = false;
-        } else if (std.mem.eql(u8, args[i], "--no-loop-unroll")) {
-            pass_options.enable_loop_unroll = false;
         } else if (std.mem.eql(u8, args[i], "--target") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "aarch64")) {
@@ -106,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 4. Optimize IR (unless -O0)
     if (optimize) {
-        const opt_changes = passes.runPasses(&ir_module, passes.defaultPassesForTargetWithOptions(target_arch, pass_options), allocator) catch |err| {
+        const opt_changes = passes.runPasses(&ir_module, passes.defaultPassesForTarget(target_arch), allocator) catch |err| {
             std.debug.print("Error optimizing IR: {}\n", .{err});
             std.process.exit(1);
         };
