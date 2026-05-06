@@ -565,6 +565,8 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .f32x4_unop,
         .f32x4_binop,
         .f32x4_convert_i32x4,
+        .f32x4_splat,
+        .f32x4_replace_lane,
         .i32x4_extadd_pairwise_i16x8,
         .i32x4_dot_i16x8_s,
         .i32x4_extend_i16x8,
@@ -627,6 +629,8 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .f32x4_unop,
                 .f32x4_binop,
                 .f32x4_convert_i32x4,
+                .f32x4_splat,
+                .f32x4_replace_lane,
                 .i32x4_extadd_pairwise_i16x8,
                 .i32x4_dot_i16x8_s,
                 .i32x4_extend_i16x8,
@@ -665,6 +669,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 },
                 .v128_store,
                 .v128_store_lane,
+                .f32x4_extract_lane,
                 .i32x4_extract_lane,
                 .i8x16_extract_lane,
                 .i16x8_extract_lane,
@@ -1447,6 +1452,9 @@ fn isV128Inst(inst: ir.Inst) bool {
         .f32x4_unop,
         .f32x4_binop,
         .f32x4_convert_i32x4,
+        .f32x4_splat,
+        .f32x4_extract_lane,
+        .f32x4_replace_lane,
         .i32x4_extadd_pairwise_i16x8,
         .i32x4_dot_i16x8_s,
         .i32x4_extend_i16x8,
@@ -1644,6 +1652,9 @@ fn compileInst(
         .f32x4_unop => |un| try emitF32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f32x4_binop => |bin| try emitF32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
+        .f32x4_splat => |src| try emitF32x4Splat(code, inst, src, reg_map, v128_map, v128_cache),
+        .f32x4_extract_lane => |lane| try emitF32x4ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
+        .f32x4_replace_lane => |lane| try emitF32x4ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
         .i32x4_extadd_pairwise_i16x8 => |op| try emitI32x4ExtAddPairwiseI16x8(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_dot_i16x8_s => |bin| try emitI32x4DotI16x8S(code, inst, bin, v128_map, v128_cache),
         .i32x4_extend_i16x8 => |op| try emitI32x4ExtendI16x8(code, inst, op, v128_map, v128_cache, fctx),
@@ -2453,6 +2464,50 @@ fn emitF32x4ConvertI32x4(
         .signed => try code.scvtf4s(dest_reg, vector_reg),
         .unsigned => try code.ucvtf4s(dest_reg, vector_reg),
     }
+}
+
+fn emitF32x4Splat(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    src: ir.VReg,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+    const src_reg = try useInto(code, reg_map, src, RegMap.tmp0);
+    try code.dup4sFromGp32(dest_reg, src_reg);
+}
+
+fn emitF32x4ExtractLane(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lane: ir.Inst.F32x4ExtractLane,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
+    const info = try destBegin(reg_map, dest, RegMap.tmp0);
+    try code.umovWFromS(info.reg, vector_reg, lane.lane);
+    try destCommit(code, reg_map, info);
+}
+
+fn emitF32x4ReplaceLane(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    lane: ir.Inst.F32x4ReplaceLane,
+    reg_map: *const RegMap,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, lane.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, lane.vector, vector_reg, v128_map, v128_cache, fctx);
+    const val_reg = try useInto(code, reg_map, lane.val, RegMap.tmp0);
+    try code.insSFromGp32(dest_reg, lane.lane, val_reg);
 }
 
 fn emitI32x4ExtAddPairwiseI16x8(
@@ -6910,6 +6965,52 @@ test "compile: i32x4 lane ops emit NEON instructions" {
         if ((w & 0xFFFFFC00) == 0x4E040C00) found_dup = true;
         if ((w & 0xFFFFFC00) == 0x4E141C00) found_ins = true;
         if ((w & 0x0FE0FC00) == 0x0E003C00) found_umov = true;
+    }
+
+    try std.testing.expect(found_dup);
+    try std.testing.expect(found_ins);
+    try std.testing.expect(found_umov);
+}
+
+test "compile: f32x4 lane ops emit bit-preserving NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const scalar = func.newVReg();
+    const splat = func.newVReg();
+    const replacement = func.newVReg();
+    const replaced = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .fconst_32 = @bitCast(@as(u32, 0x7FC1_2345)) }, .dest = scalar, .type = .f32 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_splat = scalar }, .dest = splat, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .fconst_32 = @bitCast(@as(u32, 0x8000_0000)) }, .dest = replacement, .type = .f32 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f32x4_replace_lane = .{ .vector = splat, .val = replacement, .lane = 3 } },
+        .dest = replaced,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f32x4_extract_lane = .{ .vector = replaced, .lane = 3 } },
+        .dest = lane,
+        .type = .f32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_dup = false;
+    var found_ins = false;
+    var found_umov = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4E040C00) found_dup = true;
+        if ((w & 0xFFFFFC00) == 0x4E1C1C00) found_ins = true;
+        if ((w & 0xFFFFFC00) == 0x0E1C3C00) found_umov = true;
     }
 
     try std.testing.expect(found_dup);

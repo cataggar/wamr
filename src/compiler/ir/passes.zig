@@ -267,6 +267,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .v128_not,
         .v128_any_true,
         .i32x4_splat,
+        .f32x4_splat,
         .i8x16_splat,
         .i16x8_splat,
         .i64x2_splat,
@@ -274,10 +275,15 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .simd_all_true => |op| list.append(op.vector),
         .simd_bitmask => |op| list.append(op.vector),
         .i32x4_extract_lane => |lane| list.append(lane.vector),
+        .f32x4_extract_lane => |lane| list.append(lane.vector),
         .i8x16_extract_lane => |lane| list.append(lane.vector),
         .i16x8_extract_lane => |lane| list.append(lane.vector),
         .i64x2_extract_lane => |lane| list.append(lane.vector),
         .i32x4_replace_lane => |lane| {
+            list.append(lane.vector);
+            list.append(lane.val);
+        },
+        .f32x4_replace_lane => |lane| {
             list.append(lane.vector);
             list.append(lane.val);
         },
@@ -647,6 +653,7 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .v128_not,
         .v128_any_true,
         .i32x4_splat,
+        .f32x4_splat,
         .i8x16_splat,
         .i16x8_splat,
         .i64x2_splat,
@@ -662,6 +669,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .i32x4_extract_lane => |*lane| if (lane.vector == old) {
             lane.vector = new;
         },
+        .f32x4_extract_lane => |*lane| if (lane.vector == old) {
+            lane.vector = new;
+        },
         .i8x16_extract_lane => |*lane| if (lane.vector == old) {
             lane.vector = new;
         },
@@ -672,6 +682,10 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
             lane.vector = new;
         },
         .i32x4_replace_lane => |*lane| {
+            if (lane.vector == old) lane.vector = new;
+            if (lane.val == old) lane.val = new;
+        },
+        .f32x4_replace_lane => |*lane| {
             if (lane.vector == old) lane.vector = new;
             if (lane.val == old) lane.val = new;
         },
@@ -1906,6 +1920,9 @@ fn isPure(inst: ir.Inst) bool {
         .f32x4_unop,
         .f32x4_binop,
         .f32x4_convert_i32x4,
+        .f32x4_splat,
+        .f32x4_extract_lane,
+        .f32x4_replace_lane,
         .i32x4_extmul_i16x8,
         .i32x4_shift,
         .i32x4_splat,
@@ -2044,6 +2061,9 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .i32x4_splat => |v| v == b.op.i32x4_splat,
         .i32x4_extract_lane => |lane| lane.vector == b.op.i32x4_extract_lane.vector and lane.lane == b.op.i32x4_extract_lane.lane,
         .i32x4_replace_lane => |lane| lane.vector == b.op.i32x4_replace_lane.vector and lane.val == b.op.i32x4_replace_lane.val and lane.lane == b.op.i32x4_replace_lane.lane,
+        .f32x4_splat => |v| v == b.op.f32x4_splat,
+        .f32x4_extract_lane => |lane| lane.vector == b.op.f32x4_extract_lane.vector and lane.lane == b.op.f32x4_extract_lane.lane,
+        .f32x4_replace_lane => |lane| lane.vector == b.op.f32x4_replace_lane.vector and lane.val == b.op.f32x4_replace_lane.val and lane.lane == b.op.f32x4_replace_lane.lane,
         .i8x16_binop => |bin| bin.op == b.op.i8x16_binop.op and bin.lhs == b.op.i8x16_binop.lhs and bin.rhs == b.op.i8x16_binop.rhs,
         .i8x16_shuffle => |op| op.lhs == b.op.i8x16_shuffle.lhs and op.rhs == b.op.i8x16_shuffle.rhs and std.mem.eql(u8, &op.lanes, &b.op.i8x16_shuffle.lanes),
         .i8x16_swizzle => |op| op.vector == b.op.i8x16_swizzle.vector and op.indices == b.op.i8x16_swizzle.indices,
@@ -3780,6 +3800,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .v128_not,
         .v128_any_true,
         .i32x4_splat,
+        .f32x4_splat,
         .i8x16_splat,
         .i16x8_splat,
         .i64x2_splat,
@@ -3787,10 +3808,15 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .simd_all_true => |*op| op.vector += offset,
         .simd_bitmask => |*op| op.vector += offset,
         .i32x4_extract_lane => |*lane| lane.vector += offset,
+        .f32x4_extract_lane => |*lane| lane.vector += offset,
         .i8x16_extract_lane => |*lane| lane.vector += offset,
         .i16x8_extract_lane => |*lane| lane.vector += offset,
         .i64x2_extract_lane => |*lane| lane.vector += offset,
         .i32x4_replace_lane => |*lane| {
+            lane.vector += offset;
+            lane.val += offset;
+        },
+        .f32x4_replace_lane => |*lane| {
             lane.vector += offset;
             lane.val += offset;
         },
