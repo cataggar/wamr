@@ -439,6 +439,7 @@ pub const CallPatch = struct {
 
 pub const CompileOptions = struct {
     enable_scheduler: bool = true,
+    enable_peephole: bool = true,
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -784,7 +785,7 @@ pub fn compileFunctionImpl(
     var clobbers = try collectClobberPoints(func, block_order, &scheduled, allocator);
     defer clobbers.deinit(allocator);
 
-    var code = emit.CodeBuffer.init(allocator);
+    var code = emit.CodeBuffer.initWithPeephole(allocator, .{ .enabled = ctx.options.enable_peephole });
     errdefer code.deinit();
 
     const local_layout = try computeLocalFrameLayout(func, allocator);
@@ -1134,6 +1135,7 @@ pub fn compileFunctionImpl(
     var last_was_ret = false;
     for (block_order) |bi| {
         block_offsets[bi] = code.len();
+        code.peepholeBarrier();
         for (scheduled.instructions(bi), 0..) |inst, ii| {
             last_was_ret = isRet(inst.op);
             const flat_idx = block_flat_base[bi] + ii;
@@ -1786,10 +1788,12 @@ const nop_word: u32 = 0xd503201f;
 fn emitCalleeSaveStore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_saved_regs.len]usize {
     var offs: [callee_saved_regs.len]usize = undefined;
     for (callee_saved_regs, 0..) |r, i| {
+        code.peepholeBarrier();
         offs[i] = code.len();
         const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.strImm(r, .fp, off_scaled);
     }
+    code.peepholeBarrier();
     return offs;
 }
 
@@ -1799,10 +1803,12 @@ fn emitCalleeSaveStore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_s
 fn emitCalleeSaveRestore(code: *emit.CodeBuffer, callee_save_base: u32) ![callee_saved_regs.len]usize {
     var offs: [callee_saved_regs.len]usize = undefined;
     for (callee_saved_regs, 0..) |r, i| {
+        code.peepholeBarrier();
         offs[i] = code.len();
         const off_scaled: u12 = @intCast((callee_save_base + @as(u32, @intCast(i)) * 8) / 8);
         try code.ldrImm(r, .fp, off_scaled);
     }
+    code.peepholeBarrier();
     return offs;
 }
 
@@ -11088,7 +11094,7 @@ test "compile: entry spills vmctx to [fp+16]" {
     const v0 = func.newVReg();
     try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
-    const code = try compileFunction(&func, allocator);
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
     // Layout: prologue (STP + ADD fp,sp,0), then 10 callee-save STRs for
     // x19..x28 (40 bytes), then STR x0 → [fp+16].
@@ -11107,7 +11113,7 @@ test "compile: param spill — STR x1 into first local slot" {
     const v0 = func.newVReg();
     try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
-    const code = try compileFunction(&func, allocator);
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
     // Layout: STP, ADD fp,sp,0, 10× callee-save STRs (40 bytes), STR x0
     // vmctx, STR x1 local0.
@@ -11127,7 +11133,7 @@ test "compile: zero-init of declared local (beyond params)" {
     const v0 = func.newVReg();
     try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
-    const code = try compileFunction(&func, allocator);
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
     // Layout (small-frame prologue, 2 words — spill region sized
     // dynamically from vreg count so this function's frame fits in the
@@ -11819,7 +11825,7 @@ test "compile: binop with spilled operands emits LDR/STR via spill slots" {
 
     // Disable local scheduling here: the test targets spill codegen, and the
     // scheduler can legally shorten this synthetic live-pressure pattern.
-    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_scheduler = false });
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_scheduler = false, .enable_peephole = false });
     defer allocator.free(code);
 
     // Scan for LDR Xt, [fp, #imm] (opcode pattern 0xF9400000 + rn=29<<5).

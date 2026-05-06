@@ -72,6 +72,9 @@ pub const aarch64_emit = @import("compiler/codegen/aarch64/emit.zig");
 /// AArch64 IR-to-native compiler.
 pub const aarch64_compile = @import("compiler/codegen/aarch64/compile.zig");
 
+/// AArch64 peephole optimizer.
+pub const aarch64_peephole = @import("compiler/codegen/aarch64/peephole.zig");
+
 /// AOT compiler optimization passes.
 pub const passes = @import("compiler/ir/passes.zig");
 

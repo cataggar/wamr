@@ -5,6 +5,7 @@
 //! than x86-64's variable-length encoding.
 
 const std = @import("std");
+const peephole = @import("peephole.zig");
 
 /// AArch64 general-purpose registers (64-bit X registers).
 pub const Reg = enum(u5) {
@@ -69,9 +70,15 @@ pub const Cond = enum(u4) {
 pub const CodeBuffer = struct {
     bytes: std.ArrayListUnmanaged(u8) = .empty,
     allocator: std.mem.Allocator,
+    peephole_options: peephole.Options = .{ .enabled = false },
+    peephole_barrier: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) CodeBuffer {
         return .{ .allocator = allocator };
+    }
+
+    pub fn initWithPeephole(allocator: std.mem.Allocator, options: peephole.Options) CodeBuffer {
+        return .{ .allocator = allocator, .peephole_options = options };
     }
 
     pub fn deinit(self: *CodeBuffer) void {
@@ -86,8 +93,35 @@ pub const CodeBuffer = struct {
         return self.bytes.items;
     }
 
+    pub fn peepholeBarrier(self: *CodeBuffer) void {
+        self.peephole_barrier = self.bytes.items.len;
+    }
+
     /// Emit a 4-byte AArch64 instruction word (little-endian).
     fn emit32(self: *CodeBuffer, word: u32) !void {
+        if (self.peephole_options.enabled) {
+            const prev1: ?u32 = if (self.bytes.items.len >= self.peephole_barrier + 4)
+                std.mem.readInt(u32, self.bytes.items[self.bytes.items.len - 4 ..][0..4], .little)
+            else
+                null;
+            const prev2: ?u32 = if (self.bytes.items.len >= self.peephole_barrier + 8)
+                std.mem.readInt(u32, self.bytes.items[self.bytes.items.len - 8 ..][0..4], .little)
+            else
+                null;
+            const result = peephole.optimizeWindow(prev2, prev1, word, self.peephole_options);
+            if (result.replace_last) |replacement| {
+                const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, replacement));
+                @memcpy(self.bytes.items[self.bytes.items.len - 4 ..][0..4], &bytes);
+                if (result.append_word == null) return;
+            }
+            if (result.append_word) |append| {
+                const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, append));
+                try self.bytes.appendSlice(self.allocator, &bytes);
+                return;
+            }
+            return;
+        }
+
         const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, word));
         try self.bytes.appendSlice(self.allocator, &bytes);
     }
