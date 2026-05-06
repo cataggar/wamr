@@ -334,6 +334,11 @@ const cases = [_]BenchCase{
         .build = buildSimdF32x4ConvertI32x4ULane0Module,
     },
     .{
+        .name = "simd_f32x4_demote_f64x2_zero_lane0",
+        .simd = true,
+        .build = buildSimdF32x4DemoteF64x2ZeroLane0Module,
+    },
+    .{
         .name = "simd_f32x4_splat_lane3",
         .simd = true,
         .build = buildSimdF32x4SplatLane3Module,
@@ -462,6 +467,11 @@ const cases = [_]BenchCase{
         .name = "simd_f64x2_convert_low_i32x4_u_lane0_high",
         .simd = true,
         .build = buildSimdF64x2ConvertLowI32x4ULane0HighModule,
+    },
+    .{
+        .name = "simd_f64x2_promote_low_f32x4_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2PromoteLowF32x4Lane0HighModule,
     },
     .{
         .name = "simd_i16x8_extmul_low_i8x16_s_lane0",
@@ -1894,6 +1904,17 @@ fn buildSimdF32x4ConvertI32x4ULane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4ConvertI32x4Lane0Module(allocator, 0xFB);
 }
 
+fn buildSimdF32x4DemoteF64x2ZeroLane0Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI64x2(&instr, allocator, .{ 0x3ff8_0000_0000_0000, 0xb6a0_0000_0000_0000 });
+    try appendSimdOpcode(&instr, allocator, 0x5E);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
 fn buildSimdF32x4CmpLane0Module(allocator: Allocator, simd_opcode: u32, lhs0: u32, rhs0: u32) ![]u8 {
     var instr: std.ArrayList(u8) = .empty;
     defer instr.deinit(allocator);
@@ -2085,6 +2106,20 @@ fn buildSimdF64x2ConvertLowI32x4SLane0HighModule(allocator: Allocator) ![]u8 {
 
 fn buildSimdF64x2ConvertLowI32x4ULane0HighModule(allocator: Allocator) ![]u8 {
     return buildSimdF64x2ConvertLowI32x4Lane0HighModule(allocator, 0xFF);
+}
+
+fn buildSimdF64x2PromoteLowF32x4Lane0HighModule(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstF32x4Bits(&instr, allocator, .{ 0x3fc0_0000, 0x8000_0000, 0x7fc0_1234, 0xff80_0000 });
+    try appendSimdOpcode(&instr, allocator, 0x5F);
+    try appendI64x2ExtractLane(&instr, allocator, 0);
+    try appendI64Const(&instr, allocator, 32);
+    try appendI64ShrU(&instr, allocator);
+    try appendI32WrapI64(&instr, allocator);
+
+    return buildRunI32Module(allocator, instr.items, .{});
 }
 
 const i16_extmul_lhs_i8: [16]u8 = .{ 0x01, 0xFE, 0x03, 0xFC, 0x05, 0xFA, 0x07, 0xF8, 0x09, 0xF6, 0x0B, 0xF4, 0x0D, 0xF2, 0x0F, 0xF0 };

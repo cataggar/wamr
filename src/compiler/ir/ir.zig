@@ -89,6 +89,7 @@ pub const Inst = struct {
         f32x4_binop: F32x4BinOp,
         f32x4_convert_i32x4: SimdIntToFloatConvert,
         i32x4_trunc_sat: SimdFloatToIntTruncSat,
+        f32x4_demote_f64x2_zero: SimdFloatPrecisionConvert,
         f32x4_splat: VReg,
         f32x4_extract_lane: F32x4ExtractLane,
         f32x4_replace_lane: F32x4ReplaceLane,
@@ -125,6 +126,7 @@ pub const Inst = struct {
         i64x2_replace_lane: I64x2ReplaceLane,
         f64x2_binop: F64x2BinOp,
         f64x2_convert_low_i32x4: SimdIntToFloatConvert,
+        f64x2_promote_low_f32x4: SimdFloatPrecisionConvert,
 
         // Binary arithmetic (dest = lhs op rhs)
         add: BinOp,
@@ -305,6 +307,9 @@ pub const Inst = struct {
     pub const SimdIntToFloatSign = enum { signed, unsigned };
     pub const SimdFloatToIntSign = enum { signed, unsigned };
     pub const SimdFloatToIntSrcWidth = enum { f32x4, f64x2 };
+    pub const SimdFloatPrecisionConvert = struct {
+        vector: VReg,
+    };
 
     pub const I32x4Op = enum {
         add,
@@ -1290,6 +1295,13 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(Inst.SimdFloatToIntSign.signed, i32_trunc.op.i32x4_trunc_sat.sign);
     try std.testing.expectEqual(@as(VReg, 27), i32_trunc.op.i32x4_trunc_sat.vector);
 
+    const f32_demote = Inst{
+        .op = .{ .f32x4_demote_f64x2_zero = .{ .vector = 26 } },
+        .dest = 28,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 26), f32_demote.op.f32x4_demote_f64x2_zero.vector);
+
     const f32_un = Inst{
         .op = .{ .f32x4_unop = .{ .op = .sqrt, .vector = 28 } },
         .dest = 29,
@@ -1406,6 +1418,13 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.SimdIntToFloatSign.signed, f64_convert.op.f64x2_convert_low_i32x4.sign);
     try std.testing.expectEqual(@as(VReg, 26), f64_convert.op.f64x2_convert_low_i32x4.vector);
+
+    const f64_promote = Inst{
+        .op = .{ .f64x2_promote_low_f32x4 = .{ .vector = 26 } },
+        .dest = 27,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 26), f64_promote.op.f64x2_promote_low_f32x4.vector);
 
     const i64_splat = Inst{
         .op = .{ .i64x2_splat = 26 },

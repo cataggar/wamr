@@ -203,6 +203,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .f32x4_unop => |un| live.put(un.vector, {}) catch {},
         .f32x4_convert_i32x4 => |op| live.put(op.vector, {}) catch {},
         .i32x4_trunc_sat => |op| live.put(op.vector, {}) catch {},
+        .f32x4_demote_f64x2_zero => |op| live.put(op.vector, {}) catch {},
         .i32x4_extmul_i16x8 => |op| {
             live.put(op.lhs, {}) catch {};
             live.put(op.rhs, {}) catch {};
@@ -252,6 +253,7 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
             live.put(bin.rhs, {}) catch {};
         },
         .f64x2_convert_low_i32x4 => |op| live.put(op.vector, {}) catch {},
+        .f64x2_promote_low_f32x4 => |op| live.put(op.vector, {}) catch {},
         .i64x2_unop => |un| live.put(un.vector, {}) catch {},
         .i64x2_extend_i32x4 => |op| live.put(op.vector, {}) catch {},
         .i64x2_extmul_i32x4 => |op| {
@@ -647,6 +649,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .f32x4_unop => |un| last_use.put(un.vector, pos) catch {},
         .f32x4_convert_i32x4 => |op| last_use.put(op.vector, pos) catch {},
         .i32x4_trunc_sat => |op| last_use.put(op.vector, pos) catch {},
+        .f32x4_demote_f64x2_zero => |op| last_use.put(op.vector, pos) catch {},
         .i32x4_extmul_i16x8 => |op| {
             last_use.put(op.lhs, pos) catch {};
             last_use.put(op.rhs, pos) catch {};
@@ -696,6 +699,7 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
             last_use.put(bin.rhs, pos) catch {};
         },
         .f64x2_convert_low_i32x4 => |op| last_use.put(op.vector, pos) catch {},
+        .f64x2_promote_low_f32x4 => |op| last_use.put(op.vector, pos) catch {},
         .i64x2_unop => |un| last_use.put(un.vector, pos) catch {},
         .i64x2_extend_i32x4 => |op| last_use.put(op.vector, pos) catch {},
         .i64x2_extmul_i32x4 => |op| {
