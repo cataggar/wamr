@@ -1134,6 +1134,15 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// FMLA/FMLS Vd.4S, Vn.4S, Vm.4S.
+    pub fn fmla4s(self: *CodeBuffer, subtract: bool, vd: u5, vn: u5, vm: u5) !void {
+        const base: u32 = if (subtract) 0x4EA0CC00 else 0x4E20CC00;
+        try self.emit32(base |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     pub const F32x4UnaryOp = enum(u32) {
         abs = 0x4EA0F800,
         neg = 0x6EA0F800,
@@ -1296,6 +1305,15 @@ pub const CodeBuffer = struct {
     /// Floating-point 2D binary vector op: FADD/FSUB/FMUL/FDIV/FMAX/FMIN.
     pub fn f64x2Op(self: *CodeBuffer, op: F64x2Op, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(@intFromEnum(op) |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FMLA/FMLS Vd.2D, Vn.2D, Vm.2D.
+    pub fn fmla2d(self: *CodeBuffer, subtract: bool, vd: u5, vn: u5, vm: u5) !void {
+        const base: u32 = if (subtract) 0x4EE0CC00 else 0x4E60CC00;
+        try self.emit32(base |
             (@as(u32, vm) << 16) |
             (@as(u32, vn) << 5) |
             vd);
@@ -3026,6 +3044,33 @@ test "emit: MUL v0.4s, v1.4s, v2.4s" {
     defer code.deinit();
     try code.i32x4Op(.mul, 0, 1, 2);
     try expectWord(0x4EA29C20, &code);
+}
+
+test "emit: vector FMLA/FMLS" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fmla4s(false, 0, 1, 2);
+        try expectWord(0x4E22CC20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fmla4s(true, 0, 1, 2);
+        try expectWord(0x4EA2CC20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fmla2d(false, 0, 1, 2);
+        try expectWord(0x4E62CC20, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fmla2d(true, 0, 1, 2);
+        try expectWord(0x4EE2CC20, &code);
+    }
 }
 
 test "emit: i32x4 min/max vector ops" {
