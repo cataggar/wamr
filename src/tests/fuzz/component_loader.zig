@@ -9,6 +9,20 @@ const std = @import("std");
 const wamr = @import("wamr");
 const common = @import("common.zig");
 
+/// Run the component loader once over `input`. Shared between the CLI
+/// corpus replay below and the OSS-Fuzz `LLVMFuzzerTestOneInput` shim
+/// in `oss_component_loader.zig`. Typed loader errors are expected.
+pub fn runOnce(allocator: std.mem.Allocator, input: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    if (wamr.component_loader.load(input, arena.allocator())) |_| {
+        // Valid component — fine.
+    } else |_| {
+        // Typed loader error — fine.
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -31,16 +45,7 @@ pub fn main(init: std.process.Init) !void {
         idx +%= 1;
 
         try common.markInFlight(io, args.crashes_dir, input);
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        if (wamr.component_loader.load(input, arena.allocator())) |_| {
-            // Valid component — fine.
-        } else |_| {
-            // Typed loader error — fine.
-        }
-
+        runOnce(allocator, input);
         common.clearInFlight(io, args.crashes_dir);
     }
 

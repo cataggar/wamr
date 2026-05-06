@@ -1,62 +1,75 @@
-# OSS-Fuzz feasibility evaluation
+# OSS-Fuzz feasibility and local packaging
 
-This document is the deliverable for #249. It evaluates whether to integrate
-this repository with [OSS-Fuzz][oss-fuzz] now, after the local fuzz harnesses
-introduced in #222, #245, #246, and #247 stabilised, and records the
-decision so future contributors can revisit it without redoing the analysis.
+This document is the deliverable for #249 and the readiness gate for
+#262. It evaluates whether to integrate this repository with
+[OSS-Fuzz][oss-fuzz] and records the decision so future contributors
+can revisit it without redoing the analysis.
 
 [oss-fuzz]: https://github.com/google/oss-fuzz
 
 ## Summary
 
-**Decision: defer.**
+**Decision: ship local-only OSS-Fuzz packaging; do not submit upstream.**
 
-The current corpus-replay harnesses already satisfy our near-term goal of
-catching panics, safety-checked UB, and process aborts on attacker-controlled
-binaries via scheduled CI runs. OSS-Fuzz adds genuine value (continuous
-coverage-guided mutation, ClusterFuzz triage, public regressions corpus) but
-the integration cost is non-trivial because:
+Issue #262 listed four prerequisites for re-opening the OSS-Fuzz
+question. The repository now matches the technical prerequisites:
 
-- This repo is written in Zig 0.16. OSS-Fuzz first-class language support
-  is C, C++, Rust, Go, Python, Java/JVM, JavaScript, and Swift. Zig is not
-  on that list, so we must either ship a C-ABI shim or rely on Zig's own
-  `std.testing.fuzz`, which is still in flux upstream.
-- Each existing harness is a CLI corpus replay (`pub fn main`), not a
-  libFuzzer-shaped `LLVMFuzzerTestOneInput` function. Adapting them is
-  mostly mechanical but is real work.
-- Several harnesses (`fuzz-aot`, `fuzz-diff`) have host-process trap
-  limitations on Linux/AArch64 that already constrain in-repo coverage;
-  those constraints carry over to OSS-Fuzz.
+1. #248 (corpus minimization and reducer workflow) is closed; reduced
+   inputs land under `tests/fuzz/regression/<target>/` per
+   `tests/fuzz/regression/README.md` and `scripts/fuzz_reduce.py`.
+2. We accept the cost of maintaining a hand-rolled
+   `LLVMFuzzerTestOneInput` shim and a pinned Zig toolchain.
+   Zig's `std.testing.fuzz` is still moving and OSS-Fuzz's base image
+   does not ship Zig as a first-class language; the shim path is the
+   stable choice.
+3. The high-priority deterministic harnesses (`fuzz-loader`,
+   `fuzz-component-loader`, `fuzz-canon`) have been running on the
+   `.github/workflows/fuzz.yml` daily schedule without crashers.
+4. The repository's `SECURITY.md` and `SECURITY_PROCESS.md`
+   intentionally do not promise a formal SLA, embargo, or CVE pipeline.
+   Submitting this project upstream to OSS-Fuzz would import
+   ClusterFuzz's default 90-day disclosure window and create downstream
+   expectations the maintainer has not agreed to. **For that reason
+   this work is local-only and the upstream submission step is
+   explicitly not in scope.**
 
-We will revisit this decision after:
+Local-only deliverables in this repository:
 
-1. #248 lands a documented minimization workflow so triage is repeatable;
-2. Zig's `std.testing.fuzz` stabilises in a 0.x release we plan to track,
-   or we accept the cost of writing a hand-rolled C-ABI shim;
-3. We have at least one harness that has run for ≥1 month in CI without
-   producing crashers, indicating the trivial bug surface is exhausted and
-   coverage-guided mutation would actually find new bugs.
+- `src/tests/fuzz/oss_loader.zig`, `oss_component_loader.zig`,
+  `oss_canon.zig` — Zig shim sources that export
+  `LLVMFuzzerTestOneInput` and call the same `runOnce` functions the
+  CLI corpus-replay harnesses use.
+- `build.zig` `fuzz-oss` step — emits
+  `zig-out/lib/libfuzz-oss-{loader,component-loader,canon}.a` static
+  archives.
+- `oss-fuzz/Dockerfile`, `oss-fuzz/build.sh`, `oss-fuzz/README.md` —
+  package the static archives into libFuzzer binaries by linking
+  against `$LIB_FUZZING_ENGINE` in an OSS-Fuzz-style local build.
 
-A follow-up issue captures the prerequisite list above; see the bottom of
-this document.
+OSS-Fuzz integration as a continuous service is **not** wired in.
+There is no `projects/wamr/` PR upstream and the `oss-fuzz/` directory
+must not be pushed to `google/oss-fuzz`. Re-evaluate that step only if
+a maintainer agrees to track ClusterFuzz disclosures and accept the
+upstream operational expectations.
 
 ## Per-harness assessment
 
-| Harness                 | Entry point                              | Determinism | Resource bound                  | Coverage-fuzz priority |
-| ----------------------- | ---------------------------------------- | ----------- | ------------------------------- | ---------------------- |
-| `fuzz-loader`           | `src/tests/fuzz/loader.zig`              | Yes         | 16MB input cap, no I/O          | High — small inputs, big surface, no I/O |
-| `fuzz-component-loader` | `src/tests/fuzz/component_loader.zig`    | Yes         | 16MB input cap, no I/O          | High — same as core loader |
-| `fuzz-canon`            | `src/tests/fuzz/canon.zig`               | Yes         | 64KB memory cap, arena per iter | High — pointer/length surface, no I/O |
-| `fuzz-interp`           | `src/tests/fuzz/interp.zig` + `invoke.zig` | Yes (with fuel) | Per-export fuel cap (default 100k) | Medium — needs fuel piped from libFuzzer entry |
-| `fuzz-aot`              | `src/tests/fuzz/aot.zig`                 | Yes (no execute) | `invoke_start = false`         | Medium — heavier per-iteration AOT compile |
-| `fuzz-diff`             | `src/tests/fuzz/diff.zig` + `invoke.zig` | Yes (with fuel + safe filter) | Static AOT-safe straight-line subset only | Low — limited by Linux/AArch64 native trap host-termination; safe subset is small |
+| Harness                 | Entry point                              | Determinism | Resource bound                  | Coverage-fuzz priority | OSS-Fuzz shim |
+| ----------------------- | ---------------------------------------- | ----------- | ------------------------------- | ---------------------- | ------------- |
+| `fuzz-loader`           | `src/tests/fuzz/loader.zig`              | Yes         | 16MB input cap, no I/O          | High — small inputs, big surface, no I/O | Yes (`oss_loader.zig`) |
+| `fuzz-component-loader` | `src/tests/fuzz/component_loader.zig`    | Yes         | 16MB input cap, no I/O          | High — same as core loader | Yes (`oss_component_loader.zig`) |
+| `fuzz-canon`            | `src/tests/fuzz/canon.zig`               | Yes         | 64KB memory cap, arena per iter | High — pointer/length surface, no I/O | Yes (`oss_canon.zig`) |
+| `fuzz-interp`           | `src/tests/fuzz/interp.zig` + `invoke.zig` | Yes (with fuel) | Per-export fuel cap (default 100k) | Medium — needs fuel piped from libFuzzer entry | No |
+| `fuzz-aot`              | `src/tests/fuzz/aot.zig`                 | Yes (no execute) | `invoke_start = false`         | Medium — heavier per-iteration AOT compile | No |
+| `fuzz-diff`             | `src/tests/fuzz/diff.zig` + `invoke.zig` | Yes (with fuel + safe filter) | Static AOT-safe straight-line subset only | Low — limited by Linux/AArch64 native trap host-termination; safe subset is small | No |
+| `fuzz-wasi`             | `src/tests/fuzz/wasi.zig`                | Per-iteration adapter rebuild | Per-process temp preopen | Medium — WASI sandbox surface | No |
 
-The "high" priority harnesses are good candidates for a future
-coverage-guided integration. They have small, fast iterations; no host
-file-system or network effects; and a deterministic oracle (typed errors
-OK, panic/UB/abort is a bug). The medium and low priority harnesses would
-require additional hardening before they pay back the OSS-Fuzz integration
-cost.
+The "high" priority harnesses are good candidates for coverage-guided
+mutation. They have small, fast iterations; no host file-system or
+network effects; and a deterministic oracle (typed errors OK,
+panic/UB/abort is a bug). The medium and low priority harnesses would
+require additional hardening before they pay back the OSS-Fuzz
+integration cost; their shims are intentionally not built.
 
 ## Zig + libFuzzer interop
 
@@ -67,110 +80,105 @@ libFuzzer runtime and exports the standard entry point:
 extern int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 ```
 
-Two viable paths exist:
+Two viable paths existed:
 
-1. **Hand-rolled C-ABI shim** — add a `fuzz_target_<name>.zig` that exposes:
+1. **Hand-rolled C-ABI shim (chosen).** `src/tests/fuzz/oss_*.zig`
+   exposes:
 
    ```zig
    export fn LLVMFuzzerTestOneInput(data: [*]const u8, size: usize) c_int {
-       const bytes = data[0..size];
-       runOnce(global_allocator, bytes) catch {};
+       // reset shared arena, call harness.runOnce(arena, data[0..size])
        return 0;
    }
    ```
 
-   and compile it with `-fsanitize=fuzzer-no-link` plus the system
-   libFuzzer runtime. This is conceptually simple but requires us to
-   manage a global allocator (libFuzzer reuses the process per iteration)
-   and to ensure no harness state leaks between calls.
+   The Zig shims are compiled into static archives by `zig build
+   fuzz-oss`. `oss-fuzz/build.sh` links each archive with
+   `$LIB_FUZZING_ENGINE` (clang `-fsanitize=fuzzer`) using
+   `-Wl,--whole-archive` so the linker keeps the exported symbol.
+   This approach does not depend on Zig's coverage instrumentation;
+   libFuzzer drives the shim as a black-box per-input function. See
+   "Limitations" below.
 
-2. **Use Zig's `std.testing.fuzz`** — Zig 0.16 has experimental fuzzing
-   support but the API is still moving. OSS-Fuzz's Zig support, if any,
-   would have to follow upstream Zig. Tracking this would lock our build
-   to a specific Zig release in OSS-Fuzz's base image.
-
-Either path adds a parallel fuzz build on top of the existing
-`zig build fuzz` step. It does not replace the existing CLI harnesses.
+2. **Use Zig's `std.testing.fuzz`** — Zig 0.16 has experimental
+   fuzzing support but the API is still moving and OSS-Fuzz does not
+   ship Zig in the base image. Tracking this would lock the build to
+   a specific Zig release in OSS-Fuzz's base image. Deferred.
 
 ### Sanitizer notes
 
 - Zig 0.16 ships its own runtime safety checks; combining with
   AddressSanitizer/MSAN/UBSAN under libFuzzer requires verifying that
   Zig's safety panic handler does not interfere with libFuzzer's crash
-  detection.
-- Stack overflows inside Zig's interpreter (especially for hostile control
-  flow) need a configured stack guard size; OSS-Fuzz already runs targets
-  under ASan with a guard region.
+  detection. The default (ReleaseSafe) keeps Zig safety checks
+  visible.
+- Stack overflows inside Zig's interpreter (especially for hostile
+  control flow) need a configured stack guard size; OSS-Fuzz already
+  runs targets under ASan with a guard region.
 
 ## Build environment
 
-OSS-Fuzz integration requires submitting two files to the OSS-Fuzz repo:
+`oss-fuzz/Dockerfile` mirrors `gcr.io/oss-fuzz-base/base-builder`,
+installs a pinned Zig 0.16.0 with a SHA-256 verified tarball, and
+clones this repository. `oss-fuzz/build.sh` runs:
 
-- `projects/wamr/Dockerfile` — base on `gcr.io/oss-fuzz-base/base-builder`,
-  install Zig 0.16 (download tarball, verify checksum), install
-  `wasm-tools` for seed generation, and `git clone` this repo.
-- `projects/wamr/build.sh` — run `zig build fuzz -Doptimize=ReleaseSafe`
-  and the libFuzzer-shim build for the high-priority harnesses, then copy
-  binaries to `$OUT/`.
+- `zig build fuzz-oss -Doptimize=ReleaseSafe` to emit the static
+  archives;
+- `clang++ -Wl,--whole-archive lib*.a -Wl,--no-whole-archive
+  $LIB_FUZZING_ENGINE -o $OUT/fuzz-oss-<name>` for each high-priority
+  target;
+- per-target `*_seed_corpus.zip` archives sourced from
+  `tests/malformed/fuzz`, `tests/spec-json` (loader), generated
+  minimal seeds (component-loader, canon), and any committed
+  regression seeds in `tests/fuzz/regression/<target>/`.
 
-We also need an `oss-fuzz`-friendly seed corpus. The existing
-`tests/malformed/fuzz/*.wasm` and the planned regression seeds from #248
-can be packaged as the initial OSS-Fuzz seed corpus.
+Local builds without Docker are documented in `oss-fuzz/README.md`.
 
 ## Triage flow
 
-If we proceed:
+If we ever proceed with continuous OSS-Fuzz coverage, the local
+packaging is meant to plug in directly:
 
 1. OSS-Fuzz reports a crash with a reduced reproducer.
 2. The maintainer downloads the reproducer, runs the matching local
-   harness via `--corpus <dir>` to confirm.
-3. If reproduction succeeds, follow the disclosure flow in `SECURITY.md`
-   and `SECURITY_PROCESS.md`. ClusterFuzz's 90-day disclosure window
-   should be aligned with our SECURITY policy when filing the OSS-Fuzz
-   project.
-4. After fix, the minimized reproducer becomes a regression seed under
-   `tests/fuzz/regression/<target>/` (per #248), so the in-repo harnesses
-   keep covering the original input.
+   CLI harness via `--corpus <dir>` to confirm.
+3. If reproduction succeeds, follow the disclosure flow in
+   `SECURITY.md` and `SECURITY_PROCESS.md`. ClusterFuzz's 90-day
+   disclosure window would need to be reconciled with the
+   repository's best-effort process before any upstream submission.
+4. After fix, the minimized reproducer becomes a regression seed
+   under `tests/fuzz/regression/<target>/` (per #248), so the in-repo
+   harnesses keep covering the original input.
 
-## Cost vs benefit
+## Limitations
 
-| Item                                               | Cost                          | Benefit                          |
-| -------------------------------------------------- | ----------------------------- | -------------------------------- |
-| C-ABI shim per high-priority harness               | ~100 lines + per-target build | Coverage-guided mutation         |
-| OSS-Fuzz `Dockerfile` + `build.sh`                 | One-time, modest              | ClusterFuzz infra and triage     |
-| Pin Zig version in OSS-Fuzz base                   | Ongoing maintenance           | Reproducible builds              |
-| Address Zig + sanitizer interactions               | Real, possibly fragile        | Memory-safety bug detection     |
-| Disclosure pipeline alignment with `SECURITY.md`   | Light                         | Coordinated public/private flow  |
-| Long-running coverage corpus distribution          | Free (ClusterFuzz hosts it)   | Stable seeds beyond what fits in repo |
+- **No Zig-side coverage instrumentation.** libFuzzer feedback is
+  limited to whatever the C/C++ runtime sees plus crash detection;
+  end-to-end smoke runs of the shims report
+  `WARNING: no interesting inputs were found so far. Is the code
+  instrumented for coverage?` — expected for this approach.
+  Coverage-guided mutation will still help but not as effectively as
+  a fully instrumented build.
+- **Local Docker only.** The image is reproducible locally via the
+  upstream OSS-Fuzz `helper.py` flow, but is not connected to
+  ClusterFuzz.
+- **Three high-priority targets only.** `fuzz-interp`, `fuzz-aot`,
+  `fuzz-diff`, and `fuzz-wasi` keep their CLI-only form until each
+  has a libFuzzer-friendly resource policy (fuel, subprocess
+  isolation, or sandbox redo per-iteration).
 
-Today the in-repo harnesses already catch the fast wins. We have no
-evidence yet that we are corpus-bound (CI fuzzing is finishing without
-crashers on stable code paths). Until coverage-guided mutation would
-plausibly find bugs the corpus replay misses, the maintenance cost is
-greater than the benefit.
+## Re-evaluating upstream submission
 
-## Decision
+Open a follow-up issue, not another PR, if any of the following
+change:
 
-Defer OSS-Fuzz integration. Re-evaluate after the prerequisites listed in
-the Summary land. Tracked in the follow-up issue linked from this
-document.
+- a maintainer agrees to track ClusterFuzz advisories and accept the
+  90-day disclosure default;
+- Zig becomes a first-class OSS-Fuzz language with stable `fuzz`
+  instrumentation, removing the hand-rolled shim cost;
+- coverage data from local libFuzzer runs shows the in-repo CLI
+  workflow is corpus-bound and would benefit from continuous
+  coverage-guided mutation.
 
-## Prerequisite list (for the future re-evaluation)
-
-1. #248 corpus minimization and reducer workflow merged; reduced inputs
-   landing as regression seeds.
-2. Either Zig 0.16+ `std.testing.fuzz` stable enough to depend on in
-   OSS-Fuzz's base image, **or** a written agreement that we maintain a
-   hand-rolled `LLVMFuzzerTestOneInput` shim and a pinned Zig toolchain.
-3. At least one high-priority harness has run on the daily CI schedule
-   for ≥30 days with no crashers found, suggesting coverage-guided
-   mutation would extend our reach.
-4. Disclosure-window policy (90-day default in ClusterFuzz) reconciled
-   with `SECURITY.md`/`SECURITY_PROCESS.md`.
-
-When all four conditions are met, open a focused PR that:
-
-- adds `fuzz_oss_<target>.zig` shim files for the high-priority harnesses;
-- adds `oss-fuzz/Dockerfile` and `oss-fuzz/build.sh` mirroring the
-  upstream OSS-Fuzz layout;
-- submits the OSS-Fuzz `projects/wamr/` PR upstream.
+Until then, the local packaging is the project's complete OSS-Fuzz
+posture.
