@@ -454,3 +454,41 @@ test "allocateFromRanges: v128 spills consume two aligned slots" {
     try std.testing.expectEqual(Allocation{ .stack = 32 }, result.get(1).?);
     try std.testing.expectEqual(Allocation{ .reg = 0 }, result.get(2).?);
 }
+
+test "allocateFromRanges: 24-register v128 pool holds 12 live vectors without spills" {
+    const allocator = std.testing.allocator;
+    const regs = [_]PhysReg{
+        0,  1,  2,  3,  4,  5,  6,  7,
+        16, 17, 18, 19, 20, 21, 22, 23,
+        24, 25, 26, 27, 28, 29, 30, 31,
+    };
+    const indices = [_]u8{
+        0,  1,  2,  3,  4,  5,  6,  7,
+        8,  9,  10, 11, 12, 13, 14, 15,
+        16, 17, 18, 19, 20, 21, 22, 23,
+    };
+    const vreg_set: RegSet = .{
+        .alloc_regs = &regs,
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &indices,
+        .spill_base = 128,
+        .spill_stride = 8,
+    };
+    var ranges: [12]analysis.LiveRange = undefined;
+    for (&ranges, 0..) |*range, i| {
+        range.* = .{
+            .vreg = @intCast(i),
+            .start = @intCast(i),
+            .end = 100,
+            .type = .v128,
+        };
+    }
+
+    var result = try allocateFromRanges(allocator, vreg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
+    for (0..12) |i| {
+        try std.testing.expect(result.get(@intCast(i)).? == .reg);
+    }
+}
