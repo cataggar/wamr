@@ -1008,7 +1008,10 @@ fn compileToAot(
     var ir_module = try frontend.lowerModule(module, a);
     defer ir_module.deinit();
 
-    _ = try passes.runPasses(&ir_module, passes.default_passes, a);
+    _ = try passes.runPasses(&ir_module, passes.defaultPassesForTarget(switch (builtin.cpu.arch) {
+        .aarch64 => .aarch64,
+        else => .x86_64,
+    }), a);
 
     const code: []const u8, const offsets: []const u32 = switch (builtin.cpu.arch) {
         .aarch64 => blk: {

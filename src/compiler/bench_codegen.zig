@@ -733,7 +733,7 @@ fn runBenchWithPasses(
     defer module.deinit();
     const func = try buildTestFunc(allocator, buildBody);
     _ = try module.addFunction(func);
-    _ = try passes.runPasses(&module, passes.default_passes, allocator);
+    _ = try passes.runPasses(&module, passes.defaultPassesForTarget(.x86_64), allocator);
 
     const sample_result = try compile.compileFunctionRA(&module.functions.items[0], 0, allocator);
     const code_size = sample_result.code.len;

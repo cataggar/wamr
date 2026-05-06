@@ -8,6 +8,8 @@ const std = @import("std");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
 
+pub const TargetArch = enum { x86_64, aarch64 };
+
 // ── Use-Def Analysis ────────────────────────────────────────────────────────
 
 /// Tracks which instructions define and use each VReg.
@@ -4776,7 +4778,7 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
     return total_changes;
 }
 
-/// The default optimization pipeline.
+/// Target-independent optimization pipeline.
 pub const default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
@@ -4786,10 +4788,6 @@ pub const default_passes: []const PassFn = &.{
     &strengthReduceDivRem,
     &foldConstantBranches,
     &foldInverseCompareEqz,
-    // `foldBranchOnEqz` is semantically valid, but on AArch64 it flips hot
-    // CoreMark loop branches into the taken conditional path and regresses AOT
-    // throughput heavily. Keep the pass available for future target-aware use,
-    // but do not enable it in the target-independent default pipeline.
     &threadChainedConditionalBranches,
     &foldSelectOnEqz,
     &foldSignExtendingLoad,
@@ -4803,6 +4801,38 @@ pub const default_passes: []const PassFn = &.{
     &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
+
+/// Default optimization pipeline for x86-64.
+const x86_64_default_passes: []const PassFn = &.{
+    &forwardLocalGet,
+    &constantFold,
+    &algebraicSimplify,
+    &strengthReduceMul,
+    &strengthReduceMulShiftAdd,
+    &strengthReduceDivRem,
+    &foldConstantBranches,
+    &foldInverseCompareEqz,
+    &foldBranchOnEqz,
+    &threadChainedConditionalBranches,
+    &foldSelectOnEqz,
+    &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,
+    &globalValueNumbering,
+    &hoistLoopInvariantCode,
+    &deadCodeElimination,
+    &deadLocalSetElimination,
+    &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
+};
+
+pub fn defaultPassesForTarget(target: TargetArch) []const PassFn {
+    return switch (target) {
+        .x86_64 => x86_64_default_passes,
+        .aarch64 => default_passes,
+    };
+}
 
 // ── Block Reordering ────────────────────────────────────────────────────────
 
@@ -4881,7 +4911,10 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
     // Entry block is never treated as cold.
     is_cold[0] = false;
 
-    // Partition RPO: hot first, cold second (preserving RPO within each group)
+    // Partition RPO: hot first, cold second (preserving RPO within each group).
+    // `buildSuccessors` visits br_if then_block before else_block, so AArch64
+    // keeps the original branch polarity/layout bias unless target-aware passes
+    // deliberately rewrite the terminator first.
     var order = try allocator.alloc(ir.BlockId, n);
     var hot_i: usize = 0;
 
@@ -7366,10 +7399,16 @@ test "foldBranchOnEqz: pipeline drops dead eqz after DCE" {
     try std.testing.expect(func.getBlock(b0).instructions.items[0].op == .br_if);
 }
 
-test "default pipeline excludes foldBranchOnEqz until branch layout is target-aware" {
-    for (default_passes) |pass| {
-        try std.testing.expect(pass != &foldBranchOnEqz);
+fn pipelineContains(pass_list: []const PassFn, needle: PassFn) bool {
+    for (pass_list) |pass| {
+        if (pass == needle) return true;
     }
+    return false;
+}
+
+test "default pipeline enables foldBranchOnEqz only for x86_64" {
+    try std.testing.expect(pipelineContains(defaultPassesForTarget(.x86_64), &foldBranchOnEqz));
+    try std.testing.expect(!pipelineContains(defaultPassesForTarget(.aarch64), &foldBranchOnEqz));
 }
 
 test "threadChainedConditionalBranches: true edge jumps to inner true target" {
