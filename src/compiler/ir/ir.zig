@@ -939,6 +939,14 @@ pub const IrModule = struct {
     /// but call instructions use module-level indices where
     /// indices < import_count refer to imports.
     import_count: u32 = 0,
+    /// Wasm-flat global types (imported globals first, then local globals).
+    /// Populated by the frontend so codegen can use the same byte offsets as
+    /// the AOT runtime when globals include 16-byte v128 slots.
+    global_types: ?[]const IrType = null,
+    /// Byte offset for each wasm-flat global in the AOT globals storage.
+    global_offsets: ?[]const u32 = null,
+    /// Total byte size of the AOT globals storage.
+    global_storage_size: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) IrModule {
         return .{
@@ -949,6 +957,8 @@ pub const IrModule = struct {
     pub fn deinit(self: *IrModule) void {
         for (self.functions.items) |*func| func.deinit();
         self.functions.deinit(self.allocator);
+        if (self.global_types) |gt| self.allocator.free(gt);
+        if (self.global_offsets) |go| self.allocator.free(go);
     }
 
     pub fn addFunction(self: *IrModule, func: IrFunction) !u32 {

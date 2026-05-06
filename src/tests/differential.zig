@@ -461,6 +461,133 @@ test "differential SIMD: v128 local set/get" {
     try expectSimdDiffI32(wasm, "f", 19);
 }
 
+test "differential SIMD: v128 immutable global get" {
+    var init: std.ArrayList(u8) = .empty;
+    defer init.deinit(testing.allocator);
+    try appendV128ConstI32x4(&init, testing.allocator, .{ 17, 18, 19, 20 });
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendGlobalGet(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 2);
+    try body.append(testing.allocator, 0x0B);
+
+    const globals = [_]TestGlobal{.{ .val_type = 0x7B, .mutable = false, .init_expr = init.items }};
+    const wasm = try buildCustomGlobalModule(testing.allocator, &globals, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 19);
+}
+
+test "differential SIMD: v128 mutable global set/get" {
+    var init: std.ArrayList(u8) = .empty;
+    defer init.deinit(testing.allocator);
+    try appendV128ConstI32x4(&init, testing.allocator, .{ 1, 2, 3, 4 });
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 31, 32, 33, 34 });
+    try appendGlobalSet(&body, testing.allocator, 0);
+    try appendGlobalGet(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 3);
+    try body.append(testing.allocator, 0x0B);
+
+    const globals = [_]TestGlobal{.{ .val_type = 0x7B, .mutable = true, .init_expr = init.items }};
+    const wasm = try buildCustomGlobalModule(testing.allocator, &globals, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 34);
+}
+
+test "differential SIMD: mixed scalar and v128 globals use aligned storage" {
+    var init_i32_a: std.ArrayList(u8) = .empty;
+    defer init_i32_a.deinit(testing.allocator);
+    try appendI32Const(&init_i32_a, testing.allocator, 5);
+    var init_v128: std.ArrayList(u8) = .empty;
+    defer init_v128.deinit(testing.allocator);
+    try appendV128ConstI32x4(&init_v128, testing.allocator, .{ 10, 20, 30, 40 });
+    var init_i32_b: std.ArrayList(u8) = .empty;
+    defer init_i32_b.deinit(testing.allocator);
+    try appendI32Const(&init_i32_b, testing.allocator, 12);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendGlobalGet(&body, testing.allocator, 1);
+    try appendI32x4ExtractLane(&body, testing.allocator, 2);
+    try appendGlobalGet(&body, testing.allocator, 2);
+    try body.append(testing.allocator, 0x6A); // i32.add
+    try body.append(testing.allocator, 0x0B);
+
+    const globals = [_]TestGlobal{
+        .{ .val_type = 0x7F, .mutable = false, .init_expr = init_i32_a.items },
+        .{ .val_type = 0x7B, .mutable = true, .init_expr = init_v128.items },
+        .{ .val_type = 0x7F, .mutable = false, .init_expr = init_i32_b.items },
+    };
+    const wasm = try buildCustomGlobalModule(testing.allocator, &globals, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 42);
+}
+
+test "differential: scalar global after v128 global uses aligned offset" {
+    var init_v128: std.ArrayList(u8) = .empty;
+    defer init_v128.deinit(testing.allocator);
+    try appendV128ConstI32x4(&init_v128, testing.allocator, .{ 1, 2, 3, 4 });
+    var init_i32: std.ArrayList(u8) = .empty;
+    defer init_i32.deinit(testing.allocator);
+    try appendI32Const(&init_i32, testing.allocator, 123);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendGlobalGet(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x0B);
+
+    const globals = [_]TestGlobal{
+        .{ .val_type = 0x7B, .mutable = false, .init_expr = init_v128.items },
+        .{ .val_type = 0x7F, .mutable = false, .init_expr = init_i32.items },
+    };
+    const wasm = try buildCustomGlobalModule(testing.allocator, &globals, body.items);
+    defer testing.allocator.free(wasm);
+    try expectDiffI32(wasm, "f", 123);
+}
+
+test "differential SIMD: v128 global preserves f32 signed zero bits" {
+    var init: std.ArrayList(u8) = .empty;
+    defer init.deinit(testing.allocator);
+    try appendV128ConstF32x4Bits(&init, testing.allocator, .{ 0x8000_0000, 0x3F80_0000, 0, 0 });
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendGlobalGet(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 0);
+    try body.append(testing.allocator, 0x0B);
+
+    const globals = [_]TestGlobal{.{ .val_type = 0x7B, .mutable = false, .init_expr = init.items }};
+    const wasm = try buildCustomGlobalModule(testing.allocator, &globals, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x8000_0000)));
+}
+
+test "differential SIMD: v128 global preserves f32 NaN payload bits" {
+    var init: std.ArrayList(u8) = .empty;
+    defer init.deinit(testing.allocator);
+    try appendV128ConstF32x4Bits(&init, testing.allocator, .{ 0x3F80_0000, 0x7FC1_2345, 0, 0 });
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendGlobalGet(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x0B);
+
+    const globals = [_]TestGlobal{.{ .val_type = 0x7B, .mutable = false, .init_expr = init.items }};
+    const wasm = try buildCustomGlobalModule(testing.allocator, &globals, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x7FC1_2345)));
+}
+
 test "differential SIMD: v128 local tee preserves stack value" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -2859,6 +2986,51 @@ fn buildCustomModule(allocator: std.mem.Allocator, bytecode: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+const TestGlobal = struct {
+    val_type: u8,
+    mutable: bool,
+    init_expr: []const u8,
+};
+
+fn buildCustomGlobalModule(
+    allocator: std.mem.Allocator,
+    globals: []const TestGlobal,
+    bytecode: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+    try out.appendSlice(allocator, &[_]u8{
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+    });
+    try out.appendSlice(allocator, &[_]u8{ 0x03, 0x02, 0x01, 0x00 });
+
+    var global_payload: std.ArrayList(u8) = .empty;
+    defer global_payload.deinit(allocator);
+    try encodeULEB128(&global_payload, allocator, @intCast(globals.len));
+    for (globals) |global| {
+        try global_payload.append(allocator, global.val_type);
+        try global_payload.append(allocator, if (global.mutable) 1 else 0);
+        try global_payload.appendSlice(allocator, global.init_expr);
+        try global_payload.append(allocator, 0x0B);
+    }
+    try appendSection(&out, allocator, 0x06, global_payload.items);
+
+    try out.appendSlice(allocator, &[_]u8{
+        0x07, 0x05, 0x01, 0x01, 'f', 0x00, 0x00,
+    });
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try code.append(allocator, 0x01);
+    try encodeULEB128(&code, allocator, @intCast(bytecode.len));
+    try code.appendSlice(allocator, bytecode);
+
+    try appendSection(&out, allocator, 0x0A, code.items);
+    return out.toOwnedSlice(allocator);
+}
+
 fn appendSection(out: *std.ArrayList(u8), allocator: std.mem.Allocator, id: u8, payload: []const u8) !void {
     try out.append(allocator, id);
     try encodeULEB128(out, allocator, @intCast(payload.len));
@@ -3078,6 +3250,16 @@ fn appendLocalGet(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, index: 
 
 fn appendLocalSet(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, index: u32) !void {
     try buf.append(allocator, 0x21);
+    try encodeULEB128(buf, allocator, index);
+}
+
+fn appendGlobalGet(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, index: u32) !void {
+    try buf.append(allocator, 0x23);
+    try encodeULEB128(buf, allocator, index);
+}
+
+fn appendGlobalSet(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, index: u32) !void {
+    try buf.append(allocator, 0x24);
     try encodeULEB128(buf, allocator, index);
 }
 

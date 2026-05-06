@@ -230,7 +230,7 @@ pub const Harness = struct {
     /// trampoline that loads this pointer so the callee sees the
     /// exporter's memory/tables/globals instead of the caller's.
     persistent_vmctx: ?*aot_runtime.VmCtx = null,
-    persistent_globals: ?[]i64 = null,
+    persistent_globals: ?[]u128 = null,
     /// Executable trampoline stubs (mmap'd). Each stub loads
     /// persistent_vmctx into param_regs[0] and jumps to the real func.
     trampoline_pages: ?[*]u8 = null,
@@ -628,17 +628,14 @@ pub const Harness = struct {
             vmctx.memory_max_size = inst.memories[0].data.len;
             vmctx.memory_pages = inst.memories[0].current_pages;
         }
-        const n_globals = @min(inst.globals.len, @as(usize, 256));
-        const globals_buf = allocator.alloc(i64, 256) catch {
+        const globals_buf = allocator.alloc(u128, aot_runtime.globalStorageWordCount(inst)) catch {
             allocator.destroy(vmctx);
             return;
         };
-        @memset(globals_buf, 0);
-        for (0..n_globals) |i| {
-            globals_buf[i] = aot_runtime.globalValueToI64(inst, inst.globals[i].value);
-        }
-        vmctx.globals_ptr = @intFromPtr(globals_buf.ptr);
-        vmctx.globals_count = @intCast(n_globals);
+        const globals_bytes = std.mem.sliceAsBytes(globals_buf);
+        aot_runtime.writeGlobalsToStorage(inst, globals_bytes);
+        vmctx.globals_ptr = @intFromPtr(globals_bytes.ptr);
+        vmctx.globals_count = @intCast(inst.globals.len);
         if (inst.host_functions.len > 0) {
             vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
             vmctx.host_functions_count = @intCast(inst.host_functions.len);
@@ -1118,6 +1115,7 @@ fn compileToAot(
             .val_type = @intFromEnum(gt.val_type),
             .mutability = if (gt.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
             .init_i64 = valueToI64(val),
+            .init_v128 = valueToV128(val),
         });
     }
 
@@ -1131,6 +1129,7 @@ fn compileToAot(
             .val_type = @intFromEnum(g.global_type.val_type),
             .mutability = if (g.global_type.mutability == .mutable) @as(u8, 1) else @as(u8, 0),
             .init_i64 = valueToI64(val),
+            .init_v128 = valueToV128(val),
         });
     }
 
@@ -1243,6 +1242,7 @@ fn defaultZeroValue(vt: types.ValType) types.Value {
         .i64 => .{ .i64 = 0 },
         .f32 => .{ .f32 = 0 },
         .f64 => .{ .f64 = 0 },
+        .v128 => .{ .v128 = 0 },
         else => .{ .i64 = 0 },
     };
 }
@@ -1314,9 +1314,8 @@ fn resolveFuncIdxFromExpr(
     };
 }
 
-/// Pack a typed Value into an i64 for the globals_buf layout expected by
-/// AOT code. Must stay in sync with `globalValueToI64` in
-/// runtime/aot/runtime.zig.
+/// Pack a typed scalar/reference Value into the 8-byte global init payload.
+/// Must stay in sync with `globalValueToI64` in runtime/aot/runtime.zig.
 fn valueToI64(v: types.Value) i64 {
     return switch (v) {
         .i32 => |x| @as(i64, @as(u32, @bitCast(x))),
@@ -1329,6 +1328,13 @@ fn valueToI64(v: types.Value) i64 {
         // `allocateGlobals` with the matching `-1` shift.
         .funcref, .nonfuncref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
         .externref, .nonexternref => |maybe| if (maybe) |x| @as(i64, @as(u32, x)) + 1 else 0,
+        else => 0,
+    };
+}
+
+fn valueToV128(v: types.Value) u128 {
+    return switch (v) {
+        .v128 => |x| x,
         else => 0,
     };
 }

@@ -1446,7 +1446,7 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         try offsets.append(allocator, @intCast(func_start));
 
         // Compile function using register allocator
-        const result = try compileFunctionRA(&func, ir_module.import_count, allocator);
+        const result = try compileFunctionRAWithGlobalOffsets(&func, ir_module.import_count, ir_module.global_offsets orelse &.{}, allocator);
         defer allocator.free(result.code);
         defer allocator.free(result.call_patches);
 
@@ -1639,10 +1639,29 @@ fn functionUsesV128(func: *const ir.IrFunction) bool {
     return false;
 }
 
+fn globalByteOffset(global_offsets: []const u32, idx: u32) !i32 {
+    const i: usize = @intCast(idx);
+    if (i < global_offsets.len) {
+        if (global_offsets[i] > @as(u32, @intCast(std.math.maxInt(i32)))) return error.GlobalIndexOutOfRange;
+        return @intCast(global_offsets[i]);
+    }
+    if (idx > @as(u32, @intCast(std.math.maxInt(i32) / 8))) return error.GlobalIndexOutOfRange;
+    return @intCast(idx * 8);
+}
+
 /// Compile an IR function using the linear scan register allocator.
 /// VRegs are assigned to physical registers; instructions operate directly
 /// on assigned registers without push/pop through a CachedStack.
 pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocator: std.mem.Allocator) !FuncCompileResult {
+    return compileFunctionRAWithGlobalOffsets(func, import_count, &.{}, allocator);
+}
+
+fn compileFunctionRAWithGlobalOffsets(
+    func: *const ir.IrFunction,
+    import_count: u32,
+    global_offsets: []const u32,
+    allocator: std.mem.Allocator,
+) !FuncCompileResult {
     if (functionUsesV128(func)) return error.UnsupportedV128;
 
     // Compute block emission order ONCE, before anything that uses global
@@ -1838,7 +1857,7 @@ pub fn compileFunctionRA(func: *const ir.IrFunction, import_count: u32, allocato
         const next_block_id: ?ir.BlockId = if (order_idx + 1 < block_order.len) block_order[order_idx + 1] else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets);
         }
         // C3 fall-through peephole: if the block's terminator emitted a
         // trailing `E9 disp32` (br, or br_if's unconditional else) whose
@@ -2201,6 +2220,7 @@ fn compileInstRA(
     used_caller_saved: *const [caller_saved_alloc.len]bool,
     used_callee_saved: *const [callee_saved_alloc.len]bool,
     local_count: u32,
+    global_offsets: []const u32,
 ) !void {
     switch (inst.op) {
         // ── Constants ─────────────────────────────────────────────────
@@ -3565,14 +3585,14 @@ fn compileInstRA(
             // Load globals_base from VmCtx, then load global value
             try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
             try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
-            try code.movRegMem(dr, .r10, @as(i32, @intCast(idx * 8))); // global[idx]
+            try code.movRegMem(dr, .r10, try globalByteOffset(global_offsets, idx)); // global[idx]
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .global_set => |gs| {
             const val_reg = try useVReg(code, alloc_result, gs.val, .rax);
             try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
             try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
-            try code.movMemReg(.r10, @as(i32, @intCast(gs.idx * 8)), val_reg); // global[idx] = val
+            try code.movMemReg(.r10, try globalByteOffset(global_offsets, gs.idx), val_reg); // global[idx] = val
         },
 
         .@"unreachable" => {

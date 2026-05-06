@@ -251,7 +251,8 @@ pub const VmCtx = extern struct {
     memory_base: usize = 0,
     /// Size of linear memory in bytes (current, may grow).
     memory_size: usize = 0,
-    /// Pointer to flat globals values array (each global is an i64 at index * 8).
+    /// Pointer to flat globals storage. Scalar/reference globals use 8-byte
+    /// slots; v128 globals use 16-byte aligned, 16-byte slots.
     globals_ptr: usize = 0,
     /// Pointer to array of host function pointers (one per import).
     host_functions_ptr: usize = 0,
@@ -878,6 +879,10 @@ pub const AotInstance = struct {
     memories: []*types.MemoryInstance,
     tables: []*types.TableInstance,
     globals: []*types.GlobalInstance,
+    /// Byte offset for each wasm-flat global in `VmCtx.globals_ptr`.
+    global_offsets: []u32 = &.{},
+    /// Total byte size of the globals storage described by `global_offsets`.
+    global_storage_size: u32 = 0,
     allocator: std.mem.Allocator,
     /// Base address of the mapped executable code (null if not yet mapped).
     code_base: ?[*]const u8 = null,
@@ -1015,6 +1020,10 @@ pub fn instantiate(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
 
     inst.globals = try allocateGlobals(module, allocator);
     errdefer freeGlobals(inst.globals, allocator);
+    const global_layout = try computeGlobalLayout(module.global_inits, allocator);
+    inst.global_offsets = global_layout.offsets;
+    inst.global_storage_size = global_layout.size;
+    errdefer if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
 
     // Resolve AOT host functions for imports
     inst.host_functions = try resolveHostFunctions(module, allocator);
@@ -1079,11 +1088,12 @@ pub fn destroy(inst: *AotInstance) void {
     const allocator = inst.allocator;
     // Unmap executable code if mapped.
     if (inst.code_base) |base| {
-        platform.munmap(@constCast(@ptrCast(base)), inst.code_size);
+        platform.munmap(@ptrCast(@constCast(base)), inst.code_size);
     }
     freeMemories(inst.memories, allocator);
     freeTables(inst.tables, allocator);
     freeGlobals(inst.globals, allocator);
+    if (inst.global_offsets.len > 0) allocator.free(inst.global_offsets);
     if (inst.host_functions.len > 0) allocator.free(inst.host_functions);
     // inst.func_table aliases tables[0].native_backing (freed by TableInstance.release).
     if (inst.funcptrs.len > 0) allocator.free(inst.funcptrs);
@@ -1362,12 +1372,11 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
             return error.FunctionNotFound;
     };
 
-    // Build flat globals array for AOT access
-    var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
-    const n_globals = @min(inst.globals.len, globals_buf.len);
-    for (0..n_globals) |i| {
-        globals_buf[i] = globalValueToI64(inst, inst.globals[i].value);
-    }
+    // Build flat globals storage for AOT access.
+    const globals_words = inst.allocator.alloc(u128, globalStorageWordCount(inst)) catch return error.OutOfMemory;
+    defer inst.allocator.free(globals_words);
+    const globals_buf = std.mem.sliceAsBytes(globals_words);
+    writeGlobalsToStorage(inst, globals_buf);
 
     // Build VMContext for the compiled function
     var vmctx = VmCtx{};
@@ -1379,8 +1388,8 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     }
     // Always provide a valid globals pointer — compiled code may access globals
     // even if none are explicitly initialized (they default to zero).
-    vmctx.globals_ptr = @intFromPtr(&globals_buf);
-    vmctx.globals_count = @intCast(n_globals);
+    vmctx.globals_ptr = @intFromPtr(globals_buf.ptr);
+    vmctx.globals_count = @intCast(inst.globals.len);
     if (inst.host_functions.len > 0) {
         vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
         vmctx.host_functions_count = @intCast(inst.host_functions.len);
@@ -1436,10 +1445,8 @@ pub fn callFunc(inst: *AotInstance, func_idx: u32, comptime Result: type) Runtim
     }
     const result = func_ptr(&vmctx);
 
-    // Sync globals back from flat array to GlobalInstance objects
-    for (0..n_globals) |i| {
-        inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
-    }
+    // Sync globals back from flat storage to GlobalInstance objects.
+    readGlobalsFromStorage(inst, globals_buf);
 
     return result;
 }
@@ -1502,10 +1509,52 @@ fn isScalarValType(t: types.ValType) bool {
     };
 }
 
-/// Pack a global's typed value into a raw 64-bit slot for the flat globals_buf
-/// that AOT code accesses via `movRegMem(dr, globals_base, idx*8)`. The tag
-/// determines the bit-cast; using `.value.i64` would be UB when the active
-/// tag is `.f32` / `.f64`.
+pub fn globalStorageWordCount(inst: *const AotInstance) usize {
+    const bytes = if (inst.global_storage_size == 0) @as(u32, 16) else inst.global_storage_size;
+    return (@as(usize, bytes) + 15) / 16;
+}
+
+fn globalOffsetAt(inst: *const AotInstance, idx: usize) ?usize {
+    if (idx < inst.global_offsets.len) return inst.global_offsets[idx];
+    const off = idx * 8;
+    if (off + 8 <= inst.global_storage_size) return off;
+    return null;
+}
+
+pub fn writeGlobalsToStorage(inst: *const AotInstance, storage: []u8) void {
+    @memset(storage, 0);
+    for (inst.globals, 0..) |g, i| {
+        const off = globalOffsetAt(inst, i) orelse continue;
+        switch (g.value) {
+            .v128 => |x| {
+                if (off + 16 <= storage.len) std.mem.writeInt(u128, storage[off..][0..16], x, .little);
+            },
+            else => {
+                if (off + 8 <= storage.len) std.mem.writeInt(i64, storage[off..][0..8], globalValueToI64(inst, g.value), .little);
+            },
+        }
+    }
+}
+
+pub fn readGlobalsFromStorage(inst: *AotInstance, storage: []const u8) void {
+    for (inst.globals, 0..) |g, i| {
+        const off = globalOffsetAt(inst, i) orelse continue;
+        g.value = switch (g.value) {
+            .v128 => if (off + 16 <= storage.len)
+                .{ .v128 = std.mem.readInt(u128, storage[off..][0..16], .little) }
+            else
+                g.value,
+            else => if (off + 8 <= storage.len)
+                globalValueFromI64(inst, g.value, std.mem.readInt(i64, storage[off..][0..8], .little))
+            else
+                g.value,
+        };
+    }
+}
+
+/// Pack a global's typed value into a raw 64-bit scalar/reference slot for the
+/// flat globals storage. The tag determines the bit-cast; using `.value.i64`
+/// would be UB when the active tag is `.f32` / `.f64`.
 pub fn globalValueToI64(inst: *const AotInstance, v: types.Value) i64 {
     const r: i64 = switch (v) {
         .i32 => |x| @as(i64, @as(u32, @bitCast(x))),
@@ -1658,12 +1707,11 @@ pub fn callFuncScalar(
             return error.FunctionNotFound;
     };
 
-    // Build flat globals array for AOT access (mirrors callFunc).
-    var globals_buf: [256]i64 = std.mem.zeroes([256]i64);
-    const n_globals = @min(inst.globals.len, globals_buf.len);
-    for (0..n_globals) |i| {
-        globals_buf[i] = globalValueToI64(inst, inst.globals[i].value);
-    }
+    // Build flat globals storage for AOT access (mirrors callFunc).
+    const globals_words = inst.allocator.alloc(u128, globalStorageWordCount(inst)) catch return error.OutOfMemory;
+    defer inst.allocator.free(globals_words);
+    const globals_buf = std.mem.sliceAsBytes(globals_words);
+    writeGlobalsToStorage(inst, globals_buf);
 
     var vmctx = VmCtx{};
     if (inst.memories.len > 0) {
@@ -1672,8 +1720,8 @@ pub fn callFuncScalar(
         vmctx.memory_max_size = inst.memories[0].data.len;
         vmctx.memory_pages = inst.memories[0].current_pages;
     }
-    vmctx.globals_ptr = @intFromPtr(&globals_buf);
-    vmctx.globals_count = @intCast(n_globals);
+    vmctx.globals_ptr = @intFromPtr(globals_buf.ptr);
+    vmctx.globals_count = @intCast(inst.globals.len);
     if (inst.host_functions.len > 0) {
         vmctx.host_functions_ptr = @intFromPtr(inst.host_functions.ptr);
         vmctx.host_functions_count = @intCast(inst.host_functions.len);
@@ -1770,9 +1818,7 @@ pub fn callFuncScalar(
             if (@atomicLoad(u32, &g_last_trap_code, .seq_cst) == 0xC00000FD) {
                 resetStackGuardPage();
             }
-            for (0..n_globals) |i| {
-                inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
-            }
+            readGlobalsFromStorage(inst, globals_buf);
             return error.WasmTrap;
         }
     }
@@ -1838,9 +1884,7 @@ pub fn callFuncScalar(
     }
 
     // Sync globals back.
-    for (0..n_globals) |i| {
-        inst.globals[i].value = globalValueFromI64(inst, inst.globals[i].value, globals_buf[i]);
-    }
+    readGlobalsFromStorage(inst, globals_buf);
 
     if (result_types.len == 0) return results_out[0..0];
 
@@ -1985,6 +2029,47 @@ fn allocateTables(module: *const aot_loader.AotModule, allocator: std.mem.Alloca
     return tables;
 }
 
+const GlobalLayout = struct {
+    offsets: []u32,
+    size: u32,
+};
+
+fn alignForwardU32(value: u32, alignment: u32) u32 {
+    std.debug.assert(alignment != 0 and (alignment & (alignment - 1)) == 0);
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+fn globalSlotAlignment(vt: types.ValType) u32 {
+    return switch (vt) {
+        .v128 => 16,
+        else => 8,
+    };
+}
+
+fn globalSlotSize(vt: types.ValType) u32 {
+    return switch (vt) {
+        .v128 => 16,
+        else => 8,
+    };
+}
+
+fn computeGlobalLayout(inits: []const aot_loader.AotGlobalInit, allocator: std.mem.Allocator) RuntimeError!GlobalLayout {
+    if (inits.len == 0) return .{ .offsets = &.{}, .size = 0 };
+
+    const offsets = allocator.alloc(u32, inits.len) catch return error.OutOfMemory;
+    errdefer allocator.free(offsets);
+
+    var next: u32 = 0;
+    for (inits, 0..) |ginit, i| {
+        const vt: types.ValType = @enumFromInt(ginit.val_type);
+        next = alignForwardU32(next, globalSlotAlignment(vt));
+        offsets[i] = next;
+        next += globalSlotSize(vt);
+    }
+
+    return .{ .offsets = offsets, .size = next };
+}
+
 fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Allocator) RuntimeError![]*types.GlobalInstance {
     if (module.global_inits.len == 0) return &.{};
 
@@ -2007,6 +2092,7 @@ fn allocateGlobals(module: *const aot_loader.AotModule, allocator: std.mem.Alloc
             .i64 => .{ .i64 = ginit.init_i64 },
             .f32 => .{ .f32 = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64))))) },
             .f64 => .{ .f64 = @bitCast(ginit.init_i64) },
+            .v128 => .{ .v128 = ginit.init_v128 },
             .funcref => .{ .funcref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)) - 1)) },
             .nonfuncref => .{ .nonfuncref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)) - 1)) },
             .externref => .{ .externref = if (ginit.init_i64 == 0) null else @as(u32, @truncate(@as(u64, @bitCast(ginit.init_i64)) - 1)) },
@@ -2053,6 +2139,35 @@ test "instantiate: empty module" {
     try std.testing.expectEqual(@as(usize, 0), inst.tables.len);
     try std.testing.expectEqual(@as(usize, 0), inst.globals.len);
     try std.testing.expectEqual(@as(?[*]const u8, null), inst.code_base);
+}
+
+test "globals storage packs v128 globals on 16-byte aligned offsets" {
+    const inits = [_]aot_loader.AotGlobalInit{
+        .{ .val_type = @intFromEnum(types.ValType.i32), .mutability = 0, .init_i64 = 5 },
+        .{ .val_type = @intFromEnum(types.ValType.v128), .mutability = 1, .init_v128 = 0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF },
+        .{ .val_type = @intFromEnum(types.ValType.i64), .mutability = 0, .init_i64 = 9 },
+    };
+    const module = aot_loader.AotModule{ .global_inits = &inits };
+    const inst = try instantiate(&module, std.testing.allocator);
+    defer destroy(inst);
+
+    try std.testing.expectEqualSlices(u32, &.{ 0, 16, 32 }, inst.global_offsets);
+    try std.testing.expectEqual(@as(u32, 40), inst.global_storage_size);
+    try std.testing.expectEqual(@as(usize, 3), globalStorageWordCount(inst));
+
+    const storage_words = try std.testing.allocator.alloc(u128, globalStorageWordCount(inst));
+    defer std.testing.allocator.free(storage_words);
+    const storage = std.mem.sliceAsBytes(storage_words);
+    writeGlobalsToStorage(inst, storage);
+
+    try std.testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, storage[0..8], .little));
+    try std.testing.expectEqual(inits[1].init_v128, std.mem.readInt(u128, storage[16..][0..16], .little));
+    try std.testing.expectEqual(@as(i64, 9), std.mem.readInt(i64, storage[32..][0..8], .little));
+
+    const updated: u128 = 0xFFEEDDCC_BBAA9988_77665544_33221100;
+    std.mem.writeInt(u128, storage[16..][0..16], updated, .little);
+    readGlobalsFromStorage(inst, storage);
+    try std.testing.expectEqual(updated, inst.globals[1].value.v128);
 }
 
 test "findExportFunc: returns null for missing export" {
