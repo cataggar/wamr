@@ -674,6 +674,57 @@ test "differential SIMD: f32x4 minmax NaN zero and infinity edges match interpre
     );
 }
 
+test "differential SIMD: f32x4.pmin/pmax normal and infinity lanes match interpreter" {
+    try expectF32x4BinLaneBits(
+        0xEA,
+        .{ 0x4040_0000, 0x3f80_0000, 0x7f80_0000, 0x4080_0000 },
+        .{ 0xc000_0000, 0x4000_0000, 0xff80_0000, 0x4100_0000 },
+        0,
+        0xc000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xEB,
+        .{ 0xc040_0000, 0x3f80_0000, 0xff80_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x4000_0000, 0x7f80_0000, 0x4100_0000 },
+        2,
+        0x7f80_0000,
+    );
+}
+
+test "differential SIMD: f32x4.pmin/pmax keep lhs signed zero on ties" {
+    try expectF32x4BinLaneBits(
+        0xEA,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x0000_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xEB,
+        .{ 0x8000_0000, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        .{ 0x0000_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        0,
+        0x8000_0000,
+    );
+}
+
+test "differential SIMD: f32x4.pmin/pmax NaN comparisons select lhs" {
+    try expectF32x4BinLaneBits(
+        0xEA,
+        .{ 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x7fc0_1234, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        0,
+        0x3f80_0000,
+    );
+    try expectF32x4BinLaneBits(
+        0xEB,
+        .{ 0x7fc0_1234, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        0,
+        0x7fc0_1234,
+    );
+}
+
 test "differential SIMD: f64x2.convert_low_i32x4_s lane 0 matches interpreter" {
     try expectF64x2ConvertLowLane0High(
         0xFE,

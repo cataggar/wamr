@@ -3274,6 +3274,16 @@ fn emitF32x4BinOp(
         try emitF32x4MinMax(code, inst, bin, lhs_reg, rhs_reg, v128_map, v128_cache, fctx);
         return;
     }
+    if (bin.op == .pmin or bin.op == .pmax) {
+        const dest = inst.dest orelse return;
+        const cmp_lhs = if (bin.op == .pmin) lhs_reg else rhs_reg;
+        const cmp_rhs = if (bin.op == .pmin) rhs_reg else lhs_reg;
+        try code.fcmgt4s(v128_tmp0, cmp_lhs, cmp_rhs);
+        try code.bsl16b(v128_tmp0, rhs_reg, lhs_reg);
+        const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, null);
+        try code.bitwise16b(.orr, dest_reg, v128_tmp0, v128_tmp0);
+        return;
+    }
     const dest_reg = try prepareV128BinaryDest(
         code,
         inst,
@@ -3291,6 +3301,7 @@ fn emitF32x4BinOp(
         .mul => try code.f32x4Op(.mul, dest_reg, lhs_reg, rhs_reg),
         .div => try code.f32x4Op(.div, dest_reg, lhs_reg, rhs_reg),
         .min, .max => unreachable,
+        .pmin, .pmax => unreachable,
     }
 }
 
@@ -7604,7 +7615,7 @@ test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
     try std.testing.expect(bsl_count >= 2);
 }
 
-test "compile: f32x4 arithmetic/minmax ops emit NEON instructions" {
+test "compile: f32x4 arithmetic/minmax and pseudo-minmax ops emit NEON instructions" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -7618,6 +7629,8 @@ test "compile: f32x4 arithmetic/minmax ops emit NEON instructions" {
     const div = func.newVReg();
     const min = func.newVReg();
     const max = func.newVReg();
+    const pmin = func.newVReg();
+    const pmax = func.newVReg();
     const lane = func.newVReg();
 
     try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4080_0000_4040_0000_4000_0000_3f80_0000 }, .dest = a, .type = .v128 });
@@ -7628,8 +7641,10 @@ test "compile: f32x4 arithmetic/minmax ops emit NEON instructions" {
     try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .div, .lhs = mul, .rhs = b } }, .dest = div, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .min, .lhs = div, .rhs = b } }, .dest = min, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .max, .lhs = min, .rhs = a } }, .dest = max, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .pmin, .lhs = max, .rhs = b } }, .dest = pmin, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .pmax, .lhs = pmin, .rhs = a } }, .dest = pmax, .type = .v128 });
     try func.getBlock(bid).append(.{
-        .op = .{ .i32x4_extract_lane = .{ .vector = max, .lane = 0 } },
+        .op = .{ .i32x4_extract_lane = .{ .vector = pmax, .lane = 0 } },
         .dest = lane,
         .type = .i32,
     });
@@ -7645,6 +7660,8 @@ test "compile: f32x4 arithmetic/minmax ops emit NEON instructions" {
     var found_fmin = false;
     var found_fmax = false;
     var found_fcmeq = false;
+    var found_fcmgt = false;
+    var bsl_count: u32 = 0;
     var i: usize = 0;
     while (i + 4 <= code.len) : (i += 4) {
         const w = std.mem.readInt(u32, code[i..][0..4], .little);
@@ -7655,6 +7672,8 @@ test "compile: f32x4 arithmetic/minmax ops emit NEON instructions" {
         if ((w & 0xFFE0FC00) == 0x4EA0F400) found_fmin = true;
         if ((w & 0xFFE0FC00) == 0x4E20F400) found_fmax = true;
         if ((w & 0xFFE0FC00) == 0x4E20E400) found_fcmeq = true;
+        if ((w & 0xFFE0FC00) == 0x6EA0E400) found_fcmgt = true;
+        if ((w & 0xFFE0FC00) == 0x6E601C00) bsl_count += 1;
     }
 
     try std.testing.expect(found_fadd);
@@ -7664,6 +7683,60 @@ test "compile: f32x4 arithmetic/minmax ops emit NEON instructions" {
     try std.testing.expect(found_fmin);
     try std.testing.expect(found_fmax);
     try std.testing.expect(found_fcmeq);
+    try std.testing.expect(found_fcmgt);
+    try std.testing.expect(bsl_count >= 2);
+}
+
+test "compile: f32x4 pseudo-minmax uses compare and select operand order" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const b = func.newVReg();
+    const pmin = func.newVReg();
+    const pmax = func.newVReg();
+    const mix = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4080_0000_4040_0000_4000_0000_3f80_0000 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4100_0000_40e0_0000_40c0_0000_40a0_0000 }, .dest = b, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .pmin, .lhs = a, .rhs = b } }, .dest = pmin, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = .pmax, .lhs = a, .rhs = b } }, .dest = pmax, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = pmin, .rhs = pmax } }, .dest = mix, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = mix, .lane = 0 } }, .dest = lane, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    const pmin_cmp = @as(u32, 0x6EA0E400) | (@as(u32, 17) << 16) | (@as(u32, 16) << 5);
+    const pmax_cmp = @as(u32, 0x6EA0E400) | (@as(u32, 16) << 16) | (@as(u32, 17) << 5);
+    const select_rhs_else_lhs = @as(u32, 0x6E601C00) | (@as(u32, 16) << 16) | (@as(u32, 17) << 5);
+
+    var found_pmin_cmp = false;
+    var found_pmax_cmp = false;
+    var ordered_selects: u32 = 0;
+    var after_expected_cmp = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if (w == pmin_cmp) {
+            found_pmin_cmp = true;
+            after_expected_cmp = true;
+        } else if (w == pmax_cmp) {
+            found_pmax_cmp = true;
+            after_expected_cmp = true;
+        } else if (w == select_rhs_else_lhs and after_expected_cmp) {
+            ordered_selects += 1;
+            after_expected_cmp = false;
+        }
+    }
+
+    try std.testing.expect(found_pmin_cmp);
+    try std.testing.expect(found_pmax_cmp);
+    try std.testing.expectEqual(@as(u32, 2), ordered_selects);
 }
 
 test "compile: SIMD int-to-float conversions emit NEON instructions" {
