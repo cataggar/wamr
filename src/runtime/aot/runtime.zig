@@ -1101,6 +1101,8 @@ pub fn destroy(inst: *AotInstance) void {
     if (inst.sig_table.len > 0) allocator.free(inst.sig_table);
     if (inst.func_sig_ids.len > 0) allocator.free(inst.func_sig_ids);
     if (inst.ptr_to_sig.len > 0) allocator.free(inst.ptr_to_sig);
+    if (inst.tables_info.len > 0) allocator.free(inst.tables_info);
+    if (inst.extra_tables_storage.len > 0) allocator.free(inst.extra_tables_storage);
     allocator.destroy(inst);
 }
 

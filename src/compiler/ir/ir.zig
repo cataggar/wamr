@@ -931,6 +931,13 @@ pub const IrFunction = struct {
     }
 };
 
+/// Function type metadata copied from the Wasm type section. Slices are owned
+/// by the containing `IrModule`.
+pub const IrFuncType = struct {
+    params: []const IrType,
+    results: []const IrType,
+};
+
 /// An IR module — collection of functions.
 pub const IrModule = struct {
     functions: std.ArrayList(IrFunction) = .empty,
@@ -947,6 +954,11 @@ pub const IrModule = struct {
     global_offsets: ?[]const u32 = null,
     /// Total byte size of the AOT globals storage.
     global_storage_size: u32 = 0,
+    /// Wasm function type table. Codegen uses this to marshal direct and
+    /// indirect calls whose parameter classes differ from scalar GPRs.
+    func_types: std.ArrayList(IrFuncType) = .empty,
+    /// Module function-index → type-index mapping, imports first, then locals.
+    func_type_indices: std.ArrayList(u32) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) IrModule {
         return .{
@@ -957,8 +969,32 @@ pub const IrModule = struct {
     pub fn deinit(self: *IrModule) void {
         for (self.functions.items) |*func| func.deinit();
         self.functions.deinit(self.allocator);
+        for (self.func_types.items) |ft| {
+            self.allocator.free(ft.params);
+            self.allocator.free(ft.results);
+        }
+        self.func_types.deinit(self.allocator);
+        self.func_type_indices.deinit(self.allocator);
         if (self.global_types) |gt| self.allocator.free(gt);
         if (self.global_offsets) |go| self.allocator.free(go);
+    }
+
+    pub fn addFuncType(self: *IrModule, params: []const IrType, results: []const IrType) !u32 {
+        const owned_params = try self.allocator.dupe(IrType, params);
+        errdefer self.allocator.free(owned_params);
+        const owned_results = try self.allocator.dupe(IrType, results);
+        errdefer self.allocator.free(owned_results);
+
+        const idx: u32 = @intCast(self.func_types.items.len);
+        try self.func_types.append(self.allocator, .{
+            .params = owned_params,
+            .results = owned_results,
+        });
+        return idx;
+    }
+
+    pub fn addFuncTypeIndex(self: *IrModule, type_idx: u32) !void {
+        try self.func_type_indices.append(self.allocator, type_idx);
     }
 
     pub fn addFunction(self: *IrModule, func: IrFunction) !u32 {

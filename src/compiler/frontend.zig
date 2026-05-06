@@ -121,6 +121,28 @@ pub fn lowerModule(wasm_module: *const types.WasmModule, allocator: std.mem.Allo
 
     ir_module.import_count = wasm_module.import_function_count;
 
+    for (wasm_module.types) |ft| {
+        var params: std.ArrayList(ir.IrType) = .empty;
+        defer params.deinit(allocator);
+        try params.ensureTotalCapacity(allocator, ft.params.len);
+        for (ft.params) |vt| params.appendAssumeCapacity(valTypeToIr(vt));
+
+        var results: std.ArrayList(ir.IrType) = .empty;
+        defer results.deinit(allocator);
+        try results.ensureTotalCapacity(allocator, ft.results.len);
+        for (ft.results) |vt| results.appendAssumeCapacity(valTypeToIr(vt));
+
+        _ = try ir_module.addFuncType(params.items, results.items);
+    }
+
+    for (wasm_module.imports) |imp| {
+        if (imp.kind != .function) continue;
+        try ir_module.addFuncTypeIndex(imp.func_type_idx orelse return error.InvalidBytecode);
+    }
+    for (wasm_module.functions) |func| {
+        try ir_module.addFuncTypeIndex(func.type_idx);
+    }
+
     var global_types: std.ArrayList(ir.IrType) = .empty;
     errdefer global_types.deinit(allocator);
     for (wasm_module.imports) |imp| {
@@ -706,13 +728,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
                 const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
                 const result_ir_type: ir.IrType = if (callee_type != null and call_result_count > 0)
-                    switch (callee_type.?.results[0]) {
-                        .i32 => .i32,
-                        .i64 => .i64,
-                        .f32 => .f32,
-                        .f64 => .f64,
-                        else => .i64,
-                    }
+                    valTypeToIr(callee_type.?.results[0])
                 else
                     .i32;
                 // Capture arg VRegs before popping (args are in stack order: first arg deepest)
@@ -738,13 +754,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     var ri: u32 = 1;
                     while (ri < call_result_count) : (ri += 1) {
                         const extra_dest = ir_func.newVReg();
-                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
-                            .i32 => .i32,
-                            .i64 => .i64,
-                            .f32 => .f32,
-                            .f64 => .f64,
-                            else => .i64,
-                        };
+                        const extra_ty: ir.IrType = valTypeToIr(callee_type.?.results[ri]);
                         try ir_func.getBlock(current_block).append(.{
                             .op = .{ .call_result = @intCast(ri - 1) },
                             .dest = extra_dest,
@@ -1085,13 +1095,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
                 const dest = ir_func.newVReg();
                 const ind_result_type: ir.IrType = if (callee_type != null and call_result_count > 0)
-                    switch (callee_type.?.results[0]) {
-                        .i32 => .i32,
-                        .i64 => .i64,
-                        .f32 => .f32,
-                        .f64 => .f64,
-                        else => .i64,
-                    }
+                    valTypeToIr(callee_type.?.results[0])
                 else
                     .i32;
                 const ind_extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
@@ -1110,13 +1114,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     var ri: u32 = 1;
                     while (ri < call_result_count) : (ri += 1) {
                         const extra_dest = ir_func.newVReg();
-                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
-                            .i32 => .i32,
-                            .i64 => .i64,
-                            .f32 => .f32,
-                            .f64 => .f64,
-                            else => .i64,
-                        };
+                        const extra_ty: ir.IrType = valTypeToIr(callee_type.?.results[ri]);
                         try ir_func.getBlock(current_block).append(.{
                             .op = .{ .call_result = @intCast(ri - 1) },
                             .dest = extra_dest,
@@ -1135,13 +1133,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const arg_count: u32 = if (callee_type) |ct| @intCast(ct.params.len) else 0;
                 const call_result_count: u32 = if (callee_type) |ct| @intCast(ct.results.len) else 0;
                 const result_ir_type: ir.IrType = if (callee_type != null and call_result_count > 0)
-                    switch (callee_type.?.results[0]) {
-                        .i32 => .i32,
-                        .i64 => .i64,
-                        .f32 => .f32,
-                        .f64 => .f64,
-                        else => .i64,
-                    }
+                    valTypeToIr(callee_type.?.results[0])
                 else
                     .i32;
                 const args = try allocator.alloc(ir.VReg, arg_count);
@@ -1173,13 +1165,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 }
                 const dest = ir_func.newVReg();
                 const result_ir_type: ir.IrType = if (callee_type != null and call_result_count > 0)
-                    switch (callee_type.?.results[0]) {
-                        .i32 => .i32,
-                        .i64 => .i64,
-                        .f32 => .f32,
-                        .f64 => .f64,
-                        else => .i64,
-                    }
+                    valTypeToIr(callee_type.?.results[0])
                 else
                     .i32;
                 const extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
@@ -3459,13 +3445,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
                 const dest = ir_func.newVReg();
                 const cr_result_type: ir.IrType = if (callee_type != null and call_result_count > 0)
-                    switch (callee_type.?.results[0]) {
-                        .i32 => .i32,
-                        .i64 => .i64,
-                        .f32 => .f32,
-                        .f64 => .f64,
-                        else => .i64,
-                    }
+                    valTypeToIr(callee_type.?.results[0])
                 else
                     .i32;
                 const cr_extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
@@ -3498,13 +3478,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
 
                 const dest = ir_func.newVReg();
                 const cr_result_type: ir.IrType = if (callee_type != null and call_result_count > 0)
-                    switch (callee_type.?.results[0]) {
-                        .i32 => .i32,
-                        .i64 => .i64,
-                        .f32 => .f32,
-                        .f64 => .f64,
-                        else => .i64,
-                    }
+                    valTypeToIr(callee_type.?.results[0])
                 else
                     .i32;
                 const cr_extra_results: u8 = if (call_result_count > 1) @intCast(call_result_count - 1) else 0;
@@ -3522,13 +3496,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     var ri: u32 = 1;
                     while (ri < call_result_count) : (ri += 1) {
                         const extra_dest = ir_func.newVReg();
-                        const extra_ty: ir.IrType = switch (callee_type.?.results[ri]) {
-                            .i32 => .i32,
-                            .i64 => .i64,
-                            .f32 => .f32,
-                            .f64 => .f64,
-                            else => .i64,
-                        };
+                        const extra_ty: ir.IrType = valTypeToIr(callee_type.?.results[ri]);
                         try ir_func.getBlock(current_block).append(.{
                             .op = .{ .call_result = @intCast(ri - 1) },
                             .dest = extra_dest,
@@ -3883,6 +3851,11 @@ test "lower v128 local type is not treated as i64" {
     var ir_module = try lowerModule(&wasm_module, allocator);
     defer ir_module.deinit();
 
+    try std.testing.expectEqual(@as(usize, 1), ir_module.func_types.items.len);
+    try std.testing.expectEqualSlices(ir.IrType, &.{.v128}, ir_module.func_types.items[0].params);
+    try std.testing.expectEqualSlices(ir.IrType, &.{.v128}, ir_module.func_types.items[0].results);
+    try std.testing.expectEqualSlices(u32, &.{0}, ir_module.func_type_indices.items);
+
     const ir_func = &ir_module.functions.items[0];
     try std.testing.expect(ir_func.local_types != null);
     try std.testing.expectEqual(ir.IrType.v128, ir_func.local_types.?[0]);
@@ -3891,6 +3864,45 @@ test "lower v128 local type is not treated as i64" {
     try std.testing.expectEqual(@as(u32, 0), insts[0].op.local_get);
     try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
     try std.testing.expect(insts[1].op.ret != null);
+}
+
+test "lower v128 call result is not treated as i64" {
+    const allocator = std.testing.allocator;
+
+    const callee_type = types.FuncType{ .params = &.{}, .results = &.{.v128} };
+    const caller_type = types.FuncType{ .params = &.{}, .results = &.{.i32} };
+    const callee_code = [_]u8{
+        0xFD, 0x0C,
+        0x01, 0x00,
+        0x00, 0x00,
+        0x02, 0x00,
+        0x00, 0x00,
+        0x03, 0x00,
+        0x00, 0x00,
+        0x04, 0x00,
+        0x00, 0x00,
+        0x0B,
+    };
+    const caller_code = [_]u8{
+        0x10, 0x00, // call 0
+        0xFD, 0x1B, 0x00, // i32x4.extract_lane 0
+        0x0B,
+    };
+    const funcs = [_]types.WasmFunction{
+        .{ .type_idx = 0, .func_type = callee_type, .local_count = 0, .locals = &.{}, .code = &callee_code },
+        .{ .type_idx = 1, .func_type = caller_type, .local_count = 0, .locals = &.{}, .code = &caller_code },
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{ callee_type, caller_type },
+        .functions = &funcs,
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[1].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
+    try std.testing.expectEqual(insts[0].dest.?, insts[1].op.i32x4_extract_lane.vector);
 }
 
 test "lower declared v128 local get and tee preserve v128 type" {

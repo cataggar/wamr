@@ -461,6 +461,133 @@ test "differential SIMD: v128 local set/get" {
     try expectSimdDiffI32(wasm, "f", 19);
 }
 
+test "differential SIMD: direct v128 param preserves f32 signed zero bits" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendLocalGet(&helper, testing.allocator, 0);
+    try appendI32x4ExtractLane(&helper, testing.allocator, 0);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&main, testing.allocator, .{ 0x8000_0000, 0x3F80_0000, 0, 0 });
+    try main.append(testing.allocator, 0x10); // call helper
+    try encodeULEB128(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &[_]u8{0x7B}, .results = &[_]u8{0x7F} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x8000_0000)));
+}
+
+test "differential SIMD: direct v128 param preserves f32 NaN payload bits" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendLocalGet(&helper, testing.allocator, 0);
+    try appendI32x4ExtractLane(&helper, testing.allocator, 1);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&main, testing.allocator, .{ 0x3F80_0000, 0x7FC1_2345, 0, 0 });
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &[_]u8{0x7B}, .results = &[_]u8{0x7F} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", @bitCast(@as(u32, 0x7FC1_2345)));
+}
+
+test "differential SIMD: mixed scalar and v128 params" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendLocalGet(&helper, testing.allocator, 0);
+    try appendLocalGet(&helper, testing.allocator, 1);
+    try appendI32x4ExtractLane(&helper, testing.allocator, 2);
+    try helper.append(testing.allocator, 0x6A); // i32.add
+    try appendLocalGet(&helper, testing.allocator, 2);
+    try appendI32WrapI64(&helper, testing.allocator);
+    try helper.append(testing.allocator, 0x6A);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try appendI32Const(&main, testing.allocator, 5);
+    try appendV128ConstI32x4(&main, testing.allocator, .{ 10, 20, 30, 40 });
+    try appendI64Const(&main, testing.allocator, 7);
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &[_]u8{ 0x7F, 0x7B, 0x7E }, .results = &[_]u8{0x7F} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 42);
+}
+
+test "differential SIMD: local v128 value passed as param" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendLocalGet(&helper, testing.allocator, 0);
+    try appendI32x4ExtractLane(&helper, testing.allocator, 0);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x01);
+    try encodeULEB128(&main, testing.allocator, 1);
+    try main.append(testing.allocator, 0x7B);
+    try appendV128ConstI32x4(&main, testing.allocator, .{ 77, 0, 0, 0 });
+    try appendLocalSet(&main, testing.allocator, 0);
+    try appendLocalGet(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &[_]u8{0x7B}, .results = &[_]u8{0x7F} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 77);
+}
+
 test "differential SIMD: v128 immutable global get" {
     var init: std.ArrayList(u8) = .empty;
     defer init.deinit(testing.allocator);
@@ -477,6 +604,104 @@ test "differential SIMD: v128 immutable global get" {
     const wasm = try buildCustomGlobalModule(testing.allocator, &globals, body.items);
     defer testing.allocator.free(wasm);
     try expectSimdDiffI32(wasm, "f", 19);
+}
+
+test "differential SIMD: global v128 value passed as param" {
+    var init: std.ArrayList(u8) = .empty;
+    defer init.deinit(testing.allocator);
+    try appendV128ConstI32x4(&init, testing.allocator, .{ 88, 0, 0, 0 });
+
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendLocalGet(&helper, testing.allocator, 0);
+    try appendI32x4ExtractLane(&helper, testing.allocator, 0);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try appendGlobalGet(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const globals = [_]TestGlobal{.{ .val_type = 0x7B, .mutable = false, .init_expr = init.items }};
+    const func_types = [_]TestFuncType{
+        .{ .params = &[_]u8{0x7B}, .results = &[_]u8{0x7F} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &globals, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 88);
+}
+
+test "differential SIMD: excess v128 params use stack" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendLocalGet(&helper, testing.allocator, 8);
+    try appendI32x4ExtractLane(&helper, testing.allocator, 0);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    var n: i32 = 1;
+    while (n <= 9) : (n += 1) {
+        try appendV128ConstI32x4(&main, testing.allocator, .{ n * 11, 0, 0, 0 });
+    }
+    try main.append(testing.allocator, 0x10);
+    try encodeULEB128(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x0B);
+
+    const params = [_]u8{ 0x7B, 0x7B, 0x7B, 0x7B, 0x7B, 0x7B, 0x7B, 0x7B, 0x7B };
+    const func_types = [_]TestFuncType{
+        .{ .params = &params, .results = &[_]u8{0x7F} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, false);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 99);
+}
+
+test "differential SIMD: indirect v128 param call" {
+    var helper: std.ArrayList(u8) = .empty;
+    defer helper.deinit(testing.allocator);
+    try helper.append(testing.allocator, 0x00);
+    try appendLocalGet(&helper, testing.allocator, 0);
+    try appendI32x4ExtractLane(&helper, testing.allocator, 0);
+    try helper.append(testing.allocator, 0x0B);
+
+    var main: std.ArrayList(u8) = .empty;
+    defer main.deinit(testing.allocator);
+    try main.append(testing.allocator, 0x00);
+    try appendV128ConstI32x4(&main, testing.allocator, .{ 123, 0, 0, 0 });
+    try appendI32Const(&main, testing.allocator, 0);
+    try main.append(testing.allocator, 0x11); // call_indirect
+    try encodeULEB128(&main, testing.allocator, 0); // typeidx
+    try encodeULEB128(&main, testing.allocator, 0); // tableidx
+    try main.append(testing.allocator, 0x0B);
+
+    const func_types = [_]TestFuncType{
+        .{ .params = &[_]u8{0x7B}, .results = &[_]u8{0x7F} },
+        .{ .params = &.{}, .results = &[_]u8{0x7F} },
+    };
+    const funcs = [_]TestFuncBody{
+        .{ .type_idx = 0, .body = helper.items },
+        .{ .type_idx = 1, .body = main.items },
+    };
+    const wasm = try buildFunctionModule(testing.allocator, &func_types, &funcs, 1, &.{}, true);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 123);
 }
 
 test "differential SIMD: v128 mutable global set/get" {
@@ -3035,6 +3260,100 @@ fn appendSection(out: *std.ArrayList(u8), allocator: std.mem.Allocator, id: u8, 
     try out.append(allocator, id);
     try encodeULEB128(out, allocator, @intCast(payload.len));
     try out.appendSlice(allocator, payload);
+}
+
+const TestFuncType = struct {
+    params: []const u8,
+    results: []const u8,
+};
+
+const TestFuncBody = struct {
+    type_idx: u32,
+    body: []const u8,
+};
+
+fn appendFuncTypePayload(
+    payload: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    func_type: TestFuncType,
+) !void {
+    try payload.append(allocator, 0x60);
+    try encodeULEB128(payload, allocator, @intCast(func_type.params.len));
+    try payload.appendSlice(allocator, func_type.params);
+    try encodeULEB128(payload, allocator, @intCast(func_type.results.len));
+    try payload.appendSlice(allocator, func_type.results);
+}
+
+fn buildFunctionModule(
+    allocator: std.mem.Allocator,
+    func_types: []const TestFuncType,
+    funcs: []const TestFuncBody,
+    export_func_idx: u32,
+    globals: []const TestGlobal,
+    table_elem0: bool,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, &[_]u8{ 0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00 });
+
+    var type_payload: std.ArrayList(u8) = .empty;
+    defer type_payload.deinit(allocator);
+    try encodeULEB128(&type_payload, allocator, @intCast(func_types.len));
+    for (func_types) |ft| try appendFuncTypePayload(&type_payload, allocator, ft);
+    try appendSection(&out, allocator, 0x01, type_payload.items);
+
+    var func_payload: std.ArrayList(u8) = .empty;
+    defer func_payload.deinit(allocator);
+    try encodeULEB128(&func_payload, allocator, @intCast(funcs.len));
+    for (funcs) |func| try encodeULEB128(&func_payload, allocator, func.type_idx);
+    try appendSection(&out, allocator, 0x03, func_payload.items);
+
+    if (table_elem0) {
+        try appendSection(&out, allocator, 0x04, &[_]u8{ 0x01, 0x70, 0x00, 0x01 });
+    }
+
+    if (globals.len > 0) {
+        var global_payload: std.ArrayList(u8) = .empty;
+        defer global_payload.deinit(allocator);
+        try encodeULEB128(&global_payload, allocator, @intCast(globals.len));
+        for (globals) |global| {
+            try global_payload.append(allocator, global.val_type);
+            try global_payload.append(allocator, if (global.mutable) 1 else 0);
+            try global_payload.appendSlice(allocator, global.init_expr);
+            try global_payload.append(allocator, 0x0B);
+        }
+        try appendSection(&out, allocator, 0x06, global_payload.items);
+    }
+
+    var export_payload: std.ArrayList(u8) = .empty;
+    defer export_payload.deinit(allocator);
+    try export_payload.appendSlice(allocator, &[_]u8{ 0x01, 0x01, 'f', 0x00 });
+    try encodeULEB128(&export_payload, allocator, export_func_idx);
+    try appendSection(&out, allocator, 0x07, export_payload.items);
+
+    if (table_elem0) {
+        var elem_payload: std.ArrayList(u8) = .empty;
+        defer elem_payload.deinit(allocator);
+        try elem_payload.append(allocator, 0x01); // segment count
+        try elem_payload.append(allocator, 0x00); // active, table 0, funcidx vec
+        try appendI32Const(&elem_payload, allocator, 0);
+        try elem_payload.append(allocator, 0x0B);
+        try elem_payload.append(allocator, 0x01); // one element
+        try elem_payload.append(allocator, 0x00); // funcidx 0
+        try appendSection(&out, allocator, 0x09, elem_payload.items);
+    }
+
+    var code_payload: std.ArrayList(u8) = .empty;
+    defer code_payload.deinit(allocator);
+    try encodeULEB128(&code_payload, allocator, @intCast(funcs.len));
+    for (funcs) |func| {
+        try encodeULEB128(&code_payload, allocator, @intCast(func.body.len));
+        try code_payload.appendSlice(allocator, func.body);
+    }
+    try appendSection(&out, allocator, 0x0A, code_payload.items);
+
+    return out.toOwnedSlice(allocator);
 }
 
 fn buildCustomMemoryModule(

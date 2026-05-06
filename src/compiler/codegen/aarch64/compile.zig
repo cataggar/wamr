@@ -456,6 +456,12 @@ const FuncCompileCtx = struct {
     /// older hand-built IR tests.
     global_types: []const ir.IrType = &.{},
     global_offsets: []const u32 = &.{},
+    /// Wasm function type table and module funcidx → typeidx map. Missing
+    /// entries are tolerated for hand-built IR tests; call lowering then falls
+    /// back to per-vreg definition types.
+    func_types: []const ir.IrFuncType = &.{},
+    func_type_indices: []const u32 = &.{},
+    vreg_types: ?*const std.AutoHashMap(ir.VReg, ir.IrType) = null,
     /// FP-relative byte offset of the call-save region where caller-save
     /// physregs (x0..x15) are spilled around BL instructions.
     call_save_base: u32 = 0,
@@ -542,9 +548,10 @@ fn recordKillUse(ctx: *KillUseCtx, v: ir.VReg) !void {
 /// to `[fp + 16]` in the prologue and reloaded into a scratch register
 /// (typically `x16`/`tmp0`) whenever needed.
 ///
-/// **Wasm parameters**: passed in `x1..x7` (up to 7 params; more not yet
-/// supported), spilled to their matching local slots in the prologue.
-/// Declared locals beyond `param_count` are zero-initialized.
+/// **Wasm parameters**: scalar params use `x1..x7` with `x0` reserved for the
+/// hidden VMContext; v128 params use SIMD registers `q0..q7`. Each register
+/// bank is allocated independently, and excess params are read from the
+/// caller's stack arg area with v128 slots 16-byte aligned.
 pub fn compileFunction(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]u8 {
     // Test-friendly entry: no cross-function linking. Any `.call` op will
     // fail with error.CallLinkageUnavailable.
@@ -624,10 +631,6 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
 }
 
 fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    if (func.local_types) |local_types| {
-        const param_type_count: usize = @min(local_types.len, @as(usize, @intCast(func.param_count)));
-        for (local_types[0..param_type_count]) |ty| if (ty == .v128) return true;
-    }
     var vreg_types = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
     defer vreg_types.deinit();
 
@@ -736,8 +739,6 @@ pub fn compileFunctionImpl(
     ctx: FuncCompileCtx,
     allocator: std.mem.Allocator,
 ) ![]u8 {
-    // Phase 1b: stack args beyond x7 aren't supported yet.
-    if (func.param_count > 7) return error.TooManyParams;
     if (try functionHasUnsupportedV128(func, allocator)) return error.UnsupportedV128;
 
     // Phase 3 of regalloc adoption (issue #100): drive RegMap from a real
@@ -823,6 +824,15 @@ pub fn compileFunctionImpl(
     var fctx = ctx;
     fctx.local_offsets = local_layout.offsets;
     fctx.local_types = func.local_types orelse &.{};
+
+    var vreg_types = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
+    defer vreg_types.deinit();
+    for (0..func.blocks.items.len) |bid| {
+        for (scheduled.instructions(@intCast(bid))) |inst| {
+            if (inst.dest) |dest| try vreg_types.put(dest, inst.type);
+        }
+    }
+    fctx.vreg_types = &vreg_types;
 
     var callee_save_sites: std.ArrayListUnmanaged([callee_saved_regs.len]usize) = .empty;
     defer callee_save_sites.deinit(allocator);
@@ -1111,7 +1121,7 @@ pub fn compileFunctionImpl(
     try emitCalleeSaveStoreTracked(&code, &fctx);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
-    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, hrp_save_off);
+    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, hrp_save_off, frame_size, allocator);
 
     var block_offsets = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_offsets);
@@ -1328,8 +1338,12 @@ fn localFrameOffset(fctx: *const FuncCompileCtx, idx: u32) !u32 {
     return fctx.local_offsets[i];
 }
 
-/// ABI register holding wasm parameter `i` (0-based). Parameter 0 is in x1
-/// because x0 carries the hidden VMContext pointer.
+const scalar_arg_reg_count: u32 = 7;
+const v128_arg_reg_count: u32 = 8;
+const v128_call_stack_tmp: u5 = 31;
+
+/// ABI register holding scalar wasm argument `i` within the scalar register
+/// bank. Scalar argument 0 is in x1 because x0 carries the hidden VMContext.
 fn paramAbiReg(i: u32) emit.Reg {
     return switch (i) {
         0 => .x1,
@@ -1343,6 +1357,137 @@ fn paramAbiReg(i: u32) emit.Reg {
     };
 }
 
+fn v128ParamAbiReg(i: u32) u5 {
+    if (i >= v128_arg_reg_count) unreachable;
+    return @intCast(i);
+}
+
+const AbiArgLoc = union(enum) {
+    scalar_reg: emit.Reg,
+    v128_reg: u5,
+    stack: struct {
+        offset: u32,
+        ty: ir.IrType,
+    },
+};
+
+const CallAbiPlan = struct {
+    locs: []AbiArgLoc,
+    hrp: ?AbiArgLoc = null,
+    stack_size: u32 = 0,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *CallAbiPlan) void {
+        self.allocator.free(self.locs);
+    }
+};
+
+fn classifyAbiArg(ty: ir.IrType, scalar_idx: *u32, v128_idx: *u32, stack_next: *u32) AbiArgLoc {
+    if (ty == .v128) {
+        if (v128_idx.* < v128_arg_reg_count) {
+            const reg = v128ParamAbiReg(v128_idx.*);
+            v128_idx.* += 1;
+            return .{ .v128_reg = reg };
+        }
+        stack_next.* = alignForwardU32(stack_next.*, 16);
+        const off = stack_next.*;
+        stack_next.* += 16;
+        return .{ .stack = .{ .offset = off, .ty = .v128 } };
+    }
+
+    if (scalar_idx.* < scalar_arg_reg_count) {
+        const reg = paramAbiReg(scalar_idx.*);
+        scalar_idx.* += 1;
+        return .{ .scalar_reg = reg };
+    }
+    stack_next.* = alignForwardU32(stack_next.*, 8);
+    const off = stack_next.*;
+    stack_next.* += 8;
+    return .{ .stack = .{ .offset = off, .ty = ty } };
+}
+
+fn buildEntryAbiPlan(
+    allocator: std.mem.Allocator,
+    func: ir.IrFunction,
+    local_types: []const ir.IrType,
+) !CallAbiPlan {
+    const locs = try allocator.alloc(AbiArgLoc, func.param_count);
+    errdefer allocator.free(locs);
+
+    var scalar_idx: u32 = 0;
+    var v128_idx: u32 = 0;
+    var stack_next: u32 = 0;
+    var i: u32 = 0;
+    while (i < func.param_count) : (i += 1) {
+        locs[@intCast(i)] = classifyAbiArg(localTypeAt(local_types, i), &scalar_idx, &v128_idx, &stack_next);
+    }
+
+    const hrp: ?AbiArgLoc = if (func.result_count > 1)
+        classifyAbiArg(.i64, &scalar_idx, &v128_idx, &stack_next)
+    else
+        null;
+
+    return .{
+        .locs = locs,
+        .hrp = hrp,
+        .stack_size = alignForwardU32(stack_next, 16),
+        .allocator = allocator,
+    };
+}
+
+fn funcParamTypes(fctx: *const FuncCompileCtx, func_idx: u32) []const ir.IrType {
+    const idx: usize = @intCast(func_idx);
+    if (idx >= fctx.func_type_indices.len) return &.{};
+    const type_idx = fctx.func_type_indices[idx];
+    const ti: usize = @intCast(type_idx);
+    if (ti >= fctx.func_types.len) return &.{};
+    return fctx.func_types[ti].params;
+}
+
+fn indexedParamTypes(fctx: *const FuncCompileCtx, type_idx: u32) []const ir.IrType {
+    const ti: usize = @intCast(type_idx);
+    if (ti >= fctx.func_types.len) return &.{};
+    return fctx.func_types[ti].params;
+}
+
+fn callArgType(fctx: *const FuncCompileCtx, params: []const ir.IrType, args: []const ir.VReg, idx: usize) ir.IrType {
+    if (idx < params.len) return params[idx];
+    if (fctx.vreg_types) |vts| {
+        if (vts.get(args[idx])) |ty| return ty;
+    }
+    return .i64;
+}
+
+fn buildCallAbiPlan(
+    allocator: std.mem.Allocator,
+    fctx: *const FuncCompileCtx,
+    args: []const ir.VReg,
+    params: []const ir.IrType,
+    include_hrp: bool,
+) !CallAbiPlan {
+    const locs = try allocator.alloc(AbiArgLoc, args.len);
+    errdefer allocator.free(locs);
+
+    var scalar_idx: u32 = 0;
+    var v128_idx: u32 = 0;
+    var stack_next: u32 = 0;
+    for (args, 0..) |_, i| {
+        locs[i] = classifyAbiArg(callArgType(fctx, params, args, i), &scalar_idx, &v128_idx, &stack_next);
+    }
+
+    const hrp: ?AbiArgLoc = if (include_hrp)
+        classifyAbiArg(.i64, &scalar_idx, &v128_idx, &stack_next)
+    else
+        null;
+
+    return .{
+        .locs = locs,
+        .hrp = hrp,
+        .stack_size = alignForwardU32(stack_next, 16),
+        .allocator = allocator,
+    };
+}
+
 /// Spill x0 (VMContext) and x1..x7 (wasm params) to their frame slots, and
 /// zero-initialize declared locals. Must be called right after emitPrologue
 /// and before any vreg allocation so we don't clobber these ABI regs.
@@ -1352,24 +1497,52 @@ fn emitEntrySpill(
     local_offsets: []const u32,
     local_types: []const ir.IrType,
     hrp_save_off: u32,
+    frame_size: u32,
+    allocator: std.mem.Allocator,
 ) !void {
     // VMContext → [fp + 16]
     try code.strImm(.x0, .fp, vmctx_slot_offset / 8);
+
+    var abi = try buildEntryAbiPlan(allocator, func, local_types);
+    defer abi.deinit();
 
     // Wasm params → their typed local slots.
     var i: u32 = 0;
     while (i < func.param_count) : (i += 1) {
         const offset = local_offsets[@intCast(i)];
-        try frameStore(code, paramAbiReg(i), offset);
+        switch (abi.locs[@intCast(i)]) {
+            .scalar_reg => |reg| try frameStore(code, reg, offset),
+            .v128_reg => |vt| {
+                try frameAddr(code, RegMap.tmp1, offset);
+                try code.strQ(vt, RegMap.tmp1);
+            },
+            .stack => |stack| {
+                const inbound = frame_size + stack.offset;
+                if (stack.ty == .v128) {
+                    try frameAddr(code, RegMap.tmp0, inbound);
+                    try code.ldrQ(v128_call_stack_tmp, RegMap.tmp0);
+                    try frameAddr(code, RegMap.tmp1, offset);
+                    try code.strQ(v128_call_stack_tmp, RegMap.tmp1);
+                } else {
+                    try frameLoad(code, RegMap.tmp0, inbound);
+                    try frameStore(code, RegMap.tmp0, offset);
+                }
+            },
+        }
     }
 
     // Multi-value returns: callee receives an HRP (host-result pointer)
-    // as an implicit trailing arg in x(1 + param_count). Stash to the
-    // dedicated frame slot so `.ret_multi` can retrieve it.
-    if (func.result_count > 1) {
-        if (func.param_count >= 7) return error.TooManyParamsForMultiResult;
-        const hrp_reg = paramAbiReg(func.param_count);
-        try frameStore(code, hrp_reg, hrp_save_off);
+    // as an implicit trailing scalar arg. Stash to the dedicated frame slot so
+    // `.ret_multi` can retrieve it.
+    if (abi.hrp) |hrp_loc| {
+        switch (hrp_loc) {
+            .scalar_reg => |reg| try frameStore(code, reg, hrp_save_off),
+            .stack => |stack| {
+                try frameLoad(code, RegMap.tmp0, frame_size + stack.offset);
+                try frameStore(code, RegMap.tmp0, hrp_save_off);
+            },
+            .v128_reg => unreachable,
+        }
     }
 
     // Zero-init declared locals (wasm spec requires non-param locals to be 0).
@@ -1859,9 +2032,9 @@ fn compileInst(
         .br_table => |bt| try emitBrTable(code, reg_map, patches, bt, fctx.allocator),
 
         // ── Direct function call ─────────────────────────────────────
-        .call => |cl| try emitCall(code, inst, cl, reg_map, fctx),
-        .call_indirect => |ci| try emitCallIndirect(code, inst, ci, reg_map, fctx),
-        .call_ref => |cr| try emitCallRef(code, inst, cr, reg_map, fctx),
+        .call => |cl| try emitCall(code, inst, cl, reg_map, v128_map, fctx),
+        .call_indirect => |ci| try emitCallIndirect(code, inst, ci, reg_map, v128_map, fctx),
+        .call_ref => |cr| try emitCallRef(code, inst, cr, reg_map, v128_map, fctx),
 
         // ── Tables & function refs ───────────────────────────────────
         .table_size => |tidx| try emitTableSize(code, inst, tidx, reg_map),
@@ -4634,18 +4807,185 @@ fn callArgReg(i: u32) emit.Reg {
     };
 }
 
+fn emitSpAdjust(code: *emit.CodeBuffer, bytes: u32, kind: BinOpKind) !void {
+    if (bytes == 0) return;
+    const enc = encodeAddSubImm(@intCast(bytes)) orelse return error.StackArgAreaTooLarge;
+    try emitAddSubImm(code, .sp, .sp, enc, kind);
+}
+
+fn stackAddr(code: *emit.CodeBuffer, dst: emit.Reg, offset: u32) !void {
+    if (offset <= 4095) {
+        try code.addImm(dst, .sp, @intCast(offset));
+    } else if ((offset & 0xFFF) == 0 and (offset >> 12) <= 4095) {
+        try code.addImmShift12(dst, .sp, @intCast(offset >> 12));
+    } else {
+        try emitMovImm64(code, dst, offset);
+        try code.addRegReg(dst, dst, .sp);
+    }
+}
+
+fn storeOutgoingScalarArg(
+    code: *emit.CodeBuffer,
+    src: emit.Reg,
+    offset: u32,
+    addr_tmp: emit.Reg,
+) !void {
+    if (offset % 8 == 0 and offset / 8 <= 4095) {
+        try code.strImm(src, .sp, @intCast(offset / 8));
+    } else {
+        try stackAddr(code, addr_tmp, offset);
+        try code.strImm(src, addr_tmp, 0);
+    }
+}
+
+fn storeOutgoingV128Arg(
+    code: *emit.CodeBuffer,
+    vt: u5,
+    offset: u32,
+    addr_tmp: emit.Reg,
+) !void {
+    if (offset == 0) {
+        try code.strQ(vt, .sp);
+    } else {
+        try stackAddr(code, addr_tmp, offset);
+        try code.strQ(vt, addr_tmp);
+    }
+}
+
+fn loadV128ArgFromSaved(
+    code: *emit.CodeBuffer,
+    v128_map: *V128StackMap,
+    vreg: ir.VReg,
+    vt: u5,
+    addr_tmp: emit.Reg,
+) !void {
+    const off = try v128_map.get(vreg);
+    try frameAddr(code, addr_tmp, off);
+    try code.ldrQ(vt, addr_tmp);
+}
+
+fn frameLoadWithScratch(
+    code: *emit.CodeBuffer,
+    dst: emit.Reg,
+    offset: u32,
+    scratch: emit.Reg,
+) !void {
+    if (offset % 8 == 0 and offset / 8 <= 4095) {
+        try code.ldrImm(dst, .fp, @intCast(offset / 8));
+    } else {
+        try emitMovImm64(code, scratch, offset);
+        try code.addRegReg(scratch, scratch, .fp);
+        try code.ldrImm(dst, scratch, 0);
+    }
+}
+
+const HrpSource = enum { caller_scratch, forwarded };
+
+fn emitStageHrp(
+    code: *emit.CodeBuffer,
+    loc: AbiArgLoc,
+    fctx: *FuncCompileCtx,
+    source: HrpSource,
+    scalar_tmp: emit.Reg,
+    addr_tmp: emit.Reg,
+) !void {
+    switch (loc) {
+        .scalar_reg => |target| switch (source) {
+            .caller_scratch => try frameAddr(code, target, fctx.scratch_base),
+            .forwarded => try frameLoadWithScratch(code, target, fctx.hrp_save_off, scalar_tmp),
+        },
+        .stack => |stack| {
+            switch (source) {
+                .caller_scratch => try frameAddr(code, scalar_tmp, fctx.scratch_base),
+                .forwarded => try frameLoadWithScratch(code, scalar_tmp, fctx.hrp_save_off, addr_tmp),
+            }
+            try storeOutgoingScalarArg(code, scalar_tmp, stack.offset, addr_tmp);
+        },
+        .v128_reg => unreachable,
+    }
+}
+
+fn markScalarClobbered(mask: *u16, reg: emit.Reg) void {
+    const reg_num: u32 = @intFromEnum(reg);
+    if (reg_num < RegMap.caller_saved_count) {
+        mask.* |= (@as(u16, 1) << @intCast(reg_num));
+    }
+}
+
+fn emitStageCallAbi(
+    code: *emit.CodeBuffer,
+    plan: *const CallAbiPlan,
+    args: []const ir.VReg,
+    reg_map: *RegMap,
+    v128_map: *V128StackMap,
+    fctx: *FuncCompileCtx,
+    base_clobbered: u16,
+    scalar_tmp: emit.Reg,
+    addr_tmp: emit.Reg,
+    hrp_source: ?HrpSource,
+) !u16 {
+    if (plan.stack_size > 0) try emitSpAdjust(code, plan.stack_size, .sub);
+
+    var clobbered = base_clobbered;
+
+    // Store stack-passed args first so temporary vector/scalar registers cannot
+    // clobber already-staged register args.
+    for (args, 0..) |arg_vreg, i| {
+        switch (plan.locs[i]) {
+            .stack => |stack| {
+                if (stack.ty == .v128) {
+                    try loadV128ArgFromSaved(code, v128_map, arg_vreg, v128_call_stack_tmp, addr_tmp);
+                    try storeOutgoingV128Arg(code, v128_call_stack_tmp, stack.offset, addr_tmp);
+                } else {
+                    try stageArgFromSaved(code, reg_map, fctx, scalar_tmp, arg_vreg, clobbered);
+                    try storeOutgoingScalarArg(code, scalar_tmp, stack.offset, addr_tmp);
+                }
+            },
+            else => {},
+        }
+    }
+    if (plan.hrp) |hrp_loc| {
+        if (hrp_source) |src| {
+            switch (hrp_loc) {
+                .stack => try emitStageHrp(code, hrp_loc, fctx, src, scalar_tmp, addr_tmp),
+                else => {},
+            }
+        }
+    }
+
+    for (args, 0..) |arg_vreg, i| {
+        switch (plan.locs[i]) {
+            .scalar_reg => |target| {
+                try stageArgFromSaved(code, reg_map, fctx, target, arg_vreg, clobbered);
+                markScalarClobbered(&clobbered, target);
+            },
+            .v128_reg => |vt| try loadV128ArgFromSaved(code, v128_map, arg_vreg, vt, addr_tmp),
+            .stack => {},
+        }
+    }
+    if (plan.hrp) |hrp_loc| {
+        if (hrp_source) |src| {
+            switch (hrp_loc) {
+                .scalar_reg => |reg| {
+                    try emitStageHrp(code, hrp_loc, fctx, src, scalar_tmp, addr_tmp);
+                    markScalarClobbered(&clobbered, reg);
+                },
+                .v128_reg => unreachable,
+                .stack => {},
+            }
+        }
+    }
+
+    return clobbered;
+}
+
 /// Emit a direct wasm call.
-///
-/// Limitations (Phase 1): no tail calls, no extra results, no imports,
-/// at most 7 arguments. Violations return an error rather than emit
-/// incorrect code.
 ///
 /// Sequence: spill all currently-live caller-save physregs (x0..x15) to
 /// fixed per-reg slots in the call-save region, move arguments into
-/// x1..x7 by reading from those save slots (for physreg sources) or the
-/// RegMap spill region (for stack sources), load VMContext into x0, emit
-/// `BL 0` with a patch record, move the result from x0 into the dest
-/// vreg's location, then restore all saved regs.
+/// scalar/vector argument registers or the outgoing stack area, load VMContext
+/// into x0, emit `BL 0` with a patch record, move the result from x0 into the
+/// dest vreg's location, then restore all saved regs.
 ///
 /// The result-holding physreg is safe to not skip during restore: because
 /// the RegMap allocates `dest` AFTER the spill and assign() only picks
@@ -4655,13 +4995,17 @@ fn emitCall(
     inst: ir.Inst,
     cl: @TypeOf(@as(ir.Inst.Op, undefined).call),
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
     fctx: *FuncCompileCtx,
 ) !void {
-    // args + optional HRP must fit in the 7 user-arg slots.
-    const total_call_regs: u32 = @as(u32, @intCast(cl.args.len)) +
-        (if (cl.extra_results > 0) @as(u32, 1) else 0);
-    if (total_call_regs > 7) return error.TooManyCallArgs;
+    var abi = try buildCallAbiPlan(fctx.allocator, fctx, cl.args, funcParamTypes(fctx, cl.func_idx), cl.extra_results > 0);
+    defer abi.deinit();
+    if (cl.tail and abi.stack_size > 0) return error.UnsupportedTailCallStackArgs;
+
     const is_import = cl.func_idx < fctx.import_count;
+    // Imports are marshaled with the same native ABI as local AOT functions.
+    // The scalar runtime entry helpers still reject exported v128 signatures,
+    // so tests route v128 params through scalar exported wrappers.
     const call_patches: ?*std.ArrayListUnmanaged(CallPatch) = if (is_import)
         null
     else blk: {
@@ -4685,32 +5029,18 @@ fn emitCall(
     // args whose source reg is clobbered by an earlier arg's target.
     try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, cl.args);
 
-    // Move arguments into x1..x7. `clobbered` tracks which caller-save
-    // regs have been overwritten by earlier staging in this same call;
-    // `stageArgFromSaved` uses it to pick between a direct register mov
-    // (cheap) and a reload from the call-save slot (correct when the
-    // source was clobbered by an earlier arg's target).
-    var clobbered: u16 = 0;
-    for (cl.args, 0..) |arg_vreg, i| {
-        const target = callArgReg(@intCast(i));
-        try stageArgFromSaved(code, reg_map, fctx, target, arg_vreg, clobbered);
-        clobbered |= (@as(u16, 1) << @intCast(@intFromEnum(target)));
-    }
-
-    // HRP handling. For a normal (non-tail) call, pass a pointer to our
-    // own scratch region so the callee writes extras there for
-    // `call_result` to pick up. For a tail call we instead forward our
-    // caller's HRP (saved in the prologue at `hrp_save_off`), because
-    // wasm tail-call semantics require matching signatures and the
-    // callee's extras flow straight into our caller's scratch.
-    if (cl.extra_results > 0) {
-        const hrp_target = callArgReg(@intCast(cl.args.len));
-        if (cl.tail) {
-            try frameLoad(code, hrp_target, fctx.hrp_save_off);
-        } else {
-            try frameAddr(code, hrp_target, fctx.scratch_base);
-        }
-    }
+    _ = try emitStageCallAbi(
+        code,
+        &abi,
+        cl.args,
+        reg_map,
+        v128_map,
+        fctx,
+        0,
+        RegMap.tmp0,
+        RegMap.tmp2,
+        if (cl.extra_results > 0) (if (cl.tail) HrpSource.forwarded else HrpSource.caller_scratch) else null,
+    );
 
     // Load VMContext into x0 (was saved above if previously live).
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
@@ -4764,6 +5094,7 @@ fn emitCall(
             .target_func_idx = cl.func_idx - fctx.import_count,
         });
     }
+    if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
     // Commit result (in x0) to dest's location BEFORE restoring saved regs,
     // so restoration can't clobber the result holder (dest.reg is always a
@@ -5358,21 +5689,21 @@ fn emitCallIndirect(
     inst: ir.Inst,
     ci: @TypeOf(@as(ir.Inst.Op, undefined).call_indirect),
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
     fctx: *FuncCompileCtx,
 ) !void {
-    const total_ci_regs: u32 = @as(u32, @intCast(ci.args.len)) +
-        (if (ci.extra_results > 0) @as(u32, 1) else 0);
-    if (total_ci_regs > 7) return error.TooManyCallArgs;
+    var abi = try buildCallAbiPlan(fctx.allocator, fctx, ci.args, indexedParamTypes(fctx, ci.type_idx), ci.extra_results > 0);
+    defer abi.deinit();
+    if (ci.tail and abi.stack_size > 0) return error.UnsupportedTailCallStackArgs;
 
     // Snapshot live caller-save regs and spill to call_save.
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    {
-        var all_args: [8]ir.VReg = undefined;
-        all_args[0] = ci.elem_idx;
-        for (ci.args, 0..) |a, i| all_args[1 + i] = a;
-        try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args[0 .. 1 + ci.args.len]);
-    }
+    const all_args = try fctx.allocator.alloc(ir.VReg, ci.args.len + 1);
+    defer fctx.allocator.free(all_args);
+    all_args[0] = ci.elem_idx;
+    for (ci.args, 0..) |a, i| all_args[1 + i] = a;
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args);
 
     // Stage `elem_idx` into a callee-safe spot: write it to a dedicated
     // scratch slot on the stack (we reuse slot 0 of the call-save region
@@ -5444,34 +5775,23 @@ fn emitCallIndirect(
     // arg staging won't clobber it (arg staging only uses x1..x7, x0,
     // and reads from call_save). Safe to keep in tmp0 across arg moves.
 
-    // Stage args into x1..xN. The bounds/sig check sequence above
-    // clobbered x0 (and other tmps not in caller-save range), so seed
-    // `clobbered_ci` with bit 0 to force args sourced from x0 to read
-    // from the saved slot rather than the now-garbage register.
+    // Stage args. The bounds/sig check sequence above clobbered x0, so seed
+    // the clobber mask with bit 0 to force x0-sourced args to read from the
+    // saved slot rather than the now-garbage register. Keep tmp0 for fn_ptr.
     const dying_mask_ci: u16 = dyingCallerSaveMask(reg_map, fctx.current_kills);
-    var clobbered_ci: u16 = 1; // x0 already trashed by sig/bounds checks
-    for (ci.args, 0..) |arg_vreg, i| {
-        const target = callArgReg(@intCast(i));
-        try stageArgFromSaved(code, reg_map, fctx, target, arg_vreg, clobbered_ci);
-        clobbered_ci |= (@as(u16, 1) << @intCast(@intFromEnum(target)));
-    }
+    _ = try emitStageCallAbi(
+        code,
+        &abi,
+        ci.args,
+        reg_map,
+        v128_map,
+        fctx,
+        1,
+        RegMap.tmp1,
+        RegMap.tmp2,
+        if (ci.extra_results > 0) (if (ci.tail) HrpSource.forwarded else HrpSource.caller_scratch) else null,
+    );
     if (ci.tail) {
-        // Tail: args already in x1..x7. Forward our caller's HRP if the
-        // tail target is multi-result. Then re-materialize the target
-        // fn_ptr into tmp0 AFTER any HRP load (which can transiently
-        // use tmp0 as scratch on the large-offset path), load vmctx, and
-        // finally tear down the frame + BR.
-        if (ci.extra_results > 0) {
-            const hrp_target = callArgReg(@intCast(ci.args.len));
-            try frameLoad(code, hrp_target, fctx.hrp_save_off);
-        }
-        // Recompute fn_ptr into tmp0. We already passed the bounds and
-        // sig checks above; tmp2 still holds elem_idx.
-        try loadTableInfoAddr(code, RegMap.tmp0, ci.table_idx);
-        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, @intCast(table_info_ptr_off / 8));
-        try code.addExtUxtw3(RegMap.tmp0, RegMap.tmp0, RegMap.tmp2);
-        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
-        // Load vmctx into x0 (last FP-relative read before teardown).
         try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
         try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogueNoRet(fctx.frame_size);
@@ -5479,12 +5799,9 @@ fn emitCallIndirect(
         return;
     }
 
-    if (ci.extra_results > 0) {
-        const hrp_target = callArgReg(@intCast(ci.args.len));
-        try frameAddr(code, hrp_target, fctx.scratch_base);
-    }
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
     try code.blr(RegMap.tmp0);
+    if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
     if (inst.dest) |dest| {
         const info = try destBegin(reg_map, dest, RegMap.tmp0);
@@ -5511,20 +5828,20 @@ fn emitCallRef(
     inst: ir.Inst,
     cr: @TypeOf(@as(ir.Inst.Op, undefined).call_ref),
     reg_map: *RegMap,
+    v128_map: *V128StackMap,
     fctx: *FuncCompileCtx,
 ) !void {
-    const total_cr_regs: u32 = @as(u32, @intCast(cr.args.len)) +
-        (if (cr.extra_results > 0) @as(u32, 1) else 0);
-    if (total_cr_regs > 7) return error.TooManyCallArgs;
+    var abi = try buildCallAbiPlan(fctx.allocator, fctx, cr.args, indexedParamTypes(fctx, cr.type_idx), cr.extra_results > 0);
+    defer abi.deinit();
+    if (cr.tail and abi.stack_size > 0) return error.UnsupportedTailCallStackArgs;
 
     var used_snapshot: [RegMap.scratch_regs.len]bool = undefined;
     for (&used_snapshot, reg_map.reg_used) |*dst, src| dst.* = src;
-    {
-        var all_args: [8]ir.VReg = undefined;
-        all_args[0] = cr.func_ref;
-        for (cr.args, 0..) |a, i| all_args[1 + i] = a;
-        try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args[0 .. 1 + cr.args.len]);
-    }
+    const all_args = try fctx.allocator.alloc(ir.VReg, cr.args.len + 1);
+    defer fctx.allocator.free(all_args);
+    all_args[0] = cr.func_ref;
+    for (cr.args, 0..) |a, i| all_args[1 + i] = a;
+    try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, all_args);
 
     // Load the 64-bit func_ref pointer into tmp0. tmp0 is x16 (non-
     // allocatable) so it survives arg staging below.
@@ -5544,24 +5861,21 @@ fn emitCallRef(
     // patch helper works.
     patchBCondHere(code, cbz_site);
 
-    // Stage args into x1..xN (tmp0 holds fn_ptr, non-allocatable).
+    // Stage args while preserving tmp0, which holds fn_ptr.
     const dying_mask_cr: u16 = dyingCallerSaveMask(reg_map, fctx.current_kills);
-    var clobbered_cr: u16 = 0;
-    for (cr.args, 0..) |arg_vreg, i| {
-        const target = callArgReg(@intCast(i));
-        try stageArgFromSaved(code, reg_map, fctx, target, arg_vreg, clobbered_cr);
-        clobbered_cr |= (@as(u16, 1) << @intCast(@intFromEnum(target)));
-    }
+    _ = try emitStageCallAbi(
+        code,
+        &abi,
+        cr.args,
+        reg_map,
+        v128_map,
+        fctx,
+        0,
+        RegMap.tmp1,
+        RegMap.tmp2,
+        if (cr.extra_results > 0) (if (cr.tail) HrpSource.forwarded else HrpSource.caller_scratch) else null,
+    );
     if (cr.tail) {
-        // Tail: forward caller's HRP if callee has extras, then re-stage
-        // fn_ref into tmp0 (the HRP load can clobber tmp0 on the
-        // large-offset path, so we refresh it here). Load vmctx, tear
-        // down, and BR.
-        if (cr.extra_results > 0) {
-            const hrp_target = callArgReg(@intCast(cr.args.len));
-            try frameLoad(code, hrp_target, fctx.hrp_save_off);
-        }
-        try stageArgFromSaved(code, reg_map, fctx, RegMap.tmp0, cr.func_ref, 0);
         try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
         try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogueNoRet(fctx.frame_size);
@@ -5569,12 +5883,9 @@ fn emitCallRef(
         return;
     }
 
-    if (cr.extra_results > 0) {
-        const hrp_target = callArgReg(@intCast(cr.args.len));
-        try frameAddr(code, hrp_target, fctx.scratch_base);
-    }
     try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
     try code.blr(RegMap.tmp0);
+    if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
     if (inst.dest) |dest| {
         const info = try destBegin(reg_map, dest, RegMap.tmp0);
@@ -6512,6 +6823,8 @@ pub fn compileModuleWithOptions(
             .call_patches = &func_patches,
             .global_types = ir_module.global_types orelse &.{},
             .global_offsets = ir_module.global_offsets orelse &.{},
+            .func_types = ir_module.func_types.items,
+            .func_type_indices = ir_module.func_type_indices.items,
             .options = options,
             .allocator = allocator,
         };
@@ -6735,6 +7048,23 @@ fn shadowRunRegalloc(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+fn testCodeContainsWord(code: []const u8, word: u32) bool {
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        if (std.mem.readInt(u32, code[i..][0..4], .little) == word) return true;
+    }
+    return false;
+}
+
+fn testCodeContainsMasked(code: []const u8, mask: u32, value: u32) bool {
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & mask) == value) return true;
+    }
+    return false;
+}
 
 test "compileFunction: iconst_32 + ret" {
     const allocator = std.testing.allocator;
@@ -7001,6 +7331,187 @@ test "compileModule: direct call between two local functions" {
         }
     }
     try std.testing.expect(found_bl_to_f0);
+}
+
+test "compileModule: direct v128 call stages q0" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    var f0 = ir.IrFunction.init(allocator, 1, 1, 1);
+    f0.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{.v128});
+    {
+        const b = try f0.newBlock();
+        const p = f0.newVReg();
+        const lane = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .local_get = 0 }, .dest = p, .type = .v128 });
+        try f0.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = p, .lane = 0 } }, .dest = lane, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = lane } });
+    }
+    _ = try module.addFunction(f0);
+
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+    {
+        const b = try f1.newBlock();
+        const v = f1.newVReg();
+        const r = f1.newVReg();
+        try f1.getBlock(b).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = v, .type = .v128 });
+        args[0] = v;
+        try f1.getBlock(b).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = r, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = r } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    const f1_code = result.code[result.offsets[1]..];
+    try std.testing.expect(testCodeContainsWord(f1_code, 0x3DC001E0)); // LDR Q0, [x15]
+    try std.testing.expect(testCodeContainsMasked(f1_code, 0xFC000000, 0x94000000)); // BL
+}
+
+test "compileModule: mixed scalar and v128 direct call uses independent banks" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    var f0 = ir.IrFunction.init(allocator, 3, 1, 3);
+    f0.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{ .i32, .v128, .i64 });
+    {
+        const b = try f0.newBlock();
+        const p0 = f0.newVReg();
+        const p1 = f0.newVReg();
+        const lane = f0.newVReg();
+        const sum = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .local_get = 0 }, .dest = p0, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .local_get = 1 }, .dest = p1, .type = .v128 });
+        try f0.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = p1, .lane = 0 } }, .dest = lane, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .add = .{ .lhs = p0, .rhs = lane } }, .dest = sum, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = sum } });
+    }
+    _ = try module.addFunction(f0);
+
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    const args = try allocator.alloc(ir.VReg, 3);
+    defer allocator.free(args);
+    {
+        const b = try f1.newBlock();
+        const s0 = f1.newVReg();
+        const v = f1.newVReg();
+        const s1 = f1.newVReg();
+        const r = f1.newVReg();
+        try f1.getBlock(b).append(.{ .op = .{ .iconst_32 = 7 }, .dest = s0, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0005 }, .dest = v, .type = .v128 });
+        try f1.getBlock(b).append(.{ .op = .{ .iconst_64 = 9 }, .dest = s1, .type = .i64 });
+        args[0] = s0;
+        args[1] = v;
+        args[2] = s1;
+        try f1.getBlock(b).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = r, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = r } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    const f1_code = result.code[result.offsets[1]..];
+    try std.testing.expect(testCodeContainsWord(f1_code, 0x3DC001E0)); // v128 arg → q0 from x15 addr
+    try std.testing.expect(testCodeContainsMasked(f1_code, 0xFC000000, 0x94000000));
+}
+
+test "compileModule: excess v128 args use outgoing stack" {
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    var f0 = ir.IrFunction.init(allocator, 9, 1, 9);
+    f0.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{
+        .v128, .v128, .v128, .v128, .v128, .v128, .v128, .v128, .v128,
+    });
+    {
+        const b = try f0.newBlock();
+        const p = f0.newVReg();
+        const lane = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .local_get = 8 }, .dest = p, .type = .v128 });
+        try f0.getBlock(b).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = p, .lane = 0 } }, .dest = lane, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = lane } });
+    }
+    _ = try module.addFunction(f0);
+
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    const args = try allocator.alloc(ir.VReg, 9);
+    defer allocator.free(args);
+    {
+        const b = try f1.newBlock();
+        for (args, 0..) |*slot, idx| {
+            const v = f1.newVReg();
+            try f1.getBlock(b).append(.{ .op = .{ .v128_const = @as(u128, @intCast(idx + 1)) }, .dest = v, .type = .v128 });
+            slot.* = v;
+        }
+        const r = f1.newVReg();
+        try f1.getBlock(b).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = args } }, .dest = r, .type = .i32 });
+        try f1.getBlock(b).append(.{ .op = .{ .ret = r } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    const f1_code = result.code[result.offsets[1]..];
+    try std.testing.expect(testCodeContainsWord(f1_code, 0xD10043FF)); // SUB SP, SP, #16
+    try std.testing.expect(testCodeContainsWord(f1_code, 0x3D8003FF)); // STR Q31, [SP]
+    try std.testing.expect(testCodeContainsWord(f1_code, 0x910043FF)); // ADD SP, SP, #16
+}
+
+test "compileFunction: indirect v128 call stages q0 and emits BLR" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+
+    const b = try func.newBlock();
+    const v = func.newVReg();
+    const idx = func.newVReg();
+    const r = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = v, .type = .v128 });
+    try func.getBlock(b).append(.{ .op = .{ .iconst_32 = 0 }, .dest = idx, .type = .i32 });
+    args[0] = v;
+    try func.getBlock(b).append(.{ .op = .{ .call_indirect = .{ .type_idx = 0, .elem_idx = idx, .args = args } }, .dest = r, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .ret = r } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(testCodeContainsWord(code, 0x3DC001E0)); // LDR Q0, [x15]
+    try std.testing.expect(testCodeContainsWord(code, 0xD63F0200)); // BLR x16
+}
+
+test "compileFunction: call_ref v128 call stages q0 and emits BLR" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(args);
+
+    const b = try func.newBlock();
+    const v = func.newVReg();
+    const ref = func.newVReg();
+    const r = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = v, .type = .v128 });
+    try func.getBlock(b).append(.{ .op = .{ .ref_func = 0 }, .dest = ref, .type = .i64 });
+    args[0] = v;
+    try func.getBlock(b).append(.{ .op = .{ .call_ref = .{ .type_idx = 0, .func_ref = ref, .args = args } }, .dest = r, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .ret = r } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(testCodeContainsWord(code, 0x3DC001E0)); // LDR Q0, [x15]
+    try std.testing.expect(testCodeContainsWord(code, 0xD63F0200)); // BLR x16
 }
 
 // ── New handler tests (Phase 1a) ─────────────────────────────────────────────
@@ -9347,7 +9858,7 @@ test "compile: i16x8 scalar-count shifts emit NEON instructions" {
     try std.testing.expect(found_ushl);
 }
 
-test "compile: v128 params remain unsupported before ABI support" {
+test "compile: v128 param spills q0 into first local slot" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 1, 1, 1);
     defer func.deinit();
@@ -9358,6 +9869,27 @@ test "compile: v128 params remain unsupported before ABI support" {
     try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = v, .lane = 0 } }, .dest = lane, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_entry_str_q0 = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if (w == 0x3D800220) found_entry_str_q0 = true; // STR Q0, [x17]
+    }
+    try std.testing.expect(found_entry_str_q0);
+}
+
+test "compile: v128 result remains unsupported" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0 }, .dest = v, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v } });
 
     try std.testing.expectError(error.UnsupportedV128, compileFunction(&func, allocator));
 }
@@ -10246,7 +10778,7 @@ test "compile: local_get + local_set round trip" {
     try std.testing.expect(code.len % 4 == 0);
 }
 
-test "compile: rejects more than 7 params (Phase 1b limit)" {
+test "compile: accepts scalar params beyond x7 via inbound stack" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 8, 1, 8);
     defer func.deinit();
@@ -10254,7 +10786,9 @@ test "compile: rejects more than 7 params (Phase 1b limit)" {
     const v0 = func.newVReg();
     try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
-    try std.testing.expectError(error.TooManyParams, compileFunction(&func, allocator));
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
 }
 
 test "compile: unimplemented op returns error.UnimplementedOp" {
