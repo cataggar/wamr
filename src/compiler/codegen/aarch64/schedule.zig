@@ -21,6 +21,13 @@ pub const Class = enum {
     compare,
     load,
     store,
+    neon_alu,
+    neon_fp_alu,
+    neon_mul,
+    neon_fma,
+    neon_load,
+    neon_store,
+    neon_perm,
 };
 
 pub const Metadata = struct {
@@ -236,7 +243,7 @@ pub fn opInfo(inst: ir.Inst) OpInfo {
     const class = opClass(inst);
     return .{
         .class = class,
-        .latency = classLatency(class),
+        .latency = opLatency(inst, class),
         .ordered_memory = isOrderedMemoryOp(inst.op) and class != .barrier,
     };
 }
@@ -246,19 +253,58 @@ fn opClass(inst: ir.Inst) Class {
     return switch (inst.op) {
         .iconst_32, .iconst_64 => if (def != null) .constant else .barrier,
         .v128_const => if (def != null) .constant else .barrier,
-        .v128_load, .v128_load_splat, .v128_load_zero, .v128_load_extend, .v128_load_lane => if (def != null) .load else .barrier,
-        .store, .v128_store, .v128_store_lane => .store,
+        .v128_load, .v128_load_splat, .v128_load_zero, .v128_load_extend, .v128_load_lane => if (def != null) .neon_load else .barrier,
+        .store => .store,
+        .v128_store, .v128_store_lane => .neon_store,
         .v128_not,
         .v128_any_true,
         .v128_bitwise,
         .v128_bitselect,
         .simd_all_true,
         .simd_bitmask,
-        .i32x4_binop,
         .i32x4_unop,
         .i32x4_extadd_pairwise_i16x8,
-        .i32x4_dot_i16x8_s,
         .i32x4_extend_i16x8,
+        .i32x4_shift,
+        .i32x4_splat,
+        .i32x4_extract_lane,
+        .i32x4_replace_lane,
+        .i8x16_binop,
+        .i8x16_unop,
+        .i8x16_shift,
+        .i8x16_splat,
+        .i8x16_extract_lane,
+        .i8x16_replace_lane,
+        .i8x16_narrow_i16x8,
+        .i16x8_unop,
+        .i16x8_extadd_pairwise_i8x16,
+        .i16x8_extend_i8x16,
+        .i16x8_narrow_i32x4,
+        .i16x8_shift,
+        .i16x8_splat,
+        .i16x8_extract_lane,
+        .i16x8_replace_lane,
+        .i64x2_unop,
+        .i64x2_extend_i32x4,
+        .i64x2_shift,
+        .i64x2_splat,
+        .i64x2_extract_lane,
+        .i64x2_replace_lane,
+        => if (def != null) .neon_alu else .barrier,
+
+        .i32x4_binop => |bin| if (def != null) classForI32x4BinOp(bin.op) else .barrier,
+        .i16x8_binop => |bin| if (def != null) classForI16x8BinOp(bin.op) else .barrier,
+        .i64x2_binop => |bin| if (def != null) classForI64x2BinOp(bin.op) else .barrier,
+        .i32x4_dot_i16x8_s,
+        .i32x4_extmul_i16x8,
+        .i16x8_extmul_i8x16,
+        .i64x2_extmul_i32x4,
+        => if (def != null) .neon_mul else .barrier,
+
+        .i8x16_shuffle,
+        .i8x16_swizzle,
+        => if (def != null) .neon_perm else .barrier,
+
         .f32x4_unop,
         .f32x4_binop,
         .f32x4_convert_i32x4,
@@ -267,38 +313,6 @@ fn opClass(inst: ir.Inst) Class {
         .f32x4_splat,
         .f32x4_extract_lane,
         .f32x4_replace_lane,
-        .i32x4_extmul_i16x8,
-        .i32x4_shift,
-        .i32x4_splat,
-        .i32x4_extract_lane,
-        .i32x4_replace_lane,
-        .i8x16_binop,
-        .i8x16_shuffle,
-        .i8x16_swizzle,
-        .i8x16_unop,
-        .i8x16_shift,
-        .i8x16_splat,
-        .i8x16_extract_lane,
-        .i8x16_replace_lane,
-        .i8x16_narrow_i16x8,
-        .i16x8_binop,
-        .i16x8_unop,
-        .i16x8_extadd_pairwise_i8x16,
-        .i16x8_extend_i8x16,
-        .i16x8_extmul_i8x16,
-        .i16x8_narrow_i32x4,
-        .i16x8_shift,
-        .i16x8_splat,
-        .i16x8_extract_lane,
-        .i16x8_replace_lane,
-        .i64x2_binop,
-        .i64x2_unop,
-        .i64x2_extend_i32x4,
-        .i64x2_extmul_i32x4,
-        .i64x2_shift,
-        .i64x2_splat,
-        .i64x2_extract_lane,
-        .i64x2_replace_lane,
         .f64x2_unop,
         .f64x2_binop,
         .f64x2_splat,
@@ -306,7 +320,7 @@ fn opClass(inst: ir.Inst) Class {
         .f64x2_replace_lane,
         .f64x2_convert_low_i32x4,
         .f64x2_promote_low_f32x4,
-        => if (def != null) .alu else .barrier,
+        => if (def != null) .neon_fp_alu else .barrier,
 
         .mul => if (def != null and isIntegerType(inst.type)) .mul else .barrier,
 
@@ -352,6 +366,34 @@ fn opClass(inst: ir.Inst) Class {
     };
 }
 
+fn classForI32x4BinOp(op: ir.Inst.I32x4Op) Class {
+    return switch (op) {
+        .mul => .neon_mul,
+        else => .neon_alu,
+    };
+}
+
+fn classForI16x8BinOp(op: ir.Inst.I16x8Op) Class {
+    return switch (op) {
+        .mul, .q15mulr_sat_s => .neon_mul,
+        else => .neon_alu,
+    };
+}
+
+fn classForI64x2BinOp(_: ir.Inst.I64x2Op) Class {
+    return .neon_alu;
+}
+
+fn opLatency(inst: ir.Inst, class: Class) u8 {
+    return switch (inst.op) {
+        // i8x16.shuffle lowers to a two-source TBL; Arm Neoverse N1 SOG §3.14
+        // "Advanced SIMD table lookup" and Neoverse N2 SOG §3.14 "Advanced
+        // SIMD table lookup" list an extra cycle over single-source TBL/TBX.
+        .i8x16_shuffle => 4,
+        else => classLatency(class),
+    };
+}
+
 fn classLatency(class: Class) u8 {
     return switch (class) {
         // Arm Neoverse N1/N2 optimization guides put L1 integer load-to-use at
@@ -360,6 +402,29 @@ fn classLatency(class: Class) u8 {
         .load => 4,
         // Neoverse N1/N2 integer multiply latency is 3 cycles.
         .mul => 3,
+        // Arm Neoverse N1 SOG §3.14 "Advanced SIMD integer arithmetic" and
+        // Neoverse N2 SOG §3.14 "Advanced SIMD integer arithmetic" put common
+        // NEON integer ALU operations at about two dependent cycles.
+        .neon_alu => 2,
+        // Arm Neoverse N1/N2 SOG §3.14 "Advanced SIMD floating-point
+        // arithmetic" lists FP add/mul/min/max/compare near three cycles.
+        .neon_fp_alu => 3,
+        // Arm Neoverse N1/N2 SOG §3.14 "Advanced SIMD multiply" puts integer
+        // vector MUL/MLA/MLS-style results around five cycles.
+        .neon_mul => 5,
+        // Arm Neoverse N1/N2 SOG §3.14 "Advanced SIMD fused multiply-add"
+        // lists FMLA/FMLS as four-cycle dependent operations.
+        .neon_fma => 4,
+        // Arm Neoverse N1/N2 SOG §3.14 "Advanced SIMD load/store" uses the
+        // same 4-5 cycle L1 load-to-use envelope as scalar loads, but through
+        // the NEON forwarding path.
+        .neon_load => 4,
+        // Stores retire into the store buffer; keep latency-to-pipe cheap just
+        // like scalar stores rather than modeling visibility latency.
+        .neon_store => 1,
+        // Arm Neoverse N1/N2 SOG §3.14 "Advanced SIMD table lookup/permute"
+        // puts single-source TBL/TBX/EXT/REV-style permutes around 3 cycles.
+        .neon_perm => 3,
         .constant, .alu, .compare, .store => 1,
         .barrier => 0,
     };
@@ -373,7 +438,7 @@ pub fn metadata(inst: ir.Inst) Metadata {
         .latency = info.latency,
         .barrier = info.class == .barrier,
         .def = switch (info.class) {
-            .barrier, .store => null,
+            .barrier, .store, .neon_store => null,
             else => def,
         },
     };
@@ -774,52 +839,82 @@ test "metadata models supported v128 ops as schedulable" {
 
     const load = ir.Inst{ .op = .{ .v128_load = .{ .base = 2, .offset = 0, .alignment = 4 } }, .dest = 3, .type = .v128 };
     try std.testing.expect(!metadata(load).barrier);
-    try std.testing.expectEqual(Class.load, metadata(load).class);
+    try std.testing.expectEqual(Class.neon_load, metadata(load).class);
     try std.testing.expectEqual(@as(u8, 4), metadata(load).latency);
     try std.testing.expectEqual(@as(?ir.VReg, 3), metadata(load).def);
 
     const load_extend = ir.Inst{ .op = .{ .v128_load_extend = .{ .src_width = .i8x8, .sign = .signed, .base = 2, .offset = 0, .alignment = 3 } }, .dest = 4, .type = .v128 };
     const load_extend_info = opInfo(load_extend);
     try std.testing.expect(!metadata(load_extend).barrier);
-    try std.testing.expectEqual(Class.load, load_extend_info.class);
+    try std.testing.expectEqual(Class.neon_load, load_extend_info.class);
     try std.testing.expect(load_extend_info.ordered_memory);
 
     const store = ir.Inst{ .op = .{ .v128_store = .{ .base = 4, .offset = 16, .alignment = 4, .val = 3 } }, .type = .void };
     try std.testing.expect(!metadata(store).barrier);
-    try std.testing.expectEqual(Class.store, metadata(store).class);
+    try std.testing.expectEqual(Class.neon_store, metadata(store).class);
     try std.testing.expectEqual(@as(?ir.VReg, null), metadata(store).def);
 
     const not = ir.Inst{ .op = .{ .v128_not = 3 }, .dest = 5, .type = .v128 };
     try std.testing.expect(!metadata(not).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(not).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(not).class);
 
     const bitwise = ir.Inst{ .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = 3, .rhs = 5 } }, .dest = 6, .type = .v128 };
     try std.testing.expect(!metadata(bitwise).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(bitwise).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(bitwise).class);
 
     const binop = ir.Inst{ .op = .{ .i32x4_binop = .{ .op = .add, .lhs = 3, .rhs = 6 } }, .dest = 7, .type = .v128 };
     try std.testing.expect(!metadata(binop).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(binop).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(binop).class);
 
     const splat = ir.Inst{ .op = .{ .i32x4_splat = 8 }, .dest = 9, .type = .v128 };
     try std.testing.expect(!metadata(splat).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(splat).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(splat).class);
 
     const extract = ir.Inst{ .op = .{ .i32x4_extract_lane = .{ .vector = 7, .lane = 2 } }, .dest = 10, .type = .i32 };
     try std.testing.expect(!metadata(extract).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(extract).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(extract).class);
 
     const replace = ir.Inst{ .op = .{ .i32x4_replace_lane = .{ .vector = 7, .val = 8, .lane = 1 } }, .dest = 11, .type = .v128 };
     try std.testing.expect(!metadata(replace).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(replace).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(replace).class);
 
     const i16_binop = ir.Inst{ .op = .{ .i16x8_binop = .{ .op = .add, .lhs = 7, .rhs = 11 } }, .dest = 12, .type = .v128 };
     try std.testing.expect(!metadata(i16_binop).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(i16_binop).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(i16_binop).class);
 
     const i16_extract = ir.Inst{ .op = .{ .i16x8_extract_lane = .{ .vector = 12, .lane = 5, .sign = .unsigned } }, .dest = 13, .type = .i32 };
     try std.testing.expect(!metadata(i16_extract).barrier);
-    try std.testing.expectEqual(Class.alu, metadata(i16_extract).class);
+    try std.testing.expectEqual(Class.neon_alu, metadata(i16_extract).class);
+}
+
+test "metadata uses tuned NEON latency classes for representative v128 ops" {
+    const fp_add = ir.Inst{ .op = .{ .f32x4_binop = .{ .op = .add, .lhs = 1, .rhs = 2 } }, .dest = 3, .type = .v128 };
+    try std.testing.expectEqual(Class.neon_fp_alu, metadata(fp_add).class);
+    try std.testing.expectEqual(@as(u8, 3), metadata(fp_add).latency);
+
+    const int_mul = ir.Inst{ .op = .{ .i32x4_binop = .{ .op = .mul, .lhs = 4, .rhs = 5 } }, .dest = 6, .type = .v128 };
+    try std.testing.expectEqual(Class.neon_mul, metadata(int_mul).class);
+    try std.testing.expectEqual(@as(u8, 5), metadata(int_mul).latency);
+
+    const load = ir.Inst{ .op = .{ .v128_load = .{ .base = 7, .offset = 0, .alignment = 4 } }, .dest = 8, .type = .v128 };
+    try std.testing.expectEqual(Class.neon_load, metadata(load).class);
+    try std.testing.expectEqual(@as(u8, 4), metadata(load).latency);
+
+    const swizzle = ir.Inst{ .op = .{ .i8x16_swizzle = .{ .vector = 9, .indices = 10 } }, .dest = 11, .type = .v128 };
+    try std.testing.expectEqual(Class.neon_perm, metadata(swizzle).class);
+    try std.testing.expect(metadata(swizzle).latency >= 3);
+
+    const shuffle = ir.Inst{ .op = .{ .i8x16_shuffle = .{
+        .lhs = 12,
+        .rhs = 13,
+        .lanes = .{ 0, 1, 2, 3, 4, 5, 6, 7, 31, 30, 29, 28, 27, 26, 25, 24 },
+    } }, .dest = 14, .type = .v128 };
+    try std.testing.expectEqual(Class.neon_perm, metadata(shuffle).class);
+    try std.testing.expectEqual(@as(u8, 4), metadata(shuffle).latency);
+
+    // The AArch64 backend fuses f32x4/f64x2 mul+add/sub to FMLA/FMLS after
+    // scheduling, so there is no distinct FMA IR op for metadata() to inspect.
+    try std.testing.expectEqual(@as(u8, 4), classLatency(.neon_fma));
 }
 
 test "local scheduler prioritizes a long independent multiply chain" {
@@ -943,7 +1038,7 @@ fn findV128Store(insts: []const ir.Inst) ?usize {
     return null;
 }
 
-test "local scheduler models v128 dependencies while moving independent scalar work" {
+test "local scheduler prioritizes tuned v128 dependency latency over scalar work" {
     const insts = [_]ir.Inst{
         .{ .op = .{ .iconst_32 = 0 }, .dest = 1, .type = .i32 },
         .{ .op = .{ .v128_load = .{ .base = 1, .offset = 0, .alignment = 4 } }, .dest = 2, .type = .v128 },
@@ -968,8 +1063,10 @@ test "local scheduler models v128 dependencies while moving independent scalar w
     try std.testing.expect(not_pos < extract_pos);
     try std.testing.expect(extract_pos < add_pos);
     try std.testing.expect(mul_pos < add_pos);
+    // The tuned NEON load+ALU+extract chain has a longer critical path than
+    // the independent scalar multiply chain, so it stays ahead of scalar work.
     try std.testing.expect(load_pos < mul_pos);
-    try std.testing.expect(mul_pos < not_pos);
+    try std.testing.expect(not_pos < mul_pos);
 }
 
 test "local scheduler preserves mixed scalar and v128 memory order" {
