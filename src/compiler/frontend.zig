@@ -2105,6 +2105,28 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                         });
                         try vreg_stack.append(allocator, dest);
                     },
+                    .f64x2_abs,
+                    .f64x2_neg,
+                    .f64x2_sqrt,
+                    => {
+                        const vector = safePop(&vreg_stack);
+                        const dest = ir_func.newVReg();
+                        const unary = ir.Inst.F64x2UnOp{
+                            .op = switch (simd_op) {
+                                .f64x2_abs => .abs,
+                                .f64x2_neg => .neg,
+                                .f64x2_sqrt => .sqrt,
+                                else => unreachable,
+                            },
+                            .vector = vector,
+                        };
+                        try ir_func.getBlock(current_block).append(.{
+                            .op = .{ .f64x2_unop = unary },
+                            .dest = dest,
+                            .type = .v128,
+                        });
+                        try vreg_stack.append(allocator, dest);
+                    },
                     .i16x8_extadd_pairwise_i8x16_s,
                     .i16x8_extadd_pairwise_i8x16_u,
                     .i32x4_extadd_pairwise_i16x8_s,
@@ -5495,6 +5517,92 @@ test "lower f32x4 unary opcodes" {
     const extract_idx = 1 + cases.len;
     try std.testing.expectEqual(@as(u2, 0), insts[extract_idx].op.i32x4_extract_lane.lane);
     try std.testing.expect(insts[extract_idx + 1].op.ret != null);
+}
+
+test "lower f64x2 unary opcodes" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+
+    const Case = struct {
+        opcode: u32,
+        expected: ir.Inst.F64x2UnaryOp,
+    };
+    const cases = [_]Case{
+        .{ .opcode = 0xEC, .expected = .abs },
+        .{ .opcode = 0xED, .expected = .neg },
+        .{ .opcode = 0xEF, .expected = .sqrt },
+    };
+
+    const appendULEB = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, value: u32) !void {
+            var v = value;
+            while (true) {
+                var byte: u8 = @intCast(v & 0x7F);
+                v >>= 7;
+                if (v != 0) byte |= 0x80;
+                try buf.append(alloc, byte);
+                if (v == 0) break;
+            }
+        }
+    }.call;
+    const appendSimd = struct {
+        fn call(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, opcode: u32) !void {
+            try buf.append(alloc, 0xFD);
+            try appendULEB(buf, alloc, opcode);
+        }
+    }.call;
+
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(allocator);
+    try appendSimd(&code, allocator, 0x0C); // v128.const
+    const lanes = [_]u64{ 0xc010_0000_0000_0000, 0x7ff8_0000_0000_1234 };
+    for (lanes) |lane| {
+        var le = std.mem.nativeToLittle(u64, lane);
+        try code.appendSlice(allocator, std.mem.asBytes(&le));
+    }
+    for (cases) |case| {
+        try appendSimd(&code, allocator, case.opcode);
+    }
+    try appendSimd(&code, allocator, 0x1D); // i64x2.extract_lane
+    try code.append(allocator, 0);
+    try code.append(allocator, 0xA7); // i32.wrap_i64
+    try code.append(allocator, 0x0B);
+
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 0,
+        .locals = &.{},
+        .code = code.items,
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const insts = ir_module.functions.items[0].blocks.items[0].instructions.items;
+    try std.testing.expectEqual(@as(usize, 1 + cases.len + 3), insts.len);
+    var prev_dest = insts[0].dest.?;
+    for (cases, 0..) |case, idx| {
+        const inst = insts[1 + idx];
+        const un = inst.op.f64x2_unop;
+        try std.testing.expectEqual(case.expected, un.op);
+        try std.testing.expectEqual(prev_dest, un.vector);
+        try std.testing.expectEqual(ir.IrType.v128, inst.type);
+        prev_dest = inst.dest.?;
+    }
+    const extract_idx = 1 + cases.len;
+    try std.testing.expectEqual(@as(u1, 0), insts[extract_idx].op.i64x2_extract_lane.lane);
+    try std.testing.expectEqual(ir.IrType.i64, insts[extract_idx].type);
+    try std.testing.expectEqual(insts[extract_idx].dest.?, insts[extract_idx + 1].op.wrap_i64);
+    try std.testing.expect(insts[extract_idx + 2].op.ret != null);
 }
 
 test "lower integer SIMD pairwise extended add opcodes" {

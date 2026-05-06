@@ -298,6 +298,7 @@ fn opClass(inst: ir.Inst) Class {
         .i64x2_splat,
         .i64x2_extract_lane,
         .i64x2_replace_lane,
+        .f64x2_unop,
         .f64x2_binop,
         .f64x2_convert_low_i32x4,
         .f64x2_promote_low_f32x4,
@@ -645,6 +646,7 @@ pub fn forEachUse(
             try visit(context, bin.lhs);
             try visit(context, bin.rhs);
         },
+        .f64x2_unop => |un| try visit(context, un.vector),
         .f64x2_convert_low_i32x4 => |op| try visit(context, op.vector),
         .f64x2_promote_low_f32x4 => |op| try visit(context, op.vector),
         .i64x2_unop => |un| try visit(context, un.vector),

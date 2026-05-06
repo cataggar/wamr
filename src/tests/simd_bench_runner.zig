@@ -369,6 +369,21 @@ const cases = [_]BenchCase{
         .build = buildSimdF32x4SqrtLane0Module,
     },
     .{
+        .name = "simd_f64x2_abs_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2AbsLane0HighModule,
+    },
+    .{
+        .name = "simd_f64x2_neg_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2NegLane0HighModule,
+    },
+    .{
+        .name = "simd_f64x2_sqrt_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2SqrtLane0HighModule,
+    },
+    .{
         .name = "simd_f32x4_ceil_lane0",
         .simd = true,
         .build = buildSimdF32x4CeilLane0Module,
@@ -2013,6 +2028,32 @@ fn buildSimdF32x4NegLane0Module(allocator: Allocator) ![]u8 {
 
 fn buildSimdF32x4SqrtLane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4UnLane0Module(allocator, 0xE3);
+}
+
+fn buildSimdF64x2UnLane0HighModule(allocator: Allocator, simd_opcode: u32, lanes: [2]u64) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstI64x2(&instr, allocator, lanes);
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI64x2ExtractLane(&instr, allocator, 0);
+    try appendI64Const(&instr, allocator, 32);
+    try appendI64ShrU(&instr, allocator);
+    try appendI32WrapI64(&instr, allocator);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdF64x2AbsLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2UnLane0HighModule(allocator, 0xEC, .{ 0xc010_0000_0000_0000, 0x4000_0000_0000_0000 });
+}
+
+fn buildSimdF64x2NegLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2UnLane0HighModule(allocator, 0xED, .{ 0x4010_0000_0000_0000, 0x4000_0000_0000_0000 });
+}
+
+fn buildSimdF64x2SqrtLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2UnLane0HighModule(allocator, 0xEF, .{ 0x4010_0000_0000_0000, 0x4000_0000_0000_0000 });
 }
 
 fn buildSimdF32x4RoundLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {

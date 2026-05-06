@@ -554,6 +554,33 @@ fn expectF64x2ConvertLowLane0High(opcode: u32, lanes: [4]i32, expected_high_bits
     try expectSimdDiffI32(wasm, "f", expected_high_bits);
 }
 
+fn expectF64x2UnLanePart(opcode: u32, lanes: [2]u64, lane: u8, shift: u6, expected: i32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI64x2(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI64x2ExtractLane(&body, testing.allocator, lane);
+    if (shift != 0) {
+        try appendI64Const(&body, testing.allocator, shift);
+        try appendI64ShrU(&body, testing.allocator);
+    }
+    try appendI32WrapI64(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", expected);
+}
+
+fn expectF64x2UnLaneLow(opcode: u32, lanes: [2]u64, lane: u8, expected: i32) !void {
+    try expectF64x2UnLanePart(opcode, lanes, lane, 0, expected);
+}
+
+fn expectF64x2UnLaneHigh(opcode: u32, lanes: [2]u64, lane: u8, expected: i32) !void {
+    try expectF64x2UnLanePart(opcode, lanes, lane, 32, expected);
+}
+
 test "differential SIMD: f32x4.convert_i32x4_s lane 0 matches interpreter" {
     try expectF32x4ConvertLane0(
         0xFA,
@@ -1466,6 +1493,147 @@ test "differential SIMD: f64x2.promote_low_f32x4 inf NaN and subnormal" {
     );
     try expectF64x2PromoteLaneHighMatchesInterp(
         .{ 0x7fc0_0001, 0x3f80_0000, 0xff80_0000, 0x0000_0001 },
+        0,
+    );
+}
+
+test "differential SIMD: f64x2 unary normal lanes match interpreter" {
+    try expectF64x2UnLaneHigh(
+        0xEC,
+        .{ 0xc00c_0000_0000_0000, 0x4000_0000_0000_0000 },
+        0,
+        0x400c_0000,
+    );
+    try expectF64x2UnLaneHigh(
+        0xED,
+        .{ 0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000 },
+        1,
+        @bitCast(@as(u32, 0xc000_0000)),
+    );
+    try expectF64x2UnLaneHigh(
+        0xEF,
+        .{ 0x4010_0000_0000_0000, 0x3ff0_0000_0000_0000 },
+        0,
+        0x4000_0000,
+    );
+}
+
+test "differential SIMD: f64x2 unary signed zero infinity and subnormal edges match interpreter" {
+    try expectF64x2UnLaneHigh(
+        0xEC,
+        .{ 0x8000_0000_0000_0000, 0xfff0_0000_0000_0000 },
+        0,
+        0,
+    );
+    try expectF64x2UnLaneHigh(
+        0xEC,
+        .{ 0x8000_0000_0000_0000, 0xfff0_0000_0000_0000 },
+        1,
+        0x7ff0_0000,
+    );
+    try expectF64x2UnLaneLow(
+        0xEC,
+        .{ 0x8000_0000_0000_0001, 0x3ff0_0000_0000_0000 },
+        0,
+        1,
+    );
+    try expectF64x2UnLaneHigh(
+        0xED,
+        .{ 0x0000_0000_0000_0000, 0x7ff0_0000_0000_0000 },
+        0,
+        @bitCast(@as(u32, 0x8000_0000)),
+    );
+    try expectF64x2UnLaneHigh(
+        0xED,
+        .{ 0x0000_0000_0000_0000, 0x7ff0_0000_0000_0000 },
+        1,
+        @bitCast(@as(u32, 0xfff0_0000)),
+    );
+    try expectF64x2UnLaneHigh(
+        0xED,
+        .{ 0x0000_0000_0000_0001, 0x3ff0_0000_0000_0000 },
+        0,
+        @bitCast(@as(u32, 0x8000_0000)),
+    );
+    try expectF64x2UnLaneLow(
+        0xED,
+        .{ 0x0000_0000_0000_0001, 0x3ff0_0000_0000_0000 },
+        0,
+        1,
+    );
+    try expectF64x2UnLaneHigh(
+        0xEF,
+        .{ 0x8000_0000_0000_0000, 0x7ff0_0000_0000_0000 },
+        0,
+        @bitCast(@as(u32, 0x8000_0000)),
+    );
+    try expectF64x2UnLaneHigh(
+        0xEF,
+        .{ 0x8000_0000_0000_0000, 0x7ff0_0000_0000_0000 },
+        1,
+        0x7ff0_0000,
+    );
+    try expectF64x2UnLaneHigh(
+        0xEF,
+        .{ 0x0000_0000_0000_0001, 0x3ff0_0000_0000_0000 },
+        0,
+        0x1e60_0000,
+    );
+    try expectF64x2UnLaneLow(
+        0xEF,
+        .{ 0x0000_0000_0000_0001, 0x3ff0_0000_0000_0000 },
+        0,
+        0,
+    );
+}
+
+test "differential SIMD: f64x2 unary NaN behavior matches interpreter" {
+    try expectF64x2UnLaneHigh(
+        0xEC,
+        .{ 0xfff8_0000_0000_1234, 0x3ff0_0000_0000_0000 },
+        0,
+        0x7ff8_0000,
+    );
+    try expectF64x2UnLaneLow(
+        0xEC,
+        .{ 0xfff8_0000_0000_1234, 0x3ff0_0000_0000_0000 },
+        0,
+        0x1234,
+    );
+    try expectF64x2UnLaneHigh(
+        0xED,
+        .{ 0x7ff8_0000_0000_1234, 0x3ff0_0000_0000_0000 },
+        0,
+        @bitCast(@as(u32, 0xfff8_0000)),
+    );
+    try expectF64x2UnLaneLow(
+        0xED,
+        .{ 0x7ff8_0000_0000_1234, 0x3ff0_0000_0000_0000 },
+        0,
+        0x1234,
+    );
+    try expectF64x2UnLaneHigh(
+        0xEF,
+        .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
+        0,
+        0x7ff8_0000,
+    );
+    try expectF64x2UnLaneLow(
+        0xEF,
+        .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
+        0,
+        0,
+    );
+    try expectF64x2UnLaneHigh(
+        0xEF,
+        .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
+        1,
+        0x7ff8_0000,
+    );
+    try expectF64x2UnLaneLow(
+        0xEF,
+        .{ 0x7ff8_0000_0000_1234, 0xc010_0000_0000_0000 },
+        1,
         0,
     );
 }

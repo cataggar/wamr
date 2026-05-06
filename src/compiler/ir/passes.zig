@@ -216,6 +216,7 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
             list.append(bin.lhs);
             list.append(bin.rhs);
         },
+        .f64x2_unop => |un| list.append(un.vector),
         .f64x2_convert_low_i32x4 => |op| list.append(op.vector),
         .f64x2_promote_low_f32x4 => |op| list.append(op.vector),
         .i64x2_unop => |un| list.append(un.vector),
@@ -598,6 +599,9 @@ fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .f64x2_binop => |*bin| {
             if (bin.lhs == old) bin.lhs = new;
             if (bin.rhs == old) bin.rhs = new;
+        },
+        .f64x2_unop => |*un| if (un.vector == old) {
+            un.vector = new;
         },
         .f64x2_convert_low_i32x4 => |*op| if (op.vector == old) {
             op.vector = new;
@@ -1963,6 +1967,7 @@ fn isPure(inst: ir.Inst) bool {
         .i16x8_replace_lane,
         .i64x2_binop,
         .f64x2_binop,
+        .f64x2_unop,
         .f64x2_convert_low_i32x4,
         .f64x2_promote_low_f32x4,
         .i64x2_unop,
@@ -2104,6 +2109,7 @@ fn sameOp(a: ir.Inst, b: ir.Inst) bool {
         .f32x4_unop => |un| un.op == b.op.f32x4_unop.op and un.vector == b.op.f32x4_unop.vector,
         .f32x4_binop => |bin| bin.op == b.op.f32x4_binop.op and bin.lhs == b.op.f32x4_binop.lhs and bin.rhs == b.op.f32x4_binop.rhs,
         .f64x2_binop => |bin| bin.op == b.op.f64x2_binop.op and bin.lhs == b.op.f64x2_binop.lhs and bin.rhs == b.op.f64x2_binop.rhs,
+        .f64x2_unop => |un| un.op == b.op.f64x2_unop.op and un.vector == b.op.f64x2_unop.vector,
         .f64x2_convert_low_i32x4 => |op| op.sign == b.op.f64x2_convert_low_i32x4.sign and op.vector == b.op.f64x2_convert_low_i32x4.vector,
         .f64x2_promote_low_f32x4 => |op| op.vector == b.op.f64x2_promote_low_f32x4.vector,
         .i64x2_unop => |un| un.op == b.op.i64x2_unop.op and un.vector == b.op.i64x2_unop.vector,
@@ -3763,6 +3769,7 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
             bin.lhs += offset;
             bin.rhs += offset;
         },
+        .f64x2_unop => |*un| un.vector += offset,
         .f64x2_convert_low_i32x4 => |*op| op.vector += offset,
         .f64x2_promote_low_f32x4 => |*op| op.vector += offset,
         .i64x2_unop => |*un| un.vector += offset,

@@ -124,6 +124,7 @@ pub const Inst = struct {
         i64x2_splat: VReg,
         i64x2_extract_lane: I64x2ExtractLane,
         i64x2_replace_lane: I64x2ReplaceLane,
+        f64x2_unop: F64x2UnOp,
         f64x2_binop: F64x2BinOp,
         f64x2_convert_low_i32x4: SimdIntToFloatConvert,
         f64x2_promote_low_f32x4: SimdFloatPrecisionConvert,
@@ -460,6 +461,12 @@ pub const Inst = struct {
         nearest,
     };
 
+    pub const F64x2UnaryOp = enum {
+        abs,
+        neg,
+        sqrt,
+    };
+
     pub const V128Mem = struct {
         base: VReg,
         offset: u32,
@@ -721,6 +728,11 @@ pub const Inst = struct {
 
     pub const F32x4UnOp = struct {
         op: F32x4UnaryOp,
+        vector: VReg,
+    };
+
+    pub const F64x2UnOp = struct {
+        op: F64x2UnaryOp,
         vector: VReg,
     };
 
@@ -1402,6 +1414,14 @@ test "Inst: first v128 op family preserves operand shape" {
     };
     try std.testing.expectEqual(Inst.I64x2Op.gt_s, i64_bin.op.i64x2_binop.op);
     try std.testing.expectEqual(@as(VReg, 23), i64_bin.op.i64x2_binop.lhs);
+
+    const f64_un = Inst{
+        .op = .{ .f64x2_unop = .{ .op = .sqrt, .vector = 24 } },
+        .dest = 26,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(Inst.F64x2UnaryOp.sqrt, f64_un.op.f64x2_unop.op);
+    try std.testing.expectEqual(@as(VReg, 24), f64_un.op.f64x2_unop.vector);
 
     const f64_bin = Inst{
         .op = .{ .f64x2_binop = .{ .op = .div, .lhs = 24, .rhs = 25 } },
