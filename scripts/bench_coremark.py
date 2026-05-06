@@ -68,9 +68,23 @@ def make_worktree(repo: Path, ref: str, root: Path) -> Path:
     return wt
 
 
+def worktree_env(wt: Path) -> dict:
+    """Return an environment that keeps Zig local caches isolated per worktree."""
+    env = os.environ.copy()
+    inherited_local = env.pop("ZIG_LOCAL_CACHE_DIR", None)
+    # Some self-hosted runners set both Zig caches to the checkout's .zig-cache.
+    # That is unsafe for this script because it builds multiple git worktrees in
+    # sequence; the target ref can otherwise reuse baseline build artifacts.
+    if inherited_local and env.get("ZIG_GLOBAL_CACHE_DIR") == inherited_local:
+        global_cache = wt.parent / "zig-global-cache"
+        global_cache.mkdir(exist_ok=True)
+        env["ZIG_GLOBAL_CACHE_DIR"] = str(global_cache)
+    return env
+
+
 def build_and_run(wt: Path, runs: int, coremark_src: Path) -> list[float]:
     """Build wamr + AOT-compile + run CoreMark `runs` times, return iter/s list."""
-    env = os.environ.copy()
+    env = worktree_env(wt)
     # Each worktree owns its own .zig-cache (already on /work for our runner).
     print(f"[harness] building {wt.name} (ReleaseFast)", file=sys.stderr)
     run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=wt, env=env)
