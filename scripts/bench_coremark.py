@@ -68,9 +68,23 @@ def make_worktree(repo: Path, ref: str, root: Path) -> Path:
     return wt
 
 
+def worktree_env(wt: Path) -> dict:
+    """Return an environment that keeps Zig caches isolated per worktree."""
+    env = os.environ.copy()
+    # setup-zig exports both cache dirs to the checkout's .zig-cache. That is
+    # unsafe for this script because it builds multiple git worktrees in
+    # sequence; the target ref can otherwise reuse baseline build artifacts.
+    # Keep each ref's local and global Zig caches independent.
+    env.pop("ZIG_LOCAL_CACHE_DIR", None)
+    global_cache = wt / ".zig-global-cache"
+    global_cache.mkdir(exist_ok=True)
+    env["ZIG_GLOBAL_CACHE_DIR"] = str(global_cache)
+    return env
+
+
 def build_and_run(wt: Path, runs: int, coremark_src: Path) -> list[float]:
     """Build wamr + AOT-compile + run CoreMark `runs` times, return iter/s list."""
-    env = os.environ.copy()
+    env = worktree_env(wt)
     # Each worktree owns its own .zig-cache (already on /work for our runner).
     print(f"[harness] building {wt.name} (ReleaseFast)", file=sys.stderr)
     run(["zig", "build", "-Doptimize=ReleaseFast"], cwd=wt, env=env)
@@ -104,6 +118,10 @@ def fmt_stats(values: list[float]) -> tuple[float, float, float]:
     return statistics.fmean(values), min(values), max(values)
 
 
+def compute_delta_pct(baseline_vals: list[float], target_vals: list[float]) -> float:
+    return (statistics.fmean(target_vals) / statistics.fmean(baseline_vals) - 1.0) * 100.0
+
+
 def render_table(
     baseline_ref: str,
     baseline_vals: list[float],
@@ -112,7 +130,7 @@ def render_table(
 ) -> str:
     bm, bmin, bmax = fmt_stats(baseline_vals)
     tm, tmin, tmax = fmt_stats(target_vals)
-    delta_pct = (tm / bm - 1.0) * 100.0
+    delta_pct = compute_delta_pct(baseline_vals, target_vals)
     sign = "+" if delta_pct >= 0 else ""
     lines = [
         "### CoreMark AOT comparison",
@@ -149,6 +167,12 @@ def main() -> int:
         default="markdown",
         help="`github` also appends to $GITHUB_STEP_SUMMARY when present",
     )
+    p.add_argument(
+        "--min-delta-pct",
+        type=float,
+        default=None,
+        help="fail if target mean is below baseline by more than this percent delta",
+    )
     args = p.parse_args()
 
     repo = args.repo
@@ -178,6 +202,16 @@ def main() -> int:
         if summary:
             with open(summary, "a") as fh:
                 fh.write(table + "\n")
+
+    if args.min_delta_pct is not None:
+        delta_pct = compute_delta_pct(baseline_vals, target_vals)
+        if delta_pct < args.min_delta_pct:
+            print(
+                f"CoreMark AOT regression: {delta_pct:.2f}% is below "
+                f"allowed minimum {args.min_delta_pct:.2f}%",
+                file=sys.stderr,
+            )
+            return 1
 
     return 0
 

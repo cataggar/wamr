@@ -4786,7 +4786,10 @@ pub const default_passes: []const PassFn = &.{
     &strengthReduceDivRem,
     &foldConstantBranches,
     &foldInverseCompareEqz,
-    &foldBranchOnEqz,
+    // `foldBranchOnEqz` is semantically valid, but on AArch64 it flips hot
+    // CoreMark loop branches into the taken conditional path and regresses AOT
+    // throughput heavily. Keep the pass available for future target-aware use,
+    // but do not enable it in the target-independent default pipeline.
     &threadChainedConditionalBranches,
     &foldSelectOnEqz,
     &foldSignExtendingLoad,
@@ -7361,6 +7364,12 @@ test "foldBranchOnEqz: pipeline drops dead eqz after DCE" {
     // eqz should be gone; only the br_if remains.
     try std.testing.expectEqual(@as(usize, 1), func.getBlock(b0).instructions.items.len);
     try std.testing.expect(func.getBlock(b0).instructions.items[0].op == .br_if);
+}
+
+test "default pipeline excludes foldBranchOnEqz until branch layout is target-aware" {
+    for (default_passes) |pass| {
+        try std.testing.expect(pass != &foldBranchOnEqz);
+    }
 }
 
 test "threadChainedConditionalBranches: true edge jumps to inner true target" {

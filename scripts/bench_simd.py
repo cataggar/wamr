@@ -68,6 +68,20 @@ def make_worktree(repo: Path, ref: str, root: Path, label: str) -> Path:
     return wt
 
 
+def worktree_env(wt: Path) -> dict:
+    """Return an environment that keeps Zig caches isolated per worktree."""
+    env = os.environ.copy()
+    # setup-zig exports both cache dirs to the checkout's .zig-cache. This
+    # script builds two temporary worktrees; sharing cache state can let the
+    # target ref reuse baseline artifacts. Keep each ref's local and global Zig
+    # caches independent.
+    env.pop("ZIG_LOCAL_CACHE_DIR", None)
+    global_cache = wt / ".zig-global-cache"
+    global_cache.mkdir(exist_ok=True)
+    env["ZIG_GLOBAL_CACHE_DIR"] = str(global_cache)
+    return env
+
+
 def overlay_harness(source_repo: Path, wt: Path) -> None:
     for rel in HARNESS_OVERLAY:
         src = source_repo / rel
@@ -118,7 +132,7 @@ def build_and_run(
     wasmtime_path: str,
     wasmtime_iterations: int | None,
 ) -> list[Measurement]:
-    env = os.environ.copy()
+    env = worktree_env(wt)
     overlay_harness(source_repo, wt)
 
     print(f"[harness] building {wt.name} (ReleaseFast)", file=sys.stderr)
