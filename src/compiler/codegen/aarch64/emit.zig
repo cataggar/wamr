@@ -1104,9 +1104,13 @@ pub const CodeBuffer = struct {
         abs = 0x4EA0F800,
         neg = 0x6EA0F800,
         sqrt = 0x6EA1F800,
+        frintn = 0x4E218800,
+        frintp = 0x4EA18800,
+        frintm = 0x4E219800,
+        frintz = 0x4EA19800,
     };
 
-    /// Floating-point 4S unary vector op: FABS/FNEG/FSQRT.
+    /// Floating-point 4S unary vector op: FABS/FNEG/FSQRT/FRINT*.
     pub fn f32x4UnOp(self: *CodeBuffer, op: F32x4UnaryOp, vd: u5, vn: u5) !void {
         try self.emit32(@intFromEnum(op) |
             (@as(u32, vn) << 5) |
@@ -1126,6 +1130,37 @@ pub const CodeBuffer = struct {
     /// FSQRT Vd.4S, Vn.4S.
     pub fn fsqrt4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
         return self.f32x4UnOp(.sqrt, vd, vn);
+    }
+
+    /// FRINTN/P/M/Z Vd.4S, Vn.4S — round each f32 lane to integral.
+    pub fn frint4s(self: *CodeBuffer, mode: FRoundMode, vd: u5, vn: u5) !void {
+        const op: F32x4UnaryOp = switch (mode) {
+            .nearest => .frintn,
+            .ceil => .frintp,
+            .floor => .frintm,
+            .trunc => .frintz,
+        };
+        return self.f32x4UnOp(op, vd, vn);
+    }
+
+    /// FRINTP Vd.4S, Vn.4S.
+    pub fn frintp4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint4s(.ceil, vd, vn);
+    }
+
+    /// FRINTM Vd.4S, Vn.4S.
+    pub fn frintm4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint4s(.floor, vd, vn);
+    }
+
+    /// FRINTZ Vd.4S, Vn.4S.
+    pub fn frintz4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint4s(.trunc, vd, vn);
+    }
+
+    /// FRINTN Vd.4S, Vn.4S.
+    pub fn frintn4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint4s(.nearest, vd, vn);
     }
 
     /// FCMEQ Vd.4S, Vn.4S, Vm.4S — floating-point compare equal per lane.
@@ -3180,6 +3215,30 @@ test "emit: f32x4 vector unary ops" {
         defer code.deinit();
         try code.fsqrt4s(16, 17);
         try expectWord(0x6EA1FA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintp4s(16, 17);
+        try expectWord(0x4EA18A30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintm4s(16, 17);
+        try expectWord(0x4E219A30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintz4s(16, 17);
+        try expectWord(0x4EA19A30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintn4s(16, 17);
+        try expectWord(0x4E218A30, &code);
     }
 }
 

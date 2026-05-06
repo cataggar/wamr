@@ -446,6 +446,10 @@ pub const Inst = struct {
         abs,
         neg,
         sqrt,
+        ceil,
+        floor,
+        trunc,
+        nearest,
     };
 
     pub const V128Mem = struct {

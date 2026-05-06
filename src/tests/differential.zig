@@ -685,6 +685,112 @@ test "differential SIMD: f32x4 unary NaN behavior matches interpreter" {
     );
 }
 
+test "differential SIMD: f32x4 rounding fractions match interpreter" {
+    try expectF32x4UnLaneBits(
+        0x67,
+        .{ 0x3fa0_0000, 0xbfa0_0000, 0x3fe0_0000, 0xbfe0_0000 },
+        0,
+        0x4000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x67,
+        .{ 0x3fa0_0000, 0xbfa0_0000, 0x3fe0_0000, 0xbfe0_0000 },
+        1,
+        0xbf80_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x68,
+        .{ 0x3fa0_0000, 0xbfa0_0000, 0x3fe0_0000, 0xbfe0_0000 },
+        0,
+        0x3f80_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x68,
+        .{ 0x3fa0_0000, 0xbfa0_0000, 0x3fe0_0000, 0xbfe0_0000 },
+        1,
+        0xc000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x69,
+        .{ 0x3fe0_0000, 0xbfe0_0000, 0x3fa0_0000, 0xbfa0_0000 },
+        0,
+        0x3f80_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x69,
+        .{ 0x3fe0_0000, 0xbfe0_0000, 0x3fa0_0000, 0xbfa0_0000 },
+        1,
+        0xbf80_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x6A,
+        .{ 0x3fe0_0000, 0xbfe0_0000, 0x3fa0_0000, 0xbfa0_0000 },
+        0,
+        0x4000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x6A,
+        .{ 0x3fe0_0000, 0xbfe0_0000, 0x3fa0_0000, 0xbfa0_0000 },
+        1,
+        0xc000_0000,
+    );
+}
+
+test "differential SIMD: f32x4 nearest ties to even matches interpreter" {
+    const ties = [_]u32{ 0x4020_0000, 0x4060_0000, 0xc020_0000, 0xc060_0000 };
+    try expectF32x4UnLaneBits(0x6A, ties, 0, 0x4000_0000);
+    try expectF32x4UnLaneBits(0x6A, ties, 1, 0x4080_0000);
+    try expectF32x4UnLaneBits(0x6A, ties, 2, 0xc000_0000);
+    try expectF32x4UnLaneBits(0x6A, ties, 3, 0xc080_0000);
+}
+
+test "differential SIMD: f32x4 rounding signed zeros and infinities match interpreter" {
+    try expectF32x4UnLaneBits(
+        0x67,
+        .{ 0xbe80_0000, 0x3e80_0000, 0x7f80_0000, 0xff80_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x68,
+        .{ 0xbe80_0000, 0x3e80_0000, 0x7f80_0000, 0xff80_0000 },
+        1,
+        0x0000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x69,
+        .{ 0xbe80_0000, 0x3e80_0000, 0x7f80_0000, 0xff80_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x6A,
+        .{ 0xbe80_0000, 0x3e80_0000, 0x7f80_0000, 0xff80_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x67,
+        .{ 0x7f80_0000, 0xff80_0000, 0x0000_0001, 0x8000_0001 },
+        0,
+        0x7f80_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0x68,
+        .{ 0x7f80_0000, 0xff80_0000, 0x0000_0001, 0x8000_0001 },
+        1,
+        0xff80_0000,
+    );
+}
+
+test "differential SIMD: f32x4 rounding NaN behavior matches interpreter" {
+    const lanes = [_]u32{ 0x7fc1_2345, 0xffc1_2345, 0x3f80_0000, 0x4000_0000 };
+    try expectF32x4UnLaneBits(0x67, lanes, 0, 0x7fc0_0000);
+    try expectF32x4UnLaneBits(0x68, lanes, 1, 0x7fc0_0000);
+    try expectF32x4UnLaneBits(0x69, lanes, 0, 0x7fc0_0000);
+    try expectF32x4UnLaneBits(0x6A, lanes, 1, 0x7fc0_0000);
+}
+
 test "differential SIMD: f32x4 arithmetic normal lanes match interpreter" {
     try expectF32x4BinLaneBits(
         0xE4,

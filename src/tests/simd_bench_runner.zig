@@ -344,6 +344,26 @@ const cases = [_]BenchCase{
         .build = buildSimdF32x4SqrtLane0Module,
     },
     .{
+        .name = "simd_f32x4_ceil_lane0",
+        .simd = true,
+        .build = buildSimdF32x4CeilLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_floor_lane0",
+        .simd = true,
+        .build = buildSimdF32x4FloorLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_trunc_lane0",
+        .simd = true,
+        .build = buildSimdF32x4TruncLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_nearest_lane0",
+        .simd = true,
+        .build = buildSimdF32x4NearestLane0Module,
+    },
+    .{
         .name = "simd_f32x4_eq_lane0",
         .simd = true,
         .build = buildSimdF32x4EqLane0Module,
@@ -1888,6 +1908,7 @@ fn buildSimdF32x4ReplaceLane2Module(allocator: Allocator) ![]u8 {
 const f32x4_arith_lhs_bits: [4]u32 = .{ 0x4140_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 };
 const f32x4_arith_rhs_bits: [4]u32 = .{ 0x4080_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 };
 const f32x4_unary_bits: [4]u32 = .{ 0x4110_0000, 0x4000_0000, 0x4080_0000, 0x40c0_0000 };
+const f32x4_rounding_bits: [4]u32 = .{ 0x3fe0_0000, 0xbfa0_0000, 0x4020_0000, 0xc060_0000 };
 
 fn buildSimdF32x4UnLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
     var instr: std.ArrayList(u8) = .empty;
@@ -1910,6 +1931,33 @@ fn buildSimdF32x4NegLane0Module(allocator: Allocator) ![]u8 {
 
 fn buildSimdF32x4SqrtLane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4UnLane0Module(allocator, 0xE3);
+}
+
+fn buildSimdF32x4RoundLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstF32x4Bits(&instr, allocator, f32x4_rounding_bits);
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdF32x4CeilLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4RoundLane0Module(allocator, 0x67);
+}
+
+fn buildSimdF32x4FloorLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4RoundLane0Module(allocator, 0x68);
+}
+
+fn buildSimdF32x4TruncLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4RoundLane0Module(allocator, 0x69);
+}
+
+fn buildSimdF32x4NearestLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4RoundLane0Module(allocator, 0x6A);
 }
 
 fn buildSimdF32x4BinLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
