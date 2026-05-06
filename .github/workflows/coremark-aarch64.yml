@@ -70,6 +70,7 @@ jobs:
 
       - name: Run CoreMark comparison
         id: bench
+        continue-on-error: true
         env:
           BASELINE: ${{ steps.refs.outputs.baseline }}
           TARGET: ${{ steps.refs.outputs.target }}
@@ -79,22 +80,29 @@ jobs:
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --runs     "$RUNS" \
+            --min-delta-pct=-5.0 \
             --out      coremark-table.md \
             --emit     github
 
       - name: Upload table
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coremark-aarch64-${{ github.sha }}
           path: coremark-table.md
+          if-no-files-found: ignore
           retention-days: 90
 
       - name: Comment on PR
-        if: github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
             const fs = require('fs');
+            if (!fs.existsSync('coremark-table.md')) {
+              core.warning('coremark-table.md was not produced');
+              return;
+            }
             const body = fs.readFileSync('coremark-table.md', 'utf8');
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -102,3 +110,7 @@ jobs:
               repo: context.repo.repo,
               body,
             });
+
+      - name: Fail on CoreMark regression
+        if: steps.bench.outcome == 'failure'
+        run: exit 1

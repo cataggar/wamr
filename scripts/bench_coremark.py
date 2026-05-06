@@ -104,6 +104,10 @@ def fmt_stats(values: list[float]) -> tuple[float, float, float]:
     return statistics.fmean(values), min(values), max(values)
 
 
+def compute_delta_pct(baseline_vals: list[float], target_vals: list[float]) -> float:
+    return (statistics.fmean(target_vals) / statistics.fmean(baseline_vals) - 1.0) * 100.0
+
+
 def render_table(
     baseline_ref: str,
     baseline_vals: list[float],
@@ -112,7 +116,7 @@ def render_table(
 ) -> str:
     bm, bmin, bmax = fmt_stats(baseline_vals)
     tm, tmin, tmax = fmt_stats(target_vals)
-    delta_pct = (tm / bm - 1.0) * 100.0
+    delta_pct = compute_delta_pct(baseline_vals, target_vals)
     sign = "+" if delta_pct >= 0 else ""
     lines = [
         "### CoreMark AOT comparison",
@@ -149,6 +153,12 @@ def main() -> int:
         default="markdown",
         help="`github` also appends to $GITHUB_STEP_SUMMARY when present",
     )
+    p.add_argument(
+        "--min-delta-pct",
+        type=float,
+        default=None,
+        help="fail if target mean is below baseline by more than this percent delta",
+    )
     args = p.parse_args()
 
     repo = args.repo
@@ -178,6 +188,16 @@ def main() -> int:
         if summary:
             with open(summary, "a") as fh:
                 fh.write(table + "\n")
+
+    if args.min_delta_pct is not None:
+        delta_pct = compute_delta_pct(baseline_vals, target_vals)
+        if delta_pct < args.min_delta_pct:
+            print(
+                f"CoreMark AOT regression: {delta_pct:.2f}% is below "
+                f"allowed minimum {args.min_delta_pct:.2f}%",
+                file=sys.stderr,
+            )
+            return 1
 
     return 0
 
