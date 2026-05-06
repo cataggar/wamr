@@ -832,6 +832,138 @@ test "differential SIMD: f32x4.pmin/pmax NaN comparisons select lhs" {
     );
 }
 
+test "differential SIMD: f32x4 comparisons normal zero and infinity lanes match interpreter" {
+    try expectF32x4BinLaneBits(
+        0x41,
+        .{ 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x3f80_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x42,
+        .{ 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x43,
+        .{ 0xbf80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x44,
+        .{ 0x4040_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x45,
+        .{ 0x4000_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x46,
+        .{ 0x4000_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x4000_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x41,
+        .{ 0x8000_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x0000_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x42,
+        .{ 0x8000_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x0000_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0,
+    );
+    try expectF32x4BinLaneBits(
+        0x43,
+        .{ 0xff80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x7f80_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x44,
+        .{ 0x7f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0xff80_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+}
+
+test "differential SIMD: f32x4 comparisons NaN lanes match interpreter" {
+    try expectF32x4BinLaneBits(
+        0x41,
+        .{ 0x7fc0_0001, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x7fc0_0001, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0,
+    );
+    try expectF32x4BinLaneBits(
+        0x42,
+        .{ 0x7fc0_0001, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x7fc0_0001, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x41,
+        .{ 0x7fc0_0001, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x3f80_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0,
+    );
+    try expectF32x4BinLaneBits(
+        0x42,
+        .{ 0x7fc0_0001, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x3f80_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0xffff_ffff,
+    );
+    try expectF32x4BinLaneBits(
+        0x43,
+        .{ 0x7fc0_0001, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x3f80_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0,
+    );
+    try expectF32x4BinLaneBits(
+        0x44,
+        .{ 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x7fc0_0001, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0,
+    );
+    try expectF32x4BinLaneBits(
+        0x45,
+        .{ 0x7fc0_0001, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x3f80_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0,
+    );
+    try expectF32x4BinLaneBits(
+        0x46,
+        .{ 0x3f80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        .{ 0x7fc0_0001, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 },
+        0,
+        0,
+    );
+}
+
 test "differential SIMD: f64x2.convert_low_i32x4_s lane 0 matches interpreter" {
     try expectF64x2ConvertLowLane0High(
         0xFE,

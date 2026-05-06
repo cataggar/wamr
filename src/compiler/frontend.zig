@@ -2593,6 +2593,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f32x4_max,
                     .f32x4_pmin,
                     .f32x4_pmax,
+                    .f32x4_eq,
+                    .f32x4_ne,
+                    .f32x4_lt,
+                    .f32x4_gt,
+                    .f32x4_le,
+                    .f32x4_ge,
                     => {
                         const rhs = safePop(&vreg_stack);
                         const lhs = safePop(&vreg_stack);
@@ -2606,6 +2612,12 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                             .f32x4_max => .max,
                             .f32x4_pmin => .pmin,
                             .f32x4_pmax => .pmax,
+                            .f32x4_eq => .eq,
+                            .f32x4_ne => .ne,
+                            .f32x4_lt => .lt,
+                            .f32x4_gt => .gt,
+                            .f32x4_le => .le,
+                            .f32x4_ge => .ge,
                             else => unreachable,
                         };
                         try ir_func.getBlock(current_block).append(.{
@@ -6329,7 +6341,7 @@ test "lower f64x2 arithmetic and comparison opcodes" {
     try std.testing.expect(insts[inst_idx + 2].op.ret != null);
 }
 
-test "lower f32x4 arithmetic/minmax and pseudo-minmax opcodes" {
+test "lower f32x4 arithmetic/minmax, pseudo-minmax, and comparison opcodes" {
     const allocator = std.testing.allocator;
 
     const func_type = types.FuncType{
@@ -6342,6 +6354,12 @@ test "lower f32x4 arithmetic/minmax and pseudo-minmax opcodes" {
         expected: ir.Inst.F32x4Op,
     };
     const cases = [_]Case{
+        .{ .opcode = 0x41, .expected = .eq },
+        .{ .opcode = 0x42, .expected = .ne },
+        .{ .opcode = 0x43, .expected = .lt },
+        .{ .opcode = 0x44, .expected = .gt },
+        .{ .opcode = 0x45, .expected = .le },
+        .{ .opcode = 0x46, .expected = .ge },
         .{ .opcode = 0xE4, .expected = .add },
         .{ .opcode = 0xE5, .expected = .sub },
         .{ .opcode = 0xE6, .expected = .mul },

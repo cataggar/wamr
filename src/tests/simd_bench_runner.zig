@@ -329,6 +329,36 @@ const cases = [_]BenchCase{
         .build = buildSimdF32x4SqrtLane0Module,
     },
     .{
+        .name = "simd_f32x4_eq_lane0",
+        .simd = true,
+        .build = buildSimdF32x4EqLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_ne_lane0",
+        .simd = true,
+        .build = buildSimdF32x4NeLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_lt_lane0",
+        .simd = true,
+        .build = buildSimdF32x4LtLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_gt_lane0",
+        .simd = true,
+        .build = buildSimdF32x4GtLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_le_lane0",
+        .simd = true,
+        .build = buildSimdF32x4LeLane0Module,
+    },
+    .{
+        .name = "simd_f32x4_ge_lane0",
+        .simd = true,
+        .build = buildSimdF32x4GeLane0Module,
+    },
+    .{
         .name = "simd_f32x4_add_lane0",
         .simd = true,
         .build = buildSimdF32x4AddLane0Module,
@@ -1766,6 +1796,42 @@ fn buildSimdF32x4ConvertI32x4SLane0Module(allocator: Allocator) ![]u8 {
 
 fn buildSimdF32x4ConvertI32x4ULane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4ConvertI32x4Lane0Module(allocator, 0xFB);
+}
+
+fn buildSimdF32x4CmpLane0Module(allocator: Allocator, simd_opcode: u32, lhs0: u32, rhs0: u32) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstF32x4Bits(&instr, allocator, .{ lhs0, 0x4000_0000, 0x4040_0000, 0x4080_0000 });
+    try appendV128ConstF32x4Bits(&instr, allocator, .{ rhs0, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 });
+    try appendSimdOpcode(&instr, allocator, simd_opcode);
+    try appendI32x4ExtractLane(&instr, allocator, 0);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdF32x4EqLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4CmpLane0Module(allocator, 0x41, 0x8000_0000, 0x0000_0000);
+}
+
+fn buildSimdF32x4NeLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4CmpLane0Module(allocator, 0x42, 0x3f80_0000, 0x4000_0000);
+}
+
+fn buildSimdF32x4LtLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4CmpLane0Module(allocator, 0x43, 0x3f80_0000, 0x4000_0000);
+}
+
+fn buildSimdF32x4GtLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4CmpLane0Module(allocator, 0x44, 0x4000_0000, 0x3f80_0000);
+}
+
+fn buildSimdF32x4LeLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4CmpLane0Module(allocator, 0x45, 0x3f80_0000, 0x3f80_0000);
+}
+
+fn buildSimdF32x4GeLane0Module(allocator: Allocator) ![]u8 {
+    return buildSimdF32x4CmpLane0Module(allocator, 0x46, 0x3f80_0000, 0x3f80_0000);
 }
 
 const f32x4_arith_lhs_bits: [4]u32 = .{ 0x4140_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 };
