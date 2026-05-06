@@ -120,26 +120,23 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     // Build local type table (params first, then declared locals). Used to
     // give each `.local_get` IR instruction the correct type so codegen and
     // analysis never confuse v128 with a scalar i64 slot.
-    var local_types = try allocator.alloc(ir.IrType, total_locals);
-    errdefer allocator.free(local_types);
+    var local_types: std.ArrayList(ir.IrType) = .empty;
+    errdefer local_types.deinit(allocator);
+    try local_types.ensureTotalCapacity(allocator, total_locals);
     {
-        var i: u32 = 0;
         for (func_type.params) |pt| {
-            local_types[i] = valTypeToIr(pt);
-            i += 1;
+            local_types.appendAssumeCapacity(valTypeToIr(pt));
         }
         for (func.locals) |decl| {
             const ir_t = valTypeToIr(decl.val_type);
             var n: u32 = 0;
             while (n < decl.count) : (n += 1) {
-                local_types[i] = ir_t;
-                i += 1;
+                local_types.appendAssumeCapacity(ir_t);
             }
         }
     }
 
     var ir_func = ir.IrFunction.init(allocator, param_count, result_count, total_locals);
-    ir_func.local_types = local_types;
     errdefer ir_func.deinit();
 
     // Per-function arena for block-frame slices (param/result type tables and
@@ -263,15 +260,20 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
     const allocLocals = struct {
         fn call(
             fa: std.mem.Allocator,
+            a: std.mem.Allocator,
+            local_types_ref: *std.ArrayList(ir.IrType),
             total: *u32,
             func_ref: *ir.IrFunction,
-            count: usize,
+            slot_types: []const ir.IrType,
         ) ![]u32 {
+            const count = slot_types.len;
             if (count == 0) return &[_]u32{};
             const slots = try fa.alloc(u32, count);
-            for (slots) |*s| {
+            try local_types_ref.ensureUnusedCapacity(a, count);
+            for (slots, 0..) |*s, i| {
                 s.* = total.*;
                 total.* += 1;
+                local_types_ref.appendAssumeCapacity(slot_types[i]);
             }
             func_ref.local_count = total.*;
             return slots;
@@ -429,8 +431,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const bt = readBlockType(code, &ip, module_sigs);
                 const n_params: usize = bt.params.len;
                 const end_block = try ir_func.newBlock();
-                const param_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, n_params);
-                const result_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, bt.results.len);
+                const param_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.params);
+                const result_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.results);
                 // Pop params off the operand stack (top-last), store to
                 // param_locals[i] (params[0] deepest).
                 if (n_params > 0 and vreg_stack.items.len >= n_params) {
@@ -466,8 +468,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const n_params: usize = bt.params.len;
                 const loop_header = try ir_func.newBlock();
                 const end_block = try ir_func.newBlock();
-                const param_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, n_params);
-                const result_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, bt.results.len);
+                const param_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.params);
+                const result_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.results);
                 // Pop params off the current operand stack into param_locals,
                 // then branch into the loop header where params are re-loaded.
                 if (n_params > 0 and vreg_stack.items.len >= n_params) {
@@ -509,8 +511,8 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                 const then_block = try ir_func.newBlock();
                 const else_block = try ir_func.newBlock();
                 const end_block = try ir_func.newBlock();
-                const param_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, n_params);
-                const result_locals = try allocLocals(frame_alloc, &total_locals, &ir_func, bt.results.len);
+                const param_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.params);
+                const result_locals = try allocLocals(frame_alloc, allocator, &local_types, &total_locals, &ir_func, bt.results);
                 // Pop params (below cond on the stack) into param_locals.
                 if (n_params > 0 and vreg_stack.items.len >= n_params) {
                     var i: usize = n_params;
@@ -717,7 +719,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
             .local_get => {
                 const idx = readU32(code, &ip);
                 const dest = ir_func.newVReg();
-                const t: ir.IrType = if (idx < total_locals) local_types[idx] else .i32;
+                const t: ir.IrType = if (idx < total_locals) local_types.items[@intCast(idx)] else .i32;
                 try ir_func.getBlock(current_block).append(.{ .op = .{ .local_get = idx }, .dest = dest, .type = t });
                 try vreg_stack.append(allocator, dest);
             },
@@ -3520,6 +3522,7 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
         }
     }
 
+    ir_func.local_types = try local_types.toOwnedSlice(allocator);
     return ir_func;
 }
 
@@ -3836,6 +3839,53 @@ test "lower v128 local type is not treated as i64" {
     try std.testing.expectEqual(@as(u32, 0), insts[0].op.local_get);
     try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
     try std.testing.expect(insts[1].op.ret != null);
+}
+
+test "lower declared v128 local get and tee preserve v128 type" {
+    const allocator = std.testing.allocator;
+
+    const func_type = types.FuncType{
+        .params = &.{},
+        .results = &.{.i32},
+    };
+    const local_decl = types.LocalDecl{ .count = 1, .val_type = .v128 };
+    const func = types.WasmFunction{
+        .type_idx = 0,
+        .func_type = func_type,
+        .local_count = 1,
+        .locals = &.{local_decl},
+        .code = &[_]u8{
+            0xFD, 0x0C, // v128.const
+            0x11, 0x00,
+            0x00, 0x00,
+            0x22, 0x00,
+            0x00, 0x00,
+            0x33, 0x00,
+            0x00, 0x00,
+            0x44, 0x00,
+            0x00, 0x00,
+            0x22, 0x00, // local.tee 0
+            0xFD, 0x1B, 0x00, // i32x4.extract_lane 0
+            0x0B,
+        },
+    };
+    const wasm_module = types.WasmModule{
+        .types = &[_]types.FuncType{func_type},
+        .functions = &[_]types.WasmFunction{func},
+    };
+
+    var ir_module = try lowerModule(&wasm_module, allocator);
+    defer ir_module.deinit();
+
+    const ir_func = &ir_module.functions.items[0];
+    try std.testing.expect(ir_func.local_types != null);
+    try std.testing.expectEqual(ir.IrType.v128, ir_func.local_types.?[0]);
+
+    const insts = ir_func.blocks.items[0].instructions.items;
+    try std.testing.expectEqual(ir.IrType.v128, insts[0].type);
+    try std.testing.expectEqual(@as(u32, 0), insts[1].op.local_set.idx);
+    try std.testing.expectEqual(insts[0].dest.?, insts[1].op.local_set.val);
+    try std.testing.expectEqual(insts[0].dest.?, insts[2].op.i32x4_extract_lane.vector);
 }
 
 test "lower selected SIMD first-family opcodes" {

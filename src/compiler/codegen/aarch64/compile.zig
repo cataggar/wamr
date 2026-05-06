@@ -446,6 +446,11 @@ pub const CompileOptions = struct {
 const FuncCompileCtx = struct {
     import_count: u32 = 0,
     call_patches: ?*std.ArrayListUnmanaged(CallPatch) = null,
+    /// FP-relative byte offset for each wasm/synthetic local slot.
+    local_offsets: []const u32 = &.{},
+    /// Per-local type table, params first. Missing entries are treated as
+    /// scalar 8-byte slots for compatibility with hand-built IR tests.
+    local_types: []const ir.IrType = &.{},
     /// FP-relative byte offset of the call-save region where caller-save
     /// physregs (x0..x15) are spilled around BL instructions.
     call_save_base: u32 = 0,
@@ -551,6 +556,7 @@ pub fn compileFunctionWithOptions(
 
 fn isSupportedV128Def(inst: ir.Inst) bool {
     return switch (inst.op) {
+        .local_get,
         .v128_const,
         .v128_load,
         .v128_load_splat,
@@ -613,7 +619,8 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
 
 fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.local_types) |local_types| {
-        for (local_types) |ty| if (ty == .v128) return true;
+        const param_type_count: usize = @min(local_types.len, @as(usize, @intCast(func.param_count)));
+        for (local_types[0..param_type_count]) |ty| if (ty == .v128) return true;
     }
     var vreg_types = std.AutoHashMap(ir.VReg, ir.IrType).init(allocator);
     defer vreg_types.deinit();
@@ -690,7 +697,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 => {},
                 else => {},
             }
-            if (inst.type == .v128 and !isSupportedV128Def(inst)) return true;
+            if (inst.dest != null and inst.type == .v128 and !isSupportedV128Def(inst)) return true;
             if (inst.dest) |dest| try vreg_types.put(dest, inst.type);
         }
     }
@@ -704,7 +711,6 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .ret_multi => |vals| {
                     for (vals) |v| if ((vreg_types.get(v) orelse .void) == .v128) return true;
                 },
-                .local_set => |ls| if ((vreg_types.get(ls.val) orelse .void) == .v128) return true,
                 .global_set => |gs| if ((vreg_types.get(gs.val) orelse .void) == .v128) return true,
                 .select => |sel| {
                     if ((vreg_types.get(sel.if_true) orelse .void) == .v128 or
@@ -774,10 +780,14 @@ pub fn compileFunctionImpl(
     var code = emit.CodeBuffer.init(allocator);
     errdefer code.deinit();
 
-    // Frame size: (local_count + 3) × 8 for saved FP/LR + vmctx + locals,
-    // plus spill headroom (sized from IR vreg pressure, see below), plus
-    // 128 bytes for call-save (16 physregs × 8), plus 80 bytes for 10
-    // callee-saved regs (x19..x28), aligned to 16 (AArch64 SP alignment).
+    const local_layout = try computeLocalFrameLayout(func, allocator);
+    defer allocator.free(local_layout.offsets);
+
+    // Frame size: saved FP/LR + vmctx + typed local slots (v128 slots are
+    // 16-byte aligned and 16 bytes wide), plus spill headroom (sized from IR
+    // vreg pressure, see below), plus 128 bytes for call-save (16 physregs ×
+    // 8), plus 80 bytes for 10 callee-saved regs (x19..x28), aligned to 16
+    // (AArch64 SP alignment).
     //
     // Spill capacity used to be a fixed 256 bytes (32 slots) which was
     // enough for micro-benchmarks but overflowed on real workloads
@@ -785,7 +795,7 @@ pub fn compileFunctionImpl(
     // Size it conservatively from the number of IR vregs: every vreg
     // might need a slot, plus a 16-slot safety margin for pathological
     // interleavings. Slots are 8 bytes.
-    const spill_base: u32 = (func.local_count + 3) * 8;
+    const spill_base: u32 = local_layout.end;
 
     // Multi-result plumbing. Scan call sites for max `extra_results` and
     // reserve caller-side scratch (`scratch_base`) + HRP save slot
@@ -806,6 +816,8 @@ pub fn compileFunctionImpl(
     // alloc_result.spill_count instead of a conservative next_vreg+16
     // estimate, which shrinks frames and reduces I-cache pressure).
     var fctx = ctx;
+    fctx.local_offsets = local_layout.offsets;
+    fctx.local_types = func.local_types orelse &.{};
 
     var callee_save_sites: std.ArrayListUnmanaged([callee_saved_regs.len]usize) = .empty;
     defer callee_save_sites.deinit(allocator);
@@ -960,7 +972,7 @@ pub fn compileFunctionImpl(
 
     var alloc_result = try regalloc.allocateFromRanges(
         allocator,
-        aarch64RegSet(func.local_count),
+        aarch64RegSetForSpillBase(spill_base),
         clobbers.items,
         scalar_live_ranges.items,
     );
@@ -1094,7 +1106,7 @@ pub fn compileFunctionImpl(
     try emitCalleeSaveStoreTracked(&code, &fctx);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
-    try emitEntrySpill(&code, func.*, hrp_save_off);
+    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, hrp_save_off);
 
     var block_offsets = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_offsets);
@@ -1256,14 +1268,59 @@ fn computeLiveRangesScheduled(
 /// FP-relative slot offset (in bytes) for the VMContext pointer.
 const vmctx_slot_offset: u32 = 16;
 
-/// FP-relative slot offset (in bytes, unsigned, positive) for local `idx`.
-fn localSlotOffset(idx: u32) u32 {
-    return (idx + 3) * 8;
-}
-
 fn alignForwardU32(value: u32, alignment: u32) u32 {
     std.debug.assert(alignment != 0 and (alignment & (alignment - 1)) == 0);
     return (value + alignment - 1) & ~(alignment - 1);
+}
+
+const LocalFrameLayout = struct {
+    offsets: []u32,
+    end: u32,
+};
+
+fn localTypeAt(local_types: []const ir.IrType, idx: u32) ir.IrType {
+    const i: usize = @intCast(idx);
+    if (i < local_types.len) return local_types[i];
+    return .i64;
+}
+
+fn localSlotAlignment(ty: ir.IrType) u32 {
+    return switch (ty) {
+        .v128 => 16,
+        .void => 8,
+        else => 8,
+    };
+}
+
+fn localSlotSize(ty: ir.IrType) u32 {
+    return switch (ty) {
+        .v128 => 16,
+        .void => 0,
+        else => 8,
+    };
+}
+
+fn computeLocalFrameLayout(func: *const ir.IrFunction, allocator: std.mem.Allocator) !LocalFrameLayout {
+    const slot_count = @max(func.local_count, func.param_count);
+    const offsets = try allocator.alloc(u32, slot_count);
+    errdefer allocator.free(offsets);
+
+    const local_types = func.local_types orelse &.{};
+    var next: u32 = vmctx_slot_offset + 8;
+    for (offsets, 0..) |*slot, i| {
+        const ty = localTypeAt(local_types, @intCast(i));
+        next = alignForwardU32(next, localSlotAlignment(ty));
+        slot.* = next;
+        next += localSlotSize(ty);
+    }
+
+    return .{ .offsets = offsets, .end = next };
+}
+
+fn localFrameOffset(fctx: *const FuncCompileCtx, idx: u32) !u32 {
+    const i: usize = @intCast(idx);
+    if (i >= fctx.local_offsets.len) return error.InvalidLocalIndex;
+    return fctx.local_offsets[i];
 }
 
 /// ABI register holding wasm parameter `i` (0-based). Parameter 0 is in x1
@@ -1284,15 +1341,21 @@ fn paramAbiReg(i: u32) emit.Reg {
 /// Spill x0 (VMContext) and x1..x7 (wasm params) to their frame slots, and
 /// zero-initialize declared locals. Must be called right after emitPrologue
 /// and before any vreg allocation so we don't clobber these ABI regs.
-fn emitEntrySpill(code: *emit.CodeBuffer, func: ir.IrFunction, hrp_save_off: u32) !void {
+fn emitEntrySpill(
+    code: *emit.CodeBuffer,
+    func: ir.IrFunction,
+    local_offsets: []const u32,
+    local_types: []const ir.IrType,
+    hrp_save_off: u32,
+) !void {
     // VMContext → [fp + 16]
     try code.strImm(.x0, .fp, vmctx_slot_offset / 8);
 
-    // Wasm params → local slots [fp + (i+3)*8]
+    // Wasm params → their typed local slots.
     var i: u32 = 0;
     while (i < func.param_count) : (i += 1) {
-        const off_scaled: u12 = @intCast(localSlotOffset(i) / 8);
-        try code.strImm(paramAbiReg(i), .fp, off_scaled);
+        const offset = local_offsets[@intCast(i)];
+        try frameStore(code, paramAbiReg(i), offset);
     }
 
     // Multi-value returns: callee receives an HRP (host-result pointer)
@@ -1305,13 +1368,24 @@ fn emitEntrySpill(code: *emit.CodeBuffer, func: ir.IrFunction, hrp_save_off: u32
     }
 
     // Zero-init declared locals (wasm spec requires non-param locals to be 0).
-    // Use x16 (tmp0) as the zero source. Always 64-bit store to cover any type.
+    // Scalar/reference slots are 8-byte host slots; v128 slots are zeroed with
+    // a full 128-bit Q store.
     if (func.local_count > func.param_count) {
         try code.movz(RegMap.tmp0, 0, 0);
+        var zeroed_v128 = false;
         var j: u32 = func.param_count;
         while (j < func.local_count) : (j += 1) {
-            const off_scaled: u12 = @intCast(localSlotOffset(j) / 8);
-            try code.strImm(RegMap.tmp0, .fp, off_scaled);
+            const offset = local_offsets[@intCast(j)];
+            if (localTypeAt(local_types, j) == .v128) {
+                if (!zeroed_v128) {
+                    try code.movi2dZero(v128_tmp0);
+                    zeroed_v128 = true;
+                }
+                try frameAddr(code, RegMap.tmp1, offset);
+                try code.strQ(v128_tmp0, RegMap.tmp1);
+            } else {
+                try frameStore(code, RegMap.tmp0, offset);
+            }
         }
     }
 }
@@ -1325,9 +1399,10 @@ fn frameStore(code: *emit.CodeBuffer, src: emit.Reg, offset: u32) !void {
     if (offset % 8 == 0 and offset / 8 <= 4095) {
         try code.strImm(src, .fp, @intCast(offset / 8));
     } else {
-        try emitMovImm64(code, RegMap.tmp0, offset);
-        try code.addRegReg(RegMap.tmp0, RegMap.tmp0, .fp);
-        try code.strImm(src, RegMap.tmp0, 0);
+        const scratch = if (src == RegMap.tmp0) RegMap.tmp1 else RegMap.tmp0;
+        try emitMovImm64(code, scratch, offset);
+        try code.addRegReg(scratch, scratch, .fp);
+        try code.strImm(src, scratch, 0);
     }
 }
 
@@ -1793,17 +1868,29 @@ fn compileInst(
         // ── Locals (FP-relative frame slots) ─────────────────────────
         .local_get => |idx| {
             const dest = inst.dest orelse return;
-            const info = try destBegin(reg_map, dest, RegMap.tmp0);
-            const off_scaled: u12 = @intCast(localSlotOffset(idx) / 8);
-            // Always 64-bit load: the slot stores the full 8 bytes, and a
-            // subsequent W-form op (or wrap_i64) will ignore the upper bits.
-            try code.ldrImm(info.reg, .fp, off_scaled);
-            try destCommit(code, reg_map, info);
+            const offset = try localFrameOffset(fctx, idx);
+            if (inst.type == .v128) {
+                const vt = try v128_cache.defineFresh(code, v128_map, dest, null);
+                try frameAddr(code, RegMap.tmp0, offset);
+                try code.ldrQ(vt, RegMap.tmp0);
+            } else {
+                const info = try destBegin(reg_map, dest, RegMap.tmp0);
+                // Always 64-bit load: the slot stores the full 8 bytes, and a
+                // subsequent W-form op (or wrap_i64) will ignore the upper bits.
+                try frameLoad(code, info.reg, offset);
+                try destCommit(code, reg_map, info);
+            }
         },
         .local_set => |ls| {
-            const src = try useInto(code, reg_map, ls.val, RegMap.tmp0);
-            const off_scaled: u12 = @intCast(localSlotOffset(ls.idx) / 8);
-            try code.strImm(src, .fp, off_scaled);
+            const offset = try localFrameOffset(fctx, ls.idx);
+            if (localTypeAt(fctx.local_types, ls.idx) == .v128) {
+                const vt = try v128_cache.ensure(code, v128_map, ls.val, null);
+                try frameAddr(code, RegMap.tmp0, offset);
+                try code.strQ(vt, RegMap.tmp0);
+            } else {
+                const src = try useInto(code, reg_map, ls.val, RegMap.tmp0);
+                try frameStore(code, src, offset);
+            }
         },
 
         // ── Linear memory load/store ─────────────────────────────────
@@ -6441,24 +6528,28 @@ pub const aarch64_callee_saved_indices = [_]u8{
 /// allocatable scratches, x18 is platform-reserved.
 pub const aarch64_call_clobber_mask: u64 = (@as(u64, 1) << 15) - 1;
 
-/// Build the per-function `RegSet` for aarch64. `local_count` sets the
-/// spill-slot origin above the operand stack.
+/// Build the per-function `RegSet` for aarch64 with a known typed-local
+/// frame end. Scalar-only callers can use `aarch64RegSet(local_count)`.
 ///
 /// Frame layout (matches `compileFunctionImpl` / `emitEntrySpill`):
 /// `[fp+0]` = saved fp, `[fp+8]` = saved lr, `[fp+16]` = vmctx slot,
-/// `[fp+24 .. fp+24+LC*8]` = locals, then a 64-slot operand stack, then
-/// spills growing upward. Spills begin at `fp + 24 + (LC + 64)*8`.
-pub fn aarch64RegSet(local_count: u32) regalloc.RegSet {
+/// `[fp+24 .. spill_base)` = locals plus any alignment padding, then spills
+/// grow upward.
+pub fn aarch64RegSetForSpillBase(spill_base: u32) regalloc.RegSet {
     return .{
         .alloc_regs = &aarch64_alloc_regs,
         .callee_saved_indices = &aarch64_callee_saved_indices,
         .caller_saved_indices = &aarch64_caller_saved_indices,
-        // Match RegMap's `spill_base = (local_count + 3) * 8` so
-        // translation between AllocResult.stack (absolute FP offset)
-        // and RegMap.Location.stack (offset from spill_base) is direct.
-        .spill_base = @as(i32, @intCast((local_count + 3) * 8)),
+        // Match RegMap's spill_base so translation between AllocResult.stack
+        // (absolute FP offset) and RegMap.Location.stack (offset from
+        // spill_base) is direct.
+        .spill_base = @as(i32, @intCast(spill_base)),
         .spill_stride = 8,
     };
+}
+
+pub fn aarch64RegSet(local_count: u32) regalloc.RegSet {
+    return aarch64RegSetForSpillBase((local_count + 3) * 8);
 }
 
 /// Scan `func` and emit a `ClobberPoint` for every instruction that
@@ -6541,10 +6632,13 @@ fn shadowRunRegalloc(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
     var clobbers = try collectClobberPoints(func, null, null, allocator);
     defer clobbers.deinit(allocator);
 
+    const local_layout = try computeLocalFrameLayout(func, allocator);
+    defer allocator.free(local_layout.offsets);
+
     var alloc_result = try regalloc.allocate(
         func,
         allocator,
-        aarch64RegSet(func.local_count),
+        aarch64RegSetForSpillBase(local_layout.end),
         clobbers.items,
     );
     defer alloc_result.deinit();
@@ -9151,17 +9245,111 @@ test "compile: i16x8 scalar-count shifts emit NEON instructions" {
     try std.testing.expect(found_ushl);
 }
 
-test "compile: v128 locals remain unsupported before ABI support" {
+test "compile: v128 params remain unsupported before ABI support" {
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 1, 1, 1);
     defer func.deinit();
     func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{.v128});
     const bid = try func.newBlock();
     const v = func.newVReg();
+    const lane = func.newVReg();
     try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v, .type = .v128 });
-    try func.getBlock(bid).append(.{ .op = .{ .ret = v } });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = v, .lane = 0 } }, .dest = lane, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
 
     try std.testing.expectError(error.UnsupportedV128, compileFunction(&func, allocator));
+}
+
+test "compile: local frame layout aligns v128 locals" {
+    const allocator = std.testing.allocator;
+
+    var scalar_func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer scalar_func.deinit();
+    scalar_func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{ .i32, .i64 });
+    const scalar_layout = try computeLocalFrameLayout(&scalar_func, allocator);
+    defer allocator.free(scalar_layout.offsets);
+    try std.testing.expectEqual(@as(u32, 24), scalar_layout.offsets[0]);
+    try std.testing.expectEqual(@as(u32, 32), scalar_layout.offsets[1]);
+    try std.testing.expectEqual(@as(u32, 40), scalar_layout.end);
+
+    var mixed_func = ir.IrFunction.init(allocator, 0, 1, 4);
+    defer mixed_func.deinit();
+    mixed_func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{ .i32, .v128, .i64, .v128 });
+    const mixed_layout = try computeLocalFrameLayout(&mixed_func, allocator);
+    defer allocator.free(mixed_layout.offsets);
+    try std.testing.expectEqual(@as(u32, 24), mixed_layout.offsets[0]);
+    try std.testing.expectEqual(@as(u32, 32), mixed_layout.offsets[1]);
+    try std.testing.expectEqual(@as(u32, 48), mixed_layout.offsets[2]);
+    try std.testing.expectEqual(@as(u32, 64), mixed_layout.offsets[3]);
+    try std.testing.expectEqual(@as(u32, 80), mixed_layout.end);
+}
+
+test "compile: v128 local zero-init uses full-width store without clobbering scalar zero" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 2);
+    defer func.deinit();
+    func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{ .v128, .i32 });
+    const bid = try func.newBlock();
+    const ret = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = ret, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = ret } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    const add_local0_addr = @as(u32, 0x91000000) |
+        (@as(u32, 32) << 10) |
+        (@as(u32, @intFromEnum(emit.Reg.fp)) << 5) |
+        @as(u32, @intFromEnum(RegMap.tmp1));
+    const str_q0_tmp1 = @as(u32, 0x3D800000) |
+        (@as(u32, @intFromEnum(RegMap.tmp1)) << 5) |
+        @as(u32, v128_tmp0);
+    const str_scalar_zero = @as(u32, 0xF9000000) |
+        (@as(u32, 6) << 10) |
+        (@as(u32, @intFromEnum(emit.Reg.fp)) << 5) |
+        @as(u32, @intFromEnum(RegMap.tmp0));
+
+    var found_movi_zero = false;
+    var found_local_addr = false;
+    var found_q_store = false;
+    var found_scalar_store = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const word = std.mem.readInt(u32, code[i..][0..4], .little);
+        if (word == 0x6F00E400) found_movi_zero = true;
+        if (word == add_local0_addr) found_local_addr = true;
+        if (word == str_q0_tmp1) found_q_store = true;
+        if (word == str_scalar_zero) found_scalar_store = true;
+    }
+
+    try std.testing.expect(found_movi_zero);
+    try std.testing.expect(found_local_addr);
+    try std.testing.expect(found_q_store);
+    try std.testing.expect(found_scalar_store);
+}
+
+test "compile: v128 local set/get uses Q stack traffic" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{.v128});
+    const bid = try func.newBlock();
+    const init = func.newVReg();
+    const loaded = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x0000_0004_0000_0003_0000_0002_0000_0001 }, .dest = init, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = init } } });
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = loaded, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .i32x4_extract_lane = .{ .vector = loaded, .lane = 0 } }, .dest = lane, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    const counts = countQMemOps(code);
+    try std.testing.expect(counts.loads >= 1);
+    try std.testing.expect(counts.stores >= 2);
 }
 
 test "load: size 8 (i64) emits 64-bit LDR X" {

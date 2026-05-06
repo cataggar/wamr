@@ -2342,8 +2342,8 @@ fn buildSimdI64x2ExtMulLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8
     var instr: std.ArrayList(u8) = .empty;
     defer instr.deinit(allocator);
 
-    // Re-emit the v128 consts twice because i64x2 locals are unsupported in AOT;
-    // XOR lane 0 and lane 1 of the result to fold both halves into a single i32.
+    // Re-emit the v128 consts twice so this row stays focused on extmul rather
+    // than adding local stack traffic; XOR both result lanes into one i32.
     try appendV128ConstI32x4(&instr, allocator, i64_extmul_lhs_i32);
     try appendV128ConstI32x4(&instr, allocator, i64_extmul_rhs_i32);
     try appendSimdOpcode(&instr, allocator, simd_opcode);

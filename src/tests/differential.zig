@@ -429,6 +429,88 @@ test "differential SIMD: i32x4.replace_lane preserves untouched lanes" {
     try expectSimdDiffI32(wasm, "f", 10);
 }
 
+test "differential SIMD: v128 local default zero" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x01); // local decl groups
+    try encodeULEB128(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x7B); // v128
+    try appendLocalGet(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 0);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 0);
+}
+
+test "differential SIMD: v128 local set/get" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x01); // local decl groups
+    try encodeULEB128(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x7B); // v128
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 17, 18, 19, 20 });
+    try appendLocalSet(&body, testing.allocator, 0);
+    try appendLocalGet(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 2);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 19);
+}
+
+test "differential SIMD: v128 local tee preserves stack value" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x01); // local decl groups
+    try encodeULEB128(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x7B); // v128
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 7, 11, 13, 17 });
+    try appendLocalTee(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 0);
+    try appendLocalGet(&body, testing.allocator, 0);
+    try appendI32x4ExtractLane(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x6A); // i32.add
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 18);
+}
+
+test "differential SIMD: mixed scalar and v128 locals" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x03); // local decl groups
+    try encodeULEB128(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x7F); // i32 local 0
+    try encodeULEB128(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x7B); // v128 local 1
+    try encodeULEB128(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x7F); // i32 local 2
+
+    try appendI32Const(&body, testing.allocator, 5);
+    try appendLocalSet(&body, testing.allocator, 0);
+    try appendV128ConstI32x4(&body, testing.allocator, .{ 32, 99, 7, 8 });
+    try appendLocalSet(&body, testing.allocator, 1);
+    try appendI32Const(&body, testing.allocator, 7);
+    try appendLocalSet(&body, testing.allocator, 2);
+
+    try appendLocalGet(&body, testing.allocator, 0);
+    try appendLocalGet(&body, testing.allocator, 1);
+    try appendI32x4ExtractLane(&body, testing.allocator, 1);
+    try body.append(testing.allocator, 0x6A); // i32.add
+    try appendLocalGet(&body, testing.allocator, 2);
+    try body.append(testing.allocator, 0x6A); // i32.add
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", 111);
+}
+
 test "differential SIMD: i32x4.splat feeds i32x4.add" {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -2987,6 +3069,21 @@ fn appendF64x2ReplaceLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator,
 fn appendI64Const(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i64) !void {
     try buf.append(allocator, 0x42);
     try encodeSLEB128(buf, allocator, value);
+}
+
+fn appendLocalGet(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, index: u32) !void {
+    try buf.append(allocator, 0x20);
+    try encodeULEB128(buf, allocator, index);
+}
+
+fn appendLocalSet(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, index: u32) !void {
+    try buf.append(allocator, 0x21);
+    try encodeULEB128(buf, allocator, index);
+}
+
+fn appendLocalTee(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, index: u32) !void {
+    try buf.append(allocator, 0x22);
+    try encodeULEB128(buf, allocator, index);
 }
 
 fn appendI64ShrU(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
