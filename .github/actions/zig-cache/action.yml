@@ -1,0 +1,77 @@
+name: 'Configure Zig caches'
+description: >-
+  Move ZIG_GLOBAL_CACHE_DIR and ZIG_LOCAL_CACHE_DIR out of $GITHUB_WORKSPACE.
+  mlugg/setup-zig unconditionally exports both to <workspace>/.zig-cache,
+  which (1) conflates the global and local cache, (2) puts the global cache
+  inside a checkout it does not belong in, and (3) collides between worktrees
+  spawned by perf scripts (scripts/bench_coremark.py, scripts/bench_simd.py,
+  which already pop these env vars). This composite action runs immediately
+  after setup-zig and replaces those exports with sane values:
+    * ZIG_GLOBAL_CACHE_DIR -> a stable path outside the workspace.
+    * ZIG_LOCAL_CACHE_DIR  -> a separate per-job scratch path outside the
+                              workspace. We do not unset it (an empty value
+                              makes Zig dump its h/ o/ tmp/ z/ subdirs into
+                              the current working directory).
+
+inputs:
+  global-cache-dir:
+    description: >-
+      Override for the global Zig cache directory. If empty, the action picks
+      `/work/zig-cache` when `/work` is mounted (Azure self-hosted runners
+      with the NVMe layout) and `$RUNNER_TEMP/zig-global-cache` otherwise.
+    required: false
+    default: ''
+  local-cache-dir:
+    description: >-
+      Override for the local (per-job) Zig cache directory. If empty, the
+      action uses `$RUNNER_TEMP/zig-local-cache`.
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Configure Zig cache directories
+      shell: bash
+      env:
+        OVERRIDE_GLOBAL: ${{ inputs.global-cache-dir }}
+        OVERRIDE_LOCAL: ${{ inputs.local-cache-dir }}
+      run: |
+        set -euo pipefail
+        if [ -n "${OVERRIDE_GLOBAL:-}" ]; then
+          GLOBAL="$OVERRIDE_GLOBAL"
+        elif [ -d /work ] && [ -w /work ]; then
+          # Azure self-hosted runner convention: /work is the NVMe scratch
+          # mount that survives between jobs.
+          GLOBAL=/work/zig-cache
+        else
+          # GitHub-hosted runners: use the per-job scratch dir. We do not
+          # rely on this surviving between jobs; cache restoration of this
+          # path is the caller's responsibility (e.g. via actions/cache).
+          GLOBAL="${RUNNER_TEMP:-/tmp}/zig-global-cache"
+        fi
+        if [ -n "${OVERRIDE_LOCAL:-}" ]; then
+          LOCAL="$OVERRIDE_LOCAL"
+        else
+          LOCAL="${RUNNER_TEMP:-/tmp}/zig-local-cache"
+        fi
+        if [ "$GLOBAL" = "$LOCAL" ]; then
+          echo "[zig-cache] global and local cache directories must differ" >&2
+          exit 1
+        fi
+        case "$GLOBAL" in "${GITHUB_WORKSPACE:-/__nope__}"|"${GITHUB_WORKSPACE:-/__nope__}"/*)
+          echo "[zig-cache] refusing to put global cache inside GITHUB_WORKSPACE: $GLOBAL" >&2
+          exit 1 ;;
+        esac
+        case "$LOCAL" in "${GITHUB_WORKSPACE:-/__nope__}"|"${GITHUB_WORKSPACE:-/__nope__}"/*)
+          echo "[zig-cache] refusing to put local cache inside GITHUB_WORKSPACE: $LOCAL" >&2
+          exit 1 ;;
+        esac
+        mkdir -p "$GLOBAL" "$LOCAL"
+        {
+          echo "ZIG_GLOBAL_CACHE_DIR=$GLOBAL"
+          echo "ZIG_LOCAL_CACHE_DIR=$LOCAL"
+        } >> "$GITHUB_ENV"
+        echo "[zig-cache] ZIG_GLOBAL_CACHE_DIR=$GLOBAL"
+        echo "[zig-cache] ZIG_LOCAL_CACHE_DIR=$LOCAL"
+
