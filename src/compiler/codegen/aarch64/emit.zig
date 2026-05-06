@@ -1100,6 +1100,34 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    pub const F32x4UnaryOp = enum(u32) {
+        abs = 0x4EA0F800,
+        neg = 0x6EA0F800,
+        sqrt = 0x6EA1F800,
+    };
+
+    /// Floating-point 4S unary vector op: FABS/FNEG/FSQRT.
+    pub fn f32x4UnOp(self: *CodeBuffer, op: F32x4UnaryOp, vd: u5, vn: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FABS Vd.4S, Vn.4S.
+    pub fn fabs4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.f32x4UnOp(.abs, vd, vn);
+    }
+
+    /// FNEG Vd.4S, Vn.4S.
+    pub fn fneg4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.f32x4UnOp(.neg, vd, vn);
+    }
+
+    /// FSQRT Vd.4S, Vn.4S.
+    pub fn fsqrt4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.f32x4UnOp(.sqrt, vd, vn);
+    }
+
     /// FCMEQ Vd.4S, Vn.4S, Vm.4S — floating-point compare equal per lane.
     pub fn fcmeq4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(0x4E20E400 |
@@ -3117,6 +3145,27 @@ test "emit: f32x4 vector arithmetic/minmax ops" {
         defer code.deinit();
         try code.fcmgt4s(16, 17, 30);
         try expectWord(0x6EBEE630, &code);
+    }
+}
+
+test "emit: f32x4 vector unary ops" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fabs4s(16, 17);
+        try expectWord(0x4EA0FA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fneg4s(16, 17);
+        try expectWord(0x6EA0FA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fsqrt4s(16, 17);
+        try expectWord(0x6EA1FA30, &code);
     }
 }
 

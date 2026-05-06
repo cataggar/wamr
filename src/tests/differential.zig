@@ -501,6 +501,113 @@ fn expectF32x4BinLaneBits(opcode: u32, lhs: [4]u32, rhs: [4]u32, lane: u8, expec
     try expectSimdDiffI32(wasm, "f", bitsI32(expected_bits));
 }
 
+fn expectF32x4UnLaneBits(opcode: u32, lanes: [4]u32, lane: u8, expected_bits: u32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, opcode);
+    try appendI32x4ExtractLane(&body, testing.allocator, lane);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", bitsI32(expected_bits));
+}
+
+test "differential SIMD: f32x4 unary normal lanes match interpreter" {
+    try expectF32x4UnLaneBits(
+        0xE0,
+        .{ 0xc060_0000, 0x4000_0000, 0x4080_0000, 0x4110_0000 },
+        0,
+        0x4060_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE1,
+        .{ 0xc060_0000, 0x4000_0000, 0x4080_0000, 0x4110_0000 },
+        1,
+        0xc000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE3,
+        .{ 0x3f80_0000, 0x4000_0000, 0x4080_0000, 0x4110_0000 },
+        2,
+        0x4000_0000,
+    );
+}
+
+test "differential SIMD: f32x4 unary signed zero and infinity edges match interpreter" {
+    try expectF32x4UnLaneBits(
+        0xE0,
+        .{ 0x8000_0000, 0xff80_0000, 0x7f80_0000, 0x3f80_0000 },
+        0,
+        0x0000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE0,
+        .{ 0x8000_0000, 0xff80_0000, 0x7f80_0000, 0x3f80_0000 },
+        1,
+        0x7f80_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE1,
+        .{ 0x0000_0000, 0x8000_0000, 0x7f80_0000, 0xff80_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE1,
+        .{ 0x0000_0000, 0x8000_0000, 0x7f80_0000, 0xff80_0000 },
+        1,
+        0x0000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE1,
+        .{ 0x0000_0000, 0x8000_0000, 0x7f80_0000, 0xff80_0000 },
+        2,
+        0xff80_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE3,
+        .{ 0x8000_0000, 0x0000_0000, 0x7f80_0000, 0x4110_0000 },
+        0,
+        0x8000_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE3,
+        .{ 0x8000_0000, 0x0000_0000, 0x7f80_0000, 0x4110_0000 },
+        2,
+        0x7f80_0000,
+    );
+}
+
+test "differential SIMD: f32x4 unary NaN behavior matches interpreter" {
+    try expectF32x4UnLaneBits(
+        0xE0,
+        .{ 0xffc1_2345, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0x7fc1_2345,
+    );
+    try expectF32x4UnLaneBits(
+        0xE1,
+        .{ 0x7fc1_2345, 0x3f80_0000, 0x4000_0000, 0x4040_0000 },
+        0,
+        0xffc1_2345,
+    );
+    try expectF32x4UnLaneBits(
+        0xE3,
+        .{ 0x7fc1_2345, 0xbf80_0000, 0xc080_0000, 0x4080_0000 },
+        0,
+        0x7fc0_0000,
+    );
+    try expectF32x4UnLaneBits(
+        0xE3,
+        .{ 0x7fc1_2345, 0xbf80_0000, 0xc080_0000, 0x4080_0000 },
+        2,
+        0x7fc0_0000,
+    );
+}
+
 test "differential SIMD: f32x4 arithmetic normal lanes match interpreter" {
     try expectF32x4BinLaneBits(
         0xE4,

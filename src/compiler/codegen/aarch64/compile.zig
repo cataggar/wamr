@@ -562,6 +562,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .v128_bitselect,
         .i32x4_binop,
         .i32x4_unop,
+        .f32x4_unop,
         .f32x4_binop,
         .f32x4_convert_i32x4,
         .i32x4_extadd_pairwise_i16x8,
@@ -623,6 +624,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .v128_bitselect,
                 .i32x4_binop,
                 .i32x4_unop,
+                .f32x4_unop,
                 .f32x4_binop,
                 .f32x4_convert_i32x4,
                 .i32x4_extadd_pairwise_i16x8,
@@ -1442,6 +1444,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .simd_bitmask,
         .i32x4_binop,
         .i32x4_unop,
+        .f32x4_unop,
         .f32x4_binop,
         .f32x4_convert_i32x4,
         .i32x4_extadd_pairwise_i16x8,
@@ -1638,6 +1641,7 @@ fn compileInst(
         .simd_bitmask => |op| try emitSimdBitmask(code, inst, op, reg_map, v128_map, v128_cache),
         .i32x4_binop => |bin| try emitI32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i32x4_unop => |un| try emitI32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
+        .f32x4_unop => |un| try emitF32x4UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f32x4_binop => |bin| try emitF32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_extadd_pairwise_i16x8 => |op| try emitI32x4ExtAddPairwiseI16x8(code, inst, op, v128_map, v128_cache, fctx),
@@ -2404,6 +2408,35 @@ fn emitI32x4UnOp(
         .neg => try code.neg4s(dest_reg, vector_reg),
         .popcnt => unreachable,
     }
+}
+
+fn emitF32x4UnOp(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    un: ir.Inst.F32x4UnOp,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, un.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, un.vector, vector_reg, v128_map, v128_cache, fctx);
+    switch (un.op) {
+        .abs => try code.fabs4s(dest_reg, vector_reg),
+        .neg => try code.fneg4s(dest_reg, vector_reg),
+        .sqrt => {
+            try code.fsqrt4s(dest_reg, vector_reg);
+            try canonicalizeF32x4NaNs(code, dest_reg);
+        },
+    }
+}
+
+fn canonicalizeF32x4NaNs(code: *emit.CodeBuffer, dest_reg: u5) !void {
+    try code.fcmeq4s(v128_tmp0, dest_reg, dest_reg);
+    try code.mvn16b(v128_tmp0, v128_tmp0);
+    try code.movImm32(RegMap.tmp0, @bitCast(@as(u32, 0x7fc0_0000)));
+    try code.dup4sFromGp32(v128_tmp1, RegMap.tmp0);
+    try code.bsl16b(v128_tmp0, v128_tmp1, dest_reg);
+    try code.bitwise16b(.orr, dest_reg, v128_tmp0, v128_tmp0);
 }
 
 fn emitF32x4ConvertI32x4(
@@ -7613,6 +7646,57 @@ test "compile: f64x2 arithmetic and comparison ops emit NEON instructions" {
     try std.testing.expect(found_fcmge);
     try std.testing.expect(found_mvn);
     try std.testing.expect(bsl_count >= 2);
+}
+
+test "compile: f32x4 unary ops emit NEON instructions" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const a = func.newVReg();
+    const abs = func.newVReg();
+    const neg = func.newVReg();
+    const sqrt = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4110_0000_4080_0000_8000_0000_c060_0000 }, .dest = a, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_unop = .{ .op = .abs, .vector = a } }, .dest = abs, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_unop = .{ .op = .neg, .vector = abs } }, .dest = neg, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f32x4_unop = .{ .op = .sqrt, .vector = neg } }, .dest = sqrt, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = sqrt, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_fabs = false;
+    var found_fneg = false;
+    var found_fsqrt = false;
+    var found_fcmeq = false;
+    var found_mvn = false;
+    var found_bsl = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFFFFFC00) == 0x4EA0F800) found_fabs = true;
+        if ((w & 0xFFFFFC00) == 0x6EA0F800) found_fneg = true;
+        if ((w & 0xFFFFFC00) == 0x6EA1F800) found_fsqrt = true;
+        if ((w & 0xFFE0FC00) == 0x4E20E400) found_fcmeq = true;
+        if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
+        if ((w & 0xFFE0FC00) == 0x6E601C00) found_bsl = true;
+    }
+
+    try std.testing.expect(found_fabs);
+    try std.testing.expect(found_fneg);
+    try std.testing.expect(found_fsqrt);
+    try std.testing.expect(found_fcmeq);
+    try std.testing.expect(found_mvn);
+    try std.testing.expect(found_bsl);
 }
 
 test "compile: f32x4 arithmetic/minmax and pseudo-minmax ops emit NEON instructions" {
