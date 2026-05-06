@@ -431,6 +431,12 @@ pub const Inst = struct {
         max,
         pmin,
         pmax,
+        eq,
+        ne,
+        lt,
+        gt,
+        le,
+        ge,
     };
 
     pub const F32x4UnaryOp = enum {

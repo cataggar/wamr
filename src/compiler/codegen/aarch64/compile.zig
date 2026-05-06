@@ -3333,6 +3333,15 @@ fn emitF32x4BinOp(
         .sub => try code.f32x4Op(.sub, dest_reg, lhs_reg, rhs_reg),
         .mul => try code.f32x4Op(.mul, dest_reg, lhs_reg, rhs_reg),
         .div => try code.f32x4Op(.div, dest_reg, lhs_reg, rhs_reg),
+        .eq => try code.fcmeq4s(dest_reg, lhs_reg, rhs_reg),
+        .ne => {
+            try code.fcmeq4s(dest_reg, lhs_reg, rhs_reg);
+            try code.mvn16b(dest_reg, dest_reg);
+        },
+        .gt => try code.fcmgt4s(dest_reg, lhs_reg, rhs_reg),
+        .ge => try code.fcmge4s(dest_reg, lhs_reg, rhs_reg),
+        .lt => try code.fcmgt4s(dest_reg, rhs_reg, lhs_reg),
+        .le => try code.fcmge4s(dest_reg, rhs_reg, lhs_reg),
         .min, .max => unreachable,
         .pmin, .pmax => unreachable,
     }
@@ -7697,6 +7706,60 @@ test "compile: f32x4 unary ops emit NEON instructions" {
     try std.testing.expect(found_fcmeq);
     try std.testing.expect(found_mvn);
     try std.testing.expect(found_bsl);
+}
+
+test "compile: f32x4 comparisons emit ordered NEON comparisons" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct {
+        op: ir.Inst.F32x4Op,
+        expected_cmp: u32,
+        expect_mvn: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .op = .eq, .expected_cmp = 0x4E31E610 },
+        .{ .op = .ne, .expected_cmp = 0x4E31E610, .expect_mvn = true },
+        .{ .op = .gt, .expected_cmp = 0x6EB1E610 },
+        .{ .op = .ge, .expected_cmp = 0x6E31E610 },
+        .{ .op = .lt, .expected_cmp = 0x6EB0E630 },
+        .{ .op = .le, .expected_cmp = 0x6E30E630 },
+    };
+
+    for (cases) |case| {
+        var func = ir.IrFunction.init(allocator, 0, 1, 0);
+        defer func.deinit();
+        const bid = try func.newBlock();
+
+        const a = func.newVReg();
+        const b = func.newVReg();
+        const cmp = func.newVReg();
+        const lane = func.newVReg();
+
+        try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4080_0000_4040_0000_4000_0000_3f80_0000 }, .dest = a, .type = .v128 });
+        try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4100_0000_40e0_0000_40c0_0000_40a0_0000 }, .dest = b, .type = .v128 });
+        try func.getBlock(bid).append(.{ .op = .{ .f32x4_binop = .{ .op = case.op, .lhs = a, .rhs = b } }, .dest = cmp, .type = .v128 });
+        try func.getBlock(bid).append(.{
+            .op = .{ .i32x4_extract_lane = .{ .vector = cmp, .lane = 0 } },
+            .dest = lane,
+            .type = .i32,
+        });
+        try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+        const code = try compileFunction(&func, allocator);
+        defer allocator.free(code);
+
+        var found_cmp = false;
+        var found_mvn = false;
+        var i: usize = 0;
+        while (i + 4 <= code.len) : (i += 4) {
+            const w = std.mem.readInt(u32, code[i..][0..4], .little);
+            if (w == case.expected_cmp) found_cmp = true;
+            if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
+        }
+
+        try std.testing.expect(found_cmp);
+        try std.testing.expectEqual(case.expect_mvn, found_mvn);
+    }
 }
 
 test "compile: f32x4 arithmetic/minmax and pseudo-minmax ops emit NEON instructions" {

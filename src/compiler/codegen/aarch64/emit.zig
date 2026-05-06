@@ -1144,6 +1144,14 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// FCMGE Vd.4S, Vn.4S, Vm.4S — floating-point compare greater-or-equal per lane.
+    pub fn fcmge4s(self: *CodeBuffer, vd: u5, vn: u5, vm: u5) !void {
+        try self.emit32(0x6E20E400 |
+            (@as(u32, vm) << 16) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     pub const F64x2Op = enum(u32) {
         add = 0x4E60D400,
         sub = 0x4EE0D400,
@@ -3145,6 +3153,12 @@ test "emit: f32x4 vector arithmetic/minmax ops" {
         defer code.deinit();
         try code.fcmgt4s(16, 17, 30);
         try expectWord(0x6EBEE630, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fcmge4s(16, 17, 30);
+        try expectWord(0x6E3EE630, &code);
     }
 }
 
