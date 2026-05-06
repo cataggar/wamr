@@ -435,6 +435,83 @@ test "differential SIMD: i32x4.splat feeds i32x4.add" {
     try expectSimdDiffI32(wasm, "f", 9);
 }
 
+fn expectF32x4SplatExtractBits(bits: u32, lane: u8) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendF32ConstBits(&body, testing.allocator, bits);
+    try appendF32x4Splat(&body, testing.allocator);
+    try appendF32x4ExtractLane(&body, testing.allocator, lane);
+    try appendI32ReinterpretF32(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", bitsI32(bits));
+}
+
+fn expectF32x4ExtractBits(lanes: [4]u32, lane: u8, expected_bits: u32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
+    try appendF32x4ExtractLane(&body, testing.allocator, lane);
+    try appendI32ReinterpretF32(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", bitsI32(expected_bits));
+}
+
+fn expectF32x4ReplaceExtractBits(lanes: [4]u32, scalar_bits: u32, replace_lane: u8, extract_lane: u8, expected_bits: u32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
+    try appendF32ConstBits(&body, testing.allocator, scalar_bits);
+    try appendF32x4ReplaceLane(&body, testing.allocator, replace_lane);
+    try appendF32x4ExtractLane(&body, testing.allocator, extract_lane);
+    try appendI32ReinterpretF32(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", bitsI32(expected_bits));
+}
+
+test "differential SIMD: f32x4.splat preserves NaN payload across lanes" {
+    try expectF32x4SplatExtractBits(0x7FC1_2345, 3);
+}
+
+test "differential SIMD: f32x4.extract_lane respects lane ordering" {
+    try expectF32x4ExtractBits(
+        .{ 0x3F80_0000, 0x8000_0000, 0x7FC1_2345, 0xC020_0000 },
+        3,
+        0xC020_0000,
+    );
+}
+
+test "differential SIMD: f32x4.replace_lane updates selected lane bits" {
+    try expectF32x4ReplaceExtractBits(
+        .{ 0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 },
+        0x8000_0000,
+        2,
+        2,
+        0x8000_0000,
+    );
+}
+
+test "differential SIMD: f32x4.replace_lane preserves untouched lanes" {
+    try expectF32x4ReplaceExtractBits(
+        .{ 0x7FC1_2345, 0x8000_0000, 0x4040_0000, 0x4080_0000 },
+        0xC020_0000,
+        2,
+        0,
+        0x7FC1_2345,
+    );
+}
+
 fn expectF32x4ConvertLane0(opcode: u32, lanes: [4]i32, expected_bits: i32) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
@@ -2089,13 +2166,32 @@ fn appendI32x4Splat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void
     try appendSimdOpcode(buf, allocator, 0x11);
 }
 
+fn appendF32x4Splat(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try appendSimdOpcode(buf, allocator, 0x13);
+}
+
 fn appendI32Const(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, value: i64) !void {
     try buf.append(allocator, 0x41);
     try encodeSLEB128(buf, allocator, value);
 }
 
+fn appendF32ConstBits(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, bits: u32) !void {
+    try buf.append(allocator, 0x43);
+    var le = std.mem.nativeToLittle(u32, bits);
+    try buf.appendSlice(allocator, std.mem.asBytes(&le));
+}
+
+fn appendI32ReinterpretF32(buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try buf.append(allocator, 0xBC);
+}
+
 fn appendI32x4ExtractLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1B);
+    try buf.append(allocator, lane);
+}
+
+fn appendF32x4ExtractLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x1F);
     try buf.append(allocator, lane);
 }
 
@@ -2111,6 +2207,11 @@ fn appendI64x2ExtractLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator,
 
 fn appendI32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1C);
+    try buf.append(allocator, lane);
+}
+
+fn appendF32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x20);
     try buf.append(allocator, lane);
 }
 

@@ -261,6 +261,9 @@ fn opClass(inst: ir.Inst) Class {
         .f32x4_unop,
         .f32x4_binop,
         .f32x4_convert_i32x4,
+        .f32x4_splat,
+        .f32x4_extract_lane,
+        .f32x4_replace_lane,
         .i32x4_extmul_i16x8,
         .i32x4_shift,
         .i32x4_splat,
@@ -583,6 +586,12 @@ pub fn forEachUse(
         },
         .f32x4_unop => |un| try visit(context, un.vector),
         .f32x4_convert_i32x4 => |op| try visit(context, op.vector),
+        .f32x4_splat => |v| try visit(context, v),
+        .f32x4_extract_lane => |lane| try visit(context, lane.vector),
+        .f32x4_replace_lane => |lane| {
+            try visit(context, lane.vector);
+            try visit(context, lane.val);
+        },
         .i32x4_extmul_i16x8 => |op| {
             try visit(context, op.lhs);
             try visit(context, op.rhs);

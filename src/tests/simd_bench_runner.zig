@@ -314,6 +314,21 @@ const cases = [_]BenchCase{
         .build = buildSimdF32x4ConvertI32x4ULane0Module,
     },
     .{
+        .name = "simd_f32x4_splat_lane3",
+        .simd = true,
+        .build = buildSimdF32x4SplatLane3Module,
+    },
+    .{
+        .name = "simd_f32x4_extract_lane3",
+        .simd = true,
+        .build = buildSimdF32x4ExtractLane3Module,
+    },
+    .{
+        .name = "simd_f32x4_replace_lane2",
+        .simd = true,
+        .build = buildSimdF32x4ReplaceLane2Module,
+    },
+    .{
         .name = "simd_f32x4_abs_lane0",
         .simd = true,
         .build = buildSimdF32x4AbsLane0Module,
@@ -1810,6 +1825,18 @@ fn buildSimdF32x4CmpLane0Module(allocator: Allocator, simd_opcode: u32, lhs0: u3
     return buildRunI32Module(allocator, instr.items, .{});
 }
 
+fn buildSimdF32x4SplatLane3Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendF32ConstBits(&instr, allocator, 0x7FC1_2345);
+    try appendF32x4Splat(&instr, allocator);
+    try appendF32x4ExtractLane(&instr, allocator, 3);
+    try appendI32ReinterpretF32(&instr, allocator);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
 fn buildSimdF32x4EqLane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4CmpLane0Module(allocator, 0x41, 0x8000_0000, 0x0000_0000);
 }
@@ -1832,6 +1859,30 @@ fn buildSimdF32x4LeLane0Module(allocator: Allocator) ![]u8 {
 
 fn buildSimdF32x4GeLane0Module(allocator: Allocator) ![]u8 {
     return buildSimdF32x4CmpLane0Module(allocator, 0x46, 0x3f80_0000, 0x3f80_0000);
+}
+
+fn buildSimdF32x4ExtractLane3Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstF32x4Bits(&instr, allocator, .{ 0x3F80_0000, 0x4000_0000, 0x4040_0000, 0xC020_0000 });
+    try appendF32x4ExtractLane(&instr, allocator, 3);
+    try appendI32ReinterpretF32(&instr, allocator);
+
+    return buildRunI32Module(allocator, instr.items, .{});
+}
+
+fn buildSimdF32x4ReplaceLane2Module(allocator: Allocator) ![]u8 {
+    var instr: std.ArrayList(u8) = .empty;
+    defer instr.deinit(allocator);
+
+    try appendV128ConstF32x4Bits(&instr, allocator, .{ 0x3F80_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 });
+    try appendF32ConstBits(&instr, allocator, 0x8000_0000);
+    try appendF32x4ReplaceLane(&instr, allocator, 2);
+    try appendF32x4ExtractLane(&instr, allocator, 2);
+    try appendI32ReinterpretF32(&instr, allocator);
+
+    return buildRunI32Module(allocator, instr.items, .{});
 }
 
 const f32x4_arith_lhs_bits: [4]u32 = .{ 0x4140_0000, 0x4000_0000, 0x4040_0000, 0x4080_0000 };
@@ -4614,6 +4665,12 @@ fn appendV128ConstF32x4Bits(buf: *std.ArrayList(u8), allocator: Allocator, lanes
     }
 }
 
+fn appendF32ConstBits(buf: *std.ArrayList(u8), allocator: Allocator, bits: u32) !void {
+    try buf.append(allocator, 0x43); // f32.const
+    var le = std.mem.nativeToLittle(u32, bits);
+    try buf.appendSlice(allocator, std.mem.asBytes(&le));
+}
+
 fn appendV128ConstI64x2(buf: *std.ArrayList(u8), allocator: Allocator, lanes: [2]u64) !void {
     try appendSimdOpcode(buf, allocator, 0x0C); // v128.const
     for (lanes) |lane| {
@@ -4648,6 +4705,10 @@ fn appendI32x4Splat(buf: *std.ArrayList(u8), allocator: Allocator) !void {
     try appendSimdOpcode(buf, allocator, 0x11); // i32x4.splat
 }
 
+fn appendF32x4Splat(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try appendSimdOpcode(buf, allocator, 0x13); // f32x4.splat
+}
+
 fn appendI64x2Splat(buf: *std.ArrayList(u8), allocator: Allocator) !void {
     try appendSimdOpcode(buf, allocator, 0x12); // i64x2.splat
 }
@@ -4663,6 +4724,15 @@ fn appendI8x16Splat(buf: *std.ArrayList(u8), allocator: Allocator) !void {
 fn appendI32x4ExtractLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1B); // i32x4.extract_lane
     try buf.append(allocator, lane);
+}
+
+fn appendF32x4ExtractLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x1F); // f32x4.extract_lane
+    try buf.append(allocator, lane);
+}
+
+fn appendI32ReinterpretF32(buf: *std.ArrayList(u8), allocator: Allocator) !void {
+    try buf.append(allocator, 0xBC); // i32.reinterpret_f32
 }
 
 fn appendI64x2ExtractLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
@@ -4692,6 +4762,11 @@ fn appendI16x8ExtractLaneU(buf: *std.ArrayList(u8), allocator: Allocator, lane: 
 
 fn appendI32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
     try appendSimdOpcode(buf, allocator, 0x1C); // i32x4.replace_lane
+    try buf.append(allocator, lane);
+}
+
+fn appendF32x4ReplaceLane(buf: *std.ArrayList(u8), allocator: Allocator, lane: u8) !void {
+    try appendSimdOpcode(buf, allocator, 0x20); // f32x4.replace_lane
     try buf.append(allocator, lane);
 }
 

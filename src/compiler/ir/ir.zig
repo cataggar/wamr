@@ -88,6 +88,9 @@ pub const Inst = struct {
         f32x4_unop: F32x4UnOp,
         f32x4_binop: F32x4BinOp,
         f32x4_convert_i32x4: SimdIntToFloatConvert,
+        f32x4_splat: VReg,
+        f32x4_extract_lane: F32x4ExtractLane,
+        f32x4_replace_lane: F32x4ReplaceLane,
         i32x4_shift: I32x4Shift,
         i32x4_splat: VReg,
         i32x4_extract_lane: I32x4ExtractLane,
@@ -738,6 +741,11 @@ pub const Inst = struct {
         lane: u2,
     };
 
+    pub const F32x4ExtractLane = struct {
+        vector: VReg,
+        lane: u2,
+    };
+
     pub const I8x16LaneSign = enum { signed, unsigned };
 
     pub const I8x16ExtractLane = struct {
@@ -760,6 +768,12 @@ pub const Inst = struct {
     };
 
     pub const I32x4ReplaceLane = struct {
+        vector: VReg,
+        val: VReg,
+        lane: u2,
+    };
+
+    pub const F32x4ReplaceLane = struct {
         vector: VReg,
         val: VReg,
         lane: u2,
@@ -1073,6 +1087,30 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(VReg, 6), replace.op.i32x4_replace_lane.vector);
     try std.testing.expectEqual(@as(VReg, 7), replace.op.i32x4_replace_lane.val);
     try std.testing.expectEqual(@as(u2, 1), replace.op.i32x4_replace_lane.lane);
+
+    const f32_splat = Inst{
+        .op = .{ .f32x4_splat = 9 },
+        .dest = 10,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 9), f32_splat.op.f32x4_splat);
+
+    const f32_lane = Inst{
+        .op = .{ .f32x4_extract_lane = .{ .vector = 10, .lane = 3 } },
+        .dest = 11,
+        .type = .f32,
+    };
+    try std.testing.expectEqual(@as(VReg, 10), f32_lane.op.f32x4_extract_lane.vector);
+    try std.testing.expectEqual(@as(u2, 3), f32_lane.op.f32x4_extract_lane.lane);
+
+    const f32_replace = Inst{
+        .op = .{ .f32x4_replace_lane = .{ .vector = 10, .val = 11, .lane = 0 } },
+        .dest = 12,
+        .type = .v128,
+    };
+    try std.testing.expectEqual(@as(VReg, 10), f32_replace.op.f32x4_replace_lane.vector);
+    try std.testing.expectEqual(@as(VReg, 11), f32_replace.op.f32x4_replace_lane.val);
+    try std.testing.expectEqual(@as(u2, 0), f32_replace.op.f32x4_replace_lane.lane);
 
     const shift = Inst{
         .op = .{ .i32x4_shift = .{ .op = .shr_u, .vector = 8, .count = 9 } },
