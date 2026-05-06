@@ -399,6 +399,26 @@ const cases = [_]BenchCase{
         .build = buildSimdF64x2SqrtLane0HighModule,
     },
     .{
+        .name = "simd_f64x2_ceil_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2CeilLane0HighModule,
+    },
+    .{
+        .name = "simd_f64x2_floor_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2FloorLane0HighModule,
+    },
+    .{
+        .name = "simd_f64x2_trunc_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2TruncLane0HighModule,
+    },
+    .{
+        .name = "simd_f64x2_nearest_lane0_high",
+        .simd = true,
+        .build = buildSimdF64x2NearestLane0HighModule,
+    },
+    .{
         .name = "simd_f32x4_ceil_lane0",
         .simd = true,
         .build = buildSimdF32x4CeilLane0Module,
@@ -2062,6 +2082,7 @@ const f32x4_arith_lhs_bits: [4]u32 = .{ 0x4140_0000, 0x4000_0000, 0x4040_0000, 0
 const f32x4_arith_rhs_bits: [4]u32 = .{ 0x4080_0000, 0x40a0_0000, 0x40c0_0000, 0x4100_0000 };
 const f32x4_unary_bits: [4]u32 = .{ 0x4110_0000, 0x4000_0000, 0x4080_0000, 0x40c0_0000 };
 const f32x4_rounding_bits: [4]u32 = .{ 0x3fe0_0000, 0xbfa0_0000, 0x4020_0000, 0xc060_0000 };
+const f64x2_rounding_bits: [2]u64 = .{ 0x3ff8_0000_0000_0000, 0xbff8_0000_0000_0000 };
 
 fn buildSimdF32x4UnLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {
     var instr: std.ArrayList(u8) = .empty;
@@ -2110,6 +2131,26 @@ fn buildSimdF64x2NegLane0HighModule(allocator: Allocator) ![]u8 {
 
 fn buildSimdF64x2SqrtLane0HighModule(allocator: Allocator) ![]u8 {
     return buildSimdF64x2UnLane0HighModule(allocator, 0xEF, .{ 0x4010_0000_0000_0000, 0x4000_0000_0000_0000 });
+}
+
+fn buildSimdF64x2RoundLane0HighModule(allocator: Allocator, simd_opcode: u32) ![]u8 {
+    return buildSimdF64x2UnLane0HighModule(allocator, simd_opcode, f64x2_rounding_bits);
+}
+
+fn buildSimdF64x2CeilLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2RoundLane0HighModule(allocator, 0x74);
+}
+
+fn buildSimdF64x2FloorLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2RoundLane0HighModule(allocator, 0x75);
+}
+
+fn buildSimdF64x2TruncLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2RoundLane0HighModule(allocator, 0x7A);
+}
+
+fn buildSimdF64x2NearestLane0HighModule(allocator: Allocator) ![]u8 {
+    return buildSimdF64x2RoundLane0HighModule(allocator, 0x94);
 }
 
 fn buildSimdF32x4RoundLane0Module(allocator: Allocator, simd_opcode: u32) ![]u8 {

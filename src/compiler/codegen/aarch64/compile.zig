@@ -2510,6 +2510,22 @@ fn emitF64x2UnOp(
             try code.fsqrt2d(dest_reg, vector_reg);
             try canonicalizeF64x2NaNs(code, dest_reg);
         },
+        .ceil => {
+            try code.frint2d(.ceil, dest_reg, vector_reg);
+            try canonicalizeF64x2NaNs(code, dest_reg);
+        },
+        .floor => {
+            try code.frint2d(.floor, dest_reg, vector_reg);
+            try canonicalizeF64x2NaNs(code, dest_reg);
+        },
+        .trunc => {
+            try code.frint2d(.trunc, dest_reg, vector_reg);
+            try canonicalizeF64x2NaNs(code, dest_reg);
+        },
+        .nearest => {
+            try code.frint2d(.nearest, dest_reg, vector_reg);
+            try canonicalizeF64x2NaNs(code, dest_reg);
+        },
     }
 }
 
@@ -7999,6 +8015,10 @@ test "compile: f64x2 unary ops emit NEON instructions" {
     const abs = func.newVReg();
     const neg = func.newVReg();
     const sqrt = func.newVReg();
+    const ceil = func.newVReg();
+    const floor = func.newVReg();
+    const trunc = func.newVReg();
+    const nearest = func.newVReg();
     const lane = func.newVReg();
     const wrapped = func.newVReg();
 
@@ -8006,8 +8026,12 @@ test "compile: f64x2 unary ops emit NEON instructions" {
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_unop = .{ .op = .abs, .vector = a } }, .dest = abs, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_unop = .{ .op = .neg, .vector = abs } }, .dest = neg, .type = .v128 });
     try func.getBlock(bid).append(.{ .op = .{ .f64x2_unop = .{ .op = .sqrt, .vector = neg } }, .dest = sqrt, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_unop = .{ .op = .ceil, .vector = sqrt } }, .dest = ceil, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_unop = .{ .op = .floor, .vector = ceil } }, .dest = floor, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_unop = .{ .op = .trunc, .vector = floor } }, .dest = trunc, .type = .v128 });
+    try func.getBlock(bid).append(.{ .op = .{ .f64x2_unop = .{ .op = .nearest, .vector = trunc } }, .dest = nearest, .type = .v128 });
     try func.getBlock(bid).append(.{
-        .op = .{ .i64x2_extract_lane = .{ .vector = sqrt, .lane = 0 } },
+        .op = .{ .i64x2_extract_lane = .{ .vector = nearest, .lane = 0 } },
         .dest = lane,
         .type = .i64,
     });
@@ -8020,6 +8044,10 @@ test "compile: f64x2 unary ops emit NEON instructions" {
     var found_fabs = false;
     var found_fneg = false;
     var found_fsqrt = false;
+    var found_frintp = false;
+    var found_frintm = false;
+    var found_frintz = false;
+    var found_frintn = false;
     var found_fcmeq = false;
     var found_mvn = false;
     var found_bsl = false;
@@ -8029,6 +8057,10 @@ test "compile: f64x2 unary ops emit NEON instructions" {
         if ((w & 0xFFFFFC00) == 0x4EE0F800) found_fabs = true;
         if ((w & 0xFFFFFC00) == 0x6EE0F800) found_fneg = true;
         if ((w & 0xFFFFFC00) == 0x6EE1F800) found_fsqrt = true;
+        if ((w & 0xFFFFFC00) == 0x4EE18800) found_frintp = true;
+        if ((w & 0xFFFFFC00) == 0x4E619800) found_frintm = true;
+        if ((w & 0xFFFFFC00) == 0x4EE19800) found_frintz = true;
+        if ((w & 0xFFFFFC00) == 0x4E618800) found_frintn = true;
         if ((w & 0xFFE0FC00) == 0x4E60E400) found_fcmeq = true;
         if ((w & 0xFFFFFC00) == 0x6E205800) found_mvn = true;
         if ((w & 0xFFE0FC00) == 0x6E601C00) found_bsl = true;
@@ -8037,6 +8069,10 @@ test "compile: f64x2 unary ops emit NEON instructions" {
     try std.testing.expect(found_fabs);
     try std.testing.expect(found_fneg);
     try std.testing.expect(found_fsqrt);
+    try std.testing.expect(found_frintp);
+    try std.testing.expect(found_frintm);
+    try std.testing.expect(found_frintz);
+    try std.testing.expect(found_frintn);
     try std.testing.expect(found_fcmeq);
     try std.testing.expect(found_mvn);
     try std.testing.expect(found_bsl);

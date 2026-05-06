@@ -1200,9 +1200,13 @@ pub const CodeBuffer = struct {
         abs = 0x4EE0F800,
         neg = 0x6EE0F800,
         sqrt = 0x6EE1F800,
+        frintn = 0x4E618800,
+        frintp = 0x4EE18800,
+        frintm = 0x4E619800,
+        frintz = 0x4EE19800,
     };
 
-    /// Floating-point 2D unary vector op: FABS/FNEG/FSQRT.
+    /// Floating-point 2D unary vector op: FABS/FNEG/FSQRT/FRINT*.
     pub fn f64x2UnOp(self: *CodeBuffer, op: F64x2UnaryOp, vd: u5, vn: u5) !void {
         try self.emit32(@intFromEnum(op) |
             (@as(u32, vn) << 5) |
@@ -1222,6 +1226,37 @@ pub const CodeBuffer = struct {
     /// FSQRT Vd.2D, Vn.2D.
     pub fn fsqrt2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
         return self.f64x2UnOp(.sqrt, vd, vn);
+    }
+
+    /// FRINTN/P/M/Z Vd.2D, Vn.2D — round each f64 lane to integral.
+    pub fn frint2d(self: *CodeBuffer, mode: FRoundMode, vd: u5, vn: u5) !void {
+        const op: F64x2UnaryOp = switch (mode) {
+            .nearest => .frintn,
+            .ceil => .frintp,
+            .floor => .frintm,
+            .trunc => .frintz,
+        };
+        return self.f64x2UnOp(op, vd, vn);
+    }
+
+    /// FRINTP Vd.2D, Vn.2D.
+    pub fn frintp2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint2d(.ceil, vd, vn);
+    }
+
+    /// FRINTM Vd.2D, Vn.2D.
+    pub fn frintm2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint2d(.floor, vd, vn);
+    }
+
+    /// FRINTZ Vd.2D, Vn.2D.
+    pub fn frintz2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint2d(.trunc, vd, vn);
+    }
+
+    /// FRINTN Vd.2D, Vn.2D.
+    pub fn frintn2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.frint2d(.nearest, vd, vn);
     }
 
     /// Floating-point 2D binary vector op: FADD/FSUB/FMUL/FDIV/FMAX/FMIN.
@@ -3406,6 +3441,30 @@ test "emit: f64x2 vector unary ops" {
         defer code.deinit();
         try code.fsqrt2d(16, 17);
         try expectWord(0x6EE1FA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintp2d(16, 17);
+        try expectWord(0x4EE18A30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintm2d(16, 17);
+        try expectWord(0x4E619A30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintz2d(16, 17);
+        try expectWord(0x4EE19A30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.frintn2d(16, 17);
+        try expectWord(0x4E618A30, &code);
     }
 }
 

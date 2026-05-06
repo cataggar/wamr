@@ -2108,6 +2108,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                     .f64x2_abs,
                     .f64x2_neg,
                     .f64x2_sqrt,
+                    .f64x2_ceil,
+                    .f64x2_floor,
+                    .f64x2_trunc,
+                    .f64x2_nearest,
                     => {
                         const vector = safePop(&vreg_stack);
                         const dest = ir_func.newVReg();
@@ -2116,6 +2120,10 @@ fn lowerFunction(func: *const types.WasmFunction, func_type: *const types.FuncTy
                                 .f64x2_abs => .abs,
                                 .f64x2_neg => .neg,
                                 .f64x2_sqrt => .sqrt,
+                                .f64x2_ceil => .ceil,
+                                .f64x2_floor => .floor,
+                                .f64x2_trunc => .trunc,
+                                .f64x2_nearest => .nearest,
                                 else => unreachable,
                             },
                             .vector = vector,
@@ -5694,6 +5702,10 @@ test "lower f64x2 unary opcodes" {
         expected: ir.Inst.F64x2UnaryOp,
     };
     const cases = [_]Case{
+        .{ .opcode = 0x74, .expected = .ceil },
+        .{ .opcode = 0x75, .expected = .floor },
+        .{ .opcode = 0x7A, .expected = .trunc },
+        .{ .opcode = 0x94, .expected = .nearest },
         .{ .opcode = 0xEC, .expected = .abs },
         .{ .opcode = 0xED, .expected = .neg },
         .{ .opcode = 0xEF, .expected = .sqrt },
