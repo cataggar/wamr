@@ -239,5 +239,9 @@ host-protection mechanism.
 - Corpus minimization should preserve a small checked-in seed set while storing
   larger evolving corpora as workflow artifacts (#248). See `scripts/fuzz_reduce.py`
   and `tests/fuzz/regression/README.md`.
-- OSS-Fuzz integration was evaluated in [`OSS_FUZZ.md`](OSS_FUZZ.md); the
-  decision is to defer until a documented prerequisite list is met (#249).
+- OSS-Fuzz integration was evaluated in [`OSS_FUZZ.md`](OSS_FUZZ.md). The
+  prerequisites tracked in #249 and #262 are met for repository-local use,
+  so this repo ships local-only OSS-Fuzz packaging under
+  [`oss-fuzz/`](../../oss-fuzz/) — `zig build fuzz-oss` produces the
+  static-archive shims; `oss-fuzz/Dockerfile` and `oss-fuzz/build.sh`
+  link them with `$LIB_FUZZING_ENGINE`. Nothing is submitted upstream.

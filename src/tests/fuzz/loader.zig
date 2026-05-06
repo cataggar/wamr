@@ -9,6 +9,20 @@ const std = @import("std");
 const wamr = @import("wamr");
 const common = @import("common.zig");
 
+/// Run the loader once over `input`. Shared between the CLI corpus
+/// replay below and the OSS-Fuzz `LLVMFuzzerTestOneInput` shim in
+/// `oss_loader.zig`. Typed loader errors are an expected outcome.
+pub fn runOnce(allocator: std.mem.Allocator, input: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    if (wamr.loader.load(input, arena.allocator())) |_| {
+        // Valid module — fine.
+    } else |_| {
+        // Typed error — fine.
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -31,18 +45,7 @@ pub fn main(init: std.process.Init) !void {
         idx +%= 1;
 
         try common.markInFlight(io, args.crashes_dir, input);
-
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        defer arena.deinit();
-
-        // We only care about panics / UB here. Any typed error is a
-        // legal outcome for the loader.
-        if (wamr.loader.load(input, arena.allocator())) |_| {
-            // Valid module — fine.
-        } else |_| {
-            // Typed error — fine.
-        }
-
+        runOnce(allocator, input);
         common.clearInFlight(io, args.crashes_dir);
     }
 

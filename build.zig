@@ -388,6 +388,39 @@ pub fn build(b: *std.Build) void {
         fuzz_step.dependOn(&install_fuzz.step);
     }
 
+    // ── OSS-Fuzz shim libraries ──────────────────────────────────────
+    // Static archives that export `LLVMFuzzerTestOneInput` for the
+    // high-priority deterministic harnesses (loader, component-loader,
+    // canon). `oss-fuzz/build.sh` links each archive with
+    // `$LIB_FUZZING_ENGINE` (clang `-fsanitize=fuzzer`) to produce the
+    // libFuzzer binary. Repository-local only — no upstream OSS-Fuzz
+    // submission is implied. See tests/fuzz/OSS_FUZZ.md.
+    const fuzz_oss_step = b.step("fuzz-oss", "Build OSS-Fuzz shim static libraries (loader, component-loader, canon)");
+    inline for (.{
+        .{ .name = "loader", .file = "oss_loader.zig" },
+        .{ .name = "component-loader", .file = "oss_component_loader.zig" },
+        .{ .name = "canon", .file = "oss_canon.zig" },
+    }) |tgt| {
+        const oss_mod = b.createModule(.{
+            .root_source_file = b.path("src/tests/fuzz/" ++ tgt.file),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .pic = true,
+        });
+        oss_mod.addImport("config", config_module);
+        oss_mod.addImport("wamr", lib_module);
+
+        const oss_lib = b.addLibrary(.{
+            .name = "fuzz-oss-" ++ tgt.name,
+            .root_module = oss_mod,
+            .linkage = .static,
+        });
+        // Bundle libc references symbols so static-link with libFuzzer driver works.
+        const install_oss = b.addInstallArtifact(oss_lib, .{});
+        fuzz_oss_step.dependOn(&install_oss.step);
+    }
+
     // ── Component-model examples ─────────────────────────────────────
     // Reproducible Zig (and one mixed Zig+Rust) WebAssembly component
     // examples under `tests/component/src/`. Opt-in: not reachable from
@@ -535,9 +568,9 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // Zig adder. Build is opt-in — failure mode if cargo / target not
     // present is a clear cargo error.
     const cargo = b.addSystemCommand(&.{
-        "cargo",           "build",
-        "--release",       "--target",
-        "wasm32-wasip1",   "--manifest-path",
+        "cargo",                                                      "build",
+        "--release",                                                  "--target",
+        "wasm32-wasip1",                                              "--manifest-path",
         "tests/component/src/mixed-zig-rust-calc/command/Cargo.toml",
     });
     cargo.setName("cargo build (mixed-zig-rust-calc command)");

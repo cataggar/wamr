@@ -117,7 +117,7 @@ fn parseHeader(input: []const u8) ?Header {
     return .{ .mode = mode, .ptr = ptr, .len = len, .primitive = prim, .body = input[10..] };
 }
 
-fn runOnce(allocator: std.mem.Allocator, input: []const u8) !void {
+pub fn runOnce(allocator: std.mem.Allocator, input: []const u8) !void {
     const header = parseHeader(input) orelse return;
 
     const mem_len = @min(header.body.len, max_memory_bytes);
