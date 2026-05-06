@@ -1196,6 +1196,34 @@ pub const CodeBuffer = struct {
         min = 0x4EE0F400,
     };
 
+    pub const F64x2UnaryOp = enum(u32) {
+        abs = 0x4EE0F800,
+        neg = 0x6EE0F800,
+        sqrt = 0x6EE1F800,
+    };
+
+    /// Floating-point 2D unary vector op: FABS/FNEG/FSQRT.
+    pub fn f64x2UnOp(self: *CodeBuffer, op: F64x2UnaryOp, vd: u5, vn: u5) !void {
+        try self.emit32(@intFromEnum(op) |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FABS Vd.2D, Vn.2D.
+    pub fn fabs2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.f64x2UnOp(.abs, vd, vn);
+    }
+
+    /// FNEG Vd.2D, Vn.2D.
+    pub fn fneg2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.f64x2UnOp(.neg, vd, vn);
+    }
+
+    /// FSQRT Vd.2D, Vn.2D.
+    pub fn fsqrt2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        return self.f64x2UnOp(.sqrt, vd, vn);
+    }
+
     /// Floating-point 2D binary vector op: FADD/FSUB/FMUL/FDIV/FMAX/FMIN.
     pub fn f64x2Op(self: *CodeBuffer, op: F64x2Op, vd: u5, vn: u5, vm: u5) !void {
         try self.emit32(@intFromEnum(op) |
@@ -3357,6 +3385,27 @@ test "emit: f64x2 vector arithmetic ops" {
         defer code.deinit();
         try code.fcmge2d(16, 17, 30);
         try expectWord(0x6E7EE630, &code);
+    }
+}
+
+test "emit: f64x2 vector unary ops" {
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fabs2d(16, 17);
+        try expectWord(0x4EE0FA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fneg2d(16, 17);
+        try expectWord(0x6EE0FA30, &code);
+    }
+    {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try code.fsqrt2d(16, 17);
+        try expectWord(0x6EE1FA30, &code);
     }
 }
 
