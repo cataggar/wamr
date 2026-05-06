@@ -566,6 +566,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .f32x4_binop,
         .f32x4_convert_i32x4,
         .i32x4_trunc_sat,
+        .f32x4_demote_f64x2_zero,
         .f32x4_splat,
         .f32x4_replace_lane,
         .i32x4_extadd_pairwise_i16x8,
@@ -595,6 +596,7 @@ fn isSupportedV128Def(inst: ir.Inst) bool {
         .i64x2_binop,
         .i64x2_unop,
         .f64x2_convert_low_i32x4,
+        .f64x2_promote_low_f32x4,
         .i64x2_extend_i32x4,
         .i64x2_extmul_i32x4,
         .i64x2_shift,
@@ -631,6 +633,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .f32x4_binop,
                 .f32x4_convert_i32x4,
                 .i32x4_trunc_sat,
+                .f32x4_demote_f64x2_zero,
                 .f32x4_splat,
                 .f32x4_replace_lane,
                 .i32x4_extadd_pairwise_i16x8,
@@ -660,6 +663,7 @@ fn functionHasUnsupportedV128(func: *const ir.IrFunction, allocator: std.mem.All
                 .i64x2_binop,
                 .i64x2_unop,
                 .f64x2_convert_low_i32x4,
+                .f64x2_promote_low_f32x4,
                 .i64x2_extend_i32x4,
                 .i64x2_extmul_i32x4,
                 .i64x2_shift,
@@ -1455,6 +1459,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .f32x4_binop,
         .f32x4_convert_i32x4,
         .i32x4_trunc_sat,
+        .f32x4_demote_f64x2_zero,
         .f32x4_splat,
         .f32x4_extract_lane,
         .f32x4_replace_lane,
@@ -1488,6 +1493,7 @@ fn isV128Inst(inst: ir.Inst) bool {
         .i64x2_binop,
         .i64x2_unop,
         .f64x2_convert_low_i32x4,
+        .f64x2_promote_low_f32x4,
         .i64x2_extend_i32x4,
         .i64x2_extmul_i32x4,
         .i64x2_shift,
@@ -1656,6 +1662,7 @@ fn compileInst(
         .f32x4_binop => |bin| try emitF32x4BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .f32x4_convert_i32x4 => |op| try emitF32x4ConvertI32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i32x4_trunc_sat => |op| try emitI32x4TruncSat(code, inst, op, v128_map, v128_cache, fctx),
+        .f32x4_demote_f64x2_zero => |op| try emitF32x4DemoteF64x2Zero(code, inst, op, v128_map, v128_cache),
         .f32x4_splat => |src| try emitF32x4Splat(code, inst, src, reg_map, v128_map, v128_cache),
         .f32x4_extract_lane => |lane| try emitF32x4ExtractLane(code, inst, lane, reg_map, v128_map, v128_cache),
         .f32x4_replace_lane => |lane| try emitF32x4ReplaceLane(code, inst, lane, reg_map, v128_map, v128_cache, fctx),
@@ -1689,6 +1696,7 @@ fn compileInst(
         .i64x2_binop => |bin| try emitI64x2BinOp(code, inst, bin, v128_map, v128_cache, fctx),
         .i64x2_unop => |un| try emitI64x2UnOp(code, inst, un, v128_map, v128_cache, fctx),
         .f64x2_convert_low_i32x4 => |op| try emitF64x2ConvertLowI32x4(code, inst, op, v128_map, v128_cache, fctx),
+        .f64x2_promote_low_f32x4 => |op| try emitF64x2PromoteLowF32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i64x2_extend_i32x4 => |op| try emitI64x2ExtendI32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i64x2_extmul_i32x4 => |op| try emitI64x2ExtMulI32x4(code, inst, op, v128_map, v128_cache, fctx),
         .i64x2_shift => |shift| try emitI64x2Shift(code, inst, shift, reg_map, v128_map, v128_cache, fctx),
@@ -2523,6 +2531,21 @@ fn emitI32x4TruncSat(
     }
 }
 
+fn emitF32x4DemoteF64x2Zero(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdFloatPrecisionConvert,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+) !void {
+    const dest = inst.dest orelse return;
+    const vector_reg = try v128_cache.ensure(code, v128_map, op.vector, null);
+    const dest_reg = try v128_cache.defineFresh(code, v128_map, dest, vector_reg);
+    try code.bitwise16b(.eor, dest_reg, dest_reg, dest_reg);
+    try code.fcvtn2s2d(dest_reg, vector_reg);
+    try canonicalizeF32x4NaNs(code, dest_reg);
+}
+
 fn emitF32x4Splat(
     code: *emit.CodeBuffer,
     inst: ir.Inst,
@@ -2719,6 +2742,19 @@ fn emitF64x2ConvertLowI32x4(
             try code.ucvtf2d(dest_reg, dest_reg);
         },
     }
+}
+
+fn emitF64x2PromoteLowF32x4(
+    code: *emit.CodeBuffer,
+    inst: ir.Inst,
+    op: ir.Inst.SimdFloatPrecisionConvert,
+    v128_map: *V128StackMap,
+    v128_cache: *V128RegCache,
+    fctx: *const FuncCompileCtx,
+) !void {
+    const vector_reg = try v128_cache.ensure(code, v128_map, op.vector, null);
+    const dest_reg = try prepareV128UnaryDest(code, inst, op.vector, vector_reg, v128_map, v128_cache, fctx);
+    try code.fcvtl2d2s(dest_reg, vector_reg);
 }
 
 fn emitI16x8ExtMulI8x16(
@@ -8227,6 +8263,64 @@ test "compile: SIMD trunc_sat float-to-int emits NaN masks and narrowing" {
     try std.testing.expect(found_sqxtn);
     try std.testing.expect(found_uqxtn);
     try std.testing.expectEqual(@as(u32, 2), zero_before_narrow);
+}
+
+test "compile: SIMD float precision conversions emit FCVTN and FCVTL" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+
+    const source = func.newVReg();
+    const demoted = func.newVReg();
+    const promoted = func.newVReg();
+    const mix = func.newVReg();
+    const lane = func.newVReg();
+
+    try func.getBlock(bid).append(.{ .op = .{ .v128_const = 0x4008_0000_0000_0000_3ff8_0000_0000_0000 }, .dest = source, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f32x4_demote_f64x2_zero = .{ .vector = source } },
+        .dest = demoted,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{
+        .op = .{ .f64x2_promote_low_f32x4 = .{ .vector = demoted } },
+        .dest = promoted,
+        .type = .v128,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .v128_bitwise = .{ .op = .xor, .lhs = demoted, .rhs = promoted } }, .dest = mix, .type = .v128 });
+    try func.getBlock(bid).append(.{
+        .op = .{ .i32x4_extract_lane = .{ .vector = mix, .lane = 0 } },
+        .dest = lane,
+        .type = .i32,
+    });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = lane } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    var found_fcvtn = false;
+    var found_fcvtl = false;
+    var zero_before_fcvtn = false;
+    var pending_zero = false;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        const rd = w & 0x1F;
+        const rn = (w >> 5) & 0x1F;
+        const rm = (w >> 16) & 0x1F;
+        if ((w & 0xFFE0FC00) == 0x6E201C00 and rd == rn and rd == rm) pending_zero = true;
+        if ((w & 0xFFFFFC00) == 0x0E616800) {
+            found_fcvtn = true;
+            if (pending_zero) zero_before_fcvtn = true;
+            pending_zero = false;
+        }
+        if ((w & 0xFFFFFC00) == 0x0E617800) found_fcvtl = true;
+    }
+
+    try std.testing.expect(found_fcvtn);
+    try std.testing.expect(found_fcvtl);
+    try std.testing.expect(zero_before_fcvtn);
 }
 
 test "compile: integer SIMD unary ops emit NEON instructions" {

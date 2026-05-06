@@ -1870,6 +1870,20 @@ pub const CodeBuffer = struct {
             vd);
     }
 
+    /// FCVTN Vd.2S, Vn.2D — demote low two f64 lanes to f32 lanes.
+    pub fn fcvtn2s2d(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0E616800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
+    /// FCVTL Vd.2D, Vn.2S — promote low two f32 lanes to f64 lanes.
+    pub fn fcvtl2d2s(self: *CodeBuffer, vd: u5, vn: u5) !void {
+        try self.emit32(0x0E617800 |
+            (@as(u32, vn) << 5) |
+            vd);
+    }
+
     /// FCVTZS Vd.4S, Vn.4S — f32 lanes to signed i32 lanes, round toward zero.
     pub fn fcvtzs4s(self: *CodeBuffer, vd: u5, vn: u5) !void {
         try self.emit32(0x4EA1B800 |
@@ -3559,6 +3573,19 @@ test "emit: SIMD int-to-float conversion ops" {
         .{ .name = "ucvtf4s", .expected = 0x6E21DA30 },
         .{ .name = "scvtf2d", .expected = 0x4E61DA30 },
         .{ .name = "ucvtf2d", .expected = 0x6E61DA30 },
+    };
+    inline for (cases) |c| {
+        var code = CodeBuffer.init(std.testing.allocator);
+        defer code.deinit();
+        try @field(CodeBuffer, c.name)(&code, 16, 17);
+        try expectWord(c.expected, &code);
+    }
+}
+
+test "emit: SIMD float precision conversion ops" {
+    const cases = [_]struct { name: []const u8, expected: u32 }{
+        .{ .name = "fcvtn2s2d", .expected = 0x0E616A30 },
+        .{ .name = "fcvtl2d2s", .expected = 0x0E617A30 },
     };
     inline for (cases) |c| {
         var code = CodeBuffer.init(std.testing.allocator);

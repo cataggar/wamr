@@ -100,6 +100,17 @@ fn expectSimdDiffI32(wasm: []const u8, name: []const u8, expected: i32) !void {
     try testing.expectEqual(interp_result, aot_result);
 }
 
+fn expectSimdDiffI32MatchesInterp(wasm: []const u8, name: []const u8) !void {
+    const interp_result = try runInterpI32(testing.allocator, wasm, name);
+
+    if (comptime !can_exec_simd_aot) return;
+    const aot_result = try runAotI32(testing.allocator, wasm, name);
+    if (aot_result != interp_result) {
+        std.debug.print("SIMD AOT MISMATCH: interp={d} got={d}\n", .{ interp_result, aot_result });
+    }
+    try testing.expectEqual(interp_result, aot_result);
+}
+
 fn expectSimdMemoryTrap(wasm: []const u8, name: []const u8) !void {
     try testing.expectError(error.OutOfBoundsMemoryAccess, runInterpI32(testing.allocator, wasm, name));
 
@@ -1312,6 +1323,150 @@ test "differential SIMD: f64x2.convert_low_i32x4_u lane 0 matches interpreter" {
         0xFF,
         .{ @bitCast(@as(u32, 0x8000_0000)), 1, 2, 3 },
         0x41e0_0000,
+    );
+}
+
+fn expectF32x4DemoteLaneBits(lanes: [2]u64, lane: u8, expected_bits: u32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstI64x2(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, 0x5E);
+    try appendI32x4ExtractLane(&body, testing.allocator, lane);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", bitsI32(expected_bits));
+}
+
+fn expectF64x2PromoteLanePart(lanes: [4]u32, lane: u8, shift: u6, expected: i32) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, 0x5F);
+    try appendI64x2ExtractLane(&body, testing.allocator, lane);
+    if (shift != 0) {
+        try appendI64Const(&body, testing.allocator, shift);
+        try appendI64ShrU(&body, testing.allocator);
+    }
+    try appendI32WrapI64(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32(wasm, "f", expected);
+}
+
+fn expectF64x2PromoteLaneLow(lanes: [4]u32, lane: u8, expected: i32) !void {
+    try expectF64x2PromoteLanePart(lanes, lane, 0, expected);
+}
+
+fn expectF64x2PromoteLaneHigh(lanes: [4]u32, lane: u8, expected: i32) !void {
+    try expectF64x2PromoteLanePart(lanes, lane, 32, expected);
+}
+
+fn expectF64x2PromoteLaneHighMatchesInterp(lanes: [4]u32, lane: u8) !void {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(testing.allocator);
+    try body.append(testing.allocator, 0x00);
+    try appendV128ConstF32x4Bits(&body, testing.allocator, lanes);
+    try appendSimdOpcode(&body, testing.allocator, 0x5F);
+    try appendI64x2ExtractLane(&body, testing.allocator, lane);
+    try appendI64Const(&body, testing.allocator, 32);
+    try appendI64ShrU(&body, testing.allocator);
+    try appendI32WrapI64(&body, testing.allocator);
+    try body.append(testing.allocator, 0x0B);
+
+    const wasm = try buildCustomModule(testing.allocator, body.items);
+    defer testing.allocator.free(wasm);
+    try expectSimdDiffI32MatchesInterp(wasm, "f");
+}
+
+test "differential SIMD: f32x4.demote_f64x2_zero normal signed-zero and upper lanes" {
+    try expectF32x4DemoteLaneBits(
+        .{ 0x3ff8_0000_0000_0000, 0x8000_0000_0000_0000 },
+        0,
+        0x3fc0_0000,
+    );
+    try expectF32x4DemoteLaneBits(
+        .{ 0x3ff8_0000_0000_0000, 0x8000_0000_0000_0000 },
+        1,
+        0x8000_0000,
+    );
+    try expectF32x4DemoteLaneBits(
+        .{ 0x3ff8_0000_0000_0000, 0x8000_0000_0000_0000 },
+        2,
+        0x0000_0000,
+    );
+    try expectF32x4DemoteLaneBits(
+        .{ 0x3ff8_0000_0000_0000, 0x8000_0000_0000_0000 },
+        3,
+        0x0000_0000,
+    );
+}
+
+test "differential SIMD: f32x4.demote_f64x2_zero inf NaN subnormal and overflow" {
+    try expectF32x4DemoteLaneBits(
+        .{ 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000 },
+        0,
+        0x7f80_0000,
+    );
+    try expectF32x4DemoteLaneBits(
+        .{ 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000 },
+        1,
+        0xff80_0000,
+    );
+    try expectF32x4DemoteLaneBits(
+        .{ 0x7ff8_0000_0000_0001, 0x36a0_0000_0000_0000 },
+        0,
+        0x7fc0_0000,
+    );
+    try expectF32x4DemoteLaneBits(
+        .{ 0x7ff8_0000_0000_0001, 0x36a0_0000_0000_0000 },
+        1,
+        0x0000_0001,
+    );
+    try expectF32x4DemoteLaneBits(
+        .{ 0x483d_6329_f1c3_5ca5, 0x3ff0_0000_0000_0000 },
+        0,
+        0x7f80_0000,
+    );
+}
+
+test "differential SIMD: f64x2.promote_low_f32x4 normal signed-zero and ignores high lanes" {
+    const lanes = [4]u32{ 0x3fc0_0000, 0x8000_0000, 0x7fc0_1234, 0xff80_0000 };
+    try expectF64x2PromoteLaneHigh(lanes, 0, 0x3ff8_0000);
+    try expectF64x2PromoteLaneLow(lanes, 0, 0);
+    try expectF64x2PromoteLaneHigh(lanes, 1, @bitCast(@as(u32, 0x8000_0000)));
+    try expectF64x2PromoteLaneLow(lanes, 1, 0);
+}
+
+test "differential SIMD: f64x2.promote_low_f32x4 inf NaN and subnormal" {
+    try expectF64x2PromoteLaneHigh(
+        .{ 0x7f80_0000, 0xff80_0000, 0x3f80_0000, 0x4000_0000 },
+        0,
+        0x7ff0_0000,
+    );
+    try expectF64x2PromoteLaneHigh(
+        .{ 0x7f80_0000, 0xff80_0000, 0x3f80_0000, 0x4000_0000 },
+        1,
+        @bitCast(@as(u32, 0xfff0_0000)),
+    );
+    try expectF64x2PromoteLaneHigh(
+        .{ 0x0000_0001, 0x8000_0001, 0x7fc0_1234, 0xff80_0000 },
+        0,
+        0x36a0_0000,
+    );
+    try expectF64x2PromoteLaneHigh(
+        .{ 0x0000_0001, 0x8000_0001, 0x7fc0_1234, 0xff80_0000 },
+        1,
+        @bitCast(@as(u32, 0xb6a0_0000)),
+    );
+    try expectF64x2PromoteLaneHighMatchesInterp(
+        .{ 0x7fc0_0001, 0x3f80_0000, 0xff80_0000, 0x0000_0001 },
+        0,
     );
 }
 
