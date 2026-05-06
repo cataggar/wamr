@@ -1761,6 +1761,47 @@ test "differential SIMD: f64x2 unary NaN behavior matches interpreter" {
     );
 }
 
+test "differential SIMD: f64x2 rounding fractions match interpreter" {
+    const lanes = [_]u64{ f64Bits(1.5), f64Bits(-1.5) };
+    try expectF64x2UnLaneHigh(0x74, lanes, 0, 0x4000_0000);
+    try expectF64x2UnLaneHigh(0x74, lanes, 1, @bitCast(@as(u32, 0xbff0_0000)));
+    try expectF64x2UnLaneHigh(0x75, lanes, 0, 0x3ff0_0000);
+    try expectF64x2UnLaneHigh(0x75, lanes, 1, @bitCast(@as(u32, 0xc000_0000)));
+    try expectF64x2UnLaneHigh(0x7A, .{ f64Bits(1.75), f64Bits(-1.75) }, 0, 0x3ff0_0000);
+    try expectF64x2UnLaneHigh(0x7A, .{ f64Bits(1.75), f64Bits(-1.75) }, 1, @bitCast(@as(u32, 0xbff0_0000)));
+}
+
+test "differential SIMD: f64x2 nearest ties to even matches interpreter" {
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(0.5), f64Bits(-0.5) }, 0, 0);
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(0.5), f64Bits(-0.5) }, 1, @bitCast(@as(u32, 0x8000_0000)));
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(1.5), f64Bits(-1.5) }, 0, 0x4000_0000);
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(1.5), f64Bits(-1.5) }, 1, @bitCast(@as(u32, 0xc000_0000)));
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(2.5), f64Bits(-2.5) }, 0, 0x4000_0000);
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(2.5), f64Bits(-2.5) }, 1, @bitCast(@as(u32, 0xc000_0000)));
+}
+
+test "differential SIMD: f64x2 rounding signed zeros infinities and NaNs match interpreter" {
+    try expectF64x2UnLaneHigh(0x74, .{ f64Bits(-0.0), f64Bits(0.0) }, 0, @bitCast(@as(u32, 0x8000_0000)));
+    try expectF64x2UnLaneHigh(0x75, .{ f64Bits(-0.0), f64Bits(0.0) }, 1, 0);
+    try expectF64x2UnLaneHigh(0x7A, .{ f64Bits(-0.0), f64Bits(0.0) }, 0, @bitCast(@as(u32, 0x8000_0000)));
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(-0.0), f64Bits(0.0) }, 1, 0);
+    try expectF64x2UnLaneHigh(0x74, .{ f64Bits(-0.5), f64Bits(0.5) }, 0, @bitCast(@as(u32, 0x8000_0000)));
+    try expectF64x2UnLaneHigh(0x75, .{ f64Bits(-0.5), f64Bits(0.5) }, 1, 0);
+    try expectF64x2UnLaneHigh(0x7A, .{ f64Bits(-0.5), f64Bits(0.5) }, 0, @bitCast(@as(u32, 0x8000_0000)));
+    try expectF64x2UnLaneHigh(0x94, .{ f64Bits(-0.5), f64Bits(0.5) }, 0, @bitCast(@as(u32, 0x8000_0000)));
+    try expectF64x2UnLaneHigh(0x74, .{ 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000 }, 0, 0x7ff0_0000);
+    try expectF64x2UnLaneHigh(0x75, .{ 0x7ff0_0000_0000_0000, 0xfff0_0000_0000_0000 }, 1, @bitCast(@as(u32, 0xfff0_0000)));
+    const nans = [_]u64{ 0x7ff8_0000_0000_1234, 0xfff8_0000_0000_5678 };
+    try expectF64x2UnLaneHigh(0x74, nans, 0, 0x7ff8_0000);
+    try expectF64x2UnLaneLow(0x74, nans, 0, 0);
+    try expectF64x2UnLaneHigh(0x75, nans, 1, 0x7ff8_0000);
+    try expectF64x2UnLaneLow(0x75, nans, 1, 0);
+    try expectF64x2UnLaneHigh(0x7A, nans, 0, 0x7ff8_0000);
+    try expectF64x2UnLaneLow(0x7A, nans, 0, 0);
+    try expectF64x2UnLaneHigh(0x94, nans, 1, 0x7ff8_0000);
+    try expectF64x2UnLaneLow(0x94, nans, 1, 0);
+}
+
 fn expectF64x2Lane0Part(opcode: u32, lhs: [2]u64, rhs: [2]u64, shift: u6, expected: i32) !void {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(testing.allocator);
