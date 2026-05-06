@@ -144,6 +144,13 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
     // Each canon that produces a core func and each `core(.func)` alias
     // appends one entry as it is parsed.
     var core_func_indexspace: std.ArrayListUnmanaged(ctypes.CoreFuncContributor) = .empty;
+    // Component-instance index space contributors in binary
+    // declaration order. Required for `wasm-tools compose` output
+    // where instance and alias-of-instance sections interleave —
+    // the legacy "imports then instances then aliases" walk in
+    // `indexspace.resolveCompInstance` only handles non-interleaved
+    // layouts (issue #355).
+    var comp_instance_indexspace: std.ArrayListUnmanaged(ctypes.CompInstanceContributor) = .empty;
 
     while (reader.remaining() > 0) {
         const section_id_byte = try reader.readByte();
@@ -192,7 +199,9 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
+                    const local_idx: u32 = @intCast(instances.items.len);
                     try instances.append(allocator, try parseInstance(&reader, allocator));
+                    try comp_instance_indexspace.append(allocator, .{ .instance = local_idx });
                 }
             },
             .alias => {
@@ -216,6 +225,11 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                         else => false,
                     };
                     if (is_core_func) try core_func_indexspace.append(allocator, .{ .alias = local_idx });
+                    // Aliases of sort .instance contribute to the
+                    // component-instance index space.
+                    if (sort == .instance) {
+                        try comp_instance_indexspace.append(allocator, .{ .alias = local_idx });
+                    }
                 }
             },
             .type => {
@@ -250,9 +264,15 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
+                    const local_idx: u32 = @intCast(imports.items.len);
                     const imp = try parseImport(&reader);
                     try imports.append(allocator, imp);
                     if (imp.desc == .type) try type_indexspace.append(allocator, null);
+                    // Instance-typed imports contribute to the
+                    // component-instance index space (issue #355).
+                    if (imp.desc == .instance) {
+                        try comp_instance_indexspace.append(allocator, .{ .import = local_idx });
+                    }
                 }
             },
             .@"export" => {
@@ -287,6 +307,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         .imports = try imports.toOwnedSlice(allocator),
         .exports = try exports.toOwnedSlice(allocator),
         .core_func_indexspace = try core_func_indexspace.toOwnedSlice(allocator),
+        .comp_instance_indexspace = try comp_instance_indexspace.toOwnedSlice(allocator),
     };
 }
 

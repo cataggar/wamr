@@ -467,6 +467,19 @@ pub const Component = struct {
     /// hand-authored test fixtures); callers in that case fall back to
     /// the section-order heuristic in `indexspace.resolveCoreFunc`.
     core_func_indexspace: []const CoreFuncContributor = &.{},
+    /// Component-instance index-space contributors in binary
+    /// declaration order. Each entry records whether the slot was
+    /// contributed by an `.instance`-typed `import`, an `instance`
+    /// section entry, or an `alias` section entry of sort
+    /// `.instance`. Empty when the component was constructed without
+    /// a loader (e.g. hand-authored test fixtures); callers in that
+    /// case fall back to the legacy "imports, then instances, then
+    /// aliases" walk in `indexspace.resolveCompInstance`. The legacy
+    /// walk is correct for non-composed components and Phase 2A
+    /// fixtures; the section-ordered slice is required for
+    /// `wasm-tools compose` output where instance and alias sections
+    /// interleave (issue #355).
+    comp_instance_indexspace: []const CompInstanceContributor = &.{},
 };
 
 /// A single contributor to the core-func index space.
@@ -476,6 +489,22 @@ pub const CoreFuncContributor = union(enum) {
     /// `.resource_new`, `.resource_rep`) appear here; `.lift` does not.
     canon: u32,
     /// Index into `component.aliases`.
+    alias: u32,
+};
+
+/// A single contributor to the component-instance index space, in the
+/// order it appeared in the binary. Composed components (output by
+/// `wasm-tools compose`) interleave `.instance` and `.alias` (sort
+/// `.instance`) section entries — so the index space cannot be derived
+/// by walking imports, then instances, then aliases as separate phases.
+/// (Issue #355.)
+pub const CompInstanceContributor = union(enum) {
+    /// Index into `component.imports` (must be `.instance` desc).
+    import: u32,
+    /// Index into `component.instances`.
+    instance: u32,
+    /// Index into `component.aliases` (must be `instance_export` of
+    /// sort `.instance`).
     alias: u32,
 };
 

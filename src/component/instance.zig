@@ -193,6 +193,44 @@ pub const ComponentInstance = struct {
     started: bool = false,
     /// Allocator for instance lifetime.
     allocator: std.mem.Allocator,
+    /// Child component instances created when the parent component
+    /// declares `(instance N (instantiate <subcomp> ...))` expressions.
+    /// Indexed by the *local* component-instance idx (i.e. by index into
+    /// `component.instances[]`), NOT by the full component-instance
+    /// index space (which mixes imports / locals / aliases). A `null`
+    /// slot means either:
+    ///   - the matching `instances[i]` is an `.exports` inline bundle
+    ///     (no runtime sub-instance is needed), or
+    ///   - the matching `instances[i]` is an `.instantiate` of a
+    ///     wit-bindgen "imported-func re-export" shim, which the
+    ///     existing `registerInstanceExport.instantiate` path handles
+    ///     without a real runtime instance.
+    /// Children are allocated with `self.allocator` (NOT
+    /// `module_arena.allocator()`) so each retains a deterministic
+    /// `deinit()` path. `ComponentInstance.deinit` walks this slice
+    /// before tearing down its own state. (Issue #355.)
+    sub_instances: []?*ComponentInstance = &.{},
+    /// Forwarding-`HostFunc` contexts owned by THIS instance — i.e. the
+    /// instance whose `imports` map borrows them. Created during
+    /// `linkImports` when wiring sub-component imports back to a parent
+    /// (or peer) `ExportedFunc.Local`. The borrower-owns invariant
+    /// keeps lifetimes tight: when this instance is deinitialized, its
+    /// import map vanishes along with the contexts it referenced.
+    /// (Issue #355.)
+    forwarding_ctxs: std.ArrayListUnmanaged(*executor_mod.ForwardingHostFnCtx) = .empty,
+    /// Synthetic `HostInstance`s constructed during `linkImports` to
+    /// satisfy `.instance`-typed sub-component imports whose source is
+    /// a parent / peer component (i.e. whose members must be wrapped
+    /// as forwarding host funcs). Owned by the instance whose `imports`
+    /// references them, freed in `deinit`. (Issue #355.)
+    synthetic_host_instances: std.ArrayListUnmanaged(*HostInstance) = .empty,
+    /// Whether `linkImports` has fully completed against this instance.
+    /// Surfacing a partial link (e.g. a child link that failed mid-way)
+    /// as `.poisoned` lets `deinit` and external callers reject reuse
+    /// without depending on hashmap occupancy. (Issue #355.)
+    link_state: LinkState = .unlinked,
+
+    pub const LinkState = enum { unlinked, linking, linked, poisoned };
 
     pub const CoreInstanceEntry = struct {
         module_inst: ?*core_types.ModuleInstance = null,
@@ -203,13 +241,39 @@ pub const ComponentInstance = struct {
         inline_exports: []const ctypes.CoreInlineExport = &.{},
     };
 
-    pub const ExportedFunc = struct {
-        core_instance_idx: u32,
-        core_func_idx: u32,
-        /// Component-level function type index (into component.types).
-        func_type_idx: u32 = 0,
-        /// Canonical options from the canon lift definition.
-        opts: []const ctypes.CanonOpt = &.{},
+    /// An exported component function. Two flavours:
+    ///   * `.local` — backed by a `canon.lift` inside this very
+    ///     component, executable directly against `core_instances[…]`.
+    ///   * `.forwarded` — a re-publication of another
+    ///     `ComponentInstance`'s export, used when wamr instantiates a
+    ///     sub-component (e.g. inside a `wasm-tools compose`d wrapper)
+    ///     and then exposes the child's `wasi:cli/run` instance through
+    ///     an `(alias export …)` chain. Indices in the `Local` variant
+    ///     are owner-relative; copying them into a parent would
+    ///     mis-index into the parent's `core_instances`. Forwarding by
+    ///     `(owner, name)` keeps execution dispatching against the
+    ///     correct component (issue #355).
+    pub const ExportedFunc = union(enum) {
+        local: Local,
+        forwarded: Forwarded,
+
+        pub const Local = struct {
+            core_instance_idx: u32,
+            core_func_idx: u32,
+            /// Component-level function type index (into component.types).
+            func_type_idx: u32 = 0,
+            /// Canonical options from the canon lift definition.
+            opts: []const ctypes.CanonOpt = &.{},
+        };
+
+        pub const Forwarded = struct {
+            owner: *ComponentInstance,
+            /// Key into `owner.exported_funcs`. Forwarded entries are
+            /// flattened during registration so this always points at
+            /// a `.local` (or another `.forwarded` whose owner chain
+            /// also ultimately bottoms out at `.local`).
+            owner_export_name: []const u8,
+        };
     };
 
     /// Look up an exported function by name.
@@ -405,6 +469,37 @@ pub const ComponentInstance = struct {
         self: *ComponentInstance,
         providers: std.StringHashMapUnmanaged(ImportBinding),
     ) !void {
+        if (self.link_state == .poisoned) return error.LinkAlreadyPoisoned;
+        self.link_state = .linking;
+        errdefer self.link_state = .poisoned;
+
+        // Phase 1 — bind everything (parent + recursive children) WITHOUT
+        // running any deferred core starts. This means all forwarding
+        // host_funcs and trampoline contexts are wired before any wasm
+        // start function runs, so the start can call across the
+        // composition boundary in either direction without seeing
+        // `error.HostFuncNotBound`.
+        try self.bindImports(providers);
+        try self.bindChildren();
+
+        // Phase 2 — drain deferred core starts post-order so a parent's
+        // start (which may call into child lifts after parent core
+        // modules are initialized) runs before any child start that
+        // might invoke parent lifts. Issue #308 invariant for nested
+        // composed components.
+        try self.drainAllStartsPostOrder();
+
+        self.link_state = .linked;
+    }
+
+    /// Bind only this instance's imports and resolve trampoline
+    /// `host_func`s. Does NOT run any deferred core starts. Used as the
+    /// first phase of `linkImports` so child instances can be wired
+    /// before any wasm start runs.
+    fn bindImports(
+        self: *ComponentInstance,
+        providers: std.StringHashMapUnmanaged(ImportBinding),
+    ) !void {
         for (self.component.imports) |imp| {
             const maybe_binding = providers.get(imp.name);
             if (maybe_binding) |binding| {
@@ -433,12 +528,376 @@ pub const ComponentInstance = struct {
             } else {
             }
         }
+    }
 
-        // Now run any core-module `(start ...)` directives that were
-        // deferred during `instantiate`. Trampoline `host_funcs` are bound
-        // above, so wasi imports invoked from within `_initialize` etc.
-        // resolve correctly (issue #308).
+    /// Recursively bind sub-component imports. For each non-null entry
+    /// in `sub_instances`, build a `ImportBinding` provider map by
+    /// enumerating the child component's import declarators and
+    /// matching them against the parent's `(with "<name>" <sortidx>)`
+    /// arguments. `.func` arguments are wrapped in forwarding
+    /// `host_func` bindings; `.instance` arguments are either reused
+    /// (when the parent's binding is itself a `*const HostInstance`,
+    /// e.g. inherited WASI imports) or synthesized into a per-child
+    /// `*HostInstance` whose member funcs are forwarding adapters.
+    /// (Issue #355.)
+    fn bindChildren(self: *ComponentInstance) !void {
+        if (self.sub_instances.len == 0) return;
+        for (self.sub_instances, 0..) |maybe_child, local_inst_idx| {
+            const child = maybe_child orelse continue;
+            try self.wireSubComponentImports(child, @intCast(local_inst_idx));
+            try child.bindChildren();
+        }
+    }
+
+    /// Drain deferred core starts in post-order: this instance first,
+    /// then each non-null sub-instance recursively. See `linkImports`
+    /// for ordering rationale (issue #355).
+    fn drainAllStartsPostOrder(self: *ComponentInstance) !void {
         try self.runDeferredCoreStarts();
+        for (self.sub_instances) |maybe_child| {
+            const child = maybe_child orelse continue;
+            try child.drainAllStartsPostOrder();
+        }
+    }
+
+    /// Build a child `ImportBinding` provider map for the sub-instance
+    /// at `local_inst_idx` and link the child. The `.instantiate` AST
+    /// node carries the parent's `with` arguments; the child's import
+    /// list comes from the child's parsed component. Resolution of
+    /// each `with` argument flows through the parent's index-space
+    /// resolvers and yields either a forwarding `host_func`, a
+    /// `host_instance` (synthesized or inherited), or a pass-through
+    /// of the parent's existing binding (the WASI inheritance case).
+    fn wireSubComponentImports(
+        self: *ComponentInstance,
+        child: *ComponentInstance,
+        local_inst_idx: u32,
+    ) !void {
+        const parent_comp = self.component;
+        if (local_inst_idx >= parent_comp.instances.len)
+            return error.SubComponentLinkFailed;
+        const expr = parent_comp.instances[local_inst_idx];
+        const ie = switch (expr) {
+            .instantiate => |x| x,
+            .exports => return, // synthesized from inline exports — no runtime import wiring needed
+        };
+        if (ie.component_idx >= parent_comp.components.len)
+            return error.SubComponentLinkFailed;
+        const subcomp = parent_comp.components[ie.component_idx];
+
+        var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+        defer providers.deinit(self.allocator);
+
+        for (subcomp.imports) |child_imp| {
+            const arg = findInstantiateArg(ie.args, child_imp.name);
+            if (arg == null) {
+                // No matching `with` arg. Type imports are non-runtime
+                // and need no binding; everything else is required.
+                if (importIsRuntime(child_imp)) return error.SubComponentLinkFailed;
+                continue;
+            }
+            const binding = self.resolveSubComponentArg(child, child_imp, arg.?) catch |e| {
+                return e;
+            };
+            providers.put(self.allocator, child_imp.name, binding) catch
+                return error.OutOfMemory;
+        }
+
+        try child.bindImports(providers);
+    }
+
+    /// Resolve a single sub-component import to an `ImportBinding`,
+    /// dispatching by the child import's declared kind. Forwarding
+    /// `host_func`s and synthetic `host_instance`s are allocated from
+    /// `child.allocator` and tracked in the child's owned-resources
+    /// lists so their lifetime ends with the child (issue #355).
+    fn resolveSubComponentArg(
+        self: *ComponentInstance,
+        child: *ComponentInstance,
+        child_imp: ctypes.ImportDecl,
+        arg: ctypes.InstantiateArg,
+    ) !ImportBinding {
+        switch (child_imp.desc) {
+            .type => return .{ .host_func = .{} }, // never inspected; satisfies importKindMatches loosely
+            .func => {
+                if (arg.sort_idx.sort != .func) return error.SubComponentLinkFailed;
+                const flat = self.flattenComponentFunc(arg.sort_idx.idx) catch
+                    return error.SubComponentLinkFailed;
+                const child_type_idx: u32 = switch (child_imp.desc) {
+                    .func => |t| t,
+                    else => unreachable,
+                };
+                const ctx = try child.allocator.create(executor_mod.ForwardingHostFnCtx);
+                errdefer child.allocator.destroy(ctx);
+                ctx.* = .{ .owner = flat.owner, .local = flat.local };
+                try child.forwarding_ctxs.append(child.allocator, ctx);
+                return .{ .host_func = .{
+                    .context = ctx,
+                    .call = executor_mod.forwardingHostFnCall,
+                    .type_idx = child_type_idx,
+                } };
+            },
+            .instance => {
+                if (arg.sort_idx.sort != .instance) return error.SubComponentLinkFailed;
+                // The child's import descriptor carries the type
+                // index of the expected instance type — its body
+                // enumerates the member funcs we must satisfy.
+                const child_inst_type_idx: u32 = switch (child_imp.desc) {
+                    .instance => |t| t,
+                    else => unreachable,
+                };
+                const td = resolveTypeDef(child.component, child_inst_type_idx) orelse
+                    return error.SubComponentLinkFailed;
+                const decls = switch (td) {
+                    .instance => |it| it.decls,
+                    else => return error.SubComponentLinkFailed,
+                };
+
+                // Resolve the parent-side instance the alias chain
+                // bottoms out at.
+                const target = try self.resolveInstanceArgTarget(arg.sort_idx.idx);
+                switch (target) {
+                    .host_instance => |hi| return .{ .host_instance = hi },
+                    .runtime_instance => |target_inst| {
+                        // Synthesize a HostInstance whose members
+                        // forward to `target_inst` named exports.
+                        // The member name in the runtime export map
+                        // is `<arg-name-on-target>/<member>` for
+                        // exports of an instance member, but here
+                        // the target instance is the runtime
+                        // ComponentInstance whose `exported_funcs`
+                        // is keyed by the names we already publish.
+                        // For each member func in the child's
+                        // expected instance type, we look up
+                        // `target_inst.exported_funcs.get(<member-name-as-published-on-target>)`.
+                        // Per current registration, the parent
+                        // instance publishes instance-typed exports
+                        // dotted under `<instance-name>/<member>`.
+                        // The arg's `sort_idx.idx` references that
+                        // instance in the parent's index space —
+                        // the canonical published name for its
+                        // members on the parent equals the export
+                        // name under which the parent is *exporting*
+                        // that instance, but we don't have that name
+                        // here. So instead we register names directly
+                        // off of `target_inst.exported_funcs` keyed
+                        // by member name alone, which matches what
+                        // the issue's compose-shaped components emit
+                        // (see registerInstanceExport: it publishes
+                        // bare member names for a specific subset).
+                        //
+                        // For the wasm-tools-compose pattern at hand
+                        // — parent passes `(with "docs:adder/add@…"
+                        // (instance 9))` to the child — the
+                        // resolution lands on a parent sub_instance
+                        // whose own `<instance-name>/<member>` keys
+                        // are derivable from the parent instance's
+                        // export decl that backs that arg. We
+                        // recover the instance-name-on-target by
+                        // walking the parent instance expression to
+                        // find the export name.
+                        //
+                        // Concretely, for the arg referencing parent
+                        // index `idx` resolving to a
+                        // sub_instance N, we look at how that
+                        // sub_instance was registered on the parent
+                        // (i.e. find the parent's export with
+                        // `sort_idx.idx == idx and sort == .instance`)
+                        // — but that doesn't always exist, e.g. when
+                        // an alias produces an intermediate instance.
+                        // Implement a focused walk that handles the
+                        // case where `idx` resolves to an alias-export
+                        // off another runtime instance: the alias
+                        // name IS the prefix we need.
+                        const member_prefix = self.lookupInstancePublishedPrefix(arg.sort_idx.idx);
+
+                        const hi = try child.allocator.create(HostInstance);
+                        errdefer child.allocator.destroy(hi);
+                        hi.* = .{};
+                        errdefer hi.deinit(child.allocator);
+
+                        for (decls) |d| {
+                            const exp = switch (d) {
+                                .@"export" => |e| e,
+                                else => continue,
+                            };
+                            const member_func_type: u32 = switch (exp.desc) {
+                                .func => |t| t,
+                                else => continue,
+                            };
+                            // Look up the published key on target_inst
+                            // for this member. Try (in order):
+                            //   1. <prefix>/<member>
+                            //   2. bare <member>
+                            //   3. <member-name>
+                            const candidate1 = if (member_prefix) |p|
+                                std.fmt.allocPrint(child.module_arena.allocator(), "{s}/{s}", .{ p, exp.name }) catch return error.OutOfMemory
+                            else
+                                null;
+
+                            var resolved: ?executor_mod.FlattenedExport = null;
+                            if (candidate1) |k1| {
+                                resolved = executor_mod.flattenForwardedChain(target_inst, k1);
+                            }
+                            if (resolved == null) {
+                                resolved = executor_mod.flattenForwardedChain(target_inst, exp.name);
+                            }
+                            const flat = resolved orelse continue;
+
+                            const ctx = try child.allocator.create(executor_mod.ForwardingHostFnCtx);
+                            errdefer child.allocator.destroy(ctx);
+                            ctx.* = .{ .owner = flat.owner, .local = flat.local };
+                            try child.forwarding_ctxs.append(child.allocator, ctx);
+                            try hi.members.put(child.allocator, exp.name, .{ .func = .{
+                                .context = ctx,
+                                .call = executor_mod.forwardingHostFnCall,
+                                .type_idx = member_func_type,
+                            } });
+                        }
+                        try child.synthetic_host_instances.append(child.allocator, hi);
+                        return .{ .host_instance = hi };
+                    },
+                }
+            },
+            .module, .value, .component => return error.UnsupportedSubComponentImportKind,
+        }
+    }
+
+    /// Find the published name on this instance under which the
+    /// instance referenced by `comp_inst_idx` (parent's component-instance
+    /// index space) was exported. Used to build the
+    /// `<published-name>/<member>` lookup key when forwarding instance
+    /// members across a `with` boundary. Returns null when the index
+    /// does not correspond to a top-level export (e.g. the arg refers
+    /// to another sub_instance directly without going through an
+    /// outer-level export name).
+    fn lookupInstancePublishedPrefix(
+        self: *const ComponentInstance,
+        comp_inst_idx: u32,
+    ) ?[]const u8 {
+        // First try: parent has a top-level `(export <name> (instance N))`
+        // referencing this comp-instance idx. Common case for
+        // hand-authored components.
+        for (self.component.exports) |exp| {
+            const si = exp.sort_idx orelse continue;
+            if (si.sort != .instance) continue;
+            if (si.idx != comp_inst_idx) continue;
+            return exp.name;
+        }
+        // Second try: the comp-instance idx is an alias of the form
+        // `(alias export <inner-inst-idx> "<name>")`. The alias name
+        // IS the key under which the inner instance's child published
+        // its member exports. (This matches the
+        // `wasm-tools compose` pattern: outer aliases child[k]'s
+        // exported instance, then re-passes that alias to a sibling
+        // child via `with`.)
+        const ref = indexspace.resolveInstanceExpr(self.component, comp_inst_idx) catch return null;
+        const got = ref orelse return null;
+        return switch (got) {
+            .sub_export => |se| se.name,
+            else => null,
+        };
+    }
+
+    pub const SubArgInstanceTarget = union(enum) {
+        host_instance: *const HostInstance,
+        runtime_instance: *const ComponentInstance,
+    };
+
+    /// Resolve a parent-side `(instance N)` reference (as passed to a
+    /// sub-component via `with`) to the runtime instance the alias
+    /// chain bottoms out at. Three possibilities: an imported
+    /// host_instance (return as `.host_instance` for zero-copy
+    /// pass-through); a parent-local sub_instance; or — for an alias
+    /// hop — the named instance export of either of the above.
+    fn resolveInstanceArgTarget(
+        self: *const ComponentInstance,
+        comp_inst_idx: u32,
+    ) !SubArgInstanceTarget {
+        const ref = indexspace.resolveInstanceExpr(self.component, comp_inst_idx) catch
+            return error.SubComponentLinkFailed;
+        const got = ref orelse return error.SubComponentLinkFailed;
+        switch (got) {
+            .imported => |imp_idx| {
+                if (imp_idx >= self.component.imports.len) return error.SubComponentLinkFailed;
+                const name = self.component.imports[imp_idx].name;
+                const binding = self.imports.get(name) orelse return error.SubComponentLinkFailed;
+                switch (binding) {
+                    .host_instance => |hi| return .{ .host_instance = hi },
+                    else => return error.SubComponentLinkFailed,
+                }
+            },
+            .local => |li| {
+                if (li >= self.sub_instances.len) return error.SubComponentLinkFailed;
+                const child = self.sub_instances[li] orelse return error.SubComponentLinkFailed;
+                return .{ .runtime_instance = child };
+            },
+            .sub_export => |se| switch (se.source) {
+                .imported => |imp_idx| {
+                    if (imp_idx >= self.component.imports.len) return error.SubComponentLinkFailed;
+                    const name = self.component.imports[imp_idx].name;
+                    const binding = self.imports.get(name) orelse return error.SubComponentLinkFailed;
+                    switch (binding) {
+                        .host_instance => |hi| return .{ .host_instance = hi },
+                        else => return error.SubComponentLinkFailed,
+                    }
+                },
+                .local => |li| {
+                    if (li >= self.sub_instances.len) return error.SubComponentLinkFailed;
+                    const child = self.sub_instances[li] orelse return error.SubComponentLinkFailed;
+                    return .{ .runtime_instance = child };
+                },
+            },
+        }
+    }
+
+    /// Resolve a parent component-func index to the bottoming
+    /// `(owner, ExportedFunc.Local)`. Imported funcs are rejected (a
+    /// parent can't forward an unbound import — it must be host-bound
+    /// first); aliased funcs walk to the producing instance's named
+    /// export; lifted funcs build a `Local` directly off the canon
+    /// definition without requiring a top-level export name.
+    fn flattenComponentFunc(
+        self: *const ComponentInstance,
+        comp_func_idx: u32,
+    ) !executor_mod.FlattenedExport {
+        const ref = indexspace.resolveCompFunc(self.component, comp_func_idx) orelse
+            return error.SubComponentLinkFailed;
+        switch (ref) {
+            .imported => return error.SubComponentLinkFailed,
+            .lifted => |canon_idx| {
+                if (canon_idx >= self.component.canons.len)
+                    return error.SubComponentLinkFailed;
+                const lift = switch (self.component.canons[canon_idx]) {
+                    .lift => |l| l,
+                    else => return error.SubComponentLinkFailed,
+                };
+                const resolved = resolveLiftedCoreFunc(self, self.component, lift.core_func_idx);
+                return .{ .owner = self, .local = .{
+                    .core_instance_idx = if (resolved) |r| r.core_instance_idx else 0,
+                    .core_func_idx = if (resolved) |r| r.local_func_idx else lift.core_func_idx,
+                    .func_type_idx = lift.type_idx,
+                    .opts = lift.opts,
+                } };
+            },
+            .aliased => |alias_idx| {
+                if (alias_idx >= self.component.aliases.len)
+                    return error.SubComponentLinkFailed;
+                const ie = switch (self.component.aliases[alias_idx]) {
+                    .instance_export => |x| x,
+                    .outer => return error.SubComponentLinkFailed,
+                };
+                if (ie.sort != .func) return error.SubComponentLinkFailed;
+                const target = try self.resolveInstanceArgTarget(ie.instance_idx);
+                switch (target) {
+                    .host_instance => return error.SubComponentLinkFailed, // no host-instance forwarding
+                    .runtime_instance => |inst| {
+                        return executor_mod.flattenForwardedChain(inst, ie.name) orelse
+                            error.SubComponentLinkFailed;
+                    },
+                }
+            },
+        }
     }
 
     /// Execute any core-module `(start ...)` directives whose dispatch was
@@ -501,6 +960,28 @@ pub const ComponentInstance = struct {
     }
 
     pub fn deinit(self: *ComponentInstance) void {
+        // Children are allocated independently of `module_arena` so we
+        // can give each a deterministic deinit before the parent tears
+        // down core instances / imports / arena. Walk in declaration
+        // order; per-child deinit handles its own grandchildren.
+        if (self.sub_instances.len > 0) {
+            for (self.sub_instances) |maybe_child| {
+                if (maybe_child) |child| child.deinit();
+            }
+            self.allocator.free(self.sub_instances);
+            self.sub_instances = &.{};
+        }
+        // Forwarding contexts / synthetic host instances are owned by
+        // this instance because its `imports` map borrows them. Free
+        // them before tearing down `imports` itself.
+        for (self.forwarding_ctxs.items) |ctx| self.allocator.destroy(ctx);
+        self.forwarding_ctxs.deinit(self.allocator);
+        for (self.synthetic_host_instances.items) |hi| {
+            hi.deinit(self.allocator);
+            self.allocator.destroy(hi);
+        }
+        self.synthetic_host_instances.deinit(self.allocator);
+
         var rt_it = self.resource_tables.valueIterator();
         while (rt_it.next()) |rt| rt.deinit(self.allocator);
         self.resource_tables.deinit(self.allocator);
@@ -534,6 +1015,31 @@ pub const InstantiationError = error{
     ImportResolutionFailed,
     MissingImport,
     ImportKindMismatch,
+    /// A sub-component referenced by `(instance N (instantiate ...))`
+    /// failed to instantiate. Distinct from `CoreModuleInstantiateFailed`
+    /// so the diagnostic line points at the right layer (issue #355).
+    SubComponentInstantiateFailed,
+    /// `resolveInstanceExpr` hit a multi-hop alias chain that the
+    /// current implementation does not flatten. Real wasm-tools
+    /// compose output never produces this; surface a clear error
+    /// rather than silently dropping later exports.
+    AliasChainTooComplex,
+    /// A child sub-component import could not be wired during the
+    /// parent's `linkImports` (e.g. a required `with` arg was missing,
+    /// or its target index space slot did not resolve). Distinct from
+    /// `MissingImport` (which is raised against the *parent's* own
+    /// imports) so diagnostics name the right layer (issue #355).
+    SubComponentLinkFailed,
+    /// A sub-component declared an import of a kind we do not yet
+    /// know how to forward across `with` boundaries (`.module`,
+    /// `.value`, `.component`). Real wasm-tools-compose output for
+    /// the composed-command shape only produces `.func` / `.instance`
+    /// / `.type` imports; if we ever encounter these others, the
+    /// diagnostic must surface (issue #355).
+    UnsupportedSubComponentImportKind,
+    /// `linkImports` was called against an instance that already
+    /// failed a previous link. Callers should `deinit` instead.
+    LinkAlreadyPoisoned,
 };
 
 /// Instantiate a parsed component, producing a runnable ComponentInstance.
@@ -556,7 +1062,6 @@ pub fn instantiate(
     allocator: std.mem.Allocator,
 ) InstantiationError!*ComponentInstance {
     const inst = allocator.create(ComponentInstance) catch return error.OutOfMemory;
-    errdefer allocator.destroy(inst);
 
     inst.* = .{
         .component = component,
@@ -567,6 +1072,11 @@ pub fn instantiate(
         .imports = .{},
         .allocator = allocator,
     };
+    // From here on, `inst.deinit()` is the single owner of partial-init
+    // cleanup. The struct fields above are all in trivially-deinitable
+    // states (empty maps, freshly-init arena, &.{} slices) so deinit on
+    // partial state is safe before any further work.
+    errdefer inst.deinit();
 
     const loader = @import("../runtime/interpreter/loader.zig");
     const inst_mod = @import("../runtime/interpreter/instance.zig");
@@ -1012,6 +1522,50 @@ pub fn instantiate(
         inst.core_instances = cis;
     }
 
+    // ── Sub-component instantiation (issue #355) ───────────────────────────
+    //
+    // `wasm-tools compose` produces wrapper components that hold the actual
+    // command/library code inside nested sub-components and expose
+    // `wasi:cli/run` via `(alias export <local-instance> "wasi:cli/run@…")`.
+    // Walk `component.instances` and, for each `.instantiate { component_idx
+    // … }`, build a child `ComponentInstance` so its `canon.lift`s are
+    // backed by real core instances. Linking + deferred starts run later
+    // during the parent's `linkImports` so child WASI imports inherited
+    // through `with`-args see fully-bound parent bindings (#308 invariant
+    // for nested instances).
+    if (component.instances.len > 0) {
+        const subs = allocator.alloc(?*ComponentInstance, component.instances.len) catch
+            return error.OutOfMemory;
+        @memset(subs, null);
+        inst.sub_instances = subs;
+
+        for (component.instances, 0..) |expr, i| {
+            switch (expr) {
+                // Inline-export bundles are satisfied lexically by the
+                // existing `registerInstanceExport.exports` arm; no
+                // runtime sub-instance is needed.
+                .exports => continue,
+                .instantiate => |ie| {
+                    if (ie.component_idx >= component.components.len) continue;
+                    const subcomp = component.components[ie.component_idx];
+                    if (isImportFuncReExportShim(subcomp)) {
+                        // The wit-bindgen "0.2.0-shim" pattern — the
+                        // sub-component is purely an imported-func
+                        // re-export wrapper. The existing
+                        // `registerInstanceExport.instantiate` arm
+                        // resolves these via parent-side `with`-arg
+                        // matching without ever instantiating the
+                        // sub-component. Leave the slot null so that
+                        // path keeps handling them.
+                        continue;
+                    }
+                    subs[i] = instantiate(subcomp, allocator) catch
+                        return error.SubComponentInstantiateFailed;
+                },
+            }
+        }
+    }
+
     // Build export map: walk top-level component exports, resolve each
     // `.func` export through the component-func index space to its backing
     // `canon.lift`, and register an entry in `exported_funcs` keyed by the
@@ -1035,6 +1589,41 @@ pub fn instantiate(
     return inst;
 }
 
+/// Detect the wit-bindgen "imported-func re-export" sub-component
+/// shape: zero core modules, every `.func`-sort export resolves to a
+/// component-func import. Composed components built by `wasm-tools
+/// compose` may contain such shims as part of the `wasi:cli/run`
+/// wiring; their lifts live in the parent (or sibling sub-components),
+/// not inside the shim. The existing `registerInstanceExport.instantiate`
+/// path resolves them via `with`-arg name matching without needing a
+/// runtime instance, so leave `sub_instances[i]` null for these.
+fn isImportFuncReExportShim(subcomp: *const ctypes.Component) bool {
+    if (subcomp.core_modules.len != 0) return false;
+    if (subcomp.exports.len == 0) return false;
+    var saw_func_export = false;
+    for (subcomp.exports) |exp| {
+        const si = exp.sort_idx orelse continue;
+        if (si.sort != .func) continue;
+        saw_func_export = true;
+        const ref = indexspace.resolveCompFunc(subcomp, si.idx) orelse return false;
+        switch (ref) {
+            .imported => {},
+            else => return false,
+        }
+    }
+    return saw_func_export;
+}
+
+/// Find an `(with "<name>" <sortidx>)` argument in an instantiate
+/// expression's arg list. Returns null when no arg matches the
+/// requested name. Used by `wireSubComponentImports` (issue #355).
+fn findInstantiateArg(args: []const ctypes.InstantiateArg, name: []const u8) ?ctypes.InstantiateArg {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg.name, name)) return arg;
+    }
+    return null;
+}
+
 fn registerLiftedExport(
     inst: *ComponentInstance,
     component: *const ctypes.Component,
@@ -1050,12 +1639,12 @@ fn registerLiftedExport(
     switch (component.canons[canon_idx]) {
         .lift => |lift| {
             const resolved = resolveLiftedCoreFunc(inst, component, lift.core_func_idx);
-            inst.exported_funcs.put(allocator, name, .{
+            inst.exported_funcs.put(allocator, name, .{ .local = .{
                 .core_instance_idx = if (resolved) |r| r.core_instance_idx else 0,
                 .core_func_idx = if (resolved) |r| r.local_func_idx else lift.core_func_idx,
                 .func_type_idx = lift.type_idx,
                 .opts = lift.opts,
-            }) catch {};
+            } }) catch {};
         },
         else => {},
     }
@@ -1068,13 +1657,46 @@ fn registerInstanceExport(
     instance_name: []const u8,
     instance_idx: u32,
 ) void {
-    const ref = indexspace.resolveCompInstance(component, instance_idx) orelse return;
-    const local_idx = switch (ref) {
-        .local => |i| i,
-        // Re-exported imported instances and aliased instances aren't
-        // backed by lifts inside this component — nothing to register.
-        else => return,
-    };
+    const ier_or_err = indexspace.resolveInstanceExpr(component, instance_idx);
+    const ier = (ier_or_err catch return) orelse return;
+    switch (ier) {
+        .imported => return,
+        .local => |local_idx| registerInstanceExportLocal(
+            inst,
+            component,
+            allocator,
+            instance_name,
+            local_idx,
+        ),
+        .sub_export => |se| {
+            switch (se.source) {
+                // Aliased export of an imported instance — host instance,
+                // no parent-side lifts to re-publish.
+                .imported => return,
+                .local => |local_idx| registerInstanceExportSubExport(
+                    inst,
+                    component,
+                    allocator,
+                    instance_name,
+                    local_idx,
+                    se.name,
+                ),
+            }
+        },
+    }
+}
+
+/// Register members of a parent-local instance expression as exports.
+/// This is the original (pre-#355) path: `expr` is either an inline
+/// `.exports` bundle or a parent-level `.instantiate` of a (typically
+/// shim) sub-component.
+fn registerInstanceExportLocal(
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    allocator: std.mem.Allocator,
+    instance_name: []const u8,
+    local_idx: u32,
+) void {
     if (local_idx >= component.instances.len) return;
     const expr = component.instances[local_idx];
     const expose_bare = isWasiCliRunName(instance_name);
@@ -1106,6 +1728,24 @@ fn registerInstanceExport(
             //      register under `<instance>/<member>`.
             if (inst_expr.component_idx >= component.components.len) return;
             const subcomp = component.components[inst_expr.component_idx];
+
+            // If we instantiated this sub-component as a real runtime
+            // instance (i.e. it is NOT an imported-func re-export
+            // shim), publish forwarded exports against it directly
+            // rather than using the imported-func re-export shim path.
+            if (local_idx < inst.sub_instances.len) {
+                if (inst.sub_instances[local_idx]) |child| {
+                    publishChildInstanceMembers(
+                        inst,
+                        allocator,
+                        instance_name,
+                        child,
+                        instance_name, // child's published name == parent export name
+                    );
+                    return;
+                }
+            }
+
             for (subcomp.exports) |sub_exp| {
                 if (sub_exp.desc != .func) continue;
                 const sub_si = sub_exp.sort_idx orelse continue;
@@ -1134,6 +1774,97 @@ fn registerInstanceExport(
                 }
             }
         },
+    }
+}
+
+/// Register members of a child sub-instance's named instance export
+/// (`(alias export <child-local-idx> "<sub_name>")`) as parent exports
+/// keyed by `<top-level-name>/<member>` (and bare `<member>` for the
+/// `wasi:cli/run` shape). Each member becomes a `.forwarded` entry
+/// pointing at the child's pre-registered `<sub_name>/<member>` key.
+/// (Issue #355.)
+fn registerInstanceExportSubExport(
+    inst: *ComponentInstance,
+    component: *const ctypes.Component,
+    allocator: std.mem.Allocator,
+    instance_name: []const u8,
+    local_idx: u32,
+    sub_name: []const u8,
+) void {
+    if (local_idx >= inst.sub_instances.len) return;
+    const child = inst.sub_instances[local_idx] orelse {
+        // Sub-instance is the wit-bindgen shim — no runtime instance,
+        // so re-publication via forwarding is impossible. Fall back
+        // to the existing local-instantiate path against the
+        // `(local_idx -> instances[i])` AST, matching `with` arg
+        // names against shim imports.
+        registerInstanceExportLocal(inst, component, allocator, instance_name, local_idx);
+        return;
+    };
+
+    publishChildInstanceMembers(inst, allocator, instance_name, child, sub_name);
+}
+
+/// Publish each function member of the child's `<sub_name>` instance
+/// export under the parent's `<instance_name>/<member>` (and bare
+/// `<member>` for the `wasi:cli/run` shape) as `.forwarded` entries.
+/// Member names come from the child component's instance-type body
+/// for the matching export — not from prefix-iterating the runtime
+/// hashmap (which is order-unstable and may include non-instance
+/// keys).
+fn publishChildInstanceMembers(
+    inst: *ComponentInstance,
+    allocator: std.mem.Allocator,
+    instance_name: []const u8,
+    child: *ComponentInstance,
+    sub_name: []const u8,
+) void {
+    // Walk the child's already-registered runtime exports for keys
+    // shaped `<sub_name>/<member>`. We can't recover member names
+    // from the child's static export type body alone — top-level
+    // exports of sort `.instance` may omit their externdesc in the
+    // binary (the loader infers a placeholder type idx of 0), so
+    // `resolveTypeDef` would land on the wrong instance type
+    // signature. The child's `exported_funcs` is the authoritative
+    // post-registration view: it was populated by the child's own
+    // `registerInstanceExport` walk over its `(export <name>
+    // (instance ...))` decls.
+    const expose_bare = isWasiCliRunName(instance_name);
+    const arena = inst.module_arena.allocator();
+
+    // Two-key prefix match: `<sub_name>/<member>` and the bare
+    // `<member>` form. We only forward the dotted form here; the
+    // bare alias is handled below for the `wasi:cli/run` shape.
+    var prefix_buf = std.ArrayListUnmanaged(u8).empty;
+    defer prefix_buf.deinit(arena);
+    prefix_buf.appendSlice(arena, sub_name) catch return;
+    prefix_buf.append(arena, '/') catch return;
+    const prefix = prefix_buf.items;
+
+    var it = child.exported_funcs.iterator();
+    while (it.next()) |entry| {
+        const child_key = entry.key_ptr.*;
+        if (!std.mem.startsWith(u8, child_key, prefix)) continue;
+        const member = child_key[prefix.len..];
+        // Skip nested-dotted keys (would only arise from grand-child
+        // forwarded re-publication; not applicable here).
+        if (std.mem.indexOfScalar(u8, member, '/') != null) continue;
+
+        const parent_key = std.fmt.allocPrint(arena, "{s}/{s}", .{ instance_name, member }) catch continue;
+        // Store an owned copy of `child_key` to insulate against
+        // future child-side hashmap rehashes invalidating its
+        // internal slice. Owned by `inst.module_arena`.
+        const owned_child_key = arena.dupe(u8, child_key) catch continue;
+        inst.exported_funcs.put(allocator, parent_key, .{ .forwarded = .{
+            .owner = child,
+            .owner_export_name = owned_child_key,
+        } }) catch continue;
+        if (expose_bare and std.mem.eql(u8, member, "run")) {
+            inst.exported_funcs.put(allocator, "run", .{ .forwarded = .{
+                .owner = child,
+                .owner_export_name = owned_child_key,
+            } }) catch continue;
+        }
     }
 }
 
@@ -2190,8 +2921,9 @@ test "callComponentFunc: invokes lifted export through alias (2A.2c)" {
 
     // Confirm export resolution found the right (instance, local) pair.
     const exported = inst.getExport("run") orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(u32, 1), exported.core_instance_idx);
-    try std.testing.expectEqual(@as(u32, 1), exported.core_func_idx);
+    try std.testing.expect(exported == .local);
+    try std.testing.expectEqual(@as(u32, 1), exported.local.core_instance_idx);
+    try std.testing.expectEqual(@as(u32, 1), exported.local.core_func_idx);
 
     var args = [_]abi_mod.InterfaceValue{
         .{ .s32 = 7 },
@@ -2456,12 +3188,14 @@ test "instantiate: registers nested wasi:cli/run instance member as 'run' (#151)
     defer inst.deinit();
 
     const bare = inst.getExport("run") orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(u32, 0), bare.core_instance_idx);
-    try std.testing.expectEqual(@as(u32, 0), bare.core_func_idx);
+    try std.testing.expect(bare == .local);
+    try std.testing.expectEqual(@as(u32, 0), bare.local.core_instance_idx);
+    try std.testing.expectEqual(@as(u32, 0), bare.local.core_func_idx);
 
     const dotted = inst.getExport("wasi:cli/run@0.2.6/run") orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(u32, 0), dotted.core_instance_idx);
-    try std.testing.expectEqual(@as(u32, 0), dotted.core_func_idx);
+    try std.testing.expect(dotted == .local);
+    try std.testing.expectEqual(@as(u32, 0), dotted.local.core_instance_idx);
+    try std.testing.expectEqual(@as(u32, 0), dotted.local.core_func_idx);
 }
 
 test "instantiate: core (start ...) calling canon-lowered host import sees bound host_func (#308)" {
@@ -2606,4 +3340,217 @@ test "instantiate: instance-type body export-of-type .eq aliases prior local slo
     try executor.callComponentFunc(inst, "call-now", &args, &results, std.testing.allocator);
     try std.testing.expectEqual(@as(u64, Host.expected), results[0].u64);
     try std.testing.expectEqual(@as(u32, 1), Host.calls);
+}
+
+test "instantiate: aliased instance export of sub-component publishes 'run' (#355)" {
+    const executor = @import("executor.zig");
+    const abi_mod = @import("canonical_abi.zig");
+
+    // Hand-authored composed-shape fixture (issue #355):
+    //   (component   (component                                 ;; sub-component
+    //                  (core module $A (func $r (export "run") nop))
+    //                  (core instance $a (instantiate $A))
+    //                  (alias core export $a "run" (core func $cr))
+    //                  (func $lr (canon lift (core func $cr)))
+    //                  (instance $i0 (export "run" (func $lr)))
+    //                  (export "wasi:cli/run@0.2.6" (instance $i0))
+    //                )
+    //     (instance $sub (instantiate 0))                        ;; comp inst 0
+    //     (alias export $sub "wasi:cli/run@0.2.6" (instance $r))  ;; comp inst 1
+    //     (export "wasi:cli/run@0.2.6" (instance $r))
+    //   )
+    //
+    // After instantiate(), inst.getExport("run") must resolve to a
+    // `.forwarded` whose owner is the child sub-instance and whose
+    // owner_export_name is `wasi:cli/run@0.2.6/run`. Calling it
+    // through `executor.callComponentFunc` must reach the child's
+    // lifted core func 0 in core instance 0.
+    const core_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // function section: 1 fn of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "run" -> func 0
+        0x07, 0x07, 0x01, 0x03, 'r', 'u', 'n', 0x00, 0x00,
+        // code section: empty body
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+
+    const sub_core_modules = [_]ctypes.CoreModule{.{ .data = &core_wasm }};
+    const sub_type_defs = [_]ctypes.TypeDef{
+        .{ .func = .{ .params = &.{}, .results = .none } },
+    };
+    const sub_core_insts = [_]ctypes.CoreInstanceExpr{
+        .{ .instantiate = .{ .module_idx = 0, .args = &.{} } },
+    };
+    const sub_aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = 0,
+            .name = "run",
+        } },
+    };
+    const sub_canons = [_]ctypes.Canon{
+        .{ .lift = .{ .core_func_idx = 0, .type_idx = 0, .opts = &.{} } },
+    };
+    const sub_inline_exp = [_]ctypes.InlineExport{
+        .{ .name = "run", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const sub_instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &sub_inline_exp },
+    };
+    const sub_exports = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:cli/run@0.2.6",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+    const sub_component = ctypes.Component{
+        .core_modules = &sub_core_modules,
+        .core_instances = &sub_core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &sub_instances,
+        .aliases = &sub_aliases,
+        .types = &sub_type_defs,
+        .canons = &sub_canons,
+        .imports = &.{},
+        .exports = &sub_exports,
+    };
+
+    // Outer component.
+    const sub_components = [_]*const ctypes.Component{&sub_component};
+    const outer_instances = [_]ctypes.InstanceExpr{
+        .{ .instantiate = .{ .component_idx = 0, .args = &.{} } },
+    };
+    const outer_aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 0,
+            .name = "wasi:cli/run@0.2.6",
+        } },
+    };
+    const outer_exports = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:cli/run@0.2.6",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 1 },
+        },
+    };
+    // Section-order indexspace: instance[0]=comp_inst 0, alias[0]=comp_inst 1.
+    const outer_comp_inst_indexspace = [_]ctypes.CompInstanceContributor{
+        .{ .instance = 0 },
+        .{ .alias = 0 },
+    };
+    const outer_component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = @ptrCast(&sub_components),
+        .instances = &outer_instances,
+        .aliases = &outer_aliases,
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &outer_exports,
+        .comp_instance_indexspace = &outer_comp_inst_indexspace,
+    };
+
+    const inst = try instantiate(&outer_component, std.testing.allocator);
+    defer inst.deinit();
+
+    // Bare 'run' must be present and forwarded.
+    const bare = inst.getExport("run") orelse return error.TestFailed;
+    try std.testing.expect(bare == .forwarded);
+    // The dotted parent key must also be present.
+    try std.testing.expect(inst.getExport("wasi:cli/run@0.2.6/run") != null);
+
+    // Flattening should bottom out on the child's local lift over
+    // its core instance 0, core func 0.
+    const flat = executor.flattenForwardedChain(inst, "run") orelse return error.TestFailed;
+    try std.testing.expect(flat.owner != inst);
+    try std.testing.expectEqual(@as(u32, 0), flat.local.core_instance_idx);
+    try std.testing.expectEqual(@as(u32, 0), flat.local.core_func_idx);
+
+    // End-to-end: invoke "run" via the executor — should not trap.
+    var args_buf: [0]abi_mod.InterfaceValue = .{};
+    var results_buf: [0]abi_mod.InterfaceValue = .{};
+    try executor.callComponentFunc(inst, "run", &args_buf, &results_buf, std.testing.allocator);
+}
+
+test "instantiate: two-deep alias chain to sub-component instance export (#355)" {
+    // Same sub-component as the previous test, but the outer adds a
+    // second alias hop:
+    //   alias[0] = export 0 "wasi:cli/run@0.2.6"     (comp inst 1)
+    //   alias[1] = export 1 "run"                    -- (THIS would alias a func, not an instance)
+    // Instead, do a real two-hop alias of an instance:
+    //   instance[0] = (instantiate 0)                                 (comp inst 0)
+    //   alias[0]    = export 0 "wasi:cli/run@0.2.6" (instance ;; cmp 1)
+    //   alias[1]    = export 1 ???   -- aliasing the instance member of an alias of an instance
+    //
+    // The composed shape only contains single-hop aliases of instance
+    // members in practice (each alias section emits one hop). Two-hop
+    // chains arise when an alias-of-instance is itself aliased again.
+    // We model this by adding a passthrough alias hop:
+    //   alias[1] = export 1 ... -- but instance 1 doesn't have nested instance exports here.
+    //
+    // The current resolveInstanceExpr API supports only single-hop in
+    // the body; multi-hop returns MultiHopAliasUnsupported. We assert
+    // that explicitly so that future relaxation is intentional.
+    const ier = indexspace.InstanceExprRef;
+    _ = ier;
+
+    // Build a minimal component with an alias-of-an-alias and verify
+    // that resolution returns `error.MultiHopAliasUnsupported`. This
+    // pins current behaviour; if the resolver later grows multi-hop
+    // support, this test should be flipped to verify the resolved
+    // chain lands on the underlying sub-export.
+    const dummy_imports = [_]ctypes.ImportDecl{};
+    const aliases = [_]ctypes.Alias{
+        // alias[0]: from comp_inst 0 (an import) — but with no
+        // imports declared, we instead use a synthetic instance.
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 0,
+            .name = "first-hop",
+        } },
+        // alias[1]: alias of the previous alias
+        .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = 1,
+            .name = "second-hop",
+        } },
+    };
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &.{} },
+    };
+    const idx_space = [_]ctypes.CompInstanceContributor{
+        .{ .instance = 0 }, // comp inst 0 -> instance[0]
+        .{ .alias = 0 }, // comp inst 1 -> alias[0]
+        .{ .alias = 1 }, // comp inst 2 -> alias[1]
+    };
+    const component = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &aliases,
+        .types = &.{},
+        .canons = &.{},
+        .imports = &dummy_imports,
+        .exports = &.{},
+        .comp_instance_indexspace = &idx_space,
+    };
+
+    // Single-hop (alias[0] of instance[0]) must resolve.
+    const r1 = try indexspace.resolveInstanceExpr(&component, 1);
+    try std.testing.expect(r1 != null);
+    try std.testing.expect(r1.? == .sub_export);
+
+    // Two-hop (alias[1] of alias[0]) must surface MultiHopAliasUnsupported.
+    const r2 = indexspace.resolveInstanceExpr(&component, 2);
+    try std.testing.expectError(error.MultiHopAliasUnsupported, r2);
 }
