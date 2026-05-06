@@ -39,6 +39,10 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
           version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./.github/actions/zig-cache
 
       - name: Install wabt (wat2wasm / wasm-validate / wasm-objdump)
         run: |
@@ -63,7 +67,7 @@ jobs:
       - name: Cache Zig global cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ~/.cache/zig
+          path: ${{ env.ZIG_GLOBAL_CACHE_DIR }}
           key: zig-cache-${{ runner.os }}-0.16.0-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-cache-${{ runner.os }}-0.16.0-
