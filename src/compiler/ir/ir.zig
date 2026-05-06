@@ -428,6 +428,8 @@ pub const Inst = struct {
         div,
         min,
         max,
+        pmin,
+        pmax,
     };
 
     pub const V128Mem = struct {
@@ -1211,11 +1213,11 @@ test "Inst: first v128 op family preserves operand shape" {
     try std.testing.expectEqual(@as(VReg, 26), f32_convert.op.f32x4_convert_i32x4.vector);
 
     const f32_bin = Inst{
-        .op = .{ .f32x4_binop = .{ .op = .max, .lhs = 27, .rhs = 28 } },
+        .op = .{ .f32x4_binop = .{ .op = .pmax, .lhs = 27, .rhs = 28 } },
         .dest = 29,
         .type = .v128,
     };
-    try std.testing.expectEqual(Inst.F32x4Op.max, f32_bin.op.f32x4_binop.op);
+    try std.testing.expectEqual(Inst.F32x4Op.pmax, f32_bin.op.f32x4_binop.op);
     try std.testing.expectEqual(@as(VReg, 27), f32_bin.op.f32x4_binop.lhs);
     try std.testing.expectEqual(@as(VReg, 28), f32_bin.op.f32x4_binop.rhs);
 
