@@ -1,6 +1,6 @@
 name: CoreMark (x86_64)
 
-# Per-PR CoreMark comparison on the self-hosted x86_64 runner.
+# Per-PR CoreMark comparison on a GitHub-hosted x86_64 runner.
 # Runs `scripts/bench_coremark.py` against the PR base, posts a delta table.
 
 on:
@@ -27,9 +27,9 @@ on:
       - .github/workflows/coremark-x86_64.yml
 
 concurrency:
-  # Serialize on the self-hosted runner: parallel CoreMark invocations would
-  # contend on cores and skew results.
-  group: coremark-x86_64
+  # Serialize per branch: parallel CoreMark invocations on the same runner
+  # would contend on cores and skew results.
+  group: coremark-x86_64-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -38,7 +38,7 @@ permissions:
 
 jobs:
   coremark:
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
