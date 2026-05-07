@@ -7,6 +7,14 @@ const aot_supported = switch (builtin.cpu.arch) {
     else => false,
 };
 
+/// `--map-dir HOST::GUEST` flag value: pre-open `host_path` on the host and
+/// expose it to the guest under `guest_name`. Slices borrow from `args`,
+/// which lives for the entire process.
+pub const MapDir = struct {
+    host_path: []const u8,
+    guest_name: []const u8,
+};
+
 const Subcommand = enum { run, version, help };
 
 fn parseSubcommand(s: []const u8) ?Subcommand {
@@ -47,6 +55,10 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     var wasm_path: ?[]const u8 = null;
     var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer wasm_args.deinit(allocator);
+    var env_flags: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer env_flags.deinit(allocator);
+    var map_dirs: std.ArrayListUnmanaged(MapDir) = .empty;
+    defer map_dirs.deinit(allocator);
     var listen_address: ?std.Io.net.IpAddress = null;
     var stack_size: u32 = 64 * 1024;
     var past_options = false;
@@ -71,6 +83,34 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 };
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
                 // Reserved for future WASI heap allocation
+            } else if (std.mem.eql(u8, arg, "--env") or std.mem.startsWith(u8, arg, "--env=")) {
+                const spec = if (std.mem.eql(u8, arg, "--env")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --env requires KEY=VALUE\n", .{});
+                        std.process.exit(1);
+                    }
+                    break :blk run_args[i];
+                } else arg["--env=".len..];
+                if (std.mem.indexOfScalar(u8, spec, '=') == null) {
+                    std.debug.print("error: --env value '{s}' is missing '='\n", .{spec});
+                    std.process.exit(1);
+                }
+                env_flags.append(allocator, spec) catch std.process.exit(1);
+            } else if (std.mem.eql(u8, arg, "--map-dir") or std.mem.startsWith(u8, arg, "--map-dir=")) {
+                const spec = if (std.mem.eql(u8, arg, "--map-dir")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --map-dir requires HOST::GUEST\n", .{});
+                        std.process.exit(1);
+                    }
+                    break :blk run_args[i];
+                } else arg["--map-dir=".len..];
+                const md = parseMapDir(spec) catch {
+                    std.debug.print("error: --map-dir value '{s}' must be 'HOST::GUEST'\n", .{spec});
+                    std.process.exit(1);
+                };
+                map_dirs.append(allocator, md) catch std.process.exit(1);
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
@@ -113,13 +153,21 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     if (wasm_data.len >= 8 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.wasm_magic) {
         const version = std.mem.readInt(u32, wasm_data[4..8], .little);
         if (version == wamr.types.component_version) {
-            // Inherit host env. EnvVar slices borrow from the existing
+            // For components: prefer explicit --env entries; otherwise inherit
+            // the host environment. EnvVar slices borrow from the existing
             // environ_map (lifetime: the entire process).
             var env_list: std.ArrayListUnmanaged(wamr.wasi_cli_adapter.EnvVar) = .empty;
             defer env_list.deinit(allocator);
-            var it = init.environ_map.array_hash_map.iterator();
-            while (it.next()) |kv| {
-                env_list.append(allocator, .{ .name = kv.key_ptr.*, .value = kv.value_ptr.* }) catch {};
+            if (env_flags.items.len > 0) {
+                for (env_flags.items) |kv| {
+                    const eq = std.mem.indexOfScalar(u8, kv, '=').?;
+                    env_list.append(allocator, .{ .name = kv[0..eq], .value = kv[eq + 1 ..] }) catch {};
+                }
+            } else {
+                var it = init.environ_map.array_hash_map.iterator();
+                while (it.next()) |kv| {
+                    env_list.append(allocator, .{ .name = kv.key_ptr.*, .value = kv.value_ptr.* }) catch {};
+                }
             }
             if (listen_address) |addr| {
                 runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr);
@@ -136,7 +184,15 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     }
 
     // Wasm module (core)
-    runWasm(wasm_data, stack_size, &wasm_args, allocator);
+    runWasm(wasm_data, stack_size, path, &wasm_args, env_flags.items, map_dirs.items, allocator, io);
+}
+
+fn parseMapDir(spec: []const u8) !MapDir {
+    const sep = std.mem.indexOf(u8, spec, "::") orelse return error.MissingSeparator;
+    const host = spec[0..sep];
+    const guest = spec[sep + 2 ..];
+    if (host.len == 0 or guest.len == 0) return error.MissingSeparator;
+    return .{ .host_path = host, .guest_name = guest };
 }
 
 fn parseListenAddress(spec: []const u8) !std.Io.net.IpAddress {
@@ -320,8 +376,12 @@ fn runAotReal(data: []const u8, allocator: std.mem.Allocator) void {
 fn runWasm(
     wasm_data: []const u8,
     stack_size: u32,
+    wasm_path: []const u8,
     wasm_args: *std.ArrayListUnmanaged([]const u8),
+    env_flags: []const []const u8,
+    map_dirs: []const MapDir,
     allocator: std.mem.Allocator,
+    io: std.Io,
 ) void {
     var runtime = wamr.wamr.Runtime.init(allocator);
     defer runtime.deinit();
@@ -353,15 +413,42 @@ fn runWasm(
     };
     defer env.destroy();
 
+    // Build argv for WASI: [wasm_path, wasm_args...]
+    var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv_list.deinit(allocator);
+    argv_list.append(allocator, wasm_path) catch std.process.exit(1);
+    for (wasm_args.items) |a| argv_list.append(allocator, a) catch std.process.exit(1);
+
+    var ctx = wamr.WasiCtx.init(allocator, io) catch |err| {
+        std.debug.print("Error: failed to create WASI context: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer ctx.deinit();
+
+    ctx.setArgs(argv_list.items);
+    ctx.setEnv(env_flags);
+
+    for (map_dirs) |md| {
+        _ = ctx.openMappedDir(md.host_path, md.guest_name) catch |err| {
+            std.debug.print("Error: cannot pre-open '{s}' as '{s}': {}\n", .{ md.host_path, md.guest_name, err });
+            std.process.exit(1);
+        };
+    }
+
+    env.wasi_ctx = @ptrCast(ctx);
+
     if (param_count >= 2) {
         env.pushI32(@intCast(wasm_args.items.len + 1)) catch {};
         env.pushI32(0) catch {};
     }
 
     wamr.interp.executeFunction(env, start_func.index) catch |err| {
+        if (ctx.exit_code) |code| std.process.exit(@intCast(code));
         std.debug.print("Error: execution trapped: {}\n", .{err});
         std.process.exit(1);
     };
+
+    if (ctx.exit_code) |code| std.process.exit(@intCast(code));
 }
 
 fn writeStdout(io: std.Io, text: []const u8) void {
@@ -385,10 +472,13 @@ const run_usage =
     \\Usage: wamr run [options] <file.wasm|file.cwasm> [args...]
     \\
     \\Options:
-    \\  --stack-size=<bytes>   Stack size for the interpreter (default: 65536)
-    \\  --heap-size=<bytes>    Reserved (currently ignored)
-    \\  --listen=<ip:port>     Serve a WASI HTTP component on a TCP address
-    \\  -h, --help             Show this help
+    \\  --stack-size=<bytes>     Stack size for the interpreter (default: 65536)
+    \\  --heap-size=<bytes>      Reserved (currently ignored)
+    \\  --listen=<ip:port>       Serve a WASI HTTP component on a TCP address
+    \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
+    \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
+    \\                           inside the guest WASI sandbox (repeatable)
+    \\  -h, --help               Show this help
     \\
 ;
 
@@ -429,4 +519,31 @@ test "subcommand parsing" {
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("--version"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("foo.wasm"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand(""));
+}
+
+test "parseMapDir splits HOST::GUEST" {
+    const md = try parseMapDir("/tmp/host::/sandbox");
+    try std.testing.expectEqualStrings("/tmp/host", md.host_path);
+    try std.testing.expectEqualStrings("/sandbox", md.guest_name);
+}
+
+test "parseMapDir rejects missing separator" {
+    try std.testing.expectError(error.MissingSeparator, parseMapDir("/tmp/host"));
+    try std.testing.expectError(error.MissingSeparator, parseMapDir("/tmp/host:/sandbox"));
+    try std.testing.expectError(error.MissingSeparator, parseMapDir("::guest"));
+    try std.testing.expectError(error.MissingSeparator, parseMapDir("host::"));
+}
+
+test "version line second whitespace token is the version (parsable by wasi-testsuite adapter)" {
+    // The upstream `wasi-testsuite` Python adapter calls `wamr version` and
+    // parses with `result.stdout.splitlines()[0].split(" ")[1]`. Mirror that
+    // logic exactly here so any change to the version output that breaks
+    // adapter parsing fails this test.
+    const line = "wamr " ++ wamr.version.string ++ "\n";
+    const newline = std.mem.indexOfScalar(u8, line, '\n').?;
+    const first_line = line[0..newline];
+    var it = std.mem.splitScalar(u8, first_line, ' ');
+    _ = it.next().?; // "wamr"
+    const version_token = it.next().?;
+    try std.testing.expectEqualStrings(wamr.version.string, version_token);
 }

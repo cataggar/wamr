@@ -58,6 +58,24 @@ $ zig build
 $ ./zig-out/bin/spec-test-runner tests/spec-json
 ```
 
+WASI conformance ([WebAssembly/wasi-testsuite][wts]):
+
+```console
+$ git submodule update --init tests/wasi-testsuite
+$ pip install -r tests/wasi-testsuite/test-runner/requirements.txt
+$ zig build wasi-testsuite
+```
+
+The suite drives the freshly-built `wamr` CLI through the in-tree adapter at
+[`tests/wasi-testsuite-adapter/wamr-zig.py`](tests/wasi-testsuite-adapter/wamr-zig.py)
+and applies the curated skiplist at
+[`tests/wasi-testsuite-skip.json`](tests/wasi-testsuite-skip.json). Every entry
+in the skiplist must carry a one-line rationale and a follow-up issue number.
+When a previously-skipped test starts passing, delete the entry — the suite is
+the gate against regressions in already-shipped WASI host functions.
+
+[wts]: https://github.com/WebAssembly/wasi-testsuite
+
 ## License
 
 [Apache 2.0](LICENSE)

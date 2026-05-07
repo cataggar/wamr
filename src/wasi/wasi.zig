@@ -131,6 +131,14 @@ pub const Preopen = struct {
 pub const FdEntry = struct {
     kind: FdKind,
     host_fd: ?std.posix.fd_t = null,
+    /// Owned host directory handle for `directory` entries (preopens and the
+    /// results of `path_open` on directories). `null` for non-directory
+    /// entries. WasiCtx owns this and closes it on `fd_close` / `deinit`.
+    host_dir: ?std.Io.Dir = null,
+    /// Tracks the byte offset for `regular_file` entries so `fd_seek` /
+    /// `fd_read` / `fd_write` can advance the position without relying on
+    /// host-side seek (which the std.Io.File reader/writer wraps).
+    pos: u64 = 0,
 
     pub const FdKind = enum {
         stdin,
@@ -181,7 +189,7 @@ pub const WasiCtx = struct {
     io: Io,
     args: []const []const u8 = &.{},
     env_vars: []const []const u8 = &.{},
-    preopens: []const Preopen = &.{},
+    preopens: std.ArrayListUnmanaged(Preopen) = .empty,
     fd_table: FdTable,
     exit_code: ?u32 = null,
 
@@ -200,6 +208,25 @@ pub const WasiCtx = struct {
     }
 
     pub fn deinit(self: *WasiCtx) void {
+        // Close any host Dir / file handles owned by the table before tearing
+        // it down so the OS doesn't see a leak in long-lived embedders.
+        var it = self.fd_table.entries.iterator();
+        while (it.next()) |kv| {
+            const entry = kv.value_ptr.*;
+            if (entry.host_dir) |dir| {
+                var d = dir;
+                d.close(self.io);
+            }
+            if (entry.host_fd) |host_fd| {
+                if (entry.kind == .regular_file) {
+                    const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
+                    file.close(self.io);
+                }
+            }
+        }
+        // Free the duplicated guest-name strings stored on each Preopen.
+        for (self.preopens.items) |p| self.allocator.free(p.path);
+        self.preopens.deinit(self.allocator);
         self.fd_table.deinit();
         self.allocator.destroy(self);
     }
@@ -212,11 +239,38 @@ pub const WasiCtx = struct {
         self.env_vars = env;
     }
 
-    pub fn addPreopen(self: *WasiCtx, fd: u32, path: []const u8) !void {
-        _ = self;
-        _ = fd;
-        _ = path;
-        // TODO: implement preopened directory
+    /// Register an already-opened host directory under `guest_name` as a
+    /// preopen. Allocates a fresh fd ≥ 3 and takes ownership of `dir`
+    /// (closed on `WasiCtx.deinit`). Returns the assigned fd.
+    pub fn addPreopen(self: *WasiCtx, guest_name: []const u8, dir: std.Io.Dir) !u32 {
+        const fd = self.fd_table.allocateFd();
+        const owned_name = try self.allocator.dupe(u8, guest_name);
+        errdefer self.allocator.free(owned_name);
+        try self.fd_table.insert(fd, .{
+            .kind = .directory,
+            .host_dir = dir,
+        });
+        try self.preopens.append(self.allocator, .{ .fd = fd, .path = owned_name });
+        return fd;
+    }
+
+    /// Open `host_path` on the host and register it as a preopen exposed to
+    /// the guest under `guest_name`. Used by the CLI's `--map-dir` flag.
+    pub fn openMappedDir(self: *WasiCtx, host_path: []const u8, guest_name: []const u8) !u32 {
+        const dir = try std.Io.Dir.cwd().openDir(self.io, host_path, .{ .iterate = true });
+        errdefer {
+            var d = dir;
+            d.close(self.io);
+        }
+        return try self.addPreopen(guest_name, dir);
+    }
+
+    /// Look up a preopen by its assigned fd; returns the guest name or null.
+    pub fn preopenName(self: *const WasiCtx, fd: u32) ?[]const u8 {
+        for (self.preopens.items) |p| {
+            if (p.fd == fd) return p.path;
+        }
+        return null;
     }
 
     // ── args ────────────────────────────────────────────────────────
@@ -501,24 +555,42 @@ test "environ_sizes_get" {
     try std.testing.expectEqual(@as(u32, 16), sizes.buf_size);
 }
 
-test "fd_write to stdout does not crash" {
+test "fd_write to a regular file writes all iovs" {
+    // NOTE: deliberately does NOT exercise stdout/stderr (fd 1/2). When run
+    // under `zig build test` the test binary's stdout is a pipe carrying the
+    // Zig test event protocol, so writing raw bytes there desynchronises the
+    // orchestrator and hangs CI. The real stdio path is covered end-to-end by
+    // the wasi-testsuite suite (`zig build wasi-testsuite`).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile(testing_io, "fd_write.bin", .{ .read = true });
+    defer file.close(testing_io);
+
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    var data = "test output\n".*;
-    const iovs = [_]IoVec{.{ .buf = &data, .len = @intCast(data.len) }};
-    const result = try ctx.fd_write(1, &iovs);
-    try std.testing.expectEqual(@as(u32, 12), result.nwritten);
-}
+    const fd = ctx.fd_table.allocateFd();
+    try ctx.fd_table.insert(fd, .{
+        .kind = .regular_file,
+        .host_fd = file.handle,
+    });
 
-test "fd_write to stderr does not crash" {
-    const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
-    defer ctx.deinit();
-
-    var data = "err output\n".*;
-    const iovs = [_]IoVec{.{ .buf = &data, .len = @intCast(data.len) }};
-    const result = try ctx.fd_write(2, &iovs);
+    var part1 = "hello ".*;
+    var part2 = "world".*;
+    const iovs = [_]IoVec{
+        .{ .buf = &part1, .len = @intCast(part1.len) },
+        .{ .buf = &part2, .len = @intCast(part2.len) },
+    };
+    const result = try ctx.fd_write(fd, &iovs);
     try std.testing.expectEqual(@as(u32, 11), result.nwritten);
+
+    // Drop the entry so deinit doesn't re-close the host fd we still own.
+    ctx.fd_table.remove(fd);
+
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositionalAll(testing_io, &buf, 0);
+    try std.testing.expectEqualStrings("hello world", buf[0..n]);
 }
 
 test "fd_write to invalid fd returns error" {

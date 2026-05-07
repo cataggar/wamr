@@ -186,6 +186,35 @@ pub fn build(b: *std.Build) void {
     const spec_aot_step = b.step("spec-tests-aot", "Run the spec-json suite through the AOT pipeline");
     spec_aot_step.dependOn(&run_spec_aot.step);
 
+    // ── WASI conformance suite ────────────────────────────────────────
+    // Drives the vendored `WebAssembly/wasi-testsuite` against the just-built
+    // `wamr` CLI through the in-tree adapter. Skiplist entries must each
+    // carry a rationale + follow-up issue number — see
+    // `tests/wasi-testsuite-skip.json`. Not wired into the default `test`
+    // aggregate (it requires Python 3 + the runner's deps), but the CI job
+    // gates regressions on every PR. Run locally with `zig build wasi-testsuite`.
+    const wasi_runner = b.addSystemCommand(&.{
+        "python3",
+        "tests/wasi-testsuite/test-runner/wasi_test_runner.py",
+        "--test-suite",
+        "tests/wasi-testsuite/tests/c/testsuite/wasm32-wasip1",
+        "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip1",
+        "tests/wasi-testsuite/tests/assemblyscript/testsuite/wasm32-wasip1",
+        "--runtime-adapter",
+        "tests/wasi-testsuite-adapter/wamr-zig.py",
+        "--exclude-filter",
+        "tests/wasi-testsuite-skip.json",
+    });
+    // Point the adapter at the freshly-installed wamr binary so we don't pick
+    // up a stale system iwasm.
+    wasi_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    wasi_runner.step.dependOn(b.getInstallStep());
+    const wasi_testsuite_step = b.step(
+        "wasi-testsuite",
+        "Run the WebAssembly/wasi-testsuite conformance suite",
+    );
+    wasi_testsuite_step.dependOn(&wasi_runner.step);
+
     // ── Tests ──────────────────────────────────────────────────────────
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
@@ -247,13 +276,15 @@ pub fn build(b: *std.Build) void {
         wamrc_version_run.expectStdOutEqual(wamrc_version_line);
         test_step.dependOn(&wamrc_version_run.step);
 
-        const wamr_no_subcmd = b.addRunArtifact(exe);
-        wamr_no_subcmd.expectExitCode(1);
-        test_step.dependOn(&wamr_no_subcmd.step);
+        const wamr_help_run = b.addRunArtifact(exe);
+        wamr_help_run.addArgs(&.{ "help", "run" });
+        wamr_help_run.expectExitCode(0);
+        test_step.dependOn(&wamr_help_run.step);
 
-        const wamrc_no_subcmd = b.addRunArtifact(wamrc);
-        wamrc_no_subcmd.expectExitCode(1);
-        test_step.dependOn(&wamrc_no_subcmd.step);
+        const wamrc_help_compile = b.addRunArtifact(wamrc);
+        wamrc_help_compile.addArgs(&.{ "help", "compile" });
+        wamrc_help_compile.expectExitCode(0);
+        test_step.dependOn(&wamrc_help_compile.step);
     }
 
     // Compiler IR passes tests (separate module to avoid root/wamr conflict)
