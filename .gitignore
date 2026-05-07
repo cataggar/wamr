@@ -42,4 +42,4 @@ tests/benchmarks/**/*.wasm
 tests/benchmarks/**/*.aot
 tests/benchmarks/**/*.exe
 bin/
-tests/component/src/**/target/
+examples/components/**/target/
