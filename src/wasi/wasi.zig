@@ -555,24 +555,42 @@ test "environ_sizes_get" {
     try std.testing.expectEqual(@as(u32, 16), sizes.buf_size);
 }
 
-test "fd_write to stdout does not crash" {
+test "fd_write to a regular file writes all iovs" {
+    // NOTE: deliberately does NOT exercise stdout/stderr (fd 1/2). When run
+    // under `zig build test` the test binary's stdout is a pipe carrying the
+    // Zig test event protocol, so writing raw bytes there desynchronises the
+    // orchestrator and hangs CI. The real stdio path is covered end-to-end by
+    // the wasi-testsuite suite (`zig build wasi-testsuite`).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile(testing_io, "fd_write.bin", .{ .read = true });
+    defer file.close(testing_io);
+
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
-    var data = "test output\n".*;
-    const iovs = [_]IoVec{.{ .buf = &data, .len = @intCast(data.len) }};
-    const result = try ctx.fd_write(1, &iovs);
-    try std.testing.expectEqual(@as(u32, 12), result.nwritten);
-}
+    const fd = ctx.fd_table.allocateFd();
+    try ctx.fd_table.insert(fd, .{
+        .kind = .regular_file,
+        .host_fd = file.handle,
+    });
 
-test "fd_write to stderr does not crash" {
-    const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
-    defer ctx.deinit();
-
-    var data = "err output\n".*;
-    const iovs = [_]IoVec{.{ .buf = &data, .len = @intCast(data.len) }};
-    const result = try ctx.fd_write(2, &iovs);
+    var part1 = "hello ".*;
+    var part2 = "world".*;
+    const iovs = [_]IoVec{
+        .{ .buf = &part1, .len = @intCast(part1.len) },
+        .{ .buf = &part2, .len = @intCast(part2.len) },
+    };
+    const result = try ctx.fd_write(fd, &iovs);
     try std.testing.expectEqual(@as(u32, 11), result.nwritten);
+
+    // Drop the entry so deinit doesn't re-close the host fd we still own.
+    ctx.fd_table.remove(fd);
+
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositionalAll(testing_io, &buf, 0);
+    try std.testing.expectEqualStrings("hello world", buf[0..n]);
 }
 
 test "fd_write to invalid fd returns error" {

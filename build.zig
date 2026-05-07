@@ -276,13 +276,15 @@ pub fn build(b: *std.Build) void {
         wamrc_version_run.expectStdOutEqual(wamrc_version_line);
         test_step.dependOn(&wamrc_version_run.step);
 
-        const wamr_no_subcmd = b.addRunArtifact(exe);
-        wamr_no_subcmd.expectExitCode(1);
-        test_step.dependOn(&wamr_no_subcmd.step);
+        const wamr_help_run = b.addRunArtifact(exe);
+        wamr_help_run.addArgs(&.{ "help", "run" });
+        wamr_help_run.expectExitCode(0);
+        test_step.dependOn(&wamr_help_run.step);
 
-        const wamrc_no_subcmd = b.addRunArtifact(wamrc);
-        wamrc_no_subcmd.expectExitCode(1);
-        test_step.dependOn(&wamrc_no_subcmd.step);
+        const wamrc_help_compile = b.addRunArtifact(wamrc);
+        wamrc_help_compile.addArgs(&.{ "help", "compile" });
+        wamrc_help_compile.expectExitCode(0);
+        test_step.dependOn(&wamrc_help_compile.step);
     }
 
     // Compiler IR passes tests (separate module to avoid root/wamr conflict)
