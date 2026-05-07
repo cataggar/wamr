@@ -213,28 +213,13 @@ jobs:
         with:
           name: wamr ${{ steps.version.outputs.version }}
           body: |
-            ## wamr ${{ steps.version.outputs.version }} — Zig rewrite
-
-            Experimental fork of [bytecodealliance/wasm-micro-runtime](https://github.com/bytecodealliance/wasm-micro-runtime) rewritten from C to Zig.
-
-            **Highlights:**
-            - 99.9% spec conformance (20,878/20,901 assertions)
-            - Build system: `build.zig` with cross-compilation
-            - Zig 0.16.0 (pure Zig source, libc linked for stack canaries)
-            - Built with `ReleaseSafe` (runtime safety checks) + stack protector
-            - 11 platform targets (linux, macOS, Windows, musl, RISC-V, WASI)
-
-            **Tools included:** wamr, wamrc
-
             **Install:**
+
             ```
-            dist install cataggar/wamr@v${{ steps.version.outputs.version }}
-            ```
-            ```
-            uv tool install wamr-bin==${{ steps.version.outputs.pep440 }}
+            ghr install cataggar/wamr@v${{ steps.version.outputs.version }}
             ```
 
-            See [installation details](https://github.com/cataggar/wamr/issues/69) for more options.
+            See [INSTALL.md](https://github.com/cataggar/wamr/blob/main/INSTALL.md) for more options.
           files: |
             wamr-*.tar.gz
             wamr-*.tar.xz
