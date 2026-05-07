@@ -126,9 +126,10 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(full_path);
 
         // (The previous `memory_trap64.wast` skip was removed: the spec-test
-        // runner iterates `tests/spec-json/` which only contains .json files,
-        // and the underlying wamr panic no longer reproduces after the
-        // interp/AOT loader fixes.)
+        // runner iterates `tests/spec-json/` whose canonical content is .json
+        // files plus a few salvaged .wast regression fixtures, and the
+        // underlying wamr panic no longer reproduces after the interp/AOT
+        // loader fixes.)
         var should_skip = false;
         if (mode == .aot and aot_skiplist.isSkippedInAot(name)) {
             should_skip = true;

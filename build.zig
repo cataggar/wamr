@@ -308,8 +308,8 @@ pub fn build(b: *std.Build) void {
     // ── CoreMark AOT runner ────────────────────────────────────────────
     // Loads a CoreMark wasi `.wasm` and executes it through the Zig AOT
     // backend (same pipeline as differential tests). Replaces the old
-    // C-based `tests/standalone/coremark/run.sh` for gating the Zig
-    // backend on real CoreMark workloads.
+    // C-based standalone coremark runner for gating the Zig backend on
+    // real CoreMark workloads.
     const coremark_module = b.createModule(.{
         .root_source_file = b.path("src/tests/coremark_aot_runner.zig"),
         .target = target,
@@ -324,9 +324,9 @@ pub fn build(b: *std.Build) void {
     if (aot_executable_target) b.installArtifact(coremark_exe);
 
     const run_coremark_nofp = b.addRunArtifact(coremark_exe);
-    run_coremark_nofp.addArg("tests/standalone/coremark/coremark_wasi_nofp.wasm");
+    run_coremark_nofp.addArg("tests/benchmarks/coremark/coremark_wasi_nofp.wasm");
     const run_coremark_fp = b.addRunArtifact(coremark_exe);
-    run_coremark_fp.addArg("tests/standalone/coremark/coremark_wasi.wasm");
+    run_coremark_fp.addArg("tests/benchmarks/coremark/coremark_wasi.wasm");
     const coremark_step = b.step(
         "coremark-aot",
         "Run the CoreMark wasi benchmarks through the Zig AOT backend",
@@ -427,14 +427,14 @@ pub fn build(b: *std.Build) void {
 
     // ── Component-model examples ─────────────────────────────────────
     // Reproducible Zig (and one mixed Zig+Rust) WebAssembly component
-    // examples under `tests/component/src/`. Opt-in: not reachable from
+    // examples under `examples/components/`. Opt-in: not reachable from
     // the default `zig build` or `zig build test` graphs. See
-    // `tests/component/README.md` for prereqs and runtime status.
+    // `examples/components/README.md` for prereqs and runtime status.
     addComponentExamples(b, exe);
 }
 
 /// Wires up the Component-Model example pipeline (sources under
-/// `tests/component/src/`). Two opt-in steps are exposed:
+/// `examples/components/`). Two opt-in steps are exposed:
 ///   * `zig build component-examples`     — build + validate all four
 ///   * `zig build component-examples-run` — runs `zig-hello` through `wamr`
 /// Neither is reachable from `zig build` or `zig build test`.
@@ -463,7 +463,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
 
     const examples_step = b.step(
         "component-examples",
-        "Build the WebAssembly Component examples in tests/component/src/",
+        "Build the WebAssembly Component examples in examples/components/",
     );
     const run_step = b.step(
         "component-examples-run",
@@ -473,7 +473,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // ── zig-hello ──────────────────────────────────────────────────
     // Pure-Zig WASI command: `_start` writes a greeting via fd_write.
     const hello_core = compileZigWasm(b, .{
-        .source = "tests/component/src/zig-hello/src/main.zig",
+        .source = "examples/components/zig-hello/src/main.zig",
         .target_triple = "wasm32-wasi",
         .exports = &.{"_start"},
         .output = "zig-hello.core.wasm",
@@ -501,13 +501,13 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // ── zig-adder ──────────────────────────────────────────────────
     // Library component (no `run`): exports `docs:adder/add@0.1.0`.
     const adder_core = compileZigWasm(b, .{
-        .source = "tests/component/src/zig-adder/src/main.zig",
+        .source = "examples/components/zig-adder/src/main.zig",
         .target_triple = "wasm32-freestanding",
         .exports = &.{"docs:adder/add@0.1.0#add"},
         .output = "zig-adder.core.wasm",
     });
     const adder_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "adder" });
-    adder_embed.addDirectoryArg(b.path("tests/component/src/zig-adder/wit"));
+    adder_embed.addDirectoryArg(b.path("examples/components/zig-adder/wit"));
     adder_embed.addFileArg(adder_core);
     adder_embed.addArg("-o");
     const adder_embedded = adder_embed.addOutputFileArg("zig-adder.embed.wasm");
@@ -524,13 +524,13 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
 
     // ── zig-calculator-cmd (Zig command importing zig-adder) ───────
     const calc_core = compileZigWasm(b, .{
-        .source = "tests/component/src/zig-calculator-cmd/src/main.zig",
+        .source = "examples/components/zig-calculator-cmd/src/main.zig",
         .target_triple = "wasm32-wasi",
         .exports = &.{"_start"},
         .output = "zig-calculator-cmd.core.wasm",
     });
     const calc_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "app" });
-    calc_embed.addDirectoryArg(b.path("tests/component/src/zig-calculator-cmd/wit"));
+    calc_embed.addDirectoryArg(b.path("examples/components/zig-calculator-cmd/wit"));
     calc_embed.addFileArg(calc_core);
     calc_embed.addArg("-o");
     const calc_embedded = calc_embed.addOutputFileArg("zig-calculator-cmd.embed.wasm");
@@ -575,7 +575,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
         "cargo",                                                      "build",
         "--release",                                                  "--target",
         "wasm32-wasip1",                                              "--manifest-path",
-        "tests/component/src/mixed-zig-rust-calc/command/Cargo.toml",
+        "examples/components/mixed-zig-rust-calc/command/Cargo.toml",
     });
     cargo.setName("cargo build (mixed-zig-rust-calc command)");
     // Cargo writes its outputs to a deterministic path; we surface the
@@ -583,13 +583,13 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // build-graph-tracked LazyPath.
     const cargo_pickup = b.addSystemCommand(&.{
         "cp",
-        "tests/component/src/mixed-zig-rust-calc/command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm",
+        "examples/components/mixed-zig-rust-calc/command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm",
     });
     cargo_pickup.step.dependOn(&cargo.step);
     const rust_core = cargo_pickup.addOutputFileArg("mixed_zig_rust_command.core.wasm");
 
     const rust_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "app" });
-    rust_embed.addDirectoryArg(b.path("tests/component/src/mixed-zig-rust-calc/command/wit"));
+    rust_embed.addDirectoryArg(b.path("examples/components/mixed-zig-rust-calc/command/wit"));
     rust_embed.addFileArg(rust_core);
     rust_embed.addArg("-o");
     const rust_embedded = rust_embed.addOutputFileArg("mixed-rust-command.embed.wasm");
