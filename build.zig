@@ -275,6 +275,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/compiler/bench_codegen.zig"),
         .target = target,
         .optimize = .ReleaseFast,
+        // Darwin's clock_gettime lives in libSystem; the timer needs libc
+        // linked. Linux uses a raw syscall and Windows uses ntdll, so libc
+        // is only required here.
+        .link_libc = if (target.result.os.tag.isDarwin()) true else null,
     });
 
     const bench_exe = b.addExecutable(.{

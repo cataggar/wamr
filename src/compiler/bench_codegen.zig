@@ -23,6 +23,7 @@ fn sampleUnit() []const u8 {
 }
 
 /// Read the fastest available monotonic-ish sample source for benchmark timing.
+/// Returns CPU cycles on x86 (via rdtsc) and nanoseconds on every other target.
 inline fn sampleTicks() u64 {
     if (comptime usesCycleCounter()) {
         var lo: u32 = undefined;
@@ -33,14 +34,38 @@ inline fn sampleTicks() u64 {
         );
         return (@as(u64, hi) << 32) | lo;
     }
-    if (comptime builtin.os.tag == .linux) {
-        const linux = std.os.linux;
-        var ts: linux.timespec = undefined;
-        const rc = linux.clock_gettime(.MONOTONIC, &ts);
-        if (rc != 0) @panic("clock_gettime(CLOCK_MONOTONIC) failed");
-        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-    }
-    @compileError("codegen benchmark needs a portable timer for this non-x86 target");
+    return switch (comptime builtin.os.tag) {
+        .linux => blk: {
+            const linux = std.os.linux;
+            var ts: linux.timespec = undefined;
+            const rc = linux.clock_gettime(.MONOTONIC, &ts);
+            if (rc != 0) @panic("clock_gettime(CLOCK_MONOTONIC) failed");
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+        .macos, .ios, .tvos, .watchos, .visionos => blk: {
+            // Darwin: clock_gettime(CLOCK_MONOTONIC) lives in libSystem; the
+            // bench module is built with link_libc=true on these targets.
+            var ts: std.c.timespec = undefined;
+            if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) {
+                @panic("clock_gettime(CLOCK_MONOTONIC) failed");
+            }
+            break :blk @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+        .windows => blk: {
+            // Windows: convert QueryPerformanceCounter ticks to nanoseconds so
+            // the reported unit ("ns/op") is meaningful regardless of the
+            // host's perf-counter frequency.
+            const ntdll = std.os.windows.ntdll;
+            var counter: std.os.windows.LARGE_INTEGER = undefined;
+            var freq: std.os.windows.LARGE_INTEGER = undefined;
+            _ = ntdll.RtlQueryPerformanceCounter(&counter);
+            _ = ntdll.RtlQueryPerformanceFrequency(&freq);
+            const ticks: u128 = @intCast(counter);
+            const hz: u128 = @intCast(freq);
+            break :blk @as(u64, @truncate(ticks * std.time.ns_per_s / hz));
+        },
+        else => @compileError("codegen benchmark needs a portable timer for this target"),
+    };
 }
 
 const BenchResult = struct {
