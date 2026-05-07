@@ -216,6 +216,46 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_lib_unit_tests.step);
     test_step.dependOn(&run_exe_unit_tests.step);
 
+    // wamrc unit tests (subcommand parsing, deriveOutputPath).
+    const wamrc_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    wamrc_test_module.addImport("config", config_module);
+    wamrc_test_module.addImport("wamr", lib_module);
+    const wamrc_unit_tests = b.addTest(.{
+        .root_module = wamrc_test_module,
+    });
+    const run_wamrc_unit_tests = b.addRunArtifact(wamrc_unit_tests);
+    test_step.dependOn(&run_wamrc_unit_tests.step);
+
+    // CLI smoke assertions: subcommand layout, exit codes, version stdout.
+    {
+        const wamr_version_line = b.fmt("wamr {s}\n", .{version_string});
+        const wamrc_version_line = b.fmt("wamrc {s}\n", .{version_string});
+
+        const wamr_version_run = b.addRunArtifact(exe);
+        wamr_version_run.addArg("version");
+        wamr_version_run.expectExitCode(0);
+        wamr_version_run.expectStdOutEqual(wamr_version_line);
+        test_step.dependOn(&wamr_version_run.step);
+
+        const wamrc_version_run = b.addRunArtifact(wamrc);
+        wamrc_version_run.addArg("version");
+        wamrc_version_run.expectExitCode(0);
+        wamrc_version_run.expectStdOutEqual(wamrc_version_line);
+        test_step.dependOn(&wamrc_version_run.step);
+
+        const wamr_no_subcmd = b.addRunArtifact(exe);
+        wamr_no_subcmd.expectExitCode(1);
+        test_step.dependOn(&wamr_no_subcmd.step);
+
+        const wamrc_no_subcmd = b.addRunArtifact(wamrc);
+        wamrc_no_subcmd.expectExitCode(1);
+        test_step.dependOn(&wamrc_no_subcmd.step);
+    }
+
     // Compiler IR passes tests (separate module to avoid root/wamr conflict)
     const passes_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/passes.zig"),
@@ -493,6 +533,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // fd 2 today; tracking issue separate from this PR). Pin the
     // assertion to the observed behaviour so the run step is stable.
     const run_hello = b.addRunArtifact(wamr_exe);
+    run_hello.addArg("run");
     run_hello.addFileArg(hello);
     run_hello.expectExitCode(0);
     run_hello.expectStdErrEqual("hello from zig component\n");
@@ -561,6 +602,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // that this composed command needs to reach its `wasi:cli/run`
     // export.
     const run_calc = b.addRunArtifact(wamr_exe);
+    run_calc.addArg("run");
     run_calc.addFileArg(calc_final);
     run_calc.expectExitCode(0);
     run_calc.expectStdErrEqual("40 + 2 = 42\n100 + 200 = 300\n");
@@ -613,6 +655,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // path as `zig-calculator-cmd` (issue #355); produces the same
     // two-line output, again on host stderr.
     const run_mixed = b.addRunArtifact(wamr_exe);
+    run_mixed.addArg("run");
     run_mixed.addFileArg(mixed_final);
     run_mixed.expectExitCode(0);
     run_mixed.expectStdErrEqual("40 + 2 = 42\n100 + 200 = 300\n");

@@ -7,38 +7,66 @@ const aot_supported = switch (builtin.cpu.arch) {
     else => false,
 };
 
+const Subcommand = enum { run, version, help };
+
+fn parseSubcommand(s: []const u8) ?Subcommand {
+    if (std.mem.eql(u8, s, "run")) return .run;
+    if (std.mem.eql(u8, s, "version")) return .version;
+    if (std.mem.eql(u8, s, "help")) return .help;
+    return null;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    // Parse arguments
+    if (args.len < 2) {
+        std.debug.print("error: missing subcommand — try `wamr help`\n", .{});
+        std.process.exit(1);
+    }
+
+    const subcmd = parseSubcommand(args[1]) orelse {
+        std.debug.print("error: unknown subcommand '{s}' — try `wamr help`\n", .{args[1]});
+        std.process.exit(1);
+    };
+
+    switch (subcmd) {
+        .version => {
+            writeStdout(init.io, "wamr " ++ wamr.version.string ++ "\n");
+            return;
+        },
+        .help => {
+            runHelp(init.io, args[2..]);
+            return;
+        },
+        .run => try runRun(init, allocator, args[2..]),
+    }
+}
+
+fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []const []const u8) !void {
     var wasm_path: ?[]const u8 = null;
     var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer wasm_args.deinit(allocator);
-    var show_version = false;
     var listen_address: ?std.Io.net.IpAddress = null;
     var stack_size: u32 = 64 * 1024;
     var past_options = false;
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
+    var i: usize = 0;
+    while (i < run_args.len) : (i += 1) {
+        const arg = run_args[i];
         if (!past_options and arg.len > 0 and arg[0] == '-') {
-            if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-                show_version = true;
-            } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-                printUsage();
+            if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+                runHelp(init.io, &.{"run"});
                 return;
             } else if (std.mem.startsWith(u8, arg, "--stack-size=")) {
                 stack_size = std.fmt.parseInt(u32, arg["--stack-size=".len..], 10) catch {
-                    std.debug.print("Error: invalid --stack-size value\n", .{});
+                    std.debug.print("error: invalid --stack-size value\n", .{});
                     std.process.exit(1);
                 };
             } else if (std.mem.startsWith(u8, arg, "--listen=")) {
                 const spec = arg["--listen=".len..];
                 listen_address = parseListenAddress(spec) catch {
-                    std.debug.print("Error: invalid --listen address '{s}'\n", .{spec});
+                    std.debug.print("error: invalid --listen address '{s}'\n", .{spec});
                     std.process.exit(1);
                 };
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
@@ -46,8 +74,7 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
-                std.debug.print("Error: unknown option '{s}'\n", .{arg});
-                printUsage();
+                std.debug.print("error: unknown option '{s}' — try `wamr help run`\n", .{arg});
                 std.process.exit(1);
             }
         } else if (wasm_path == null) {
@@ -58,17 +85,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    if (show_version) {
-        printVersion();
-        if (wasm_path == null) return;
-    }
-
     const path = wasm_path orelse {
-        printUsage();
-        return;
+        std.debug.print("error: missing wasm/cwasm file — usage: wamr run <file> [args...]\n", .{});
+        std.process.exit(1);
     };
 
-    // Load wasm binary
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
     const wasm_data = cwd.readFileAlloc(io, path, allocator, @enumFromInt(256 * 1024 * 1024)) catch |err| {
@@ -343,30 +364,69 @@ fn runWasm(
     };
 }
 
-fn versionLine() []const u8 {
-    return "wamr " ++ wamr.version.string ++ "\n";
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
 }
 
-fn printVersion() void {
-    std.debug.print("{s}", .{versionLine()});
+const top_usage =
+    \\wamr - WebAssembly Micro Runtime
+    \\
+    \\Usage: wamr <subcommand> [args...]
+    \\
+    \\Subcommands:
+    \\  run       Run a .wasm or .cwasm file
+    \\  version   Print version and exit
+    \\  help      Print this help; `wamr help <subcommand>` for details
+    \\
+;
+
+const run_usage =
+    \\Usage: wamr run [options] <file.wasm|file.cwasm> [args...]
+    \\
+    \\Options:
+    \\  --stack-size=<bytes>   Stack size for the interpreter (default: 65536)
+    \\  --heap-size=<bytes>    Reserved (currently ignored)
+    \\  --listen=<ip:port>     Serve a WASI HTTP component on a TCP address
+    \\  -h, --help             Show this help
+    \\
+;
+
+const version_usage =
+    \\Usage: wamr version
+    \\
+    \\Print the wamr version and exit.
+    \\
+;
+
+const help_usage =
+    \\Usage: wamr help [subcommand]
+    \\
+    \\Print top-level help, or help for a specific subcommand.
+    \\
+;
+
+fn runHelp(io: std.Io, args: []const []const u8) void {
+    if (args.len == 0) {
+        writeStdout(io, top_usage);
+        return;
+    }
+    const sub = parseSubcommand(args[0]) orelse {
+        std.debug.print("error: unknown subcommand '{s}' — try `wamr help`\n", .{args[0]});
+        std.process.exit(1);
+    };
+    writeStdout(io, switch (sub) {
+        .run => run_usage,
+        .version => version_usage,
+        .help => help_usage,
+    });
 }
 
-fn printUsage() void {
-    std.debug.print(
-        \\wamr - WebAssembly Micro Runtime
-        \\
-        \\Usage: wamr [options] <file.wasm> [args...]
-        \\
-        \\Options:
-        \\  -v, --version           Show version
-        \\  -h, --help              Show this help
-        \\  --stack-size=<bytes>     Set stack size (default: 65536)
-        \\  --heap-size=<bytes>     Set heap size (default: 262144)
-        \\  --listen=<ip:port>       Serve a WASI HTTP component on a TCP address
-        \\
-    , .{});
-}
-
-test "version line uses wamr name and build version" {
-    try std.testing.expectEqualStrings("wamr " ++ wamr.version.string ++ "\n", versionLine());
+test "subcommand parsing" {
+    try std.testing.expectEqual(@as(?Subcommand, .run), parseSubcommand("run"));
+    try std.testing.expectEqual(@as(?Subcommand, .version), parseSubcommand("version"));
+    try std.testing.expectEqual(@as(?Subcommand, .help), parseSubcommand("help"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("--version"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("foo.wasm"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand(""));
 }

@@ -1,6 +1,7 @@
 //! wamrc — WebAssembly AOT Compiler (Zig implementation)
 //!
-//! Compiles .wasm files to WAMR AOT format using the Zig-native compiler backend.
+//! Compiles .wasm files to a `.cwasm` AOT-compiled binary using the
+//! Zig-native compiler backend.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -12,18 +13,43 @@ const passes = wamr.passes;
 
 const TargetArch = passes.TargetArch;
 
+const Subcommand = enum { compile, version, help };
+
+fn parseSubcommand(s: []const u8) ?Subcommand {
+    if (std.mem.eql(u8, s, "compile")) return .compile;
+    if (std.mem.eql(u8, s, "version")) return .version;
+    if (std.mem.eql(u8, s, "help")) return .help;
+    return null;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    if (args.len < 3) {
-        std.debug.print("Usage: wamrc <input.wasm> -o <output.aot>\n", .{});
-        std.debug.print("       wamrc [--aarch64-no-scheduler] [--aarch64-no-xreg-alloc] [--target aarch64|x86_64] <input.wasm> -o <output.aot>\n", .{});
-        std.debug.print("\nWebAssembly AOT Compiler (Zig)\n", .{});
+    if (args.len < 2) {
+        std.debug.print("error: missing subcommand — try `wamrc help`\n", .{});
         std.process.exit(1);
     }
 
+    const subcmd = parseSubcommand(args[1]) orelse {
+        std.debug.print("error: unknown subcommand '{s}' — try `wamrc help`\n", .{args[1]});
+        std.process.exit(1);
+    };
+
+    switch (subcmd) {
+        .version => {
+            writeStdout(init.io, "wamrc " ++ wamr.version.string ++ "\n");
+            return;
+        },
+        .help => {
+            runHelp(init.io, args[2..]);
+            return;
+        },
+        .compile => try runCompile(init, allocator, args[2..]),
+    }
+}
+
+fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var optimize = true;
@@ -34,39 +60,62 @@ pub fn main(init: std.process.Init) !void {
         else => .x86_64,
     };
 
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "-o") and i + 1 < args.len) {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const a = sub_args[i];
+        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            runHelp(init.io, &.{"compile"});
+            return;
+        } else if (std.mem.eql(u8, a, "-o") and i + 1 < sub_args.len) {
             i += 1;
-            output_path = args[i];
-        } else if (std.mem.eql(u8, args[i], "-O0")) {
+            output_path = sub_args[i];
+        } else if (std.mem.eql(u8, a, "-O0")) {
             optimize = false;
-        } else if (std.mem.eql(u8, args[i], "--target") and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, a, "--target") and i + 1 < sub_args.len) {
             i += 1;
-            if (std.mem.eql(u8, args[i], "aarch64")) {
+            if (std.mem.eql(u8, sub_args[i], "aarch64")) {
                 target_arch = .aarch64;
-            } else if (std.mem.eql(u8, args[i], "x86_64") or std.mem.eql(u8, args[i], "x86-64")) {
+            } else if (std.mem.eql(u8, sub_args[i], "x86_64") or std.mem.eql(u8, sub_args[i], "x86-64")) {
                 target_arch = .x86_64;
             } else {
-                std.debug.print("Error: unknown target '{s}' (supported: x86_64, aarch64)\n", .{args[i]});
+                std.debug.print("error: unknown target '{s}' (supported: x86_64, aarch64)\n", .{sub_args[i]});
                 std.process.exit(1);
             }
-        } else if (std.mem.eql(u8, args[i], "--aarch64-no-scheduler")) {
+        } else if (std.mem.startsWith(u8, a, "--target=")) {
+            const t = a["--target=".len..];
+            if (std.mem.eql(u8, t, "aarch64")) {
+                target_arch = .aarch64;
+            } else if (std.mem.eql(u8, t, "x86_64") or std.mem.eql(u8, t, "x86-64")) {
+                target_arch = .x86_64;
+            } else {
+                std.debug.print("error: unknown target '{s}' (supported: x86_64, aarch64)\n", .{t});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, a, "--aarch64-no-scheduler")) {
             enable_aarch64_scheduler = false;
-        } else if (std.mem.eql(u8, args[i], "--aarch64-no-xreg-alloc")) {
+        } else if (std.mem.eql(u8, a, "--aarch64-no-xreg-alloc")) {
             enable_aarch64_xreg_alloc = false;
+        } else if (a.len > 0 and a[0] == '-') {
+            std.debug.print("error: unknown option '{s}' — try `wamrc help compile`\n", .{a});
+            std.process.exit(1);
+        } else if (input_path == null) {
+            input_path = a;
         } else {
-            input_path = args[i];
+            std.debug.print("error: unexpected positional argument '{s}'\n", .{a});
+            std.process.exit(1);
         }
     }
 
     const in_path = input_path orelse {
-        std.debug.print("Error: no input file specified\n", .{});
+        std.debug.print("error: missing input wasm file — usage: wamrc compile <input.wasm> [-o <output.cwasm>]\n", .{});
         std.process.exit(1);
     };
-    const out_path = output_path orelse {
-        std.debug.print("Error: no output file specified (use -o)\n", .{});
-        std.process.exit(1);
+    var derived_out_path: ?[]u8 = null;
+    defer if (derived_out_path) |p| allocator.free(p);
+    const out_path: []const u8 = if (output_path) |p| p else blk: {
+        const d = try deriveOutputPath(allocator, in_path);
+        derived_out_path = d;
+        break :blk d;
     };
 
     // 1. Read input wasm
@@ -347,4 +396,108 @@ fn valueToV128(v: wamr.types.Value) u128 {
         .v128 => |x| x,
         else => 0,
     };
+}
+
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
+}
+
+const top_usage =
+    \\wamrc - WebAssembly AOT Compiler
+    \\
+    \\Usage: wamrc <subcommand> [args...]
+    \\
+    \\Subcommands:
+    \\  compile   Compile a .wasm module to a .cwasm AOT binary
+    \\  version   Print version and exit
+    \\  help      Print this help; `wamrc help <subcommand>` for details
+    \\
+;
+
+const compile_usage =
+    \\Usage: wamrc compile [options] <input.wasm> [-o <output.cwasm>]
+    \\
+    \\Compile a .wasm module to a .cwasm AOT binary. If `-o` is omitted,
+    \\the output filename is derived by replacing the `.wasm` suffix on the
+    \\input with `.cwasm` (or appending `.cwasm` if no `.wasm` suffix).
+    \\
+    \\Options:
+    \\  -o <path>                     Output .cwasm path (default: <input>.cwasm)
+    \\  --target=<x86_64|aarch64>     Target architecture (default: host)
+    \\  -O0                           Disable IR optimizations
+    \\  --aarch64-no-scheduler        Disable AArch64 instruction scheduler
+    \\  --aarch64-no-xreg-alloc       Disable AArch64 X-register allocator
+    \\  -h, --help                    Show this help
+    \\
+;
+
+const version_usage =
+    \\Usage: wamrc version
+    \\
+    \\Print the wamrc version and exit.
+    \\
+;
+
+const help_usage =
+    \\Usage: wamrc help [subcommand]
+    \\
+    \\Print top-level help, or help for a specific subcommand.
+    \\
+;
+
+fn runHelp(io: std.Io, args: []const []const u8) void {
+    if (args.len == 0) {
+        writeStdout(io, top_usage);
+        return;
+    }
+    const sub = parseSubcommand(args[0]) orelse {
+        std.debug.print("error: unknown subcommand '{s}' — try `wamrc help`\n", .{args[0]});
+        std.process.exit(1);
+    };
+    writeStdout(io, switch (sub) {
+        .compile => compile_usage,
+        .version => version_usage,
+        .help => help_usage,
+    });
+}
+
+/// Derive an output `.cwasm` path from the input wasm path. Strips a
+/// trailing `.wasm` suffix and appends `.cwasm`; if there is no
+/// `.wasm` suffix, just appends `.cwasm`. Caller owns the returned slice.
+fn deriveOutputPath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const stem = if (std.mem.endsWith(u8, input, ".wasm"))
+        input[0 .. input.len - ".wasm".len]
+    else
+        input;
+    return std.mem.concat(allocator, u8, &.{ stem, ".cwasm" });
+}
+
+test "subcommand parsing" {
+    try std.testing.expectEqual(@as(?Subcommand, .compile), parseSubcommand("compile"));
+    try std.testing.expectEqual(@as(?Subcommand, .version), parseSubcommand("version"));
+    try std.testing.expectEqual(@as(?Subcommand, .help), parseSubcommand("help"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("--help"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("foo.wasm"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand(""));
+}
+
+test "deriveOutputPath strips .wasm and appends .cwasm" {
+    const a = std.testing.allocator;
+
+    const r1 = try deriveOutputPath(a, "foo.wasm");
+    defer a.free(r1);
+    try std.testing.expectEqualStrings("foo.cwasm", r1);
+
+    const r2 = try deriveOutputPath(a, "/tmp/path/to/bar.wasm");
+    defer a.free(r2);
+    try std.testing.expectEqualStrings("/tmp/path/to/bar.cwasm", r2);
+
+    const r3 = try deriveOutputPath(a, "noext");
+    defer a.free(r3);
+    try std.testing.expectEqualStrings("noext.cwasm", r3);
+
+    const r4 = try deriveOutputPath(a, "weird.wasm.bin");
+    defer a.free(r4);
+    try std.testing.expectEqualStrings("weird.wasm.bin.cwasm", r4);
 }
