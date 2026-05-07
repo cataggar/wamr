@@ -92,6 +92,7 @@ pub const spec_runner = @import("tests/spec_runner.zig");
 /// Note: Uses std.fs.File; tests require IO-aware runner.
 /// Excluded from refAllDecls to avoid test runner hang.
 const _wasi = @import("wasi/wasi.zig");
+pub const WasiCtx = _wasi.WasiCtx;
 
 /// Thread manager for WASI-threads.
 pub const thread_manager = @import("wasi/thread_manager.zig");

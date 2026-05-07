@@ -131,6 +131,14 @@ pub const Preopen = struct {
 pub const FdEntry = struct {
     kind: FdKind,
     host_fd: ?std.posix.fd_t = null,
+    /// Owned host directory handle for `directory` entries (preopens and the
+    /// results of `path_open` on directories). `null` for non-directory
+    /// entries. WasiCtx owns this and closes it on `fd_close` / `deinit`.
+    host_dir: ?std.Io.Dir = null,
+    /// Tracks the byte offset for `regular_file` entries so `fd_seek` /
+    /// `fd_read` / `fd_write` can advance the position without relying on
+    /// host-side seek (which the std.Io.File reader/writer wraps).
+    pos: u64 = 0,
 
     pub const FdKind = enum {
         stdin,
@@ -181,7 +189,7 @@ pub const WasiCtx = struct {
     io: Io,
     args: []const []const u8 = &.{},
     env_vars: []const []const u8 = &.{},
-    preopens: []const Preopen = &.{},
+    preopens: std.ArrayListUnmanaged(Preopen) = .empty,
     fd_table: FdTable,
     exit_code: ?u32 = null,
 
@@ -200,6 +208,25 @@ pub const WasiCtx = struct {
     }
 
     pub fn deinit(self: *WasiCtx) void {
+        // Close any host Dir / file handles owned by the table before tearing
+        // it down so the OS doesn't see a leak in long-lived embedders.
+        var it = self.fd_table.entries.iterator();
+        while (it.next()) |kv| {
+            const entry = kv.value_ptr.*;
+            if (entry.host_dir) |dir| {
+                var d = dir;
+                d.close(self.io);
+            }
+            if (entry.host_fd) |host_fd| {
+                if (entry.kind == .regular_file) {
+                    const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
+                    file.close(self.io);
+                }
+            }
+        }
+        // Free the duplicated guest-name strings stored on each Preopen.
+        for (self.preopens.items) |p| self.allocator.free(p.path);
+        self.preopens.deinit(self.allocator);
         self.fd_table.deinit();
         self.allocator.destroy(self);
     }
@@ -212,11 +239,38 @@ pub const WasiCtx = struct {
         self.env_vars = env;
     }
 
-    pub fn addPreopen(self: *WasiCtx, fd: u32, path: []const u8) !void {
-        _ = self;
-        _ = fd;
-        _ = path;
-        // TODO: implement preopened directory
+    /// Register an already-opened host directory under `guest_name` as a
+    /// preopen. Allocates a fresh fd ≥ 3 and takes ownership of `dir`
+    /// (closed on `WasiCtx.deinit`). Returns the assigned fd.
+    pub fn addPreopen(self: *WasiCtx, guest_name: []const u8, dir: std.Io.Dir) !u32 {
+        const fd = self.fd_table.allocateFd();
+        const owned_name = try self.allocator.dupe(u8, guest_name);
+        errdefer self.allocator.free(owned_name);
+        try self.fd_table.insert(fd, .{
+            .kind = .directory,
+            .host_dir = dir,
+        });
+        try self.preopens.append(self.allocator, .{ .fd = fd, .path = owned_name });
+        return fd;
+    }
+
+    /// Open `host_path` on the host and register it as a preopen exposed to
+    /// the guest under `guest_name`. Used by the CLI's `--map-dir` flag.
+    pub fn openMappedDir(self: *WasiCtx, host_path: []const u8, guest_name: []const u8) !u32 {
+        const dir = try std.Io.Dir.cwd().openDir(self.io, host_path, .{ .iterate = true });
+        errdefer {
+            var d = dir;
+            d.close(self.io);
+        }
+        return try self.addPreopen(guest_name, dir);
+    }
+
+    /// Look up a preopen by its assigned fd; returns the guest name or null.
+    pub fn preopenName(self: *const WasiCtx, fd: u32) ?[]const u8 {
+        for (self.preopens.items) |p| {
+            if (p.fd == fd) return p.path;
+        }
+        return null;
     }
 
     // ── args ────────────────────────────────────────────────────────

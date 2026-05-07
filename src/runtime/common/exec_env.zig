@@ -124,6 +124,17 @@ pub const ExecEnv = struct {
     /// an opaque "Unreachable" — see issue #308.
     host_trap: ?HostTrapInfo = null,
 
+    /// Optional opaque pointer to a `wasi.WasiCtx` used by the
+    /// `wasi_snapshot_preview1` host functions to look up args, env vars,
+    /// and preopened file descriptors. `null` when no WASI context has been
+    /// attached (unit tests, fuzz harnesses, library-style embedders); host
+    /// functions then fall back to the legacy stub behavior in
+    /// `src/wasi/wasi_core.zig`. Stored as `*anyopaque` to keep this
+    /// runtime-common module from depending on the higher-level WASI module.
+    /// Not owned by ExecEnv: lifetime is managed by the embedder (`runWasm`
+    /// in `src/main.zig`).
+    wasi_ctx: ?*anyopaque = null,
+
     /// Create a new execution environment.
     pub fn create(
         module_inst: *types.ModuleInstance,
