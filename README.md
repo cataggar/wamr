@@ -16,8 +16,8 @@ See [INSTALL.md](INSTALL.md) for alternative installation methods (winget, uv, p
 
 ## Tools
 
- - **wamrc**: AOT compiler — compile a `.wasm` module to a native `.aot` binary
- - **wamr**: run a WebAssembly module — either a `.wasm` file via the stack-based interpreter, or a precompiled `.aot` file produced by `wamrc`
+ - **wamrc**: AOT compiler — compile a `.wasm` module to a native `.cwasm` binary (`wamrc compile foo.wasm`)
+ - **wamr**: run a WebAssembly module — either a `.wasm` file via the stack-based interpreter, or a precompiled `.cwasm` file produced by `wamrc` (`wamr run foo.wasm`)
 
 ## Building
 

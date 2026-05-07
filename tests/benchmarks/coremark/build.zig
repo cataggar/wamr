@@ -70,14 +70,14 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(wasm_exe);
 
-    // ── AOT compilation (wamrc: .wasm → .aot) ────────────────────────
-    const aot_cmd = b.addSystemCommand(&.{wamrc_path});
+    // ── AOT compilation (wamrc compile: .wasm → .cwasm) ──────────────
+    const aot_cmd = b.addSystemCommand(&.{ wamrc_path, "compile" });
     aot_cmd.addArg("-o");
-    const aot_output = aot_cmd.addOutputFileArg("coremark.aot");
+    const aot_output = aot_cmd.addOutputFileArg("coremark.cwasm");
     aot_cmd.addFileArg(wasm_exe.getEmittedBin());
 
-    const install_aot = b.addInstallFile(aot_output, "bin/coremark.aot");
-    const aot_step = b.step("aot", "Compile CoreMark .wasm to .aot via wamrc");
+    const install_aot = b.addInstallFile(aot_output, "bin/coremark.cwasm");
+    const aot_step = b.step("aot", "Compile CoreMark .wasm to .cwasm via wamrc");
     aot_step.dependOn(&install_aot.step);
 
     // ── Run steps ─────────────────────────────────────────────────────
@@ -85,12 +85,12 @@ pub fn build(b: *std.Build) void {
     const run_native_step = b.step("run-native", "Run CoreMark native");
     run_native_step.dependOn(&run_native.step);
 
-    const run_aot = b.addSystemCommand(&.{wamr_path});
+    const run_aot = b.addSystemCommand(&.{ wamr_path, "run" });
     run_aot.addFileArg(aot_output);
     const run_aot_step = b.step("run-aot", "Run CoreMark via WAMR AOT");
     run_aot_step.dependOn(&run_aot.step);
 
-    const run_interp = b.addSystemCommand(&.{wamr_path});
+    const run_interp = b.addSystemCommand(&.{ wamr_path, "run" });
     run_interp.addFileArg(wasm_exe.getEmittedBin());
     const run_interp_step = b.step("run-interp", "Run CoreMark via WAMR interpreter");
     run_interp_step.dependOn(&run_interp.step);

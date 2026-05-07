@@ -62,8 +62,8 @@ jobs:
       - name: CoreMark (if available)
         continue-on-error: true
         run: |
-          if [ -f coremark.aot ]; then
-            ./zig-out/bin/spec-test-runner --mode=aot coremark.aot 2>&1 | tee coremark.txt || true
+          if [ -f coremark.cwasm ]; then
+            ./zig-out/bin/spec-test-runner --mode=aot coremark.cwasm 2>&1 | tee coremark.txt || true
           fi
 
       - name: Upload bench results
