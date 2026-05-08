@@ -16,6 +16,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
+const range_split = @import("range_split.zig");
 
 /// Physical register identifier. Widest architecture we target is aarch64
 /// with 0..30 (v0..v31 is separate). `u8` leaves headroom.
