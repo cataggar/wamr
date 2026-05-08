@@ -1159,7 +1159,16 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         return trampolineTrap(env, ctx, err, .host_call);
     };
 
-    // Lower results.
+    // Lower results. Normalize each result first so any host-built
+    // `.list_val` is materialized into the canonical `.list = PtrLen`
+    // form before storeInterfaceValue / pushInterfaceValue read
+    // `val.list.*` (would otherwise panic on the active-tag mismatch —
+    // issue #402).
+    for (results, ctx.result_types) |*r, t| {
+        r.* = ctx.comp_inst.lowerListVals(r.*, t, registry, allocator) catch |err| {
+            return trampolineTrap(env, ctx, err, .lower_results);
+        };
+    }
     if (results_spill) {
         const mem_idx = ctx.lower_opts.memory_idx.?;
         const mem_via_resolve = ctx.comp_inst.resolveTopLevelMemory(mem_idx);

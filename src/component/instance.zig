@@ -157,12 +157,51 @@ pub const ImportBinding = union(enum) {
     },
 };
 
+/// Backing buffer used in unit tests that don't have a real core module
+/// instance with a `cabi_realloc` export. Tests opt-in via
+/// `ComponentInstance.enableTestMem`; runtime code never sets this.
+///
+/// Provides a bump-allocated `[]u8` that `hostAllocGuest` /
+/// `hostAllocAndWrite` write into and `readGuestBytes` reads from, so
+/// adapter host functions can lower lists / strings into "guest"
+/// memory under test without needing a live realloc.
+pub const TestGuestMem = struct {
+    buffer: []u8,
+    bump: u32 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, size: usize) !TestGuestMem {
+        const buf = try allocator.alloc(u8, size);
+        @memset(buf, 0);
+        return .{ .buffer = buf };
+    }
+
+    pub fn deinit(self: *TestGuestMem, allocator: std.mem.Allocator) void {
+        allocator.free(self.buffer);
+    }
+
+    /// Bump-allocate `size` bytes aligned to `align_`. Returns the
+    /// guest-side offset, or null if the buffer is exhausted.
+    pub fn alloc(self: *TestGuestMem, size: u32, align_: u32) ?u32 {
+        const a = if (align_ == 0) 1 else align_;
+        const start = std.mem.alignForward(u32, self.bump, a);
+        const end = std.math.add(u32, start, size) catch return null;
+        if (end > self.buffer.len) return null;
+        self.bump = end;
+        return start;
+    }
+};
+
 /// A runtime component instance — the result of instantiating a Component.
 pub const ComponentInstance = struct {
     /// The parsed component this instance was created from.
     component: *const ctypes.Component,
     /// Core module instances created during instantiation.
     core_instances: []CoreInstanceEntry,
+    /// Test-only guest-memory shim. When non-null, `hostAllocGuest`,
+    /// `hostAllocAndWrite`, and `readGuestBytes` operate on this buffer
+    /// instead of looking for a real `cabi_realloc` / canonical memory.
+    /// Always null in production paths.
+    test_mem: ?*TestGuestMem = null,
     /// Resource tables, keyed by the raw component resource type index
     /// (as referenced by `canon resource.{new,drop,rep}`). Allocated
     /// lazily on first access so the dense `[]ResourceTable` layout (which
@@ -365,6 +404,11 @@ pub const ComponentInstance = struct {
     /// Returns null if no such instance is present, the memory is missing,
     /// or the slice is out of bounds.
     pub fn readGuestBytes(self: *const ComponentInstance, ptr: u32, len: u32) ?[]const u8 {
+        if (self.test_mem) |tm| {
+            const end = @as(usize, ptr) + @as(usize, len);
+            if (end > tm.buffer.len) return null;
+            return tm.buffer[ptr..end];
+        }
         const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);
         if (end > mem.data.len) return null;
@@ -398,9 +442,43 @@ pub const ComponentInstance = struct {
         return null;
     }
 
-    /// Allocate `len` bytes inside the canonical guest linear memory and
-    /// copy `bytes` into them. Returns the guest-side pointer or null on
-    /// failure (no `cabi_realloc` export, OOM, or invocation error).
+    /// Allocate `size` bytes inside the canonical guest linear memory
+    /// (or the test_mem shim, if installed) aligned to `align_`. Returns
+    /// the guest-side pointer, or null on failure.
+    ///
+    /// Used by host-side adapter callbacks that must materialize
+    /// host-constructed lists / strings into guest memory before the
+    /// canonical ABI sees a `(ptr, len)` PtrLen.
+    pub fn hostAllocGuest(self: *ComponentInstance, size: u32, align_: u32) ?u32 {
+        if (self.test_mem) |tm| return tm.alloc(size, align_);
+        const realloc_owner = self.reallocOwner() orelse return null;
+        const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
+        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+        const executor = @import("executor.zig");
+        const env = ExecEnv.create(realloc_owner, 4096, self.allocator) catch return null;
+        defer env.destroy();
+        const a: u32 = if (align_ == 0) 1 else align_;
+        return executor.callRealloc(env, realloc_local, 0, 0, a, size) catch null;
+    }
+
+    /// Return a writable slice into the canonical guest memory (or the
+    /// test_mem shim) covering `[ptr, ptr+len)`. Returns null if the
+    /// range is out of bounds.
+    pub fn writableGuestBytes(self: *ComponentInstance, ptr: u32, len: u32) ?[]u8 {
+        if (self.test_mem) |tm| {
+            const end = @as(usize, ptr) + @as(usize, len);
+            if (end > tm.buffer.len) return null;
+            return tm.buffer[ptr..end];
+        }
+        const mem = self.canonicalMemory() orelse return null;
+        const end = @as(usize, ptr) + @as(usize, len);
+        if (end > mem.data.len) return null;
+        return mem.data[ptr..end];
+    }
+
+    /// Allocate `bytes.len` bytes in guest memory and copy `bytes` into
+    /// them. Returns the guest-side pointer or null on failure (no
+    /// `cabi_realloc` export, OOM, or invocation error).
     ///
     /// Used by host-side callbacks (e.g. `wasi:io/streams.[method]
     /// input-stream.blocking-read`) that must materialize a `list<u8>`
@@ -411,20 +489,65 @@ pub const ComponentInstance = struct {
     /// the main core module; we call it with `(0, 0, align=1, len)` to
     /// allocate fresh space.
     pub fn hostAllocAndWrite(self: *ComponentInstance, bytes: []const u8) ?u32 {
-        const realloc_owner = self.reallocOwner() orelse return null;
-        const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
-        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
-        const executor = @import("executor.zig");
-        const env = ExecEnv.create(realloc_owner, 4096, self.allocator) catch return null;
-        defer env.destroy();
-        const ptr = executor.callRealloc(env, realloc_local, 0, 0, 1, @intCast(bytes.len)) catch return null;
-        const mem = self.canonicalMemory() orelse return null;
-        const end = @as(usize, ptr) + bytes.len;
-        if (end > mem.data.len) return null;
-        @memcpy(mem.data[ptr..end], bytes);
+        const ptr = self.hostAllocGuest(@intCast(bytes.len), 1) orelse return null;
+        const dst = self.writableGuestBytes(ptr, @intCast(bytes.len)) orelse return null;
+        @memcpy(dst, bytes);
         return ptr;
     }
 
+    /// Test-only: enable a backing `TestGuestMem` so `hostAllocGuest`,
+    /// `hostAllocAndWrite`, `writableGuestBytes`, and `readGuestBytes`
+    /// operate on a self-contained buffer. Sets `test_mem` and
+    /// `allocator`; other fields are left untouched (callers using
+    /// `var ci: ComponentInstance = undefined` keep their UB-on-read
+    /// invariant for fields they don't initialize).
+    pub fn enableTestMem(self: *ComponentInstance, allocator: std.mem.Allocator, size: usize) !void {
+        const tm = try allocator.create(TestGuestMem);
+        errdefer allocator.destroy(tm);
+        tm.* = try TestGuestMem.init(allocator, size);
+        self.test_mem = tm;
+        self.allocator = allocator;
+    }
+
+    /// Test-only: tear down a `TestGuestMem` previously installed via
+    /// `enableTestMem`.
+    pub fn disableTestMem(self: *ComponentInstance) void {
+        if (self.test_mem) |tm| {
+            tm.deinit(self.allocator);
+            self.allocator.destroy(tm);
+            self.test_mem = null;
+        }
+    }
+
+    /// Walk a host-produced `InterfaceValue` tree and convert every
+    /// eagerly-lifted `.list_val` (and `.string_val` if/when added) into
+    /// its canonical `.list = PtrLen` representation by lowering elements
+    /// into guest memory via `cabi_realloc` (or the test_mem shim).
+    ///
+    /// Called by the canon-lower trampoline (`componentTrampoline`) on
+    /// each result before pushing/storing it. After this call the value
+    /// tree contains no `.list_val` nodes and is safe to feed into
+    /// `pushInterfaceValue` / `storeValReg`, both of which expect the
+    /// PtrLen form.
+    ///
+    /// `arena` owns any heap allocations made for compound substructures
+    /// (e.g. cloned `record_val` slices when a nested `.list_val`
+    /// triggers a rewrite). Callers typically pass the same allocator
+    /// used to build the original tree so deinit walks both consistently.
+    ///
+    /// `reg` is taken as `anytype` to avoid an import cycle with
+    /// `canonical_abi.zig`; in practice it is always a
+    /// `canonical_abi.TypeRegistry`.
+    pub fn lowerListVals(
+        self: *ComponentInstance,
+        val: InterfaceValue,
+        t: ctypes.ValType,
+        reg: anytype,
+        arena: std.mem.Allocator,
+    ) LowerListError!InterfaceValue {
+        const abi = @import("canonical_abi.zig");
+        return lowerListValsImpl(self, val, t, reg, arena, abi);
+    }
     /// Kind-classify a top-level component import. Pure-type imports (those
     /// whose sole purpose is to introduce a type index) do not need a runtime
     /// binding; every other kind must be satisfied by `linkImports`.
@@ -1004,6 +1127,204 @@ pub const ComponentInstance = struct {
         self.allocator.destroy(self);
     }
 };
+
+// ── List materialization helpers (issue #402) ───────────────────────────────
+//
+// These walkers run on host-produced result trees just before the canon-lower
+// trampoline pushes/stores them. They convert every eagerly-lifted
+// `.list_val` into the canonical `.list = PtrLen` form by allocating guest
+// memory via `cabi_realloc` (or the test_mem shim) and lowering elements
+// through `storeValReg`. Consume-and-free semantics: the input tree is
+// owned by the helpers and any heap allocations belonging to rewritten
+// nodes (`.list_val` slices, replaced compound slices, replaced payload
+// pointers) are freed before the new tree is returned, so callers can
+// simply replace `results[i] = ci.lowerListVals(results[i], …)` without
+// leaking the original.
+
+// `arena` and the input value tree, plus any error from `cabi_realloc`
+// invocation through `hostAllocGuest`.
+const LowerListError = error{
+    OutOfMemory,
+    InvalidTypeIndex,
+};
+
+/// Recursive worker for `ComponentInstance.lowerListVals`. Consumes
+/// `val`: any heap memory referenced by rewritten subtrees is freed via
+/// `arena` before this returns.
+fn lowerListValsImpl(
+    ci: *ComponentInstance,
+    val: InterfaceValue,
+    t: ctypes.ValType,
+    reg: anytype,
+    arena: std.mem.Allocator,
+    comptime abi: type,
+) LowerListError!InterfaceValue {
+    return switch (t) {
+        // Primitives + handle types own no heap; pass through.
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow => val,
+        // PtrLen-shaped types own no host heap; pass through.
+        .string => val,
+        .list => |idx| try lowerListField(ci, val, idx, reg, arena, abi),
+        .record => |idx| try lowerCompoundField(ci, val, .{ .record = idx }, reg, arena, abi),
+        .tuple => |idx| try lowerCompoundField(ci, val, .{ .tuple = idx }, reg, arena, abi),
+        .variant => |idx| try lowerCompoundField(ci, val, .{ .variant = idx }, reg, arena, abi),
+        .option => |idx| try lowerCompoundField(ci, val, .{ .option = idx }, reg, arena, abi),
+        .result => |idx| try lowerCompoundField(ci, val, .{ .result = idx }, reg, arena, abi),
+        // flags_val owns a `[]u32` slice but contains no nested lists;
+        // pass-through preserves ownership for the caller's deinit.
+        .flags, .enum_ => val,
+        .type_idx => |idx| blk: {
+            const td = reg.get(idx) orelse break :blk val;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |inner| inner,
+                .list => .{ .list = idx },
+                .record => .{ .record = idx },
+                .tuple => .{ .tuple = idx },
+                .variant => .{ .variant = idx },
+                .flags => .{ .flags = idx },
+                .enum_ => .{ .enum_ = idx },
+                .option => .{ .option = idx },
+                .result => .{ .result = idx },
+                .resource => .{ .own = idx },
+                else => break :blk val,
+            };
+            break :blk try lowerListValsImpl(ci, val, reified, reg, arena, abi);
+        },
+    };
+}
+
+/// Convert a host `.list_val` into a `.list = PtrLen` by lowering each
+/// element through `storeValReg` into a freshly-allocated guest buffer.
+/// Pre-existing `.list = PtrLen` values pass through unchanged. Frees
+/// the consumed `.list_val` element slice before returning.
+fn lowerListField(
+    ci: *ComponentInstance,
+    val: InterfaceValue,
+    list_type_idx: u32,
+    reg: anytype,
+    arena: std.mem.Allocator,
+    comptime abi: type,
+) LowerListError!InterfaceValue {
+    const elems: []const InterfaceValue = switch (val) {
+        .list => return val,
+        .list_val => |e| e,
+        else => return val,
+    };
+
+    const td = reg.get(list_type_idx) orelse return error.InvalidTypeIndex;
+    const elem_t: ctypes.ValType = switch (td) {
+        .list => |lt| lt.element,
+        else => return error.InvalidTypeIndex,
+    };
+
+    if (elems.len == 0) {
+        arena.free(elems);
+        return .{ .list = .{ .ptr = 0, .len = 0 } };
+    }
+
+    // Recursively normalize each element so any nested .list_val is
+    // already a PtrLen by the time storeValReg runs. Each recursion
+    // consumes its element's heap; free the outer slice afterward.
+    const normalized = try arena.alloc(InterfaceValue, elems.len);
+    defer arena.free(normalized);
+    for (elems, 0..) |e, i| {
+        normalized[i] = try lowerListValsImpl(ci, e, elem_t, reg, arena, abi);
+    }
+    arena.free(elems);
+
+    const elem_size = abi.sizeOfType(reg, elem_t);
+    const elem_align = abi.alignOfType(reg, elem_t);
+    const total = std.math.mul(u32, elem_size, @intCast(normalized.len)) catch return error.OutOfMemory;
+    const ptr = ci.hostAllocGuest(total, elem_align) orelse return error.OutOfMemory;
+    const dst = ci.writableGuestBytes(ptr, total) orelse return error.OutOfMemory;
+
+    var off: u32 = 0;
+    for (normalized) |e| {
+        abi.storeValReg(dst, off, elem_t, e, reg) catch return error.InvalidTypeIndex;
+        off += elem_size;
+    }
+    // Free per-element heap now that bytes are in guest memory.
+    for (normalized) |e| e.deinit(arena);
+
+    return .{ .list = .{ .ptr = ptr, .len = @intCast(normalized.len) } };
+}
+
+/// Recurse into the substructure of a compound value so any nested
+/// `.list_val` reaches `lowerListField`. Builds a fresh tree on
+/// `arena` and frees the original wrapper allocations (slices,
+/// payload pointers); per-child heap is consumed by the recursive
+/// call so it is not double-freed.
+fn lowerCompoundField(
+    ci: *ComponentInstance,
+    val: InterfaceValue,
+    t: ctypes.ValType,
+    reg: anytype,
+    arena: std.mem.Allocator,
+    comptime abi: type,
+) LowerListError!InterfaceValue {
+    const idx: u32 = switch (t) {
+        .record => |i| i,
+        .tuple => |i| i,
+        .variant => |i| i,
+        .option => |i| i,
+        .result => |i| i,
+        else => return val,
+    };
+    const td = reg.get(idx) orelse return val;
+
+    return switch (td) {
+        .record => |r| blk: {
+            const fields = val.record_val;
+            const out = try arena.alloc(InterfaceValue, fields.len);
+            for (fields, r.fields, 0..) |f_val, f_def, i| {
+                out[i] = try lowerListValsImpl(ci, f_val, f_def.type, reg, arena, abi);
+            }
+            arena.free(fields);
+            break :blk .{ .record_val = out };
+        },
+        .tuple => |tup| blk: {
+            const fields = val.tuple_val;
+            const out = try arena.alloc(InterfaceValue, fields.len);
+            for (fields, tup.fields, 0..) |f_val, f_t, i| {
+                out[i] = try lowerListValsImpl(ci, f_val, f_t, reg, arena, abi);
+            }
+            arena.free(fields);
+            break :blk .{ .tuple_val = out };
+        },
+        .variant => |v| blk: {
+            const vv = val.variant_val;
+            if (vv.payload == null or vv.discriminant >= v.cases.len) break :blk val;
+            const case = v.cases[vv.discriminant];
+            const ct = case.type orelse break :blk val;
+            const lowered = try lowerListValsImpl(ci, vv.payload.?.*, ct, reg, arena, abi);
+            const new_payload = try arena.create(InterfaceValue);
+            new_payload.* = lowered;
+            arena.destroy(vv.payload.?);
+            break :blk .{ .variant_val = .{ .discriminant = vv.discriminant, .payload = new_payload } };
+        },
+        .option => |opt| blk: {
+            const ov = val.option_val;
+            if (!ov.is_some or ov.payload == null) break :blk val;
+            const lowered = try lowerListValsImpl(ci, ov.payload.?.*, opt.inner, reg, arena, abi);
+            const new_payload = try arena.create(InterfaceValue);
+            new_payload.* = lowered;
+            arena.destroy(ov.payload.?);
+            break :blk .{ .option_val = .{ .is_some = true, .payload = new_payload } };
+        },
+        .result => |res| blk: {
+            const rv = val.result_val;
+            if (rv.payload == null) break :blk val;
+            const arm_t: ?ctypes.ValType = if (rv.is_ok) res.ok else res.err;
+            const at = arm_t orelse break :blk val;
+            const lowered = try lowerListValsImpl(ci, rv.payload.?.*, at, reg, arena, abi);
+            const new_payload = try arena.create(InterfaceValue);
+            new_payload.* = lowered;
+            arena.destroy(rv.payload.?);
+            break :blk .{ .result_val = .{ .is_ok = rv.is_ok, .payload = new_payload } };
+        },
+        else => val,
+    };
+}
 
 // ── Component Instantiation ─────────────────────────────────────────────────
 
@@ -3553,4 +3874,44 @@ test "instantiate: two-deep alias chain to sub-component instance export (#355)"
     // Two-hop (alias[1] of alias[0]) must surface MultiHopAliasUnsupported.
     const r2 = indexspace.resolveInstanceExpr(&component, 2);
     try std.testing.expectError(error.MultiHopAliasUnsupported, r2);
+}
+
+test "lowerListVals: list_val<u8> materializes into PtrLen via test_mem (issue #402)" {
+    const allocator = std.testing.allocator;
+
+    // Set up a one-typedef component: a single `list<u8>` at type-idx 0.
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .list = .{ .element = .u8 } },
+    };
+    const comp_idxspace = [_]?u32{0};
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+
+    var ci: ComponentInstance = undefined;
+    ci.component = &component;
+    ci.test_mem = null;
+    ci.allocator = allocator;
+    try ci.enableTestMem(allocator, 4096);
+    defer ci.disableTestMem();
+
+    // Build a host-style `.list_val` containing 4 u8 elements.
+    const elems = try allocator.alloc(InterfaceValue, 4);
+    elems[0] = .{ .u8 = 0xDE };
+    elems[1] = .{ .u8 = 0xAD };
+    elems[2] = .{ .u8 = 0xBE };
+    elems[3] = .{ .u8 = 0xEF };
+    const input: InterfaceValue = .{ .list_val = elems };
+
+    const abi = @import("canonical_abi.zig");
+    const reg = abi.TypeRegistry.init(&component);
+    const lowered = try ci.lowerListVals(input, .{ .list = 0 }, reg, allocator);
+    defer lowered.deinit(allocator);
+
+    // After lowering, the value must be a PtrLen pointing at our 4 bytes
+    // inside the test_mem buffer — and reading them back must round-trip.
+    try std.testing.expect(lowered == .list);
+    try std.testing.expectEqual(@as(u32, 4), lowered.list.len);
+    const bytes = ci.test_mem.?.buffer[lowered.list.ptr .. lowered.list.ptr + lowered.list.len];
+    try std.testing.expectEqualSlices(u8, &.{ 0xDE, 0xAD, 0xBE, 0xEF }, bytes);
 }
