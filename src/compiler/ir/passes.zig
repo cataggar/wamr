@@ -10,6 +10,11 @@ const analysis = @import("analysis.zig");
 
 pub const TargetArch = enum { x86_64, aarch64 };
 
+pub const CompileOptions = struct {
+    enable_iv_simplify: bool = true,
+    enable_loop_unroll: bool = true,
+};
+
 // ── Use-Def Analysis ────────────────────────────────────────────────────────
 
 /// Tracks which instructions define and use each VReg.
@@ -2536,6 +2541,437 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
     return changed;
 }
 
+const DefSite = struct { block: ir.BlockId, inst: usize };
+
+fn buildDefSites(func: *const ir.IrFunction, allocator: std.mem.Allocator) !std.AutoHashMap(ir.VReg, DefSite) {
+    var defs = std.AutoHashMap(ir.VReg, DefSite).init(allocator);
+    errdefer defs.deinit();
+    for (func.blocks.items, 0..) |block, bid| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.dest) |d| try defs.put(d, .{ .block = @intCast(bid), .inst = ii });
+        }
+    }
+    return defs;
+}
+
+fn defInst(func: *const ir.IrFunction, defs: *const std.AutoHashMap(ir.VReg, DefSite), v: ir.VReg) ?ir.Inst {
+    const site = defs.get(v) orelse return null;
+    return func.blocks.items[site.block].instructions.items[site.inst];
+}
+
+fn constI32Of(func: *const ir.IrFunction, defs: *const std.AutoHashMap(ir.VReg, DefSite), v: ir.VReg) ?i32 {
+    const inst = defInst(func, defs, v) orelse return null;
+    return switch (inst.op) {
+        .iconst_32 => |c| c,
+        else => null,
+    };
+}
+
+fn localGetIdxOf(func: *const ir.IrFunction, defs: *const std.AutoHashMap(ir.VReg, DefSite), v: ir.VReg) ?u32 {
+    const inst = defInst(func, defs, v) orelse return null;
+    return switch (inst.op) {
+        .local_get => |idx| idx,
+        else => null,
+    };
+}
+
+fn dedicatedPreheader(
+    func: *const ir.IrFunction,
+    loop: *const analysis.Loop,
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    dom: *const analysis.DomTree,
+) ?ir.BlockId {
+    const header_preds = predecessors.get(loop.header) orelse return null;
+    var preheader: ?ir.BlockId = null;
+    for (header_preds) |p| {
+        if (!loop.containsBlock(p)) {
+            if (preheader != null) return null;
+            preheader = p;
+        }
+    }
+    const ph = preheader orelse return null;
+    const ph_insts = func.blocks.items[ph].instructions.items;
+    if (ph_insts.len == 0) return null;
+    switch (ph_insts[ph_insts.len - 1].op) {
+        .br => |target| if (target != loop.header) return null,
+        else => return null,
+    }
+    if (!dom.dominates(ph, loop.header)) return null;
+    return ph;
+}
+
+const Induction = struct {
+    local_idx: u32,
+    init: ?i32 = null,
+    step: i32,
+    step_vreg: ir.VReg,
+    update_val: ir.VReg,
+    update_block: ir.BlockId,
+    update_index: usize,
+};
+
+fn findPrimaryInduction(
+    func: *const ir.IrFunction,
+    loop: *const analysis.Loop,
+    preheader: ir.BlockId,
+    defs: *const std.AutoHashMap(ir.VReg, DefSite),
+) ?Induction {
+    for (loop.blocks) |bid| {
+        const block = func.blocks.items[bid];
+        for (block.instructions.items, 0..) |inst, ii| {
+            const ls = switch (inst.op) {
+                .local_set => |ls| ls,
+                else => continue,
+            };
+            const add_inst = defInst(func, defs, ls.val) orelse continue;
+            const add = switch (add_inst.op) {
+                .add => |a| a,
+                else => continue,
+            };
+
+            var step_vreg: ir.VReg = undefined;
+            if (localGetIdxOf(func, defs, add.lhs) == ls.idx and constI32Of(func, defs, add.rhs) != null) {
+                step_vreg = add.rhs;
+            } else if (localGetIdxOf(func, defs, add.rhs) == ls.idx and constI32Of(func, defs, add.lhs) != null) {
+                step_vreg = add.lhs;
+            } else {
+                continue;
+            }
+            const step = constI32Of(func, defs, step_vreg) orelse continue;
+            if (step == 0) continue;
+
+            var init: ?i32 = null;
+            for (func.blocks.items[preheader].instructions.items) |ph_inst| {
+                const ph_ls = switch (ph_inst.op) {
+                    .local_set => |set| set,
+                    else => continue,
+                };
+                if (ph_ls.idx != ls.idx) continue;
+                init = constI32Of(func, defs, ph_ls.val);
+            }
+
+            return .{
+                .local_idx = ls.idx,
+                .init = init,
+                .step = step,
+                .step_vreg = step_vreg,
+                .update_val = ls.val,
+                .update_block = bid,
+                .update_index = ii,
+            };
+        }
+    }
+    return null;
+}
+
+fn currentInductionUpdateIndex(func: *const ir.IrFunction, ind: Induction) usize {
+    const block = func.blocks.items[ind.update_block];
+    for (block.instructions.items, 0..) |inst, ii| {
+        if (inst.op == .local_set and inst.op.local_set.idx == ind.local_idx and inst.op.local_set.val == ind.update_val) return ii;
+    }
+    return @min(ind.update_index, block.instructions.items.len);
+}
+
+fn invariantAddressBase(
+    func: *const ir.IrFunction,
+    loop: *const analysis.Loop,
+    defs: *const std.AutoHashMap(ir.VReg, DefSite),
+    addr: ir.VReg,
+    induction_local: u32,
+) ?ir.VReg {
+    const inst = defInst(func, defs, addr) orelse return null;
+    const add = switch (inst.op) {
+        .add => |a| a,
+        else => return null,
+    };
+    const lhs_is_iv = localGetIdxOf(func, defs, add.lhs) == induction_local;
+    const rhs_is_iv = localGetIdxOf(func, defs, add.rhs) == induction_local;
+    const base = if (lhs_is_iv and !rhs_is_iv) add.rhs else if (rhs_is_iv and !lhs_is_iv) add.lhs else return null;
+    const base_def = defs.get(base) orelse return null;
+    if (loop.containsBlock(base_def.block)) return null;
+    return base;
+}
+
+/// Strength-reduce stride-1 induction-addressed memory accesses.
+///
+/// This first implementation recognizes `local_set i, i + c` and rewrites
+/// scalar `load`/`store` bases of the form `base + i` to use a synthetic
+/// pointer local `p`, initialized in the preheader and bumped by the same
+/// step immediately after the induction update.  Multi-stride (`i * stride`)
+/// and preheader range-check collapsing are intentionally left for follow-up:
+/// if a per-iteration bounds check on the same address pattern remains, future
+/// work can collapse it to a single preheader range check on `[p, p + N*stride]`.
+pub fn inductionVariableSimplification(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    var lf = try analysis.computeLoops(func, &dom, allocator);
+    defer lf.deinit();
+    if (lf.loops.len == 0) return false;
+
+    var predecessors = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var pit = predecessors.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    var changed = false;
+    for (lf.loops) |*loop| {
+        // Restrict to innermost loops. For an outer loop that contains a
+        // nested loop, `loop.blocks` includes the nested loop's blocks, so
+        // `findPrimaryInduction` may pick the inner loop's `i = i + step`
+        // as the outer's primary induction. The transform would then init
+        // `p = base` only in the outer preheader, but `i` (and the inner
+        // loop's IV) gets reset every outer iteration — leaving `p` stale
+        // and producing out-of-bounds memory accesses (observed as a
+        // CoreMark AOT trap, see #385).
+        var is_innermost = true;
+        for (loop.blocks) |bid| {
+            if (bid == loop.header) continue;
+            if (lf.header_loop.contains(bid)) {
+                is_innermost = false;
+                break;
+            }
+        }
+        if (!is_innermost) continue;
+
+        var defs = try buildDefSites(func, allocator);
+        defer defs.deinit();
+
+        const ph = dedicatedPreheader(func, loop, &predecessors, &dom) orelse continue;
+        const ind = findPrimaryInduction(func, loop, ph, &defs) orelse continue;
+
+        // The preheader initialiser below sets `p = base`, which is only
+        // correct when `i` starts at 0. Skip otherwise — handling non-zero
+        // init would require emitting a `p = base + init` add in the
+        // preheader, deferred to a follow-up.
+        const init_val = ind.init orelse continue;
+        if (init_val != 0) continue;
+
+        var ptr_locals = std.AutoHashMap(ir.VReg, u32).init(allocator);
+        defer ptr_locals.deinit();
+        var ptr_order: std.ArrayList(struct { base: ir.VReg, local: u32 }) = .empty;
+        defer ptr_order.deinit(allocator);
+
+        for (loop.blocks) |bid| {
+            var block = &func.blocks.items[bid];
+            var i: usize = 0;
+            while (i < block.instructions.items.len) : (i += 1) {
+                const maybe_base: ?ir.VReg = switch (block.instructions.items[i].op) {
+                    .load => |ld| invariantAddressBase(func, loop, &defs, ld.base, ind.local_idx),
+                    .store => |st| invariantAddressBase(func, loop, &defs, st.base, ind.local_idx),
+                    else => null,
+                };
+                const base = maybe_base orelse continue;
+
+                const gop = try ptr_locals.getOrPut(base);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = func.local_count;
+                    func.local_count += 1;
+                    try ptr_order.append(allocator, .{ .base = base, .local = gop.value_ptr.* });
+                }
+                const p_local = gop.value_ptr.*;
+                const p_vreg = func.newVReg();
+                try block.instructions.insert(func.allocator, i, .{
+                    .op = .{ .local_get = p_local },
+                    .dest = p_vreg,
+                    .type = .i32,
+                });
+                i += 1;
+                switch (block.instructions.items[i].op) {
+                    .load => |*ld| ld.base = p_vreg,
+                    .store => |*st| st.base = p_vreg,
+                    else => unreachable,
+                }
+                changed = true;
+            }
+        }
+
+        if (ptr_order.items.len == 0) continue;
+
+        var ph_block = &func.blocks.items[ph];
+        var insert_at = ph_block.instructions.items.len - 1;
+        for (ptr_order.items) |entry| {
+            try ph_block.instructions.insert(func.allocator, insert_at, .{
+                .op = .{ .local_set = .{ .idx = entry.local, .val = entry.base } },
+            });
+            insert_at += 1;
+        }
+
+        var update_block = &func.blocks.items[ind.update_block];
+        var update_at = currentInductionUpdateIndex(func, ind) + 1;
+        for (ptr_order.items) |entry| {
+            const cur = func.newVReg();
+            const next = func.newVReg();
+            try update_block.instructions.insert(func.allocator, update_at, .{
+                .op = .{ .local_get = entry.local },
+                .dest = cur,
+                .type = .i32,
+            });
+            update_at += 1;
+            try update_block.instructions.insert(func.allocator, update_at, .{
+                .op = .{ .add = .{ .lhs = cur, .rhs = ind.step_vreg } },
+                .dest = next,
+                .type = .i32,
+            });
+            update_at += 1;
+            try update_block.instructions.insert(func.allocator, update_at, .{
+                .op = .{ .local_set = .{ .idx = entry.local, .val = next } },
+            });
+            update_at += 1;
+        }
+    }
+    return changed;
+}
+
+fn loopBodySize(func: *const ir.IrFunction, loop: *const analysis.Loop) usize {
+    var n: usize = 0;
+    for (loop.blocks) |bid| n += func.blocks.items[bid].instructions.items.len;
+    return n;
+}
+
+fn isLoopTarget(loop: *const analysis.Loop, target: ir.BlockId) bool {
+    return loop.containsBlock(target);
+}
+
+fn findLoopExit(func: *const ir.IrFunction, loop: *const analysis.Loop) ?struct { exit: ir.BlockId, cond: ir.VReg } {
+    const header = func.blocks.items[loop.header];
+    if (header.instructions.items.len == 0) return null;
+    const term = header.instructions.items[header.instructions.items.len - 1];
+    const bi = switch (term.op) {
+        .br_if => |bi| bi,
+        else => return null,
+    };
+    const then_loop = isLoopTarget(loop, bi.then_block);
+    const else_loop = isLoopTarget(loop, bi.else_block);
+    if (then_loop == else_loop) return null;
+    return .{ .exit = if (then_loop) bi.else_block else bi.then_block, .cond = bi.cond };
+}
+
+fn tripCountForLoop(
+    func: *const ir.IrFunction,
+    defs: *const std.AutoHashMap(ir.VReg, DefSite),
+    ind: Induction,
+    cond: ir.VReg,
+) ?u32 {
+    const init = ind.init orelse return null;
+    if (ind.step <= 0) return null;
+    const cmp_inst = defInst(func, defs, cond) orelse return null;
+    const cmp = switch (cmp_inst.op) {
+        .lt_s, .lt_u => |c| c,
+        else => return null,
+    };
+    const lhs_idx = localGetIdxOf(func, defs, cmp.lhs);
+    if (lhs_idx != ind.local_idx) return null;
+    const limit = constI32Of(func, defs, cmp.rhs) orelse return null;
+    if (limit <= init) return 0;
+    const distance: u32 = @intCast(limit - init);
+    const step: u32 = @intCast(ind.step);
+    return (distance + step - 1) / step;
+}
+
+const VRegRemap = struct { from: ir.VReg, to: ir.VReg };
+
+fn remapCloneVRegs(inst: *ir.Inst, map: []const VRegRemap) void {
+    for (map) |m| replaceInInst(inst, m.from, m.to);
+}
+
+/// Fully unroll very small counted loops.
+///
+/// The transform is deliberately conservative: it handles dedicated-preheader
+/// natural loops with a single primary `i = i + const_step`, a header
+/// `i < const_limit` condition, trip count ≤ 8, and ≤ 16 IR instructions in
+/// the loop.  It clones the loop instructions into the preheader, substitutes
+/// each `local_get i` with the iteration constant when possible, then redirects
+/// the preheader to the loop exit; the old loop blocks become unreachable.
+pub fn unrollSmallFixedLoops(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len == 0) return false;
+
+    var dom = try analysis.computeDominators(func, allocator);
+    defer dom.deinit();
+    var lf = try analysis.computeLoops(func, &dom, allocator);
+    defer lf.deinit();
+    if (lf.loops.len == 0) return false;
+
+    var predecessors = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var pit = predecessors.iterator();
+        while (pit.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    for (lf.loops) |*loop| {
+        if (loopBodySize(func, loop) > 16) continue;
+        const ph = dedicatedPreheader(func, loop, &predecessors, &dom) orelse continue;
+        var defs = try buildDefSites(func, allocator);
+        defer defs.deinit();
+        const ind = findPrimaryInduction(func, loop, ph, &defs) orelse continue;
+        const exit_info = findLoopExit(func, loop) orelse continue;
+        const trips = tripCountForLoop(func, &defs, ind, exit_info.cond) orelse continue;
+        if (trips > 8) continue;
+
+        var templates: std.ArrayList(ir.Inst) = .empty;
+        defer templates.deinit(allocator);
+        var unsupported = false;
+        for (loop.blocks) |bid| {
+            const block = func.blocks.items[bid];
+            for (block.instructions.items, 0..) |inst, ii| {
+                if (ii == findTerminatorIndex(&block)) continue;
+                switch (inst.op) {
+                    .br,
+                    .br_if,
+                    .br_table,
+                    .ret,
+                    .ret_multi,
+                    .@"unreachable",
+                    .call,
+                    .call_indirect,
+                    .call_ref,
+                    => {
+                        unsupported = true;
+                        break;
+                    },
+                    else => try templates.append(allocator, inst),
+                }
+            }
+            if (unsupported) break;
+        }
+        if (unsupported) continue;
+        if (templates.items.len == 0 and trips != 0) continue;
+
+        var ph_block = &func.blocks.items[ph];
+        const original_term = ph_block.instructions.items.len - 1;
+        var insert_at = original_term;
+        var iter: u32 = 0;
+        while (iter < trips) : (iter += 1) {
+            const iter_value = (ind.init orelse 0) + @as(i32, @intCast(iter)) * ind.step;
+            var map: std.ArrayList(VRegRemap) = .empty;
+            defer map.deinit(allocator);
+
+            for (templates.items) |tmpl| {
+                var cloned = tmpl;
+                if (cloned.dest) |old_dest| {
+                    const new_dest = func.newVReg();
+                    cloned.dest = new_dest;
+                    try map.append(allocator, .{ .from = old_dest, .to = new_dest });
+                }
+                remapCloneVRegs(&cloned, map.items);
+                if (cloned.op == .local_get and cloned.op.local_get == ind.local_idx) {
+                    cloned.op = .{ .iconst_32 = iter_value };
+                }
+                try ph_block.instructions.insert(func.allocator, insert_at, cloned);
+                insert_at += 1;
+            }
+        }
+
+        ph_block.instructions.items[insert_at].op = .{ .br = exit_info.exit };
+        return true;
+    }
+    return false;
+}
+
 /// Redundant bounds-check elimination, dominator-scoped.
 ///
 /// For every `.load` and `.store`, codegen emits an inline wasm-memory
@@ -4908,7 +5344,9 @@ pub const default_passes: []const PassFn = &.{
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
     &globalValueNumbering,
+    &inductionVariableSimplification,
     &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
@@ -4933,7 +5371,9 @@ const x86_64_default_passes: []const PassFn = &.{
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
     &globalValueNumbering,
+    &inductionVariableSimplification,
     &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
@@ -4941,10 +5381,73 @@ const x86_64_default_passes: []const PassFn = &.{
     &foldLoadStoreOffset,
 };
 
+const default_passes_no_iv: []const PassFn = &.{
+    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,      &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,   &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,  &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,                 &globalValueNumbering,    &hoistLoopInvariantCode, &unrollSmallFixedLoops,
+    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,  &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
+};
+
+const default_passes_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,               &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,            &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,                 &globalValueNumbering,    &inductionVariableSimplification, &hoistLoopInvariantCode,
+    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
+};
+
+const default_passes_no_iv_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,                  &constantFold,          &algebraicSimplify,          &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,  &foldConstantBranches,       &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &foldSelectOnEqz,       &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,
+    &foldWrapOfExtend,                 &globalValueNumbering,  &hoistLoopInvariantCode,     &deadCodeElimination,
+    &deadLocalSetElimination,          &hoistLoopBoundsChecks, &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_iv: []const PassFn = &.{
+    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
+    &foldBranchOnEqz,            &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,  &foldWrapOfExtend,                 &globalValueNumbering,    &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,      &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
+    &foldBranchOnEqz,            &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,  &foldWrapOfExtend,                 &globalValueNumbering,    &inductionVariableSimplification,
+    &hoistLoopInvariantCode,     &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+};
+
+const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
+    &forwardLocalGet,           &constantFold,                     &algebraicSimplify,     &strengthReduceMul,
+    &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,  &foldInverseCompareEqz,
+    &foldBranchOnEqz,           &threadChainedConditionalBranches, &foldSelectOnEqz,       &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents, &foldWrapOfExtend,                 &globalValueNumbering,  &hoistLoopInvariantCode,
+    &deadCodeElimination,       &deadLocalSetElimination,          &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
+};
+
 pub fn defaultPassesForTarget(target: TargetArch) []const PassFn {
+    return defaultPassesForTargetWithOptions(target, .{});
+}
+
+pub fn defaultPassesForTargetWithOptions(target: TargetArch, options: CompileOptions) []const PassFn {
     return switch (target) {
-        .x86_64 => x86_64_default_passes,
-        .aarch64 => default_passes,
+        .x86_64 => if (options.enable_iv_simplify)
+            (if (options.enable_loop_unroll) x86_64_default_passes else x86_64_default_passes_no_unroll)
+        else
+            (if (options.enable_loop_unroll) x86_64_default_passes_no_iv else x86_64_default_passes_no_iv_no_unroll),
+        .aarch64 => if (options.enable_iv_simplify)
+            (if (options.enable_loop_unroll) default_passes else default_passes_no_unroll)
+        else
+            (if (options.enable_loop_unroll) default_passes_no_iv else default_passes_no_iv_no_unroll),
     };
 }
 
@@ -6161,6 +6664,364 @@ test "hoistLoopInvariantCode: trapping op not hoisted" {
     const changed = try hoistLoopInvariantCode(&func, allocator);
     try std.testing.expect(!changed);
     try std.testing.expect(func.getBlock(b1).instructions.items[0].op == .div_u);
+}
+
+test "inductionVariableSimplification: single induction address is strength reduced" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i_addr = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_val = func.newVReg();
+    const v_i_up = func.newVReg();
+    const v_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_addr });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_i_addr } }, .dest = v_addr });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_val });
+    try func.getBlock(b1).append(.{ .op = .{ .store = .{ .base = v_addr, .offset = 0, .size = 4, .val = v_val } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_up });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i_up, .rhs = v_step } }, .dest = v_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try inductionVariableSimplification(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(@as(u32, 2), func.local_count);
+
+    var rewritten = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .store) {
+            try std.testing.expect(inst.op.store.base != v_addr);
+            rewritten = true;
+        }
+    }
+    try std.testing.expect(rewritten);
+}
+
+test "inductionVariableSimplification: multiple inductions leave secondary alone" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 2);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    const v_i_up = func.newVReg();
+    const v_next = func.newVReg();
+    const v_j = func.newVReg();
+    const v_j_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_i } }, .dest = v_addr });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4 } }, .dest = v_load });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_up });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i_up, .rhs = v_step } }, .dest = v_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 1 }, .dest = v_j });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_j, .rhs = v_step } }, .dest = v_j_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_j_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    try std.testing.expect(try inductionVariableSimplification(&func, allocator));
+    var saw_secondary = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .local_set and inst.op.local_set.idx == 1) saw_secondary = true;
+    }
+    try std.testing.expect(saw_secondary);
+}
+
+test "inductionVariableSimplification: aliased base pointers share synthetic local" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_i_up = func.newVReg();
+    const v_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_i } }, .dest = v_addr });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4 } }, .dest = v_a });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 4, .size = 4 } }, .dest = v_b });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_up });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i_up, .rhs = v_step } }, .dest = v_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    try std.testing.expect(try inductionVariableSimplification(&func, allocator));
+    try std.testing.expectEqual(@as(u32, 2), func.local_count);
+}
+
+test "inductionVariableSimplification: nested loops only transform innermost" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 2);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_zero = func.newVReg();
+    const v_one = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_zero } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+
+    const v_j = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_load = func.newVReg();
+    const v_j_up = func.newVReg();
+    const v_j_next = func.newVReg();
+    const v_j_cmp = func.newVReg();
+    const v_jcond = func.newVReg();
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 1 }, .dest = v_j });
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_j } }, .dest = v_addr });
+    try func.getBlock(b2).append(.{ .op = .{ .load = .{ .base = v_addr, .offset = 0, .size = 4 } }, .dest = v_load });
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 1 }, .dest = v_j_up });
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v_j_up, .rhs = v_one } }, .dest = v_j_next });
+    try func.getBlock(b2).append(.{ .op = .{ .local_set = .{ .idx = 1, .val = v_j_next } } });
+    try func.getBlock(b2).append(.{ .op = .{ .local_get = 1 }, .dest = v_j_cmp });
+    try func.getBlock(b2).append(.{ .op = .{ .lt_s = .{ .lhs = v_j_cmp, .rhs = v_limit } }, .dest = v_jcond });
+    try func.getBlock(b2).append(.{ .op = .{ .br_if = .{ .cond = v_jcond, .then_block = b2, .else_block = b3 } } });
+
+    const v_i_up = func.newVReg();
+    const v_i_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_icond = func.newVReg();
+    try func.getBlock(b3).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_up });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v_i_up, .rhs = v_one } }, .dest = v_i_next });
+    try func.getBlock(b3).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_i_next } } });
+    try func.getBlock(b3).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b3).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_icond });
+    try func.getBlock(b3).append(.{ .op = .{ .br_if = .{ .cond = v_icond, .then_block = b1, .else_block = b4 } } });
+
+    try func.getBlock(b4).append(.{ .op = .{ .ret = null } });
+
+    try std.testing.expect(try inductionVariableSimplification(&func, allocator));
+    try std.testing.expectEqual(@as(u32, 3), func.local_count);
+
+    var rewritten = false;
+    for (func.getBlock(b2).instructions.items) |inst| {
+        if (inst.op == .load) {
+            try std.testing.expect(inst.op.load.base != v_addr);
+            rewritten = true;
+        }
+    }
+    try std.testing.expect(rewritten);
+}
+
+test "inductionVariableSimplification: non-zero init is skipped" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_init = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_base });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v_init });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_init } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 9 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i = func.newVReg();
+    const v_addr = func.newVReg();
+    const v_val = func.newVReg();
+    const v_i_up = func.newVReg();
+    const v_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_i } }, .dest = v_addr });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_val });
+    try func.getBlock(b1).append(.{ .op = .{ .store = .{ .base = v_addr, .offset = 0, .size = 4, .val = v_val } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_up });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i_up, .rhs = v_step } }, .dest = v_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const changed = try inductionVariableSimplification(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(@as(u32, 1), func.local_count);
+}
+
+test "unrollSmallFixedLoops: trip count four fully unrolled" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_zero = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_i = func.newVReg();
+    const v_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_step } }, .dest = v_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    try std.testing.expect(try unrollSmallFixedLoops(&func, allocator));
+    try std.testing.expectEqual(ir.Inst.Op{ .br = b2 }, func.getBlock(b0).instructions.items[func.getBlock(b0).instructions.items.len - 1].op);
+    var dom = try analysis.computeDominators(&func, allocator);
+    defer dom.deinit();
+    var lf = try analysis.computeLoops(&func, &dom, allocator);
+    defer lf.deinit();
+    try std.testing.expectEqual(@as(usize, 0), lf.loops.len);
+}
+
+test "unrollSmallFixedLoops: trip count too large is skipped" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v_zero = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    const v_i = func.newVReg();
+    const v_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_step } }, .dest = v_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+    try std.testing.expect(!try unrollSmallFixedLoops(&func, allocator));
+}
+
+test "unrollSmallFixedLoops: body too large is skipped" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const v_zero = func.newVReg();
+    const v_step = func.newVReg();
+    const v_limit = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero });
+    try func.getBlock(b0).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_zero } } });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_step });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 4 }, .dest = v_limit });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    var last = v_zero;
+    for (0..17) |_| {
+        const v = func.newVReg();
+        try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = last, .rhs = v_step } }, .dest = v });
+        last = v;
+    }
+    const v_i = func.newVReg();
+    const v_next = func.newVReg();
+    const v_i_cmp = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_step } }, .dest = v_next });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_i_cmp });
+    try func.getBlock(b1).append(.{ .op = .{ .lt_s = .{ .lhs = v_i_cmp, .rhs = v_limit } }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+    try std.testing.expect(!try unrollSmallFixedLoops(&func, allocator));
 }
 
 test "elideRedundantBoundsChecks: call invalidates tracker" {
