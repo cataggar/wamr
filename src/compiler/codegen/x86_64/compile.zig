@@ -1441,7 +1441,7 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
     var global_call_patches: std.ArrayList(GlobalCallPatch) = .empty;
     defer global_call_patches.deinit(allocator);
 
-    for (ir_module.functions.items, 0..) |func, fi| {
+    for (ir_module.functions.items) |func| {
         const func_start = all_code.items.len;
         try offsets.append(allocator, @intCast(func_start));
 
@@ -1449,13 +1449,6 @@ pub fn compileModule(ir_module: *const ir.IrModule, allocator: std.mem.Allocator
         const result = try compileFunctionRAWithGlobalOffsets(&func, ir_module.import_count, ir_module.global_offsets orelse &.{}, allocator);
         defer allocator.free(result.code);
         defer allocator.free(result.call_patches);
-
-        // Debug: dump IR+alloc for selected function index (-1 disables).
-        const dump_func_idx: i32 = -1;
-        const dump_all: bool = false;
-        if (dump_all or @as(i32, @intCast(fi)) == dump_func_idx) {
-            dumpFuncIRAlloc(&func, @intCast(fi), ir_module.import_count, allocator) catch {};
-        }
 
         // Accumulate call patches with global offsets
         for (result.call_patches) |patch| {
@@ -2580,8 +2573,12 @@ fn compileInstRA(
             // and the target is a local function (rel32 JMP).
             const can_real_tail: bool = cl.tail and total_stack_args == 0 and !hrp_on_stack and !is_import;
             if (can_real_tail) {
-                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                // Load vmctx into rdi AFTER arg moves: rdi (param_regs[0] on SysV)
+                // is in caller_saved_alloc, so it may hold an arg vreg that
+                // emitCallRegArgMoves must consume. Loading vmctx earlier would
+                // clobber that vreg.
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
                 if (has_hrp) {
                     const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
                     const hrp_dst = param_regs[1 + n_args];
@@ -2605,8 +2602,12 @@ fn compileInstRA(
             }
 
             if (is_import) {
-                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
-                try code.movRegMem(.r10, param_regs[0], vmctx_host_functions_field);
+                // Load func ptr via r10 scratch so we don't clobber rdi here.
+                // rdi is in caller_saved_alloc and may hold an arg vreg that
+                // emitCallRegArgMoves below consumes. We load vmctx → rdi
+                // only after all arg setup is complete.
+                try code.movRegMem(.r10, .rbp, vmctx_offset);
+                try code.movRegMem(.r10, .r10, vmctx_host_functions_field);
                 if (cl.func_idx > 0) {
                     try code.addRegImm32(.r10, @intCast(@as(u32, cl.func_idx) * 8));
                 }
@@ -2619,6 +2620,7 @@ fn compileInstRA(
                     try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
                 }
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
                 if (has_hrp) {
                     if (hrp_in_reg) {
                         const hrp_dst = param_regs[1 + n_args];
@@ -2633,8 +2635,6 @@ fn compileInstRA(
                 try code.callReg(.rax);
                 if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
             } else {
-                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
-
                 if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
                 var j2: u32 = 0;
                 while (j2 < extra) : (j2 += 1) {
@@ -2642,6 +2642,11 @@ fn compileInstRA(
                     try code.movMemReg(.rsp, @intCast(shadow + j2 * 8), arg_reg);
                 }
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
+                // Defer vmctx → rdi load until AFTER arg moves: rdi (param_regs[0]
+                // on SysV) is in caller_saved_alloc, so an arg vreg may be live in
+                // rdi at the call (e.g. arg 2 of a 3-arg call). Loading vmctx into
+                // rdi before emitCallRegArgMoves would clobber that vreg.
+                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
                 if (has_hrp) {
                     if (hrp_in_reg) {
                         const hrp_dst = param_regs[1 + n_args];
@@ -2756,9 +2761,6 @@ fn compileInstRA(
             try code.addRegReg(.rax, .r10);
             try code.movRegMem(.r11, .rax, 0);
 
-            // Load vmctx into param_regs[0]
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
-
             const n_args: u32 = @intCast(ci.args.len);
             const has_hrp: bool = ci.extra_results > 0;
             const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
@@ -2785,6 +2787,10 @@ fn compileInstRA(
                 try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
             }
             try emitCallRegArgMoves(code, alloc_result, ci.args, max_reg_args);
+            // Load vmctx into param_regs[0] AFTER arg setup: rdi (param_regs[0] on
+            // SysV) is in caller_saved_alloc, so it may hold an arg vreg consumed
+            // by emitCallRegArgMoves. Loading vmctx earlier would clobber it.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
             if (has_hrp) {
                 if (hrp_in_reg) {
                     const hrp_dst = param_regs[1 + n_args];
@@ -2853,9 +2859,6 @@ fn compileInstRA(
             try code.callReg(.rax);
             // over_trap:
 
-            // Load vmctx into param_regs[0] for the callee.
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
-
             const n_args: u32 = @intCast(cr.args.len);
             const has_hrp: bool = cr.extra_results > 0;
             const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
@@ -2878,6 +2881,10 @@ fn compileInstRA(
                 try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
             }
             try emitCallRegArgMoves(code, alloc_result, cr.args, max_reg_args);
+            // Load vmctx into param_regs[0] AFTER arg setup: rdi (param_regs[0] on
+            // SysV) is in caller_saved_alloc, so it may hold an arg vreg consumed
+            // by emitCallRegArgMoves. Loading vmctx earlier would clobber it.
+            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
             if (has_hrp) {
                 if (hrp_in_reg) {
                     const hrp_dst = param_regs[1 + n_args];
