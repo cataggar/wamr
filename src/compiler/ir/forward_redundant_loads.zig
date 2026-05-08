@@ -1,24 +1,39 @@
 const std = @import("std");
 const ir = @import("ir.zig");
+const passes = @import("passes.zig");
 
-/// forwards redundant loads within a basic block
+/// Forward redundant loads within a basic block: when a load at the
+/// same `(base, offset, size, sign_extend)` location was already
+/// performed earlier in the block with no intervening aliasing store,
+/// barrier, or call, replace later loads' result vregs with the
+/// earlier load's dest and remove the redundant load instructions.
+///
+/// Removal is safe because the prior load already performed (and
+/// either succeeded at, or trapped during) the bounds check; if we
+/// reach the redundant load at run-time, the same access would be
+/// in-bounds again. No intervening op modifies linear memory at the
+/// stored location, so the value is unchanged.
 pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    var changed = false;
     const LoadKey = struct {
         base: ir.VReg,
         offset: u32,
         size: u8,
         sign_extend: bool,
     };
+
     var value_table = std.AutoHashMap(LoadKey, ir.VReg).init(allocator);
     defer value_table.deinit();
 
-    // for each block
+    var aliasing_keys: std.ArrayList(LoadKey) = .empty;
+    defer aliasing_keys.deinit(allocator);
+
+    var changed = false;
+
     for (func.blocks.items) |*block| {
         value_table.clearRetainingCapacity();
-        // scan each instruction
+
         var i: usize = 0;
-        while (i < block.instructions.items.len) : (i += 1) {
+        while (i < block.instructions.items.len) {
             const inst = &block.instructions.items[i];
             switch (inst.op) {
                 .load => |ld| {
@@ -29,41 +44,51 @@ pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator)
                         .sign_extend = ld.sign_extend,
                     };
                     if (value_table.get(key)) |held_vreg| {
-                        // replace this load with a simple move from held_vreg
-                        inst.op = .{ .iconst_32 = 0 }; // dummy, prevents double-free
-                        inst.* = ir.Inst{
-                            .op = .{ .add = .{ .lhs = held_vreg, .rhs = 0 } },
-                            .dest = inst.dest,
-                            .type = inst.type,
-                        };
+                        if (inst.dest) |dest| {
+                            passes.replaceVReg(func, dest, held_vreg);
+                        }
+                        _ = block.instructions.orderedRemove(i);
                         changed = true;
-                    } else if (inst.dest) |dest| {
+                        continue;
+                    }
+                    if (inst.dest) |dest| {
                         try value_table.put(key, dest);
                     }
                 },
                 .store => |st| {
-                    // Invalidate table entries that may alias this store
-                    
-                    // Zig 0.10+ doesn't allow mutation+remove during iteration.
-// Workaround: collect keys to remove, then remove them.
-var remove_keys = std.ArrayList(LoadKey).initCapacity(allocator, 4) catch unreachable;
-
-                    // remove unused var it from store branch
-defer remove_keys.deinit(allocator);
-var entry_it = value_table.iterator();
-while (entry_it.next()) |entry| {
-    const key = entry.key_ptr.*;
-    if (key.base == st.base and !(key.offset + key.size <= st.offset or st.offset + st.size <= key.offset)) {
-        remove_keys.append(allocator, key) catch unreachable;
-    }
-}
-for (remove_keys.items) |key| {
-    _ = value_table.remove(key);
-}
-
+                    aliasing_keys.clearRetainingCapacity();
+                    var it = value_table.iterator();
+                    while (it.next()) |entry| {
+                        const key = entry.key_ptr.*;
+                        if (key.base == st.base and
+                            !(key.offset + key.size <= st.offset or
+                                st.offset + st.size <= key.offset))
+                        {
+                            try aliasing_keys.append(allocator, key);
+                        }
+                    }
+                    for (aliasing_keys.items) |k| _ = value_table.remove(k);
+                },
+                .call,
+                .call_indirect,
+                .call_ref,
+                .atomic_load,
+                .atomic_store,
+                .atomic_rmw,
+                .atomic_cmpxchg,
+                .atomic_fence,
+                .atomic_notify,
+                .atomic_wait,
+                .memory_copy,
+                .memory_fill,
+                .memory_init,
+                .memory_grow,
+                => {
+                    value_table.clearRetainingCapacity();
                 },
                 else => {},
             }
+            i += 1;
         }
     }
     return changed;
