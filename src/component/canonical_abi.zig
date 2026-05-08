@@ -1862,3 +1862,99 @@ test "encodeUtf16ToMem: surrogate pair" {
     try std.testing.expectEqual(@as(u16, 0xD83D), std.mem.readInt(u16, mem[0..2], .little));
     try std.testing.expectEqual(@as(u16, 0xDE00), std.mem.readInt(u16, mem[2..4], .little));
 }
+
+test "loadVal/storeVal: list<u8> PtrLen roundtrip" {
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .list = .{ .element = .u8 } },
+    };
+    const comp_idxspace = [_]?u32{0};
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+    const reg = TypeRegistry.init(&component);
+
+    var mem = [_]u8{0} ** 32;
+    try storeValReg(&mem, 0, .{ .list = 0 }, .{ .list = .{ .ptr = 200, .len = 4 } }, reg);
+    const val = try loadValReg(&mem, 0, .{ .list = 0 }, reg, std.testing.allocator);
+    try std.testing.expect(val == .list);
+    try std.testing.expectEqual(@as(u32, 200), val.list.ptr);
+    try std.testing.expectEqual(@as(u32, 4), val.list.len);
+}
+
+test "list<u8>: lower elements then load PtrLen roundtrip" {
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .list = .{ .element = .u8 } },
+    };
+    const comp_idxspace = [_]?u32{0};
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+    const reg = TypeRegistry.init(&component);
+
+    var mem = [_]u8{0} ** 64;
+    const data_off: u32 = 16;
+    const bytes_in = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    for (bytes_in, 0..) |b, i| {
+        try storeValReg(&mem, data_off + @as(u32, @intCast(i)), .u8, .{ .u8 = b }, reg);
+    }
+    try storeValReg(&mem, 0, .{ .list = 0 }, .{ .list = .{ .ptr = data_off, .len = 4 } }, reg);
+    const val = try loadValReg(&mem, 0, .{ .list = 0 }, reg, std.testing.allocator);
+    try std.testing.expect(val == .list);
+    try std.testing.expectEqual(data_off, val.list.ptr);
+    try std.testing.expectEqual(@as(u32, 4), val.list.len);
+    try std.testing.expectEqualSlices(u8, &bytes_in, mem[val.list.ptr..][0..val.list.len]);
+}
+
+test "list<list<u8>>: nested lower/load roundtrip" {
+    // type 0: list<u8>; type 1: list<list<u8>>
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .list = .{ .element = .u8 } },
+        .{ .list = .{ .element = .{ .list = 0 } } },
+    };
+    const comp_idxspace = [_]?u32{ 0, 1 };
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+    const reg = TypeRegistry.init(&component);
+
+    var mem = [_]u8{0} ** 256;
+    const inner_a_off: u32 = 16;
+    const inner_b_off: u32 = 32;
+    @memcpy(mem[inner_a_off..][0..3], &[_]u8{ 0x01, 0x02, 0x03 });
+    @memcpy(mem[inner_b_off..][0..2], &[_]u8{ 0x10, 0x20 });
+
+    const outer_off: u32 = 64;
+    const inner_a: InterfaceValue = .{ .list = .{ .ptr = inner_a_off, .len = 3 } };
+    const inner_b: InterfaceValue = .{ .list = .{ .ptr = inner_b_off, .len = 2 } };
+    try storeValReg(&mem, outer_off + 0, .{ .list = 0 }, inner_a, reg);
+    try storeValReg(&mem, outer_off + 8, .{ .list = 0 }, inner_b, reg);
+
+    try storeValReg(&mem, 0, .{ .list = 1 }, .{ .list = .{ .ptr = outer_off, .len = 2 } }, reg);
+
+    const outer = try loadValReg(&mem, 0, .{ .list = 1 }, reg, std.testing.allocator);
+    try std.testing.expect(outer == .list);
+    try std.testing.expectEqual(@as(u32, 2), outer.list.len);
+
+    const child_a = try loadValReg(&mem, outer.list.ptr + 0, .{ .list = 0 }, reg, std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x01, 0x02, 0x03 }, mem[child_a.list.ptr..][0..child_a.list.len]);
+
+    const child_b = try loadValReg(&mem, outer.list.ptr + 8, .{ .list = 0 }, reg, std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x10, 0x20 }, mem[child_b.list.ptr..][0..child_b.list.len]);
+}
+
+test "list types: alignment=4, elemSize=8" {
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .list = .{ .element = .u8 } },
+        .{ .list = .{ .element = .{ .list = 0 } } },
+    };
+    const comp_idxspace = [_]?u32{ 0, 1 };
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+    const reg = TypeRegistry.init(&component);
+
+    try std.testing.expectEqual(@as(u32, 4), alignOfType(reg, .{ .list = 0 }));
+    try std.testing.expectEqual(@as(u32, 8), sizeOfType(reg, .{ .list = 0 }));
+    try std.testing.expectEqual(@as(u32, 4), alignOfType(reg, .{ .list = 1 }));
+    try std.testing.expectEqual(@as(u32, 8), sizeOfType(reg, .{ .list = 1 }));
+}
