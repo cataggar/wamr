@@ -2123,18 +2123,6 @@ pub const WasiCliAdapter = struct {
     ) ![]u32 {
         _ = self;
         return switch (arg) {
-            .list_val => |items| blk: {
-                const handles = try allocator.alloc(u32, items.len);
-                errdefer allocator.free(handles);
-                for (items, 0..) |item, i| {
-                    handles[i] = switch (item) {
-                        .handle => |h| h,
-                        .u32 => |h| h,
-                        else => return error.InvalidArgs,
-                    };
-                }
-                break :blk handles;
-            },
             .list => |list| blk: {
                 if (list.len == 0) break :blk try allocator.alloc(u32, 0);
                 const byte_len = std.math.mul(u32, list.len, 4) catch return error.OutOfBoundsMemory;
@@ -2166,14 +2154,8 @@ pub const WasiCliAdapter = struct {
     fn lowerReadyIndexList(
         ci: *ComponentInstance,
         ready: []const u32,
-        direct_list_result: bool,
         allocator: Allocator,
     ) !InterfaceValue {
-        if (direct_list_result) {
-            const values = try allocator.alloc(InterfaceValue, ready.len);
-            for (ready, 0..) |idx, i| values[i] = .{ .u32 = idx };
-            return .{ .list_val = values };
-        }
         if (ready.len == 0) return .{ .list = .{ .ptr = 0, .len = 0 } };
 
         const bytes = try allocator.alloc(u8, ready.len * 4);
@@ -2245,7 +2227,6 @@ pub const WasiCliAdapter = struct {
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (args.len == 0 or results.len == 0) return error.InvalidArgs;
-        const direct_list_result = args[0] == .list_val;
         const handles = try self.readPollableHandlesFromArg(ci, args[0], allocator);
         defer allocator.free(handles);
 
@@ -2254,7 +2235,7 @@ pub const WasiCliAdapter = struct {
         }
         const ready = try self.readyPollableIndices(handles, allocator);
         defer allocator.free(ready);
-        results[0] = try lowerReadyIndexList(ci, ready, direct_list_result, allocator);
+        results[0] = try lowerReadyIndexList(ci, ready, allocator);
     }
 
     /// Register `wasi:io/poll` and `wasi:io/error` host bindings.
@@ -5561,8 +5542,7 @@ pub const WasiCliAdapter = struct {
         }
         if (max_results == 0) {
             // WIT: max_results==0 → ok([]).
-            const empty_list = try allocator.alloc(InterfaceValue, 0);
-            results[0] = try socketResultOk(allocator, .{ .list_val = empty_list });
+            results[0] = try socketResultOk(allocator, .{ .list = .{ .ptr = 0, .len = 0 } });
             return;
         }
         const host_socket = s.host_socket orelse {
@@ -5614,6 +5594,10 @@ pub const WasiCliAdapter = struct {
             rec[0] = .{ .list_val = data_iv };
             rec[1] = remote_iv;
             try collected.append(allocator, .{ .record_val = rec });
+        }
+        if (collected.items.len == 0) {
+            results[0] = try socketResultOk(allocator, .{ .list = .{ .ptr = 0, .len = 0 } });
+            return;
         }
         const list = try allocator.alloc(InterfaceValue, collected.items.len);
         @memcpy(list, collected.items);
@@ -6361,28 +6345,28 @@ pub const WasiCliAdapter = struct {
         return .{ .result_val = .{ .is_ok = true, .payload = payload } };
     }
 
-    fn httpBytesValue(allocator: Allocator, bytes: []const u8) !InterfaceValue {
-        const ivs = try allocator.alloc(InterfaceValue, bytes.len);
-        for (bytes, 0..) |b, i| ivs[i] = .{ .u8 = b };
-        return .{ .list_val = ivs };
+    fn httpBytesValue(ci: *ComponentInstance, bytes: []const u8) !InterfaceValue {
+        const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+        return .{ .string = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
     }
 
-    fn httpOptionBytes(allocator: Allocator, maybe_bytes: ?[]const u8) !InterfaceValue {
+    fn httpOptionBytes(ci: *ComponentInstance, allocator: Allocator, maybe_bytes: ?[]const u8) !InterfaceValue {
         const bytes = maybe_bytes orelse
             return .{ .option_val = .{ .is_some = false, .payload = null } };
         const payload = try allocator.create(InterfaceValue);
-        payload.* = try httpBytesValue(allocator, bytes);
+        payload.* = try httpBytesValue(ci, bytes);
         return .{ .option_val = .{ .is_some = true, .payload = payload } };
     }
 
     fn httpVariantWithOptionalBytes(
+        ci: *ComponentInstance,
         allocator: Allocator,
         discriminant: u32,
         maybe_bytes: ?[]const u8,
     ) !InterfaceValue {
         const payload: ?*InterfaceValue = if (maybe_bytes) |bytes| blk: {
             const p = try allocator.create(InterfaceValue);
-            p.* = try httpBytesValue(allocator, bytes);
+            p.* = try httpBytesValue(ci, bytes);
             break :blk p;
         } else null;
         return .{ .variant_val = .{ .discriminant = discriminant, .payload = payload } };
@@ -6628,24 +6612,14 @@ pub const WasiCliAdapter = struct {
     // --- helpers for extracting bytes from InterfaceValue args ---
 
     /// Extract a byte slice from an InterfaceValue that is either a
-    /// `.string` PtrLen (from guest memory) or a `.list_val` of u8
-    /// InterfaceValues (from test / host calls). Returns null on
-    /// invalid encoding or out-of-bounds guest memory.
+    /// `.string` PtrLen or a `.list` PtrLen (both pointing into guest
+    /// memory). Returns null on invalid encoding or out-of-bounds
+    /// guest memory.
     fn extractArgBytes(ci: *ComponentInstance, arg: InterfaceValue) ?[]const u8 {
         switch (arg) {
             .string => |pl| {
                 if (pl.len == 0) return "";
                 return ci.readGuestBytes(pl.ptr, pl.len);
-            },
-            .list_val => |elems| {
-                // For test calls: each element is .u8
-                // Return a pointer to a contiguous region by checking if the
-                // underlying slice of InterfaceValues can be reinterpreted.
-                // Actually, the u8 values are scattered in tagged unions, so
-                // we cannot get a contiguous []const u8 without copying.
-                // Return null and let the caller use extractArgBytesAlloc.
-                _ = elems;
-                return null;
             },
             .list => |pl| {
                 if (pl.len == 0) return "";
@@ -6655,7 +6629,7 @@ pub const WasiCliAdapter = struct {
         }
     }
 
-    /// Like `extractArgBytes` but allocates a copy for list_val of u8.
+    /// Like `extractArgBytes` but allocates a copy.
     fn extractArgBytesAlloc(
         alloc: Allocator,
         ci: *ComponentInstance,
@@ -6666,19 +6640,6 @@ pub const WasiCliAdapter = struct {
                 if (pl.len == 0) return try alloc.dupe(u8, "");
                 const src = ci.readGuestBytes(pl.ptr, pl.len) orelse return null;
                 return try alloc.dupe(u8, src);
-            },
-            .list_val => |elems| {
-                const buf = try alloc.alloc(u8, elems.len);
-                for (elems, 0..) |e, i| {
-                    buf[i] = switch (e) {
-                        .u8 => |b| b,
-                        else => {
-                            alloc.free(buf);
-                            return null;
-                        },
-                    };
-                }
-                return buf;
             },
             .list => |pl| {
                 if (pl.len == 0) return try alloc.dupe(u8, "");
@@ -7147,7 +7108,7 @@ pub const WasiCliAdapter = struct {
     ///   -> option<string>`.
     fn httpOutgoingRequestGetPath(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -7162,15 +7123,7 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
             return;
         };
-        if (r.path_with_query) |p| {
-            const ivs = try allocator.alloc(InterfaceValue, p.len);
-            for (p, 0..) |b, i| ivs[i] = .{ .u8 = b };
-            const payload = try allocator.create(InterfaceValue);
-            payload.* = .{ .list_val = ivs };
-            results[0] = .{ .option_val = .{ .is_some = true, .payload = payload } };
-        } else {
-            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
-        }
+        results[0] = try httpOptionBytes(ci, allocator, r.path_with_query);
     }
 
     /// `[method]outgoing-request.set-path-with-query(borrow,
@@ -7291,7 +7244,7 @@ pub const WasiCliAdapter = struct {
     /// `[method]outgoing-request.authority(borrow) -> option<string>`.
     fn httpOutgoingRequestGetAuthority(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -7306,15 +7259,7 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
             return;
         };
-        if (r.authority) |a| {
-            const ivs = try allocator.alloc(InterfaceValue, a.len);
-            for (a, 0..) |b, i| ivs[i] = .{ .u8 = b };
-            const payload = try allocator.create(InterfaceValue);
-            payload.* = .{ .list_val = ivs };
-            results[0] = .{ .option_val = .{ .is_some = true, .payload = payload } };
-        } else {
-            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
-        }
+        results[0] = try httpOptionBytes(ci, allocator, r.authority);
     }
 
     /// `[method]outgoing-request.set-authority(borrow,
@@ -7591,7 +7536,7 @@ pub const WasiCliAdapter = struct {
     /// `[method]incoming-request.method(borrow) -> method`.
     fn httpIncomingRequestMethod(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -7608,6 +7553,7 @@ pub const WasiCliAdapter = struct {
             return;
         };
         results[0] = try httpVariantWithOptionalBytes(
+            ci,
             allocator,
             r.method_disc,
             if (r.method_disc == 9) r.method_other else null,
@@ -7618,7 +7564,7 @@ pub const WasiCliAdapter = struct {
     ///   -> option<string>`.
     fn httpIncomingRequestPath(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -7633,13 +7579,13 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
             return;
         };
-        results[0] = try httpOptionBytes(allocator, r.path_with_query);
+        results[0] = try httpOptionBytes(ci, allocator, r.path_with_query);
     }
 
     /// `[method]incoming-request.scheme(borrow) -> option<scheme>`.
     fn httpIncomingRequestScheme(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -7660,6 +7606,7 @@ pub const WasiCliAdapter = struct {
         };
         const payload = try allocator.create(InterfaceValue);
         payload.* = try httpVariantWithOptionalBytes(
+            ci,
             allocator,
             disc,
             if (disc == 2) r.scheme_other else null,
@@ -7670,7 +7617,7 @@ pub const WasiCliAdapter = struct {
     /// `[method]incoming-request.authority(borrow) -> option<string>`.
     fn httpIncomingRequestAuthority(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -7685,7 +7632,7 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
             return;
         };
-        results[0] = try httpOptionBytes(allocator, r.authority);
+        results[0] = try httpOptionBytes(ci, allocator, r.authority);
     }
 
     fn httpIncomingRequestHeaders(
@@ -10454,20 +10401,25 @@ test "wasi:io/poll.poll returns ready indices and drops pollables (#199)" {
 
     const ready_handle = try adapter.pushPollable(.immediate);
     const pending_handle = try adapter.pushPollable(.{ .monotonic_timer = 2_000 });
-    const list_items = try testing.allocator.alloc(InterfaceValue, 2);
-    list_items[0] = .{ .handle = pending_handle };
-    list_items[1] = .{ .handle = ready_handle };
-    defer testing.allocator.free(list_items);
 
     var ci: ComponentInstance = undefined;
-    const args: [1]InterfaceValue = .{.{ .list_val = list_items }};
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // Build the list<u32> arg in test_mem (each pollable handle is u32).
+    var arg_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u32, arg_bytes[0..4], pending_handle, .little);
+    std.mem.writeInt(u32, arg_bytes[4..8], ready_handle, .little);
+    const arg_ptr = ci.hostAllocAndWrite(&arg_bytes) orelse return error.OutOfMemory;
+    const args: [1]InterfaceValue = .{.{ .list = .{ .ptr = arg_ptr, .len = 2 } }};
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.pollPoll(&adapter, &ci, &args, &results, testing.allocator);
     defer results[0].deinit(testing.allocator);
 
-    try testing.expect(results[0] == .list_val);
-    try testing.expectEqual(@as(usize, 1), results[0].list_val.len);
-    try testing.expectEqual(@as(u32, 1), results[0].list_val[0].u32);
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, 1), results[0].list.len);
+    const out_bytes = ci.test_mem.?.buffer[results[0].list.ptr..][0..4];
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, out_bytes[0..4], .little));
 
     const drop_args: [1]InterfaceValue = .{.{ .handle = ready_handle }};
     try WasiCliAdapter.pollableResourceDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
@@ -10481,19 +10433,24 @@ test "wasi:io/poll.poll advances deterministic clock for timers (#199)" {
     adapter.monotonic_clock_override = 10;
 
     const timer_handle = try adapter.pushPollable(.{ .monotonic_timer = 20 });
-    const list_items = try testing.allocator.alloc(InterfaceValue, 1);
-    list_items[0] = .{ .handle = timer_handle };
-    defer testing.allocator.free(list_items);
 
     var ci: ComponentInstance = undefined;
-    const args: [1]InterfaceValue = .{.{ .list_val = list_items }};
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    var arg_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, arg_bytes[0..4], timer_handle, .little);
+    const arg_ptr = ci.hostAllocAndWrite(&arg_bytes) orelse return error.OutOfMemory;
+    const args: [1]InterfaceValue = .{.{ .list = .{ .ptr = arg_ptr, .len = 1 } }};
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.pollPoll(&adapter, &ci, &args, &results, testing.allocator);
     defer results[0].deinit(testing.allocator);
 
     try testing.expectEqual(@as(?u64, 20), adapter.monotonic_clock_override);
-    try testing.expectEqual(@as(usize, 1), results[0].list_val.len);
-    try testing.expectEqual(@as(u32, 0), results[0].list_val[0].u32);
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, 1), results[0].list.len);
+    const out_bytes = ci.test_mem.?.buffer[results[0].list.ptr..][0..4];
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, out_bytes[0..4], .little));
 }
 
 test "wasi:io/poll.pollable.ready and block use readiness model (#199)" {
@@ -11686,21 +11643,23 @@ test "populateWasiProviders: binds wasi:http/* (#149)" {
     try testing.expect(adapter.http_incoming_handler_iface.members.contains("handle"));
 }
 
-fn expectInterfaceBytes(value: InterfaceValue, expected: []const u8) !void {
+fn expectInterfaceBytes(ci: *const ComponentInstance, value: InterfaceValue, expected: []const u8) !void {
     const testing = std.testing;
-    try testing.expect(value == .list_val);
-    try testing.expectEqual(expected.len, value.list_val.len);
-    for (expected, 0..) |b, i| {
-        try testing.expect(value.list_val[i] == .u8);
-        try testing.expectEqual(b, value.list_val[i].u8);
-    }
+    const pl = switch (value) {
+        .list => |x| x,
+        .string => |x| x,
+        else => return testing.expect(false),
+    };
+    try testing.expectEqual(@as(u32, @intCast(expected.len)), pl.len);
+    const bytes = ci.test_mem.?.buffer[pl.ptr..][0..pl.len];
+    try testing.expectEqualSlices(u8, expected, bytes);
 }
 
-fn expectOptionBytes(value: InterfaceValue, expected: []const u8) !void {
+fn expectOptionBytes(ci: *const ComponentInstance, value: InterfaceValue, expected: []const u8) !void {
     const testing = std.testing;
     try testing.expect(value == .option_val);
     try testing.expect(value.option_val.is_some);
-    try expectInterfaceBytes(value.option_val.payload.?.*, expected);
+    try expectInterfaceBytes(ci, value.option_val.payload.?.*, expected);
 }
 
 test "http: incoming request parser populates getters (#201)" {
@@ -11718,6 +11677,8 @@ test "http: incoming request parser populates getters (#201)" {
     );
 
     var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
     const req_args = [_]InterfaceValue{.{ .handle = req_handle }};
 
     var method_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -11728,7 +11689,7 @@ test "http: incoming request parser populates getters (#201)" {
     var path_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpIncomingRequestPath(&adapter, &ci, &req_args, &path_results, testing.allocator);
     defer path_results[0].deinit(testing.allocator);
-    try expectOptionBytes(path_results[0], "/hello?x=1");
+    try expectOptionBytes(&ci, path_results[0], "/hello?x=1");
 
     var scheme_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpIncomingRequestScheme(&adapter, &ci, &req_args, &scheme_results, testing.allocator);
@@ -11739,7 +11700,7 @@ test "http: incoming request parser populates getters (#201)" {
     var authority_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpIncomingRequestAuthority(&adapter, &ci, &req_args, &authority_results, testing.allocator);
     defer authority_results[0].deinit(testing.allocator);
-    try expectOptionBytes(authority_results[0], "example.com");
+    try expectOptionBytes(&ci, authority_results[0], "example.com");
 
     var headers_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpIncomingRequestHeaders(&adapter, &ci, &req_args, &headers_results, testing.allocator);
@@ -12533,12 +12494,13 @@ test "sockets #178: tcp resource-drop after listen frees server" {
 
 // ── #176: real outbound HTTP client ─────────────────────────────────────────
 
-/// Helper: build a `list_val` of u8 InterfaceValues from a byte slice.
-/// Allocator-owned; caller frees via `deinit`.
-fn testMakeListVal(alloc: Allocator, bytes: []const u8) !InterfaceValue {
-    const ivs = try alloc.alloc(InterfaceValue, bytes.len);
-    for (bytes, 0..) |b, i| ivs[i] = .{ .u8 = b };
-    return .{ .list_val = ivs };
+/// Helper: copy `bytes` into `ci.test_mem` and return a
+/// `.list = PtrLen` pointing into it. The test must call
+/// `ci.enableTestMem(...)` first; the bytes live for the lifetime
+/// of `test_mem`.
+fn testMakeListVal(ci: *ComponentInstance, _: Allocator, bytes: []const u8) !InterfaceValue {
+    const ptr = ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory;
+    return .{ .list = .{ .ptr = ptr, .len = @intCast(bytes.len) } };
 }
 
 test "http #176: fields.append stores and entries returns entries" {
@@ -12546,6 +12508,8 @@ test "http #176: fields.append stores and entries returns entries" {
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
 
     // Create fields
     var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -12553,9 +12517,9 @@ test "http #176: fields.append stores and entries returns entries" {
     const fh = ctor_results[0].handle;
 
     // Append "content-type: text/plain"
-    const name1 = try testMakeListVal(testing.allocator, "content-type");
+    const name1 = try testMakeListVal(&ci, testing.allocator, "content-type");
     defer name1.deinit(testing.allocator);
-    const val1 = try testMakeListVal(testing.allocator, "text/plain");
+    const val1 = try testMakeListVal(&ci, testing.allocator, "text/plain");
     defer val1.deinit(testing.allocator);
     const app_args1 = [_]InterfaceValue{ .{ .handle = fh }, name1, val1 };
     var app_results1: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -12563,9 +12527,9 @@ test "http #176: fields.append stores and entries returns entries" {
     try testing.expect(app_results1[0].result_val.is_ok);
 
     // Append "x-custom: hello"
-    const name2 = try testMakeListVal(testing.allocator, "x-custom");
+    const name2 = try testMakeListVal(&ci, testing.allocator, "x-custom");
     defer name2.deinit(testing.allocator);
-    const val2 = try testMakeListVal(testing.allocator, "hello");
+    const val2 = try testMakeListVal(&ci, testing.allocator, "hello");
     defer val2.deinit(testing.allocator);
     const app_args2 = [_]InterfaceValue{ .{ .handle = fh }, name2, val2 };
     var app_results2: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -12587,17 +12551,19 @@ test "http #176: fields.get returns matching values" {
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
 
     var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
     const fh = ctor_results[0].handle;
 
     // Append two entries with same name
-    const name = try testMakeListVal(testing.allocator, "accept");
+    const name = try testMakeListVal(&ci, testing.allocator, "accept");
     defer name.deinit(testing.allocator);
-    const val_a = try testMakeListVal(testing.allocator, "text/html");
+    const val_a = try testMakeListVal(&ci, testing.allocator, "text/html");
     defer val_a.deinit(testing.allocator);
-    const val_b = try testMakeListVal(testing.allocator, "application/json");
+    const val_b = try testMakeListVal(&ci, testing.allocator, "application/json");
     defer val_b.deinit(testing.allocator);
 
     const args_a = [_]InterfaceValue{ .{ .handle = fh }, name, val_a };
@@ -12623,13 +12589,15 @@ test "http #176: fields.has returns true for existing name" {
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
 
     var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
     const fh = ctor_results[0].handle;
 
     // has() before append → false
-    const name = try testMakeListVal(testing.allocator, "x-test");
+    const name = try testMakeListVal(&ci, testing.allocator, "x-test");
     defer name.deinit(testing.allocator);
     const has_args = [_]InterfaceValue{ .{ .handle = fh }, name };
     var has_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -12637,7 +12605,7 @@ test "http #176: fields.has returns true for existing name" {
     try testing.expect(!has_r[0].bool);
 
     // Append
-    const val = try testMakeListVal(testing.allocator, "yes");
+    const val = try testMakeListVal(&ci, testing.allocator, "yes");
     defer val.deinit(testing.allocator);
     const app_args = [_]InterfaceValue{ .{ .handle = fh }, name, val };
     var app_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -12653,14 +12621,16 @@ test "http #176: fields.delete removes entries" {
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
 
     var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
     const fh = ctor_results[0].handle;
 
-    const name = try testMakeListVal(testing.allocator, "x-del");
+    const name = try testMakeListVal(&ci, testing.allocator, "x-del");
     defer name.deinit(testing.allocator);
-    const val = try testMakeListVal(testing.allocator, "gone");
+    const val = try testMakeListVal(&ci, testing.allocator, "gone");
     defer val.deinit(testing.allocator);
     const app_args = [_]InterfaceValue{ .{ .handle = fh }, name, val };
     var app_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -12716,6 +12686,8 @@ test "http #176: outgoing-request set-path persists" {
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
 
     var f_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpFieldsConstructor(&adapter, &ci, &.{}, &f_r, testing.allocator);
@@ -12731,7 +12703,7 @@ test "http #176: outgoing-request set-path persists" {
     try testing.expect(!gp_r[0].option_val.is_some);
 
     // Set path
-    const path_val = try testMakeListVal(testing.allocator, "/api/data");
+    const path_val = try testMakeListVal(&ci, testing.allocator, "/api/data");
     defer path_val.deinit(testing.allocator);
     const path_payload = try testing.allocator.create(InterfaceValue);
     defer testing.allocator.destroy(path_payload);
@@ -13095,7 +13067,7 @@ test "sockets #178 UDP: receive on empty queue returns ok([])" {
             try WasiCliAdapter.incomingDatagramReceive(adapter, &ci, &recv_args, &recv_results, std.testing.allocator);
             defer recv_results[0].deinit(std.testing.allocator);
             try std.testing.expect(recv_results[0].result_val.is_ok);
-            try std.testing.expectEqual(@as(usize, 0), recv_results[0].result_val.payload.?.list_val.len);
+            try std.testing.expectEqual(@as(usize, 0), recv_results[0].result_val.payload.?.list.len);
         }
     }.run);
 }
@@ -13577,7 +13549,7 @@ test "sockets #178 UDP: receive max_results=0 returns ok([])" {
             try WasiCliAdapter.incomingDatagramReceive(adapter, &ci, &recv_args, &recv_results, a);
             defer recv_results[0].deinit(a);
             try std.testing.expect(recv_results[0].result_val.is_ok);
-            try std.testing.expectEqual(@as(usize, 0), recv_results[0].result_val.payload.?.list_val.len);
+            try std.testing.expectEqual(@as(usize, 0), recv_results[0].result_val.payload.?.list.len);
         }
     }.run);
 }
