@@ -7,6 +7,7 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
+const deadStoreElimination = @import("dead_store_elimination.zig").deadStoreElimination;
 
 pub const TargetArch = enum { x86_64, aarch64 };
 
@@ -5347,12 +5348,15 @@ pub const default_passes: []const PassFn = &.{
     &inductionVariableSimplification,
     &hoistLoopInvariantCode,
     &unrollSmallFixedLoops,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &deadStoreElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
     &elideRedundantBoundsChecks,
     &foldLoadStoreOffset,
 };
+
 
 /// Default optimization pipeline for x86-64.
 const x86_64_default_passes: []const PassFn = &.{
