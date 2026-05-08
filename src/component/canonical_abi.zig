@@ -138,7 +138,6 @@ pub const InterfaceValue = union(enum) {
     // Compound values (fully lifted, allocator-owned)
     record_val: []const InterfaceValue,
     variant_val: VariantVal,
-    list_val: []const InterfaceValue,
     tuple_val: []const InterfaceValue,
     flags_val: []const u32, // packed bitfields, ceil(n/32) words
     enum_val: u32, // discriminant index
@@ -177,10 +176,6 @@ pub const InterfaceValue = union(enum) {
                     p.*.deinit(allocator);
                     allocator.destroy(p);
                 }
-            },
-            .list_val => |elems| {
-                for (elems) |e| e.deinit(allocator);
-                allocator.free(elems);
             },
             .tuple_val => |fields| {
                 for (fields) |f| f.deinit(allocator);

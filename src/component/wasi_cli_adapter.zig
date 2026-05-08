@@ -36,6 +36,109 @@ const HostInstance = instance_mod.HostInstance;
 const HostInstanceMember = instance_mod.HostInstanceMember;
 const ImportBinding = instance_mod.ImportBinding;
 const InterfaceValue = instance_mod.InterfaceValue;
+const ctypes = @import("types.zig");
+const abi = @import("canonical_abi.zig");
+
+// ── Local TypeDef table for hand-lowered list<compound> shapes (#402) ───────
+//
+// `incomingDatagramReceive` and `outgoingSend` produce/consume canonical
+// `list<incoming-datagram>` / `list<outgoing-datagram>` values. Rather
+// than depending on the host component's wider type table (which is not
+// available — host callbacks have no access to declared result_types),
+// we mirror the WIT shape locally and feed it to `abi.storeValReg` /
+// `abi.loadValReg` via a private `TypeRegistry`.
+//
+// Indices (consult `socket_local_types` below):
+//   0: tuple<u8, u8, u8, u8>                                — ipv4 octets
+//   1: tuple<u16, u16, u16, u16, u16, u16, u16, u16>         — ipv6 groups
+//   2: record { port: u16, address: tuple<u8...> }           — ipv4 socket-addr
+//   3: record { port: u16, flow-info: u32, address: tuple<u16...>, scope-id: u32 } — ipv6 socket-addr
+//   4: variant<ipv4, ipv6>                                   — ip-socket-address
+//   5: option<ip-socket-address>                             — outgoing-datagram remote
+//   6: list<u8>                                              — datagram data
+//   7: record { data: list<u8>, remote-address: ip-socket-address }            — incoming-datagram
+//   8: record { data: list<u8>, remote-address: option<ip-socket-address> }    — outgoing-datagram
+const socket_ipv4_octets_fields = [_]ctypes.ValType{ .u8, .u8, .u8, .u8 };
+const socket_ipv6_groups_fields = [_]ctypes.ValType{ .u16, .u16, .u16, .u16, .u16, .u16, .u16, .u16 };
+const socket_ipv4_record_fields = [_]ctypes.Field{
+    .{ .name = "port", .type = .u16 },
+    .{ .name = "address", .type = .{ .tuple = 0 } },
+};
+const socket_ipv6_record_fields = [_]ctypes.Field{
+    .{ .name = "port", .type = .u16 },
+    .{ .name = "flow-info", .type = .u32 },
+    .{ .name = "address", .type = .{ .tuple = 1 } },
+    .{ .name = "scope-id", .type = .u32 },
+};
+const socket_ip_address_cases = [_]ctypes.Case{
+    .{ .name = "ipv4", .type = .{ .record = 2 } },
+    .{ .name = "ipv6", .type = .{ .record = 3 } },
+};
+const socket_incoming_dg_fields = [_]ctypes.Field{
+    .{ .name = "data", .type = .{ .list = 6 } },
+    .{ .name = "remote-address", .type = .{ .variant = 4 } },
+};
+const socket_outgoing_dg_fields = [_]ctypes.Field{
+    .{ .name = "data", .type = .{ .list = 6 } },
+    .{ .name = "remote-address", .type = .{ .option = 5 } },
+};
+const socket_local_types = [_]ctypes.TypeDef{
+    .{ .tuple = .{ .fields = &socket_ipv4_octets_fields } },
+    .{ .tuple = .{ .fields = &socket_ipv6_groups_fields } },
+    .{ .record = .{ .fields = &socket_ipv4_record_fields } },
+    .{ .record = .{ .fields = &socket_ipv6_record_fields } },
+    .{ .variant = .{ .cases = &socket_ip_address_cases } },
+    .{ .option = .{ .inner = .{ .variant = 4 } } },
+    .{ .list = .{ .element = .u8 } },
+    .{ .record = .{ .fields = &socket_incoming_dg_fields } },
+    .{ .record = .{ .fields = &socket_outgoing_dg_fields } },
+};
+const SOCKET_INCOMING_DG_RECORD_IDX: u32 = 7;
+const SOCKET_OUTGOING_DG_RECORD_IDX: u32 = 8;
+fn socketTypeRegistry() abi.TypeRegistry {
+    return abi.TypeRegistry.fromTypes(&socket_local_types);
+}
+
+/// Lower a host slice-of-byte-slices into a canonical
+/// `list<list<u8>>` PtrLen in guest memory. Each inner slice is
+/// `hostAllocAndWrite`'d; the outer buffer holds `n × (u32 ptr, u32 len)`
+/// pairs. Returns `{ .ptr = 0, .len = 0 }` for empty input without
+/// touching guest memory.
+fn lowerByteListList(ci: *ComponentInstance, lists: []const []const u8) !InterfaceValue.PtrLen {
+    if (lists.len == 0) return .{ .ptr = 0, .len = 0 };
+    const total: u32 = @intCast(lists.len * 8);
+    const outer = ci.hostAllocGuest(total, 4) orelse return error.OutOfMemory;
+    const dst = ci.writableGuestBytes(outer, total) orelse return error.OutOfMemory;
+    var off: u32 = 0;
+    for (lists) |bytes| {
+        const inner_ptr: u32 = if (bytes.len == 0) 0 else (ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory);
+        std.mem.writeInt(u32, dst[off..][0..4], inner_ptr, .little);
+        std.mem.writeInt(u32, dst[off + 4 ..][0..4], @intCast(bytes.len), .little);
+        off += 8;
+    }
+    return .{ .ptr = outer, .len = @intCast(lists.len) };
+}
+
+/// Lower a slice of (name, value) byte pairs into canonical
+/// `list<tuple<list<u8>, list<u8>>>` PtrLen in guest memory. Each
+/// element is 16 bytes: `(name_ptr, name_len, value_ptr, value_len)`.
+fn lowerFieldEntriesList(ci: *ComponentInstance, entries: []const HttpFieldEntry) !InterfaceValue.PtrLen {
+    if (entries.len == 0) return .{ .ptr = 0, .len = 0 };
+    const total: u32 = @intCast(entries.len * 16);
+    const outer = ci.hostAllocGuest(total, 4) orelse return error.OutOfMemory;
+    const dst = ci.writableGuestBytes(outer, total) orelse return error.OutOfMemory;
+    var off: u32 = 0;
+    for (entries) |e| {
+        const name_ptr: u32 = if (e.name.len == 0) 0 else (ci.hostAllocAndWrite(e.name) orelse return error.OutOfMemory);
+        const value_ptr: u32 = if (e.value.len == 0) 0 else (ci.hostAllocAndWrite(e.value) orelse return error.OutOfMemory);
+        std.mem.writeInt(u32, dst[off..][0..4], name_ptr, .little);
+        std.mem.writeInt(u32, dst[off + 4 ..][0..4], @intCast(e.name.len), .little);
+        std.mem.writeInt(u32, dst[off + 8 ..][0..4], value_ptr, .little);
+        std.mem.writeInt(u32, dst[off + 12 ..][0..4], @intCast(e.value.len), .little);
+        off += 16;
+    }
+    return .{ .ptr = outer, .len = @intCast(entries.len) };
+}
 
 const streams = @import("../wasi/preview2/streams.zig");
 const wasi_p2_core = @import("../wasi/preview2/core.zig");
@@ -5511,7 +5614,7 @@ pub const WasiCliAdapter = struct {
     /// "no data available, return list so far".
     fn incomingDatagramReceive(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -5583,15 +5686,14 @@ pub const WasiCliAdapter = struct {
                     continue;
                 }
             }
-            // Build incoming-datagram record: { data: list<u8>, remote-address: ip-socket-address }
-            const data_copy = try allocator.alloc(u8, msg.data.len);
-            @memcpy(data_copy, msg.data);
-            const data_iv = try allocator.alloc(InterfaceValue, msg.data.len);
-            for (data_copy, 0..) |b, i| data_iv[i] = .{ .u8 = b };
-            allocator.free(data_copy);
+            // Build incoming-datagram record: { data: list<u8>, remote-address: ip-socket-address }.
+            // Lower the data slice into guest memory directly so the
+            // record value already carries the canonical `.list = PtrLen`
+            // shape (issue #402).
+            const data_ptr: u32 = if (msg.data.len == 0) 0 else (ci.hostAllocAndWrite(msg.data) orelse return error.OutOfMemory);
             const remote_iv = try lowerIpSocketAddress(allocator, msg.from);
             const rec = try allocator.alloc(InterfaceValue, 2);
-            rec[0] = .{ .list_val = data_iv };
+            rec[0] = .{ .list = .{ .ptr = data_ptr, .len = @intCast(msg.data.len) } };
             rec[1] = remote_iv;
             try collected.append(allocator, .{ .record_val = rec });
         }
@@ -5599,9 +5701,24 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultOk(allocator, .{ .list = .{ .ptr = 0, .len = 0 } });
             return;
         }
-        const list = try allocator.alloc(InterfaceValue, collected.items.len);
-        @memcpy(list, collected.items);
-        results[0] = try socketResultOk(allocator, .{ .list_val = list });
+        // Lower the outer `list<incoming-datagram>` into a single guest
+        // buffer via storeValReg using the file-local socket type registry.
+        const reg = socketTypeRegistry();
+        const elem_t: ctypes.ValType = .{ .record = SOCKET_INCOMING_DG_RECORD_IDX };
+        const elem_size = abi.sizeOfType(reg, elem_t);
+        const elem_align = abi.alignOfType(reg, elem_t);
+        const total = std.math.mul(u32, elem_size, @intCast(collected.items.len)) catch return error.OutOfMemory;
+        const list_ptr = ci.hostAllocGuest(total, elem_align) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(list_ptr, total) orelse return error.OutOfMemory;
+        var off: u32 = 0;
+        for (collected.items) |dg_iv| {
+            abi.storeValReg(dst, off, elem_t, dg_iv, reg) catch return error.InvalidArgs;
+            off += elem_size;
+        }
+        // Free per-element host heap (record_val slices, variant payloads)
+        // now that bytes are written into guest memory.
+        for (collected.items) |dg_iv| dg_iv.deinit(allocator);
+        results[0] = try socketResultOk(allocator, .{ .list = .{ .ptr = list_ptr, .len = @intCast(collected.items.len) } });
     }
 
     /// `[method]outgoing-datagram-stream.check-send:
@@ -5647,7 +5764,7 @@ pub const WasiCliAdapter = struct {
     ///    else `ok(i)`.
     fn outgoingSend(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -5658,8 +5775,8 @@ pub const WasiCliAdapter = struct {
             .handle => |h| h,
             else => return error.InvalidArgs,
         };
-        const datagrams = switch (args[1]) {
-            .list_val => |l| l,
+        const datagrams_pl = switch (args[1]) {
+            .list => |pl| pl,
             else => return error.InvalidArgs,
         };
         const out_stream = self.lookupUdpOutgoingStream(stream_handle) orelse {
@@ -5676,13 +5793,41 @@ pub const WasiCliAdapter = struct {
         }
         // WIT-mandated trap: check-send must precede send.
         const credit = out_stream.send_credit orelse return error.Trap;
-        if (datagrams.len > credit) return error.Trap;
+        if (datagrams_pl.len > credit) return error.Trap;
         // Consume credit — every send re-requires a check.
         out_stream.send_credit = null;
 
-        if (datagrams.len == 0) {
+        if (datagrams_pl.len == 0) {
             results[0] = try socketResultOk(allocator, .{ .u64 = 0 });
             return;
+        }
+
+        // Lift the canonical `list<outgoing-datagram>` from guest memory
+        // into a host slice of `.record_val` (#402). Inner `data: list<u8>`
+        // remains a `.list = PtrLen` reference; we read its bytes from
+        // the same memory below.
+        const reg = socketTypeRegistry();
+        const elem_t: ctypes.ValType = .{ .record = SOCKET_OUTGOING_DG_RECORD_IDX };
+        const elem_size = abi.sizeOfType(reg, elem_t);
+        // Resolve a contiguous byte view that covers all datagram records.
+        // Prefer test_mem when active so unit tests don't require a real
+        // canonical memory.
+        const total_bytes: u32 = @as(u32, @intCast(datagrams_pl.len)) * elem_size;
+        const list_bytes = ci.readGuestBytes(datagrams_pl.ptr, total_bytes) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        const datagrams = try allocator.alloc(InterfaceValue, datagrams_pl.len);
+        defer {
+            for (datagrams) |d| d.deinit(allocator);
+            allocator.free(datagrams);
+        }
+        for (0..datagrams_pl.len) |i| {
+            const off = @as(u32, @intCast(i)) * elem_size;
+            datagrams[i] = abi.loadValReg(list_bytes, off, elem_t, reg, allocator) catch {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            };
         }
 
         const host_socket = s.host_socket orelse {
@@ -5713,9 +5858,9 @@ pub const WasiCliAdapter = struct {
                 results[0] = try socketResultOk(allocator, .{ .u64 = sent });
                 return;
             }
-            // Extract data bytes.
-            const data_list = switch (dg_fields[0]) {
-                .list_val => |l| l,
+            // Extract data bytes — `.list = PtrLen` after loadValReg.
+            const data_pl = switch (dg_fields[0]) {
+                .list => |pl| pl,
                 else => {
                     if (sent == 0) {
                         results[0] = try socketResultErr(allocator, .invalid_argument);
@@ -5725,14 +5870,20 @@ pub const WasiCliAdapter = struct {
                     return;
                 },
             };
-            const data_buf = try allocator.alloc(u8, data_list.len);
-            defer allocator.free(data_buf);
-            for (data_list, 0..) |iv, i| {
-                data_buf[i] = switch (iv) {
-                    .u8 => |b| b,
-                    else => 0,
+            const data_buf = if (data_pl.len == 0)
+                try allocator.alloc(u8, 0)
+            else blk: {
+                const src = ci.readGuestBytes(data_pl.ptr, data_pl.len) orelse {
+                    if (sent == 0) {
+                        results[0] = try socketResultErr(allocator, .invalid_argument);
+                        return;
+                    }
+                    results[0] = try socketResultOk(allocator, .{ .u64 = sent });
+                    return;
                 };
-            }
+                break :blk try allocator.dupe(u8, src);
+            };
+            defer allocator.free(data_buf);
 
             // Determine destination address.
             var dest: std.Io.net.IpAddress = undefined;
@@ -6716,10 +6867,10 @@ pub const WasiCliAdapter = struct {
     /// a list_val of u8 for name and a list_val of u8 for value.
     fn httpFieldsEntries(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
-        allocator: Allocator,
+        _: Allocator,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (results.len == 0) return error.InvalidArgs;
@@ -6727,30 +6878,20 @@ pub const WasiCliAdapter = struct {
         const handle = switch (args[0]) {
             .handle => |h| h,
             else => {
-                const empty = try allocator.alloc(InterfaceValue, 0);
-                results[0] = .{ .list_val = empty };
+                results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
                 return;
             },
         };
 
         const f = self.lookupHttpFields(handle) orelse {
-            const empty = try allocator.alloc(InterfaceValue, 0);
-            results[0] = .{ .list_val = empty };
+            results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
             return;
         };
 
-        const entries = try allocator.alloc(InterfaceValue, f.entries.items.len);
-        for (f.entries.items, 0..) |e, i| {
-            const name_ivs = try allocator.alloc(InterfaceValue, e.name.len);
-            for (e.name, 0..) |b, j| name_ivs[j] = .{ .u8 = b };
-            const val_ivs = try allocator.alloc(InterfaceValue, e.value.len);
-            for (e.value, 0..) |b, j| val_ivs[j] = .{ .u8 = b };
-            const tup = try allocator.alloc(InterfaceValue, 2);
-            tup[0] = .{ .list_val = name_ivs };
-            tup[1] = .{ .list_val = val_ivs };
-            entries[i] = .{ .tuple_val = tup };
-        }
-        results[0] = .{ .list_val = entries };
+        // Lower into canonical `list<tuple<list<u8>, list<u8>>>` PtrLen
+        // form (issue #402): each entry is 16 bytes of (ptr,len) pairs
+        // backed by guest memory.
+        results[0] = .{ .list = try lowerFieldEntriesList(ci, f.entries.items) };
     }
 
     /// `[method]fields.get(borrow<fields>, field-name)
@@ -6760,7 +6901,7 @@ pub const WasiCliAdapter = struct {
         ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
-        allocator: Allocator,
+        _: Allocator,
     ) anyerror!void {
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (args.len < 2 or results.len == 0) return error.InvalidArgs;
@@ -6770,8 +6911,7 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         const f = self.lookupHttpFields(handle) orelse {
-            const empty = try allocator.alloc(InterfaceValue, 0);
-            results[0] = .{ .list_val = empty };
+            results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
             return;
         };
 
@@ -6780,28 +6920,20 @@ pub const WasiCliAdapter = struct {
         const name_alloc = if (name_bytes == null) try extractArgBytesAlloc(self.allocator, ci, args[1]) else null;
         defer if (name_alloc) |n| self.allocator.free(n);
         const name = name_bytes orelse (name_alloc orelse {
-            const empty = try allocator.alloc(InterfaceValue, 0);
-            results[0] = .{ .list_val = empty };
+            results[0] = .{ .list = .{ .ptr = 0, .len = 0 } };
             return;
         });
 
-        // Count matches
-        var count: usize = 0;
-        for (f.entries.items) |e| {
-            if (std.mem.eql(u8, e.name, name)) count += 1;
-        }
-
-        const matches = try allocator.alloc(InterfaceValue, count);
-        var idx: usize = 0;
+        // Collect matching values into a temporary slice so we can hand
+        // it to the byte-list-of-byte-lists lowerer in one shot.
+        var matches: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer matches.deinit(self.allocator);
         for (f.entries.items) |e| {
             if (std.mem.eql(u8, e.name, name)) {
-                const val_ivs = try allocator.alloc(InterfaceValue, e.value.len);
-                for (e.value, 0..) |b, j| val_ivs[j] = .{ .u8 = b };
-                matches[idx] = .{ .list_val = val_ivs };
-                idx += 1;
+                try matches.append(self.allocator, e.value);
             }
         }
-        results[0] = .{ .list_val = matches };
+        results[0] = .{ .list = try lowerByteListList(ci, matches.items) };
     }
 
     /// `[method]fields.has(borrow<fields>, field-name) -> bool`.
@@ -6910,36 +7042,45 @@ pub const WasiCliAdapter = struct {
         // Remove existing entries with this name
         httpFieldsRemoveByName(f, self.allocator, name);
 
-        // Add new entries from the list of values
-        const vals = switch (args[2]) {
-            .list_val => |l| l,
+        // Add new entries from the list of values: canonical
+        // `list<list<u8>>` is laid out in guest memory as
+        // `n × (u32 ptr, u32 len)` pairs (issue #402).
+        const vals_pl = switch (args[2]) {
+            .list => |pl| pl,
             else => {
                 results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
                 return;
             },
         };
-        for (vals) |v| {
+        if (vals_pl.len == 0) {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        }
+        const mem = ci.canonicalMemory() orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        const stride: u32 = 8;
+        const total = std.math.mul(u32, vals_pl.len, stride) catch return error.InvalidArgs;
+        const list_end = std.math.add(u32, vals_pl.ptr, total) catch return error.InvalidArgs;
+        if (list_end > mem.data.len) return error.OutOfBoundsMemory;
+        var i: u32 = 0;
+        while (i < vals_pl.len) : (i += 1) {
+            const off = vals_pl.ptr + i * stride;
+            const inner_ptr = std.mem.readInt(u32, mem.data[off..][0..4], .little);
+            const inner_len = std.mem.readInt(u32, mem.data[off + 4 ..][0..4], .little);
+            const inner_bytes: []const u8 = if (inner_len == 0)
+                ""
+            else blk: {
+                const end = std.math.add(u32, inner_ptr, inner_len) catch return error.OutOfBoundsMemory;
+                if (end > mem.data.len) return error.OutOfBoundsMemory;
+                break :blk mem.data[inner_ptr..end];
+            };
+
             const name_copy = try self.allocator.dupe(u8, name);
             errdefer self.allocator.free(name_copy);
-
-            var val_copy: ?[]u8 = null;
-            switch (v) {
-                .list_val => |vbytes| {
-                    const buf = try self.allocator.alloc(u8, vbytes.len);
-                    for (vbytes, 0..) |b, j| {
-                        buf[j] = switch (b) {
-                            .u8 => |byte| byte,
-                            else => 0,
-                        };
-                    }
-                    val_copy = buf;
-                },
-                else => {
-                    val_copy = try extractArgBytesAlloc(self.allocator, ci, v);
-                },
-            }
-            const vc = val_copy orelse try self.allocator.dupe(u8, "");
-            try f.entries.append(self.allocator, .{ .name = name_copy, .value = vc });
+            const val_copy = try self.allocator.dupe(u8, inner_bytes);
+            try f.entries.append(self.allocator, .{ .name = name_copy, .value = val_copy });
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
@@ -9613,7 +9754,6 @@ test "WasiCliAdapter: init/deinit captures empty buffer" {
 }
 
 test "WasiCliAdapter: end-to-end via instance import + alias + canon.lower" {
-    const ctypes = @import("types.zig");
     const testing = std.testing;
 
     // Hand-authored core module:
@@ -9759,7 +9899,6 @@ test "WasiCliAdapter: end-to-end via instance import + alias + canon.lower" {
 }
 
 test "WasiCliAdapter: hello-world fixture (cli/stdout + io/streams + run)" {
-    const ctypes = @import("types.zig");
     const executor = @import("executor.zig");
     const abi_mod = @import("canonical_abi.zig");
     const testing = std.testing;
@@ -10001,7 +10140,6 @@ test "runLoadedComponent: matches versioned WASI import names" {
     // with versioned import names (`@0.2.6`) and dispatched through the
     // CLI's `runLoadedComponent` helper. This exercises the full
     // populateWasiProviders → linkImports → callComponentFunc path.
-    const ctypes = @import("types.zig");
     const testing = std.testing;
 
     const core_wasm = [_]u8{
@@ -11822,7 +11960,6 @@ test "http: response writer rejects invalid response headers (#201)" {
 
 test "http: discovers versioned incoming-handler export (#201)" {
     const testing = std.testing;
-    const ctypes = ctypes_root;
 
     const core_wasm = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
@@ -11904,12 +12041,12 @@ test "http: fields constructor + drop roundtrip (#149)" {
     try testing.expectEqual(@as(usize, 1), adapter.http_fields_table.items.len);
     try testing.expect(adapter.http_fields_table.items[handle] != null);
 
-    // entries returns an empty list_val.
+    // entries returns an empty list (PtrLen).
     var entries_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     const entries_args = [_]InterfaceValue{.{ .handle = handle }};
     try WasiCliAdapter.httpFieldsEntries(&adapter, &ci, &entries_args, &entries_results, testing.allocator);
-    try testing.expect(entries_results[0] == .list_val);
-    try testing.expectEqual(@as(usize, 0), entries_results[0].list_val.len);
+    try testing.expect(entries_results[0] == .list);
+    try testing.expectEqual(@as(u32, 0), entries_results[0].list.len);
     entries_results[0].deinit(testing.allocator);
 
     // Drop frees the slot.
@@ -12542,8 +12679,8 @@ test "http #176: fields.append stores and entries returns entries" {
     try WasiCliAdapter.httpFieldsEntries(&adapter, &ci, &ent_args, &ent_results, testing.allocator);
     defer ent_results[0].deinit(testing.allocator);
 
-    try testing.expect(ent_results[0] == .list_val);
-    try testing.expectEqual(@as(usize, 2), ent_results[0].list_val.len);
+    try testing.expect(ent_results[0] == .list);
+    try testing.expectEqual(@as(u32, 2), ent_results[0].list.len);
 }
 
 test "http #176: fields.get returns matching values" {
@@ -12580,8 +12717,8 @@ test "http #176: fields.get returns matching values" {
     try WasiCliAdapter.httpFieldsGet(&adapter, &ci, &get_args, &get_results, testing.allocator);
     defer get_results[0].deinit(testing.allocator);
 
-    try testing.expect(get_results[0] == .list_val);
-    try testing.expectEqual(@as(usize, 2), get_results[0].list_val.len);
+    try testing.expect(get_results[0] == .list);
+    try testing.expectEqual(@as(u32, 2), get_results[0].list.len);
 }
 
 test "http #176: fields.has returns true for existing name" {
@@ -12647,7 +12784,7 @@ test "http #176: fields.delete removes entries" {
     var ent_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.httpFieldsEntries(&adapter, &ci, &ent_args, &ent_r, testing.allocator);
     defer ent_r[0].deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), ent_r[0].list_val.len);
+    try testing.expectEqual(@as(u32, 0), ent_r[0].list.len);
 }
 
 test "http #176: outgoing-request set-method persists" {
@@ -13087,9 +13224,7 @@ test "sockets #178 UDP: check-send credit and send traps" {
 
             // send without check-send → trap.
             {
-                const empty_list = try std.testing.allocator.alloc(InterfaceValue, 0);
-                defer std.testing.allocator.free(empty_list);
-                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = empty_list } };
+                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list = .{ .ptr = 0, .len = 0 } } };
                 var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                 const err = WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, std.testing.allocator);
                 try std.testing.expectError(error.Trap, err);
@@ -13105,13 +13240,11 @@ test "sockets #178 UDP: check-send credit and send traps" {
                 try std.testing.expectEqual(@as(u64, 8), cs_results[0].result_val.payload.?.u64);
             }
 
-            // send with too many datagrams → trap.
+            // send with too many datagrams → trap. The credit check
+            // (`len > credit`) fires before any guest memory is read,
+            // so we can pass a bogus PtrLen with len=9 here.
             {
-                // credit is 8, send 9 → trap
-                const too_many = try std.testing.allocator.alloc(InterfaceValue, 9);
-                defer std.testing.allocator.free(too_many);
-                for (too_many) |*slot| slot.* = .{ .u32 = 0 };
-                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = too_many } };
+                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list = .{ .ptr = 0, .len = 9 } } };
                 var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                 const err = WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, std.testing.allocator);
                 try std.testing.expectError(error.Trap, err);
@@ -13129,9 +13262,7 @@ test "sockets #178 UDP: check-send credit and send traps" {
 
             // send 0 datagrams → ok(0)
             {
-                const empty_list = try std.testing.allocator.alloc(InterfaceValue, 0);
-                defer std.testing.allocator.free(empty_list);
-                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = empty_list } };
+                const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list = .{ .ptr = 0, .len = 0 } } };
                 var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                 try WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, std.testing.allocator);
                 defer send_results[0].deinit(std.testing.allocator);
@@ -13149,6 +13280,9 @@ test "sockets #178 UDP: loopback send + receive round-trip" {
     try adapter_with_allow_list(.{ .allow = &.{"127.0.0.0/8"} }, struct {
         fn run(adapter: *WasiCliAdapter) !void {
             var ci: ComponentInstance = undefined;
+            ci.test_mem = null;
+            try ci.enableTestMem(std.testing.allocator, 4096);
+            defer ci.disableTestMem();
             const a = std.testing.allocator;
             // Create + bind socket A on 127.0.0.1:0.
             try testUdpBind(adapter);
@@ -13220,26 +13354,32 @@ test "sockets #178 UDP: loopback send + receive round-trip" {
             _ = port_a;
 
             // Build outgoing-datagram { data: "hello", remote-address: some(B) }
+            // and lower it into guest memory as `list<outgoing-datagram>`
+            // PtrLen (issue #402).
             const dest = try testMakeIpv4SocketAddress(a, .{ 127, 0, 0, 1 }, port_b);
             defer dest.deinit(a);
-            const remote_opt = try a.create(InterfaceValue);
-            remote_opt.* = dest;
-            defer a.destroy(remote_opt);
+            const remote_opt_payload = try a.create(InterfaceValue);
+            remote_opt_payload.* = dest;
+            defer a.destroy(remote_opt_payload);
 
             const hello = "hello";
-            const data_iv = try a.alloc(InterfaceValue, hello.len);
-            defer a.free(data_iv);
-            for (hello, 0..) |b, i| data_iv[i] = .{ .u8 = b };
+            const data_ptr = ci.hostAllocAndWrite(hello).?;
             const dg_fields = try a.alloc(InterfaceValue, 2);
             defer a.free(dg_fields);
-            dg_fields[0] = .{ .list_val = data_iv };
-            dg_fields[1] = .{ .variant_val = .{ .discriminant = 1, .payload = remote_opt } };
-            const dg_list = try a.alloc(InterfaceValue, 1);
-            defer a.free(dg_list);
-            dg_list[0] = .{ .record_val = dg_fields };
+            dg_fields[0] = .{ .list = .{ .ptr = data_ptr, .len = @intCast(hello.len) } };
+            dg_fields[1] = .{ .option_val = .{ .is_some = true, .payload = remote_opt_payload } };
+            const dg_iv: InterfaceValue = .{ .record_val = dg_fields };
+
+            const dg_reg = socketTypeRegistry();
+            const dg_t: ctypes.ValType = .{ .record = SOCKET_OUTGOING_DG_RECORD_IDX };
+            const dg_size = abi.sizeOfType(dg_reg, dg_t);
+            const dg_align = abi.alignOfType(dg_reg, dg_t);
+            const dg_list_ptr = ci.hostAllocGuest(dg_size, dg_align).?;
+            const dg_list_dst = ci.writableGuestBytes(dg_list_ptr, dg_size).?;
+            try abi.storeValReg(dg_list_dst, 0, dg_t, dg_iv, dg_reg);
 
             {
-                const send_args = [_]InterfaceValue{ .{ .handle = out_a }, .{ .list_val = dg_list } };
+                const send_args = [_]InterfaceValue{ .{ .handle = out_a }, .{ .list = .{ .ptr = dg_list_ptr, .len = 1 } } };
                 var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                 try WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, a);
                 defer send_results[0].deinit(a);
@@ -13259,15 +13399,19 @@ test "sockets #178 UDP: loopback send + receive round-trip" {
                     var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
                     try WasiCliAdapter.incomingDatagramReceive(adapter, &ci, &recv_args, &recv_results, a);
                     const is_ok = recv_results[0].result_val.is_ok;
-                    const list = if (is_ok) recv_results[0].result_val.payload.?.list_val else &[_]InterfaceValue{};
-                    if (is_ok and list.len >= 1) {
+                    const list_pl = if (is_ok) recv_results[0].result_val.payload.?.list else InterfaceValue.PtrLen{ .ptr = 0, .len = 0 };
+                    if (is_ok and list_pl.len >= 1) {
                         defer recv_results[0].deinit(a);
-                        // Check received data.
-                        const dg0 = list[0].record_val;
-                        const received_data = dg0[0].list_val;
-                        try std.testing.expectEqual(@as(usize, 5), received_data.len);
-                        try std.testing.expectEqual(@as(u8, 'h'), received_data[0].u8);
-                        try std.testing.expectEqual(@as(u8, 'o'), received_data[4].u8);
+                        // Lift the first incoming-datagram from guest memory.
+                        const reg_in = socketTypeRegistry();
+                        const idg_t: ctypes.ValType = .{ .record = SOCKET_INCOMING_DG_RECORD_IDX };
+                        const idg_size = abi.sizeOfType(reg_in, idg_t);
+                        const buf = ci.readGuestBytes(list_pl.ptr, idg_size).?;
+                        const dg = try abi.loadValReg(buf, 0, idg_t, reg_in, a);
+                        defer dg.deinit(a);
+                        const data_pl = dg.record_val[0].list;
+                        const received_data = ci.readGuestBytes(data_pl.ptr, data_pl.len).?;
+                        try std.testing.expectEqualStrings(hello, received_data);
                         received = true;
                         break;
                     }
@@ -13284,6 +13428,9 @@ test "sockets #178 UDP: send unconnected + per-datagram none is invalid_argument
         fn run(adapter: *WasiCliAdapter) !void {
             try testUdpBind(adapter);
             var ci: ComponentInstance = undefined;
+            ci.test_mem = null;
+            try ci.enableTestMem(std.testing.allocator, 4096);
+            defer ci.disableTestMem();
             const a = std.testing.allocator;
             // stream(none)
             var stream_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
@@ -13300,19 +13447,25 @@ test "sockets #178 UDP: send unconnected + per-datagram none is invalid_argument
                 try WasiCliAdapter.outgoingCheckSend(adapter, &ci, &cs_args, &cs_results, a);
                 cs_results[0].deinit(a);
             }
-            // Build datagram with remote = none (variant discriminant 0, no payload).
-            const data_iv = try a.alloc(InterfaceValue, 1);
-            defer a.free(data_iv);
-            data_iv[0] = .{ .u8 = 42 };
+            // Build datagram with remote = none and lower into guest mem (#402).
+            const data_byte = [_]u8{42};
+            const data_ptr = ci.hostAllocAndWrite(&data_byte).?;
             const dg_fields = try a.alloc(InterfaceValue, 2);
             defer a.free(dg_fields);
-            dg_fields[0] = .{ .list_val = data_iv };
-            dg_fields[1] = .{ .variant_val = .{ .discriminant = 0, .payload = null } };
-            const dg_list = try a.alloc(InterfaceValue, 1);
-            defer a.free(dg_list);
-            dg_list[0] = .{ .record_val = dg_fields };
+            dg_fields[0] = .{ .list = .{ .ptr = data_ptr, .len = 1 } };
+            dg_fields[1] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            const dg_iv: InterfaceValue = .{ .record_val = dg_fields };
+
+            const dg_reg = socketTypeRegistry();
+            const dg_t: ctypes.ValType = .{ .record = SOCKET_OUTGOING_DG_RECORD_IDX };
+            const dg_size = abi.sizeOfType(dg_reg, dg_t);
+            const dg_align = abi.alignOfType(dg_reg, dg_t);
+            const dg_list_ptr = ci.hostAllocGuest(dg_size, dg_align).?;
+            const dg_list_dst = ci.writableGuestBytes(dg_list_ptr, dg_size).?;
+            try abi.storeValReg(dg_list_dst, 0, dg_t, dg_iv, dg_reg);
+
             // send → invalid_argument (unconnected requires per-datagram remote).
-            const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list_val = dg_list } };
+            const send_args = [_]InterfaceValue{ .{ .handle = out_handle }, .{ .list = .{ .ptr = dg_list_ptr, .len = 1 } } };
             var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
             try WasiCliAdapter.outgoingSend(adapter, &ci, &send_args, &send_results, a);
             defer send_results[0].deinit(a);
