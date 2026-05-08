@@ -103,6 +103,8 @@ pub fn build(b: *std.Build) void {
     const component_model = b.option(bool, "component_model", "Enable Component Model") orelse false;
     options.addOption(bool, "component_model", component_model);
 
+    const skip_coldstart = b.option(bool, "skip-coldstart", "Skip cold-start budget tests (issue #395)") orelse false;
+
     const config_module = options.createModule();
 
     // ── Root module for the library ────────────────────────────────────
@@ -340,6 +342,42 @@ pub fn build(b: *std.Build) void {
     });
     const run_differential_tests = b.addRunArtifact(differential_tests);
     test_step.dependOn(&run_differential_tests.step);
+
+    // Cold-start budget tests (issue #395). In-process timing companion
+    // to the subprocess harness in #394. Compile a 36-byte noop wasm
+    // through the just-built `wamrc` to produce a `.cwasm` fixture, then
+    // run two timing tests asserting WAMR-internal load+invoke stays
+    // under fixed budgets. Disable with `-Dskip-coldstart=true`.
+    if (aot_executable_target) {
+        const wamrc_compile_noop = b.addRunArtifact(wamrc);
+        wamrc_compile_noop.addArg("compile");
+        wamrc_compile_noop.addFileArg(b.path("tests/coldstart/noop.wasm"));
+        wamrc_compile_noop.addArg("-o");
+        const noop_cwasm = wamrc_compile_noop.addOutputFileArg("noop.cwasm");
+
+        const coldstart_options = b.addOptions();
+        coldstart_options.addOption(bool, "skip", skip_coldstart);
+
+        const coldstart_test_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/coldstart_test.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        coldstart_test_module.addImport("wamr", lib_module);
+        coldstart_test_module.addImport("coldstart_options", coldstart_options.createModule());
+        coldstart_test_module.addAnonymousImport("noop_wasm", .{
+            .root_source_file = b.path("tests/coldstart/noop.wasm"),
+        });
+        coldstart_test_module.addAnonymousImport("noop_cwasm", .{
+            .root_source_file = noop_cwasm,
+        });
+
+        const coldstart_tests = b.addTest(.{
+            .root_module = coldstart_test_module,
+        });
+        const run_coldstart_tests = b.addRunArtifact(coldstart_tests);
+        test_step.dependOn(&run_coldstart_tests.step);
+    }
 
     // ── Benchmark ─────────────────────────────────────────────────────
     const bench_module = b.createModule(.{
