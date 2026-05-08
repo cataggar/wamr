@@ -299,6 +299,21 @@ pub fn build(b: *std.Build) void {
     const run_passes_tests = b.addRunArtifact(passes_tests);
     test_step.dependOn(&run_passes_tests.step);
 
+    // Issue #402: list_val<u8> must survive the canon-lower trampoline
+    // (lowerListVals + storeVal) without panicking on the union-tag
+    // mismatch. Rooted at the test file so it doesn't drag in
+    // `wasi_cli_adapter.zig` (parallel migration may break compile).
+    const issue_402_test_module = b.createModule(.{
+        .root_source_file = b.path("src/issue_402_e2e_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const issue_402_tests = b.addTest(.{
+        .root_module = issue_402_test_module,
+    });
+    const run_issue_402_tests = b.addRunArtifact(issue_402_tests);
+    test_step.dependOn(&run_issue_402_tests.step);
+
     // Compiler IR analysis tests
     const analysis_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/analysis.zig"),
