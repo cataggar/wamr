@@ -157,12 +157,51 @@ pub const ImportBinding = union(enum) {
     },
 };
 
+/// Backing buffer used in unit tests that don't have a real core module
+/// instance with a `cabi_realloc` export. Tests opt-in via
+/// `ComponentInstance.enableTestMem`; runtime code never sets this.
+///
+/// Provides a bump-allocated `[]u8` that `hostAllocGuest` /
+/// `hostAllocAndWrite` write into and `readGuestBytes` reads from, so
+/// adapter host functions can lower lists / strings into "guest"
+/// memory under test without needing a live realloc.
+pub const TestGuestMem = struct {
+    buffer: []u8,
+    bump: u32 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, size: usize) !TestGuestMem {
+        const buf = try allocator.alloc(u8, size);
+        @memset(buf, 0);
+        return .{ .buffer = buf };
+    }
+
+    pub fn deinit(self: *TestGuestMem, allocator: std.mem.Allocator) void {
+        allocator.free(self.buffer);
+    }
+
+    /// Bump-allocate `size` bytes aligned to `align_`. Returns the
+    /// guest-side offset, or null if the buffer is exhausted.
+    pub fn alloc(self: *TestGuestMem, size: u32, align_: u32) ?u32 {
+        const a = if (align_ == 0) 1 else align_;
+        const start = std.mem.alignForward(u32, self.bump, a);
+        const end = std.math.add(u32, start, size) catch return null;
+        if (end > self.buffer.len) return null;
+        self.bump = end;
+        return start;
+    }
+};
+
 /// A runtime component instance — the result of instantiating a Component.
 pub const ComponentInstance = struct {
     /// The parsed component this instance was created from.
     component: *const ctypes.Component,
     /// Core module instances created during instantiation.
     core_instances: []CoreInstanceEntry,
+    /// Test-only guest-memory shim. When non-null, `hostAllocGuest`,
+    /// `hostAllocAndWrite`, and `readGuestBytes` operate on this buffer
+    /// instead of looking for a real `cabi_realloc` / canonical memory.
+    /// Always null in production paths.
+    test_mem: ?*TestGuestMem = null,
     /// Resource tables, keyed by the raw component resource type index
     /// (as referenced by `canon resource.{new,drop,rep}`). Allocated
     /// lazily on first access so the dense `[]ResourceTable` layout (which
@@ -365,6 +404,11 @@ pub const ComponentInstance = struct {
     /// Returns null if no such instance is present, the memory is missing,
     /// or the slice is out of bounds.
     pub fn readGuestBytes(self: *const ComponentInstance, ptr: u32, len: u32) ?[]const u8 {
+        if (self.test_mem) |tm| {
+            const end = @as(usize, ptr) + @as(usize, len);
+            if (end > tm.buffer.len) return null;
+            return tm.buffer[ptr..end];
+        }
         const mem = self.canonicalMemory() orelse return null;
         const end = @as(usize, ptr) + @as(usize, len);
         if (end > mem.data.len) return null;
@@ -398,9 +442,43 @@ pub const ComponentInstance = struct {
         return null;
     }
 
-    /// Allocate `len` bytes inside the canonical guest linear memory and
-    /// copy `bytes` into them. Returns the guest-side pointer or null on
-    /// failure (no `cabi_realloc` export, OOM, or invocation error).
+    /// Allocate `size` bytes inside the canonical guest linear memory
+    /// (or the test_mem shim, if installed) aligned to `align_`. Returns
+    /// the guest-side pointer, or null on failure.
+    ///
+    /// Used by host-side adapter callbacks that must materialize
+    /// host-constructed lists / strings into guest memory before the
+    /// canonical ABI sees a `(ptr, len)` PtrLen.
+    pub fn hostAllocGuest(self: *ComponentInstance, size: u32, align_: u32) ?u32 {
+        if (self.test_mem) |tm| return tm.alloc(size, align_);
+        const realloc_owner = self.reallocOwner() orelse return null;
+        const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
+        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
+        const executor = @import("executor.zig");
+        const env = ExecEnv.create(realloc_owner, 4096, self.allocator) catch return null;
+        defer env.destroy();
+        const a: u32 = if (align_ == 0) 1 else align_;
+        return executor.callRealloc(env, realloc_local, 0, 0, a, size) catch null;
+    }
+
+    /// Return a writable slice into the canonical guest memory (or the
+    /// test_mem shim) covering `[ptr, ptr+len)`. Returns null if the
+    /// range is out of bounds.
+    pub fn writableGuestBytes(self: *ComponentInstance, ptr: u32, len: u32) ?[]u8 {
+        if (self.test_mem) |tm| {
+            const end = @as(usize, ptr) + @as(usize, len);
+            if (end > tm.buffer.len) return null;
+            return tm.buffer[ptr..end];
+        }
+        const mem = self.canonicalMemory() orelse return null;
+        const end = @as(usize, ptr) + @as(usize, len);
+        if (end > mem.data.len) return null;
+        return mem.data[ptr..end];
+    }
+
+    /// Allocate `bytes.len` bytes in guest memory and copy `bytes` into
+    /// them. Returns the guest-side pointer or null on failure (no
+    /// `cabi_realloc` export, OOM, or invocation error).
     ///
     /// Used by host-side callbacks (e.g. `wasi:io/streams.[method]
     /// input-stream.blocking-read`) that must materialize a `list<u8>`
@@ -411,18 +489,34 @@ pub const ComponentInstance = struct {
     /// the main core module; we call it with `(0, 0, align=1, len)` to
     /// allocate fresh space.
     pub fn hostAllocAndWrite(self: *ComponentInstance, bytes: []const u8) ?u32 {
-        const realloc_owner = self.reallocOwner() orelse return null;
-        const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
-        const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
-        const executor = @import("executor.zig");
-        const env = ExecEnv.create(realloc_owner, 4096, self.allocator) catch return null;
-        defer env.destroy();
-        const ptr = executor.callRealloc(env, realloc_local, 0, 0, 1, @intCast(bytes.len)) catch return null;
-        const mem = self.canonicalMemory() orelse return null;
-        const end = @as(usize, ptr) + bytes.len;
-        if (end > mem.data.len) return null;
-        @memcpy(mem.data[ptr..end], bytes);
+        const ptr = self.hostAllocGuest(@intCast(bytes.len), 1) orelse return null;
+        const dst = self.writableGuestBytes(ptr, @intCast(bytes.len)) orelse return null;
+        @memcpy(dst, bytes);
         return ptr;
+    }
+
+    /// Test-only: enable a backing `TestGuestMem` so `hostAllocGuest`,
+    /// `hostAllocAndWrite`, `writableGuestBytes`, and `readGuestBytes`
+    /// operate on a self-contained buffer. Sets `test_mem` and
+    /// `allocator`; other fields are left untouched (callers using
+    /// `var ci: ComponentInstance = undefined` keep their UB-on-read
+    /// invariant for fields they don't initialize).
+    pub fn enableTestMem(self: *ComponentInstance, allocator: std.mem.Allocator, size: usize) !void {
+        const tm = try allocator.create(TestGuestMem);
+        errdefer allocator.destroy(tm);
+        tm.* = try TestGuestMem.init(allocator, size);
+        self.test_mem = tm;
+        self.allocator = allocator;
+    }
+
+    /// Test-only: tear down a `TestGuestMem` previously installed via
+    /// `enableTestMem`.
+    pub fn disableTestMem(self: *ComponentInstance) void {
+        if (self.test_mem) |tm| {
+            tm.deinit(self.allocator);
+            self.allocator.destroy(tm);
+            self.test_mem = null;
+        }
     }
 
     /// Kind-classify a top-level component import. Pure-type imports (those
@@ -3554,3 +3648,4 @@ test "instantiate: two-deep alias chain to sub-component instance export (#355)"
     const r2 = indexspace.resolveInstanceExpr(&component, 2);
     try std.testing.expectError(error.MultiHopAliasUnsupported, r2);
 }
+
