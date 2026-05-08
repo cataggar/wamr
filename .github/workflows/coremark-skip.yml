@@ -1,0 +1,46 @@
+name: CoreMark (skip)
+
+# Companion to coremark-x86_64.yml / coremark-aarch64.yml.
+#
+# Branch protection on `main` requires a `coremark` status check, but the
+# real CoreMark workflows have `paths:` filters and only run when sources
+# that can affect benchmark numbers change. Without this companion, PRs
+# that don't touch those paths (e.g. component-only or docs-only changes)
+# would be blocked indefinitely waiting for a `coremark` check that never
+# gets posted.
+#
+# This workflow uses the inverse `paths-ignore:` filter and posts a
+# trivially-successful `coremark` check so such PRs can merge. The job is
+# named `coremark` so the resulting check-run name matches the required
+# context.
+#
+# When a PR touches both relevant and irrelevant paths, all three workflows
+# fire and produce same-named check-runs; the real benchmark workflows
+# finish well after this no-op skip, so they remain authoritative for
+# branch protection (latest check-run with a given name wins).
+#
+# Reference:
+# https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/troubleshooting-required-status-checks#handling-skipped-but-required-checks
+
+on:
+  pull_request:
+    paths-ignore:
+      - src/compiler/**
+      - src/runtime/**
+      - tests/benchmarks/coremark/**
+      - scripts/bench_coremark.py
+      - .github/workflows/coremark-x86_64.yml
+      - .github/workflows/coremark-aarch64.yml
+
+concurrency:
+  group: coremark-skip-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  coremark:
+    runs-on: ubuntu-22.04
+    steps:
+      - run: echo "CoreMark check skipped — PR does not touch compiler/runtime/coremark sources."
