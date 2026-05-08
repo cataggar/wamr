@@ -122,8 +122,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
     const wasm_data = cwd.readFileAlloc(io, in_path, allocator, @enumFromInt(64 * 1024 * 1024)) catch |err| {
-        std.debug.print("Error reading {s}: {}\n", .{ in_path, err });
-        std.process.exit(1);
+        wamr.utils.read_file.dieReadFileError(in_path, err);
     };
     defer allocator.free(wasm_data);
 
