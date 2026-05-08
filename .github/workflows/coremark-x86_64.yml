@@ -80,12 +80,13 @@ jobs:
           TARGET: ${{ steps.refs.outputs.target }}
           RUNS: ${{ github.event.inputs.runs || '3' }}
         run: |
-          # TODO: tune threshold once stabilized.
+          # Match the aarch64 gate's tolerance band; CoreMark variance on
+          # GitHub-hosted runners is comfortably wider than 0%.
           python3 scripts/bench_coremark.py \
             --baseline "$BASELINE" \
             --target   "$TARGET" \
             --runs     "$RUNS" \
-            --min-delta-pct=0 \
+            --min-delta-pct=-5.0 \
             --out      coremark-table.md \
             --emit     github
 

@@ -5888,6 +5888,95 @@ test "emitCallRegArgMoves: regression — arg[1] source equals arg[0] target (co
     }
 }
 
+test "compileModule: regression #406 — vmctx → rdi load deferred past arg moves at call (SysV)" {
+    // Issue #406: when an arg vreg is bound to rdi at a call site, the
+    // call-site `mov rdi, [rbp-vmctx_offset]` must be emitted AFTER
+    // emitCallRegArgMoves. The buggy order clobbered the arg vreg with
+    // vmctx before the parallel-move algorithm read it; the parallel move
+    // then propagated vmctx into the wrong arg register.
+    //
+    // On Win64 rdi/rsi are not parameter registers, so the bug is
+    // SysV-specific.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    // callee(i32 x3) -> i32 — body irrelevant; we only inspect caller bytes.
+    var callee = ir.IrFunction.init(allocator, 3, 3, 0);
+    _ = try callee.newBlock();
+    try callee.getBlock(0).append(.{ .op = .{ .ret = 0 } });
+    _ = try ir_module.addFunction(callee);
+
+    // caller(): three i32 constants live simultaneously into a 3-arg call.
+    // With caller_saved_alloc = [rdx, rsi, rdi, r8, r9], the third arg
+    // vreg is allocated to rdi — exactly the bug shape from coremark.
+    var caller = ir.IrFunction.init(allocator, 0, 1, 0);
+    _ = try caller.newBlock();
+    const a0 = caller.newVReg();
+    const a1 = caller.newVReg();
+    const a2 = caller.newVReg();
+    const r = caller.newVReg();
+    try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a0, .type = .i32 });
+    try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = a1, .type = .i32 });
+    try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 3 }, .dest = a2, .type = .i32 });
+    const args = try allocator.alloc(ir.VReg, 3);
+    defer allocator.free(args);
+    args[0] = a0;
+    args[1] = a1;
+    args[2] = a2;
+    try caller.getBlock(0).append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = args } },
+        .dest = r,
+        .type = .i32,
+    });
+    try caller.getBlock(0).append(.{ .op = .{ .ret = r } });
+    _ = try ir_module.addFunction(caller);
+
+    const result = try compileModule(&ir_module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    // Restrict inspection to the caller body (function 1).
+    const caller_off = result.offsets[1];
+    const caller_code = result.code[caller_off..];
+
+    // The CALL site is a rel32 direct call: 0xE8 + 4-byte displacement.
+    const idx_call = std.mem.lastIndexOfScalar(u8, caller_code, 0xE8) orelse
+        return error.TestExpectedCallEmitted;
+
+    // The vmctx → rdi load is `mov rdi, [rbp-8]` encoded as the disp32 form
+    // movRegMem always emits: REX.W (0x48), opcode 0x8B, ModR/M=0xBD
+    // (mod=10, reg=rdi=7, r/m=rbp=5), disp32 = 0xFFFFFFF8.
+    const vmctx_load: [7]u8 = .{ 0x48, 0x8B, 0xBD, 0xF8, 0xFF, 0xFF, 0xFF };
+    const idx_vmctx = std.mem.lastIndexOf(u8, caller_code[0..idx_call], &vmctx_load) orelse
+        return error.TestExpectedVmctxLoadBeforeCall;
+
+    // After the fix, the vmctx load is the LAST emit before HRP setup +
+    // CALL. Crucially, no `mov dst, rdi` (reading rdi as source via
+    // REX.W 0x89 with ModR/M reg-field = 7, mod = 11) may appear between
+    // vmctx_load and the CALL — such a move would propagate vmctx (not
+    // the original arg vreg) into the destination register.
+    const tail = caller_code[idx_vmctx + vmctx_load.len .. idx_call];
+    var i: usize = 0;
+    while (i + 2 < tail.len) : (i += 1) {
+        // REX.W only (0x48): mov reg64, reg64 with both reg and r/m in
+        // the low-8 bank. REX.WR (0x4C) would mean dst is r8..r15; we
+        // don't care for this assertion since the bug shape moves into
+        // rcx/rdx/rsi (low-8). Restrict to 0x48 0x89 reading rdi as src.
+        if (tail[i] == 0x48 and tail[i + 1] == 0x89) {
+            const modrm = tail[i + 2];
+            const mod = (modrm >> 6) & 0x3;
+            const reg_field = (modrm >> 3) & 0x7;
+            if (mod == 0b11 and reg_field == 7) {
+                // Found `mov ?, rdi` between vmctx load and CALL — bug shape.
+                return error.TestVmctxLoadClobbersArgVreg;
+            }
+        }
+    }
+}
+
 test "compileFunctionRA: i32.load emits inline memory bounds check" {
     // A wasm memory load must emit an inline bounds check before reading,
     // so out-of-bounds access traps cleanly via vmctx.trap_oob_fn() rather
