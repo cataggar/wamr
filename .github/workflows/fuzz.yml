@@ -60,15 +60,6 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
-      - name: Install wasm-tools (generator + validator)
-        run: |
-          set -euo pipefail
-          ver=1.219.0
-          url=https://github.com/bytecodealliance/wasm-tools/releases/download/v${ver}/wasm-tools-${ver}-x86_64-linux.tar.gz
-          curl -fsSL "$url" -o /tmp/wasm-tools.tgz
-          sudo tar -C /usr/local/bin --strip-components=1 -xzf /tmp/wasm-tools.tgz \
-            wasm-tools-${ver}-x86_64-linux/wasm-tools
-
       - name: Restore fuzz corpus
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:

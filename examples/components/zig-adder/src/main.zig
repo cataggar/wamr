@@ -4,15 +4,15 @@
 //! Build pipeline:
 //!   1. `zig build-exe -target wasm32-freestanding -fno-entry \
 //!         --export="docs:adder/add@0.1.0#add" -O ReleaseSmall src/main.zig`
-//!   2. `wasm-tools component embed --world adder wit main.wasm \
+//!   2. `wabt component embed --world adder wit main.wasm \
 //!         -o main.embed.wasm`
-//!   3. `wasm-tools component new main.embed.wasm \
+//!   3. `wabt component new main.embed.wasm \
 //!         -o zig-adder.component.wasm`
 //!
 //! No WASI imports — the canonical-ABI core export name
 //! `"docs:adder/add@0.1.0#add"` is the only public surface. The pkg/iface
 //! prefix matches the WIT in `wit/world.wit` and is what
-//! `wasm-tools component embed` recognises as the lift target for the
+//! `wabt component embed` recognises as the lift target for the
 //! `add` function in interface `docs:adder/add@0.1.0`.
 //!
 //! Saturating add (`+%`) avoids a signed-overflow trap on host-driven

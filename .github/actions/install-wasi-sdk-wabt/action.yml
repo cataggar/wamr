@@ -3,13 +3,13 @@
 
 # Get URLs from:
 #   - https://github.com/WebAssembly/wasi-sdk/releases
-#   - https://github.com/WebAssembly/wabt/releases
+#   - https://github.com/cataggar/wabt/releases
 
 # Install WASI-SDK and WABT at /opt
 # /opt is the assumed location widely used in the project
 name: Install WASI-SDK and WABT
 
-description: A composite action to download and install wasi-sdk and wabt on Ubuntu, macOS.
+description: A composite action to download and install wasi-sdk and cataggar/wabt on Ubuntu, macOS, and Windows.
 
 inputs:
   os:
@@ -37,17 +37,17 @@ runs:
         sudo tar -xf wasi-sdk.tar.gz
         sudo ln -sf  wasi-sdk-25.0-x86_64-linux/ wasi-sdk
 
-        echo "Downloading wabt for Ubuntu..."
-        sudo wget -O wabt.tar.gz     --progress=dot:giga https://github.com/WebAssembly/wabt/releases/download/1.0.37/wabt-1.0.37-ubuntu-20.04.tar.gz
+        echo "Downloading cataggar/wabt for Ubuntu..."
+        sudo wget -O wabt.tar.gz     --progress=dot:giga https://github.com/cataggar/wabt/releases/download/v3.0.0-dev.3/wabt-3.0.0-dev.3-linux-x64.tar.gz
 
         echo "Extracting wabt..."
         sudo tar -xf wabt.tar.gz
-        sudo ln -sf  wabt-1.0.37 wabt
+        sudo ln -sf  wabt-3.0.0-dev.3-linux-x64 wabt
 
         /opt/wasi-sdk/bin/clang --version
-        /opt/wabt/bin/wasm-interp --version
+        /opt/wabt/bin/wabt version
 
-        echo "::notice::wasi-sdk-25 and wabt-1.0.37 installed on ubuntu"
+        echo "::notice::wasi-sdk-25 and cataggar/wabt v3.0.0-dev.3 installed on ubuntu"
       working-directory: /opt
 
     - name: Set up wasi-sdk and wabt on macOS on Intel
@@ -61,17 +61,17 @@ runs:
         sudo tar -xf wasi-sdk.tar.gz
         sudo ln -sf  wasi-sdk-25.0-x86_64-macos wasi-sdk
 
-        echo "Downloading wabt for macOS on Intel..."
-        sudo wget -O wabt.tar.gz     --progress=dot:giga https://github.com/WebAssembly/wabt/releases/download/1.0.36/wabt-1.0.36-macos-12.tar.gz
+        echo "Downloading cataggar/wabt for macOS on Intel..."
+        sudo wget -O wabt.tar.gz     --progress=dot:giga https://github.com/cataggar/wabt/releases/download/v3.0.0-dev.3/wabt-3.0.0-dev.3-macos-x64.tar.gz
 
         echo "Extracting wabt..."
         sudo tar -xf wabt.tar.gz
-        sudo ln -sf  wabt-1.0.36 wabt
+        sudo ln -sf  wabt-3.0.0-dev.3-macos-x64 wabt
 
         /opt/wasi-sdk/bin/clang --version
-        /opt/wabt/bin/wasm-interp --version
+        /opt/wabt/bin/wabt version
 
-        echo "::notice::wasi-sdk-25 and wabt-1.0.36 installed on ${{ inputs.os }}"
+        echo "::notice::wasi-sdk-25 and cataggar/wabt v3.0.0-dev.3 installed on ${{ inputs.os }}"
       working-directory: /opt
 
     - name: Set up wasi-sdk and wabt on macOS on ARM
@@ -85,17 +85,17 @@ runs:
         sudo tar -xf wasi-sdk.tar.gz
         sudo ln -sf  wasi-sdk-25.0-arm64-macos wasi-sdk
 
-        echo "Downloading wabt for macOS on ARM..."
-        sudo wget -O wabt.tar.gz     --progress=dot:giga https://github.com/WebAssembly/wabt/releases/download/1.0.37/wabt-1.0.37-macos-14.tar.gz
+        echo "Downloading cataggar/wabt for macOS on ARM..."
+        sudo wget -O wabt.tar.gz     --progress=dot:giga https://github.com/cataggar/wabt/releases/download/v3.0.0-dev.3/wabt-3.0.0-dev.3-macos-arm64.tar.gz
 
         echo "Extracting wabt..."
         sudo tar -xf wabt.tar.gz
-        sudo ln -sf  wabt-1.0.37 wabt
+        sudo ln -sf  wabt-3.0.0-dev.3-macos-arm64 wabt
 
         /opt/wasi-sdk/bin/clang --version
-        /opt/wabt/bin/wasm-interp --version
+        /opt/wabt/bin/wabt version
 
-        echo "::notice::wasi-sdk-25 and wabt-1.0.37 installed on ${{ inputs.os }}"
+        echo "::notice::wasi-sdk-25 and cataggar/wabt v3.0.0-dev.3 installed on ${{ inputs.os }}"
       working-directory: /opt
 
     - name: Set up wasi-sdk and wabt on Windows
@@ -113,13 +113,13 @@ runs:
         echo "Extracting wasi-sdk..."
         tar --strip-components=1 -xf wasi-sdk.tar.gz -C /opt/wasi-sdk
 
-        echo "Downloading wabt for Windows..."
-        wget -O wabt.tar.gz --progress=dot:giga https://github.com/WebAssembly/wabt/releases/download/1.0.37/wabt-1.0.37-windows.tar.gz
+        echo "Downloading cataggar/wabt for Windows..."
+        wget -O wabt.tar.gz --progress=dot:giga https://github.com/cataggar/wabt/releases/download/v3.0.0-dev.3/wabt-3.0.0-dev.3-windows-x64.tar.gz
 
         echo "Extracting wabt..."
         tar --strip-components=1 -xf wabt.tar.gz -C /opt/wabt
 
         /opt/wasi-sdk/bin/clang --version
-        /opt/wabt/bin/wasm-interp --version
+        /opt/wabt/bin/wabt version
 
-        echo "::notice::wasi-sdk-25 and wabt-1.0.37 installed on Windows"
+        echo "::notice::wasi-sdk-25 and cataggar/wabt v3.0.0-dev.3 installed on Windows"

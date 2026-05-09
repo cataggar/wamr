@@ -16,8 +16,8 @@ zig build-exe -target wasm32-wasi -O ReleaseSmall \
     src/main.zig
 
 # 2. Wrap it as a component using the wasi-preview1 command adapter.
-wasm-tools component new main.wasm \
-    --adapt wasi_snapshot_preview1.command.wasm \
+wabt component new main.wasm \
+    --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm \
     -o zig-hello.component.wasm
 ```
 
@@ -41,7 +41,7 @@ This example runs end-to-end through wamr today (exit code 0).
 
 - Zig 0.16 producing a `wasm32-wasi` core module with no use of
   `std.start.startWasi` (so no `proc_exit`).
-- `wasm-tools component new --adapt` wrapping a preview1 core into a
+- `wabt component new --adapt` wrapping a preview1 core into a
   Component-Model component.
 - wamr's `wasi:cli/run` instance-export lifting and `wasi:cli/stdout`
   + `wasi:io/streams` host adapters.

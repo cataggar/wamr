@@ -1,10 +1,10 @@
 //! Rust half of the `mixed-zig-rust-calc` example: a `wasm32-wasip1`
 //! binary that imports `docs:adder/add@0.1.0` via `wit-bindgen` and
-//! prints two sample sums to stdout. After `wasm-tools component
+//! prints two sample sums to stdout. After `wabt component
 //! embed/new` (with the wasi-preview1 adapter) it becomes a Component
 //! Model command component whose only non-WASI import is the adder
-//! interface — letting `wasm-tools compose` link it against the Zig
-//! adder in `../../zig-adder`.
+//! interface — letting `wabt component compose` link it against the
+//! Zig adder in `../../zig-adder`.
 
 wit_bindgen::generate!({
     path: "wit",

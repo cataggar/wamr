@@ -149,9 +149,10 @@ scripts/fuzz_reduce.py <target> <crasher.wasm> [--duration 2] [--extra --fuel --
 ```
 
 The script verifies the input still reproduces, optionally invokes
-`wasm-tools shrink` if it is on `PATH`, then runs a built-in byte-level
-delta-debug pass. The smallest reproducer is written next to the input as
-`<crasher>.reduced.wasm` (override with `--out`).
+`wabt shrink` (or `wasm-tools shrink`) if either is on `PATH`, then runs
+a built-in byte-level delta-debug pass. The smallest reproducer is
+written next to the input as `<crasher>.reduced.wasm` (override with
+`--out`).
 
 A candidate "still reproduces" when the harness exits non-zero (process
 abort) or leaves a named crasher file like `diff-mismatch-*.wasm`. Pass

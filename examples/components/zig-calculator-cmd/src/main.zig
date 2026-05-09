@@ -3,20 +3,20 @@
 //! `command` half of the bytecodealliance `component-docs` adder /
 //! calculator / command tutorial (simplified to skip the calculator
 //! intermediary), and is composed with `../zig-adder` (or the equivalent
-//! Rust adder, in `../mixed-zig-rust-calc`) via `wasm-tools compose`.
+//! Rust adder, in `../mixed-zig-rust-calc`) via `wabt component compose`.
 //!
 //! Build pipeline (driven by the repo's root `build.zig`):
 //!   1. zig build-exe -target wasm32-wasi -O ReleaseSmall \
 //!         -fno-entry --export=_start src/main.zig
-//!   2. wasm-tools component embed --world app wit main.wasm \
+//!   2. wabt component embed --world app wit main.wasm \
 //!         -o main.embed.wasm
-//!   3. wasm-tools component new main.embed.wasm \
-//!         --adapt wasi_snapshot_preview1.command.wasm \
+//!   3. wabt component new main.embed.wasm \
+//!         --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm \
 //!         -o zig-calculator-cmd.component.wasm
 //!
 //! The `extern "docs:adder/add@0.1.0" fn add(...)` declaration becomes a
 //! component-level import of `docs:adder/add@0.1.0::add` after the embed
-//! step, which `wasm-tools compose` later wires to the Zig adder's
+//! step, which `wabt component compose` later wires to the Zig adder's
 //! matching export. We deliberately keep a hand-rolled `_start` (instead
 //! of `pub fn main`) for the same reason as the `zig-hello` example — it
 //! avoids `proc_exit` so the run unwinds cleanly through the adapter.

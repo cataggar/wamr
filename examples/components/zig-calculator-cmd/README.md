@@ -25,7 +25,7 @@ The Zig source declares the import directly with `extern "pkg:ns/iface@ver"`:
 extern "docs:adder/add@0.1.0" fn add(x: u32, y: u32) u32;
 ```
 
-After `wasm-tools component embed --world app …` the import becomes a
+After `wabt component embed --world app …` the import becomes a
 component-level `docs:adder/add@0.1.0::add` import, which any
 implementation of the adder world (including
 [`../zig-adder`](../zig-adder)) can satisfy. The wasi-preview1 adapter
@@ -40,15 +40,15 @@ zig build-exe -target wasm32-wasi -O ReleaseSmall \
     -fno-entry --export=_start src/main.zig
 
 # 2. embed the world so component new can recognise the docs:adder import.
-wasm-tools component embed --world app wit main.wasm -o main.embed.wasm
+wabt component embed --world app wit main.wasm -o main.embed.wasm
 
 # 3. encode + adapt.
-wasm-tools component new main.embed.wasm \
-    --adapt wasi_snapshot_preview1.command.wasm \
+wabt component new main.embed.wasm \
+    --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm \
     -o zig-calculator-cmd.component.wasm
 
 # 4. compose with an adder implementation (e.g. ../zig-adder).
-wasm-tools compose -d zig-adder.component.wasm \
+wabt component compose -d zig-adder.component.wasm \
     zig-calculator-cmd.component.wasm \
     -o final.component.wasm
 ```
@@ -66,22 +66,12 @@ Zig adder linked in.
 
 ## Runtime status
 
-The composed component validates with `wasm-tools validate` and runs in
-[Wasmtime][wasmtime] (and other modern component runtimes). On wamr's
-current preview-state runtime it loads but does not execute, because
-`wasm-tools compose` emits the top-level `wasi:cli/run@0.2.x` export as
-an *aliased* instance, while wamr's
-[`registerInstanceExport` in `src/component/instance.zig`][regfn] only
-walks `.local` (inline `.exports` / `.instantiate`) instance refs and
-not `.aliased` ones.
-
-The pre-compose component (with the unresolved adder import) already
-uses the inline `.instantiate` shim shape that wamr does support — the
-limitation is purely about composed output. The aliased-instance gap
-will be addressed alongside the issue #142 follow-up.
+The composed component validates with `wabt validate` and runs in both
+[Wasmtime][wasmtime] and wamr. `zig build component-examples-run` runs
+this example end-to-end through `./zig-out/bin/wamr` and asserts the
+expected two-line output.
 
 [wasmtime]: https://wasmtime.dev/
-[regfn]: ../../../../src/component/instance.zig
 
 ## Notes
 
@@ -92,6 +82,5 @@ will be addressed alongside the issue #142 follow-up.
 - Argument parsing is omitted; the example focuses on the import linkage.
   A future variant could parse `argv` via `std.os.wasi.args_sizes_get` /
   `args_get` to match the BCA tutorial's `1 2 add → "1 + 2 = 3"` shape.
-- `wasm-tools compose` is deprecated upstream in favour of
-  [`wac`](https://github.com/bytecodealliance/wac); both produce
-  equivalent component shapes for this example.
+- `wabt component compose` and `wac` produce equivalent component
+  shapes for this example; wamr's component loader accepts both.
