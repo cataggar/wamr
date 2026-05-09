@@ -9,11 +9,9 @@ directory.
 
 Two reduction strategies are attempted in order:
 
-1. ``wabt shrink`` (preferred) or ``wasm-tools shrink`` (back-compat) if
-   either binary is on ``PATH``. ``wabt shrink`` is a drop-in replacement
-   for ``wasm-tools shrink`` (matching positional argument order and
-   ``--output`` flag). The predicate is a tiny shell wrapper that
-   re-invokes this script in ``--predicate-mode``.
+1. ``wabt module shrink`` if the ``wabt`` binary (cataggar/wabt v3.x) is
+   on ``PATH``. The predicate is a tiny shell wrapper that re-invokes
+   this script in ``--predicate-mode``.
 2. A built-in byte-level shrinker that deletes contiguous ranges of bytes
    and accepts the shorter candidate when it still reproduces.
 
@@ -135,15 +133,12 @@ def byte_level_shrink(
 
 
 def detect_external_shrinker() -> str | None:
-    """Return the name of the preferred external shrinker on PATH.
+    """Return ``"wabt"`` if cataggar/wabt is on PATH, else ``None``.
 
-    Prefers ``wabt`` (cataggar/wabt v3.x: ``wabt shrink``) and falls back
-    to ``wasm-tools`` (``wasm-tools shrink``) for back-compat.
+    Uses ``wabt module shrink`` (v3.x subject/verb layout).
     """
     if shutil.which("wabt") is not None:
         return "wabt"
-    if shutil.which("wasm-tools") is not None:
-        return "wasm-tools"
     return None
 
 
@@ -156,11 +151,9 @@ def try_external_shrink(
     extra_args: list[str],
     binary: str,
 ) -> bool:
-    """Use ``wabt shrink`` (or ``wasm-tools shrink``) when available.
+    """Use ``wabt module shrink`` when available.
 
-    ``wabt shrink`` is documented as a drop-in for ``wasm-tools shrink``
-    (same positional argument order, same ``--output`` flag), so the
-    same argv works for both. Returns True if it ran.
+    Returns True if the shrinker ran and produced ``out_path``.
     """
     if shutil.which(binary) is None:
         return False
@@ -184,6 +177,7 @@ def try_external_shrink(
             subprocess.run(
                 [
                     binary,
+                    "module",
                     "shrink",
                     str(predicate),
                     str(input_path),
@@ -194,7 +188,7 @@ def try_external_shrink(
             )
             return out_path.exists()
         except Exception as e:  # noqa: BLE001
-            print(f"{binary} shrink failed: {e}", file=sys.stderr)
+            print(f"{binary} module shrink failed: {e}", file=sys.stderr)
             return False
 
 
@@ -225,12 +219,12 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--no-external-shrink",
         action="store_true",
-        help="skip wabt/wasm-tools shrink even if installed",
+        help="skip wabt module shrink even if installed",
     )
     parser.add_argument(
         "--predicate-mode",
         action="store_true",
-        help="internal: run as a wabt/wasm-tools shrink predicate",
+        help="internal: run as a wabt module shrink predicate",
     )
     parser.add_argument(
         "--harness",
@@ -241,7 +235,7 @@ def main(argv: list[str]) -> int:
         "predicate_input",
         nargs="?",
         type=Path,
-        help="internal: candidate wasm passed by wabt/wasm-tools shrink",
+        help="internal: candidate wasm passed by wabt module shrink",
     )
     args = parser.parse_args(argv)
 

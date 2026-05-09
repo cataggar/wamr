@@ -44,15 +44,17 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
-      - name: Install cataggar/wabt v3.0.0-dev.3 (component CLI)
+      - name: Install cataggar/wabt v3.0.0-dev.4 (component CLI)
         run: |
           set -euo pipefail
-          ver=3.0.0-dev.3
-          url=https://github.com/cataggar/wabt/releases/download/v${ver}/wabt-${ver}-linux-x64.tar.gz
-          curl -fsSL "$url" -o /tmp/wabt.tgz
-          sudo tar -C /usr/local --strip-components=1 -xzf /tmp/wabt.tgz \
-            wabt-${ver}-linux-x64/bin/wabt
-          wabt version
+          # ghr-bin is a tiny PyPI wrapper that downloads sha256-verified
+          # GitHub release archives and links the chosen binary into
+          # ~/.local/bin. pipx is preinstalled on ubuntu-latest; pip is
+          # blocked by PEP 668. Pin both ghr-bin and the wabt release.
+          pipx install ghr-bin==0.1.6
+          ghr install cataggar/wabt@v3.0.0-dev.4
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/wabt" version
 
       - name: Cache Zig global cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

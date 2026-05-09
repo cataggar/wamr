@@ -65,7 +65,7 @@ That step produces `zig-out/component-examples/mixed-zig-rust-calc.composed.wasm
 ## Prerequisites
 
 - Zig 0.16.x (already required for the rest of the repo).
-- `wabt` (cataggar/wabt v3.0.0-dev.3+) on `PATH`.
+- `wabt` (cataggar/wabt v3.0.0-dev.4+) on `PATH`.
 - A Rust toolchain with the `wasm32-wasip1` target installed:
   `rustup target add wasm32-wasip1`.
 - The `wasi_snapshot_preview1.command.wasm` adapter (downloaded by the

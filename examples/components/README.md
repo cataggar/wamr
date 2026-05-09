@@ -55,7 +55,7 @@ zig-out/component-examples/
 | Tool                                  | Version    | Notes                                                    |
 |---------------------------------------|-----------:|----------------------------------------------------------|
 | Zig                                   | 0.16.x     | Toolchain already required by the rest of the repo.       |
-| `wabt` (cataggar/wabt)                | v3.0.0-dev.3 | Provides `component embed/new`, `validate`, `component compose`. |
+| `wabt` (cataggar/wabt)                | v3.0.0-dev.4 | Provides `component embed/new`, `validate`, `component compose`. |
 | Wasmtime preview1→component adapter   | v36.0.9    | Auto-fetched + sha256-pinned by the build (`build.zig`). |
 | Rust toolchain (`cargo`, `rustup`)    | recent stable | Mixed example only.                                  |
 | `wasm32-wasip1` Rust target           | —          | `rustup target add wasm32-wasip1`. Mixed example only.    |
