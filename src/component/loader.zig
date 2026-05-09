@@ -415,7 +415,9 @@ fn parseInstance(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
             const count = try reader.readU32();
             const exps = try allocator.alloc(ctypes.InlineExport, count);
             for (exps) |*e| {
-                e.name = try reader.readName();
+                // inlineexport ::= n:<exportname'> si:<sortidx>
+                // exportname' carries a 0x00/0x01/0x02 prefix tag — must use readExternName.
+                e.name = try readExternName(reader);
                 e.sort_idx = try readSortIdx(reader);
             }
             return .{ .exports = exps };
@@ -952,6 +954,43 @@ test "parseTypeDef: instance type rejects import decl" {
     const data = [_]u8{ 0x42, 0x01, 0x03 };
     var reader = BinaryReader{ .data = &data };
     try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
+}
+
+test "parseInstance: inline-export form expects exportname' (0x00 prefix) on each name" {
+    // Regression test for `wabt component compose` interop:
+    //
+    // Component-model spec:
+    //   instance       ::= 0x00 c arg* | 0x01 ie*
+    //   inlineexport   ::= n:<exportname'> si:<sortidx>
+    //   exportname'    ::= 0x00 en:<exportname>          ; tagged form
+    //
+    // wabt's `component compose` emits the inline-export form (tag 0x01)
+    // for sub-component instantiation, while wasm-tools always uses the
+    // `instantiate` form (tag 0x00). The bug fixed alongside this test
+    // had `parseInstance` reading the inline-export name with bare
+    // `readName` (vec(byte)), which mis-aligned into the sortidx and
+    // surfaced as `error.InvalidSectionSize` from the section-end check.
+    const data = [_]u8{
+        // tag = 0x01 (inline-export form)
+        0x01,
+        // count of inline-exports = 1
+        0x01,
+        // exportname' = 0x00 prefix, len=3, "add"
+        0x00, 0x03, 'a', 'd', 'd',
+        // sortidx = sort=0x01 (func), idx=0
+        0x01, 0x00,
+    };
+    var reader = BinaryReader{ .data = &data };
+    const inst = try parseInstance(&reader, std.testing.allocator);
+    defer std.testing.allocator.free(inst.exports);
+    try std.testing.expect(inst == .exports);
+    try std.testing.expectEqual(@as(usize, 1), inst.exports.len);
+    try std.testing.expectEqualStrings("add", inst.exports[0].name);
+    try std.testing.expect(inst.exports[0].sort_idx.sort == .func);
+    try std.testing.expectEqual(@as(u32, 0), inst.exports[0].sort_idx.idx);
+    // Reader must have consumed every byte — the section-end check in
+    // `load` enforces this for the real call site.
+    try std.testing.expectEqual(data.len, reader.pos);
 }
 
 test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
