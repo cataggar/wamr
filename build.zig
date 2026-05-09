@@ -159,10 +159,26 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(wamrc);
 
     // ── Spec test runner ─────────────────────────────────────────────
+    // wabt v3.0.0-dev.4 ships both a library and a CLI exe both named "wabt",
+    // so `wabt_dep.artifact("wabt")` panics with "artifact name 'wabt' is
+    // ambiguous", and the package no longer calls `b.addModule(...)` either.
+    // Build the wabt library module ourselves from the dep's `src/root.zig`,
+    // wired with a synthetic `build_options.version` (the only build option
+    // wabt's root.zig consumes).
     const wabt_dep = b.dependency("wabt", .{
         .target = target,
         .optimize = .ReleaseSafe,
     });
+
+    const wabt_build_options = b.addOptions();
+    wabt_build_options.addOption([]const u8, "version", "v3.0.0-dev.4");
+
+    const wabt_module = b.createModule(.{
+        .root_source_file = wabt_dep.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+    wabt_module.addImport("build_options", wabt_build_options.createModule());
 
     const spec_runner_module = b.createModule(.{
         .root_source_file = b.path("src/tests/run_spec_tests.zig"),
@@ -171,7 +187,7 @@ pub fn build(b: *std.Build) void {
     });
     spec_runner_module.addImport("config", config_module);
     spec_runner_module.addImport("wamr", lib_module);
-    spec_runner_module.addImport("wabt", wabt_dep.artifact("wabt").root_module);
+    spec_runner_module.addImport("wabt", wabt_module);
 
     const spec_runner_exe = b.addExecutable(.{
         .name = "spec-test-runner",
@@ -550,7 +566,7 @@ pub fn build(b: *std.Build) void {
 ///
 /// Pinned versions:
 ///   * Wasmtime preview1 → component adapter v36.0.9 (sha256 verified)
-///   * `cataggar/wabt` ≥ v3.0.0-dev.3 on PATH (provides `component embed`,
+///   * `cataggar/wabt` ≥ v3.0.0-dev.4 on PATH (provides `component embed`,
 ///     `component new`, `component compose`, `validate`)
 ///   * `cargo` with `wasm32-wasip1` target for the mixed example
 fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
@@ -784,9 +800,9 @@ fn installAndValidate(
     component: std.Build.LazyPath,
     install_basename: []const u8,
 ) void {
-    const validate = b.addSystemCommand(&.{ "wabt", "validate" });
+    const validate = b.addSystemCommand(&.{ "wabt", "module", "validate" });
     validate.addFileArg(component);
-    validate.setName(b.fmt("wabt validate {s}", .{install_basename}));
+    validate.setName(b.fmt("wabt module validate {s}", .{install_basename}));
 
     const install = b.addInstallFileWithDir(
         component,
