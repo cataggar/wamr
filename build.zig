@@ -550,7 +550,8 @@ pub fn build(b: *std.Build) void {
 ///
 /// Pinned versions:
 ///   * Wasmtime preview1 → component adapter v36.0.9 (sha256 verified)
-///   * `wasm-tools` ≥ 1.220 expected on PATH (also provides `validate`/`compose`)
+///   * `cataggar/wabt` ≥ v3.0.0-dev.3 on PATH (provides `component embed`,
+///     `component new`, `component compose`, `validate`)
 ///   * `cargo` with `wasm32-wasip1` target for the mixed example
 fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     const adapter_url =
@@ -616,19 +617,20 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
         .exports = &.{"docs:adder/add@0.1.0#add"},
         .output = "zig-adder.core.wasm",
     });
-    const adder_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "adder" });
+    const adder_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "adder" });
     adder_embed.addDirectoryArg(b.path("examples/components/zig-adder/wit"));
     adder_embed.addFileArg(adder_core);
     adder_embed.addArg("-o");
     const adder_embedded = adder_embed.addOutputFileArg("zig-adder.embed.wasm");
 
-    const adder_new = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    const adder_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
     adder_new.addFileArg(adder_embedded);
     adder_new.addArg("-o");
-    // `wasm-tools compose` requires kebab-case file basenames (no dots
-    // before the .wasm extension). Emit `zig-adder.wasm` for use as a
-    // compose dependency below; the install copy uses the more
-    // descriptive `.component.wasm` suffix for end-user discoverability.
+    // `wabt component compose` (like `wasm-tools compose`) requires
+    // kebab-case file basenames (no dots before the .wasm extension).
+    // Emit `zig-adder.wasm` for use as a compose dependency below; the
+    // install copy uses the more descriptive `.component.wasm` suffix
+    // for end-user discoverability.
     const adder = adder_new.addOutputFileArg("zig-adder.wasm");
     installAndValidate(b, examples_step, adder, "zig-adder.component.wasm");
 
@@ -639,24 +641,22 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
         .exports = &.{"_start"},
         .output = "zig-calculator-cmd.core.wasm",
     });
-    const calc_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "app" });
+    const calc_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "app" });
     calc_embed.addDirectoryArg(b.path("examples/components/zig-calculator-cmd/wit"));
     calc_embed.addFileArg(calc_core);
     calc_embed.addArg("-o");
     const calc_embedded = calc_embed.addOutputFileArg("zig-calculator-cmd.embed.wasm");
 
-    const calc_new = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    const calc_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
     calc_new.addFileArg(calc_embedded);
     calc_new.addArg("--adapt");
     calc_new.addPrefixedFileArg("wasi_snapshot_preview1=", adapter);
     calc_new.addArg("-o");
-    // Kebab-case basename for `wasm-tools compose` consumption.
+    // Kebab-case basename for `wabt component compose` consumption.
     const calc_cmd = calc_new.addOutputFileArg("zig-calculator-cmd.wasm");
 
     // Compose: link `docs:adder/add@0.1.0` import against the Zig adder.
-    // wasm-tools compose is deprecated upstream in favour of `wac`; we use
-    // it because it ships with wasm-tools 1.220.
-    const calc_compose = b.addSystemCommand(&.{ "wasm-tools", "compose", "-d" });
+    const calc_compose = b.addSystemCommand(&.{ "wabt", "component", "compose", "-d" });
     calc_compose.addFileArg(adder);
     calc_compose.addFileArg(calc_cmd);
     calc_compose.addArg("-o");
@@ -679,9 +679,9 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
 
     // ── mixed-zig-rust-calc (Zig adder + Rust command, composed) ───
     // Rust command builds via cargo on `wasm32-wasip1`; we then run the
-    // standard wasm-tools embed/new pipeline and compose against the
-    // Zig adder. Build is opt-in — failure mode if cargo / target not
-    // present is a clear cargo error.
+    // standard wabt component embed/new pipeline and compose against
+    // the Zig adder. Build is opt-in — failure mode if cargo / target
+    // not present is a clear cargo error.
     const cargo = b.addSystemCommand(&.{
         "cargo",                                                      "build",
         "--release",                                                  "--target",
@@ -699,21 +699,21 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     cargo_pickup.step.dependOn(&cargo.step);
     const rust_core = cargo_pickup.addOutputFileArg("mixed_zig_rust_command.core.wasm");
 
-    const rust_embed = b.addSystemCommand(&.{ "wasm-tools", "component", "embed", "--world", "app" });
+    const rust_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "app" });
     rust_embed.addDirectoryArg(b.path("examples/components/mixed-zig-rust-calc/command/wit"));
     rust_embed.addFileArg(rust_core);
     rust_embed.addArg("-o");
     const rust_embedded = rust_embed.addOutputFileArg("mixed-rust-command.embed.wasm");
 
-    const rust_new = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    const rust_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
     rust_new.addFileArg(rust_embedded);
     rust_new.addArg("--adapt");
     rust_new.addPrefixedFileArg("wasi_snapshot_preview1=", adapter);
     rust_new.addArg("-o");
-    // Kebab-case basename for `wasm-tools compose`.
+    // Kebab-case basename for `wabt component compose`.
     const rust_cmd = rust_new.addOutputFileArg("mixed-rust-command.wasm");
 
-    const mixed_compose = b.addSystemCommand(&.{ "wasm-tools", "compose", "-d" });
+    const mixed_compose = b.addSystemCommand(&.{ "wabt", "component", "compose", "-d" });
     mixed_compose.addFileArg(adder);
     mixed_compose.addFileArg(rust_cmd);
     mixed_compose.addArg("-o");
@@ -766,9 +766,9 @@ const CommandComponent = struct {
     adapter: std.Build.LazyPath,
 };
 
-/// Wraps `wasm-tools component new --adapt wasi_snapshot_preview1=<adapter>`.
+/// Wraps `wabt component new --adapt wasi_snapshot_preview1=<adapter>`.
 fn makeCommandComponent(b: *std.Build, opts: CommandComponent) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{ "wasm-tools", "component", "new" });
+    const cmd = b.addSystemCommand(&.{ "wabt", "component", "new" });
     cmd.addFileArg(opts.core);
     cmd.addArg("--adapt");
     cmd.addPrefixedFileArg("wasi_snapshot_preview1=", opts.adapter);
@@ -784,9 +784,9 @@ fn installAndValidate(
     component: std.Build.LazyPath,
     install_basename: []const u8,
 ) void {
-    const validate = b.addSystemCommand(&.{ "wasm-tools", "validate" });
+    const validate = b.addSystemCommand(&.{ "wabt", "validate" });
     validate.addFileArg(component);
-    validate.setName(b.fmt("wasm-tools validate {s}", .{install_basename}));
+    validate.setName(b.fmt("wabt validate {s}", .{install_basename}));
 
     const install = b.addInstallFileWithDir(
         component,

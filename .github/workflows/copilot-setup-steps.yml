@@ -44,25 +44,15 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
-      - name: Install wabt (wat2wasm / wasm-validate / wasm-objdump)
+      - name: Install cataggar/wabt v3.0.0-dev.3 (component CLI)
         run: |
           set -euo pipefail
-          ver=1.0.36
-          url=https://github.com/WebAssembly/wabt/releases/download/${ver}/wabt-${ver}-ubuntu-20.04.tar.gz
+          ver=3.0.0-dev.3
+          url=https://github.com/cataggar/wabt/releases/download/v${ver}/wabt-${ver}-linux-x64.tar.gz
           curl -fsSL "$url" -o /tmp/wabt.tgz
-          sudo tar -C /usr/local --strip-components=1 -xzf /tmp/wabt.tgz
-          wat2wasm --version
-          wasm-validate --version
-
-      - name: Install wasm-tools (smith, validate, print, mutate)
-        run: |
-          set -euo pipefail
-          ver=1.219.0
-          url=https://github.com/bytecodealliance/wasm-tools/releases/download/v${ver}/wasm-tools-${ver}-x86_64-linux.tar.gz
-          curl -fsSL "$url" -o /tmp/wasm-tools.tgz
-          sudo tar -C /usr/local/bin --strip-components=1 -xzf /tmp/wasm-tools.tgz \
-            wasm-tools-${ver}-x86_64-linux/wasm-tools
-          wasm-tools --version
+          sudo tar -C /usr/local --strip-components=1 -xzf /tmp/wabt.tgz \
+            wabt-${ver}-linux-x64/bin/wabt
+          wabt version
 
       - name: Cache Zig global cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0

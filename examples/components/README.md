@@ -2,12 +2,13 @@
 
 Source-only Zig (and one mixed Zig+Rust) examples that exercise the
 [bytecodealliance Component-Model][bca] story end-to-end through
-`wasm-tools` and wamr. The examples mirror the structure of the
+[`cataggar/wabt`][cw] and wamr. The examples mirror the structure of the
 [component-docs][cd] adder/calculator/command tutorial — Zig is the
 language column the upstream docs do not yet cover.
 
 [bca]: https://component-model.bytecodealliance.org/
-[cd]: https://github.com/bytecodealliance/component-docs/tree/main/component-model
+[cd]: https://github.com/bytecodealliance/component-docs/tree/main/component-model/examples/tutorial
+[cw]: https://github.com/cataggar/wabt
 
 No `.wasm` artifacts are checked in; everything is built reproducibly
 from the sources in this directory via the repo's root `build.zig`.
@@ -54,7 +55,7 @@ zig-out/component-examples/
 | Tool                                  | Version    | Notes                                                    |
 |---------------------------------------|-----------:|----------------------------------------------------------|
 | Zig                                   | 0.16.x     | Toolchain already required by the rest of the repo.       |
-| `wasm-tools`                          | ≥ 1.220    | Provides `component embed/new`, `validate`, `compose`.    |
+| `wabt` (cataggar/wabt)                | v3.0.0-dev.3 | Provides `component embed/new`, `validate`, `component compose`. |
 | Wasmtime preview1→component adapter   | v36.0.9    | Auto-fetched + sha256-pinned by the build (`build.zig`). |
 | Rust toolchain (`cargo`, `rustup`)    | recent stable | Mixed example only.                                  |
 | `wasm32-wasip1` Rust target           | —          | `rustup target add wasm32-wasip1`. Mixed example only.    |
@@ -63,19 +64,16 @@ zig-out/component-examples/
 
 | Example                   | Builds | Validates | Runs in wamr today | Notes                                                      |
 |---------------------------|:------:|:---------:|:------------------:|------------------------------------------------------------|
-| `zig-hello`               |   ✓    |     ✓     |         ✓          | Full end-to-end (greeting written via the captured-stdout flush). |
+| `zig-hello`               |   ✓    |     ✓     |         ✓          | End-to-end (greeting written via the captured-stdout flush). |
 | `zig-adder`               |   ✓    |     ✓     |        n/a         | Library component — no `wasi:cli/run`.                     |
-| `zig-calculator-cmd` (composed) | ✓ |     ✓     |         ✗          | Aliased-instance gap, see below.                           |
-| `mixed-zig-rust-calc`     |   ✓    |     ✓     |         ✗          | Same gap.                                                  |
+| `zig-calculator-cmd` (composed) | ✓ |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
+| `mixed-zig-rust-calc`     |   ✓    |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
 
-The composed examples produce valid components that run in
-[Wasmtime][wasmtime] today. Under wamr they currently fail with
-`error.NoRunExport` — `wasm-tools compose` emits the top-level
-`wasi:cli/run@0.2.x` export as an *aliased* instance, while wamr's
-`registerInstanceExport` (in
-[`src/component/instance.zig`](../../src/component/instance.zig))
-currently only walks `.local` instance refs. Closing that gap is
-runtime work distinct from this examples set.
+All composed examples produce valid components that run in
+[Wasmtime][wasmtime] and on wamr today. `wabt component compose` emits
+the cross-component plumbing in the inline-export form (rather than the
+aliased-instance form `wasm-tools compose` historically used); both
+shapes are spec-valid, and wamr's component loader handles both.
 
 The `zig-hello` runtime test asserts that wamr exits 0 and emits the
 greeting. Note that the captured-stdout flush in
@@ -86,10 +84,6 @@ stderr fd; the assertion is pinned to that observed behaviour.
 
 ## Caveats
 
-- `wasm-tools compose` is deprecated upstream in favour of
-  [`wac`](https://github.com/bytecodealliance/wac); we use `compose`
-  because it ships in `wasm-tools` 1.220 with no extra install. Either
-  is acceptable as a producer; the linker semantics match.
 - Component-Model support in wamr is still in **preview**; behaviour
   may shift between releases. Each example's README pins its
   expectations to the current state of the runtime.

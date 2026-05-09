@@ -2,7 +2,7 @@
 
 A polyglot WebAssembly component composition: a **Zig** library
 component (the [`zig-adder`](../zig-adder)) is linked into a **Rust**
-command component (`command/`) via `wasm-tools compose`. The pair
+command component (`command/`) via `wabt component compose`. The pair
 produces a runnable WASI command whose `add` lift is implemented in Zig
 and whose CLI / IO logic is implemented in Rust.
 
@@ -35,22 +35,22 @@ live under this directory.
 zig build-exe -target wasm32-freestanding -O ReleaseSmall \
     -fno-entry --export="docs:adder/add@0.1.0#add" \
     ../zig-adder/src/main.zig
-wasm-tools component embed --world adder ../zig-adder/wit main.wasm \
+wabt component embed --world adder ../zig-adder/wit main.wasm \
     -o adder.embed.wasm
-wasm-tools component new adder.embed.wasm -o zig-adder.component.wasm
+wabt component new adder.embed.wasm -o zig-adder.component.wasm
 
 # 2. Build the Rust command (wasi-preview1 binary).
 (cd command && cargo build --release --target wasm32-wasip1)
-wasm-tools component embed --world app command/wit \
+wabt component embed --world app command/wit \
     command/target/wasm32-wasip1/release/mixed_zig_rust_command.wasm \
     -o command.embed.wasm
-wasm-tools component new command.embed.wasm \
-    --adapt wasi_snapshot_preview1.command.wasm \
+wabt component new command.embed.wasm \
+    --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm \
     -o rust-command.component.wasm
 
 # 3. Compose — wires the Rust command's `docs:adder/add@0.1.0` import
 #    against the Zig adder's matching export.
-wasm-tools compose -d zig-adder.component.wasm rust-command.component.wasm \
+wabt component compose -d zig-adder.component.wasm rust-command.component.wasm \
     -o mixed-zig-rust-calc.composed.wasm
 ```
 
@@ -65,7 +65,7 @@ That step produces `zig-out/component-examples/mixed-zig-rust-calc.composed.wasm
 ## Prerequisites
 
 - Zig 0.16.x (already required for the rest of the repo).
-- `wasm-tools` 1.220+ on `PATH`.
+- `wabt` (cataggar/wabt v3.0.0-dev.3+) on `PATH`.
 - A Rust toolchain with the `wasm32-wasip1` target installed:
   `rustup target add wasm32-wasip1`.
 - The `wasi_snapshot_preview1.command.wasm` adapter (downloaded by the
@@ -74,13 +74,10 @@ That step produces `zig-out/component-examples/mixed-zig-rust-calc.composed.wasm
 
 ## Runtime status
 
-The composed component validates with `wasm-tools validate` and runs in
-[Wasmtime][wasmtime]. On wamr's current preview-state runtime it loads
-but does not execute, for the same reason described in
-[`../zig-calculator-cmd/README.md`](../zig-calculator-cmd/README.md):
-`wasm-tools compose` emits the top-level `wasi:cli/run@0.2.x` export as
-an *aliased* instance, while wamr's `registerInstanceExport` currently
-only walks `.local` instance refs.
+The composed component validates with `wabt validate` and runs in both
+[Wasmtime][wasmtime] and wamr. `zig build component-examples-run` runs
+this example end-to-end through `./zig-out/bin/wamr` and asserts the
+expected two-line output.
 
 [wasmtime]: https://wasmtime.dev/
 
@@ -92,4 +89,4 @@ already has a well-documented build path (cargo + `wit-bindgen`); the
 Zig half being the implementation of `add` is the more interesting
 artifact in a wamr-flavoured tutorial. (The reverse direction —
 Rust adder + Zig command — is left as an exercise; it would compose
-identically using the same `wasm-tools` recipe.)
+identically using the same `wabt` recipe.)

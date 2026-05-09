@@ -18,7 +18,7 @@ world adder {
 ```
 
 The Zig source is a single function whose name uses the canonical-ABI
-mangled form `"docs:adder/add@0.1.0#add"`, which `wasm-tools component
+mangled form `"docs:adder/add@0.1.0#add"`, which `wabt component
 embed --world adder` recognises as the lift target for the `add` function
 in the `docs:adder/add@0.1.0` interface. The component has no imports.
 
@@ -29,8 +29,8 @@ zig build-exe -target wasm32-freestanding -O ReleaseSmall \
     -fno-entry --export="docs:adder/add@0.1.0#add" \
     src/main.zig
 
-wasm-tools component embed --world adder wit main.wasm -o main.embed.wasm
-wasm-tools component new main.embed.wasm -o zig-adder.component.wasm
+wabt component embed --world adder wit main.wasm -o main.embed.wasm
+wabt component new main.embed.wasm -o zig-adder.component.wasm
 ```
 
 Or via the repo's root `build.zig`:

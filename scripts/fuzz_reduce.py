@@ -9,8 +9,11 @@ directory.
 
 Two reduction strategies are attempted in order:
 
-1. ``wasm-tools shrink`` if the binary is on ``PATH``. The predicate is a
-   tiny shell wrapper that re-invokes this script in ``--predicate-mode``.
+1. ``wabt shrink`` (preferred) or ``wasm-tools shrink`` (back-compat) if
+   either binary is on ``PATH``. ``wabt shrink`` is a drop-in replacement
+   for ``wasm-tools shrink`` (matching positional argument order and
+   ``--output`` flag). The predicate is a tiny shell wrapper that
+   re-invokes this script in ``--predicate-mode``.
 2. A built-in byte-level shrinker that deletes contiguous ranges of bytes
    and accepts the shorter candidate when it still reproduces.
 
@@ -131,22 +134,37 @@ def byte_level_shrink(
     return best
 
 
-def try_wasm_tools_shrink(
+def detect_external_shrinker() -> str | None:
+    """Return the name of the preferred external shrinker on PATH.
+
+    Prefers ``wabt`` (cataggar/wabt v3.x: ``wabt shrink``) and falls back
+    to ``wasm-tools`` (``wasm-tools shrink``) for back-compat.
+    """
+    if shutil.which("wabt") is not None:
+        return "wabt"
+    if shutil.which("wasm-tools") is not None:
+        return "wasm-tools"
+    return None
+
+
+def try_external_shrink(
     target: str,
     harness: Path,
     input_path: Path,
     out_path: Path,
     duration: int,
     extra_args: list[str],
+    binary: str,
 ) -> bool:
-    """Use ``wasm-tools shrink`` when available.
+    """Use ``wabt shrink`` (or ``wasm-tools shrink``) when available.
 
-    Returns True if it ran. The predicate script re-invokes this module in
-    predicate mode so a single Python file is enough.
+    ``wabt shrink`` is documented as a drop-in for ``wasm-tools shrink``
+    (same positional argument order, same ``--output`` flag), so the
+    same argv works for both. Returns True if it ran.
     """
-    if shutil.which("wasm-tools") is None:
+    if shutil.which(binary) is None:
         return False
-    with tempfile.TemporaryDirectory(prefix="fuzz-reduce-wt-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="fuzz-reduce-shrink-") as tmp:
         tmp_path = Path(tmp)
         predicate = tmp_path / "predicate.sh"
         predicate.write_text(
@@ -165,7 +183,7 @@ def try_wasm_tools_shrink(
         try:
             subprocess.run(
                 [
-                    "wasm-tools",
+                    binary,
                     "shrink",
                     str(predicate),
                     str(input_path),
@@ -176,7 +194,7 @@ def try_wasm_tools_shrink(
             )
             return out_path.exists()
         except Exception as e:  # noqa: BLE001
-            print(f"wasm-tools shrink failed: {e}", file=sys.stderr)
+            print(f"{binary} shrink failed: {e}", file=sys.stderr)
             return False
 
 
@@ -205,14 +223,14 @@ def main(argv: list[str]) -> int:
         help="maximum number of byte-level shrink passes",
     )
     parser.add_argument(
-        "--no-wasm-tools",
+        "--no-external-shrink",
         action="store_true",
-        help="skip wasm-tools shrink even if installed",
+        help="skip wabt/wasm-tools shrink even if installed",
     )
     parser.add_argument(
         "--predicate-mode",
         action="store_true",
-        help="internal: run as a wasm-tools shrink predicate",
+        help="internal: run as a wabt/wasm-tools shrink predicate",
     )
     parser.add_argument(
         "--harness",
@@ -223,7 +241,7 @@ def main(argv: list[str]) -> int:
         "predicate_input",
         nargs="?",
         type=Path,
-        help="internal: candidate wasm passed by wasm-tools shrink",
+        help="internal: candidate wasm passed by wabt/wasm-tools shrink",
     )
     args = parser.parse_args(argv)
 
@@ -248,18 +266,19 @@ def main(argv: list[str]) -> int:
     out = args.out or args.input.with_suffix(".reduced.wasm")
     best = initial
 
-    if not args.no_wasm_tools and shutil.which("wasm-tools") is not None:
-        print("attempting wasm-tools shrink...", file=sys.stderr)
-        wt_out = out.with_suffix(".wt.wasm")
-        if try_wasm_tools_shrink(args.target, harness, args.input, wt_out, args.duration, args.extra):
-            wt_bytes = wt_out.read_bytes()
-            if reproduces(harness, wt_bytes, args.duration, args.extra) and len(wt_bytes) < len(best):
+    shrinker = None if args.no_external_shrink else detect_external_shrinker()
+    if shrinker is not None:
+        print(f"attempting {shrinker} shrink...", file=sys.stderr)
+        ext_out = out.with_suffix(".ext.wasm")
+        if try_external_shrink(args.target, harness, args.input, ext_out, args.duration, args.extra, shrinker):
+            ext_bytes = ext_out.read_bytes()
+            if reproduces(harness, ext_bytes, args.duration, args.extra) and len(ext_bytes) < len(best):
                 print(
-                    f"  wasm-tools: {len(initial)} -> {len(wt_bytes)} bytes",
+                    f"  {shrinker}: {len(initial)} -> {len(ext_bytes)} bytes",
                     file=sys.stderr,
                 )
-                best = wt_bytes
-            wt_out.unlink(missing_ok=True)
+                best = ext_bytes
+            ext_out.unlink(missing_ok=True)
 
     print("running byte-level shrinker...", file=sys.stderr)
     best = byte_level_shrink(harness, best, args.duration, args.extra, args.max_passes)
