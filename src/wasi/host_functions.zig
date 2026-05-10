@@ -395,6 +395,190 @@ pub fn wasiPathOpen(env_opaque: *anyopaque) types.HostFnError!void {
     env.pushI32(result) catch return error.StackOverflow;
 }
 
+// ── fd metadata host functions (issue #420 phase 1) ───────────────────
+
+/// `wasi_snapshot_preview1.fd_filestat_get` — populate a 64-byte
+/// `filestat` struct in linear memory.
+/// Signature: (fd: i32, buf_ptr: i32) -> i32
+pub fn wasiFdFilestatGet(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const buf_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdFilestatGetCore(ctx, mem, fd, buf_ptr)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_filestat_set_size` — truncate a regular
+/// file to the requested length.
+/// Signature: (fd: i32, size: i64) -> i32
+pub fn wasiFdFilestatSetSize(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const size = env.popI64() catch return error.StackUnderflow;
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdFilestatSetSizeCore(ctx, fd, size)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_filestat_set_times` — set atim / mtim on
+/// the file referenced by `fd`. `fst_flags` selects which timestamp(s)
+/// to set and whether to use `now`.
+/// Signature: (fd: i32, atim: i64, mtim: i64, fst_flags: i32) -> i32
+pub fn wasiFdFilestatSetTimes(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const fst_flags: u16 = blk: {
+        const v = env.popI32() catch return error.StackUnderflow;
+        break :blk @intCast(@as(u32, @bitCast(v)) & 0xffff);
+    };
+    const mtim: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const atim: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdFilestatSetTimesCore(ctx, fd, atim, mtim, fst_flags)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_fdstat_set_flags` — apply preview1 fdflags
+/// to the host fd. Currently maps APPEND and NONBLOCK to host O_*; the
+/// SYNC family is accepted only when zero (no-op) since we don't open
+/// host fds with O_DSYNC/O_RSYNC/O_SYNC and toggling them post-open
+/// isn't portable.
+/// Signature: (fd: i32, fdflags: i32) -> i32
+pub fn wasiFdFdstatSetFlags(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const fdflags_raw = env.popI32() catch return error.StackUnderflow;
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    const fdflags: u16 = @intCast(@as(u32, @bitCast(fdflags_raw)) & 0xffff);
+    env.pushI32(ctxFdFdstatSetFlagsCore(ctx, fd, fdflags)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_fdstat_set_rights` — narrow the rights cap
+/// recorded on the fd. Widening (setting any bit not currently set)
+/// returns `notcapable` per the witx spec.
+/// Signature: (fd: i32, rights_base: i64, rights_inheriting: i64) -> i32
+pub fn wasiFdFdstatSetRights(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const rights_inheriting: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const rights_base: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdFdstatSetRightsCore(ctx, fd, rights_base, rights_inheriting)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_advise` — pass a posix_fadvise hint.
+/// Signature: (fd: i32, offset: i64, len: i64, advice: i32) -> i32
+pub fn wasiFdAdvise(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const advice_raw = env.popI32() catch return error.StackUnderflow;
+    const len = env.popI64() catch return error.StackUnderflow;
+    const offset = env.popI64() catch return error.StackUnderflow;
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    const advice: u8 = @intCast(@as(u32, @bitCast(advice_raw)) & 0xff);
+    env.pushI32(ctxFdAdviseCore(ctx, fd, offset, len, advice)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_allocate` — extend a regular file so that
+/// `[offset, offset+len)` is allocated. Falls back to `setLength` when
+/// the host's `fallocate` is unavailable.
+/// Signature: (fd: i32, offset: i64, len: i64) -> i32
+pub fn wasiFdAllocate(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const len = env.popI64() catch return error.StackUnderflow;
+    const offset = env.popI64() catch return error.StackUnderflow;
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdAllocateCore(ctx, fd, offset, len)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_datasync` — flush file contents (not
+/// necessarily metadata) to disk.
+/// Signature: (fd: i32) -> i32
+pub fn wasiFdDatasync(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdSyncCore(ctx, fd, .data)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_sync` — flush file contents and metadata
+/// to disk.
+/// Signature: (fd: i32) -> i32
+pub fn wasiFdSync(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdSyncCore(ctx, fd, .full)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_tell` — write the current file position to
+/// `offset_ptr`.
+/// Signature: (fd: i32, offset_ptr: i32) -> i32
+pub fn wasiFdTell(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const offset_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdTellCore(ctx, mem, fd, offset_ptr)) catch return error.StackOverflow;
+}
+
 // ── ctx-aware core implementations ────────────────────────────────────
 
 /// Layout for `args_get` / `environ_get`: write `argv_ptrs` (one i32 pointer
@@ -415,28 +599,97 @@ fn writeStringTable(mem: []u8, entries: []const []const u8, argv_ptrs: u32, argv
 
 /// fdstat layout (24 bytes): fs_filetype(u8) + 1 pad + fs_flags(u16) +
 /// 4 pad + fs_rights_base(u64) + fs_rights_inheriting(u64).
-fn writeFdstat(mem: []u8, buf_ptr: u32, kind: wasi.FdEntry.FdKind) i32 {
+fn writeFdstat(mem: []u8, buf_ptr: u32, entry: wasi.FdEntry) i32 {
     if (buf_ptr + 24 > mem.len) return wasi_core.WASI_EINVAL;
     @memset(mem[buf_ptr..][0..24], 0);
-    const filetype: u8 = switch (kind) {
-        .stdin, .stdout, .stderr => 2, // character device
-        .regular_file => 4,
-        .directory => 3,
-        .socket => 6,
-    };
-    mem[buf_ptr] = filetype;
-    // Permissive rights so downstream tests that read fs_rights_base before
-    // read/write don't trip on missing capabilities.
-    _ = wasi_core.memWriteU64(mem, buf_ptr + 8, 0xFFFF_FFFF_FFFF_FFFF);
-    _ = wasi_core.memWriteU64(mem, buf_ptr + 16, 0xFFFF_FFFF_FFFF_FFFF);
+    mem[buf_ptr] = @intFromEnum(filetypeForEntry(entry));
+    _ = wasi_core.memWriteU16(mem, buf_ptr + 2, entry.fdflags);
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 8, entry.rights_base);
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 16, entry.rights_inheriting);
     return wasi_core.WASI_ESUCCESS;
+}
+
+/// Resolve the WASI `filetype` for an fd entry. Stdio fds are looked up
+/// via `std.posix.isatty` so `wasi-libc`'s `isatty(3)` (which checks
+/// `fs_filetype == character_device`) returns the right answer when the
+/// host stdio is/isn't a TTY. For regular files, sockets and directories
+/// the kind is determined statically by the FdEntry; for an unmapped
+/// stdio fd that isn't a TTY we report `unknown` so guests don't
+/// incorrectly treat a pipe as a TTY.
+fn filetypeForEntry(entry: wasi.FdEntry) wasi.Filetype {
+    return switch (entry.kind) {
+        .stdin => stdioFiletype(0),
+        .stdout => stdioFiletype(1),
+        .stderr => stdioFiletype(2),
+        .regular_file => .regular_file,
+        .directory => .directory,
+        .socket => .socket_stream,
+    };
+}
+
+/// Probe whether the given POSIX-style stdio descriptor is a TTY. Only
+/// meaningful on Linux; other platforms return `.unknown` so the caller
+/// falls back to the FdEntry kind. The parameter is `i32` (rather than
+/// `std.posix.fd_t`) because Windows uses HANDLE-based fd_t but doesn't
+/// expose positional stdio fds — keeping the type as a plain integer
+/// keeps the helper buildable on every target.
+fn stdioFiletype(host_fd: i32) wasi.Filetype {
+    if (builtin.os.tag == .linux) {
+        // F_GETFL doesn't tell us whether the fd is a tty; use isatty()
+        // syscall via the standard linux ioctl wrapper. std.os.linux
+        // exposes `isatty` indirectly through the TIOCGWINSZ probe used
+        // by `tcgetattr`, so use the dedicated linux syscall path here.
+        const linux = std.os.linux;
+        var termios: linux.termios = undefined;
+        const rc = linux.tcgetattr(host_fd, &termios);
+        if (linux.errno(rc) == .SUCCESS) return .character_device;
+        return .unknown;
+    }
+    return .unknown;
 }
 
 fn ctxFdFdstatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
-    const entry = ctx.fd_table.get(@intCast(fd)) orelse return wasi_core.WASI_EBADF;
-    return writeFdstat(mem, buf_ptr, entry.kind);
+    const u_fd: u32 = @intCast(fd);
+    var entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    // Refresh fdflags from the host fd when applicable so changes that
+    // happened outside `fd_fdstat_set_flags` (e.g. inheritance) are
+    // reflected. Stdio + regular files honour O_APPEND/O_NONBLOCK; the
+    // remaining preview1 sync flags don't have a portable readback
+    // path, so we trust whatever was stashed on the entry.
+    if (entryHostFd(entry)) |host_fd| {
+        if (builtin.os.tag == .linux) {
+            const flags = std.os.linux.fcntl(host_fd, std.os.linux.F.GETFL, 0);
+            if (std.os.linux.errno(flags) == .SUCCESS) {
+                const o: std.os.linux.O = @bitCast(@as(u32, @intCast(flags & 0xFFFF_FFFF)));
+                var fd_flags: u16 = entry.fdflags & ~(wasi.FDFLAGS_APPEND | wasi.FDFLAGS_NONBLOCK);
+                if (o.APPEND) fd_flags |= wasi.FDFLAGS_APPEND;
+                if (o.NONBLOCK) fd_flags |= wasi.FDFLAGS_NONBLOCK;
+                entry.fdflags = fd_flags;
+            }
+        }
+    }
+    return writeFdstat(mem, buf_ptr, entry);
 }
+
+/// Look up the host fd backing an FdEntry. Returns null for directory
+/// entries (no host fd to act on directly — use `host_dir`). On
+/// Windows we don't have positional stdio fds (`std.posix.fd_t` is a
+/// HANDLE there), so stdio entries also return null — none of the
+/// host-fd consumers (Linux fcntl/fadvise/etc.) run on Windows anyway.
+fn entryHostFd(entry: wasi.FdEntry) ?std.posix.fd_t {
+    return switch (entry.kind) {
+        .stdin => stdio_in_fd,
+        .stdout => stdio_out_fd,
+        .stderr => stdio_err_fd,
+        .regular_file, .socket => entry.host_fd,
+        .directory => null,
+    };
+}
+
+const stdio_in_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDIN_FILENO;
+const stdio_out_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDOUT_FILENO;
+const stdio_err_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDERR_FILENO;
 
 fn ctxFdPrestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
@@ -658,6 +911,297 @@ fn ctxPathOpenCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
+// ── fd metadata core helpers (issue #420 phase 1) ─────────────────────
+
+/// `filestat` layout (64 bytes): dev(u64) + ino(u64) + filetype(u8 + 7 pad)
+/// + nlink(u64) + size(u64) + atim(u64) + mtim(u64) + ctim(u64).
+fn writeFilestat(mem: []u8, buf_ptr: u32, stat: anytype, filetype: wasi.Filetype) i32 {
+    if (buf_ptr + 64 > mem.len) return wasi_core.WASI_EINVAL;
+    @memset(mem[buf_ptr..][0..64], 0);
+    // dev: stable per-mount id; std.Io.File.Stat doesn't expose it, so
+    // synthesize zero (wasi guests typically only use ino for tracking).
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 0, 0);
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 8, @intCast(stat.inode));
+    mem[buf_ptr + 16] = @intFromEnum(filetype);
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 24, @intCast(stat.nlink));
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 32, stat.size);
+    const atim_ns: u64 = if (stat.atime) |t| timestampToNs(t) else 0;
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 40, atim_ns);
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 48, timestampToNs(stat.mtime));
+    _ = wasi_core.memWriteU64(mem, buf_ptr + 56, timestampToNs(stat.ctime));
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn timestampToNs(ts: std.Io.Timestamp) u64 {
+    if (ts.nanoseconds < 0) return 0;
+    return @intCast(ts.nanoseconds);
+}
+
+fn filetypeFromIoKind(kind: std.Io.File.Kind) wasi.Filetype {
+    return switch (kind) {
+        .block_device => .block_device,
+        .character_device => .character_device,
+        .directory => .directory,
+        .named_pipe, .unix_domain_socket => .socket_stream,
+        .sym_link => .symbolic_link,
+        .file => .regular_file,
+        else => .unknown,
+    };
+}
+
+fn ctxFdFilestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+
+    if (entry.kind == .directory) {
+        if (entry.host_dir) |dir| {
+            const stat = dir.stat(ctx.io) catch return errnoToI32(error.IoError);
+            return writeFilestat(mem, buf_ptr, stat, .directory);
+        }
+        return wasi_core.WASI_EBADF;
+    }
+
+    const host_fd = entryHostFd(entry) orelse return wasi_core.WASI_EBADF;
+    const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
+    const stat = file.stat(ctx.io) catch |err| switch (err) {
+        error.Streaming => {
+            // Pipes / ttys can't be stat'd. Synthesise a zeroed filestat
+            // and best-effort filetype.
+            return writeFilestatSynthesised(mem, buf_ptr, filetypeForEntry(entry));
+        },
+        else => return errnoToI32(err),
+    };
+    const filetype: wasi.Filetype = switch (entry.kind) {
+        .regular_file => filetypeFromIoKind(stat.kind),
+        .socket => .socket_stream,
+        else => filetypeForEntry(entry),
+    };
+    return writeFilestat(mem, buf_ptr, stat, filetype);
+}
+
+fn writeFilestatSynthesised(mem: []u8, buf_ptr: u32, filetype: wasi.Filetype) i32 {
+    if (buf_ptr + 64 > mem.len) return wasi_core.WASI_EINVAL;
+    @memset(mem[buf_ptr..][0..64], 0);
+    mem[buf_ptr + 16] = @intFromEnum(filetype);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxFdFilestatSetSizeCore(ctx: *wasi.WasiCtx, fd: i32, size: i64) i32 {
+    if (size < 0) return wasi_core.WASI_EINVAL;
+    if (fd < 0) return wasi_core.WASI_EBADF;
+
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    if (entry.kind == .directory) return @intCast(@intFromEnum(wasi.Errno.isdir));
+    if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.inval));
+
+    if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
+
+    const linux = std.os.linux;
+    const host_fd = entryHostFd(entry) orelse return wasi_core.WASI_EBADF;
+    const rc = linux.ftruncate(@intCast(host_fd), size);
+    return mapLinuxErrno(rc);
+}
+
+fn ctxFdFilestatSetTimesCore(ctx: *wasi.WasiCtx, fd: i32, atim: u64, mtim: u64, fst_flags: u16) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const exclusive = wasi.FSTFLAGS_ATIM | wasi.FSTFLAGS_ATIM_NOW;
+    if ((fst_flags & exclusive) == exclusive) return wasi_core.WASI_EINVAL;
+    const exclusive_m = wasi.FSTFLAGS_MTIM | wasi.FSTFLAGS_MTIM_NOW;
+    if ((fst_flags & exclusive_m) == exclusive_m) return wasi_core.WASI_EINVAL;
+
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+
+    if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
+    const linux = std.os.linux;
+    var times: [2]linux.timespec = undefined;
+    times[0] = nsToFutimens(atim, fst_flags, wasi.FSTFLAGS_ATIM, wasi.FSTFLAGS_ATIM_NOW);
+    times[1] = nsToFutimens(mtim, fst_flags, wasi.FSTFLAGS_MTIM, wasi.FSTFLAGS_MTIM_NOW);
+
+    const host_fd = entryHostFd(entry) orelse return wasi_core.WASI_EBADF;
+    const rc = linux.futimens(@intCast(host_fd), &times);
+    return mapLinuxErrno(rc);
+}
+
+fn nsToFutimens(ns: u64, flags: u16, set_bit: u16, now_bit: u16) std.os.linux.timespec {
+    if ((flags & now_bit) != 0) return std.os.linux.UTIME.NOW;
+    if ((flags & set_bit) == 0) return std.os.linux.UTIME.OMIT;
+    const sec: isize = @intCast(ns / std.time.ns_per_s);
+    const nsec: isize = @intCast(ns % std.time.ns_per_s);
+    return .{ .sec = sec, .nsec = nsec };
+}
+
+fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    if ((fdflags & ~wasi.FDFLAGS_ALL) != 0) return wasi_core.WASI_EINVAL;
+
+    const u_fd: u32 = @intCast(fd);
+    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
+    if (entry_ptr.kind == .directory) return wasi_core.WASI_EBADF;
+
+    // SYNC/DSYNC/RSYNC can't be toggled via F_SETFL on Linux, and we
+    // have no portable way to apply them on macOS/Windows either, so
+    // reject any request that tries to change them on every platform.
+    // Otherwise guests would see a silent success-on-no-op.
+    if ((fdflags & (wasi.FDFLAGS_DSYNC | wasi.FDFLAGS_RSYNC | wasi.FDFLAGS_SYNC)) != 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notsup));
+    }
+
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const host_fd = entryHostFd(entry_ptr.*) orelse return wasi_core.WASI_EBADF;
+        const cur = linux.fcntl(host_fd, linux.F.GETFL, 0);
+        if (linux.errno(cur) != .SUCCESS) return mapLinuxErrno(cur);
+
+        var o: linux.O = @bitCast(@as(u32, @intCast(cur & 0xFFFF_FFFF)));
+        o.APPEND = (fdflags & wasi.FDFLAGS_APPEND) != 0;
+        o.NONBLOCK = (fdflags & wasi.FDFLAGS_NONBLOCK) != 0;
+        const new_flags: u32 = @bitCast(o);
+
+        const rc = linux.fcntl(host_fd, linux.F.SETFL, new_flags);
+        if (linux.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+    }
+
+    entry_ptr.fdflags = fdflags;
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxFdFdstatSetRightsCore(ctx: *wasi.WasiCtx, fd: i32, base: u64, inheriting: u64) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
+    if ((base & ~entry_ptr.rights_base) != 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
+    if ((inheriting & ~entry_ptr.rights_inheriting) != 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
+    entry_ptr.rights_base = base;
+    entry_ptr.rights_inheriting = inheriting;
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxFdAdviseCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64, advice: u8) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    if (offset < 0 or len < 0) return wasi_core.WASI_EINVAL;
+    if (advice > @intFromEnum(wasi.Advice.noreuse)) return wasi_core.WASI_EINVAL;
+
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.spipe));
+
+    if (builtin.os.tag != .linux) return wasi_core.WASI_ESUCCESS;
+
+    const linux = std.os.linux;
+    const linux_advice: usize = switch (@as(wasi.Advice, @enumFromInt(advice))) {
+        .normal => linux.POSIX_FADV.NORMAL,
+        .sequential => linux.POSIX_FADV.SEQUENTIAL,
+        .random => linux.POSIX_FADV.RANDOM,
+        .willneed => linux.POSIX_FADV.WILLNEED,
+        .dontneed => linux.POSIX_FADV.DONTNEED,
+        .noreuse => linux.POSIX_FADV.NOREUSE,
+    };
+    const host_fd = entryHostFd(entry) orelse return wasi_core.WASI_EBADF;
+    const rc = linux.fadvise(host_fd, offset, len, linux_advice);
+    return mapLinuxErrno(rc);
+}
+
+fn ctxFdAllocateCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    if (offset < 0 or len < 0) return wasi_core.WASI_EINVAL;
+
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.spipe));
+
+    if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
+
+    const linux = std.os.linux;
+    const host_fd = entryHostFd(entry) orelse return wasi_core.WASI_EBADF;
+    // mode = 0 means "extend the file as needed".
+    const rc = linux.fallocate(@intCast(host_fd), 0, offset, len);
+    if (linux.errno(rc) == .SUCCESS) return wasi_core.WASI_ESUCCESS;
+    // Fall back to ftruncate-extend on filesystems where fallocate is
+    // unsupported (e.g. tmpfs on some kernels reports ENOTSUP).
+    const e = linux.errno(rc);
+    if (e == .OPNOTSUPP) {
+        const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
+        const cur_size: u64 = (file.length(ctx.io) catch return mapLinuxErrno(rc));
+        const new_end: u64 = @intCast(offset + len);
+        if (new_end > cur_size) {
+            file.setLength(ctx.io, new_end) catch return wasi_core.WASI_EINVAL;
+        }
+        return wasi_core.WASI_ESUCCESS;
+    }
+    return mapLinuxErrno(rc);
+}
+
+const SyncMode = enum { data, full };
+
+fn ctxFdSyncCore(ctx: *wasi.WasiCtx, fd: i32, mode: SyncMode) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+
+    if (entry.kind == .directory) {
+        if (entry.host_dir) |dir| {
+            if (builtin.os.tag == .linux) {
+                const rc = std.os.linux.fsync(dir.handle);
+                return mapLinuxErrno(rc);
+            }
+            return wasi_core.WASI_ESUCCESS;
+        }
+        return wasi_core.WASI_EBADF;
+    }
+
+    const host_fd = entryHostFd(entry) orelse return wasi_core.WASI_EBADF;
+    if (builtin.os.tag == .linux and mode == .data) {
+        std.posix.fdatasync(host_fd) catch |err| return errnoToI32(err);
+        return wasi_core.WASI_ESUCCESS;
+    }
+    const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
+    file.sync(ctx.io) catch |err| return errnoToI32(err);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxFdTellCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, offset_ptr: u32) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    if (entry.kind != .regular_file) {
+        return @intCast(@intFromEnum(wasi.Errno.spipe));
+    }
+    if (!wasi_core.memWriteU64(mem, offset_ptr, entry.pos)) return wasi_core.WASI_EINVAL;
+    return wasi_core.WASI_ESUCCESS;
+}
+
+/// Map a raw linux syscall return into a WASI errno (or success).
+fn mapLinuxErrno(rc: usize) i32 {
+    const linux = std.os.linux;
+    return switch (linux.errno(rc)) {
+        .SUCCESS => wasi_core.WASI_ESUCCESS,
+        .BADF => wasi_core.WASI_EBADF,
+        .INVAL => wasi_core.WASI_EINVAL,
+        .ACCES => @intCast(@intFromEnum(wasi.Errno.acces)),
+        .PERM => @intCast(@intFromEnum(wasi.Errno.perm)),
+        .NOSPC => @intCast(@intFromEnum(wasi.Errno.nospc)),
+        .ROFS => @intCast(@intFromEnum(wasi.Errno.rofs)),
+        .ISDIR => @intCast(@intFromEnum(wasi.Errno.isdir)),
+        .NOTDIR => @intCast(@intFromEnum(wasi.Errno.notdir)),
+        .NOENT => @intCast(@intFromEnum(wasi.Errno.noent)),
+        .EXIST => @intCast(@intFromEnum(wasi.Errno.exist)),
+        .FBIG => @intCast(@intFromEnum(wasi.Errno.fbig)),
+        .IO => @intCast(@intFromEnum(wasi.Errno.io)),
+        .SPIPE => @intCast(@intFromEnum(wasi.Errno.spipe)),
+        .OPNOTSUPP => @intCast(@intFromEnum(wasi.Errno.notsup)),
+        .DQUOT => @intCast(@intFromEnum(wasi.Errno.dquot)),
+        .NXIO => @intCast(@intFromEnum(wasi.Errno.nxio)),
+        else => wasi_core.WASI_EINVAL,
+    };
+}
+
 // ── Import resolution ─────────────────────────────────────────────────
 
 /// Resolve WASI host functions for a module's imports.
@@ -701,6 +1245,16 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "fd_seek", &wasiFdSeek },
         .{ "fd_close", &wasiFdClose },
         .{ "fd_fdstat_get", &wasiFdFdstatGet },
+        .{ "fd_fdstat_set_flags", &wasiFdFdstatSetFlags },
+        .{ "fd_fdstat_set_rights", &wasiFdFdstatSetRights },
+        .{ "fd_filestat_get", &wasiFdFilestatGet },
+        .{ "fd_filestat_set_size", &wasiFdFilestatSetSize },
+        .{ "fd_filestat_set_times", &wasiFdFilestatSetTimes },
+        .{ "fd_advise", &wasiFdAdvise },
+        .{ "fd_allocate", &wasiFdAllocate },
+        .{ "fd_datasync", &wasiFdDatasync },
+        .{ "fd_sync", &wasiFdSync },
+        .{ "fd_tell", &wasiFdTell },
         .{ "fd_prestat_get", &wasiFdPrestatGet },
         .{ "fd_prestat_dir_name", &wasiFdPrestatDirName },
         .{ "clock_time_get", &wasiClockTimeGet },
@@ -837,17 +1391,138 @@ test "resolveWasiFunction: unknown returns null" {
     try std.testing.expect(result == null);
 }
 
-test "resolveWasiFunction: all 16 functions resolve" {
+test "resolveWasiFunction: all 26 functions resolve" {
     const names = [_][]const u8{
-        "proc_exit",     "thread-spawn",       "fd_write",
-        "fd_read",       "fd_seek",            "fd_close",
-        "fd_fdstat_get", "fd_prestat_get",     "fd_prestat_dir_name",
-        "clock_time_get", "environ_sizes_get", "environ_get",
-        "args_sizes_get", "args_get",          "random_get",
-        "path_open",
+        "proc_exit",          "thread-spawn",         "fd_write",
+        "fd_read",            "fd_seek",              "fd_close",
+        "fd_fdstat_get",      "fd_fdstat_set_flags",  "fd_fdstat_set_rights",
+        "fd_filestat_get",    "fd_filestat_set_size", "fd_filestat_set_times",
+        "fd_advise",          "fd_allocate",          "fd_datasync",
+        "fd_sync",            "fd_tell",              "fd_prestat_get",
+        "fd_prestat_dir_name", "clock_time_get",      "environ_sizes_get",
+        "environ_get",        "args_sizes_get",       "args_get",
+        "random_get",         "path_open",
     };
     for (names) |name| {
         const result = resolveWasiFunction(name);
         try std.testing.expect(result != null);
     }
+}
+
+const testing_io = std.testing.io;
+
+test "ctxFdFdstatSetFlagsCore: bad fd" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFdstatSetFlagsCore(ctx, -1, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFdstatSetFlagsCore(ctx, 99, 0));
+}
+
+test "ctxFdFdstatSetFlagsCore: invalid bits return EINVAL" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxFdFdstatSetFlagsCore(ctx, 1, 0x8000));
+}
+
+test "ctxFdFdstatSetFlagsCore: SYNC bits return notsup" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsup));
+    try std.testing.expectEqual(expected, ctxFdFdstatSetFlagsCore(ctx, 1, wasi.FDFLAGS_SYNC));
+    try std.testing.expectEqual(expected, ctxFdFdstatSetFlagsCore(ctx, 1, wasi.FDFLAGS_DSYNC));
+    try std.testing.expectEqual(expected, ctxFdFdstatSetFlagsCore(ctx, 1, wasi.FDFLAGS_RSYNC));
+}
+
+test "ctxFdFdstatSetRightsCore: narrow ok, widen rejected" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(50, .{
+        .kind = .regular_file,
+        .rights_base = 0xFF,
+        .rights_inheriting = 0xFF,
+    });
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxFdFdstatSetRightsCore(ctx, 50, 0x0F, 0x0F),
+    );
+    const after_narrow = ctx.fd_table.get(50).?;
+    try std.testing.expectEqual(@as(u64, 0x0F), after_narrow.rights_base);
+    try std.testing.expectEqual(@as(u64, 0x0F), after_narrow.rights_inheriting);
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    try std.testing.expectEqual(expected, ctxFdFdstatSetRightsCore(ctx, 50, 0xFF, 0x0F));
+    try std.testing.expectEqual(@as(u64, 0x0F), ctx.fd_table.get(50).?.rights_base);
+}
+
+test "ctxFdFdstatSetRightsCore: bad fd" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFdstatSetRightsCore(ctx, -1, 0, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFdstatSetRightsCore(ctx, 99, 0, 0));
+}
+
+test "ctxFdAdviseCore: invalid advice returns EINVAL" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(60, .{ .kind = .regular_file });
+    try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxFdAdviseCore(ctx, 60, 0, 0, 99));
+}
+
+test "ctxFdAdviseCore: bad fd" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdAdviseCore(ctx, -1, 0, 0, 0));
+}
+
+test "ctxFdSyncCore: bad fd" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdSyncCore(ctx, -1, .full));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdSyncCore(ctx, 99, .data));
+}
+
+test "ctxFdTellCore: bad fd / spipe / cached pos" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    var mem: [16]u8 = @splat(0);
+
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdTellCore(ctx, &mem, -1, 0));
+
+    const spipe: i32 = @intCast(@intFromEnum(wasi.Errno.spipe));
+    try std.testing.expectEqual(spipe, ctxFdTellCore(ctx, &mem, 1, 0));
+
+    try ctx.fd_table.insert(70, .{ .kind = .regular_file, .pos = 0xDEADBEEF });
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdTellCore(ctx, &mem, 70, 0));
+    try std.testing.expectEqual(@as(u64, 0xDEADBEEF), wasi_core.memReadU64(&mem, 0).?);
+}
+
+test "ctxFdFilestatSetTimesCore: conflicting fst_flags return EINVAL" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(80, .{ .kind = .regular_file });
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxFdFilestatSetTimesCore(ctx, 80, 0, 0, wasi.FSTFLAGS_ATIM | wasi.FSTFLAGS_ATIM_NOW),
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxFdFilestatSetTimesCore(ctx, 80, 0, 0, wasi.FSTFLAGS_MTIM | wasi.FSTFLAGS_MTIM_NOW),
+    );
+}
+
+test "ctxFdFilestatGetCore: bad fd" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [128]u8 = @splat(0);
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFilestatGetCore(ctx, &mem, -1, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFilestatGetCore(ctx, &mem, 99, 0));
+}
+
+test "ctxFdFilestatSetSizeCore: bad fd / directory rejected" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdFilestatSetSizeCore(ctx, -1, 0));
+    try ctx.fd_table.insert(90, .{ .kind = .directory });
+    const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+    try std.testing.expectEqual(isdir, ctxFdFilestatSetSizeCore(ctx, 90, 0));
 }

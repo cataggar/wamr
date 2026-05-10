@@ -108,6 +108,49 @@ pub const Whence = enum(u8) {
     end = 2,
 };
 
+// ── WASI Filetype ───────────────────────────────────────────────────────
+
+/// `filetype` per the WASI preview1 spec — used in `fdstat.fs_filetype`
+/// and `filestat.filetype`. Values match the witx layout exactly.
+pub const Filetype = enum(u8) {
+    unknown = 0,
+    block_device = 1,
+    character_device = 2,
+    directory = 3,
+    regular_file = 4,
+    socket_dgram = 5,
+    socket_stream = 6,
+    symbolic_link = 7,
+};
+
+// ── WASI fdflags (bitset, u16) ──────────────────────────────────────────
+
+pub const FDFLAGS_APPEND: u16 = 0x0001;
+pub const FDFLAGS_DSYNC: u16 = 0x0002;
+pub const FDFLAGS_NONBLOCK: u16 = 0x0004;
+pub const FDFLAGS_RSYNC: u16 = 0x0008;
+pub const FDFLAGS_SYNC: u16 = 0x0010;
+pub const FDFLAGS_ALL: u16 =
+    FDFLAGS_APPEND | FDFLAGS_DSYNC | FDFLAGS_NONBLOCK | FDFLAGS_RSYNC | FDFLAGS_SYNC;
+
+// ── WASI fstflags (bitset, u16) for `*_filestat_set_times` ──────────────
+
+pub const FSTFLAGS_ATIM: u16 = 0x0001;
+pub const FSTFLAGS_ATIM_NOW: u16 = 0x0002;
+pub const FSTFLAGS_MTIM: u16 = 0x0004;
+pub const FSTFLAGS_MTIM_NOW: u16 = 0x0008;
+
+// ── WASI advice (u8 enum) for `fd_advise` ──────────────────────────────
+
+pub const Advice = enum(u8) {
+    normal = 0,
+    sequential = 1,
+    random = 2,
+    willneed = 3,
+    dontneed = 4,
+    noreuse = 5,
+};
+
 // ── IoVec ───────────────────────────────────────────────────────────────
 
 pub const IoVec = struct {
@@ -139,6 +182,18 @@ pub const FdEntry = struct {
     /// `fd_read` / `fd_write` can advance the position without relying on
     /// host-side seek (which the std.Io.File reader/writer wraps).
     pos: u64 = 0,
+    /// Cached preview1 fdflags (APPEND/DSYNC/NONBLOCK/RSYNC/SYNC). Updated
+    /// by `fd_fdstat_set_flags` and surfaced by `fd_fdstat_get`. The
+    /// authoritative state still lives on the host fd via `fcntl` for
+    /// flags that map to host O_*, but we cache here so `fd_fdstat_get`
+    /// reads cheaply and so flags that don't have an O_ analogue (none
+    /// in preview1) are still preserved.
+    fdflags: u16 = 0,
+    /// Preview1 rights cap. Defaults to "all bits set" so existing
+    /// callers see unconstrained rights. `fd_fdstat_set_rights` narrows
+    /// these (widening returns `notcapable`).
+    rights_base: u64 = 0xFFFF_FFFF_FFFF_FFFF,
+    rights_inheriting: u64 = 0xFFFF_FFFF_FFFF_FFFF,
 
     pub const FdKind = enum {
         stdin,
