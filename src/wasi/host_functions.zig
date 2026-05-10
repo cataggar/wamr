@@ -618,16 +618,22 @@ fn writeFdstat(mem: []u8, buf_ptr: u32, entry: wasi.FdEntry) i32 {
 /// incorrectly treat a pipe as a TTY.
 fn filetypeForEntry(entry: wasi.FdEntry) wasi.Filetype {
     return switch (entry.kind) {
-        .stdin => stdioFiletype(std.posix.STDIN_FILENO),
-        .stdout => stdioFiletype(std.posix.STDOUT_FILENO),
-        .stderr => stdioFiletype(std.posix.STDERR_FILENO),
+        .stdin => stdioFiletype(0),
+        .stdout => stdioFiletype(1),
+        .stderr => stdioFiletype(2),
         .regular_file => .regular_file,
         .directory => .directory,
         .socket => .socket_stream,
     };
 }
 
-fn stdioFiletype(host_fd: std.posix.fd_t) wasi.Filetype {
+/// Probe whether the given POSIX-style stdio descriptor is a TTY. Only
+/// meaningful on Linux; other platforms return `.unknown` so the caller
+/// falls back to the FdEntry kind. The parameter is `i32` (rather than
+/// `std.posix.fd_t`) because Windows uses HANDLE-based fd_t but doesn't
+/// expose positional stdio fds — keeping the type as a plain integer
+/// keeps the helper buildable on every target.
+fn stdioFiletype(host_fd: i32) wasi.Filetype {
     if (builtin.os.tag == .linux) {
         // F_GETFL doesn't tell us whether the fd is a tty; use isatty()
         // syscall via the standard linux ioctl wrapper. std.os.linux
@@ -667,16 +673,23 @@ fn ctxFdFdstatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 
 }
 
 /// Look up the host fd backing an FdEntry. Returns null for directory
-/// entries (no host fd to act on directly — use `host_dir`).
+/// entries (no host fd to act on directly — use `host_dir`). On
+/// Windows we don't have positional stdio fds (`std.posix.fd_t` is a
+/// HANDLE there), so stdio entries also return null — none of the
+/// host-fd consumers (Linux fcntl/fadvise/etc.) run on Windows anyway.
 fn entryHostFd(entry: wasi.FdEntry) ?std.posix.fd_t {
     return switch (entry.kind) {
-        .stdin => std.posix.STDIN_FILENO,
-        .stdout => std.posix.STDOUT_FILENO,
-        .stderr => std.posix.STDERR_FILENO,
+        .stdin => stdio_in_fd,
+        .stdout => stdio_out_fd,
+        .stderr => stdio_err_fd,
         .regular_file, .socket => entry.host_fd,
         .directory => null,
     };
 }
+
+const stdio_in_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDIN_FILENO;
+const stdio_out_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDOUT_FILENO;
+const stdio_err_fd: ?std.posix.fd_t = if (builtin.os.tag == .windows) null else std.posix.STDERR_FILENO;
 
 fn ctxFdPrestatGetCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, buf_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
@@ -1028,18 +1041,19 @@ fn ctxFdFdstatSetFlagsCore(ctx: *wasi.WasiCtx, fd: i32, fdflags: u16) i32 {
     const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
     if (entry_ptr.kind == .directory) return wasi_core.WASI_EBADF;
 
+    // SYNC/DSYNC/RSYNC can't be toggled via F_SETFL on Linux, and we
+    // have no portable way to apply them on macOS/Windows either, so
+    // reject any request that tries to change them on every platform.
+    // Otherwise guests would see a silent success-on-no-op.
+    if ((fdflags & (wasi.FDFLAGS_DSYNC | wasi.FDFLAGS_RSYNC | wasi.FDFLAGS_SYNC)) != 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notsup));
+    }
+
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         const host_fd = entryHostFd(entry_ptr.*) orelse return wasi_core.WASI_EBADF;
         const cur = linux.fcntl(host_fd, linux.F.GETFL, 0);
         if (linux.errno(cur) != .SUCCESS) return mapLinuxErrno(cur);
-
-        // SYNC/DSYNC/RSYNC can't be toggled via F_SETFL on Linux; reject
-        // requests that try to change them so guests don't get a silent
-        // success-on-no-op.
-        if ((fdflags & (wasi.FDFLAGS_DSYNC | wasi.FDFLAGS_RSYNC | wasi.FDFLAGS_SYNC)) != 0) {
-            return @intCast(@intFromEnum(wasi.Errno.notsup));
-        }
 
         var o: linux.O = @bitCast(@as(u32, @intCast(cur & 0xFFFF_FFFF)));
         o.APPEND = (fdflags & wasi.FDFLAGS_APPEND) != 0;
