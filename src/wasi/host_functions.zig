@@ -317,6 +317,39 @@ pub fn wasiClockTimeGet(env_opaque: *anyopaque) types.HostFnError!void {
     env.pushI32(result) catch return error.StackOverflow;
 }
 
+/// `wasi_snapshot_preview1.clock_res_get` — get the host-reported
+/// resolution of a WASI clock.
+/// Signature: (clock_id: i32, resolution_ptr: i32) -> i32
+pub fn wasiClockResGet(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const resolution_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const clock_id = env.popI32() catch return error.StackUnderflow;
+
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    const result = wasi_core.clockResGetCore(mem, clock_id, resolution_ptr);
+    env.pushI32(result) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.sched_yield` — yield the scheduler.
+/// Signature: () -> i32
+pub fn wasiSchedYield(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    env.pushI32(wasi_core.schedYieldCore()) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.proc_raise` — raise a signal against the
+/// current process.
+/// Signature: (sig: i32) -> i32
+pub fn wasiProcRaise(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const sig = env.popI32() catch return error.StackUnderflow;
+    env.pushI32(wasi_core.procRaiseCore(sig)) catch return error.StackOverflow;
+}
+
 /// `wasi_snapshot_preview1.environ_sizes_get` — get environment variable sizes.
 pub fn wasiEnvironSizesGet(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
@@ -2859,6 +2892,9 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "path_readlink", &wasiPathReadlink },
         .{ "poll_oneoff", &wasiPollOneoff },
         .{ "sock_shutdown", &wasiSockShutdown },
+        .{ "clock_res_get", &wasiClockResGet },
+        .{ "sched_yield", &wasiSchedYield },
+        .{ "proc_raise", &wasiProcRaise },
     };
 
     inline for (map) |entry| {
@@ -2986,7 +3022,7 @@ test "resolveWasiFunction: unknown returns null" {
     try std.testing.expect(result == null);
 }
 
-test "resolveWasiFunction: all 41 functions resolve" {
+test "resolveWasiFunction: all 44 functions resolve" {
     const names = [_][]const u8{
         "proc_exit",          "thread-spawn",         "fd_write",
         "fd_read",            "fd_pread",             "fd_pwrite",
@@ -3001,7 +3037,8 @@ test "resolveWasiFunction: all 41 functions resolve" {
         "path_filestat_get",  "path_filestat_set_times", "path_create_directory",
         "path_remove_directory", "path_unlink_file",  "path_link",
         "path_rename",        "path_symlink",         "path_readlink",
-        "poll_oneoff",        "sock_shutdown",
+        "poll_oneoff",        "sock_shutdown",        "clock_res_get",
+        "sched_yield",        "proc_raise",
     };
     for (names) |name| {
         const result = resolveWasiFunction(name);
