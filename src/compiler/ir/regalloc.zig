@@ -85,6 +85,22 @@ pub const ClobberPoint = struct {
     regs_clobbered: u64,
 };
 
+/// Hint that `vreg` should be allocated to a particular index in
+/// `RegSet.alloc_regs` if at all possible. Hints are advisory: if the
+/// hinted register is busy or unsafe (clobbered inside the range), the
+/// allocator silently falls back to the normal caller/callee-saved
+/// preference order.
+///
+/// Hints exist primarily to satisfy ABI constraints — e.g. an x86-64
+/// vreg used as `args[i]` of a call site that is then placed into
+/// `param_regs[i + 1]` benefits if the allocator put it there directly,
+/// avoiding a `mov` at the call site.
+pub const Hint = struct {
+    vreg: ir.VReg,
+    /// Index into `RegSet.alloc_regs` of the preferred register.
+    reg_idx: u8,
+};
+
 /// Run linear scan register allocation on a function.
 /// `clobbers` lists positions where specific registers are destroyed.
 pub fn allocate(
@@ -109,9 +125,34 @@ pub fn allocateFromRanges(
     clobbers: []const ClobberPoint,
     ranges: []const analysis.LiveRange,
 ) !AllocResult {
+    return allocateFromRangesWithHints(allocator, reg_set, clobbers, ranges, &.{});
+}
+
+/// Variant of `allocateFromRanges` that additionally accepts a list of
+/// per-vreg register hints. See `Hint` for semantics.
+///
+/// Multiple hints for the same vreg are allowed; the first one wins.
+/// Subsequent hints have no effect (they're not consulted as fallback).
+pub fn allocateFromRangesWithHints(
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    hints: []const Hint,
+) !AllocResult {
     std.debug.assert(reg_set.alloc_regs.len <= max_alloc_regs);
 
     var assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator);
+
+    // Build a map of vreg → hinted alloc-regs index. First hint wins on
+    // duplicates; subsequent ones are ignored.
+    var hint_map = std.AutoHashMap(ir.VReg, u8).init(allocator);
+    defer hint_map.deinit();
+    try hint_map.ensureTotalCapacity(@intCast(hints.len));
+    for (hints) |h| {
+        const gop = hint_map.getOrPutAssumeCapacity(h.vreg);
+        if (!gop.found_existing) gop.value_ptr.* = h.reg_idx;
+    }
 
     // Track which register indices are free (bit i ↔ alloc_regs[i]).
     // Start with the low `alloc_regs.len` bits set.
@@ -130,8 +171,10 @@ pub fn allocateFromRanges(
         // Expire old intervals that ended before this one starts
         expireOldIntervals(&active, range.start, &reg_free);
 
+        const hint_idx: ?u8 = hint_map.get(range.vreg);
+
         // Try to find a free register that is safe (not clobbered during this range)
-        if (findSafeReg(reg_set, reg_free, range.start, range.end, clobbers)) |reg_idx| {
+        if (findSafeReg(reg_set, reg_free, range.start, range.end, clobbers, hint_idx)) |reg_idx| {
             reg_free &= ~(@as(u64, 1) << @intCast(reg_idx));
             try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[reg_idx] });
             try insertActive(&active, allocator, .{
@@ -243,13 +286,27 @@ fn spansClobber(start: u32, end: u32, clobbers: []const ClobberPoint) bool {
 
 /// Find a free register, preferring callee-saved for long-lived values
 /// (those spanning calls) and caller-saved for short-lived values.
+///
+/// If `hint_idx` is set and that register is free and safe for this
+/// range, it is returned without consulting the preference lists. This
+/// lets callers steer ABI-constrained vregs (e.g. call-arg vregs) into
+/// the right register at allocation time. Hints are advisory: when the
+/// hinted register is unavailable we silently fall back to the normal
+/// caller/callee-saved scan.
 fn findSafeReg(
     reg_set: RegSet,
     reg_free: u64,
     start: u32,
     end: u32,
     clobbers: []const ClobberPoint,
+    hint_idx: ?u8,
 ) ?u8 {
+    if (hint_idx) |i| {
+        if (i < reg_set.alloc_regs.len) {
+            const bit = @as(u64, 1) << @intCast(i);
+            if ((reg_free & bit) != 0 and regSafeForRange(i, start, end, clobbers)) return i;
+        }
+    }
     const prefer_callee = spansClobber(start, end, clobbers);
     const first: []const u8 = if (prefer_callee) reg_set.callee_saved_indices else reg_set.caller_saved_indices;
     const second: []const u8 = if (prefer_callee) reg_set.caller_saved_indices else reg_set.callee_saved_indices;
@@ -492,4 +549,131 @@ test "allocateFromRanges: 24-register v128 pool holds 12 live vectors without sp
     for (0..12) |i| {
         try std.testing.expect(result.get(@intCast(i)).? == .reg);
     }
+}
+
+test "allocateFromRangesWithHints: hint honored when target reg is free" {
+    const allocator = std.testing.allocator;
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 1, .type = .i64 },
+    };
+    // Without a hint, the first caller-saved index (0 → physreg 2 = rdx)
+    // would be picked. Hint to index 4 (physreg 8 = r8) instead.
+    const hints = [_]Hint{.{ .vreg = 0, .reg_idx = 4 }};
+
+    var result = try allocateFromRangesWithHints(
+        allocator,
+        test_reg_set,
+        &.{},
+        &ranges,
+        &hints,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(Allocation{ .reg = 8 }, result.get(0).?);
+}
+
+test "allocateFromRangesWithHints: hint silently ignored when target reg is busy" {
+    const allocator = std.testing.allocator;
+    // vreg 0 is allocated first into physreg 8 (idx 4) via a hint.
+    // vreg 1 is then hinted to the same idx 4, but it's still in use,
+    // so the allocator must fall back without erroring.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 5, .type = .i64 },
+        .{ .vreg = 1, .start = 1, .end = 3, .type = .i64 },
+    };
+    const hints = [_]Hint{
+        .{ .vreg = 0, .reg_idx = 4 },
+        .{ .vreg = 1, .reg_idx = 4 },
+    };
+
+    var result = try allocateFromRangesWithHints(
+        allocator,
+        test_reg_set,
+        &.{},
+        &ranges,
+        &hints,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(Allocation{ .reg = 8 }, result.get(0).?);
+    // vreg 1 must have landed somewhere else (not idx 4 → physreg 8).
+    const a1 = result.get(1).?;
+    try std.testing.expect(a1 == .reg);
+    try std.testing.expect(a1.reg != 8);
+    try std.testing.expectEqual(@as(u32, 0), result.spill_count);
+}
+
+test "allocateFromRangesWithHints: hint ignored when target is clobbered inside range" {
+    const allocator = std.testing.allocator;
+    // Range [0, 4] spans a clobber at pos 2 that destroys idx 0
+    // (caller-saved). The hint targets idx 0; it must be rejected and
+    // the allocator must fall back to a callee-saved register.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 4, .type = .i64 },
+    };
+    const clobbers = [_]ClobberPoint{
+        .{ .pos = 2, .regs_clobbered = 0b1 }, // clobbers idx 0
+    };
+    const hints = [_]Hint{.{ .vreg = 0, .reg_idx = 0 }};
+
+    var result = try allocateFromRangesWithHints(
+        allocator,
+        test_reg_set,
+        &clobbers,
+        &ranges,
+        &hints,
+    );
+    defer result.deinit();
+
+    const a = result.get(0).?;
+    try std.testing.expect(a == .reg);
+    // Hint (idx 0 → physreg 2 = rdx) was unsafe; allocator must have
+    // chosen a callee-saved physreg. Callee-saved phys regs in
+    // test_reg_set are alloc_regs[1, 6, 7, 8, 9] = {3, 12, 13, 14, 15}.
+    try std.testing.expect(a.reg != 2);
+}
+
+test "allocateFromRangesWithHints: duplicate hints — first wins" {
+    const allocator = std.testing.allocator;
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 1, .type = .i64 },
+    };
+    // Both hints target free safe registers; the first should be honored.
+    const hints = [_]Hint{
+        .{ .vreg = 0, .reg_idx = 4 }, // physreg 8 = r8
+        .{ .vreg = 0, .reg_idx = 5 }, // physreg 9 = r9
+    };
+
+    var result = try allocateFromRangesWithHints(
+        allocator,
+        test_reg_set,
+        &.{},
+        &ranges,
+        &hints,
+    );
+    defer result.deinit();
+
+    try std.testing.expectEqual(Allocation{ .reg = 8 }, result.get(0).?);
+}
+
+test "allocateFromRangesWithHints: empty hint list behaves like allocateFromRanges" {
+    const allocator = std.testing.allocator;
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 1, .type = .i64 },
+        .{ .vreg = 1, .start = 0, .end = 1, .type = .i64 },
+    };
+
+    var result_a = try allocateFromRangesWithHints(
+        allocator,
+        test_reg_set,
+        &.{},
+        &ranges,
+        &.{},
+    );
+    defer result_a.deinit();
+    var result_b = try allocateFromRanges(allocator, test_reg_set, &.{}, &ranges);
+    defer result_b.deinit();
+
+    try std.testing.expectEqual(result_a.get(0).?, result_b.get(0).?);
+    try std.testing.expectEqual(result_a.get(1).?, result_b.get(1).?);
 }

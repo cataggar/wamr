@@ -1512,6 +1512,54 @@ const x86_64_call_clobber_mask: u64 = blk: {
     break :blk m;
 };
 
+/// Map an `emit.Reg` to its index in `x86_64_alloc_regs`, or null if the
+/// register is not allocatable. Used to build register-allocator hints
+/// from ABI-fixed parameter registers.
+fn x86_64_alloc_idx(reg: emit.Reg) ?u8 {
+    inline for (x86_64_alloc_regs, 0..) |phys, i| {
+        if (@intFromEnum(reg) == phys) return @intCast(i);
+    }
+    return null;
+}
+
+/// Hint indices for `param_regs[0..]`. Slots that map to non-allocatable
+/// registers (rcx on SysV, rcx on Win64 since param_regs[0]=rcx is
+/// non-allocatable) are null.
+///
+/// SysV: rdi(idx 3), rsi(idx 2), rdx(idx 0), rcx(null), r8(idx 4), r9(idx 5)
+/// Win64: rcx(null), rdx(idx 0), r8(idx 4), r9(idx 5)
+const param_reg_hint_idx: [param_regs.len]?u8 = blk: {
+    var t: [param_regs.len]?u8 = undefined;
+    for (param_regs, 0..) |r, i| t[i] = x86_64_alloc_idx(r);
+    break :blk t;
+};
+
+/// Hint allocator index for the i-th wasm-call argument (which lands in
+/// `param_regs[i + 1]`). Returns null when the slot maps to a non-allocatable
+/// register or when `i` is out of range.
+fn callArgHintIdx(arg_index: u32) ?u8 {
+    if (arg_index + 1 >= param_regs.len) return null;
+    return param_reg_hint_idx[arg_index + 1];
+}
+
+/// Append a hint for each wasm call argument that maps to an allocatable
+/// `param_regs[i + 1]` on the current ABI. Args targeting non-allocatable
+/// registers (rcx on SysV at args[2]) are skipped.
+fn addCallArgHints(
+    list: *std.ArrayList(regalloc.Hint),
+    allocator: std.mem.Allocator,
+    args: []const ir.VReg,
+) !void {
+    const max_reg_slots: u32 = @as(u32, @intCast(param_regs.len)) - 1;
+    const max_args: u32 = @min(@as(u32, @intCast(args.len)), max_reg_slots);
+    var i: u32 = 0;
+    while (i < max_args) : (i += 1) {
+        if (callArgHintIdx(i)) |idx| {
+            try list.append(allocator, .{ .vreg = args[i], .reg_idx = idx });
+        }
+    }
+}
+
 /// Build the per-function `RegSet` for x86-64. `local_count` determines
 /// the spill-slot origin so it must be passed in.
 fn x86_64_reg_set(local_count: u32) regalloc.RegSet {
@@ -1666,10 +1714,15 @@ fn compileFunctionRAWithGlobalOffsets(
     var const_vals = try buildConstVals(func, allocator);
     defer const_vals.deinit();
 
-    // Collect clobber points: instructions that destroy specific registers.
+    // Collect clobber points and ABI register hints in a single walk.
+    // Hints steer call-arg vregs into their target `param_regs[i+1]` so
+    // emitCallRegArgMoves emits no inter-vreg movs. Hints are advisory:
+    // unsafe / unavailable hints are silently ignored by the allocator.
     // Uses block_order so numbering matches live-range computation.
     var clobber_points: std.ArrayList(regalloc.ClobberPoint) = .empty;
     defer clobber_points.deinit(allocator);
+    var hint_points: std.ArrayList(regalloc.Hint) = .empty;
+    defer hint_points.deinit(allocator);
     {
         var pos: u32 = 0;
         for (block_order) |block_id| {
@@ -1698,6 +1751,70 @@ fn compileFunctionRAWithGlobalOffsets(
                     },
                     else => {},
                 }
+                // Collect hints. These don't depend on the const-fold of
+                // bulk-memory lengths, since the hint applies in either path
+                // (small inline path uses param regs less, but a free hint
+                // never hurts).
+                switch (ci.op) {
+                    .call => |cl| addCallArgHints(&hint_points, allocator, cl.args) catch |e| return e,
+                    .call_indirect => |cli| addCallArgHints(&hint_points, allocator, cli.args) catch |e| return e,
+                    .call_ref => |cr| addCallArgHints(&hint_points, allocator, cr.args) catch |e| return e,
+                    .memory_copy => |mc| {
+                        if (smallFixedBulkMemLen(&const_vals, mc.len) == null) {
+                            // [dst, src, len] → param_regs[1..4]
+                            const args = [_]ir.VReg{ mc.dst, mc.src, mc.len };
+                            try addCallArgHints(&hint_points, allocator, &args);
+                        }
+                    },
+                    .memory_fill => |mf| {
+                        if (smallFixedBulkMemLen(&const_vals, mf.len) == null) {
+                            // dst → rdi (param_regs[0]; rdi is alloc_regs idx 3
+                            // on both ABIs). Hint at-use is safe: the clobber
+                            // at this op forbids any other vreg from holding
+                            // rdi across the op, and the dst's range ends here.
+                            if (x86_64_alloc_idx(.rdi)) |idx| {
+                                try hint_points.append(allocator, .{ .vreg = mf.dst, .reg_idx = idx });
+                            }
+                        }
+                    },
+                    .memory_grow => |pages_vreg| {
+                        // pages → param_regs[1] (rsi on SysV, rdx on Win64).
+                        if (param_reg_hint_idx[1]) |idx| {
+                            try hint_points.append(allocator, .{ .vreg = pages_vreg, .reg_idx = idx });
+                        }
+                    },
+                    .table_init => |ti| {
+                        // ti.dst → param_regs[2] (rdx on SysV, r8 on Win64).
+                        // ti.len → param_regs[3] (rcx on SysV [skip], r9 on Win64).
+                        // ti.src is staged through r11 (non-allocatable), no hint.
+                        if (param_reg_hint_idx[2]) |idx| {
+                            try hint_points.append(allocator, .{ .vreg = ti.dst, .reg_idx = idx });
+                        }
+                        if (param_reg_hint_idx[3]) |idx| {
+                            try hint_points.append(allocator, .{ .vreg = ti.len, .reg_idx = idx });
+                        }
+                    },
+                    .table_grow => |tg| {
+                        // Win64: init→rdx(idx 0), delta→r8(idx 4).
+                        // SysV:  init→rsi(idx 2), delta→rdx(idx 0).
+                        if (comptime builtin.os.tag == .windows) {
+                            if (x86_64_alloc_idx(.rdx)) |idx| {
+                                try hint_points.append(allocator, .{ .vreg = tg.init, .reg_idx = idx });
+                            }
+                            if (x86_64_alloc_idx(.r8)) |idx| {
+                                try hint_points.append(allocator, .{ .vreg = tg.delta, .reg_idx = idx });
+                            }
+                        } else {
+                            if (x86_64_alloc_idx(.rsi)) |idx| {
+                                try hint_points.append(allocator, .{ .vreg = tg.init, .reg_idx = idx });
+                            }
+                            if (x86_64_alloc_idx(.rdx)) |idx| {
+                                try hint_points.append(allocator, .{ .vreg = tg.delta, .reg_idx = idx });
+                            }
+                        }
+                    },
+                    else => {},
+                }
                 pos += 1;
             }
         }
@@ -1706,7 +1823,13 @@ fn compileFunctionRAWithGlobalOffsets(
     // Compute live ranges using the SAME block_order, then allocate registers.
     const live_ranges = try analysis.computeLiveRangesWithOrder(func, block_order, allocator);
     defer allocator.free(live_ranges);
-    var alloc_result = try regalloc.allocateFromRanges(allocator, x86_64_reg_set(func.local_count), clobber_points.items, live_ranges);
+    var alloc_result = try regalloc.allocateFromRangesWithHints(
+        allocator,
+        x86_64_reg_set(func.local_count),
+        clobber_points.items,
+        live_ranges,
+        hint_points.items,
+    );
     defer alloc_result.deinit();
 
     // Compute which caller-saved registers are actually used by this function.
@@ -6106,4 +6229,102 @@ test "compileFunctionRA: block ordering consistency (clobbers match live ranges)
 
     // Sanity: produced non-empty code.
     try std.testing.expect(compile_result.code.len > 0);
+}
+
+test "compileModule: regalloc hints — leaf 2-arg call emits no inter-vreg shuffle (SysV)" {
+    // Issue #379: with calling-convention hints, the regalloc places
+    // arg vregs directly into their target param_regs. For a 2-arg
+    // wasm-to-wasm call on SysV that means args[0] → rsi and
+    // args[1] → rdx, so emitCallRegArgMoves emits zero inter-vreg movs.
+    //
+    // Without hints the allocator picks the first two caller-saved
+    // indices (rdx then rsi), producing a 2-cycle (rdx↔rsi) that
+    // emitCallRegArgMoves would break by emitting at least one
+    // `mov r10, X` cycle-breaker.
+    //
+    // Win64 args go to {rdx, r8, r9}, all in different alloc-regs
+    // indices, so the allocator already happens to land on the right
+    // registers without the hint mechanism for the first two slots.
+    // The cycle-breaker pattern is SysV-specific.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    // callee(i32, i32) -> i32 — body irrelevant.
+    var callee = ir.IrFunction.init(allocator, 2, 2, 0);
+    _ = try callee.newBlock();
+    try callee.getBlock(0).append(.{ .op = .{ .ret = 0 } });
+    _ = try ir_module.addFunction(callee);
+
+    // caller(): two iconsts → 2-arg call → ret.
+    var caller = ir.IrFunction.init(allocator, 0, 1, 0);
+    _ = try caller.newBlock();
+    const a0 = caller.newVReg();
+    const a1 = caller.newVReg();
+    const r = caller.newVReg();
+    try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a0, .type = .i32 });
+    try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = a1, .type = .i32 });
+    const args = try allocator.alloc(ir.VReg, 2);
+    defer allocator.free(args);
+    args[0] = a0;
+    args[1] = a1;
+    try caller.getBlock(0).append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = args } },
+        .dest = r,
+        .type = .i32,
+    });
+    try caller.getBlock(0).append(.{ .op = .{ .ret = r } });
+    _ = try ir_module.addFunction(caller);
+
+    const result = try compileModule(&ir_module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    const caller_off = result.offsets[1];
+    const caller_code = result.code[caller_off..];
+
+    // Locate the direct CALL (E8 + rel32).
+    const idx_call = std.mem.lastIndexOfScalar(u8, caller_code, 0xE8) orelse
+        return error.TestExpectedCallEmitted;
+
+    // No `mov r10, ?` cycle-breaker should appear before the call. r10
+    // is encoded with REX.B=1, opcode 0x89, mod=11, reg=src, r/m=010 (r10).
+    // The full byte pattern for `mov r10, X` where X is any GPR is:
+    //   REX.WB = 0x49, opcode 0x89, ModR/M = 11_xxx_010 = 0xC2..0xFA in
+    //   steps of 8 (xxx covers reg 0..7).
+    // We assert no occurrence of `49 89` followed by a ModR/M whose
+    // r/m field is 010 (r10) — i.e., low 3 bits == 010.
+    //
+    // Simpler conservative check: there is no `49 89 D?` in the call-arg
+    // setup region. The cycle-breaker patterns the parallel-move algorithm
+    // emits are `mov r10, src` (49 89 sf 010) which all have low ModR/M
+    // r/m bits = 010. 0xD2/0xDA/0xC2/0xCA/0xE2/0xEA/0xF2/0xFA — eighth
+    // values starting at 0xC2.
+    const arg_setup = caller_code[0..idx_call];
+    var p: usize = 0;
+    while (p + 2 < arg_setup.len) : (p += 1) {
+        if (arg_setup[p] == 0x49 and arg_setup[p + 1] == 0x89) {
+            const modrm = arg_setup[p + 2];
+            // mod == 11 (top two bits = 11) and r/m field (low 3) == 010
+            // means destination is r10.
+            if ((modrm & 0xC7) == 0xC2) {
+                // Found a `mov r10, src`. With hints there should be
+                // none in the call-arg setup region.
+                std.debug.print("\nUnexpected `mov r10, X` cycle-breaker at offset {}: bytes {x:0>2} {x:0>2} {x:0>2}\n", .{ p, arg_setup[p], arg_setup[p + 1], modrm });
+                try std.testing.expect(false);
+            }
+        }
+    }
+
+    // Positive check: the iconsts must directly target rsi and rdx
+    // (since a0 → param_regs[1]=rsi, a1 → param_regs[2]=rdx on SysV).
+    //   `mov rsi, 1`  =  48 C7 C6 01 00 00 00
+    //   `mov rdx, 2`  =  48 C7 C2 02 00 00 00
+    // movRegImm32 always emits the REX.W form (see emit.zig:119).
+    const iconst_to_rsi = [_]u8{ 0x48, 0xC7, 0xC6, 0x01, 0x00, 0x00, 0x00 };
+    const iconst_to_rdx = [_]u8{ 0x48, 0xC7, 0xC2, 0x02, 0x00, 0x00, 0x00 };
+    try std.testing.expect(containsBytes(caller_code, &iconst_to_rsi));
+    try std.testing.expect(containsBytes(caller_code, &iconst_to_rdx));
 }
