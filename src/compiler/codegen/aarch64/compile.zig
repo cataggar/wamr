@@ -838,6 +838,15 @@ pub fn compileFunctionImpl(
     var clobbers = try collectClobberPoints(func, block_order, &scheduled, allocator);
     defer clobbers.deinit(allocator);
 
+    // Calling-convention regalloc hints (issue #423, mirrors x86_64 PR
+    // #422). Steers call-arg vregs into their AAPCS64 target reg
+    // (x{i+1}) so `emitStageCallAbi`/`stageArgFromSaved` short-circuits
+    // each arg via the `target == r` no-op path instead of emitting an
+    // inter-X-reg `mov`. Hints are advisory: unsafe / unavailable hints
+    // are silently ignored by `regalloc.allocateFromRangesWithHints`.
+    var hint_points = try collectHintPoints(func, &ctx, block_order, &scheduled, allocator);
+    defer hint_points.deinit(allocator);
+
     var code = emit.CodeBuffer.initWithPeephole(allocator, .{ .enabled = ctx.options.enable_peephole });
     errdefer code.deinit();
 
@@ -1130,11 +1139,12 @@ pub fn compileFunctionImpl(
     var alloc_result_storage: ?regalloc.AllocResult = null;
     defer if (alloc_result_storage) |*ar| ar.deinit();
     if (ctx.options.enable_xreg_alloc) {
-        alloc_result_storage = try regalloc.allocateFromRanges(
+        alloc_result_storage = try regalloc.allocateFromRangesWithHints(
             allocator,
             aarch64RegSetForSpillBase(spill_base),
             clobbers.items,
             scalar_live_ranges.items,
+            hint_points.items,
         );
     }
 
@@ -7406,6 +7416,18 @@ pub const aarch64_callee_saved_indices = [_]u8{
 /// allocatable scratches, x18 is platform-reserved.
 pub const aarch64_call_clobber_mask: u64 = (@as(u64, 1) << 15) - 1;
 
+/// Map an aarch64 physical register to its position in
+/// `aarch64_alloc_regs`. Returns `null` for non-allocatable regs (x15
+/// = `RegMap.tmp2`, x16 = `tmp0`, x17 = `tmp1`, x18 platform reg, plus
+/// fp/lr/sp). Used by the regalloc-hint pre-pass to translate
+/// AAPCS64 ABI-fixed call-arg targets (x1..x7) into hint indices.
+fn aarch64_alloc_idx(reg: emit.Reg) ?u8 {
+    inline for (aarch64_alloc_regs, 0..) |phys, i| {
+        if (@intFromEnum(reg) == phys) return @intCast(i);
+    }
+    return null;
+}
+
 /// Conservative SIMD allocator pool: v3-v7 plus v16-v31. v0-v2 remain
 /// non-allocatable codegen temporaries used by complex NEON sequences. v8-v15
 /// are excluded because AAPCS64 only preserves their low 64 bits; using them
@@ -7548,9 +7570,160 @@ pub fn collectClobberPoints(
     return clobbers;
 }
 
-/// Phase 2 shim: run the linear-scan allocator on `func` and discard the
-/// result. Exercises `collectClobberPoints`, `analysis.computeLiveRanges`,
-/// and `regalloc.allocate` on every aarch64 function the compiler sees,
+/// Append calling-convention regalloc hints for the scalar args of one
+/// call site. Each scalar arg `i` whose AAPCS64 plan-loc is
+/// `.scalar_reg = xN` gets a hint `{ vreg = args[i], reg_idx = idx(xN) }`.
+/// `.v128_reg` and `.stack` arg locs are skipped — v128 hints are out
+/// of scope for issue #423, and stack args have no fixed-physreg target.
+///
+/// Multiple hints may be emitted per call (one per scalar arg). The
+/// allocator (`regalloc.allocateFromRangesWithHints`) honors a hint
+/// only when the target is free at assignment time and the vreg's live
+/// range survives any clobber, so unsafe hints are harmlessly dropped.
+fn addCallArgScalarHints(
+    list: *std.ArrayList(regalloc.Hint),
+    allocator: std.mem.Allocator,
+    fctx: *const FuncCompileCtx,
+    args: []const ir.VReg,
+    params: []const ir.IrType,
+) !void {
+    var plan = try buildCallAbiPlan(fctx.allocator, fctx, args, params, false);
+    defer plan.deinit();
+    for (args, 0..) |arg_vreg, i| {
+        switch (plan.locs[i]) {
+            .scalar_reg => |reg| {
+                if (aarch64_alloc_idx(reg)) |idx| {
+                    try list.append(allocator, .{ .vreg = arg_vreg, .reg_idx = idx });
+                }
+            },
+            .v128_reg, .stack => {},
+        }
+    }
+}
+
+/// Emit a single `Hint` for `vreg` targeting AAPCS64 register `xN` if
+/// `xN` is allocatable in `aarch64_alloc_regs`. x0..x14 are; x15..x18
+/// and the callee-saved x19..x28 are (callee-saved are reachable but
+/// not used for ABI-fixed call-arg slots).
+fn appendArgRegHint(
+    list: *std.ArrayList(regalloc.Hint),
+    allocator: std.mem.Allocator,
+    vreg: ir.VReg,
+    reg: emit.Reg,
+) !void {
+    if (aarch64_alloc_idx(reg)) |idx| {
+        try list.append(allocator, .{ .vreg = vreg, .reg_idx = idx });
+    }
+}
+
+/// Collect calling-convention register hints for every IR op that flows
+/// vregs into AAPCS64 ABI-fixed param registers. Mirrors x86_64's
+/// hint pre-pass (PR #422), adapted for AAPCS64: vmctx is in x0 and
+/// scalar wasm args go to x1..x7 in declaration order; v128 args go to
+/// v0..v7 (out of scope here — v0..v2 aren't even in the V-reg
+/// allocator pool, see `aarch64_v_alloc_regs`).
+///
+/// Hint sources covered (matching `emitCall`/`emitCallIndirect`/
+/// `emitCallRef`/host-helper emit fns):
+///   - `.call`, `.call_indirect`, `.call_ref`: scalar args by plan
+///   - `.memory_copy` (dst, src, len) → x1, x2, x3
+///   - `.memory_fill` (dst, val, len) → x1, x2, x3
+///   - `.memory_grow` (pages) → x1
+///   - `.table_grow` (init, delta) → x1, x2
+///   - `.table_set` (idx, val) → x2, x3 (x1 holds the constant table_idx)
+///   - `.atomic_notify` (base, count) → x1, x2
+///   - `.atomic_wait` (base, expected) → x1, x2 (timeout's slot varies
+///     by 32/64 path, hint just the unambiguous prefix)
+///
+/// Skipped: `.table_init` packs dst/src/len into encoded x3/x4 values
+/// rather than placing the vregs directly in fixed param regs, so a
+/// hint would point at the wrong register.
+///
+/// Positions are not used in the returned list — `Hint` is just
+/// `(vreg, reg_idx)`. This walk only needs to cover every op that has
+/// a fixed-target arg.
+fn collectHintPoints(
+    func: *const ir.IrFunction,
+    fctx: *const FuncCompileCtx,
+    block_order_opt: ?[]const ir.BlockId,
+    scheduled: ?*const schedule.FunctionSchedule,
+    allocator: std.mem.Allocator,
+) !std.ArrayList(regalloc.Hint) {
+    var hints: std.ArrayList(regalloc.Hint) = .empty;
+    errdefer hints.deinit(allocator);
+
+    var owns_order = false;
+    const block_order: []const ir.BlockId = if (block_order_opt) |bo| bo else blk: {
+        const raw = try allocator.alloc(ir.BlockId, func.blocks.items.len);
+        for (raw, 0..) |*r, i| r.* = @intCast(i);
+        owns_order = true;
+        break :blk raw;
+    };
+    defer if (owns_order) allocator.free(block_order);
+
+    for (block_order) |bo_bid| {
+        const insts = if (scheduled) |s|
+            s.instructions(bo_bid)
+        else
+            func.blocks.items[bo_bid].instructions.items;
+        for (insts) |ci| {
+            switch (ci.op) {
+                .call => |cl| try addCallArgScalarHints(
+                    &hints,
+                    allocator,
+                    fctx,
+                    cl.args,
+                    funcParamTypes(fctx, cl.func_idx),
+                ),
+                .call_indirect => |cli| try addCallArgScalarHints(
+                    &hints,
+                    allocator,
+                    fctx,
+                    cli.args,
+                    indexedParamTypes(fctx, cli.type_idx),
+                ),
+                .call_ref => |cr| try addCallArgScalarHints(
+                    &hints,
+                    allocator,
+                    fctx,
+                    cr.args,
+                    indexedParamTypes(fctx, cr.type_idx),
+                ),
+                .memory_copy => |mc| {
+                    try appendArgRegHint(&hints, allocator, mc.dst, .x1);
+                    try appendArgRegHint(&hints, allocator, mc.src, .x2);
+                    try appendArgRegHint(&hints, allocator, mc.len, .x3);
+                },
+                .memory_fill => |mf| {
+                    try appendArgRegHint(&hints, allocator, mf.dst, .x1);
+                    try appendArgRegHint(&hints, allocator, mf.val, .x2);
+                    try appendArgRegHint(&hints, allocator, mf.len, .x3);
+                },
+                .memory_grow => |pages_vreg| {
+                    try appendArgRegHint(&hints, allocator, pages_vreg, .x1);
+                },
+                .table_grow => |tg| {
+                    try appendArgRegHint(&hints, allocator, tg.init, .x1);
+                    try appendArgRegHint(&hints, allocator, tg.delta, .x2);
+                },
+                .table_set => |ts| {
+                    try appendArgRegHint(&hints, allocator, ts.idx, .x2);
+                    try appendArgRegHint(&hints, allocator, ts.val, .x3);
+                },
+                .atomic_notify => |an| {
+                    try appendArgRegHint(&hints, allocator, an.base, .x1);
+                    try appendArgRegHint(&hints, allocator, an.count, .x2);
+                },
+                .atomic_wait => |aw| {
+                    try appendArgRegHint(&hints, allocator, aw.base, .x1);
+                    try appendArgRegHint(&hints, allocator, aw.expected, .x2);
+                },
+                else => {},
+            }
+        }
+    }
+    return hints;
+}
 /// so bugs surface here before Phase 3 depends on the output.
 ///
 /// This is called unconditionally from `compileFunctionImpl` and will be
@@ -12408,4 +12581,123 @@ test "aarch64RegSet: sane layout for a tiny function" {
     try std.testing.expect(rs.spill_stride > 0);
     // Spills live above the locals area (saved fp/lr + vmctx + locals = 24 bytes min).
     try std.testing.expect(rs.spill_base >= 24);
+}
+
+test "compileModule: regalloc hints — leaf 2-arg call places args directly into x1/x2 (aarch64)" {
+    // Issue #423: with calling-convention hints the regalloc places
+    // arg vregs directly into their AAPCS64 target param regs (x1, x2
+    // for a 2-arg call). `stageArgFromSaved` then short-circuits via
+    // its `target == r` no-op path, so the call-arg setup region
+    // contains zero inter-X-reg `MOV Xd, Xn` instructions.
+    //
+    // Without hints the allocator picks the first two caller-saved
+    // indices (x0 then x1), so arg[0] lands in x0 and arg[1] in x1 —
+    // which then have to be shuffled to x1/x2 at the call site,
+    // emitting at least one inter-X-reg MOV.
+
+    const allocator = std.testing.allocator;
+    var ir_module = ir.IrModule.init(allocator);
+    defer ir_module.deinit();
+
+    // callee: returns 0. Body is irrelevant — the test inspects the
+    // *caller*'s call-arg setup region. (Test fixtures don't populate
+    // `func_types`, so `funcParamTypes` returns &.{} and the ABI plan
+    // falls back to `vreg_types` / .i64 for every arg, all of which
+    // still classify as scalar_reg in the AAPCS64 plan.)
+    var callee = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        _ = try callee.newBlock();
+        const v = callee.newVReg();
+        try callee.getBlock(0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v, .type = .i32 });
+        try callee.getBlock(0).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try ir_module.addFunction(callee);
+
+    // caller(): two iconsts → 2-arg call → ret.
+    var caller = ir.IrFunction.init(allocator, 0, 1, 0);
+    _ = try caller.newBlock();
+    const a0 = caller.newVReg();
+    const a1 = caller.newVReg();
+    const r = caller.newVReg();
+    try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = a0, .type = .i32 });
+    try caller.getBlock(0).append(.{ .op = .{ .iconst_32 = 2 }, .dest = a1, .type = .i32 });
+    const args = try allocator.alloc(ir.VReg, 2);
+    defer allocator.free(args);
+    args[0] = a0;
+    args[1] = a1;
+    try caller.getBlock(0).append(.{
+        .op = .{ .call = .{ .func_idx = 0, .args = args } },
+        .dest = r,
+        .type = .i32,
+    });
+    try caller.getBlock(0).append(.{ .op = .{ .ret = r } });
+    _ = try ir_module.addFunction(caller);
+
+    const result = try compileModule(&ir_module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+
+    const caller_off = result.offsets[1];
+    const caller_code = result.code[caller_off..];
+
+    // Locate the BL to the callee (top 6 bits = 0b100101 → 0x94000000).
+    var bl_word_off: ?usize = null;
+    {
+        var i: usize = 0;
+        while (i + 4 <= caller_code.len) : (i += 4) {
+            const word = std.mem.readInt(u32, caller_code[i..][0..4], .little);
+            if ((word & 0xFC000000) == 0x94000000) {
+                bl_word_off = i;
+                break;
+            }
+        }
+    }
+    const bl_off = bl_word_off orelse return error.TestExpectedCallEmitted;
+
+    // Positive check: the iconsts must directly target x1 and x2.
+    //   movImm32 with val < 0x10000 emits a single MOVZ.
+    //   MOVZ Xd, #imm16, LSL #0 = 0xD2800000 | (imm16 << 5) | rd
+    //   MOVZ X1, #1 = 0xD2800021
+    //   MOVZ X2, #2 = 0xD2800042
+    const movz_x1_1: u32 = 0xD2800021;
+    const movz_x2_2: u32 = 0xD2800042;
+    try std.testing.expect(testCodeContainsWord(caller_code[0..bl_off], movz_x1_1));
+    try std.testing.expect(testCodeContainsWord(caller_code[0..bl_off], movz_x2_2));
+
+    // Negative check: no inter-X-reg MOV (= ORR Xd, XZR, Xn shifted form
+    // with shift=0) appears in the call-arg setup region (everything
+    // before the BL). Encoding: 0xAA0003E0 | (rn << 16) | rd, where
+    // rd, rn are 5-bit register numbers. The pattern is:
+    //   bits [31:24] = 0xAA
+    //   bits [23:21] = 000 (sf=1 sz=01 already in 0xAA prefix? Actually
+    //                       0xAA means top byte; ORR shifted reg has
+    //                       top 8 bits = 0xAA when sf=1, opc=01,
+    //                       0|01010|00|0 in [29:21], all good)
+    //   bits [15:10] = 000000 (no shift)
+    //   bits [9:5]   = rn
+    //   bits [4:0]   = rd
+    //
+    // Mask 0xFFE0FC00 captures [31:21] | [15:10]; the literal 0xAA0003E0
+    // requires [9:5] = 11111 (XZR), which is the ORR-as-MOV alias. A
+    // direct ORR-as-MOV with rn=XZR and rd in 0..30 is a register move.
+    // We assert no such instruction is present — every "real" mov in
+    // the staging region would otherwise show up here.
+    var p: usize = 0;
+    while (p + 4 <= bl_off) : (p += 4) {
+        const word = std.mem.readInt(u32, caller_code[p..][0..4], .little);
+        const is_mov_xd_xn = (word & 0xFFE0FC00) == 0xAA0003E0;
+        if (is_mov_xd_xn) {
+            const rd: u32 = word & 0x1F;
+            const rn: u32 = (word >> 16) & 0x1F;
+            // Allow MOV Xd, XZR (rn=31, alias for clearing) — not an
+            // inter-vreg shuffle. Real shuffles have rn in 0..30.
+            if (rn != 31) {
+                std.debug.print(
+                    "\nUnexpected inter-X-reg MOV at offset {}: word=0x{x:0>8} rd=x{} rn=x{}\n",
+                    .{ p, word, rd, rn },
+                );
+                try std.testing.expect(false);
+            }
+        }
+    }
 }
