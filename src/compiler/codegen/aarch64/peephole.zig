@@ -8,7 +8,17 @@ const std = @import("std");
 
 pub const Options = struct {
     enabled: bool = true,
-    enable_mem_pair: bool = true,
+    /// Fuse adjacent `LDR (unsigned offset)` pairs into `LDP`. Architecturally
+    /// safe under the same-Rt and base-clobber guards in `tryFuseMemPair`.
+    enable_load_pair: bool = true,
+    /// Fuse adjacent `STR (unsigned offset)` pairs into `STP`. Off by default:
+    /// even though the encoding is architecturally valid (subject to the
+    /// universal Rt1 == Rt2 reject), Neoverse N3 takes a slow path on STP at
+    /// stack slots adjacent to v128 spill ranges, regressing the SIMD bench
+    /// `simd_i32x4_mem_sum8_4k_loop` by ~30 % (issue #380). Re-enable once a
+    /// more selective guard (frequency-aware emission, or stack-slot aware) is
+    /// in place.
+    enable_store_pair: bool = false,
     enable_mul_add: bool = true,
     enable_conditional_select: bool = true,
 };
@@ -74,8 +84,8 @@ pub fn optimizeWindow(prev2: ?u32, prev1: ?u32, new_word: u32, options: Options)
     if (!options.enabled) return .{ .append_word = new_word };
 
     if (prev1) |last| {
-        if (options.enable_mem_pair) {
-            if (tryFuseMemPair(last, new_word)) |fused| return .{ .replace_last = fused };
+        if (options.enable_load_pair or options.enable_store_pair) {
+            if (tryFuseMemPair(last, new_word, options)) |fused| return .{ .replace_last = fused };
         }
         if (options.enable_mul_add) {
             if (tryFuseMulAdd(last, new_word)) |fused| return .{ .replace_last = fused };
@@ -110,19 +120,36 @@ pub fn optimizeWords(insts: []const u32, allocator: std.mem.Allocator, options: 
     return out.toOwnedSlice(allocator);
 }
 
-fn tryFuseMemPair(a_word: u32, b_word: u32) ?u32 {
+fn tryFuseMemPair(a_word: u32, b_word: u32, options: Options) ?u32 {
     const a = decodeMemUnsigned(a_word) orelse return null;
     const b = decodeMemUnsigned(b_word) orelse return null;
     if (a.kind != b.kind or a.width != b.width or a.rn != b.rn) return null;
     if (@as(u32, a.offset) + 1 != b.offset) return null;
     if (a.offset > 63) return null;
 
+    switch (a.kind) {
+        .ldr => if (!options.enable_load_pair) return null,
+        .str => if (!options.enable_store_pair) return null,
+    }
+
+    // Per ARM ARM (LDP/STP, signed offset): Rt1 == Rt2 is CONSTRAINED
+    // UNPREDICTABLE for both loads (load result is UNKNOWN) and stores
+    // (the second slot becomes UNKNOWN). Real cores (e.g. Neoverse N3)
+    // take a very slow microarchitectural path on this encoding, so a
+    // pair like `STR X16,[fp,#24]; STR X16,[fp,#32]` must not fuse —
+    // and the original two-store sequence is itself faster than the
+    // unsafe fused STP would be. See issue #380.
+    if (a.rt == b.rt) return null;
+
     if (a.kind == .ldr) {
-        if (a.rt == a.rn or b.rt == a.rn or a.rt == b.rt) return null;
+        // First load writes Rn or its result feeds the second load's base:
+        // architecturally invalid as an LDP because the second access
+        // would observe an updated base.
+        if (a.rt == a.rn or b.rt == a.rn) return null;
     }
 
     const imm7: u32 = a.offset;
-    return switch (a.width) {
+    const result: u32 = switch (a.width) {
         .x64 => switch (a.kind) {
             .ldr => 0xA9400000 | (imm7 << 15) | (@as(u32, b.rt) << 10) | (@as(u32, a.rn) << 5) | a.rt,
             .str => 0xA9000000 | (imm7 << 15) | (@as(u32, b.rt) << 10) | (@as(u32, a.rn) << 5) | a.rt,
@@ -132,6 +159,7 @@ fn tryFuseMemPair(a_word: u32, b_word: u32) ?u32 {
             .str => 0x29000000 | (imm7 << 15) | (@as(u32, b.rt) << 10) | (@as(u32, a.rn) << 5) | a.rt,
         },
     };
+    return result;
 }
 
 fn tryFuseMulAdd(mul_word: u32, add_word: u32) ?u32 {
@@ -305,6 +333,12 @@ fn expectOptimized(input: []const u32, expected: []const u32) !void {
     try std.testing.expectEqualSlices(u32, expected, got);
 }
 
+fn expectOptimizedWith(input: []const u32, expected: []const u32, options: Options) !void {
+    const got = try optimizeWords(input, std.testing.allocator, options);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualSlices(u32, expected, got);
+}
+
 test "peephole: fuses adjacent 64-bit ldr into ldp" {
     const input = [_]u32{
         0xF9401020, // ldr x0, [x1, #16]
@@ -322,13 +356,58 @@ test "peephole: does not fuse load pair when first load rewrites base" {
     try expectOptimized(&input, &input);
 }
 
-test "peephole: fuses adjacent 64-bit str into stp" {
+test "peephole: does not fuse store pair into stp with Rt1 == Rt2 (#380)" {
+    // STR X16, [fp, #24]; STR X16, [fp, #32] — the regalloc emits this
+    // when re-spilling the same intra-procedure-call temp. STP Xt,Xt is
+    // CONSTRAINED UNPREDICTABLE per ARM ARM (the second slot becomes
+    // UNKNOWN); on Neoverse N3 it also tanks performance by ~40 % when
+    // hit on a hot path. The two original STRs are correct and faster.
+    // Opt in `enable_store_pair` so we exercise the same-Rt guard rather
+    // than the default store-pair gate added in #380.
+    const input = [_]u32{
+        0xF9000FB0, // str x16, [x29, #24]
+        0xF90013B0, // str x16, [x29, #32]
+    };
+    try expectOptimizedWith(&input, &input, .{ .enable_store_pair = true });
+}
+
+test "peephole: does not fuse load pair into ldp with Rt1 == Rt2" {
+    // The ARM-ARM same-rt rule applies symmetrically to LDP loads.
+    const input = [_]u32{
+        0xF9401020, // ldr x0, [x1, #16]
+        0xF9401420, // ldr x0, [x1, #24]
+    };
+    try expectOptimized(&input, &input);
+}
+
+test "peephole: does not fuse 32-bit store pair with Rt1 == Rt2" {
+    const input = [_]u32{
+        0xB9000FA0, // str w0, [x29, #12]
+        0xB90013A0, // str w0, [x29, #16]
+    };
+    try expectOptimizedWith(&input, &input, .{ .enable_store_pair = true });
+}
+
+test "peephole: does not fuse store pair by default (#380)" {
+    // STR/STP fusion is currently off by default because Neoverse N3 takes
+    // a slow microarchitectural path on STP at stack slots adjacent to v128
+    // spill ranges, regressing simd_i32x4_mem_sum8_4k_loop. The fusion is
+    // architecturally valid; just disabled until a more selective guard is
+    // in place. See issue #380.
+    const input = [_]u32{
+        0xF9001060, // str x0, [x3, #32]
+        0xF9001461, // str x1, [x3, #40]
+    };
+    try expectOptimized(&input, &input);
+}
+
+test "peephole: fuses adjacent 64-bit str into stp when enable_store_pair is set" {
     const input = [_]u32{
         0xF9001060, // str x0, [x3, #32]
         0xF9001461, // str x1, [x3, #40]
     };
     const expected = [_]u32{0xA9020460}; // stp x0, x1, [x3, #32]
-    try expectOptimized(&input, &expected);
+    try expectOptimizedWith(&input, &expected, .{ .enable_store_pair = true });
 }
 
 test "peephole: leaves non-adjacent memory offsets untouched" {
