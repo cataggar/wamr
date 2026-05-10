@@ -892,6 +892,24 @@ pub fn wasiFdSync(env_opaque: *anyopaque) types.HostFnError!void {
     env.pushI32(ctxFdSyncCore(ctx, fd, .full)) catch return error.StackOverflow;
 }
 
+/// `wasi_snapshot_preview1.fd_renumber` — atomically replace fd `to`
+/// with the resource at fd `from`, closing `to`'s prior host resource
+/// before the swap. `from`'s entry is removed without closing its host
+/// resource (ownership transfers to `to`).
+/// Signature: (from: i32, to: i32) -> i32
+pub fn wasiFdRenumber(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const to = env.popI32() catch return error.StackUnderflow;
+    const from = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdRenumberCore(ctx, from, to)) catch return error.StackOverflow;
+}
+
 /// `wasi_snapshot_preview1.fd_tell` — write the current file position to
 /// `offset_ptr`.
 /// Signature: (fd: i32, offset_ptr: i32) -> i32
@@ -2106,6 +2124,50 @@ fn ctxFdSyncCore(ctx: *wasi.WasiCtx, fd: i32, mode: SyncMode) i32 {
     return wasi_core.WASI_ESUCCESS;
 }
 
+/// `fd_renumber` core: atomically replace `to` with the resource at
+/// `from`, closing `to`'s prior host resource. Both fds must be open;
+/// `to` keeps its numeric value but inherits all of `from`'s state
+/// (kind, host_fd, host_dir, pos, fdflags, rights). `from` is removed
+/// from the table without closing its host resource since ownership
+/// transfers to `to`. wasmtime semantics: `from == to` on an open fd
+/// is a no-op success.
+fn ctxFdRenumberCore(ctx: *wasi.WasiCtx, from: i32, to: i32) i32 {
+    if (from < 0 or to < 0) return wasi_core.WASI_EBADF;
+    const u_from: u32 = @intCast(from);
+    const u_to: u32 = @intCast(to);
+
+    if (u_from == u_to) {
+        if (ctx.fd_table.get(u_from) == null) return wasi_core.WASI_EBADF;
+        return wasi_core.WASI_ESUCCESS;
+    }
+
+    const from_entry = ctx.fd_table.get(u_from) orelse return wasi_core.WASI_EBADF;
+    const to_entry = ctx.fd_table.get(u_to) orelse return wasi_core.WASI_EBADF;
+
+    switch (from_entry.kind) {
+        .stdin, .stdout, .stderr => return wasi_core.WASI_EBADF,
+        else => {},
+    }
+    switch (to_entry.kind) {
+        .stdin, .stdout, .stderr => return wasi_core.WASI_EBADF,
+        else => {},
+    }
+
+    if (to_entry.host_fd) |host_fd| {
+        const f = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
+        f.close(ctx.io);
+    }
+    if (to_entry.host_dir) |dir| {
+        var d = dir;
+        d.close(ctx.io);
+    }
+
+    ctx.fd_table.insert(u_to, from_entry) catch return wasi_core.WASI_EINVAL;
+    ctx.fd_table.remove(u_from);
+
+    return wasi_core.WASI_ESUCCESS;
+}
+
 fn ctxFdTellCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, offset_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
@@ -2192,6 +2254,7 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "fd_readdir", &wasiFdReaddir },
         .{ "fd_seek", &wasiFdSeek },
         .{ "fd_close", &wasiFdClose },
+        .{ "fd_renumber", &wasiFdRenumber },
         .{ "fd_fdstat_get", &wasiFdFdstatGet },
         .{ "fd_fdstat_set_flags", &wasiFdFdstatSetFlags },
         .{ "fd_fdstat_set_rights", &wasiFdFdstatSetRights },
@@ -2348,21 +2411,21 @@ test "resolveWasiFunction: unknown returns null" {
     try std.testing.expect(result == null);
 }
 
-test "resolveWasiFunction: all 38 functions resolve" {
+test "resolveWasiFunction: all 39 functions resolve" {
     const names = [_][]const u8{
         "proc_exit",          "thread-spawn",         "fd_write",
         "fd_read",            "fd_pread",             "fd_pwrite",
         "fd_readdir",         "fd_seek",              "fd_close",
-        "fd_fdstat_get",      "fd_fdstat_set_flags",  "fd_fdstat_set_rights",
-        "fd_filestat_get",    "fd_filestat_set_size", "fd_filestat_set_times",
-        "fd_advise",          "fd_allocate",          "fd_datasync",
-        "fd_sync",            "fd_tell",              "fd_prestat_get",
-        "fd_prestat_dir_name", "clock_time_get",      "environ_sizes_get",
-        "environ_get",        "args_sizes_get",       "args_get",
-        "random_get",         "path_open",            "path_filestat_get",
-        "path_filestat_set_times", "path_create_directory", "path_remove_directory",
-        "path_unlink_file",   "path_link",            "path_rename",
-        "path_symlink",       "path_readlink",
+        "fd_renumber",        "fd_fdstat_get",        "fd_fdstat_set_flags",
+        "fd_fdstat_set_rights", "fd_filestat_get",    "fd_filestat_set_size",
+        "fd_filestat_set_times", "fd_advise",         "fd_allocate",
+        "fd_datasync",        "fd_sync",              "fd_tell",
+        "fd_prestat_get",     "fd_prestat_dir_name",  "clock_time_get",
+        "environ_sizes_get",  "environ_get",          "args_sizes_get",
+        "args_get",           "random_get",           "path_open",
+        "path_filestat_get",  "path_filestat_set_times", "path_create_directory",
+        "path_remove_directory", "path_unlink_file",  "path_link",
+        "path_rename",        "path_symlink",         "path_readlink",
     };
     for (names) |name| {
         const result = resolveWasiFunction(name);
@@ -3610,4 +3673,204 @@ test "ctxPathOpenCore: doRead/doWrite are gated by rights_base" {
     const n = try doRead(ctx, &entry_ro, &buf);
     try std.testing.expectEqual(@as(usize, 5), n);
     try std.testing.expectError(error.BadFd, doWrite(ctx, &entry_ro, "x"));
+}
+
+// ── fd_renumber tests (issue #420 phase 6) ──────────────────────────────
+
+test "ctxFdRenumberCore: bad fds" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, -1, 4));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, -1));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, -1, -1));
+
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file });
+    defer ctx.fd_table.remove(4);
+
+    // from missing.
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 99, 4));
+    // to missing.
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 99));
+}
+
+test "ctxFdRenumberCore: stdio in either slot returns BADF" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file });
+    defer ctx.fd_table.remove(4);
+
+    // from is stdio.
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 0, 4));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 1, 4));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 2, 4));
+
+    // to is stdio.
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 1));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 2));
+}
+
+test "ctxFdRenumberCore: from == to is no-op success when open" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file, .pos = 7 });
+    defer ctx.fd_table.remove(4);
+
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 4, 4));
+    const after = ctx.fd_table.get(4).?;
+    try std.testing.expectEqual(wasi.FdEntry.FdKind.regular_file, after.kind);
+    try std.testing.expectEqual(@as(u64, 7), after.pos);
+}
+
+test "ctxFdRenumberCore: from == to BADF when fd is not open" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 99, 99));
+}
+
+test "ctxFdRenumberCore: regular_file over regular_file closes destination host_fd" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f_from = try tmp.dir.createFile(testing_io, "from.bin", .{ .read = true });
+    const f_to = try tmp.dir.createFile(testing_io, "to.bin", .{ .read = true });
+    const from_handle = f_from.handle;
+    const to_handle = f_to.handle;
+    try std.testing.expect(from_handle != to_handle);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    try ctx.fd_table.insert(10, .{ .kind = .regular_file, .host_fd = from_handle });
+    try ctx.fd_table.insert(11, .{ .kind = .regular_file, .host_fd = to_handle });
+
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 10, 11));
+
+    // `from` slot is gone.
+    try std.testing.expect(ctx.fd_table.get(10) == null);
+    // `to` slot now references `from`'s old host_fd. ctx.deinit will close
+    // `from_handle` (now at slot 11) — `to_handle` was closed by renumber.
+    try std.testing.expectEqual(@as(?std.posix.fd_t, from_handle), ctx.fd_table.get(11).?.host_fd);
+    // The original `to` host_fd has been closed: any operation should fail.
+    const rc = std.os.linux.fcntl(to_handle, std.os.linux.F.GETFD, 0);
+    try std.testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(rc));
+}
+
+test "ctxFdRenumberCore: directory over directory closes destination host_dir" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp_from = std.testing.tmpDir(.{});
+    defer tmp_from.cleanup();
+    var tmp_to = std.testing.tmpDir(.{});
+    defer tmp_to.cleanup();
+
+    // Dup the TmpDir handles so that ownership transferred into ctx is
+    // independent of TmpDir.cleanup() — otherwise std.Io.Threaded panics
+    // on the second `close` of the same fd.
+    const from_rc = std.os.linux.dup(tmp_from.dir.handle);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(from_rc));
+    const from_handle: std.posix.fd_t = @intCast(from_rc);
+    const to_rc = std.os.linux.dup(tmp_to.dir.handle);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(to_rc));
+    const to_handle: std.posix.fd_t = @intCast(to_rc);
+    try std.testing.expect(from_handle != to_handle);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    try ctx.fd_table.insert(20, .{ .kind = .directory, .host_dir = .{ .handle = from_handle } });
+    try ctx.fd_table.insert(21, .{ .kind = .directory, .host_dir = .{ .handle = to_handle } });
+
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 20, 21));
+
+    try std.testing.expect(ctx.fd_table.get(20) == null);
+    const after = ctx.fd_table.get(21).?;
+    try std.testing.expectEqual(wasi.FdEntry.FdKind.directory, after.kind);
+    try std.testing.expectEqual(@as(?std.posix.fd_t, from_handle), if (after.host_dir) |d| d.handle else null);
+
+    // The original `to_handle` was closed by renumber; verify with fcntl.
+    const fc = std.os.linux.fcntl(to_handle, std.os.linux.F.GETFD, 0);
+    try std.testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(fc));
+    // ctx.deinit closes `from_handle` via the entry now at slot 21.
+}
+
+test "ctxFdRenumberCore: fdflags and rights transfer from `from` to `to`" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    try ctx.fd_table.insert(30, .{
+        .kind = .regular_file,
+        .fdflags = wasi.FDFLAGS_APPEND,
+        .rights_base = wasi.RIGHTS_FD_READ,
+        .rights_inheriting = wasi.RIGHTS_FD_WRITE,
+        .pos = 42,
+    });
+    try ctx.fd_table.insert(31, .{
+        .kind = .regular_file,
+        .fdflags = 0,
+        .rights_base = 0xFFFF_FFFF_FFFF_FFFF,
+        .rights_inheriting = 0xFFFF_FFFF_FFFF_FFFF,
+        .pos = 0,
+    });
+
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 30, 31));
+    defer ctx.fd_table.remove(31);
+
+    try std.testing.expect(ctx.fd_table.get(30) == null);
+    const after = ctx.fd_table.get(31).?;
+    try std.testing.expectEqual(wasi.FdEntry.FdKind.regular_file, after.kind);
+    try std.testing.expectEqual(wasi.FDFLAGS_APPEND, after.fdflags);
+    try std.testing.expectEqual(wasi.RIGHTS_FD_READ, after.rights_base);
+    try std.testing.expectEqual(wasi.RIGHTS_FD_WRITE, after.rights_inheriting);
+    try std.testing.expectEqual(@as(u64, 42), after.pos);
+}
+
+test "ctxFdRenumberCore: overwriting a preopen leaves preopens list intact" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp_pre = std.testing.tmpDir(.{});
+    defer tmp_pre.cleanup();
+    var tmp_new = std.testing.tmpDir(.{});
+    defer tmp_new.cleanup();
+
+    // Dup the TmpDir handles so ownership transferred into ctx is
+    // independent of TmpDir.cleanup().
+    const pre_rc = std.os.linux.dup(tmp_pre.dir.handle);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(pre_rc));
+    const pre_handle: std.posix.fd_t = @intCast(pre_rc);
+    const new_rc = std.os.linux.dup(tmp_new.dir.handle);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(new_rc));
+    const new_handle: std.posix.fd_t = @intCast(new_rc);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const pre_fd = try ctx.addPreopen("/pre", .{ .handle = pre_handle });
+    const new_fd = ctx.fd_table.allocateFd();
+    try ctx.fd_table.insert(new_fd, .{ .kind = .directory, .host_dir = .{ .handle = new_handle } });
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxFdRenumberCore(ctx, @intCast(new_fd), @intCast(pre_fd)),
+    );
+
+    // `new_fd` is gone, `pre_fd` references the new dir handle.
+    try std.testing.expect(ctx.fd_table.get(new_fd) == null);
+    const after = ctx.fd_table.get(pre_fd).?;
+    try std.testing.expectEqual(@as(?std.posix.fd_t, new_handle), if (after.host_dir) |d| d.handle else null);
+
+    // The original preopen handle was closed by renumber; verify with fcntl.
+    const fc = std.os.linux.fcntl(pre_handle, std.os.linux.F.GETFD, 0);
+    try std.testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(fc));
+
+    // The preopens list is unchanged: still maps `pre_fd` → "/pre".
+    try std.testing.expectEqual(@as(usize, 1), ctx.preopens.items.len);
+    try std.testing.expectEqual(pre_fd, ctx.preopens.items[0].fd);
+    try std.testing.expectEqualSlices(u8, "/pre", ctx.preopens.items[0].path);
+    // ctx.deinit closes `new_handle` via the entry now at slot pre_fd.
 }
