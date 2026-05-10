@@ -58,9 +58,14 @@ on:
       - .github/workflows/coldstart-aarch64.yml
 
 concurrency:
-  # Serialize on the self-hosted runner: parallel cold-start invocations
-  # would contend on cores and skew measurements near 1 ms.
-  group: coldstart-aarch64
+  # Per-ref so successive pushes to the *same* PR cancel earlier runs,
+  # but unrelated PRs queue at the self-hosted runner instead of
+  # silently cancelling each other (a global group key here would make
+  # every new PR discard the previous PR's still-queued run, surfacing
+  # as a `cancelled` ✗ check). The single-slot self-hosted aarch64
+  # runner already serialises cross-PR runs, avoiding the core
+  # contention the author originally guarded against.
+  group: coldstart-aarch64-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:

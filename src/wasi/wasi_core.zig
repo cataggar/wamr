@@ -5,7 +5,9 @@
 //! AOT/JIT paths that provide memory directly.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("../platform/platform.zig");
+const wasi = @import("wasi.zig");
 
 // ── WASI errno constants ──────────────────────────────────────────────
 
@@ -18,6 +20,8 @@ pub const WASI_ENOSYS: i32 = 52;
 
 pub const WASI_CLOCK_REALTIME: i32 = 0;
 pub const WASI_CLOCK_MONOTONIC: i32 = 1;
+pub const WASI_CLOCK_PROCESS_CPUTIME: i32 = 2;
+pub const WASI_CLOCK_THREAD_CPUTIME: i32 = 3;
 
 // ── Memory helpers ────────────────────────────────────────────────────
 
@@ -169,6 +173,76 @@ pub fn argsGetCore() i32 {
 /// the intent.  The caller is responsible for triggering the trap.
 pub fn procExitCore() void {}
 
+/// Core logic for `sched_yield`.  Best-effort cross-platform yield via
+/// `std.Thread.yield` (sched_yield on POSIX, SwitchToThread on Windows).
+/// Errors are non-fatal: WASI's spec doesn't promise actual rescheduling,
+/// so we always report success.
+pub fn schedYieldCore() i32 {
+    std.Thread.yield() catch {};
+    return WASI_ESUCCESS;
+}
+
+/// Core logic for `proc_raise`.  Validates the WASI signal number,
+/// translates it to the host POSIX number via `wasi.wasiSignalToPosix`,
+/// and raises the signal against the current process.
+///
+/// Under `zig test` we short-circuit before the actual `raise` so the
+/// test runner can validate the validation + mapping paths without being
+/// killed by SIGTERM / SIGABRT / etc.
+///
+/// Returns:
+///   - `WASI_EINVAL` for `Signal.none` (`0`) or values outside `0..30`.
+///   - `WASI_ENOSYS` on platforms without a usable host signal API.
+///   - `WASI_ESUCCESS` if the signal was successfully delivered.
+pub fn procRaiseCore(sig: i32) i32 {
+    if (sig < 0 or sig > 30) return WASI_EINVAL;
+    const posix_sig = wasi.wasiSignalToPosix(@intCast(sig)) orelse return WASI_EINVAL;
+
+    if (builtin.is_test) return WASI_ESUCCESS;
+
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        const sig_enum: linux.SIG = @enumFromInt(@as(u32, posix_sig));
+        const rc = linux.kill(linux.getpid(), sig_enum);
+        return switch (linux.errno(rc)) {
+            .SUCCESS => WASI_ESUCCESS,
+            .INVAL => WASI_EINVAL,
+            else => WASI_EINVAL,
+        };
+    }
+
+    return WASI_ENOSYS;
+}
+
+/// Core logic for `clock_res_get`.  Writes the host-reported resolution
+/// (in nanoseconds) of the given WASI clock to `resolution_ptr`. Accepts
+/// all four WASI clock IDs (realtime, monotonic, process_cputime,
+/// thread_cputime) because Linux's `clock_getres` exposes a resolution
+/// for each.
+pub fn clockResGetCore(mem: []u8, clock_id: i32, resolution_ptr: u32) i32 {
+    if (clock_id < 0 or clock_id > WASI_CLOCK_THREAD_CPUTIME) return WASI_EINVAL;
+    if (resolution_ptr + 8 > mem.len) return WASI_EINVAL;
+
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var ts: linux.timespec = undefined;
+        const id: linux.clockid_t = @enumFromInt(@as(u32, @intCast(clock_id)));
+        const rc = linux.clock_getres(id, &ts);
+        if (linux.errno(rc) != .SUCCESS) return WASI_EINVAL;
+        const ns: u64 =
+            @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
+            @as(u64, @intCast(ts.nsec));
+        if (!memWriteU64(mem, resolution_ptr, ns)) return WASI_EINVAL;
+        return WASI_ESUCCESS;
+    }
+
+    // Non-Linux fallback: report 1µs as a conservative resolution. wasi-libc
+    // doesn't currently link this on non-Linux hosts, so this only matters
+    // for direct embedders.
+    if (!memWriteU64(mem, resolution_ptr, std.time.ns_per_us)) return WASI_EINVAL;
+    return WASI_ESUCCESS;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 test "memReadU32: reads little-endian value" {
@@ -317,4 +391,58 @@ test "argsSizesGetCore: writes zeroes" {
 
 test "argsGetCore: returns ESUCCESS" {
     try std.testing.expectEqual(WASI_ESUCCESS, argsGetCore());
+}
+
+test "schedYieldCore: returns ESUCCESS" {
+    try std.testing.expectEqual(WASI_ESUCCESS, schedYieldCore());
+}
+
+test "procRaiseCore: out-of-range signal returns EINVAL" {
+    try std.testing.expectEqual(WASI_EINVAL, procRaiseCore(-1));
+    try std.testing.expectEqual(WASI_EINVAL, procRaiseCore(31));
+    try std.testing.expectEqual(WASI_EINVAL, procRaiseCore(255));
+}
+
+test "procRaiseCore: Signal.none returns EINVAL" {
+    // WASI 0 = `none`; not a deliverable signal.
+    try std.testing.expectEqual(WASI_EINVAL, procRaiseCore(0));
+}
+
+test "procRaiseCore: every in-range WASI signal maps under is_test" {
+    // The `builtin.is_test` short-circuit prevents an actual `raise`,
+    // so this validates that the WASI→POSIX mapping table covers the
+    // full witx `signal` range 1..30 without killing the test runner.
+    var sig: i32 = 1;
+    while (sig <= 30) : (sig += 1) {
+        try std.testing.expectEqual(WASI_ESUCCESS, procRaiseCore(sig));
+    }
+}
+
+test "clockResGetCore: invalid clock_id returns EINVAL" {
+    var mem = [_]u8{0} ** 16;
+    try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, -1, 0));
+    try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, 4, 0));
+    try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, 99, 0));
+}
+
+test "clockResGetCore: out-of-bounds resolution_ptr returns EINVAL" {
+    var mem = [_]u8{0} ** 8;
+    // resolution_ptr = 4 would write past the end (needs 8 bytes).
+    try std.testing.expectEqual(WASI_EINVAL, clockResGetCore(&mem, WASI_CLOCK_MONOTONIC, 4));
+}
+
+test "clockResGetCore: monotonic success writes non-zero resolution" {
+    var mem = [_]u8{0xFF} ** 16;
+    const result = clockResGetCore(&mem, WASI_CLOCK_MONOTONIC, 0);
+    try std.testing.expectEqual(WASI_ESUCCESS, result);
+    const ns = std.mem.readInt(u64, mem[0..8], .little);
+    try std.testing.expect(ns > 0);
+}
+
+test "clockResGetCore: realtime success writes non-zero resolution" {
+    var mem = [_]u8{0xFF} ** 16;
+    const result = clockResGetCore(&mem, WASI_CLOCK_REALTIME, 0);
+    try std.testing.expectEqual(WASI_ESUCCESS, result);
+    const ns = std.mem.readInt(u64, mem[0..8], .little);
+    try std.testing.expect(ns > 0);
 }

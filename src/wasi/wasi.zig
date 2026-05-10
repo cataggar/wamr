@@ -100,6 +100,66 @@ pub const ClockId = enum(u32) {
     thread_cputime_id = 3,
 };
 
+// ── WASI Signal numbers ─────────────────────────────────────────────────
+
+/// WASI preview1 `signal` witx enum. The numeric ABI is *not* identical
+/// to POSIX `SIG*` on Linux: WASI compresses the range and shifts the
+/// values from `chld` onward to keep the enum dense. Translation to the
+/// host POSIX number lives in `wasiSignalToPosix` below.
+pub const Signal = enum(u8) {
+    none = 0,
+    hup = 1,
+    int = 2,
+    quit = 3,
+    ill = 4,
+    trap = 5,
+    abrt = 6,
+    bus = 7,
+    fpe = 8,
+    kill = 9,
+    usr1 = 10,
+    segv = 11,
+    usr2 = 12,
+    pipe = 13,
+    alrm = 14,
+    term = 15,
+    chld = 16,
+    cont = 17,
+    stop = 18,
+    tstp = 19,
+    ttin = 20,
+    ttou = 21,
+    urg = 22,
+    xcpu = 23,
+    xfsz = 24,
+    vtalrm = 25,
+    prof = 26,
+    winch = 27,
+    poll = 28,
+    pwr = 29,
+    sys = 30,
+};
+
+/// Translate a WASI signal value to the host POSIX `SIG*` integer.
+/// Returns null for `Signal.none` (`0`) and for values outside the witx
+/// `signal` enum (≥ 31). The mapping is identity for 1..15 (HUP..TERM)
+/// then shifts forward by one on Linux from CHLD onward.
+pub fn wasiSignalToPosix(sig: u8) ?u8 {
+    return switch (sig) {
+        // 0 = `none`: not deliverable.
+        0 => null,
+        // 1..15 — HUP..TERM — match POSIX numbering exactly.
+        1...15 => sig,
+        // 16..30 — shift by one to match Linux `SIG*` numbering.
+        // 16 CHLD→17, 17 CONT→18, 18 STOP→19, 19 TSTP→20, 20 TTIN→21,
+        // 21 TTOU→22, 22 URG→23, 23 XCPU→24, 24 XFSZ→25, 25 VTALRM→26,
+        // 26 PROF→27, 27 WINCH→28, 28 POLL→29 (SIGIO), 29 PWR→30,
+        // 30 SYS→31.
+        16...30 => sig + 1,
+        else => null,
+    };
+}
+
 // ── WASI Whence values ──────────────────────────────────────────────────
 
 pub const Whence = enum(u8) {
@@ -866,6 +926,37 @@ test "Errno values match WASI spec" {
     try std.testing.expectEqual(@as(u16, 52), @intFromEnum(Errno.nosys));
     try std.testing.expectEqual(@as(u16, 63), @intFromEnum(Errno.perm));
     try std.testing.expectEqual(@as(u16, 76), @intFromEnum(Errno.notcapable));
+}
+
+test "Signal values match WASI witx" {
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Signal.none));
+    try std.testing.expectEqual(@as(u8, 6), @intFromEnum(Signal.abrt));
+    try std.testing.expectEqual(@as(u8, 9), @intFromEnum(Signal.kill));
+    try std.testing.expectEqual(@as(u8, 15), @intFromEnum(Signal.term));
+    try std.testing.expectEqual(@as(u8, 16), @intFromEnum(Signal.chld));
+    try std.testing.expectEqual(@as(u8, 27), @intFromEnum(Signal.winch));
+    try std.testing.expectEqual(@as(u8, 30), @intFromEnum(Signal.sys));
+}
+
+test "wasiSignalToPosix: known signals map to POSIX numbering" {
+    // 1..15 identity (HUP..TERM).
+    try std.testing.expectEqual(@as(?u8, 1), wasiSignalToPosix(1));
+    try std.testing.expectEqual(@as(?u8, 6), wasiSignalToPosix(6));
+    try std.testing.expectEqual(@as(?u8, 9), wasiSignalToPosix(9));
+    try std.testing.expectEqual(@as(?u8, 15), wasiSignalToPosix(15));
+    // 16..30 shifted by one to match Linux POSIX numbering.
+    try std.testing.expectEqual(@as(?u8, 17), wasiSignalToPosix(16)); // CHLD
+    try std.testing.expectEqual(@as(?u8, 18), wasiSignalToPosix(17)); // CONT
+    try std.testing.expectEqual(@as(?u8, 19), wasiSignalToPosix(18)); // STOP
+    try std.testing.expectEqual(@as(?u8, 28), wasiSignalToPosix(27)); // WINCH
+    try std.testing.expectEqual(@as(?u8, 31), wasiSignalToPosix(30)); // SYS
+}
+
+test "wasiSignalToPosix: none and out-of-range return null" {
+    try std.testing.expectEqual(@as(?u8, null), wasiSignalToPosix(0));
+    try std.testing.expectEqual(@as(?u8, null), wasiSignalToPosix(31));
+    try std.testing.expectEqual(@as(?u8, null), wasiSignalToPosix(100));
+    try std.testing.expectEqual(@as(?u8, null), wasiSignalToPosix(255));
 }
 
 test "IoVec slice" {
