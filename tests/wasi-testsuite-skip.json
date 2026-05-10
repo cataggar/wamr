@@ -1,19 +1,9 @@
 {
     "WASI C tests [wasm32-wasip1]": {
-        "pwrite-with-append": "fd_pwrite/path_open OFLAGS_CREAT|TRUNC|APPEND landed in #420 phases 2+5; test asserts seek tracking under O_APPEND mirrors kernel offset, which our doWrite doesn't track yet (#420 phase 5 follow-up: APPEND-mode lseek SEEK_CUR after write)",
         "sock_shutdown-invalid_fd": "sock_shutdown not implemented (#420 phase 8)",
         "sock_shutdown-not_sock": "sock_shutdown not implemented (#420 phase 8)"
     },
     "WASI Rust tests [wasm32-wasip1]": {
-        "dir_fd_op_failures": "path_create_directory/path_unlink_file landed in #420 phase 3; test also needs fd_seek directory errno fix (phase 1 follow-up)",
-        "directory_seek": "fd_readdir/path_create_directory landed in #420 phases 2-3; test also needs fd_seek directory errno fix (phase 1 follow-up)",
-        "fd_fdstat_set_rights": "fd_fdstat_set_rights landed in #420 phase 1 but per-call rights enforcement not yet implemented",
-        "interesting_paths": "path_open landed in #420 phase 5 with absolute-path rejection; test also needs path_open to reject paths whose normalized form escapes the preopen sandbox via '..' (phase 5 follow-up)",
-        "path_open_preopen": "path_open landed in #420 phase 5; test asserts that opening a preopen dir with OFLAGS_DIRECTORY + RIGHTS_FD_WRITE returns ISDIR — which requires preopen FdEntry rights to omit FD_WRITE/FD_READ (currently default all-ones). Tracked as phase 5 follow-up: tighten preopen rights mask",
-        "poll_oneoff_stdio": "poll_oneoff not implemented (#420 phase 7)",
-        "stdio": "fd_fdstat_get rights for stdio not yet matching wasi-libc expectations (#420 phase 1 follow-up)",
-        "symlink_create": "path_symlink landed in #420 phase 4; test also needs path_symlink to reject absolute target paths (phase 4 follow-up)",
-        "truncation_rights": "path_unlink_file/path_create_directory/path_remove_directory landed in #420 phase 3; test also needs fd_fdstat_set_rights per-call enforcement (phase 1 follow-up)"
+        "poll_oneoff_stdio": "poll_oneoff not implemented (#420 phase 7)"
     }
 }
-

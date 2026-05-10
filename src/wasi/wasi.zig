@@ -143,6 +143,78 @@ pub const RIGHTS_FD_FDSTAT_SET_FLAGS: u64 = 0x0000_0000_0000_0008;
 pub const RIGHTS_FD_SYNC: u64 = 0x0000_0000_0000_0010;
 pub const RIGHTS_FD_TELL: u64 = 0x0000_0000_0000_0020;
 pub const RIGHTS_FD_WRITE: u64 = 0x0000_0000_0000_0040;
+pub const RIGHTS_FD_ADVISE: u64 = 0x0000_0000_0000_0080;
+pub const RIGHTS_FD_ALLOCATE: u64 = 0x0000_0000_0000_0100;
+pub const RIGHTS_PATH_CREATE_DIRECTORY: u64 = 0x0000_0000_0000_0200;
+pub const RIGHTS_PATH_CREATE_FILE: u64 = 0x0000_0000_0000_0400;
+pub const RIGHTS_PATH_LINK_SOURCE: u64 = 0x0000_0000_0000_0800;
+pub const RIGHTS_PATH_LINK_TARGET: u64 = 0x0000_0000_0000_1000;
+pub const RIGHTS_PATH_OPEN: u64 = 0x0000_0000_0000_2000;
+pub const RIGHTS_FD_READDIR: u64 = 0x0000_0000_0000_4000;
+pub const RIGHTS_PATH_READLINK: u64 = 0x0000_0000_0000_8000;
+pub const RIGHTS_PATH_RENAME_SOURCE: u64 = 0x0000_0000_0001_0000;
+pub const RIGHTS_PATH_RENAME_TARGET: u64 = 0x0000_0000_0002_0000;
+pub const RIGHTS_PATH_FILESTAT_GET: u64 = 0x0000_0000_0004_0000;
+pub const RIGHTS_PATH_FILESTAT_SET_SIZE: u64 = 0x0000_0000_0008_0000;
+pub const RIGHTS_PATH_FILESTAT_SET_TIMES: u64 = 0x0000_0000_0010_0000;
+pub const RIGHTS_FD_FILESTAT_GET: u64 = 0x0000_0000_0020_0000;
+pub const RIGHTS_FD_FILESTAT_SET_SIZE: u64 = 0x0000_0000_0040_0000;
+pub const RIGHTS_FD_FILESTAT_SET_TIMES: u64 = 0x0000_0000_0080_0000;
+pub const RIGHTS_PATH_SYMLINK: u64 = 0x0000_0000_0100_0000;
+pub const RIGHTS_PATH_REMOVE_DIRECTORY: u64 = 0x0000_0000_0200_0000;
+pub const RIGHTS_PATH_UNLINK_FILE: u64 = 0x0000_0000_0400_0000;
+pub const RIGHTS_POLL_FD_READWRITE: u64 = 0x0000_0000_0800_0000;
+pub const RIGHTS_SOCK_SHUTDOWN: u64 = 0x0000_0000_1000_0000;
+pub const RIGHTS_SOCK_ACCEPT: u64 = 0x0000_0000_2000_0000;
+
+/// Rights that apply to a directory file descriptor. wasi-libc and
+/// wasmtime mask `path_open` results that yield a directory against
+/// this set so e.g. `FD_READ`/`FD_WRITE`/`FD_SEEK` never appear on a
+/// dir's `fs_rights_base`.
+pub const DIRECTORY_BASE_RIGHTS: u64 =
+    RIGHTS_FD_FDSTAT_SET_FLAGS |
+    RIGHTS_FD_SYNC |
+    RIGHTS_PATH_CREATE_DIRECTORY |
+    RIGHTS_PATH_CREATE_FILE |
+    RIGHTS_PATH_LINK_SOURCE |
+    RIGHTS_PATH_LINK_TARGET |
+    RIGHTS_PATH_OPEN |
+    RIGHTS_FD_READDIR |
+    RIGHTS_PATH_READLINK |
+    RIGHTS_PATH_RENAME_SOURCE |
+    RIGHTS_PATH_RENAME_TARGET |
+    RIGHTS_PATH_FILESTAT_GET |
+    RIGHTS_PATH_FILESTAT_SET_SIZE |
+    RIGHTS_PATH_FILESTAT_SET_TIMES |
+    RIGHTS_FD_FILESTAT_GET |
+    RIGHTS_FD_FILESTAT_SET_TIMES |
+    RIGHTS_PATH_SYMLINK |
+    RIGHTS_PATH_REMOVE_DIRECTORY |
+    RIGHTS_PATH_UNLINK_FILE |
+    RIGHTS_POLL_FD_READWRITE;
+
+/// Rights that apply to a regular file descriptor (everything that's
+/// not directory-only). Used as the inheriting-rights mask for files
+/// opened beneath a directory.
+pub const FILE_BASE_RIGHTS: u64 =
+    RIGHTS_FD_DATASYNC |
+    RIGHTS_FD_READ |
+    RIGHTS_FD_SEEK |
+    RIGHTS_FD_FDSTAT_SET_FLAGS |
+    RIGHTS_FD_SYNC |
+    RIGHTS_FD_TELL |
+    RIGHTS_FD_WRITE |
+    RIGHTS_FD_ADVISE |
+    RIGHTS_FD_ALLOCATE |
+    RIGHTS_FD_FILESTAT_GET |
+    RIGHTS_FD_FILESTAT_SET_SIZE |
+    RIGHTS_FD_FILESTAT_SET_TIMES |
+    RIGHTS_POLL_FD_READWRITE;
+
+/// Rights a directory passes through to children opened beneath it via
+/// `path_open`. Same as base + the file rights so opening a regular
+/// file inside still gets read/write/seek capabilities.
+pub const DIRECTORY_INHERITING_RIGHTS: u64 = DIRECTORY_BASE_RIGHTS | FILE_BASE_RIGHTS;
 
 // ── WASI fstflags (bitset, u16) for `*_filestat_set_times` ──────────────
 
@@ -312,9 +384,16 @@ pub const WasiCtx = struct {
         const fd = self.fd_table.allocateFd();
         const owned_name = try self.allocator.dupe(u8, guest_name);
         errdefer self.allocator.free(owned_name);
+        // Preopens are directories: mask the default all-ones rights down
+        // to the directory rights set so wasi-libc / wasi-tests inheritance
+        // stays consistent (e.g. `path_open(preopen, OFLAGS_DIRECTORY,
+        // base, ...)` doesn't carry FD_WRITE/FD_SEEK that would conflict
+        // with the new fd's directory-only nature).
         try self.fd_table.insert(fd, .{
             .kind = .directory,
             .host_dir = dir,
+            .rights_base = DIRECTORY_BASE_RIGHTS,
+            .rights_inheriting = DIRECTORY_INHERITING_RIGHTS,
         });
         try self.preopens.append(self.allocator, .{ .fd = fd, .path = owned_name });
         return fd;
