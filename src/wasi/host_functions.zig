@@ -2495,7 +2495,7 @@ test "ctxPathFilestatGetCore: bad fd / not-a-directory dirfd / noent" {
     );
 
     // Register a regular_file fd at 4 → notdir.
-    try ctx.fd_table.insert(4, .{ .kind = .regular_file, .host_fd = 0 });
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file });
     defer ctx.fd_table.remove(4);
     const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
     try std.testing.expectEqual(
@@ -2634,7 +2634,7 @@ test "ctxPathCreateDirectoryCore: happy + exist + bad fd + notdir" {
     );
 
     // Not a directory.
-    try ctx.fd_table.insert(99, .{ .kind = .regular_file, .host_fd = 0 });
+    try ctx.fd_table.insert(99, .{ .kind = .regular_file });
     defer ctx.fd_table.remove(99);
     const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
     try std.testing.expectEqual(
