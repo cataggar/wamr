@@ -459,6 +459,32 @@ pub fn build(b: *std.Build) void {
     coremark_step.dependOn(&run_coremark_nofp.step);
     coremark_step.dependOn(&run_coremark_fp.step);
 
+    // ── CoreMark profile runner ────────────────────────────────────────
+    // SIGPROF-based sampling profiler for the CoreMark AOT, plus
+    // disassembly of the top-3 hot functions. Linux + aarch64/x86_64
+    // only — see src/tests/profile/sigprof.zig. See
+    // tests/benchmarks/coremark/README.md "Profiling" section.
+    const coremark_profile_module = b.createModule(.{
+        .root_source_file = b.path("src/tests/coremark_profile_runner.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    coremark_profile_module.addImport("wamr", lib_module);
+
+    const coremark_profile_exe = b.addExecutable(.{
+        .name = "coremark-profile-runner",
+        .root_module = coremark_profile_module,
+    });
+    if (aot_executable_target) b.installArtifact(coremark_profile_exe);
+
+    const run_coremark_profile = b.addRunArtifact(coremark_profile_exe);
+    run_coremark_profile.addArg("tests/benchmarks/coremark/coremark_wasi_nofp.wasm");
+    const coremark_profile_step = b.step(
+        "coremark-profile",
+        "Sampling-profile the CoreMark AOT and dump top-3 hot-function disassembly",
+    );
+    coremark_profile_step.dependOn(&run_coremark_profile.step);
+
     // ── SIMD benchmark runner ───────────────────────────────────────────
     // Builds small in-memory SIMD modules and reports interpreter vs AOT
     // status/timing. Optional runner args after `--` can enable external
