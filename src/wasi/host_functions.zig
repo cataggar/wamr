@@ -132,6 +132,75 @@ pub fn wasiFdRead(env_opaque: *anyopaque) types.HostFnError!void {
     env.pushI32(wasi_core.WASI_EBADF) catch return error.StackOverflow;
 }
 
+/// `wasi_snapshot_preview1.fd_pread` — positional read at `offset` without
+/// affecting the cached fd position.
+/// Signature: (fd: i32, iovs_ptr: i32, iovs_len: i32, offset: i64, nread_ptr: i32) -> i32
+pub fn wasiFdPread(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const nread_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const offset = env.popI64() catch return error.StackUnderflow;
+    const iovs_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const iovs_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdPreadCore(ctx, mem, fd, iovs_ptr, iovs_len, offset, nread_ptr)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_pwrite` — positional write at `offset` without
+/// affecting the cached fd position.
+/// Signature: (fd: i32, iovs_ptr: i32, iovs_len: i32, offset: i64, nwritten_ptr: i32) -> i32
+pub fn wasiFdPwrite(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const nwritten_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const offset = env.popI64() catch return error.StackUnderflow;
+    const iovs_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const iovs_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdPwriteCore(ctx, mem, fd, iovs_ptr, iovs_len, offset, nwritten_ptr)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.fd_readdir` — encode directory entries as
+/// preview1 `dirent` records into the guest buffer.
+/// Signature: (fd: i32, buf_ptr: i32, buf_len: i32, cookie: i64, bufused_ptr: i32) -> i32
+pub fn wasiFdReaddir(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const bufused_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const cookie: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const buf_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const buf_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxFdReaddirCore(ctx, mem, fd, buf_ptr, buf_len, cookie, bufused_ptr)) catch return error.StackOverflow;
+}
+
 /// `wasi_snapshot_preview1.fd_seek` — seek on a file descriptor.
 pub fn wasiFdSeek(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
@@ -853,6 +922,226 @@ fn ctxFdSeekCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
+/// Translate a Linux `getdents64` `d_type` to a WASI preview1 `filetype`.
+/// `DT_FIFO`, `DT_WHT`, and any unknown values fall through to `unknown`
+/// since preview1 has no dedicated FIFO/whiteout filetype.
+fn wasiFiletypeFromDt(dt: u8) wasi.Filetype {
+    const linux = std.os.linux;
+    return switch (dt) {
+        linux.DT.REG => .regular_file,
+        linux.DT.DIR => .directory,
+        linux.DT.CHR => .character_device,
+        linux.DT.BLK => .block_device,
+        linux.DT.LNK => .symbolic_link,
+        linux.DT.SOCK => .socket_stream,
+        else => .unknown,
+    };
+}
+
+/// Validate `fd` for fd_pread / fd_pwrite, returning the FdEntry pointer
+/// or a WASI errno. The host-fd null check is deliberately deferred so
+/// callers can apply per-flavour rejections (e.g. fd_pwrite refuses
+/// append-mode fds with `notsup`) before bailing out with `EBADF`.
+fn pIoLookup(
+    ctx: *wasi.WasiCtx,
+    fd: i32,
+    offset: i64,
+) union(enum) {
+    ok: *wasi.FdEntry,
+    err: i32,
+} {
+    if (fd < 0) return .{ .err = wasi_core.WASI_EBADF };
+    if (offset < 0) return .{ .err = wasi_core.WASI_EINVAL };
+    const u_fd: u32 = @intCast(fd);
+    const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse
+        return .{ .err = wasi_core.WASI_EBADF };
+    switch (entry_ptr.kind) {
+        .stdin, .stdout, .stderr, .socket => return .{ .err = @intCast(@intFromEnum(wasi.Errno.spipe)) },
+        .directory => return .{ .err = @intCast(@intFromEnum(wasi.Errno.isdir)) },
+        .regular_file => {},
+    }
+    return .{ .ok = entry_ptr };
+}
+
+fn ctxFdPreadCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    iovs_ptr: u32,
+    iovs_len: u32,
+    offset: i64,
+    nread_ptr: u32,
+) i32 {
+    const entry_ptr = switch (pIoLookup(ctx, fd, offset)) {
+        .err => |e| return e,
+        .ok => |p| p,
+    };
+    const host_fd = entry_ptr.host_fd orelse return wasi_core.WASI_EBADF;
+
+    if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
+    const linux = std.os.linux;
+
+    var total: u32 = 0;
+    var cur_off: i64 = offset;
+    var i: u32 = 0;
+    while (i < iovs_len) : (i += 1) {
+        const iov_offset = iovs_ptr + i * 8;
+        const buf_ptr = wasi_core.memReadU32(mem, iov_offset) orelse
+            return wasi_core.WASI_EINVAL;
+        const buf_len = wasi_core.memReadU32(mem, iov_offset + 4) orelse
+            return wasi_core.WASI_EINVAL;
+        if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
+        if (buf_len == 0) continue;
+
+        const dst = mem[buf_ptr..][0..buf_len];
+        const rc = linux.pread(host_fd, dst.ptr, dst.len, cur_off);
+        if (linux.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        const n: u32 = @intCast(rc);
+        total += n;
+        cur_off += @intCast(n);
+        if (n < dst.len) break; // EOF or short read
+    }
+
+    if (!wasi_core.memWriteU32(mem, nread_ptr, total)) return wasi_core.WASI_EINVAL;
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxFdPwriteCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    iovs_ptr: u32,
+    iovs_len: u32,
+    offset: i64,
+    nwritten_ptr: u32,
+) i32 {
+    const entry_ptr = switch (pIoLookup(ctx, fd, offset)) {
+        .err => |e| return e,
+        .ok => |p| p,
+    };
+    // POSIX requires pwrite to ignore the file's append-mode (Linux's
+    // implementation in fact respects O_APPEND, contradicting POSIX).
+    // Rather than silently differ from the witx contract, refuse pwrite
+    // on append-mode fds with `notsup`. Guests that want positional
+    // writes shouldn't be opening with APPEND in the first place.
+    if ((entry_ptr.fdflags & wasi.FDFLAGS_APPEND) != 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notsup));
+    }
+    const host_fd = entry_ptr.host_fd orelse return wasi_core.WASI_EBADF;
+
+    if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
+    const linux = std.os.linux;
+
+    var total: u32 = 0;
+    var cur_off: i64 = offset;
+    var i: u32 = 0;
+    while (i < iovs_len) : (i += 1) {
+        const iov_offset = iovs_ptr + i * 8;
+        const buf_ptr = wasi_core.memReadU32(mem, iov_offset) orelse
+            return wasi_core.WASI_EINVAL;
+        const buf_len = wasi_core.memReadU32(mem, iov_offset + 4) orelse
+            return wasi_core.WASI_EINVAL;
+        if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
+        if (buf_len == 0) continue;
+
+        const src = mem[buf_ptr..][0..buf_len];
+        const rc = linux.pwrite(host_fd, src.ptr, src.len, cur_off);
+        if (linux.errno(rc) != .SUCCESS) return mapLinuxErrno(rc);
+        const n: u32 = @intCast(rc);
+        total += n;
+        cur_off += @intCast(n);
+        if (n < src.len) break; // partial write — unusual but possible
+    }
+
+    if (!wasi_core.memWriteU32(mem, nwritten_ptr, total)) return wasi_core.WASI_EINVAL;
+    return wasi_core.WASI_ESUCCESS;
+}
+
+/// Encode `getdents64`-derived directory entries into the guest buffer
+/// using the preview1 `dirent` layout (24-byte header + name bytes, no
+/// NUL). Truncates on overflow, matching the wasi-libc expectation that
+/// `bufused == buf_len` signals "more entries may exist; retry with the
+/// last complete entry's `d_next` cookie".
+fn ctxFdReaddirCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    buf_ptr: u32,
+    buf_len: u32,
+    cookie: u64,
+    bufused_ptr: u32,
+) i32 {
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
+
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+    if (entry.kind != .directory) return @intCast(@intFromEnum(wasi.Errno.notdir));
+    const dir = entry.host_dir orelse return wasi_core.WASI_EBADF;
+
+    if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
+    const linux = std.os.linux;
+
+    // Cookie 0 = restart from the top; otherwise it's the kernel d_off
+    // we returned for the previous entry.
+    const seek_off: i64 = @bitCast(cookie);
+    const lrc = linux.lseek(dir.handle, seek_off, linux.SEEK.SET);
+    if (linux.errno(lrc) != .SUCCESS) return mapLinuxErrno(lrc);
+
+    var bufused: u32 = 0;
+    var staging: [4096]u8 = undefined;
+
+    outer: while (true) {
+        const grc = linux.getdents64(dir.handle, &staging, staging.len);
+        if (linux.errno(grc) != .SUCCESS) return mapLinuxErrno(grc);
+        if (grc == 0) break; // end of directory
+
+        var pos: usize = 0;
+        while (pos < grc) {
+            // linux_dirent64: u64 d_ino, s64 d_off, u16 d_reclen, u8 d_type, char d_name[].
+            const ino = std.mem.readInt(u64, staging[pos..][0..8], .little);
+            const off_raw = std.mem.readInt(u64, staging[pos + 8 ..][0..8], .little);
+            const reclen = std.mem.readInt(u16, staging[pos + 16 ..][0..2], .little);
+            const dt = staging[pos + 18];
+            const name_start = pos + 19;
+            const name_end_max = pos + reclen;
+            var name_len: usize = 0;
+            while (name_start + name_len < name_end_max and staging[name_start + name_len] != 0) {
+                name_len += 1;
+            }
+            const name = staging[name_start..][0..name_len];
+
+            // Encode the 24-byte preview1 dirent header.
+            var hdr: [24]u8 = @splat(0);
+            std.mem.writeInt(u64, hdr[0..8], off_raw, .little);
+            std.mem.writeInt(u64, hdr[8..16], ino, .little);
+            std.mem.writeInt(u32, hdr[16..20], @intCast(name_len), .little);
+            hdr[20] = @intFromEnum(wasiFiletypeFromDt(dt));
+
+            // Header — copy as much as fits.
+            const remaining_h = buf_len - bufused;
+            if (remaining_h == 0) break :outer;
+            const hdr_to_copy = @min(@as(u32, @intCast(hdr.len)), remaining_h);
+            @memcpy(mem[buf_ptr + bufused ..][0..hdr_to_copy], hdr[0..hdr_to_copy]);
+            bufused += hdr_to_copy;
+            if (hdr_to_copy < hdr.len) break :outer;
+
+            // Name — copy as much as fits.
+            const remaining_n = buf_len - bufused;
+            if (remaining_n == 0) break :outer;
+            const name_to_copy = @min(@as(u32, @intCast(name_len)), remaining_n);
+            @memcpy(mem[buf_ptr + bufused ..][0..name_to_copy], name[0..name_to_copy]);
+            bufused += name_to_copy;
+            if (name_to_copy < name_len) break :outer;
+
+            pos += reclen;
+        }
+    }
+
+    if (!wasi_core.memWriteU32(mem, bufused_ptr, bufused)) return wasi_core.WASI_EINVAL;
+    return wasi_core.WASI_ESUCCESS;
+}
+
 /// `path_open` core: resolve `path` relative to the dirfd's host Dir, open
 /// it via std.Io.Dir.openFile (read or read+write), allocate a new fd
 /// pointing at the host fd, and write the new fd to `fd_ptr`.
@@ -1242,6 +1531,9 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "thread-spawn", &wasiThreadSpawn },
         .{ "fd_write", &wasiFdWrite },
         .{ "fd_read", &wasiFdRead },
+        .{ "fd_pread", &wasiFdPread },
+        .{ "fd_pwrite", &wasiFdPwrite },
+        .{ "fd_readdir", &wasiFdReaddir },
         .{ "fd_seek", &wasiFdSeek },
         .{ "fd_close", &wasiFdClose },
         .{ "fd_fdstat_get", &wasiFdFdstatGet },
@@ -1391,10 +1683,11 @@ test "resolveWasiFunction: unknown returns null" {
     try std.testing.expect(result == null);
 }
 
-test "resolveWasiFunction: all 26 functions resolve" {
+test "resolveWasiFunction: all 29 functions resolve" {
     const names = [_][]const u8{
         "proc_exit",          "thread-spawn",         "fd_write",
-        "fd_read",            "fd_seek",              "fd_close",
+        "fd_read",            "fd_pread",             "fd_pwrite",
+        "fd_readdir",         "fd_seek",              "fd_close",
         "fd_fdstat_get",      "fd_fdstat_set_flags",  "fd_fdstat_set_rights",
         "fd_filestat_get",    "fd_filestat_set_size", "fd_filestat_set_times",
         "fd_advise",          "fd_allocate",          "fd_datasync",
@@ -1525,4 +1818,213 @@ test "ctxFdFilestatSetSizeCore: bad fd / directory rejected" {
     try ctx.fd_table.insert(90, .{ .kind = .directory });
     const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
     try std.testing.expectEqual(isdir, ctxFdFilestatSetSizeCore(ctx, 90, 0));
+}
+
+test "ctxFdPreadCore: bad fd / negative offset / spipe / isdir" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [32]u8 = @splat(0);
+
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdPreadCore(ctx, &mem, -1, 0, 0, 0, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdPreadCore(ctx, &mem, 99, 0, 0, 0, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxFdPreadCore(ctx, &mem, 1, 0, 0, -1, 0));
+
+    const spipe: i32 = @intCast(@intFromEnum(wasi.Errno.spipe));
+    try std.testing.expectEqual(spipe, ctxFdPreadCore(ctx, &mem, 0, 0, 0, 0, 0));
+    try std.testing.expectEqual(spipe, ctxFdPreadCore(ctx, &mem, 1, 0, 0, 0, 0));
+    try std.testing.expectEqual(spipe, ctxFdPreadCore(ctx, &mem, 2, 0, 0, 0, 0));
+
+    try ctx.fd_table.insert(90, .{ .kind = .directory });
+    const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+    try std.testing.expectEqual(isdir, ctxFdPreadCore(ctx, &mem, 90, 0, 0, 0, 0));
+}
+
+test "ctxFdPwriteCore: bad fd / negative offset / spipe / isdir / append rejected" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [32]u8 = @splat(0);
+
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdPwriteCore(ctx, &mem, -1, 0, 0, 0, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxFdPwriteCore(ctx, &mem, 1, 0, 0, -1, 0));
+
+    const spipe: i32 = @intCast(@intFromEnum(wasi.Errno.spipe));
+    try std.testing.expectEqual(spipe, ctxFdPwriteCore(ctx, &mem, 1, 0, 0, 0, 0));
+
+    try ctx.fd_table.insert(91, .{ .kind = .directory });
+    const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+    try std.testing.expectEqual(isdir, ctxFdPwriteCore(ctx, &mem, 91, 0, 0, 0, 0));
+
+    // Append-mode regular file rejected with notsup, but only after the
+    // pre-checks pass (so the fdflags branch actually runs).
+    try ctx.fd_table.insert(92, .{ .kind = .regular_file, .fdflags = wasi.FDFLAGS_APPEND });
+    const notsup: i32 = @intCast(@intFromEnum(wasi.Errno.notsup));
+    try std.testing.expectEqual(notsup, ctxFdPwriteCore(ctx, &mem, 92, 0, 0, 0, 0));
+}
+
+test "ctxFdReaddirCore: bad fd / notdir / inval buf" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [16]u8 = @splat(0);
+
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdReaddirCore(ctx, &mem, -1, 0, 0, 0, 0));
+    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdReaddirCore(ctx, &mem, 99, 0, 0, 0, 0));
+
+    // Regular file → notdir.
+    try ctx.fd_table.insert(93, .{ .kind = .regular_file });
+    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    try std.testing.expectEqual(notdir, ctxFdReaddirCore(ctx, &mem, 93, 0, 0, 0, 0));
+
+    // buf_ptr + buf_len out of bounds → einval. Use a fresh dir entry
+    // (host_dir = null is fine since the bound-check runs first).
+    try ctx.fd_table.insert(94, .{ .kind = .directory });
+    try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxFdReaddirCore(ctx, &mem, 94, 8, 9, 0, 0));
+}
+
+test "ctxFdPreadCore: reads at offset without moving cached pos" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile(testing_io, "pread.bin", .{ .read = true });
+    defer file.close(testing_io);
+    try file.writePositionalAll(testing_io, "abcdefghij", 0);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const fd = ctx.fd_table.allocateFd();
+    try ctx.fd_table.insert(fd, .{
+        .kind = .regular_file,
+        .host_fd = file.handle,
+        .pos = 5,
+    });
+    defer ctx.fd_table.remove(fd);
+
+    // mem layout: [0..4] iov0.buf_ptr=12, [4..8] iov0.buf_len=4,
+    //             [8..12] nread, [12..16] dst.
+    var mem: [32]u8 = @splat(0);
+    _ = wasi_core.memWriteU32(&mem, 0, 12);
+    _ = wasi_core.memWriteU32(&mem, 4, 4);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxFdPreadCore(ctx, &mem, @intCast(fd), 0, 1, 3, 8),
+    );
+    try std.testing.expectEqualStrings("defg", mem[12..16]);
+    try std.testing.expectEqual(@as(u32, 4), wasi_core.memReadU32(&mem, 8).?);
+
+    // Cached pos must be unchanged — fd_pread is positional.
+    const after = ctx.fd_table.get(fd).?;
+    try std.testing.expectEqual(@as(u64, 5), after.pos);
+}
+
+test "ctxFdPwriteCore: writes at offset without moving cached pos" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile(testing_io, "pwrite.bin", .{ .read = true });
+    defer file.close(testing_io);
+    // Seed 10 bytes of zeros so we can pwrite into the middle.
+    try file.writePositionalAll(testing_io, "..........", 0);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const fd = ctx.fd_table.allocateFd();
+    try ctx.fd_table.insert(fd, .{
+        .kind = .regular_file,
+        .host_fd = file.handle,
+        .pos = 0,
+    });
+    defer ctx.fd_table.remove(fd);
+
+    // mem: [0..4] iov.buf_ptr=12, [4..8] iov.buf_len=3, [8..12] nwritten,
+    //      [12..16] src "XYZ".
+    var mem: [32]u8 = @splat(0);
+    _ = wasi_core.memWriteU32(&mem, 0, 12);
+    _ = wasi_core.memWriteU32(&mem, 4, 3);
+    @memcpy(mem[12..15], "XYZ");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxFdPwriteCore(ctx, &mem, @intCast(fd), 0, 1, 4, 8),
+    );
+    try std.testing.expectEqual(@as(u32, 3), wasi_core.memReadU32(&mem, 8).?);
+    try std.testing.expectEqual(@as(u64, 0), ctx.fd_table.get(fd).?.pos);
+
+    var read_back: [10]u8 = undefined;
+    const n = try file.readPositionalAll(testing_io, &read_back, 0);
+    try std.testing.expectEqualStrings("....XYZ...", read_back[0..n]);
+}
+
+test "ctxFdReaddirCore: encodes preview1 dirents" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Populate a small set of entries; getdents64 also returns "." and "..".
+    const f_a = try tmp.dir.createFile(testing_io, "alpha", .{});
+    f_a.close(testing_io);
+    const f_b = try tmp.dir.createFile(testing_io, "beta", .{});
+    f_b.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const fd = ctx.fd_table.allocateFd();
+    try ctx.fd_table.insert(fd, .{
+        .kind = .directory,
+        .host_dir = tmp.dir,
+    });
+    // Drop the entry before deinit so we don't double-close the dir.
+    defer ctx.fd_table.remove(fd);
+
+    // 4 KiB scratch buffer in linear memory.
+    var mem: [4096]u8 = @splat(0);
+    const buf_ptr: u32 = 8;
+    const buf_len: u32 = 4096 - 8;
+    const bufused_ptr: u32 = 0;
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxFdReaddirCore(ctx, &mem, @intCast(fd), buf_ptr, buf_len, 0, bufused_ptr),
+    );
+
+    const bufused = wasi_core.memReadU32(&mem, bufused_ptr).?;
+    try std.testing.expect(bufused > 0);
+    try std.testing.expect(bufused <= buf_len);
+
+    // Walk the encoded entries and verify we see "alpha" and "beta" with
+    // filetype = regular_file. We don't insist on order; getdents64 may
+    // also surface "." / ".." entries.
+    var saw_alpha = false;
+    var saw_beta = false;
+    var off: u32 = 0;
+    while (off + 24 <= bufused) {
+        const namlen = wasi_core.memReadU32(&mem, buf_ptr + off + 16).?;
+        const dt = mem[buf_ptr + off + 20];
+        const name_start = off + 24;
+        if (name_start + namlen > bufused) break; // truncated tail
+        const name = mem[buf_ptr + name_start ..][0..namlen];
+        if (std.mem.eql(u8, name, "alpha")) {
+            saw_alpha = true;
+            try std.testing.expectEqual(
+                @intFromEnum(wasi.Filetype.regular_file),
+                dt,
+            );
+        } else if (std.mem.eql(u8, name, "beta")) {
+            saw_beta = true;
+            try std.testing.expectEqual(
+                @intFromEnum(wasi.Filetype.regular_file),
+                dt,
+            );
+        }
+        off = name_start + namlen;
+    }
+    try std.testing.expect(saw_alpha);
+    try std.testing.expect(saw_beta);
 }
