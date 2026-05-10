@@ -650,6 +650,72 @@ pub fn wasiPathRename(env_opaque: *anyopaque) types.HostFnError!void {
     )) catch return error.StackOverflow;
 }
 
+/// `wasi_snapshot_preview1.path_symlink`. Signature:
+/// (old_path_ptr: i32, old_len: i32, fd: i32,
+///  new_path_ptr: i32, new_len: i32) -> i32
+///
+/// preview1 calls the link-target `old_path` and the link-name
+/// `new_path`; std.Io.Dir.symLink expects `(target_path, sym_link_path)`,
+/// which matches once we map old→target and new→sym_link.
+pub fn wasiPathSymlink(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const new_path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const new_path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+    const old_path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const old_path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathSymlinkCore(
+        ctx,
+        mem,
+        old_path_ptr,
+        old_path_len,
+        fd,
+        new_path_ptr,
+        new_path_len,
+    )) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.path_readlink`. Signature:
+/// (fd: i32, path_ptr: i32, path_len: i32,
+///  buf_ptr: i32, buf_len: i32, bufused_ptr: i32) -> i32
+pub fn wasiPathReadlink(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const bufused_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const buf_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const buf_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathReadlinkCore(
+        ctx,
+        mem,
+        fd,
+        path_ptr,
+        path_len,
+        buf_ptr,
+        buf_len,
+        bufused_ptr,
+    )) catch return error.StackOverflow;
+}
+
 // ── fd metadata host functions (issue #420 phase 1) ───────────────────
 
 /// `wasi_snapshot_preview1.fd_filestat_get` — populate a 64-byte
@@ -1438,6 +1504,10 @@ fn mapStdIoErr(err: anyerror) i32 {
         error.OperationUnsupported => @intCast(@intFromEnum(wasi.Errno.notsup)),
         error.SystemResources => @intCast(@intFromEnum(wasi.Errno.nomem)),
         error.NoDevice => @intCast(@intFromEnum(wasi.Errno.nodev)),
+        error.NotLink => wasi_core.WASI_EINVAL,
+        error.FileSystem, error.AntivirusInterference => @intCast(@intFromEnum(wasi.Errno.io)),
+        error.NetworkNotFound => @intCast(@intFromEnum(wasi.Errno.noent)),
+        error.UnsupportedReparsePointType => @intCast(@intFromEnum(wasi.Errno.notsup)),
         else => wasi_core.WASI_EINVAL,
     };
 }
@@ -1611,6 +1681,54 @@ fn ctxPathRenameCore(
         return wasi_core.WASI_EINVAL;
     std.Io.Dir.rename(old_dir, old_path, new_dir, new_path, ctx.io) catch |err|
         return mapStdIoErr(err);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxPathSymlinkCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    old_path_ptr: u32,
+    old_path_len: u32,
+    fd: i32,
+    new_path_ptr: u32,
+    new_path_len: u32,
+) i32 {
+    const dir = switch (pPathLookup(ctx, fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const old_path = readGuestPath(mem, old_path_ptr, old_path_len) orelse
+        return wasi_core.WASI_EINVAL;
+    const new_path = readGuestPath(mem, new_path_ptr, new_path_len) orelse
+        return wasi_core.WASI_EINVAL;
+    dir.symLink(ctx.io, old_path, new_path, .{}) catch |err|
+        return mapStdIoErr(err);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxPathReadlinkCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    path_ptr: u32,
+    path_len: u32,
+    buf_ptr: u32,
+    buf_len: u32,
+    bufused_ptr: u32,
+) i32 {
+    const dir = switch (pPathLookup(ctx, fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
+    if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
+    if (@as(u64, bufused_ptr) + 4 > mem.len) return wasi_core.WASI_EINVAL;
+    const n = if (buf_len == 0)
+        0
+    else
+        dir.readLink(ctx.io, path, mem[buf_ptr..][0..buf_len]) catch |err|
+            return mapStdIoErr(err);
+    if (!wasi_core.memWriteU32(mem, bufused_ptr, @intCast(n))) return wasi_core.WASI_EINVAL;
     return wasi_core.WASI_ESUCCESS;
 }
 
@@ -1982,6 +2100,8 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "path_unlink_file", &wasiPathUnlinkFile },
         .{ "path_link", &wasiPathLink },
         .{ "path_rename", &wasiPathRename },
+        .{ "path_symlink", &wasiPathSymlink },
+        .{ "path_readlink", &wasiPathReadlink },
     };
 
     inline for (map) |entry| {
@@ -2109,7 +2229,7 @@ test "resolveWasiFunction: unknown returns null" {
     try std.testing.expect(result == null);
 }
 
-test "resolveWasiFunction: all 36 functions resolve" {
+test "resolveWasiFunction: all 38 functions resolve" {
     const names = [_][]const u8{
         "proc_exit",          "thread-spawn",         "fd_write",
         "fd_read",            "fd_pread",             "fd_pwrite",
@@ -2123,6 +2243,7 @@ test "resolveWasiFunction: all 36 functions resolve" {
         "random_get",         "path_open",            "path_filestat_get",
         "path_filestat_set_times", "path_create_directory", "path_remove_directory",
         "path_unlink_file",   "path_link",            "path_rename",
+        "path_symlink",       "path_readlink",
     };
     for (names) |name| {
         const result = resolveWasiFunction(name);
@@ -2841,4 +2962,194 @@ test "ctxPathRenameCore: same-dir rename + bad fd" {
             @intCast(np.len),
         ),
     );
+}
+
+test "ctxPathSymlinkCore: bad fd / notdir / embedded NUL" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [128]u8 = @splat(0);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathSymlinkCore(ctx, &mem, 0, 0, -1, 0, 0),
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathSymlinkCore(ctx, &mem, 0, 0, 99, 0, 0),
+    );
+
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file });
+    defer ctx.fd_table.remove(4);
+    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    try std.testing.expectEqual(
+        notdir,
+        ctxPathSymlinkCore(ctx, &mem, 0, 0, 4, 0, 0),
+    );
+}
+
+test "ctxPathSymlinkCore: happy path creates a symlink" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [256]u8 = @splat(0);
+    const target = "target";
+    const link = "link";
+    @memcpy(mem[16..][0..target.len], target);
+    @memcpy(mem[64..][0..link.len], link);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathSymlinkCore(
+            ctx,
+            &mem,
+            16,
+            @intCast(target.len),
+            @intCast(fd),
+            64,
+            @intCast(link.len),
+        ),
+    );
+
+    const stat = try tmp.dir.statFile(testing_io, "link", .{ .follow_symlinks = false });
+    try std.testing.expectEqual(std.Io.File.Kind.sym_link, stat.kind);
+}
+
+test "ctxPathSymlinkCore: target with embedded NUL → inval" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [128]u8 = @splat(0);
+    // target = "ab\0c" (embedded NUL) — readGuestPath rejects
+    mem[16] = 'a';
+    mem[17] = 'b';
+    mem[18] = 0;
+    mem[19] = 'c';
+    const link = "link";
+    @memcpy(mem[64..][0..link.len], link);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxPathSymlinkCore(ctx, &mem, 16, 4, @intCast(fd), 64, @intCast(link.len)),
+    );
+}
+
+test "ctxPathReadlinkCore: bad fd / notdir" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [128]u8 = @splat(0);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathReadlinkCore(ctx, &mem, -1, 0, 0, 0, 0, 0),
+    );
+
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file });
+    defer ctx.fd_table.remove(4);
+    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    try std.testing.expectEqual(
+        notdir,
+        ctxPathReadlinkCore(ctx, &mem, 4, 0, 0, 0, 0, 0),
+    );
+}
+
+test "ctxPathReadlinkCore: happy path round-trips target" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(testing_io, "target", "link", .{});
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [256]u8 = @splat(0);
+    const link = "link";
+    @memcpy(mem[16..][0..link.len], link);
+    const buf_ptr: u32 = 64;
+    const buf_len: u32 = 32;
+    const bufused_ptr: u32 = 128;
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathReadlinkCore(
+            ctx,
+            &mem,
+            @intCast(fd),
+            16,
+            @intCast(link.len),
+            buf_ptr,
+            buf_len,
+            bufused_ptr,
+        ),
+    );
+
+    const n = wasi_core.memReadU32(&mem, bufused_ptr).?;
+    try std.testing.expectEqual(@as(u32, 6), n);
+    try std.testing.expectEqualStrings("target", mem[buf_ptr..][0..n]);
+}
+
+test "ctxPathReadlinkCore: not-a-link returns inval" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "regular", .{});
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [256]u8 = @splat(0);
+    const p = encodePath(&mem, "regular");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxPathReadlinkCore(ctx, &mem, @intCast(fd), p.ptr, p.len, 64, 32, 128),
+    );
+}
+
+test "ctxPathReadlinkCore: short buffer truncates silently" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(testing_io, "longer-target", "link", .{});
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [256]u8 = @splat(0);
+    const p = encodePath(&mem, "link");
+    const buf_ptr: u32 = 64;
+    const buf_len: u32 = 4;
+    const bufused_ptr: u32 = 128;
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathReadlinkCore(ctx, &mem, @intCast(fd), p.ptr, p.len, buf_ptr, buf_len, bufused_ptr),
+    );
+
+    const n = wasi_core.memReadU32(&mem, bufused_ptr).?;
+    try std.testing.expectEqual(@as(u32, 4), n);
+    try std.testing.expectEqualStrings("long", mem[buf_ptr..][0..n]);
 }
