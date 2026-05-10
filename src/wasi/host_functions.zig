@@ -930,6 +930,21 @@ pub fn wasiFdTell(env_opaque: *anyopaque) types.HostFnError!void {
     env.pushI32(ctxFdTellCore(ctx, mem, fd, offset_ptr)) catch return error.StackOverflow;
 }
 
+/// `wasi_snapshot_preview1.sock_shutdown` — shut down one or both halves of
+/// a socket. Signature: (fd: i32, sdflags: i32) -> i32
+pub fn wasiSockShutdown(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const sdflags = env.popI32() catch return error.StackUnderflow;
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxSockShutdownCore(ctx, fd, sdflags)) catch return error.StackOverflow;
+}
+
 // ── ctx-aware core implementations ────────────────────────────────────
 
 /// Layout for `args_get` / `environ_get`: write `argv_ptrs` (one i32 pointer
@@ -2719,6 +2734,54 @@ fn ctxPollOneoffCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
+// ── sock_shutdown (#420 phase 8) ───────────────────────────────────────
+
+/// Shut down one or both halves of a socket. The two wasi-testsuite cases
+/// are negative-path (bad fd, non-socket fd) so this implementation is
+/// classification-heavy; the real `shutdown(2)` call only fires for the
+/// `entry.kind == .socket` path with a valid `host_fd`.
+fn ctxSockShutdownCore(ctx: *wasi.WasiCtx, fd: i32, sdflags: i32) i32 {
+    if (comptime builtin.os.tag == .windows) return wasi_core.WASI_ENOSYS;
+
+    if (sdflags < 0) return wasi_core.WASI_EINVAL;
+    const u_flags: u32 = @intCast(sdflags);
+    if (u_flags == 0) return wasi_core.WASI_EINVAL;
+    const all_bits: u32 = wasi.SDFLAGS_RD | wasi.SDFLAGS_WR;
+    if ((u_flags & ~all_bits) != 0) return wasi_core.WASI_EINVAL;
+
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+
+    if (entry.kind != .socket) {
+        return @intCast(@intFromEnum(wasi.Errno.notsock));
+    }
+
+    if ((entry.rights_base & wasi.RIGHTS_SOCK_SHUTDOWN) == 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
+
+    const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
+
+    const rd = (u_flags & wasi.SDFLAGS_RD) != 0;
+    const wr = (u_flags & wasi.SDFLAGS_WR) != 0;
+    const posix_how: i32 = if (rd and wr)
+        2 // SHUT_RDWR
+    else if (wr)
+        1 // SHUT_WR
+    else
+        0; // SHUT_RD
+
+    if (comptime builtin.os.tag == .linux) {
+        const rc = std.os.linux.shutdown(host_fd, posix_how);
+        return mapLinuxErrno(rc);
+    } else {
+        const rc = std.c.shutdown(host_fd, posix_how);
+        if (rc == 0) return wasi_core.WASI_ESUCCESS;
+        return wasi_core.WASI_EINVAL;
+    }
+}
+
 // ── Import resolution ─────────────────────────────────────────────────
 
 /// Resolve WASI host functions for a module's imports.
@@ -2795,6 +2858,7 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "path_symlink", &wasiPathSymlink },
         .{ "path_readlink", &wasiPathReadlink },
         .{ "poll_oneoff", &wasiPollOneoff },
+        .{ "sock_shutdown", &wasiSockShutdown },
     };
 
     inline for (map) |entry| {
@@ -2922,7 +2986,7 @@ test "resolveWasiFunction: unknown returns null" {
     try std.testing.expect(result == null);
 }
 
-test "resolveWasiFunction: all 40 functions resolve" {
+test "resolveWasiFunction: all 41 functions resolve" {
     const names = [_][]const u8{
         "proc_exit",          "thread-spawn",         "fd_write",
         "fd_read",            "fd_pread",             "fd_pwrite",
@@ -2937,7 +3001,7 @@ test "resolveWasiFunction: all 40 functions resolve" {
         "path_filestat_get",  "path_filestat_set_times", "path_create_directory",
         "path_remove_directory", "path_unlink_file",  "path_link",
         "path_rename",        "path_symlink",         "path_readlink",
-        "poll_oneoff",
+        "poll_oneoff",        "sock_shutdown",
     };
     for (names) |name| {
         const result = resolveWasiFunction(name);
@@ -4679,5 +4743,96 @@ test "ctxPollOneoffCore: rights deficit → notcapable event" {
     try std.testing.expectEqual(
         @intFromEnum(wasi.Errno.notcapable),
         pollTestEventErrno(&mem, 64, 0),
+    );
+}
+
+// ── sock_shutdown tests (#420 phase 8) ──────────────────────────────
+
+test "ctxSockShutdownCore: sdflags == 0 → EINVAL" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxSockShutdownCore(ctx, 3, 0));
+}
+
+test "ctxSockShutdownCore: invalid bit in sdflags → EINVAL" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    // 0x10 is outside SDFLAGS_RD|SDFLAGS_WR.
+    try std.testing.expectEqual(wasi_core.WASI_EINVAL, ctxSockShutdownCore(ctx, 3, 0x10));
+    // Combination of valid + invalid bits is still EINVAL.
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxSockShutdownCore(ctx, 3, @as(i32, wasi.SDFLAGS_RD) | 0x10),
+    );
+}
+
+test "ctxSockShutdownCore: bad fd → EBADF" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    // Negative fd.
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockShutdownCore(ctx, -1, @as(i32, wasi.SDFLAGS_RD)),
+    );
+    // Out-of-range fd (no entry).
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockShutdownCore(ctx, 99, @as(i32, wasi.SDFLAGS_RD)),
+    );
+}
+
+test "ctxSockShutdownCore: stdout fd → ENOTSOCK" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    // Stdout (fd 1) is registered as a `.stdout` kind by WasiCtx.init.
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    try std.testing.expectEqual(
+        expected,
+        ctxSockShutdownCore(ctx, 1, @as(i32, wasi.SDFLAGS_RD)),
+    );
+}
+
+test "ctxSockShutdownCore: regular_file fd → ENOTSOCK" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(100, .{ .kind = .regular_file });
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    try std.testing.expectEqual(
+        expected,
+        ctxSockShutdownCore(ctx, 100, @as(i32, wasi.SDFLAGS_RD) | @as(i32, wasi.SDFLAGS_WR)),
+    );
+}
+
+test "ctxSockShutdownCore: directory fd → ENOTSOCK" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(101, .{ .kind = .directory });
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    try std.testing.expectEqual(
+        expected,
+        ctxSockShutdownCore(ctx, 101, @as(i32, wasi.SDFLAGS_WR)),
+    );
+}
+
+test "ctxSockShutdownCore: socket without RIGHTS_SOCK_SHUTDOWN → ENOTCAPABLE" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try ctx.fd_table.insert(102, .{
+        .kind = .socket,
+        .host_fd = 0,
+        .rights_base = 0,
+        .rights_inheriting = 0,
+    });
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    try std.testing.expectEqual(
+        expected,
+        ctxSockShutdownCore(ctx, 102, @as(i32, wasi.SDFLAGS_RD)),
     );
 }

@@ -153,6 +153,11 @@ pub const EVENT_FD_READWRITE_HANGUP: u16 = 0x0001;
 pub const SUBSCRIPTION_SIZE: usize = 48;
 pub const EVENT_SIZE: usize = 32;
 
+// ── sock_shutdown sdflags ───────────────────────────────────────────────
+// Witx encodes the direction as a bitfield; both bits set ≡ SHUT_RDWR.
+pub const SDFLAGS_RD: u16 = 0x0001;
+pub const SDFLAGS_WR: u16 = 0x0002;
+
 // ── WASI rights (bitset, u64) — only the bits we currently consult ──────
 // Full taxonomy in the preview1 spec; extend on demand.
 

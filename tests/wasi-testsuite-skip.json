@@ -1,7 +1,5 @@
 {
     "WASI C tests [wasm32-wasip1]": {
-        "sock_shutdown-invalid_fd": "sock_shutdown not implemented (#420 phase 8)",
-        "sock_shutdown-not_sock": "sock_shutdown not implemented (#420 phase 8)"
     },
     "WASI Rust tests [wasm32-wasip1]": {
     }
