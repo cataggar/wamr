@@ -27,10 +27,29 @@ pub fn memReadU32(mem: []const u8, offset: u32) ?u32 {
     return std.mem.readInt(u32, mem[offset..][0..4], .little);
 }
 
+/// Read a little-endian u64 from linear memory at the given offset.
+pub fn memReadU64(mem: []const u8, offset: u32) ?u64 {
+    if (offset + 8 > mem.len) return null;
+    return std.mem.readInt(u64, mem[offset..][0..8], .little);
+}
+
+/// Read a little-endian u16 from linear memory at the given offset.
+pub fn memReadU16(mem: []const u8, offset: u32) ?u16 {
+    if (offset + 2 > mem.len) return null;
+    return std.mem.readInt(u16, mem[offset..][0..2], .little);
+}
+
 /// Write a little-endian u32 to linear memory at the given offset.
 pub fn memWriteU32(mem: []u8, offset: u32, val: u32) bool {
     if (offset + 4 > mem.len) return false;
     std.mem.writeInt(u32, mem[offset..][0..4], val, .little);
+    return true;
+}
+
+/// Write a little-endian u16 to linear memory at the given offset.
+pub fn memWriteU16(mem: []u8, offset: u32, val: u16) bool {
+    if (offset + 2 > mem.len) return false;
+    std.mem.writeInt(u16, mem[offset..][0..2], val, .little);
     return true;
 }
 
