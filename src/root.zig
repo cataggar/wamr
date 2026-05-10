@@ -26,6 +26,9 @@ pub const exec_env = @import("runtime/common/exec_env.zig");
 /// Process-global canonical FuncType → u32 sig_id registry (for AOT call_indirect).
 pub const sig_registry = @import("runtime/common/sig_registry.zig");
 
+/// Wasm `name` custom section parser (function names; for diagnostics).
+pub const name_section = @import("runtime/common/name_section.zig");
+
 /// Wasm opcode definitions.
 pub const opcode = @import("runtime/interpreter/opcode.zig");
 
