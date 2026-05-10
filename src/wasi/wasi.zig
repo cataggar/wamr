@@ -133,6 +133,26 @@ pub const FDFLAGS_SYNC: u16 = 0x0010;
 pub const FDFLAGS_ALL: u16 =
     FDFLAGS_APPEND | FDFLAGS_DSYNC | FDFLAGS_NONBLOCK | FDFLAGS_RSYNC | FDFLAGS_SYNC;
 
+// ── WASI poll_oneoff types (#420 phase 7) ───────────────────────────────
+
+pub const CLOCKID_REALTIME: u32 = 0;
+pub const CLOCKID_MONOTONIC: u32 = 1;
+pub const CLOCKID_PROCESS_CPUTIME_ID: u32 = 2;
+pub const CLOCKID_THREAD_CPUTIME_ID: u32 = 3;
+
+pub const EVENTTYPE_CLOCK: u8 = 0;
+pub const EVENTTYPE_FD_READ: u8 = 1;
+pub const EVENTTYPE_FD_WRITE: u8 = 2;
+
+pub const SUBSCRIPTION_CLOCK_ABSTIME: u16 = 0x0001;
+
+pub const EVENT_FD_READWRITE_HANGUP: u16 = 0x0001;
+
+/// Per-witx ABI: subscription is 48 bytes, event is 32 bytes, both
+/// align 8. Used by ctxPollOneoffCore for guest-memory bounds checks.
+pub const SUBSCRIPTION_SIZE: usize = 48;
+pub const EVENT_SIZE: usize = 32;
+
 // ── WASI rights (bitset, u64) — only the bits we currently consult ──────
 // Full taxonomy in the preview1 spec; extend on demand.
 
