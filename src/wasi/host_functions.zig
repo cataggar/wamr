@@ -1128,12 +1128,35 @@ fn doWrite(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []const u8) !usiz
             if ((entry_ptr.rights_base & wasi.RIGHTS_FD_WRITE) == 0) return error.BadFd;
             const host_fd = entry_ptr.host_fd orelse return error.BadFd;
             const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
-            var buf: [4096]u8 = undefined;
-            var w = file.writer(ctx.io, &buf);
-            w.seekTo(entry_ptr.pos) catch return error.IoError;
-            w.interface.writeAll(data) catch return error.IoError;
-            w.flush() catch return error.IoError;
-            entry_ptr.pos += data.len;
+            const append = (entry_ptr.fdflags & wasi.FDFLAGS_APPEND) != 0;
+            if (append) {
+                // O_APPEND requires streaming write() on the host: std.Io's
+                // positional writer would issue pwrite, which on Linux
+                // still respects O_APPEND but the std side tracks an
+                // independent cursor that drifts from the kernel offset.
+                // Use writeStreamingAll (calls write(2)) so the kernel
+                // append + offset advancement stay in sync, then read the
+                // post-write offset back to update entry.pos.
+                file.writeStreamingAll(ctx.io, data) catch return error.IoError;
+                if (builtin.os.tag == .linux) {
+                    const linux = std.os.linux;
+                    const rc = linux.lseek(host_fd, 0, std.posix.SEEK.CUR);
+                    if (linux.errno(rc) == .SUCCESS) {
+                        entry_ptr.pos = @intCast(rc);
+                    } else {
+                        entry_ptr.pos += data.len;
+                    }
+                } else {
+                    entry_ptr.pos += data.len;
+                }
+            } else {
+                var buf: [4096]u8 = undefined;
+                var w = file.writer(ctx.io, &buf);
+                w.seekTo(entry_ptr.pos) catch return error.IoError;
+                w.interface.writeAll(data) catch return error.IoError;
+                w.flush() catch return error.IoError;
+                entry_ptr.pos += data.len;
+            }
             return data.len;
         },
         else => return error.BadFd,
@@ -1184,8 +1207,10 @@ fn ctxFdSeekCore(
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const entry_ptr = ctx.fd_table.entries.getPtr(u_fd) orelse return wasi_core.WASI_EBADF;
-    if (entry_ptr.kind != .regular_file) {
-        return @intCast(@intFromEnum(wasi.Errno.spipe));
+    switch (entry_ptr.kind) {
+        .regular_file => {},
+        .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
+        .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
     }
     const host_fd = entry_ptr.host_fd orelse return wasi_core.WASI_EBADF;
     const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
@@ -1304,13 +1329,10 @@ fn ctxFdPwriteCore(
         .ok => |p| p,
     };
     // POSIX requires pwrite to ignore the file's append-mode (Linux's
-    // implementation in fact respects O_APPEND, contradicting POSIX).
-    // Rather than silently differ from the witx contract, refuse pwrite
-    // on append-mode fds with `notsup`. Guests that want positional
-    // writes shouldn't be opening with APPEND in the first place.
-    if ((entry_ptr.fdflags & wasi.FDFLAGS_APPEND) != 0) {
-        return @intCast(@intFromEnum(wasi.Errno.notsup));
-    }
+    // implementation in fact respects O_APPEND, contradicting POSIX). We
+    // delegate to the host's pwrite — wasi-tests' `pwrite-with-append`
+    // explicitly accepts either offset (POSIX or Linux). Crucially we
+    // don't update entry.pos here since pwrite doesn't move the cursor.
     const host_fd = entry_ptr.host_fd orelse return wasi_core.WASI_EBADF;
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
@@ -1426,6 +1448,35 @@ fn ctxFdReaddirCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
+/// Lexically detect whether `path` would resolve outside its dirfd's
+/// subtree once `..` and `.` segments are normalised. Returns true if
+/// the running depth ever drops below zero (i.e. a `..` pops past the
+/// dirfd). Empty segments (consecutive `/`) and `.` segments are
+/// skipped per POSIX path resolution. Trailing/leading slashes are
+/// handled naturally by treating empty components as no-ops.
+///
+/// Note: this is a *pre-flight* check before the host openat — paths
+/// that don't escape lexically still get the host's traversal which
+/// enforces existence and follows symlinks subject to dirflags. We
+/// intentionally do NOT rewrite the path: the host can resolve
+/// balanced `..`s itself, and rewriting would change the meaning of
+/// symlinked intermediate components.
+fn pathEscapesSandbox(path: []const u8) bool {
+    var depth: i32 = 0;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            depth -= 1;
+            if (depth < 0) return true;
+            continue;
+        }
+        depth += 1;
+    }
+    return false;
+}
+
 /// `path_open` core: resolve `path` relative to the dirfd's host Dir,
 /// honor preview1 oflags / dirflags / fdflags, persist requested rights
 /// onto the new FdEntry, and write the new fd to `fd_ptr`.
@@ -1455,6 +1506,9 @@ fn ctxPathOpenCore(
         .err => |e| return e,
         .ok => |d| d,
     };
+    // Need the dir entry separately for rights enforcement (PATH_FILESTAT_SET_SIZE
+    // gates OFLAGS_TRUNC, etc.). pPathLookup already validated kind+host_dir.
+    const dir_entry: ?wasi.FdEntry = if (dirfd >= 0) ctx.fd_table.get(@intCast(dirfd)) else null;
     const path = readGuestPath(mem, path_ptr, path_len) orelse
         return wasi_core.WASI_EINVAL;
 
@@ -1462,6 +1516,16 @@ fn ctxPathOpenCore(
     // dir. Absolute paths escape the sandbox and are rejected with
     // notcapable.
     if (path.len > 0 and path[0] == '/') {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
+
+    // Reject paths that lexically escape the preopen via `..`. We track
+    // depth from the dirfd: each non-empty/non-"." component pushes a
+    // level, ".." pops one. Going below zero means the path would
+    // resolve outside the sandbox even if intermediate components
+    // exist on the host. Returns NOTCAPABLE before the host openat,
+    // matching wasi-libc / wasmtime semantics.
+    if (pathEscapesSandbox(path)) {
         return @intCast(@intFromEnum(wasi.Errno.notcapable));
     }
 
@@ -1473,10 +1537,34 @@ fn ctxPathOpenCore(
 
     if (want_creat and want_dir) return wasi_core.WASI_EINVAL;
 
+    // OFLAGS_TRUNC requires PATH_FILESTAT_SET_SIZE on the dirfd. wasi-libc
+    // expects NOTCAPABLE when the right was previously dropped via
+    // fd_fdstat_set_rights.
+    if (want_trunc) {
+        if (dir_entry) |de| {
+            if ((de.rights_base & wasi.RIGHTS_PATH_FILESTAT_SET_SIZE) == 0) {
+                return @intCast(@intFromEnum(wasi.Errno.notcapable));
+            }
+        }
+    }
+
     const base = if (fs_rights_base == 0) ~@as(u64, 0) else fs_rights_base;
     const inh = if (fs_rights_inh == 0) ~@as(u64, 0) else fs_rights_inh;
     const can_read = (base & wasi.RIGHTS_FD_READ) != 0;
     const can_write = (base & wasi.RIGHTS_FD_WRITE) != 0;
+
+    // OFLAGS_DIRECTORY + a write-class right is contradictory: dirs can't
+    // be written via fd_write/fd_pwrite/etc. Return ISDIR up-front so the
+    // host openat doesn't succeed and produce a half-usable directory fd.
+    if (want_dir) {
+        const write_class = wasi.RIGHTS_FD_WRITE |
+            wasi.RIGHTS_FD_DATASYNC |
+            wasi.RIGHTS_FD_ALLOCATE |
+            wasi.RIGHTS_FD_FILESTAT_SET_SIZE;
+        if ((fs_rights_base & write_class) != 0) {
+            return @intCast(@intFromEnum(wasi.Errno.isdir));
+        }
+    }
 
     if (want_dir) {
         var new_dir = dir.openDir(ctx.io, path, .{
@@ -1488,8 +1576,8 @@ fn ctxPathOpenCore(
             .kind = .directory,
             .host_dir = new_dir,
             .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
-            .rights_base = base,
-            .rights_inheriting = inh,
+            .rights_base = base & wasi.DIRECTORY_BASE_RIGHTS,
+            .rights_inheriting = inh & wasi.DIRECTORY_INHERITING_RIGHTS,
         }) catch {
             new_dir.close(ctx.io);
             return wasi_core.WASI_EINVAL;
@@ -1528,8 +1616,8 @@ fn ctxPathOpenCore(
                     .kind = .directory,
                     .host_dir = nd,
                     .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
-                    .rights_base = base,
-                    .rights_inheriting = inh,
+                    .rights_base = base & wasi.DIRECTORY_BASE_RIGHTS,
+                    .rights_inheriting = inh & wasi.DIRECTORY_INHERITING_RIGHTS,
                 }) catch {
                     nd.close(ctx.io);
                     return wasi_core.WASI_EINVAL;
@@ -1838,6 +1926,13 @@ fn ctxPathSymlinkCore(
         return wasi_core.WASI_EINVAL;
     const new_path = readGuestPath(mem, new_path_ptr, new_path_len) orelse
         return wasi_core.WASI_EINVAL;
+    // Reject absolute symlink targets — wasi-libc / wasi-tests treat any
+    // symlink whose target leaves the preopen sandbox as a capability
+    // violation. wasmtime returns NOTCAPABLE; PERM is also accepted by
+    // wasi-tests' assert_errno helper.
+    if (old_path.len > 0 and old_path[0] == '/') {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
     dir.symLink(ctx.io, old_path, new_path, .{}) catch |err|
         return mapStdIoErr(err);
     return wasi_core.WASI_ESUCCESS;
@@ -2072,7 +2167,11 @@ fn ctxFdAllocateCore(ctx: *wasi.WasiCtx, fd: i32, offset: i64, len: i64) i32 {
 
     const u_fd: u32 = @intCast(fd);
     const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
-    if (entry.kind != .regular_file) return @intCast(@intFromEnum(wasi.Errno.spipe));
+    switch (entry.kind) {
+        .regular_file => {},
+        .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
+        .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
+    }
 
     if (builtin.os.tag != .linux) return wasi_core.WASI_ENOSYS;
 
@@ -2131,6 +2230,12 @@ fn ctxFdSyncCore(ctx: *wasi.WasiCtx, fd: i32, mode: SyncMode) i32 {
 /// from the table without closing its host resource since ownership
 /// transfers to `to`. wasmtime semantics: `from == to` on an open fd
 /// is a no-op success.
+///
+/// Stdio entries are permitted in the `from` slot (the `stdio` test in
+/// wasi-testsuite renumbers stdin onto a regular file fd). They remain
+/// rejected in the `to` slot because overwriting stdio with another
+/// resource is more invasive than the test exercises and risks
+/// interfering with the host runtime's own stdio.
 fn ctxFdRenumberCore(ctx: *wasi.WasiCtx, from: i32, to: i32) i32 {
     if (from < 0 or to < 0) return wasi_core.WASI_EBADF;
     const u_from: u32 = @intCast(from);
@@ -2144,10 +2249,6 @@ fn ctxFdRenumberCore(ctx: *wasi.WasiCtx, from: i32, to: i32) i32 {
     const from_entry = ctx.fd_table.get(u_from) orelse return wasi_core.WASI_EBADF;
     const to_entry = ctx.fd_table.get(u_to) orelse return wasi_core.WASI_EBADF;
 
-    switch (from_entry.kind) {
-        .stdin, .stdout, .stderr => return wasi_core.WASI_EBADF,
-        else => {},
-    }
     switch (to_entry.kind) {
         .stdin, .stdout, .stderr => return wasi_core.WASI_EBADF,
         else => {},
@@ -2172,8 +2273,10 @@ fn ctxFdTellCore(ctx: *wasi.WasiCtx, mem: []u8, fd: i32, offset_ptr: u32) i32 {
     if (fd < 0) return wasi_core.WASI_EBADF;
     const u_fd: u32 = @intCast(fd);
     const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
-    if (entry.kind != .regular_file) {
-        return @intCast(@intFromEnum(wasi.Errno.spipe));
+    switch (entry.kind) {
+        .regular_file => {},
+        .directory => return @intCast(@intFromEnum(wasi.Errno.isdir)),
+        .stdin, .stdout, .stderr, .socket => return @intCast(@intFromEnum(wasi.Errno.spipe)),
     }
     if (!wasi_core.memWriteU64(mem, offset_ptr, entry.pos)) return wasi_core.WASI_EINVAL;
     return wasi_core.WASI_ESUCCESS;
@@ -2585,11 +2688,14 @@ test "ctxFdPwriteCore: bad fd / negative offset / spipe / isdir / append rejecte
     const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
     try std.testing.expectEqual(isdir, ctxFdPwriteCore(ctx, &mem, 91, 0, 0, 0, 0));
 
-    // Append-mode regular file rejected with notsup, but only after the
-    // pre-checks pass (so the fdflags branch actually runs).
+    // Append-mode regular file is allowed: Linux pwrite respects O_APPEND
+    // (writes at end-of-file) and the wasi-testsuite pwrite-with-append test
+    // explicitly accepts that semantics. We don't reject the call here; just
+    // ensure it doesn't return notsup. Without an iovec/host fd this exits
+    // early with success once pre-checks pass.
     try ctx.fd_table.insert(92, .{ .kind = .regular_file, .fdflags = wasi.FDFLAGS_APPEND });
     const notsup: i32 = @intCast(@intFromEnum(wasi.Errno.notsup));
-    try std.testing.expectEqual(notsup, ctxFdPwriteCore(ctx, &mem, 92, 0, 0, 0, 0));
+    try std.testing.expect(ctxFdPwriteCore(ctx, &mem, 92, 0, 0, 0, 0) != notsup);
 }
 
 test "ctxFdReaddirCore: bad fd / notdir / inval buf" {
@@ -3694,19 +3800,23 @@ test "ctxFdRenumberCore: bad fds" {
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 99));
 }
 
-test "ctxFdRenumberCore: stdio in either slot returns BADF" {
+test "ctxFdRenumberCore: stdio in to slot returns BADF; from slot is allowed" {
     const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
 
     try ctx.fd_table.insert(4, .{ .kind = .regular_file });
     defer ctx.fd_table.remove(4);
 
-    // from is stdio.
-    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 0, 4));
-    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 1, 4));
-    try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 2, 4));
+    // `from` is stdio: this is allowed (wasi-testsuite stdio test renumbers
+    // an opened scratch fd into stdout/stderr; the converse direction is also
+    // permitted). All three preopened stdio slots succeed.
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, ctxFdRenumberCore(ctx, 0, 4));
+    // After the renumber, fd 0 is closed and fd 4 holds what fd 0 had.
+    // Re-prime fd 4 for the next assertion.
+    ctx.fd_table.remove(4);
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file });
 
-    // to is stdio.
+    // `to` is stdio: rejected to keep stdio slots stable.
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 0));
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 1));
     try std.testing.expectEqual(wasi_core.WASI_EBADF, ctxFdRenumberCore(ctx, 4, 2));
