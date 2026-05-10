@@ -1,0 +1,195 @@
+name: Cold-start (aarch64)
+
+# Per-PR cold-start latency comparison on the self-hosted aarch64 runner.
+# Runs `scripts/bench_coldstart.py` against the PR base, posts a sticky
+# delta table, and fails the job if the wamr CLI's median cold-start time
+# regresses by more than --regression-ratio (default 1.5×).
+#
+# Cold-start is one of WAMR's strongest selling points (~50× faster than
+# Wasmtime for a noop module — see issue #394). None of the existing
+# benches (codegen cycles/op, in-process CoreMark iter/s, spec tests)
+# observe CLI startup, so a PR adding eager init could 5–10× cold-start
+# with zero CI signal. This workflow guards against that.
+#
+# Reference baseline (issue #394, AArch64 D16pds_v6 commit ab887c59):
+#   wamr `noop.cwasm` median 0.78 ms (range 0.72–0.84)
+#   wamr `noop.wasm`  median 0.82 ms (range 0.77–0.98)
+#   wasmtime `.cwasm`        ~40 ms
+#   wasmtime `.wasm` (JIT)   ~44 ms
+#
+# Pinned to the self-hosted ARM64 runner: GitHub-hosted x86 noise easily
+# exceeds the ~1 ms wamr signal. Hosted runners are unsuitable for this
+# gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Baseline git ref"
+        required: false
+        default: "origin/main"
+      target:
+        description: "Target git ref"
+        required: false
+        default: "HEAD"
+      samples:
+        description: "Timed invocations per (engine, module, variant)"
+        required: false
+        default: "50"
+      warmup:
+        description: "Warmup invocations discarded before timing"
+        required: false
+        default: "5"
+      regression_ratio:
+        description: "Fail if target_median / baseline_median exceeds this"
+        required: false
+        default: "1.5"
+  pull_request:
+    paths:
+      - src/main.zig
+      - src/runtime/**
+      - src/component/**
+      - src/wasi/**
+      - src/compiler/**
+      - build.zig
+      - build.zig.zon
+      - tests/coldstart/**
+      - scripts/bench_coldstart.py
+      - .github/workflows/coldstart-aarch64.yml
+
+concurrency:
+  # Serialize on the self-hosted runner: parallel cold-start invocations
+  # would contend on cores and skew measurements near 1 ms.
+  group: coldstart-aarch64
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  coldstart:
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Need the base commit to compare against, so deepen the checkout.
+          fetch-depth: 0
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./.github/actions/zig-cache
+
+      - name: Resolve refs
+        id: refs
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          INPUT_BASELINE: ${{ github.event.inputs.baseline }}
+          INPUT_TARGET: ${{ github.event.inputs.target }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "baseline=$BASE_SHA" >> "$GITHUB_OUTPUT"
+            echo "target=$HEAD_SHA"   >> "$GITHUB_OUTPUT"
+          else
+            echo "baseline=${INPUT_BASELINE:-origin/main}" >> "$GITHUB_OUTPUT"
+            echo "target=${INPUT_TARGET:-HEAD}"            >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run cold-start comparison
+        id: bench
+        continue-on-error: true
+        env:
+          BASELINE: ${{ steps.refs.outputs.baseline }}
+          TARGET: ${{ steps.refs.outputs.target }}
+          SAMPLES: ${{ github.event.inputs.samples || '50' }}
+          WARMUP: ${{ github.event.inputs.warmup || '5' }}
+          REGRESSION_RATIO: ${{ github.event.inputs.regression_ratio || '1.5' }}
+        run: |
+          python3 scripts/bench_coldstart.py \
+            --baseline         "$BASELINE" \
+            --target           "$TARGET" \
+            --samples          "$SAMPLES" \
+            --warmup           "$WARMUP" \
+            --regression-ratio "$REGRESSION_RATIO" \
+            --out              coldstart-table.md \
+            --json             coldstart.json \
+            --emit             github
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coldstart-aarch64-${{ github.sha }}
+          path: |
+            coldstart-table.md
+            coldstart.json
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Sticky comment on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- coldstart-aarch64 -->';
+            const tablePath = 'coldstart-table.md';
+            const status = '${{ steps.bench.outcome }}';
+
+            let table = '';
+            if (fs.existsSync(tablePath)) {
+              table = fs.readFileSync(tablePath, 'utf8');
+            } else {
+              core.warning('coldstart-table.md was not produced');
+              table = '_No comparison table was produced._';
+            }
+
+            const verdict = status === 'success'
+              ? '✅ Cold-start within 1.5× of baseline.'
+              : '❌ Cold-start regressed beyond the 1.5× threshold — see job logs.';
+
+            const body = [
+              marker,
+              '## ❄️ Cold-start (aarch64)',
+              '',
+              verdict,
+              '',
+              table,
+              '',
+              '<sub>Self-hosted aarch64 runner. ' +
+                'See [`scripts/bench_coldstart.py`](../tree/main/scripts/bench_coldstart.py) ' +
+                'and issue #394 for context.</sub>',
+            ].join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const existing = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 },
+            );
+            const prior = existing.find(
+              (c) => c.user && c.user.type === 'Bot' && c.body && c.body.startsWith(marker),
+            );
+
+            if (prior) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: prior.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body,
+              });
+            }
+
+      - name: Fail on cold-start regression
+        if: steps.bench.outcome == 'failure'
+        run: exit 1
