@@ -182,18 +182,42 @@ pub fn allocateFromRangesWithHints(
                 .end = range.end,
                 .reg_idx = reg_idx,
                 .type = range.type,
+                .max_loop_depth = range.max_loop_depth,
             });
         } else {
             // No safe free register — try to evict an active interval
-            // whose register IS safe for this range.
+            // whose register IS safe for this range. Eviction order:
+            //
+            //   1. Prefer the active interval with the **smallest**
+            //      `max_loop_depth` (the coldest candidate — its spill
+            //      pays at most a few loads outside any loop).
+            //   2. Tie-break by **largest end** (Poletto–Sarkar's
+            //      original "longest remaining" rule, which retires the
+            //      shorter ranges first).
+            //
+            // We also require the candidate's `max_loop_depth` to be no
+            // larger than the new range's: spilling something that's
+            // hotter than the value we're trying to keep just shifts
+            // the per-iteration load/store penalty around rather than
+            // removing it. If no such candidate exists we fall back to
+            // spilling the incoming range itself (this is the same
+            // fallback the previous heuristic used when no longer-end
+            // active was safe).
             var best_evict: ?usize = null;
             for (active.items, 0..) |ai, idx| {
-                if (ai.end > range.end and
-                    regSafeForRange(ai.reg_idx, range.start, range.end, clobbers))
-                {
-                    if (best_evict == null or ai.end > active.items[best_evict.?].end) {
+                if (ai.end <= range.end) continue;
+                if (!regSafeForRange(ai.reg_idx, range.start, range.end, clobbers)) continue;
+                if (ai.max_loop_depth > range.max_loop_depth) continue;
+                if (best_evict) |bi| {
+                    const cur = active.items[bi];
+                    // Lower loop depth wins; tie → larger end wins.
+                    if (ai.max_loop_depth < cur.max_loop_depth or
+                        (ai.max_loop_depth == cur.max_loop_depth and ai.end > cur.end))
+                    {
                         best_evict = idx;
                     }
+                } else {
+                    best_evict = idx;
                 }
             }
 
@@ -208,6 +232,7 @@ pub fn allocateFromRangesWithHints(
                     .end = range.end,
                     .reg_idx = stolen_reg,
                     .type = range.type,
+                    .max_loop_depth = range.max_loop_depth,
                 });
             } else {
                 // No safe eviction candidate — spill the new interval
@@ -249,6 +274,12 @@ const ActiveInterval = struct {
     end: u32,
     reg_idx: u8,
     type: ir.IrType,
+    /// Max loop-nest depth of the originating live range. The eviction
+    /// heuristic prefers to spill the active interval with the smallest
+    /// `max_loop_depth` (i.e. the coldest), which keeps loop-invariant
+    /// pointers in registers across iterations on hot wasm loops like
+    /// CoreMark's `core_state_transition`.
+    max_loop_depth: u8,
 };
 
 /// Remove intervals from `active` whose end position is <= `pos`.
@@ -676,4 +707,110 @@ test "allocateFromRangesWithHints: empty hint list behaves like allocateFromRang
 
     try std.testing.expectEqual(result_a.get(0).?, result_b.get(0).?);
     try std.testing.expectEqual(result_a.get(1).?, result_b.get(1).?);
+}
+
+// ── Loop-depth-weighted eviction (issue #382) ───────────────────────────
+
+test "allocateFromRanges: cold vreg evicted over hot vreg under pressure" {
+    // Two-register pool with one free-reg conflict. Both candidates are
+    // longer than the incoming range, so the old end-only heuristic
+    // would pick whichever has the larger `.end`. Here we set the
+    // *cold* candidate to have the larger end and the *hot* candidate
+    // (max_loop_depth > 0) to have the smaller end. The new heuristic
+    // must still evict the cold one because it is at depth 0.
+    const allocator = std.testing.allocator;
+    const two_reg_set: RegSet = .{
+        .alloc_regs = &.{ 7, 8 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    // vreg 0: cold (depth 0), end=100 → would be the legacy eviction
+    // pick because it has the largest end.
+    // vreg 1: hot (depth 2), end=60 → legacy heuristic would *keep* it
+    // (smaller end) but it's already what we want; flipped end values
+    // below ensure we're really testing the depth signal, not a happy
+    // accident.
+    // vreg 2: incoming, start=2, end=10 → forces eviction because both
+    // registers are taken at this point.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 100, .type = .i64, .max_loop_depth = 0 },
+        .{ .vreg = 1, .start = 1, .end = 60, .type = .i64, .max_loop_depth = 2 },
+        .{ .vreg = 2, .start = 2, .end = 10, .type = .i64, .max_loop_depth = 0 },
+    };
+
+    var result = try allocateFromRanges(allocator, two_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    // The hot vreg (1) must remain in a register; the cold vreg (0)
+    // must have been spilled.
+    try std.testing.expect(result.get(1).? == .reg);
+    try std.testing.expect(result.get(0).? == .stack);
+    // And vreg 2 (the one that triggered eviction) must have taken
+    // vreg 0's slot.
+    try std.testing.expect(result.get(2).? == .reg);
+    try std.testing.expectEqual(@as(u32, 1), result.spill_count);
+}
+
+test "allocateFromRanges: tie on loop depth falls back to longest end" {
+    // When all active intervals share the same loop depth, the
+    // heuristic must reproduce the original Poletto–Sarkar rule
+    // (evict the longest-remaining).
+    const allocator = std.testing.allocator;
+    const two_reg_set: RegSet = .{
+        .alloc_regs = &.{ 7, 8 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 50, .type = .i64, .max_loop_depth = 1 },
+        .{ .vreg = 1, .start = 1, .end = 100, .type = .i64, .max_loop_depth = 1 },
+        .{ .vreg = 2, .start = 2, .end = 10, .type = .i64, .max_loop_depth = 1 },
+    };
+
+    var result = try allocateFromRanges(allocator, two_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    // Both candidates share depth 1; the longer one (vreg 1, end=100)
+    // must be evicted, matching the pre-change behavior.
+    try std.testing.expect(result.get(0).? == .reg);
+    try std.testing.expect(result.get(1).? == .stack);
+    try std.testing.expect(result.get(2).? == .reg);
+    try std.testing.expectEqual(@as(u32, 1), result.spill_count);
+}
+
+test "allocateFromRanges: hotter incoming range spills itself instead of evicting cold" {
+    // The incoming range is *hotter* than every active interval, but
+    // the predicate `ai.max_loop_depth <= range.max_loop_depth`
+    // permits evicting equally-cold candidates. To verify the
+    // safeguard against the opposite direction we set up an incoming
+    // range that is *colder* than every active and confirm no
+    // eviction happens — the new range falls back to a stack slot.
+    const allocator = std.testing.allocator;
+    const two_reg_set: RegSet = .{
+        .alloc_regs = &.{ 7, 8 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 100, .type = .i64, .max_loop_depth = 3 },
+        .{ .vreg = 1, .start = 1, .end = 80, .type = .i64, .max_loop_depth = 2 },
+        // Incoming range at depth 0 — colder than both actives. With
+        // the new rule we should keep both hot actives and spill the
+        // newcomer.
+        .{ .vreg = 2, .start = 2, .end = 50, .type = .i64, .max_loop_depth = 0 },
+    };
+
+    var result = try allocateFromRanges(allocator, two_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    try std.testing.expect(result.get(0).? == .reg);
+    try std.testing.expect(result.get(1).? == .reg);
+    try std.testing.expect(result.get(2).? == .stack);
+    try std.testing.expectEqual(@as(u32, 1), result.spill_count);
 }

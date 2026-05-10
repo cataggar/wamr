@@ -466,11 +466,24 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
 }
 
 /// A live range interval for a VReg.
+///
+/// `max_loop_depth` is the loop-nest depth of the hottest block the range
+/// overlaps. The register allocator uses it to bias eviction toward the
+/// coldest active interval — a long-living, loop-invariant value carrying
+/// `max_loop_depth = N` is preferred over a short-lived noise vreg at
+/// depth `0` when the spill cost would otherwise be paid once per
+/// iteration. See `computeLoopDepthByBlock` for how the value is derived.
 pub const LiveRange = struct {
     vreg: ir.VReg,
     start: u32, // global instruction index of definition
     end: u32, // global instruction index of last use
     type: ir.IrType,
+    /// Maximum loop-nest depth of any block the range overlaps. `0` means
+    /// the range is never inside a loop (cheap to spill). Higher values
+    /// indicate hotter code — every iteration of the enclosing loop pays
+    /// the load/store cost of a spill, so the allocator should prefer to
+    /// evict ranges with smaller `max_loop_depth`.
+    max_loop_depth: u8 = 0,
 };
 
 /// Compute live ranges for all VRegs in a function.
@@ -520,8 +533,16 @@ pub fn computeLiveRangesWithOrder(
     };
     defer if (owns_order) allocator.free(effective_order);
 
+    // Per-order-position flat-index span: block at order position `i`
+    // covers [block_starts[i], block_starts[i+1]). Used after the main
+    // pass to annotate each live range with the max loop-nest depth of
+    // any block it overlaps.
+    const block_starts = try allocator.alloc(u32, effective_order.len + 1);
+    defer allocator.free(block_starts);
+
     var global_idx: u32 = 0;
-    for (effective_order) |bid| {
+    for (effective_order, 0..) |bid, oi| {
+        block_starts[oi] = global_idx;
         const block = func.blocks.items[bid];
 
         // VRegs in live_in are used before defined in this block — extend their range
@@ -558,6 +579,16 @@ pub fn computeLiveRangesWithOrder(
             }
         }
     }
+    block_starts[effective_order.len] = global_idx;
+
+    // Per-block loop-nest depth, computed once and reused for every
+    // range. On functions without back-edges this stays all-zeros and
+    // the eviction heuristic degrades to the pre-change "longest end"
+    // rule. Failures here are propagated rather than silently masked —
+    // dominator/loop computation is bounded by CFG size and very rarely
+    // OOMs in practice.
+    const loop_depth_by_block: []u8 = try computeLoopDepthByBlockForFunc(func, allocator);
+    defer allocator.free(loop_depth_by_block);
 
     // Build sorted live ranges
     var ranges: std.ArrayList(LiveRange) = .empty;
@@ -566,11 +597,20 @@ pub fn computeLiveRangesWithOrder(
         const vreg = entry.key_ptr.*;
         const start = entry.value_ptr.*;
         const end = last_use_pos.get(vreg) orelse start;
+        const final_end = @max(start, end);
+        const depth = maxLoopDepthOverSpan(
+            start,
+            final_end,
+            effective_order,
+            block_starts,
+            loop_depth_by_block,
+        );
         try ranges.append(allocator, .{
             .vreg = vreg,
             .start = start,
-            .end = @max(start, end),
+            .end = final_end,
             .type = def_type.get(vreg) orelse .i32,
+            .max_loop_depth = depth,
         });
     }
 
@@ -582,6 +622,68 @@ pub fn computeLiveRangesWithOrder(
     }.lessThan);
 
     return try ranges.toOwnedSlice(allocator);
+}
+
+/// Build the dominator tree and loop forest for `func` and return the
+/// per-block loop-nest depth (slice of length `func.blocks.items.len`).
+/// All zeros if the function has no natural loops or no blocks.
+///
+/// Exposed under both names so the aarch64 scheduler-aware live-range
+/// path can call into the same helper as `computeLiveRangesWithOrder`,
+/// keeping the eviction-priority signal byte-identical between
+/// backends.
+pub fn loopDepthByBlockForFunc(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    return computeLoopDepthByBlockForFunc(func, allocator);
+}
+
+fn computeLoopDepthByBlockForFunc(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const nblocks = func.blocks.items.len;
+    if (nblocks == 0) return try allocator.alloc(u8, 0);
+
+    var dom = try computeDominators(func, allocator);
+    defer dom.deinit();
+    var forest = try computeLoops(func, &dom, allocator);
+    defer forest.deinit();
+    return try computeLoopDepthByBlock(func, &forest, allocator);
+}
+
+/// Walk the blocks whose flat-index spans overlap `[start, end]` and
+/// return the largest `depth_by_block` value encountered. `block_starts`
+/// is the sentinel-terminated array produced by
+/// `computeLiveRangesWithOrder`. Falls back to depth 0 if the range
+/// spans no recognized block (defensive — shouldn't happen for ranges
+/// produced by this pass).
+///
+/// Exposed publicly so the aarch64 scheduler-aware live-range builder
+/// can reuse the same overlap-walk logic.
+pub fn maxLoopDepthOverSpan(
+    start: u32,
+    end: u32,
+    block_order: []const ir.BlockId,
+    block_starts: []const u32,
+    depth_by_block: []const u8,
+) u8 {
+    if (block_order.len == 0) return 0;
+    var max_depth: u8 = 0;
+    for (block_order, 0..) |bid, oi| {
+        const blk_begin = block_starts[oi];
+        const blk_end = block_starts[oi + 1]; // exclusive
+        // Range is [start, end] inclusive; block is [blk_begin, blk_end).
+        // No overlap if blk_end <= start or blk_begin > end.
+        if (blk_end <= start) continue;
+        if (blk_begin > end) break; // block_starts is monotonic; rest are later
+        if (bid < depth_by_block.len) {
+            const d = depth_by_block[bid];
+            if (d > max_depth) max_depth = d;
+        }
+    }
+    return max_depth;
 }
 
 fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u32) void {
@@ -1401,6 +1503,33 @@ pub fn computeLoops(
     };
 }
 
+/// Compute per-block loop-nest depth: for each block `b`, the number of
+/// natural loops (from `forest`) that contain `b`. Outer loops contribute
+/// to the depth of every block they cover, so a block inside two nested
+/// loops gets depth 2. Unreachable blocks and blocks outside any loop
+/// have depth 0.
+///
+/// Saturates at `std.math.maxInt(u8)` — pathological CFGs with hundreds
+/// of nesting levels would otherwise wrap.
+///
+/// Caller owns the returned slice (length `func.blocks.items.len`).
+pub fn computeLoopDepthByBlock(
+    func: *const ir.IrFunction,
+    forest: *const LoopForest,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const nblocks = func.blocks.items.len;
+    const depths = try allocator.alloc(u8, nblocks);
+    @memset(depths, 0);
+    for (forest.loops) |loop| {
+        for (loop.blocks) |bid| {
+            if (bid >= nblocks) continue;
+            depths[bid] = std.math.add(u8, depths[bid], 1) catch std.math.maxInt(u8);
+        }
+    }
+    return depths;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "buildSuccessors: linear block" {
@@ -1964,4 +2093,104 @@ test "computeLoops: irreducible-ish (no back-edge without dominator) produces no
     try std.testing.expectEqual(@as(usize, 1), lf.loops.len);
     try std.testing.expectEqual(b0, lf.loops[0].header);
     try std.testing.expectEqual(@as(usize, 3), lf.loops[0].blocks.len);
+}
+
+// ── Loop-depth annotation on live ranges (issue #382) ──────────────────
+
+test "computeLoopDepthByBlock: nested loop yields depth 2 in body" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // outer header → inner header → body → inner header → outer header.
+    const b0 = try func.newBlock();
+    const h_o = try func.newBlock();
+    const h_i = try func.newBlock();
+    const body = try func.newBlock();
+    const exit_i = try func.newBlock();
+    const exit_o = try func.newBlock();
+    const c_o = func.newVReg();
+    const c_i = func.newVReg();
+    const c_e = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = h_o } });
+    try func.getBlock(h_o).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c_o });
+    try func.getBlock(h_o).append(.{ .op = .{ .br_if = .{ .cond = c_o, .then_block = h_i, .else_block = exit_o } } });
+    try func.getBlock(h_i).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c_i });
+    try func.getBlock(h_i).append(.{ .op = .{ .br_if = .{ .cond = c_i, .then_block = body, .else_block = exit_i } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = h_i } });
+    try func.getBlock(exit_i).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c_e });
+    try func.getBlock(exit_i).append(.{ .op = .{ .br_if = .{ .cond = c_e, .then_block = h_o, .else_block = exit_o } } });
+    try func.getBlock(exit_o).append(.{ .op = .{ .ret = null } });
+
+    var dom = try computeDominators(&func, allocator);
+    defer dom.deinit();
+    var forest = try computeLoops(&func, &dom, allocator);
+    defer forest.deinit();
+    const depths = try computeLoopDepthByBlock(&func, &forest, allocator);
+    defer allocator.free(depths);
+
+    try std.testing.expectEqual(@as(u8, 0), depths[b0]);
+    try std.testing.expectEqual(@as(u8, 1), depths[h_o]);
+    try std.testing.expectEqual(@as(u8, 2), depths[h_i]);
+    try std.testing.expectEqual(@as(u8, 2), depths[body]);
+    try std.testing.expectEqual(@as(u8, 1), depths[exit_i]);
+    try std.testing.expectEqual(@as(u8, 0), depths[exit_o]);
+}
+
+test "computeLiveRanges: max_loop_depth annotated for loop body vreg" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    // Single-block self-loop: vreg defined inside the loop must end up
+    // with depth 1. A vreg defined before the loop and dead after it
+    // would not get depth — we only need to confirm the inside-loop
+    // case here.
+    const b0 = try func.newBlock();
+    const b_hdr = try func.newBlock();
+    const b_exit = try func.newBlock();
+    const v_cond = func.newVReg();
+    const v_loop = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b_hdr } });
+    try func.getBlock(b_hdr).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_loop });
+    try func.getBlock(b_hdr).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond });
+    try func.getBlock(b_hdr).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_hdr, .else_block = b_exit } } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = null } });
+
+    const ranges = try computeLiveRanges(&func, allocator);
+    defer allocator.free(ranges);
+
+    // Find vreg defined inside the loop. The header is at depth 1 in
+    // its own natural loop.
+    var seen = false;
+    for (ranges) |r| {
+        if (r.vreg == v_loop) {
+            try std.testing.expectEqual(@as(u8, 1), r.max_loop_depth);
+            seen = true;
+        }
+    }
+    try std.testing.expect(seen);
+}
+
+test "computeLiveRanges: max_loop_depth is 0 for ranges outside any loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const block0 = func.getBlock(b0);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try block0.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try block0.append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try block0.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2 });
+    try block0.append(.{ .op = .{ .ret = v2 } });
+
+    const ranges = try computeLiveRanges(&func, allocator);
+    defer allocator.free(ranges);
+
+    for (ranges) |r| {
+        try std.testing.expectEqual(@as(u8, 0), r.max_loop_depth);
+    }
 }

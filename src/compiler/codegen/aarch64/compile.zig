@@ -1416,8 +1416,15 @@ fn computeLiveRangesScheduled(
     var last_use_pos = std.AutoHashMap(ir.VReg, u32).init(allocator);
     defer last_use_pos.deinit();
 
+    // Per-order-position flat-index span (mirrors the same array used
+    // by `analysis.computeLiveRangesWithOrder`). One extra slot acts as
+    // a sentinel so `block_starts[i+1]` is always a valid exclusive end.
+    const block_starts = try allocator.alloc(u32, block_order.len + 1);
+    defer allocator.free(block_starts);
+
     var global_idx: u32 = 0;
-    for (block_order) |bid| {
+    for (block_order, 0..) |bid, oi| {
+        block_starts[oi] = global_idx;
         if (liveness.getPtr(bid)) |bl| {
             var lit = bl.live_in.iterator();
             while (lit.next()) |entry| {
@@ -1451,6 +1458,13 @@ fn computeLiveRangesScheduled(
             }
         }
     }
+    block_starts[block_order.len] = global_idx;
+
+    // Per-block loop-nest depth. Kept as a separate helper so the
+    // scheduler-aware path here and the canonical `computeLiveRanges`
+    // path share the exact same eviction-priority signal.
+    const loop_depth_by_block: []u8 = try analysis.loopDepthByBlockForFunc(func, allocator);
+    defer allocator.free(loop_depth_by_block);
 
     var ranges: std.ArrayList(analysis.LiveRange) = .empty;
     errdefer ranges.deinit(allocator);
@@ -1459,11 +1473,20 @@ fn computeLiveRangesScheduled(
         const vreg = entry.key_ptr.*;
         const start = entry.value_ptr.*;
         const end = last_use_pos.get(vreg) orelse start;
+        const final_end = @max(start, end);
+        const depth = analysis.maxLoopDepthOverSpan(
+            start,
+            final_end,
+            block_order,
+            block_starts,
+            loop_depth_by_block,
+        );
         try ranges.append(allocator, .{
             .vreg = vreg,
             .start = start,
-            .end = @max(start, end),
+            .end = final_end,
             .type = def_type.get(vreg) orelse .i32,
+            .max_loop_depth = depth,
         });
     }
 
