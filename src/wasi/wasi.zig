@@ -133,6 +133,17 @@ pub const FDFLAGS_SYNC: u16 = 0x0010;
 pub const FDFLAGS_ALL: u16 =
     FDFLAGS_APPEND | FDFLAGS_DSYNC | FDFLAGS_NONBLOCK | FDFLAGS_RSYNC | FDFLAGS_SYNC;
 
+// ── WASI rights (bitset, u64) — only the bits we currently consult ──────
+// Full taxonomy in the preview1 spec; extend on demand.
+
+pub const RIGHTS_FD_DATASYNC: u64 = 0x0000_0000_0000_0001;
+pub const RIGHTS_FD_READ: u64 = 0x0000_0000_0000_0002;
+pub const RIGHTS_FD_SEEK: u64 = 0x0000_0000_0000_0004;
+pub const RIGHTS_FD_FDSTAT_SET_FLAGS: u64 = 0x0000_0000_0000_0008;
+pub const RIGHTS_FD_SYNC: u64 = 0x0000_0000_0000_0010;
+pub const RIGHTS_FD_TELL: u64 = 0x0000_0000_0000_0020;
+pub const RIGHTS_FD_WRITE: u64 = 0x0000_0000_0000_0040;
+
 // ── WASI fstflags (bitset, u16) for `*_filestat_set_times` ──────────────
 
 pub const FSTFLAGS_ATIM: u16 = 0x0001;

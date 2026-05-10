@@ -443,12 +443,12 @@ pub fn wasiPathOpen(env_opaque: *anyopaque) types.HostFnError!void {
     const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
     const fd_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
     const fdflags: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-    _ = env.popI64() catch return error.StackUnderflow; // fs_rights_inheriting
-    _ = env.popI64() catch return error.StackUnderflow; // fs_rights_base
+    const fs_rights_inh: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const fs_rights_base: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
     const oflags: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
     const path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
     const path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-    _ = env.popI32() catch return error.StackUnderflow; // dirflags
+    const dirflags: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
     const dirfd = env.popI32() catch return error.StackUnderflow;
 
     const ctx = getCtx(env) orelse {
@@ -460,7 +460,19 @@ pub fn wasiPathOpen(env_opaque: *anyopaque) types.HostFnError!void {
         return;
     };
 
-    const result = ctxPathOpenCore(ctx, mem, dirfd, path_ptr, path_len, oflags, fdflags, fd_ptr);
+    const result = ctxPathOpenCore(
+        ctx,
+        mem,
+        dirfd,
+        dirflags,
+        path_ptr,
+        path_len,
+        oflags,
+        fs_rights_base,
+        fs_rights_inh,
+        fdflags,
+        fd_ptr,
+    );
     env.pushI32(result) catch return error.StackOverflow;
 }
 
@@ -1095,6 +1107,7 @@ fn doWrite(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []const u8) !usiz
             return data.len;
         },
         .regular_file => {
+            if ((entry_ptr.rights_base & wasi.RIGHTS_FD_WRITE) == 0) return error.BadFd;
             const host_fd = entry_ptr.host_fd orelse return error.BadFd;
             const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
             var buf: [4096]u8 = undefined;
@@ -1119,6 +1132,7 @@ fn doRead(ctx: *wasi.WasiCtx, entry_ptr: *wasi.FdEntry, data: []u8) !usize {
             return n;
         },
         .regular_file => {
+            if ((entry_ptr.rights_base & wasi.RIGHTS_FD_READ) == 0) return error.BadFd;
             const host_fd = entry_ptr.host_fd orelse return error.BadFd;
             const file = std.Io.File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
             var buf: [4096]u8 = undefined;
@@ -1394,38 +1408,70 @@ fn ctxFdReaddirCore(
     return wasi_core.WASI_ESUCCESS;
 }
 
-/// `path_open` core: resolve `path` relative to the dirfd's host Dir, open
-/// it via std.Io.Dir.openFile (read or read+write), allocate a new fd
-/// pointing at the host fd, and write the new fd to `fd_ptr`.
+/// `path_open` core: resolve `path` relative to the dirfd's host Dir,
+/// honor preview1 oflags / dirflags / fdflags, persist requested rights
+/// onto the new FdEntry, and write the new fd to `fd_ptr`.
+///
+/// preview1 oflags bits: CREAT(0x1), DIRECTORY(0x2), EXCL(0x4), TRUNC(0x8).
+/// preview1 dirflags bit: SYMLINK_FOLLOW(0x1) — guests opt-in to follow
+/// the trailing symlink. fs_rights_base / fs_rights_inheriting are
+/// stored as-is on the new FdEntry; an all-zero rights_base is treated
+/// as "default all-ones" because wasi-libc helpers (`create_file`,
+/// `create_tmp_dir`) pass rights_base=0 expecting full access. fdflags
+/// (APPEND/DSYNC/NONBLOCK/RSYNC/SYNC) are cached on the FdEntry; we
+/// don't currently propagate them into host fcntl flags.
 fn ctxPathOpenCore(
     ctx: *wasi.WasiCtx,
     mem: []u8,
     dirfd: i32,
+    dirflags: u32,
     path_ptr: u32,
     path_len: u32,
     oflags: u32,
+    fs_rights_base: u64,
+    fs_rights_inh: u64,
     fdflags: u32,
     fd_ptr: u32,
 ) i32 {
-    _ = fdflags;
-    if (dirfd < 0) return wasi_core.WASI_EBADF;
-    if (path_ptr + path_len > mem.len) return wasi_core.WASI_EINVAL;
-    const path = mem[path_ptr..][0..path_len];
+    const dir = switch (pPathLookup(ctx, dirfd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const path = readGuestPath(mem, path_ptr, path_len) orelse
+        return wasi_core.WASI_EINVAL;
 
-    const dir_entry = ctx.fd_table.get(@intCast(dirfd)) orelse return wasi_core.WASI_EBADF;
-    const host_dir = dir_entry.host_dir orelse return wasi_core.WASI_EBADF;
+    // wasi capability model: paths must be relative to a preopened
+    // dir. Absolute paths escape the sandbox and are rejected with
+    // notcapable.
+    if (path.len > 0 and path[0] == '/') {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
 
-    // Detect the OFLAGS_DIRECTORY flag (bit 1, value 0x2). If set, open a
-    // directory; otherwise open a file. We don't yet honor CREAT/TRUNC/EXCL.
+    const want_creat = (oflags & 0x1) != 0;
     const want_dir = (oflags & 0x2) != 0;
+    const want_excl = (oflags & 0x4) != 0;
+    const want_trunc = (oflags & 0x8) != 0;
+    const follow = (dirflags & 0x1) != 0;
+
+    if (want_creat and want_dir) return wasi_core.WASI_EINVAL;
+
+    const base = if (fs_rights_base == 0) ~@as(u64, 0) else fs_rights_base;
+    const inh = if (fs_rights_inh == 0) ~@as(u64, 0) else fs_rights_inh;
+    const can_read = (base & wasi.RIGHTS_FD_READ) != 0;
+    const can_write = (base & wasi.RIGHTS_FD_WRITE) != 0;
 
     if (want_dir) {
-        var new_dir = host_dir.openDir(ctx.io, path, .{ .iterate = true }) catch |err|
-            return mapStdIoErr(err);
+        var new_dir = dir.openDir(ctx.io, path, .{
+            .iterate = true,
+            .follow_symlinks = follow,
+        }) catch |err| return mapStdIoErr(err);
         const new_fd = ctx.fd_table.allocateFd();
         ctx.fd_table.insert(new_fd, .{
             .kind = .directory,
             .host_dir = new_dir,
+            .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
+            .rights_base = base,
+            .rights_inheriting = inh,
         }) catch {
             new_dir.close(ctx.io);
             return wasi_core.WASI_EINVAL;
@@ -1434,16 +1480,83 @@ fn ctxPathOpenCore(
         return wasi_core.WASI_ESUCCESS;
     }
 
-    var file = host_dir.openFile(ctx.io, path, .{ .mode = .read_write }) catch |err| switch (err) {
-        error.FileNotFound => return @intCast(@intFromEnum(wasi.Errno.noent)),
-        error.AccessDenied => host_dir.openFile(ctx.io, path, .{ .mode = .read_only }) catch
-            return @intCast(@intFromEnum(wasi.Errno.acces)),
-        else => return wasi_core.WASI_EINVAL,
+    var file: std.Io.File = if (want_creat) blk: {
+        break :blk dir.createFile(ctx.io, path, .{
+            .read = can_read,
+            .truncate = want_trunc,
+            .exclusive = want_excl,
+        }) catch |err| return mapStdIoErr(err);
+    } else blk: {
+        const mode: std.Io.Dir.OpenFileOptions.Mode = if (can_read and can_write)
+            .read_write
+        else if (can_write)
+            .write_only
+        else
+            .read_only;
+        var f = dir.openFile(ctx.io, path, .{
+            .mode = mode,
+            .follow_symlinks = follow,
+        }) catch |err| switch (err) {
+            // Opening a path that turns out to be a directory without
+            // OFLAGS_DIRECTORY is allowed in preview1: fall through to
+            // openDir so the guest gets a directory fd.
+            error.IsDir => {
+                var nd = dir.openDir(ctx.io, path, .{
+                    .iterate = true,
+                    .follow_symlinks = follow,
+                }) catch |err2| return mapStdIoErr(err2);
+                const new_fd = ctx.fd_table.allocateFd();
+                ctx.fd_table.insert(new_fd, .{
+                    .kind = .directory,
+                    .host_dir = nd,
+                    .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
+                    .rights_base = base,
+                    .rights_inheriting = inh,
+                }) catch {
+                    nd.close(ctx.io);
+                    return wasi_core.WASI_EINVAL;
+                };
+                if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) return wasi_core.WASI_EINVAL;
+                return wasi_core.WASI_ESUCCESS;
+            },
+            else => return mapStdIoErr(err),
+        };
+        if (want_trunc) {
+            f.setLength(ctx.io, 0) catch |err| {
+                f.close(ctx.io);
+                return mapStdIoErr(err);
+            };
+        }
+        break :blk f;
     };
+
+    // Propagate FDFLAGS_APPEND/NONBLOCK to the host fd via fcntl so that
+    // host writes actually append and reads return EAGAIN as advertised.
+    // wasi-libc round-trips fdflags through fd_fdstat_get which re-reads
+    // O_APPEND/O_NONBLOCK from the host fd, so we need them to stick at
+    // the kernel level too.
+    if (builtin.os.tag == .linux) {
+        const want_append = (fdflags & wasi.FDFLAGS_APPEND) != 0;
+        const want_nonblock = (fdflags & wasi.FDFLAGS_NONBLOCK) != 0;
+        if (want_append or want_nonblock) {
+            const linux = std.os.linux;
+            const cur = linux.fcntl(file.handle, linux.F.GETFL, 0);
+            if (linux.errno(cur) == .SUCCESS) {
+                var new_flags = @as(u32, @intCast(cur));
+                if (want_append) new_flags |= 0o2000; // O_APPEND
+                if (want_nonblock) new_flags |= 0o4000; // O_NONBLOCK
+                _ = linux.fcntl(file.handle, linux.F.SETFL, new_flags);
+            }
+        }
+    }
+
     const new_fd = ctx.fd_table.allocateFd();
     ctx.fd_table.insert(new_fd, .{
         .kind = .regular_file,
         .host_fd = file.handle,
+        .fdflags = @intCast(fdflags & wasi.FDFLAGS_ALL),
+        .rights_base = base,
+        .rights_inheriting = inh,
     }) catch {
         file.close(ctx.io);
         return wasi_core.WASI_EINVAL;
@@ -1508,6 +1621,12 @@ fn mapStdIoErr(err: anyerror) i32 {
         error.FileSystem, error.AntivirusInterference => @intCast(@intFromEnum(wasi.Errno.io)),
         error.NetworkNotFound => @intCast(@intFromEnum(wasi.Errno.noent)),
         error.UnsupportedReparsePointType => @intCast(@intFromEnum(wasi.Errno.notsup)),
+        error.PipeBusy, error.DeviceBusy => @intCast(@intFromEnum(wasi.Errno.busy)),
+        error.FileLocksUnsupported => @intCast(@intFromEnum(wasi.Errno.notsup)),
+        error.FileTooBig => @intCast(@intFromEnum(wasi.Errno.fbig)),
+        error.WouldBlock => @intCast(@intFromEnum(wasi.Errno.again)),
+        error.ProcessFdQuotaExceeded => @intCast(@intFromEnum(wasi.Errno.mfile)),
+        error.SystemFdQuotaExceeded => @intCast(@intFromEnum(wasi.Errno.nfile)),
         else => wasi_core.WASI_EINVAL,
     };
 }
@@ -3152,4 +3271,343 @@ test "ctxPathReadlinkCore: short buffer truncates silently" {
     const n = wasi_core.memReadU32(&mem, bufused_ptr).?;
     try std.testing.expectEqual(@as(u32, 4), n);
     try std.testing.expectEqualStrings("long", mem[buf_ptr..][0..n]);
+}
+
+// ── path_open core tests (issue #420 phase 5) ──────────────────────────
+
+test "ctxPathOpenCore: bad fd / not-a-directory dirfd" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [128]u8 = @splat(0);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathOpenCore(ctx, &mem, -1, 0, 0, 0, 0, 0, 0, 0, 64),
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathOpenCore(ctx, &mem, 99, 0, 0, 0, 0, 0, 0, 0, 64),
+    );
+
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file });
+    defer ctx.fd_table.remove(4);
+    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    try std.testing.expectEqual(
+        notdir,
+        ctxPathOpenCore(ctx, &mem, 4, 0, 0, 0, 0, 0, 0, 0, 64),
+    );
+}
+
+test "ctxPathOpenCore: missing file without CREAT → noent" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "missing");
+
+    const noent: i32 = @intCast(@intFromEnum(wasi.Errno.noent));
+    try std.testing.expectEqual(
+        noent,
+        ctxPathOpenCore(ctx, &mem, @intCast(fd), 0, p.ptr, p.len, 0, 0, 0, 0, 64),
+    );
+}
+
+test "ctxPathOpenCore: CREAT creates new file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "newfile");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x1, 0, 0, 0, 64),
+    );
+    const new_fd = wasi_core.memReadU32(&mem, 64).?;
+    try std.testing.expect(new_fd != 0);
+    ctx.fd_table.remove(new_fd);
+
+    // Confirm the file now exists.
+    const f = try tmp.dir.openFile(testing_io, "newfile", .{ .mode = .read_only });
+    f.close(testing_io);
+}
+
+test "ctxPathOpenCore: CREAT|EXCL on existing file → exist" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "victim", .{});
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "victim");
+
+    const exist: i32 = @intCast(@intFromEnum(wasi.Errno.exist));
+    try std.testing.expectEqual(
+        exist,
+        ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x1 | 0x4, 0, 0, 0, 64),
+    );
+}
+
+test "ctxPathOpenCore: CREAT|TRUNC zeros existing file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "data", .{});
+    try f.writePositionalAll(testing_io, "hello world", 0);
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "data");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x1 | 0x8, 0, 0, 0, 64),
+    );
+    const new_fd = wasi_core.memReadU32(&mem, 64).?;
+    ctx.fd_table.remove(new_fd);
+
+    const stat_f = try tmp.dir.openFile(testing_io, "data", .{ .mode = .read_only });
+    defer stat_f.close(testing_io);
+    try std.testing.expectEqual(@as(u64, 0), try stat_f.length(testing_io));
+}
+
+test "ctxPathOpenCore: TRUNC without CREAT zeros existing file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "data2", .{});
+    try f.writePositionalAll(testing_io, "abc", 0);
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "data2");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x8, 0, 0, 0, 64),
+    );
+    const new_fd = wasi_core.memReadU32(&mem, 64).?;
+    ctx.fd_table.remove(new_fd);
+
+    const stat_f = try tmp.dir.openFile(testing_io, "data2", .{ .mode = .read_only });
+    defer stat_f.close(testing_io);
+    try std.testing.expectEqual(@as(u64, 0), try stat_f.length(testing_io));
+}
+
+test "ctxPathOpenCore: fdflags persists on FdEntry" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "f", .{});
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "f");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(
+            ctx,
+            &mem,
+            @intCast(dir_fd),
+            0,
+            p.ptr,
+            p.len,
+            0,
+            0,
+            0,
+            wasi.FDFLAGS_NONBLOCK | wasi.FDFLAGS_APPEND,
+            64,
+        ),
+    );
+    const new_fd = wasi_core.memReadU32(&mem, 64).?;
+    defer ctx.fd_table.remove(new_fd);
+
+    const entry = ctx.fd_table.get(new_fd).?;
+    try std.testing.expectEqual(
+        @as(u16, wasi.FDFLAGS_NONBLOCK | wasi.FDFLAGS_APPEND),
+        entry.fdflags,
+    );
+}
+
+test "ctxPathOpenCore: rights_base persists; zero is treated as all-ones" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "f", .{});
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "f");
+
+    // rights_base=0 → defaulted to all-ones.
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0, 0, 0, 0, 64),
+    );
+    const fd_default = wasi_core.memReadU32(&mem, 64).?;
+    try std.testing.expectEqual(@as(u64, ~@as(u64, 0)), ctx.fd_table.get(fd_default).?.rights_base);
+    ctx.fd_table.remove(fd_default);
+
+    // Explicit rights_base = FD_READ → preserved verbatim.
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(
+            ctx,
+            &mem,
+            @intCast(dir_fd),
+            0,
+            p.ptr,
+            p.len,
+            0,
+            wasi.RIGHTS_FD_READ,
+            0,
+            0,
+            64,
+        ),
+    );
+    const fd_ro = wasi_core.memReadU32(&mem, 64).?;
+    defer ctx.fd_table.remove(fd_ro);
+    try std.testing.expectEqual(wasi.RIGHTS_FD_READ, ctx.fd_table.get(fd_ro).?.rights_base);
+}
+
+test "ctxPathOpenCore: CREAT|DIRECTORY → einval" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "x");
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0x1 | 0x2, 0, 0, 0, 64),
+    );
+}
+
+test "ctxPathOpenCore: SYMLINK_FOLLOW honors dirflags bit" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "target", .{});
+    try f.writePositionalAll(testing_io, "ok", 0);
+    f.close(testing_io);
+    try tmp.dir.symLink(testing_io, "target", "link", .{});
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "link");
+
+    // dirflags=0x1 (SYMLINK_FOLLOW) → succeeds and lands on the target.
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0x1, p.ptr, p.len, 0, 0, 0, 0, 64),
+    );
+    const fd_followed = wasi_core.memReadU32(&mem, 64).?;
+    ctx.fd_table.remove(fd_followed);
+
+    // dirflags=0 (no follow) → preview1 spec: open the symlink itself
+    // is still an error path; std.Io maps O_NOFOLLOW on a symlink to
+    // SymLinkLoop / IsSymLink. We just assert it doesn't succeed.
+    const rc = ctxPathOpenCore(ctx, &mem, @intCast(dir_fd), 0, p.ptr, p.len, 0, 0, 0, 0, 64);
+    try std.testing.expect(rc != wasi_core.WASI_ESUCCESS);
+}
+
+test "ctxPathOpenCore: doRead/doWrite are gated by rights_base" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "f", .{});
+    try f.writePositionalAll(testing_io, "hello", 0);
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const dir_fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(dir_fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "f");
+
+    // Open read-only: writes must fail with BadFd.
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathOpenCore(
+            ctx,
+            &mem,
+            @intCast(dir_fd),
+            0,
+            p.ptr,
+            p.len,
+            0,
+            wasi.RIGHTS_FD_READ,
+            0,
+            0,
+            64,
+        ),
+    );
+    const fd_ro = wasi_core.memReadU32(&mem, 64).?;
+    defer ctx.fd_table.remove(fd_ro);
+
+    var entry_ro = ctx.fd_table.get(fd_ro).?;
+    var buf: [8]u8 = undefined;
+    const n = try doRead(ctx, &entry_ro, &buf);
+    try std.testing.expectEqual(@as(usize, 5), n);
+    try std.testing.expectError(error.BadFd, doWrite(ctx, &entry_ro, "x"));
 }
