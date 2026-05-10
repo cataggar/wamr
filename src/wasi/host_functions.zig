@@ -464,6 +464,192 @@ pub fn wasiPathOpen(env_opaque: *anyopaque) types.HostFnError!void {
     env.pushI32(result) catch return error.StackOverflow;
 }
 
+// ── path_* metadata + namespace host functions (issue #420 phase 3) ───
+
+/// `wasi_snapshot_preview1.path_filestat_get` — stat a path relative to a
+/// dirfd. Signature:
+/// (fd: i32, lookup_flags: i32, path_ptr: i32, path_len: i32, *filestat) -> i32
+pub fn wasiPathFilestatGet(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const buf_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const lookup_flags: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathFilestatGetCore(ctx, mem, fd, lookup_flags, path_ptr, path_len, buf_ptr)) catch
+        return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.path_filestat_set_times`. Signature:
+/// (fd: i32, lookup_flags: i32, path_ptr: i32, path_len: i32,
+///  atim: i64, mtim: i64, fst_flags: i32) -> i32
+pub fn wasiPathFilestatSetTimes(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const fst_flags_raw: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fst_flags: u16 = @intCast(fst_flags_raw & 0xFFFF);
+    const mtim: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const atim: u64 = @bitCast(env.popI64() catch return error.StackUnderflow);
+    const path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const lookup_flags: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathFilestatSetTimesCore(
+        ctx,
+        mem,
+        fd,
+        lookup_flags,
+        path_ptr,
+        path_len,
+        atim,
+        mtim,
+        fst_flags,
+    )) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.path_create_directory`. Signature:
+/// (fd: i32, path_ptr: i32, path_len: i32) -> i32
+pub fn wasiPathCreateDirectory(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathCreateDirectoryCore(ctx, mem, fd, path_ptr, path_len)) catch
+        return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.path_remove_directory`. Signature:
+/// (fd: i32, path_ptr: i32, path_len: i32) -> i32
+pub fn wasiPathRemoveDirectory(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathRemoveDirectoryCore(ctx, mem, fd, path_ptr, path_len)) catch
+        return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.path_unlink_file`. Signature:
+/// (fd: i32, path_ptr: i32, path_len: i32) -> i32
+pub fn wasiPathUnlinkFile(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathUnlinkFileCore(ctx, mem, fd, path_ptr, path_len)) catch
+        return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.path_link`. Signature:
+/// (old_fd: i32, old_flags: i32, old_path_ptr: i32, old_len: i32,
+///  new_fd: i32, new_path_ptr: i32, new_len: i32) -> i32
+pub fn wasiPathLink(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const new_path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const new_path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const new_fd = env.popI32() catch return error.StackUnderflow;
+    const old_path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const old_path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const old_flags: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const old_fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathLinkCore(
+        ctx,
+        mem,
+        old_fd,
+        old_flags,
+        old_path_ptr,
+        old_path_len,
+        new_fd,
+        new_path_ptr,
+        new_path_len,
+    )) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.path_rename`. Signature:
+/// (old_fd: i32, old_path_ptr: i32, old_len: i32,
+///  new_fd: i32, new_path_ptr: i32, new_len: i32) -> i32
+pub fn wasiPathRename(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const new_path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const new_path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const new_fd = env.popI32() catch return error.StackUnderflow;
+    const old_path_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const old_path_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const old_fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+    env.pushI32(ctxPathRenameCore(
+        ctx,
+        mem,
+        old_fd,
+        old_path_ptr,
+        old_path_len,
+        new_fd,
+        new_path_ptr,
+        new_path_len,
+    )) catch return error.StackOverflow;
+}
+
 // ── fd metadata host functions (issue #420 phase 1) ───────────────────
 
 /// `wasi_snapshot_preview1.fd_filestat_get` — populate a 64-byte
@@ -1168,8 +1354,8 @@ fn ctxPathOpenCore(
     const want_dir = (oflags & 0x2) != 0;
 
     if (want_dir) {
-        var new_dir = host_dir.openDir(ctx.io, path, .{ .iterate = true }) catch
-            return wasi_core.WASI_EBADF;
+        var new_dir = host_dir.openDir(ctx.io, path, .{ .iterate = true }) catch |err|
+            return mapStdIoErr(err);
         const new_fd = ctx.fd_table.allocateFd();
         ctx.fd_table.insert(new_fd, .{
             .kind = .directory,
@@ -1197,6 +1383,234 @@ fn ctxPathOpenCore(
         return wasi_core.WASI_EINVAL;
     };
     if (!wasi_core.memWriteU32(mem, fd_ptr, new_fd)) return wasi_core.WASI_EINVAL;
+    return wasi_core.WASI_ESUCCESS;
+}
+
+// ── path_* core helpers (issue #420 phase 3) ──────────────────────────
+
+/// Validate that `dirfd` resolves to a directory entry with an open
+/// `host_dir`, returning either the std.Io.Dir or an early errno.
+fn pPathLookup(
+    ctx: *wasi.WasiCtx,
+    dirfd: i32,
+) union(enum) {
+    ok: std.Io.Dir,
+    err: i32,
+} {
+    if (dirfd < 0) return .{ .err = wasi_core.WASI_EBADF };
+    const u_fd: u32 = @intCast(dirfd);
+    const entry = ctx.fd_table.get(u_fd) orelse return .{ .err = wasi_core.WASI_EBADF };
+    if (entry.kind != .directory) return .{ .err = @intCast(@intFromEnum(wasi.Errno.notdir)) };
+    const dir = entry.host_dir orelse return .{ .err = wasi_core.WASI_EBADF };
+    return .{ .ok = dir };
+}
+
+/// Bounds-check `(path_ptr, path_len)` against linear memory and reject
+/// embedded NUL bytes (preview1 paths are byte slices, not C strings, but
+/// the std.Io.Dir layer asserts no NULs).
+fn readGuestPath(mem: []u8, path_ptr: u32, path_len: u32) ?[]const u8 {
+    if (@as(u64, path_ptr) + path_len > mem.len) return null;
+    const slice = mem[path_ptr..][0..path_len];
+    if (std.mem.indexOfScalar(u8, slice, 0) != null) return null;
+    return slice;
+}
+
+/// Translate a `std.Io.Dir.{CreateDir,DeleteFile,DeleteDir,Rename,HardLink,
+/// StatFile}Error` (or any superset) into the matching preview1 errno.
+/// Errors not enumerated fall through to `inval`.
+fn mapStdIoErr(err: anyerror) i32 {
+    return switch (err) {
+        error.FileNotFound => @intCast(@intFromEnum(wasi.Errno.noent)),
+        error.PathAlreadyExists => @intCast(@intFromEnum(wasi.Errno.exist)),
+        error.AccessDenied, error.PermissionDenied => @intCast(@intFromEnum(wasi.Errno.acces)),
+        error.IsDir => @intCast(@intFromEnum(wasi.Errno.isdir)),
+        error.NotDir => @intCast(@intFromEnum(wasi.Errno.notdir)),
+        error.DirNotEmpty => @intCast(@intFromEnum(wasi.Errno.notempty)),
+        error.SymLinkLoop => @intCast(@intFromEnum(wasi.Errno.loop)),
+        error.NameTooLong => @intCast(@intFromEnum(wasi.Errno.nametoolong)),
+        error.BadPathName => wasi_core.WASI_EINVAL,
+        error.NoSpaceLeft => @intCast(@intFromEnum(wasi.Errno.nospc)),
+        error.DiskQuota => @intCast(@intFromEnum(wasi.Errno.dquot)),
+        error.ReadOnlyFileSystem => @intCast(@intFromEnum(wasi.Errno.rofs)),
+        error.FileBusy => @intCast(@intFromEnum(wasi.Errno.busy)),
+        error.LinkQuotaExceeded => @intCast(@intFromEnum(wasi.Errno.mlink)),
+        error.CrossDevice => @intCast(@intFromEnum(wasi.Errno.xdev)),
+        error.OperationUnsupported => @intCast(@intFromEnum(wasi.Errno.notsup)),
+        error.SystemResources => @intCast(@intFromEnum(wasi.Errno.nomem)),
+        error.NoDevice => @intCast(@intFromEnum(wasi.Errno.nodev)),
+        else => wasi_core.WASI_EINVAL,
+    };
+}
+
+fn ctxPathFilestatGetCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    lookup_flags: u32,
+    path_ptr: u32,
+    path_len: u32,
+    buf_ptr: u32,
+) i32 {
+    const dir = switch (pPathLookup(ctx, fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
+    const follow = (lookup_flags & 0x1) != 0;
+    const stat = dir.statFile(ctx.io, path, .{ .follow_symlinks = follow }) catch |err|
+        return mapStdIoErr(err);
+    const filetype = filetypeFromIoKind(stat.kind);
+    return writeFilestat(mem, buf_ptr, stat, filetype);
+}
+
+fn ctxPathFilestatSetTimesCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    lookup_flags: u32,
+    path_ptr: u32,
+    path_len: u32,
+    atim: u64,
+    mtim: u64,
+    fst_flags: u16,
+) i32 {
+    const exclusive_a = wasi.FSTFLAGS_ATIM | wasi.FSTFLAGS_ATIM_NOW;
+    if ((fst_flags & exclusive_a) == exclusive_a) return wasi_core.WASI_EINVAL;
+    const exclusive_m = wasi.FSTFLAGS_MTIM | wasi.FSTFLAGS_MTIM_NOW;
+    if ((fst_flags & exclusive_m) == exclusive_m) return wasi_core.WASI_EINVAL;
+
+    const dir = switch (pPathLookup(ctx, fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
+
+    if (builtin.os.tag != .linux) return @intCast(@intFromEnum(wasi.Errno.notsup));
+    const linux = std.os.linux;
+
+    // utimensat takes a NUL-terminated C string; copy into a stack buffer.
+    var c_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (path.len >= c_path_buf.len) return @intCast(@intFromEnum(wasi.Errno.nametoolong));
+    @memcpy(c_path_buf[0..path.len], path);
+    c_path_buf[path.len] = 0;
+    const c_path: [*:0]const u8 = @ptrCast(&c_path_buf);
+
+    var times: [2]linux.timespec = undefined;
+    times[0] = nsToFutimens(atim, fst_flags, wasi.FSTFLAGS_ATIM, wasi.FSTFLAGS_ATIM_NOW);
+    times[1] = nsToFutimens(mtim, fst_flags, wasi.FSTFLAGS_MTIM, wasi.FSTFLAGS_MTIM_NOW);
+
+    const flags: u32 = if ((lookup_flags & 0x1) == 0) linux.AT.SYMLINK_NOFOLLOW else 0;
+    const rc = linux.utimensat(@intCast(dir.handle), c_path, &times, flags);
+    return mapLinuxErrno(rc);
+}
+
+fn ctxPathCreateDirectoryCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    path_ptr: u32,
+    path_len: u32,
+) i32 {
+    const dir = switch (pPathLookup(ctx, fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
+    dir.createDir(ctx.io, path, .default_dir) catch |err| return mapStdIoErr(err);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxPathRemoveDirectoryCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    path_ptr: u32,
+    path_len: u32,
+) i32 {
+    const dir = switch (pPathLookup(ctx, fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
+    dir.deleteDir(ctx.io, path) catch |err| return mapStdIoErr(err);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxPathUnlinkFileCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    path_ptr: u32,
+    path_len: u32,
+) i32 {
+    const dir = switch (pPathLookup(ctx, fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const path = readGuestPath(mem, path_ptr, path_len) orelse return wasi_core.WASI_EINVAL;
+    dir.deleteFile(ctx.io, path) catch |err| return mapStdIoErr(err);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxPathLinkCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    old_fd: i32,
+    old_flags: u32,
+    old_path_ptr: u32,
+    old_path_len: u32,
+    new_fd: i32,
+    new_path_ptr: u32,
+    new_path_len: u32,
+) i32 {
+    const old_dir = switch (pPathLookup(ctx, old_fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const new_dir = switch (pPathLookup(ctx, new_fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const old_path = readGuestPath(mem, old_path_ptr, old_path_len) orelse
+        return wasi_core.WASI_EINVAL;
+    const new_path = readGuestPath(mem, new_path_ptr, new_path_len) orelse
+        return wasi_core.WASI_EINVAL;
+    const follow = (old_flags & 0x1) != 0;
+    std.Io.Dir.hardLink(
+        old_dir,
+        old_path,
+        new_dir,
+        new_path,
+        ctx.io,
+        .{ .follow_symlinks = follow },
+    ) catch |err| return mapStdIoErr(err);
+    return wasi_core.WASI_ESUCCESS;
+}
+
+fn ctxPathRenameCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    old_fd: i32,
+    old_path_ptr: u32,
+    old_path_len: u32,
+    new_fd: i32,
+    new_path_ptr: u32,
+    new_path_len: u32,
+) i32 {
+    const old_dir = switch (pPathLookup(ctx, old_fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const new_dir = switch (pPathLookup(ctx, new_fd)) {
+        .err => |e| return e,
+        .ok => |d| d,
+    };
+    const old_path = readGuestPath(mem, old_path_ptr, old_path_len) orelse
+        return wasi_core.WASI_EINVAL;
+    const new_path = readGuestPath(mem, new_path_ptr, new_path_len) orelse
+        return wasi_core.WASI_EINVAL;
+    std.Io.Dir.rename(old_dir, old_path, new_dir, new_path, ctx.io) catch |err|
+        return mapStdIoErr(err);
     return wasi_core.WASI_ESUCCESS;
 }
 
@@ -1479,6 +1893,7 @@ fn mapLinuxErrno(rc: usize) i32 {
         .ROFS => @intCast(@intFromEnum(wasi.Errno.rofs)),
         .ISDIR => @intCast(@intFromEnum(wasi.Errno.isdir)),
         .NOTDIR => @intCast(@intFromEnum(wasi.Errno.notdir)),
+        .NOTEMPTY => @intCast(@intFromEnum(wasi.Errno.notempty)),
         .NOENT => @intCast(@intFromEnum(wasi.Errno.noent)),
         .EXIST => @intCast(@intFromEnum(wasi.Errno.exist)),
         .FBIG => @intCast(@intFromEnum(wasi.Errno.fbig)),
@@ -1487,6 +1902,10 @@ fn mapLinuxErrno(rc: usize) i32 {
         .OPNOTSUPP => @intCast(@intFromEnum(wasi.Errno.notsup)),
         .DQUOT => @intCast(@intFromEnum(wasi.Errno.dquot)),
         .NXIO => @intCast(@intFromEnum(wasi.Errno.nxio)),
+        .LOOP => @intCast(@intFromEnum(wasi.Errno.loop)),
+        .NAMETOOLONG => @intCast(@intFromEnum(wasi.Errno.nametoolong)),
+        .XDEV => @intCast(@intFromEnum(wasi.Errno.xdev)),
+        .MLINK => @intCast(@intFromEnum(wasi.Errno.mlink)),
         else => wasi_core.WASI_EINVAL,
     };
 }
@@ -1556,6 +1975,13 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "args_get", &wasiArgsGet },
         .{ "random_get", &wasiRandomGet },
         .{ "path_open", &wasiPathOpen },
+        .{ "path_filestat_get", &wasiPathFilestatGet },
+        .{ "path_filestat_set_times", &wasiPathFilestatSetTimes },
+        .{ "path_create_directory", &wasiPathCreateDirectory },
+        .{ "path_remove_directory", &wasiPathRemoveDirectory },
+        .{ "path_unlink_file", &wasiPathUnlinkFile },
+        .{ "path_link", &wasiPathLink },
+        .{ "path_rename", &wasiPathRename },
     };
 
     inline for (map) |entry| {
@@ -1683,7 +2109,7 @@ test "resolveWasiFunction: unknown returns null" {
     try std.testing.expect(result == null);
 }
 
-test "resolveWasiFunction: all 29 functions resolve" {
+test "resolveWasiFunction: all 36 functions resolve" {
     const names = [_][]const u8{
         "proc_exit",          "thread-spawn",         "fd_write",
         "fd_read",            "fd_pread",             "fd_pwrite",
@@ -1694,7 +2120,9 @@ test "resolveWasiFunction: all 29 functions resolve" {
         "fd_sync",            "fd_tell",              "fd_prestat_get",
         "fd_prestat_dir_name", "clock_time_get",      "environ_sizes_get",
         "environ_get",        "args_sizes_get",       "args_get",
-        "random_get",         "path_open",
+        "random_get",         "path_open",            "path_filestat_get",
+        "path_filestat_set_times", "path_create_directory", "path_remove_directory",
+        "path_unlink_file",   "path_link",            "path_rename",
     };
     for (names) |name| {
         const result = resolveWasiFunction(name);
@@ -2027,4 +2455,390 @@ test "ctxFdReaddirCore: encodes preview1 dirents" {
     }
     try std.testing.expect(saw_alpha);
     try std.testing.expect(saw_beta);
+}
+
+// ── path_* tests (issue #420 phase 3) ──────────────────────────────────
+
+/// Helper: register a tmpDir as a directory fd in `ctx`. The caller must
+/// `defer ctx.fd_table.remove(fd)` to keep `tmp.cleanup()` from
+/// double-closing the dir handle.
+fn registerTmpDirFd(ctx: *wasi.WasiCtx, dir: std.Io.Dir) !u32 {
+    const fd = ctx.fd_table.allocateFd();
+    try ctx.fd_table.insert(fd, .{
+        .kind = .directory,
+        .host_dir = dir,
+    });
+    return fd;
+}
+
+/// Encode a path string into linear memory at offset 16 and return
+/// `(path_ptr, path_len)`. Mirrors the layout used by the existing path_*
+/// tests: the filestat / nresult slot lives at offset 0..8 and the path
+/// bytes live at 16..16+len.
+fn encodePath(mem: []u8, path: []const u8) struct { ptr: u32, len: u32 } {
+    @memcpy(mem[16..][0..path.len], path);
+    return .{ .ptr = 16, .len = @intCast(path.len) };
+}
+
+test "ctxPathFilestatGetCore: bad fd / not-a-directory dirfd / noent" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [128]u8 = @splat(0);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathFilestatGetCore(ctx, &mem, -1, 0, 0, 0, 64),
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathFilestatGetCore(ctx, &mem, 99, 0, 0, 0, 64),
+    );
+
+    // Register a regular_file fd at 4 → notdir.
+    try ctx.fd_table.insert(4, .{ .kind = .regular_file, .host_fd = 0 });
+    defer ctx.fd_table.remove(4);
+    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    try std.testing.expectEqual(
+        notdir,
+        ctxPathFilestatGetCore(ctx, &mem, 4, 0, 0, 0, 64),
+    );
+}
+
+test "ctxPathFilestatGetCore: happy path on a regular file" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f = try tmp.dir.createFile(testing_io, "stat.bin", .{});
+    try f.writePositionalAll(testing_io, "hi", 0);
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "stat.bin");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathFilestatGetCore(ctx, &mem, @intCast(fd), 0x1, p.ptr, p.len, 0),
+    );
+    // filestat.size lives at offset 32, filetype at offset 16.
+    try std.testing.expectEqual(@as(u64, 2), wasi_core.memReadU64(&mem, 32).?);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(wasi.Filetype.regular_file)), mem[16]);
+}
+
+test "ctxPathFilestatSetTimesCore: explicit ns round-trip via stat" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f = try tmp.dir.createFile(testing_io, "times.bin", .{});
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "times.bin");
+    const new_atim: u64 = 1_700_000_000_000_000_000;
+    const new_mtim: u64 = 1_800_000_000_000_000_000;
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathFilestatSetTimesCore(
+            ctx,
+            &mem,
+            @intCast(fd),
+            0x1, // SYMLINK_FOLLOW
+            p.ptr,
+            p.len,
+            new_atim,
+            new_mtim,
+            wasi.FSTFLAGS_ATIM | wasi.FSTFLAGS_MTIM,
+        ),
+    );
+
+    // Read back via path_filestat_get and verify mtim round-tripped.
+    var mem2: [128]u8 = @splat(0);
+    const p2 = encodePath(&mem2, "times.bin");
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathFilestatGetCore(ctx, &mem2, @intCast(fd), 0x1, p2.ptr, p2.len, 0),
+    );
+    // mtim sits at offset 48; ns precision varies by filesystem so compare
+    // truncated to seconds.
+    const got_mtim = wasi_core.memReadU64(&mem2, 48).?;
+    try std.testing.expectEqual(new_mtim / std.time.ns_per_s, got_mtim / std.time.ns_per_s);
+}
+
+test "ctxPathFilestatSetTimesCore: conflicting fst_flags return EINVAL" {
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [32]u8 = @splat(0);
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxPathFilestatSetTimesCore(
+            ctx,
+            &mem,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            wasi.FSTFLAGS_ATIM | wasi.FSTFLAGS_ATIM_NOW,
+        ),
+    );
+}
+
+test "ctxPathCreateDirectoryCore: happy + exist + bad fd + notdir" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [128]u8 = @splat(0);
+    const p = encodePath(&mem, "newdir");
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathCreateDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+    );
+
+    // Second create → exist.
+    const exist: i32 = @intCast(@intFromEnum(wasi.Errno.exist));
+    try std.testing.expectEqual(
+        exist,
+        ctxPathCreateDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+    );
+
+    // Bad fd.
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathCreateDirectoryCore(ctx, &mem, -1, p.ptr, p.len),
+    );
+
+    // Not a directory.
+    try ctx.fd_table.insert(99, .{ .kind = .regular_file, .host_fd = 0 });
+    defer ctx.fd_table.remove(99);
+    const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+    try std.testing.expectEqual(
+        notdir,
+        ctxPathCreateDirectoryCore(ctx, &mem, 99, p.ptr, p.len),
+    );
+}
+
+test "ctxPathRemoveDirectoryCore: empty ok, populated -> notempty, regular -> notdir" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDir(testing_io, "empty", .default_dir);
+    try tmp.dir.createDir(testing_io, "populated", .default_dir);
+    {
+        var sub = try tmp.dir.openDir(testing_io, "populated", .{});
+        defer sub.close(testing_io);
+        const f = try sub.createFile(testing_io, "guard", .{});
+        f.close(testing_io);
+    }
+    const f = try tmp.dir.createFile(testing_io, "regular", .{});
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [128]u8 = @splat(0);
+
+    {
+        const p = encodePath(&mem, "empty");
+        try std.testing.expectEqual(
+            wasi_core.WASI_ESUCCESS,
+            ctxPathRemoveDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+        );
+    }
+    {
+        const p = encodePath(&mem, "populated");
+        const notempty: i32 = @intCast(@intFromEnum(wasi.Errno.notempty));
+        try std.testing.expectEqual(
+            notempty,
+            ctxPathRemoveDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+        );
+    }
+    {
+        const p = encodePath(&mem, "regular");
+        const notdir: i32 = @intCast(@intFromEnum(wasi.Errno.notdir));
+        try std.testing.expectEqual(
+            notdir,
+            ctxPathRemoveDirectoryCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+        );
+    }
+}
+
+test "ctxPathUnlinkFileCore: happy + noent + isdir-on-directory" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const f = try tmp.dir.createFile(testing_io, "victim", .{});
+    f.close(testing_io);
+    try tmp.dir.createDir(testing_io, "sub", .default_dir);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [128]u8 = @splat(0);
+
+    {
+        const p = encodePath(&mem, "victim");
+        try std.testing.expectEqual(
+            wasi_core.WASI_ESUCCESS,
+            ctxPathUnlinkFileCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+        );
+    }
+    {
+        const p = encodePath(&mem, "victim");
+        const noent: i32 = @intCast(@intFromEnum(wasi.Errno.noent));
+        try std.testing.expectEqual(
+            noent,
+            ctxPathUnlinkFileCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+        );
+    }
+    {
+        const p = encodePath(&mem, "sub");
+        const isdir: i32 = @intCast(@intFromEnum(wasi.Errno.isdir));
+        try std.testing.expectEqual(
+            isdir,
+            ctxPathUnlinkFileCore(ctx, &mem, @intCast(fd), p.ptr, p.len),
+        );
+    }
+}
+
+test "ctxPathLinkCore: cross-dirfd link succeeds and shares ino" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing_io, "src", .default_dir);
+    try tmp.dir.createDir(testing_io, "dst", .default_dir);
+
+    var src = try tmp.dir.openDir(testing_io, "src", .{});
+    defer src.close(testing_io);
+    var dst = try tmp.dir.openDir(testing_io, "dst", .{});
+    defer dst.close(testing_io);
+
+    const f = try src.createFile(testing_io, "orig", .{});
+    try f.writePositionalAll(testing_io, "data", 0);
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const old_fd = try registerTmpDirFd(ctx, src);
+    defer ctx.fd_table.remove(old_fd);
+    const new_fd = try registerTmpDirFd(ctx, dst);
+    defer ctx.fd_table.remove(new_fd);
+
+    var mem: [256]u8 = @splat(0);
+    const op = "orig";
+    const np = "linked";
+    @memcpy(mem[16..][0..op.len], op);
+    @memcpy(mem[64..][0..np.len], np);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathLinkCore(
+            ctx,
+            &mem,
+            @intCast(old_fd),
+            0,
+            16,
+            @intCast(op.len),
+            @intCast(new_fd),
+            64,
+            @intCast(np.len),
+        ),
+    );
+
+    // Confirm the link landed by stat'ing both ends and comparing inode.
+    const src_stat = try src.statFile(testing_io, "orig", .{});
+    const dst_stat = try dst.statFile(testing_io, "linked", .{});
+    try std.testing.expectEqual(src_stat.inode, dst_stat.inode);
+}
+
+test "ctxPathRenameCore: same-dir rename + bad fd" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile(testing_io, "before", .{});
+    try f.writePositionalAll(testing_io, "x", 0);
+    f.close(testing_io);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const fd = try registerTmpDirFd(ctx, tmp.dir);
+    defer ctx.fd_table.remove(fd);
+
+    var mem: [256]u8 = @splat(0);
+    const op = "before";
+    const np = "after";
+    @memcpy(mem[16..][0..op.len], op);
+    @memcpy(mem[64..][0..np.len], np);
+
+    try std.testing.expectEqual(
+        wasi_core.WASI_ESUCCESS,
+        ctxPathRenameCore(
+            ctx,
+            &mem,
+            @intCast(fd),
+            16,
+            @intCast(op.len),
+            @intCast(fd),
+            64,
+            @intCast(np.len),
+        ),
+    );
+
+    // Source gone, destination present.
+    try std.testing.expectError(
+        error.FileNotFound,
+        tmp.dir.statFile(testing_io, "before", .{}),
+    );
+    const stat = try tmp.dir.statFile(testing_io, "after", .{});
+    try std.testing.expectEqual(@as(u64, 1), stat.size);
+
+    // Bad new_fd.
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxPathRenameCore(
+            ctx,
+            &mem,
+            @intCast(fd),
+            16,
+            @intCast(op.len),
+            -1,
+            64,
+            @intCast(np.len),
+        ),
+    );
 }
