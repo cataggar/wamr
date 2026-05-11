@@ -818,6 +818,17 @@ pub const ModuleInstance = struct {
     gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
     /// Cached evaluated element segment values (spec requires one-time evaluation)
     cached_elem_values: []?[]Value = &.{},
+    /// Optional pointer to a `?u32` slot the component-layer caller
+    /// uses to capture a guest's `wasi_snapshot_preview1.proc_exit`
+    /// numeric exit code (issue #436). When non-null, `wasiProcExit`
+    /// writes the requested code through this pointer in addition to
+    /// trapping the guest. The component-model `runLoadedComponent`
+    /// path wires this to `WasiCliAdapter.exit_code` so the CLI can
+    /// mirror it into the host process exit code. Stays null on the
+    /// core-wasm path — that route already encodes the exit code on
+    /// the attached `WasiCtx` and unwinds via `wasiProcExit`'s trap.
+    /// Not owned by `ModuleInstance`.
+    exit_code_sink: ?*?u32 = null,
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {
         const exp = self.module.findExport(name, .function) orelse return null;

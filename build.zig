@@ -692,6 +692,32 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     run_hello.expectStdErrEqual("hello from zig component\n");
     run_step.dependOn(&run_hello.step);
 
+    // ── zig-exit ───────────────────────────────────────────────────
+    // Exercises the component exit-code path (issue #436): `_start`
+    // writes a marker line then calls `proc_exit(7)`; through the
+    // wasi-preview1 adapter that becomes `wasi:cli/exit.exit-with-code(7)`,
+    // which `runLoadedComponent` propagates as `RunOutcome.exit_code`
+    // and `main.zig:runComponent` maps to host exit code 7.
+    const exit_core = compileZigWasm(b, .{
+        .source = "examples/components/zig-exit/src/main.zig",
+        .target_triple = "wasm32-wasi",
+        .exports = &.{"_start"},
+        .output = "zig-exit.core.wasm",
+    });
+    const exit_component = makeCommandComponent(b, .{
+        .name = "zig-exit",
+        .core = exit_core,
+        .adapter = adapter,
+    });
+    installAndValidate(b, examples_step, exit_component, "zig-exit.component.wasm");
+
+    const run_exit = b.addRunArtifact(wamr_exe);
+    run_exit.addArg("run");
+    run_exit.addFileArg(exit_component);
+    run_exit.expectExitCode(7);
+    run_exit.expectStdErrEqual("exiting with code 7\n");
+    run_step.dependOn(&run_exit.step);
+
     // ── zig-adder ──────────────────────────────────────────────────
     // Library component (no `run`): exports `docs:adder/add@0.1.0`.
     const adder_core = compileZigWasm(b, .{

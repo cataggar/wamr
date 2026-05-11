@@ -286,7 +286,15 @@ fn runComponent(
         stdout_file.writeStreamingAll(io, captured) catch {};
     }
 
-    std.process.exit(if (outcome.is_ok) 0 else 1);
+    // Prefer the explicit numeric exit code recorded by
+    // `wasi:cli/exit.exit-with-code` / preview1 `proc_exit` (#436);
+    // fall back to the boolean is_ok mapping when the component
+    // returned normally without recording a code. POSIX exit codes
+    // are 8-bit on most hosts, so saturate to 1 on overflow.
+    const rc: u8 = if (outcome.exit_code) |code|
+        std.math.cast(u8, code) orelse 1
+    else if (outcome.is_ok) 0 else 1;
+    std.process.exit(rc);
 }
 
 fn runHttpComponent(

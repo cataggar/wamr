@@ -77,6 +77,16 @@ pub fn wasiProcExit(env_opaque: *anyopaque) types.HostFnError!void {
         ctx.exit_code = @bitCast(code);
     }
 
+    // Component-model wiring (issue #436): the wamr component flow has no
+    // `WasiCtx`, so writeback above is a no-op. When the component layer
+    // routed a guest preview1 `proc_exit` here via wasi auto-resolution
+    // (vs through the wasm-tools adapter), record the numeric code on the
+    // host-side slot so `runLoadedComponent`/`runComponent` can mirror it
+    // into the host process exit code.
+    if (env.module_inst.exit_code_sink) |sink| {
+        sink.* = @bitCast(code);
+    }
+
     if (env.module_inst.thread_manager) |tm| {
         tm.signalTrap();
     }

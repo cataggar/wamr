@@ -264,18 +264,28 @@ pub fn callComponentFuncByLocal(
     // 5. Call the core function
     interp.executeFunction(env, exported.core_func_idx) catch {
         if (env.host_trap) |ht| {
-            std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
-            if (ht.component_func_idx != std.math.maxInt(u32))
-                std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
-            if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+            // Suppress the diagnostic when this trap is actually a
+            // `wasi_snapshot_preview1.proc_exit` unwind that already
+            // landed the numeric code on `exit_code_sink` — that's
+            // normal control flow, not a real error (issue #436).
+            const is_proc_exit = if (module_inst.exit_code_sink) |sink|
+                sink.* != null
+            else
+                false;
+            if (!is_proc_exit) {
+                std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
+                if (ht.component_func_idx != std.math.maxInt(u32))
+                    std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
+                if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+                    std.debug.print(
+                        " import='{s}.{s}'",
+                        .{ ht.import_module_name, ht.import_field_name },
+                    );
                 std.debug.print(
-                    " import='{s}.{s}'",
-                    .{ ht.import_module_name, ht.import_field_name },
+                    " stage={s} error={s}\n",
+                    .{ @tagName(ht.stage), ht.err_name },
                 );
-            std.debug.print(
-                " stage={s} error={s}\n",
-                .{ @tagName(ht.stage), ht.err_name },
-            );
+            }
         }
         return error.TrapInCoreFunction;
     };
