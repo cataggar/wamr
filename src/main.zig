@@ -360,6 +360,14 @@ fn runAotReal(data: []const u8, allocator: std.mem.Allocator) void {
         std.debug.print("Error: failed to load AOT module: {}\n", .{err});
         std.process.exit(1);
     };
+    // Mirror the load/unload pairing used by every other `aot_loader.load`
+    // call site in the repo (compiler/emit_aot.zig, tests/coldstart_test.zig,
+    // tests/aot_harness.zig). Without this, `runAotReal` leaks every owned
+    // slice on `AotModule` — func_offsets, local_func_type_indices,
+    // func_types, exports, memories, data_segments, tables, imports,
+    // global_inits, elem_segments — which DebugAllocator prints to stderr
+    // on exit, even though the AOT image executes successfully.
+    defer aot_loader.unload(&aot_module, allocator);
 
     const aot_inst = aot_runtime.instantiate(&aot_module, allocator) catch |err| {
         std.debug.print("Error: failed to instantiate AOT module: {}\n", .{err});
