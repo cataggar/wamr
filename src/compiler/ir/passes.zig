@@ -5291,39 +5291,70 @@ fn findTerminatorIndex(block: *const ir.BasicBlock) usize {
 
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
-    // Module-level: inline small leaf callees before per-function passes.
-    // Iterate to fixpoint so callers of callers also benefit.
-    var inline_iter: u32 = 0;
-    var inlined_count: u32 = 0;
-    while (inline_iter < 4) : (inline_iter += 1) {
-        const iter_inlined = try inlineSmallFunctionsCount(module, allocator);
-        if (iter_inlined == 0) break;
-        inlined_count += iter_inlined;
-        total_changes += 1;
-    }
-    if (inlined_count != 0) {
-        std.log.debug("inlineSmallFunctions: inlined {d} call(s) over {d} iteration(s)", .{ inlined_count, inline_iter });
-    }
-    for (module.functions.items) |*func| {
-        // SSA promotion: run once before the fixpoint loop.
-        if (try promoteLocalsToSSA(func, allocator)) {
+
+    // Outer loop: alternate between module-level inlining and per-function
+    // fixpoint passes. The first per-function round constant-folds
+    // arguments at call sites (e.g. via `forwardLocalGet` + `constantFold`),
+    // which can make previously-borderline callees newly inlinable, or
+    // exposes brand-new inline opportunities in callers whose body was
+    // simplified. Re-running module-level inlining lets the second
+    // per-function round specialise those freshly inlined bodies.
+    //
+    // Cap the outer iterations at 2 — sufficient for the
+    // constant-argument-specialisation cases that motivate this loop,
+    // without exploding compile time.
+    const outer_max: u32 = 2;
+    var outer_iter: u32 = 0;
+    while (outer_iter < outer_max) : (outer_iter += 1) {
+        // Module-level: inline small leaf callees. Iterate to fixpoint so
+        // callers of callers also benefit within a single outer round.
+        var inline_iter: u32 = 0;
+        var inlined_count: u32 = 0;
+        while (inline_iter < 4) : (inline_iter += 1) {
+            const iter_inlined = try inlineSmallFunctionsCount(module, allocator);
+            if (iter_inlined == 0) break;
+            inlined_count += iter_inlined;
             total_changes += 1;
-            if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
+        }
+        if (inlined_count != 0) {
+            std.log.debug(
+                "inlineSmallFunctions (outer {d}): inlined {d} call(s) over {d} iteration(s)",
+                .{ outer_iter, inlined_count, inline_iter },
+            );
+        } else if (outer_iter != 0) {
+            // No additional inlining opportunities surfaced after the first
+            // per-function fixpoint, so a second per-function round would
+            // be redundant. Stop here.
+            break;
         }
 
-        // Iterate the pipeline until fixpoint so that passes can re-expose
-        // opportunities for each other (e.g. constantFold → CSE → DCE →
-        // more constantFold). Cap iterations as a safety net.
-        var iter: u32 = 0;
-        while (iter < 8) : (iter += 1) {
-            var any_changed = false;
-            for (passes) |pass| {
-                if (try pass(func, allocator)) {
-                    any_changed = true;
+        for (module.functions.items) |*func| {
+            // SSA promotion: only meaningful on the first outer round. On
+            // later rounds the function is already past mem2reg and any new
+            // local_set/get inserted by inlining is handled by
+            // `forwardLocalGet` + `deadLocalSetElimination`.
+            if (outer_iter == 0) {
+                if (try promoteLocalsToSSA(func, allocator)) {
                     total_changes += 1;
+                    if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
                 }
             }
-            if (!any_changed) break;
+
+            // Iterate the pipeline until fixpoint so that passes can
+            // re-expose opportunities for each other (e.g. constantFold →
+            // CSE → DCE → more constantFold). Cap iterations as a safety
+            // net.
+            var iter: u32 = 0;
+            while (iter < 8) : (iter += 1) {
+                var any_changed = false;
+                for (passes) |pass| {
+                    if (try pass(func, allocator)) {
+                        any_changed = true;
+                        total_changes += 1;
+                    }
+                }
+                if (!any_changed) break;
+            }
         }
     }
     return total_changes;
@@ -7546,6 +7577,86 @@ test "inlineSmallFunctions: br_table callee gets inlined with remapped targets" 
     try std.testing.expectEqual(clone_offset + 2, bt.targets[1]);
     try std.testing.expectEqual(clone_offset + 3, bt.default);
     try std.testing.expectEqual(module.functions.items[1].blocks.items[0].instructions.items[0].dest.?, bt.index);
+}
+
+test "runPasses: re-runs inlining after first per-function fixpoint" {
+    // Scenario: a caller invokes a small leaf callee with an argument that
+    // is itself the result of a small chain (local.get → constant fold).
+    // After the first per-function fixpoint round the call survives, but
+    // it now has a constant-folded argument, which still satisfies the
+    // existing inliner's eligibility. The second outer round must inline
+    // it. We use two levels of indirection so that the first round only
+    // inlines the innermost callee, and the second round inlines what
+    // becomes the new leaf after that.
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    // f0 (innermost leaf): fn id(x) -> x.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    {
+        const f = &module.functions.items[0];
+        const cb = try f.newBlock();
+        _ = f.newVReg();
+        const v_get = f.newVReg();
+        try f.getBlock(cb).append(.{ .op = .{ .local_get = 0 }, .dest = v_get, .type = .i32 });
+        try f.getBlock(cb).append(.{ .op = .{ .ret = v_get } });
+    }
+
+    // f1 (middle): fn middle(x) -> x. Calls f0(x). On the first outer
+    // round f1 is not eligible (it contains a `call`), so its body is
+    // simplified but f2's call to it survives. After the first
+    // per-function fixpoint, f0 has been inlined into f1, making f1 a
+    // pass-through that becomes eligible. The second outer round then
+    // inlines f1 into f2.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 1, 1, 1));
+    const f1_args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(f1_args);
+    {
+        const f = &module.functions.items[1];
+        const cb = try f.newBlock();
+        _ = f.newVReg();
+        const v_arg = f.newVReg();
+        const v_ret = f.newVReg();
+        try f.getBlock(cb).append(.{ .op = .{ .local_get = 0 }, .dest = v_arg, .type = .i32 });
+        f1_args[0] = v_arg;
+        try f.getBlock(cb).append(.{ .op = .{ .call = .{ .func_idx = 0, .args = f1_args } }, .dest = v_ret, .type = .i32 });
+        try f.getBlock(cb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    // f2 (caller): fn main() -> i32 { call middle(42); ret }.
+    try module.functions.append(allocator, ir.IrFunction.init(allocator, 0, 1, 0));
+    const f2_args = try allocator.alloc(ir.VReg, 1);
+    defer allocator.free(f2_args);
+    {
+        const f = &module.functions.items[2];
+        const cb = try f.newBlock();
+        const v_arg = f.newVReg();
+        const v_ret = f.newVReg();
+        try f.getBlock(cb).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_arg, .type = .i32 });
+        f2_args[0] = v_arg;
+        try f.getBlock(cb).append(.{ .op = .{ .call = .{ .func_idx = 1, .args = f2_args } }, .dest = v_ret, .type = .i32 });
+        try f.getBlock(cb).append(.{ .op = .{ .ret = v_ret } });
+    }
+
+    // Use a minimal pass list to keep the test focused. forwardLocalGet
+    // and constantFold are what the issue's motivating example relies on.
+    const test_passes = [_]PassFn{
+        &forwardLocalGet,
+        &constantFold,
+        &deadCodeElimination,
+    };
+    _ = try runPasses(&module, &test_passes, allocator);
+
+    // After two outer rounds, f2 must contain no `.call` instructions:
+    // f0 was inlined into f1 during the first outer round, and the now
+    // pass-through f1 was inlined into f2 during the second outer round.
+    const caller = &module.functions.items[2];
+    for (caller.blocks.items) |blk| {
+        for (blk.instructions.items) |inst| {
+            try std.testing.expect(inst.op != .call);
+        }
+    }
 }
 
 test "foldConstantBranches: zero cond picks else block" {
