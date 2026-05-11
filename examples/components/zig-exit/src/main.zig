@@ -1,10 +1,12 @@
 //! WASI command component that exercises the exit-code path (issue #436).
 //!
 //! Writes a marker line to fd 1 via `wasi_snapshot_preview1.fd_write`, then
-//! calls `wasi_snapshot_preview1.proc_exit(7)`. The numeric code reaches
-//! the host via `ModuleInstance.exit_code_sink` →
-//! `WasiCliAdapter.exit_code` → `RunOutcome.exit_code` →
-//! `main.zig:runComponent`, which exits the host process with 7.
+//! calls `wasi_snapshot_preview1.proc_exit(7)`. Both imports are bound by
+//! the wasm-tools wasi-preview1 adapter; the adapter's `proc_exit` body
+//! rewrites the call into `wasi:cli/exit.exit-with-code(7)`, which lands
+//! on `WasiCliAdapter.cliExitWithCode` → `adapter.exit_code` →
+//! `RunOutcome.exit_code` → `main.zig:runComponent`, which exits the
+//! host process with 7 (issue #448 made the adapter route actually run).
 //!
 //! Pair with `zig-hello` which exercises the normal-return path.
 
