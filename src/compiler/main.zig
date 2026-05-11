@@ -132,10 +132,11 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     //
     // The loader allocates many slices on `module` (types, rec_groups,
     // canonical_type_map, imports, functions, exports, data_segments,
-    // …) but `WasmModule` has no deinit and `wamrc` doesn't otherwise
-    // tear it down. Scope all loader allocations to an arena so they're
-    // freed in one shot at end-of-main, mirroring every other call site
-    // of `loader.load` in the repo (api/c_api.zig, api/wamr.zig,
+    // …) but `WasmModule` has no deinit and `runCompile` doesn't
+    // otherwise tear it down before returning to `main`. Scope all
+    // loader allocations to an arena so they're freed in one shot when
+    // this function returns, mirroring every other call site of
+    // `loader.load` in the repo (api/c_api.zig, api/wamr.zig,
     // wast_runner, fuzz harnesses, runtime/interpreter/instance.zig,
     // component/instance.zig). Eliminates the DebugAllocator leak
     // reports that `wamrc` emits at exit when invoked from build steps.
