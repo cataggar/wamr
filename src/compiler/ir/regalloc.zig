@@ -101,6 +101,21 @@ pub const Hint = struct {
     reg_idx: u8,
 };
 
+/// A copy-like IR instruction whose emitted `mov rD, rS` becomes a NOP
+/// when the allocator places `dest` and `src` in the same physical
+/// register. Reported to `coalesceMoves` so it can retarget one
+/// endpoint at the other's physreg post-allocation.
+///
+/// Currently produced for `.reinterpret` (i64↔f64, i32↔f32 bit-
+/// identical copies). The aarch64 emit site at `emitReinterpret`
+/// already guards with `if (src != dest) movRegReg(...)`, so after
+/// successful coalescing the move literally disappears from the code
+/// stream without any codegen changes.
+pub const CopyHint = struct {
+    dest: ir.VReg,
+    src: ir.VReg,
+};
+
 /// Run linear scan register allocation on a function.
 /// `clobbers` lists positions where specific registers are destroyed.
 pub fn allocate(
@@ -221,6 +236,154 @@ pub fn allocateFromRangesWithHints(
         .assignments = assignments,
         .spill_count = spill_slots_used,
     };
+}
+
+/// Post-allocation move coalescing (issue #386).
+///
+/// For each `CopyHint{ dest, src }` representing a copy-like IR
+/// instruction (e.g. `.reinterpret`), retarget `dest`'s physreg to
+/// equal `src`'s physreg when doing so introduces no live-range
+/// conflict on that physreg. The aarch64 codegen guards reg→reg moves
+/// with `if (src != dest)`, so after this rewrite the move is elided
+/// entirely at emit time — no codegen changes needed.
+///
+/// Algorithm: standard biased coalescing on linear-scan output.
+///   1. Build PhysReg → list of (vreg, live_range) intervals from
+///      `assignments` + `ranges`.
+///   2. For each copy hint, in order, try to move `dest` from its
+///      current physreg `R_d` to `src`'s physreg `R_s` iff:
+///        - both endpoints are register-allocated (not spilled),
+///        - `R_s != R_d` (else nothing to do),
+///        - no other interval already on `R_s` overlaps `dest`'s live
+///          range,
+///        - no clobber point inside `dest`'s live range destroys
+///          `R_s` (regs-clobbered bitmask, same semantics as
+///          `regSafeForRange`).
+///   3. Iterate the hint list once (single pass): each successful
+///      retarget makes future hints touching the same source easier,
+///      and chained copies (a → b → c) collapse left-to-right.
+///
+/// `ranges` must match the slice originally passed to
+/// `allocateFromRangesWithHints` (same vreg numbering, sorted by
+/// start). `clobbers` likewise mirrors the allocator's input.
+///
+/// Returns the number of moves coalesced (rewrites applied). The
+/// AllocResult is mutated in place. Safe to call with empty
+/// `copy_hints` — does nothing and returns 0.
+pub fn coalesceMoves(
+    allocator: std.mem.Allocator,
+    result: *AllocResult,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    copy_hints: []const CopyHint,
+) !u32 {
+    if (copy_hints.len == 0) return 0;
+
+    // Build a vreg → range index for O(1) range lookup.
+    var range_idx = std.AutoHashMap(ir.VReg, usize).init(allocator);
+    defer range_idx.deinit();
+    try range_idx.ensureTotalCapacity(@intCast(ranges.len));
+    for (ranges, 0..) |r, i| range_idx.putAssumeCapacity(r.vreg, i);
+
+    // Build PhysReg → list of intervals currently on that physreg.
+    // Each entry is `(start, end)` from the originating live range.
+    const Interval = struct {
+        vreg: ir.VReg,
+        start: u32,
+        end: u32,
+    };
+    var per_reg = std.AutoHashMap(PhysReg, std.ArrayList(Interval)).init(allocator);
+    defer {
+        var it = per_reg.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        per_reg.deinit();
+    }
+    {
+        var it = result.assignments.iterator();
+        while (it.next()) |entry| {
+            const vreg = entry.key_ptr.*;
+            const alloc = entry.value_ptr.*;
+            switch (alloc) {
+                .reg => |r| {
+                    const ridx = range_idx.get(vreg) orelse continue;
+                    const range = ranges[ridx];
+                    const gop = try per_reg.getOrPut(r);
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    try gop.value_ptr.append(allocator, .{
+                        .vreg = vreg,
+                        .start = range.start,
+                        .end = range.end,
+                    });
+                },
+                .stack => {},
+            }
+        }
+    }
+
+    var coalesced: u32 = 0;
+    for (copy_hints) |ch| {
+        const dest_alloc = result.assignments.get(ch.dest) orelse continue;
+        const src_alloc = result.assignments.get(ch.src) orelse continue;
+        if (dest_alloc != .reg or src_alloc != .reg) continue;
+        const r_d = dest_alloc.reg;
+        const r_s = src_alloc.reg;
+        if (r_d == r_s) continue; // already coalesced — no-op
+
+        const dest_range_idx = range_idx.get(ch.dest) orelse continue;
+        const dest_range = ranges[dest_range_idx];
+
+        // Find r_s's index in reg_set.alloc_regs (for clobber bitmask).
+        const r_s_alloc_idx_opt: ?u8 = blk: {
+            for (reg_set.alloc_regs, 0..) |p, i| {
+                if (p == r_s) break :blk @intCast(i);
+            }
+            break :blk null;
+        };
+        const r_s_alloc_idx = r_s_alloc_idx_opt orelse continue;
+
+        // Clobber safety: same predicate as the allocator. Note we use
+        // the strict-inside check (start < pos < end) consistent with
+        // `regSafeForRange`.
+        if (!regSafeForRange(r_s_alloc_idx, dest_range.start, dest_range.end, clobbers)) continue;
+
+        // Interference check: any *other* interval already on r_s
+        // whose range overlaps dest's range blocks the retarget.
+        // (Two intervals overlap iff max(start) < min(end). Equal
+        // endpoints don't overlap under our live-range convention —
+        // a vreg defined at pos N ends a different vreg that died at
+        // N.)
+        const r_s_list_ptr = per_reg.getPtr(r_s) orelse continue;
+        var conflict = false;
+        for (r_s_list_ptr.items) |iv| {
+            if (iv.vreg == ch.dest) continue;
+            if (iv.start < dest_range.end and dest_range.start < iv.end) {
+                conflict = true;
+                break;
+            }
+        }
+        if (conflict) continue;
+
+        // Safe to retarget. Move `dest`'s interval from r_d → r_s.
+        try result.assignments.put(ch.dest, .{ .reg = r_s });
+        if (per_reg.getPtr(r_d)) |old_list| {
+            var i: usize = 0;
+            while (i < old_list.items.len) : (i += 1) {
+                if (old_list.items[i].vreg == ch.dest) {
+                    _ = old_list.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        try r_s_list_ptr.append(allocator, .{
+            .vreg = ch.dest,
+            .start = dest_range.start,
+            .end = dest_range.end,
+        });
+        coalesced += 1;
+    }
+
+    return coalesced;
 }
 
 fn allocateSpill(spill_slots_used: *u32, reg_set: RegSet, ty: ir.IrType) i32 {
@@ -676,4 +839,186 @@ test "allocateFromRangesWithHints: empty hint list behaves like allocateFromRang
 
     try std.testing.expectEqual(result_a.get(0).?, result_b.get(0).?);
     try std.testing.expectEqual(result_a.get(1).?, result_b.get(1).?);
+}
+
+// ── coalesceMoves tests (issue #386) ────────────────────────────────────
+
+test "coalesceMoves: empty hint list is a no-op" {
+    const allocator = std.testing.allocator;
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 2, .type = .i64 },
+        .{ .vreg = 1, .start = 3, .end = 5, .type = .i64 },
+    };
+    var result = try allocateFromRanges(allocator, test_reg_set, &.{}, &ranges);
+    defer result.deinit();
+    const before0 = result.get(0).?;
+    const before1 = result.get(1).?;
+
+    const n = try coalesceMoves(allocator, &result, test_reg_set, &.{}, &ranges, &.{});
+    try std.testing.expectEqual(@as(u32, 0), n);
+    try std.testing.expectEqual(before0, result.get(0).?);
+    try std.testing.expectEqual(before1, result.get(1).?);
+}
+
+test "coalesceMoves: dest retargeted to src's physreg when ranges don't conflict" {
+    const allocator = std.testing.allocator;
+    // vreg 0 is defined at pos 0 and dies at pos 2 (the reinterpret).
+    // vreg 1 (the reinterpret dest) is defined at pos 2 and lives to 5.
+    // Their live ranges abut but do not overlap → coalescable.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 2, .type = .i64 },
+        .{ .vreg = 1, .start = 2, .end = 5, .type = .i64 },
+    };
+    var result = try allocateFromRanges(allocator, test_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    // Sanity: linear-scan picked different physregs (overlap at pos 2 in
+    // its expire-vs-assign rule keeps them apart by default).
+    const r0_before = result.get(0).?.reg;
+    const r1_before = result.get(1).?.reg;
+    try std.testing.expect(r0_before != r1_before);
+
+    const copy_hints = [_]CopyHint{.{ .dest = 1, .src = 0 }};
+    const n = try coalesceMoves(allocator, &result, test_reg_set, &.{}, &ranges, &copy_hints);
+    try std.testing.expectEqual(@as(u32, 1), n);
+    // vreg 1 now lives on vreg 0's physreg.
+    try std.testing.expectEqual(r0_before, result.get(1).?.reg);
+    // vreg 0's assignment is unchanged.
+    try std.testing.expectEqual(r0_before, result.get(0).?.reg);
+}
+
+test "coalesceMoves: refuses to coalesce when ranges overlap on src's reg" {
+    const allocator = std.testing.allocator;
+    // Three vregs all live simultaneously [0..10]: linear scan gives
+    // each a distinct physreg. Adding a copy hint (dest=2, src=0) must
+    // be rejected — vreg 2 is alive while vreg 0 still holds its reg.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 10, .type = .i64 },
+        .{ .vreg = 1, .start = 1, .end = 9, .type = .i64 },
+        .{ .vreg = 2, .start = 2, .end = 8, .type = .i64 },
+    };
+    var result = try allocateFromRanges(allocator, test_reg_set, &.{}, &ranges);
+    defer result.deinit();
+    const r2_before = result.get(2).?;
+
+    const copy_hints = [_]CopyHint{.{ .dest = 2, .src = 0 }};
+    const n = try coalesceMoves(allocator, &result, test_reg_set, &.{}, &ranges, &copy_hints);
+    try std.testing.expectEqual(@as(u32, 0), n);
+    try std.testing.expectEqual(r2_before, result.get(2).?);
+}
+
+test "coalesceMoves: already-equal physregs counted as no-op" {
+    const allocator = std.testing.allocator;
+    // One-register set forces vreg 0 and vreg 1 onto the same physreg
+    // (non-overlapping ranges reuse via linear-scan expiration).
+    const one_reg_set: RegSet = .{
+        .alloc_regs = &.{7},
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{0},
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 1, .type = .i64 },
+        .{ .vreg = 1, .start = 2, .end = 3, .type = .i64 },
+    };
+    var result = try allocateFromRanges(allocator, one_reg_set, &.{}, &ranges);
+    defer result.deinit();
+    try std.testing.expectEqual(Allocation{ .reg = 7 }, result.get(0).?);
+    try std.testing.expectEqual(Allocation{ .reg = 7 }, result.get(1).?);
+
+    const copy_hints = [_]CopyHint{.{ .dest = 1, .src = 0 }};
+    const n = try coalesceMoves(allocator, &result, one_reg_set, &.{}, &ranges, &copy_hints);
+    try std.testing.expectEqual(@as(u32, 0), n);
+}
+
+test "coalesceMoves: refuses when src's reg is clobbered inside dest's range" {
+    const allocator = std.testing.allocator;
+    // vreg 0 in physreg 2 (alloc index 0, caller-saved) [0..1]; vreg 1
+    // dest [1..4] spans a clobber at pos 2 that destroys index 0. A
+    // hint (dest=1, src=0) would put vreg 1 on physreg 2 — but the
+    // clobber would corrupt it mid-range, so coalesce must refuse.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 1, .type = .i64 },
+        .{ .vreg = 1, .start = 1, .end = 4, .type = .i64 },
+    };
+    // Hand-build assignments to control placement deterministically.
+    var result: AllocResult = .{
+        .assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator),
+        .spill_count = 0,
+    };
+    defer result.deinit();
+    try result.assignments.put(0, .{ .reg = 2 });
+    try result.assignments.put(1, .{ .reg = 3 });
+
+    const clobbers = [_]ClobberPoint{
+        .{ .pos = 2, .regs_clobbered = 0b1 }, // clobbers idx 0 = physreg 2
+    };
+    const copy_hints = [_]CopyHint{.{ .dest = 1, .src = 0 }};
+    const n = try coalesceMoves(allocator, &result, test_reg_set, &clobbers, &ranges, &copy_hints);
+    try std.testing.expectEqual(@as(u32, 0), n);
+    try std.testing.expectEqual(Allocation{ .reg = 3 }, result.get(1).?);
+}
+
+test "coalesceMoves: spilled endpoints are skipped" {
+    const allocator = std.testing.allocator;
+    const one_reg_set: RegSet = .{
+        .alloc_regs = &.{7},
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{0},
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    // Two overlapping ranges, only one physreg → one must spill.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 5, .type = .i64 },
+        .{ .vreg = 1, .start = 1, .end = 4, .type = .i64 },
+    };
+    var result = try allocateFromRanges(allocator, one_reg_set, &.{}, &ranges);
+    defer result.deinit();
+    const before0 = result.get(0).?;
+    const before1 = result.get(1).?;
+
+    const copy_hints = [_]CopyHint{.{ .dest = 1, .src = 0 }};
+    const n = try coalesceMoves(allocator, &result, one_reg_set, &.{}, &ranges, &copy_hints);
+    try std.testing.expectEqual(@as(u32, 0), n);
+    try std.testing.expectEqual(before0, result.get(0).?);
+    try std.testing.expectEqual(before1, result.get(1).?);
+}
+
+test "coalesceMoves: two-step chain coalesces both hints" {
+    const allocator = std.testing.allocator;
+    // Use a one-reg pool variant: with multiple physregs available the
+    // strict-< expiration in linear-scan tends to put non-overlapping
+    // intervals on distinct fresh regs, which makes setting up a
+    // "chained coalesce" scenario depend on subtle ordering. Instead,
+    // build the AllocResult by hand to model exactly the scenario we
+    // want: vreg 0 on physreg 2, vreg 1 on physreg 3, vreg 2 on
+    // physreg 8, all non-overlapping lifetimes that each abut.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 4, .type = .i64 },
+        .{ .vreg = 1, .start = 5, .end = 8, .type = .i64 },
+        .{ .vreg = 2, .start = 9, .end = 12, .type = .i64 },
+    };
+    var result: AllocResult = .{
+        .assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator),
+        .spill_count = 0,
+    };
+    defer result.deinit();
+    try result.assignments.put(0, .{ .reg = 2 });
+    try result.assignments.put(1, .{ .reg = 3 });
+    try result.assignments.put(2, .{ .reg = 8 });
+
+    const copy_hints = [_]CopyHint{
+        .{ .dest = 1, .src = 0 },
+        .{ .dest = 2, .src = 1 },
+    };
+    const n = try coalesceMoves(allocator, &result, test_reg_set, &.{}, &ranges, &copy_hints);
+    // After hint 1, vreg 1 moves to physreg 2 (vreg 0's reg). After
+    // hint 2, vreg 2 — whose range [9..12] doesn't overlap either
+    // vreg 0 [0..4] or vreg 1 [5..8] — moves to physreg 2 as well.
+    try std.testing.expectEqual(@as(u32, 2), n);
+    try std.testing.expectEqual(Allocation{ .reg = 2 }, result.get(0).?);
+    try std.testing.expectEqual(Allocation{ .reg = 2 }, result.get(1).?);
+    try std.testing.expectEqual(Allocation{ .reg = 2 }, result.get(2).?);
 }
