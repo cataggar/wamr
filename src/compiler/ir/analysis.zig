@@ -1401,6 +1401,120 @@ pub fn computeLoops(
     };
 }
 
+// ── Block frequency estimation ──────────────────────────────────────────
+
+/// Maximum loop-depth amplification factor exponent. A block nested inside
+/// `k` natural loops gets its base frequency multiplied by `10^min(k, MAX_LOOP_DEPTH_EXP)`.
+/// Capped to keep the result well within `f32` range even for deeply
+/// nested loops (10^6 still fits comfortably).
+const MAX_LOOP_DEPTH_EXP: u8 = 6;
+
+/// Per-loop trip count assumed by the heuristic. Mirrors what LLVM's
+/// BlockFrequencyInfo uses as a default when no profile data is available.
+const LOOP_TRIP_FACTOR: f32 = 10.0;
+
+/// Estimate static execution frequency for every block of `func`,
+/// relative to the entry block (which has frequency `1.0`).
+///
+/// The heuristic is a single-pass push-flow model:
+///
+///   1. Walk reachable blocks in reverse post-order from the entry.
+///      Each block `b` distributes its frequency uniformly across its
+///      forward-edge successors (`share = freq[b] / out_degree`).
+///      Back-edges (those whose target dominates the source — i.e. the
+///      back-edges of natural loops) are skipped so the flow is acyclic;
+///      loop amplification is added in a second step.
+///
+///   2. For every natural loop, multiply `freq[b]` by `LOOP_TRIP_FACTOR`
+///      for each loop that contains `b`. Loop depth is saturated at
+///      `MAX_LOOP_DEPTH_EXP` to keep the values bounded.
+///
+/// Unreachable blocks (those with no incoming flow from the entry) keep
+/// frequency `0.0`. The returned slice is indexed by `BlockId` and the
+/// caller owns it.
+///
+/// This is a deliberately simple static heuristic — no edge profiling,
+/// no branch-bias hints, no irreducible-cycle handling. It is intended
+/// only as input to layout/cold-sinking passes; correctness of generated
+/// code never depends on these numbers.
+pub fn computeBlockFrequencies(
+    func: *const ir.IrFunction,
+    allocator: std.mem.Allocator,
+) ![]f32 {
+    const nblocks = func.blocks.items.len;
+    const freq = try allocator.alloc(f32, nblocks);
+    errdefer allocator.free(freq);
+    @memset(freq, 0.0);
+    if (nblocks == 0) return freq;
+
+    // Successors are required to push flow.
+    var successors = try buildSuccessors(func, allocator);
+    defer {
+        var sit = successors.iterator();
+        while (sit.next()) |entry| allocator.free(entry.value_ptr.*);
+        successors.deinit();
+    }
+
+    // Dominators identify back-edges (target dominates source).
+    var dom = try computeDominators(func, allocator);
+    defer dom.deinit();
+
+    // Walk reachable blocks in reverse post-order. `dom.post_order` is
+    // in DFS post-order (lowest index = first popped), so iterating it
+    // back-to-front yields RPO with the entry first.
+    freq[0] = 1.0;
+    var i: usize = dom.post_order.len;
+    while (i > 0) {
+        i -= 1;
+        const b = dom.post_order[i];
+        const f = freq[b];
+        if (f == 0.0) continue; // no flow to distribute
+
+        const succs = successors.get(b) orelse continue;
+        if (succs.len == 0) continue;
+
+        // Count forward (non-back-edge) successors. A back-edge is one
+        // whose target dominates the source.
+        var forward_count: u32 = 0;
+        for (succs) |s| {
+            if (s >= nblocks) continue;
+            if (dom.dominates(s, b)) continue; // back-edge
+            forward_count += 1;
+        }
+        if (forward_count == 0) continue;
+
+        const share = f / @as(f32, @floatFromInt(forward_count));
+        for (succs) |s| {
+            if (s >= nblocks) continue;
+            if (dom.dominates(s, b)) continue; // back-edge
+            freq[s] += share;
+        }
+    }
+
+    // Apply loop-depth amplification. Each natural loop containing a
+    // block multiplies its frequency by `LOOP_TRIP_FACTOR` (saturated
+    // at `MAX_LOOP_DEPTH_EXP`).
+    var lf = try computeLoops(func, &dom, allocator);
+    defer lf.deinit();
+    if (lf.loops.len > 0) {
+        const depth = try allocator.alloc(u8, nblocks);
+        defer allocator.free(depth);
+        @memset(depth, 0);
+        for (lf.loops) |*loop| {
+            for (loop.blocks) |bid| {
+                if (depth[bid] < MAX_LOOP_DEPTH_EXP) depth[bid] += 1;
+            }
+        }
+        for (freq, 0..) |*f, idx| {
+            if (f.* == 0.0) continue;
+            var k: u8 = 0;
+            while (k < depth[idx]) : (k += 1) f.* *= LOOP_TRIP_FACTOR;
+        }
+    }
+
+    return freq;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 test "buildSuccessors: linear block" {
@@ -1964,4 +2078,153 @@ test "computeLoops: irreducible-ish (no back-edge without dominator) produces no
     try std.testing.expectEqual(@as(usize, 1), lf.loops.len);
     try std.testing.expectEqual(b0, lf.loops[0].header);
     try std.testing.expectEqual(@as(usize, 3), lf.loops[0].blocks.len);
+}
+
+test "computeBlockFrequencies: single block has frequency 1.0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .ret = null } });
+
+    const freq = try computeBlockFrequencies(&func, allocator);
+    defer allocator.free(freq);
+
+    try std.testing.expectEqual(@as(usize, 1), freq.len);
+    try std.testing.expectEqual(@as(f32, 1.0), freq[0]);
+}
+
+test "computeBlockFrequencies: linear chain preserves frequency" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b2 } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = null } });
+
+    const freq = try computeBlockFrequencies(&func, allocator);
+    defer allocator.free(freq);
+
+    try std.testing.expectEqual(@as(f32, 1.0), freq[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), freq[1]);
+    try std.testing.expectEqual(@as(f32, 1.0), freq[2]);
+}
+
+test "computeBlockFrequencies: diamond splits flow then rejoins" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const cond = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = null } });
+
+    const freq = try computeBlockFrequencies(&func, allocator);
+    defer allocator.free(freq);
+
+    try std.testing.expectEqual(@as(f32, 1.0), freq[0]);
+    try std.testing.expectEqual(@as(f32, 0.5), freq[1]);
+    try std.testing.expectEqual(@as(f32, 0.5), freq[2]);
+    try std.testing.expectEqual(@as(f32, 1.0), freq[3]);
+}
+
+test "computeBlockFrequencies: while-loop body is hotter than entry" {
+    // b0 → h; h ⇄ body; h → exit.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const h = try func.newBlock();
+    const body = try func.newBlock();
+    const exit_b = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = h } });
+    try func.getBlock(h).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(h).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = body, .else_block = exit_b } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = h } });
+    try func.getBlock(exit_b).append(.{ .op = .{ .ret = null } });
+
+    const freq = try computeBlockFrequencies(&func, allocator);
+    defer allocator.free(freq);
+
+    try std.testing.expectEqual(@as(f32, 1.0), freq[b0]);
+    // Header gets full inflow from b0; loop factor 10 applied once.
+    try std.testing.expectEqual(@as(f32, 10.0), freq[h]);
+    // Body receives half of header's pre-loop-factor flow (0.5), then ×10.
+    try std.testing.expectEqual(@as(f32, 5.0), freq[body]);
+    // Exit is cold (no loop nesting).
+    try std.testing.expectEqual(@as(f32, 0.5), freq[exit_b]);
+    // Entry < header.
+    try std.testing.expect(freq[b0] < freq[h]);
+    // Body hotter than entry.
+    try std.testing.expect(freq[body] > freq[b0]);
+}
+
+test "computeBlockFrequencies: nested loops multiply" {
+    // Outer header h_o; inner header h_i nested inside; body inside inner.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const h_o = try func.newBlock();
+    const h_i = try func.newBlock();
+    const body = try func.newBlock();
+    const exit_i = try func.newBlock();
+    const exit_o = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = h_o } });
+    try func.getBlock(h_o).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0 });
+    try func.getBlock(h_o).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = h_i, .else_block = exit_o } } });
+    try func.getBlock(h_i).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v1 });
+    try func.getBlock(h_i).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = body, .else_block = exit_i } } });
+    try func.getBlock(body).append(.{ .op = .{ .br = h_i } });
+    try func.getBlock(exit_i).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v2 });
+    try func.getBlock(exit_i).append(.{ .op = .{ .br_if = .{ .cond = v2, .then_block = h_o, .else_block = exit_o } } });
+    try func.getBlock(exit_o).append(.{ .op = .{ .ret = null } });
+
+    const freq = try computeBlockFrequencies(&func, allocator);
+    defer allocator.free(freq);
+
+    // body lies inside both loops ⇒ 100× amplification applied to its
+    // pre-amplification inflow (≈0.25), while h_o sees only 10×. The
+    // resulting ratio is dominated by the depth difference.
+    try std.testing.expect(freq[body] > freq[h_o] * 2.0);
+    // h_i lies inside the outer loop and is itself a header ⇒ depth 2,
+    // hotter than h_o (depth 1).
+    try std.testing.expect(freq[h_i] > freq[h_o] * 2.0);
+    // h_o is hotter than its preheader b0.
+    try std.testing.expect(freq[h_o] > freq[0]);
+    // exit_o is cold (outside every loop) and stays close to entry.
+    try std.testing.expect(freq[exit_o] < freq[h_o]);
+    try std.testing.expect(freq[exit_o] < 2.0);
+}
+
+test "computeBlockFrequencies: unreachable block stays at 0" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    _ = try func.newBlock(); // b2: unreachable, no edges to it
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .ret = null } });
+
+    const freq = try computeBlockFrequencies(&func, allocator);
+    defer allocator.free(freq);
+
+    try std.testing.expectEqual(@as(f32, 1.0), freq[0]);
+    try std.testing.expectEqual(@as(f32, 1.0), freq[1]);
+    try std.testing.expectEqual(@as(f32, 0.0), freq[2]);
 }

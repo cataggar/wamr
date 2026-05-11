@@ -5491,13 +5491,24 @@ pub fn defaultPassesForTargetWithOptions(target: TargetArch, options: CompileOpt
 const DfsEntry = struct { block: ir.BlockId, child_idx: usize };
 
 /// Compute a block emission order using Reverse Postorder (RPO) with
-/// cold-block sinking. Places hot blocks contiguously for i-cache locality
-/// and maximises fall-through opportunities for the C3 peephole.
+/// frequency-biased sibling order and cold-block sinking. Places hot
+/// blocks contiguously for i-cache locality and maximises fall-through
+/// opportunities for the C3 peephole.
+///
+/// Internally:
+///   * Static block frequencies are estimated via
+///     `analysis.computeBlockFrequencies` (push-flow + loop-depth heuristic).
+///   * Successor lists are sorted ascending by callee frequency before the
+///     DFS, which causes the hottest successor to land directly after its
+///     parent in the reversed post-order.
+///   * "Cold" blocks — those containing `.@"unreachable"` *or* whose
+///     estimated frequency is below 10% of the entry's — are moved to the
+///     end of the layout, preserving relative RPO order within each
+///     hot/cold group.
 ///
 /// Returns a permutation of all BlockIds (caller owns the slice).
 /// Block 0 (entry) is always first. Unreachable blocks are appended at the
-/// end. Blocks containing `.unreachable` instructions are sunk after all
-/// hot blocks.
+/// end. The entry block is never classified as cold.
 pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) ![]ir.BlockId {
     const n: u32 = @intCast(func.blocks.items.len);
     if (n <= 1) {
@@ -5512,6 +5523,54 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
         var it = successors.valueIterator();
         while (it.next()) |v| allocator.free(v.*);
         successors.deinit();
+    }
+
+    // Estimate static block frequencies. Used to (a) bias the DFS visit
+    // order so the hottest sibling ends up adjacent to its parent in the
+    // resulting RPO, and (b) sink rarely-executed blocks (≤10% of entry)
+    // to the end of the layout alongside any block containing
+    // `.@"unreachable"`.
+    const freq = try analysis.computeBlockFrequencies(func, allocator);
+    defer allocator.free(freq);
+
+    // Build a writable per-block visit-order array indexed by BlockId.
+    // Each entry is the block's successor list sorted ascending by
+    // estimated frequency, with original index as the stable tie-breaker.
+    //
+    // The iterative DFS visits successors in order: the *first* child
+    // is fully explored and popped before the next sibling, so it gets
+    // the lowest post-order number → appears *latest* in RPO. Iterating
+    // siblings in ascending-frequency order therefore places the hottest
+    // successor closest to its parent in the final RPO — the fall-through
+    // slot the C3 peephole later collapses into a no-op branch.
+    const visit_succs = try allocator.alloc([]ir.BlockId, n);
+    defer {
+        for (visit_succs) |s| allocator.free(s);
+        allocator.free(visit_succs);
+    }
+    for (visit_succs, 0..) |*slot, idx| {
+        const src = successors.get(@intCast(idx)) orelse &[_]ir.BlockId{};
+        slot.* = try allocator.dupe(ir.BlockId, src);
+        if (slot.len < 2) continue;
+        // Stable insertion sort by ascending frequency. `succs.len` is
+        // tiny in practice (≤2 for br_if; br_table arity is bounded by
+        // the source wasm module). Stability preserves the original
+        // br_if then/else order for equal-frequency siblings, keeping
+        // `reorderBlocks` deterministic.
+        const succs = slot.*;
+        var i: usize = 1;
+        while (i < succs.len) : (i += 1) {
+            var j: usize = i;
+            while (j > 0) : (j -= 1) {
+                const a = succs[j - 1];
+                const b = succs[j];
+                const fa: f32 = if (a < n) freq[a] else 0.0;
+                const fb: f32 = if (b < n) freq[b] else 0.0;
+                if (fa <= fb) break; // already ascending; stable for equals
+                succs[j - 1] = b;
+                succs[j] = a;
+            }
+        }
     }
 
     // Iterative DFS → post-order
@@ -5530,7 +5589,7 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
 
     while (stack.items.len > 0) {
         const top = &stack.items[stack.items.len - 1];
-        const succs = successors.get(top.block) orelse &[_]ir.BlockId{};
+        const succs = visit_succs[top.block];
         if (top.child_idx < succs.len) {
             const child = succs[top.child_idx];
             top.child_idx += 1;
@@ -5547,17 +5606,28 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
     // Reverse → RPO
     std.mem.reverse(ir.BlockId, post_order.items);
 
-    // Detect cold blocks (those containing .@"unreachable")
+    // Detect cold blocks: either they contain `.@"unreachable"` (a hard
+    // signal — these are dead-end traps that should never execute on a
+    // hot path) or their estimated frequency falls below 10% of the entry
+    // frequency. The entry itself is always kept hot.
     const is_cold = try allocator.alloc(bool, n);
     defer allocator.free(is_cold);
     @memset(is_cold, false);
 
+    const cold_threshold: f32 = freq[0] * 0.1;
     for (func.blocks.items, 0..) |block, idx| {
+        // `.@"unreachable"` always sinks.
         for (block.instructions.items) |inst| {
             if (inst.op == .@"unreachable") {
                 is_cold[idx] = true;
                 break;
             }
+        }
+        // Frequency-based cold: must have non-zero (reachable) freq below
+        // threshold. Zero-frequency blocks are unreachable and handled
+        // separately via the !visited check below.
+        if (!is_cold[idx] and freq[idx] > 0.0 and freq[idx] < cold_threshold) {
+            is_cold[idx] = true;
         }
     }
     // Entry block is never treated as cold.
@@ -6231,6 +6301,61 @@ test "reorderBlocks: unreachable block appended at end" {
     try std.testing.expectEqual(@as(ir.BlockId, 1), order[1]);
     // Unreachable block 2 at end
     try std.testing.expectEqual(@as(ir.BlockId, 2), order[2]);
+}
+
+test "reorderBlocks: hot loop laid out before cold throw (issue #388)" {
+    // Sketches a typical "checked arithmetic in a loop" pattern:
+    //   b0 (entry) → b1 (loop header)
+    //   b1 → b2 (loop body, back-edges to b1) | b3 (loop exit)
+    //   b3 → b4 (normal return) | b5 (overflow → unreachable)
+    //
+    // Expected layout invariants after `reorderBlocks`:
+    //   * Entry comes first.
+    //   * The hot loop {b1, b2} is laid out contiguously, with b2 (the
+    //     back-edge body) placed directly after b1 so the back-edge
+    //     becomes a fall-through-like short branch.
+    //   * The cold/trap block b5 lands after every hot block.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock(); // loop header
+    const b2 = try func.newBlock(); // loop body
+    const b3 = try func.newBlock(); // loop exit
+    const b4 = try func.newBlock(); // normal return
+    const b5 = try func.newBlock(); // overflow → unreachable
+
+    const c0 = func.newVReg();
+    const c1 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c0 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = c0, .then_block = b2, .else_block = b3 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b1 } });
+    try func.getBlock(b3).append(.{ .op = .{ .iconst_32 = 1 }, .dest = c1 });
+    try func.getBlock(b3).append(.{ .op = .{ .br_if = .{ .cond = c1, .then_block = b4, .else_block = b5 } } });
+    try func.getBlock(b4).append(.{ .op = .{ .ret = null } });
+    try func.getBlock(b5).append(.{ .op = .{ .@"unreachable" = {} } });
+
+    const order = try reorderBlocks(&func, allocator);
+    defer allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 6), order.len);
+
+    var pos: [6]usize = undefined;
+    for (order, 0..) |bid, i| pos[bid] = i;
+
+    // Entry is first.
+    try std.testing.expectEqual(@as(ir.BlockId, 0), order[0]);
+    // Loop header and body are adjacent, with body right after header.
+    try std.testing.expectEqual(pos[b1] + 1, pos[b2]);
+    // Hot path (everything except b5) precedes the cold trap.
+    try std.testing.expect(pos[b5] > pos[b0]);
+    try std.testing.expect(pos[b5] > pos[b1]);
+    try std.testing.expect(pos[b5] > pos[b2]);
+    try std.testing.expect(pos[b5] > pos[b3]);
+    try std.testing.expect(pos[b5] > pos[b4]);
+    // b5 (containing .@"unreachable") is the very last block.
+    try std.testing.expectEqual(@as(ir.BlockId, b5), order[order.len - 1]);
 }
 
 test "strengthReduceMul: mul(x, 8) → shl(x, 3)" {
