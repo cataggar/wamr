@@ -76,6 +76,10 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     std.process.exit(1);
                 };
             } else if (std.mem.startsWith(u8, arg, "--listen=")) {
+                if (listen_address != null) {
+                    std.debug.print("error: --listen specified more than once; only one listening socket preopen is supported\n", .{});
+                    std.process.exit(1);
+                }
                 const spec = arg["--listen=".len..];
                 listen_address = parseListenAddress(spec) catch {
                     std.debug.print("error: invalid --listen address '{s}'\n", .{spec});
@@ -140,7 +144,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // Detect file type by magic bytes: AOT (\0aot) vs Wasm (\0asm)
     if (wasm_data.len >= 4 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.aot_magic) {
         if (listen_address != null) {
-            std.debug.print("Error: --listen is only supported for WASI HTTP components\n", .{});
+            std.debug.print("Error: --listen is not supported for AOT modules; rerun without --aot\n", .{});
             std.process.exit(1);
         }
         runAot(wasm_data, allocator);
@@ -177,13 +181,17 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
         }
     }
 
-    if (listen_address != null) {
-        std.debug.print("Error: --listen is only supported for WASI HTTP components\n", .{});
-        std.process.exit(1);
+    if (listen_address) |addr| {
+        // Core wasm path: --listen registers a TCP listening socket as a
+        // socket preopen (kind = .socket, fd ≥ 3) for the guest's WASI
+        // preview1 sock_accept. The component-model path above already
+        // handled --listen for HTTP servers.
+        runWasm(wasm_data, stack_size, path, &wasm_args, env_flags.items, map_dirs.items, addr, allocator, io);
+        return;
     }
 
     // Wasm module (core)
-    runWasm(wasm_data, stack_size, path, &wasm_args, env_flags.items, map_dirs.items, allocator, io);
+    runWasm(wasm_data, stack_size, path, &wasm_args, env_flags.items, map_dirs.items, null, allocator, io);
 }
 
 fn parseMapDir(spec: []const u8) !MapDir {
@@ -379,6 +387,7 @@ fn runWasm(
     wasm_args: *std.ArrayListUnmanaged([]const u8),
     env_flags: []const []const u8,
     map_dirs: []const MapDir,
+    listen_address: ?std.Io.net.IpAddress,
     allocator: std.mem.Allocator,
     io: std.Io,
 ) void {
@@ -434,6 +443,17 @@ fn runWasm(
         };
     }
 
+    if (listen_address) |addr| {
+        const listen_fd = openListenSocket(addr) catch |err| {
+            std.debug.print("Error: --listen bind failed: {}\n", .{err});
+            std.process.exit(1);
+        };
+        _ = ctx.addPreopenSocket(listen_fd) catch |err| {
+            std.debug.print("Error: cannot register --listen socket preopen: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+
     env.wasi_ctx = @ptrCast(ctx);
 
     if (param_count >= 2) {
@@ -448,6 +468,67 @@ fn runWasm(
     };
 
     if (ctx.exit_code) |code| std.process.exit(@intCast(code));
+}
+
+/// Bind a TCP socket to `addr` and put it in the listen state. Used by the
+/// core wasm `--listen=` flow to register the listener as a socket
+/// preopen (fd ≥ 3) for the guest's WASI preview1 sock_accept. Backlog
+/// matches `SOMAXCONN` on modern Linux (128 is the historical floor).
+///
+/// Implemented with raw `std.os.linux` syscalls because the cross-platform
+/// `std.posix.{socket,bind,listen,close}` wrappers were removed in Zig 0.16.0.
+/// `--listen` is therefore Linux-only on the core-wasm path; the CLI
+/// front-end rejects it elsewhere.
+fn openListenSocket(addr: std.Io.net.IpAddress) !std.posix.fd_t {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const linux = std.os.linux;
+
+    const family: u32 = switch (addr) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const sock_type: u32 = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    const sock_rc = linux.socket(family, sock_type, linux.IPPROTO.TCP);
+    if (linux.errno(sock_rc) != .SUCCESS) return error.SocketFailed;
+    const fd: std.posix.fd_t = @intCast(@as(isize, @bitCast(sock_rc)));
+    errdefer _ = linux.close(fd);
+
+    // SO_REUSEADDR: lets the host re-bind quickly after a restart while
+    // a previous accepted client lingers in TIME_WAIT.
+    const one: c_int = 1;
+    const so_rc = linux.setsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.REUSEADDR,
+        @ptrCast(&one),
+        @sizeOf(c_int),
+    );
+    if (linux.errno(so_rc) != .SUCCESS) return error.SetSockOptFailed;
+
+    switch (addr) {
+        .ip4 => |v4| {
+            const sa = linux.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, v4.port),
+                .addr = @bitCast(v4.bytes),
+            };
+            const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            if (linux.errno(b) != .SUCCESS) return error.BindFailed;
+        },
+        .ip6 => |v6| {
+            const sa = linux.sockaddr.in6{
+                .port = std.mem.nativeToBig(u16, v6.port),
+                .flowinfo = v6.flow,
+                .addr = v6.bytes,
+                .scope_id = v6.interface.index,
+            };
+            const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            if (linux.errno(b) != .SUCCESS) return error.BindFailed;
+        },
+    }
+
+    const lr = linux.listen(fd, 128);
+    if (linux.errno(lr) != .SUCCESS) return error.ListenFailed;
+    return fd;
 }
 
 fn writeStdout(io: std.Io, text: []const u8) void {
@@ -473,7 +554,10 @@ const run_usage =
     \\Options:
     \\  --stack-size=<bytes>     Stack size for the interpreter (default: 65536)
     \\  --heap-size=<bytes>      Reserved (currently ignored)
-    \\  --listen=<ip:port>       Serve a WASI HTTP component on a TCP address
+    \\  --listen=<ip:port>       For components: serve WASI HTTP on the address.
+    \\                           For core wasm: bind a TCP listening socket and
+    \\                           expose it to the guest as the next preopen fd
+    \\                           (≥ 3) for `sock_accept` (single use only).
     \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
     \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
     \\                           inside the guest WASI sandbox (repeatable)
