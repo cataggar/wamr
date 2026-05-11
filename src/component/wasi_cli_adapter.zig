@@ -9602,14 +9602,16 @@ pub fn runLoadedComponent(
     };
 
     // Wire each core module instance's `exit_code_sink` to the adapter's
-    // slot so a guest preview1 `proc_exit(code)` routed through wamr's
-    // wasi auto-resolution still lands the numeric code where the CLI
-    // expects it. Components composed with the wasm-tools wasi-preview1
-    // adapter normally route `proc_exit` to the adapter's exported
-    // `proc_exit` (which then calls `wasi:cli/exit.exit-with-code` and
-    // hits `cliExitWithCode`); but in wamr today, wasi auto-resolution
-    // overrides the cross-instance import binding for `proc_exit`, so
-    // we'd otherwise lose the code. Issue #436.
+    // slot so a guest preview1 `proc_exit(code)` lands the numeric code
+    // where the CLI expects it. After #448 gated WASI auto-resolution,
+    // `proc_exit` is reached on adapter-composed components via the
+    // cross-instance dispatch path in
+    // `src/runtime/interpreter/interp.zig`, which short-circuits to
+    // `wasiProcExit` rather than invoking the adapter's body — the
+    // wasmtime preview1 adapter's `wasi:cli/exit.exit(result)` loses
+    // the numeric i32 (no `exit-with-code(u8)` even in v44). Issues
+    // #436 / #448; tracked for retirement under #453 (wamr-native
+    // adapter exposing `exit-with-code(u8)`).
     for (inst.core_instances) |entry| {
         if (entry.module_inst) |mi| {
             mi.exit_code_sink = &adapter.exit_code;

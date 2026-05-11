@@ -820,14 +820,23 @@ pub const ModuleInstance = struct {
     cached_elem_values: []?[]Value = &.{},
     /// Optional pointer to a `?u32` slot the component-layer caller
     /// uses to capture a guest's `wasi_snapshot_preview1.proc_exit`
-    /// numeric exit code (issue #436). When non-null, `wasiProcExit`
-    /// writes the requested code through this pointer in addition to
-    /// trapping the guest. The component-model `runLoadedComponent`
-    /// path wires this to `WasiCliAdapter.exit_code` so the CLI can
-    /// mirror it into the host process exit code. Stays null on the
-    /// core-wasm path — that route already encodes the exit code on
-    /// the attached `WasiCtx` and unwinds via `wasiProcExit`'s trap.
+    /// numeric exit code (issues #436 / #448). When non-null,
+    /// `wasiProcExit` writes the requested code through this pointer
+    /// in addition to trapping the guest.
+    ///
+    /// After #448 gated WASI auto-resolution, `proc_exit` on a
+    /// component is reached via the cross-instance dispatch path in
+    /// `src/runtime/interpreter/interp.zig`, which short-circuits to
+    /// `wasiProcExit` so the i32 lands here. The component-model
+    /// `runLoadedComponent` path wires this to
+    /// `WasiCliAdapter.exit_code` so the CLI can mirror it into the
+    /// host process exit code. Stays null on the core-wasm path —
+    /// that route already encodes the exit code on the attached
+    /// `WasiCtx` and unwinds via `wasiProcExit`'s trap.
     /// Not owned by `ModuleInstance`.
+    ///
+    /// Workaround pending #453 (a wamr-native wasi-preview1 adapter
+    /// that exposes `exit-with-code(u8)`).
     exit_code_sink: ?*?u32 = null,
 
     pub fn getExportFunc(self: *const ModuleInstance, name: []const u8) ?u32 {

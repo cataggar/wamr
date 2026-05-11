@@ -265,14 +265,12 @@ pub fn callComponentFuncByLocal(
     interp.executeFunction(env, exported.core_func_idx) catch {
         if (env.host_trap) |ht| {
             // Suppress the diagnostic when this trap is actually a
-            // `wasi_snapshot_preview1.proc_exit` unwind that already
-            // landed the numeric code on `exit_code_sink` — that's
-            // normal control flow, not a real error (issue #436).
-            const is_proc_exit = if (module_inst.exit_code_sink) |sink|
-                sink.* != null
-            else
-                false;
-            if (!is_proc_exit) {
+            // `wasi:cli/exit.{exit, exit-with-code}` unwind — that's
+            // normal control flow (the host code is already stashed on
+            // `WasiCliAdapter.exit_code`), not a real error (issue
+            // #436 / #448).
+            const is_wasi_exit = std.mem.eql(u8, ht.err_name, "WasiExit");
+            if (!is_wasi_exit) {
                 std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
                 if (ht.component_func_idx != std.math.maxInt(u32))
                     std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});

@@ -1545,6 +1545,7 @@ pub fn instantiate(
                                 .memories = mems_buf,
                                 .tables = tbls_buf,
                                 .globals = globs_buf,
+                                .cross_instance_mask = is_cross,
                             };
                             // Defer core `(start ...)` execution so canon-lower
                             // trampoline `host_funcs` are bound by `linkImports`

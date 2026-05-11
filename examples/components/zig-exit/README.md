@@ -41,11 +41,12 @@ $ echo $?
 
 ## What this exercises
 
-- The component-model exit-code propagation path added in #436:
-  `proc_exit(rc)` → wamr's `wasiProcExit` (the import is bound via the
-  wasm-tools wasi-preview1 adapter, but wamr's wasi auto-resolution
-  currently dispatches it directly) → `ModuleInstance.exit_code_sink`
-  → `WasiCliAdapter.exit_code` → `RunOutcome.exit_code` →
-  `main.zig:runComponent` → host `std.process.exit(rc as u8)`.
+- The component-model exit-code propagation path:
+  guest `proc_exit(rc)` → wasm-tools adapter's exported `proc_exit` →
+  `wasi:cli/exit.exit-with-code(rc)` → wamr's `cliExitWithCode`
+  (stashes `rc` on the `WasiCliAdapter` and traps) → `RunOutcome.exit_code`
+  → `main.zig:runComponent` → host `std.process.exit(rc as u8)`.
+  Issue #448 gated wamr's WASI auto-resolution so the adapter route
+  actually runs (it used to be clobbered by the bare `wasiProcExit`).
 - Pairs with `zig-hello` (normal return → exit code 0) for end-to-end
   coverage of both component exit shapes.
