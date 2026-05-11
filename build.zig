@@ -395,6 +395,47 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_coldstart_tests.step);
     }
 
+    // ── WASI sockets (#437) end-to-end ────────────────────────────────
+    // Compiles a tiny `wasm32-wasi` echo server that calls preview1
+    // `sock_accept`/`sock_recv`/`sock_send` against an embedder-provided
+    // socket preopen at fd 3, then spawns `wamr run --listen=127.0.0.1:<port>`
+    // and round-trips a single payload from a host client.
+    //
+    // Linux-only — host sockets and the `--listen` CLI plumbing return
+    // ENOSYS / NotSupported on other targets. Uses a fixed high port to
+    // avoid teaching the CLI an out-of-band port-discovery channel.
+    if (target.result.os.tag == .linux) {
+        const echo_wasm = compileZigWasm(b, .{
+            .source = "tests/wasi-sock/echo_server.zig",
+            .target_triple = "wasm32-wasi",
+            .exports = &.{"_start"},
+            .output = "echo_server.wasm",
+        });
+
+        const driver_module = b.createModule(.{
+            .root_source_file = b.path("tests/wasi-sock/driver.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const driver_exe = b.addExecutable(.{
+            .name = "wasi-sock-driver",
+            .root_module = driver_module,
+        });
+
+        const run_sock = b.addRunArtifact(driver_exe);
+        run_sock.addFileArg(exe.getEmittedBin());
+        run_sock.addFileArg(echo_wasm);
+        run_sock.addArg("43657");
+        run_sock.expectExitCode(0);
+
+        const sock_step = b.step(
+            "test-wasi-sock",
+            "Run the WASI sockets end-to-end echo test (#437; Linux only)",
+        );
+        sock_step.dependOn(&run_sock.step);
+        test_step.dependOn(&run_sock.step);
+    }
+
     // ── Benchmark ─────────────────────────────────────────────────────
     const bench_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/bench_codegen.zig"),

@@ -978,6 +978,95 @@ pub fn wasiSockShutdown(env_opaque: *anyopaque) types.HostFnError!void {
     env.pushI32(ctxSockShutdownCore(ctx, fd, sdflags)) catch return error.StackOverflow;
 }
 
+/// `wasi_snapshot_preview1.sock_accept` — accept an incoming connection on a
+/// listening socket fd. Signature:
+/// `(fd: i32, fdflags: i32, ro_fd_ptr: i32) -> errno: i32`. On success the
+/// new guest fd is written to `ro_fd_ptr` and `ESUCCESS` is returned.
+pub fn wasiSockAccept(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const ro_fd_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fdflags = env.popI32() catch return error.StackUnderflow;
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxSockAcceptCore(ctx, mem, fd, fdflags, ro_fd_ptr)) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.sock_recv` — receive a message from a connected
+/// socket. Signature: `(fd, ri_data_ptr, ri_data_len, ri_flags, ro_datalen_ptr,
+/// ro_flags_ptr) -> errno`. `ri_data_ptr` is a guest pointer to an `iovec`
+/// array and `ri_data_len` is its element count. `ro_datalen_ptr` receives
+/// the number of bytes read; `ro_flags_ptr` receives a roflags bitset
+/// (currently always 0 — `MSG_TRUNC` propagation is a follow-up).
+pub fn wasiSockRecv(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const ro_flags_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const ro_datalen_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const ri_flags = env.popI32() catch return error.StackUnderflow;
+    const ri_data_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const ri_data_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxSockRecvCore(
+        ctx,
+        mem,
+        fd,
+        ri_data_ptr,
+        ri_data_len,
+        ri_flags,
+        ro_datalen_ptr,
+        ro_flags_ptr,
+    )) catch return error.StackOverflow;
+}
+
+/// `wasi_snapshot_preview1.sock_send` — send a message on a connected socket.
+/// Signature: `(fd, si_data_ptr, si_data_len, si_flags, so_datalen_ptr) -> errno`.
+/// `si_flags` is reserved and must be 0.
+pub fn wasiSockSend(env_opaque: *anyopaque) types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const so_datalen_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const si_flags = env.popI32() catch return error.StackUnderflow;
+    const si_data_len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const si_data_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+    const fd = env.popI32() catch return error.StackUnderflow;
+
+    const ctx = getCtx(env) orelse {
+        env.pushI32(wasi_core.WASI_ENOSYS) catch return error.StackOverflow;
+        return;
+    };
+    const mem = getMemory(env) orelse {
+        env.pushI32(wasi_core.WASI_EINVAL) catch return error.StackOverflow;
+        return;
+    };
+
+    env.pushI32(ctxSockSendCore(
+        ctx,
+        mem,
+        fd,
+        si_data_ptr,
+        si_data_len,
+        si_flags,
+        so_datalen_ptr,
+    )) catch return error.StackOverflow;
+}
+
 // ── ctx-aware core implementations ────────────────────────────────────
 
 /// Layout for `args_get` / `environ_get`: write `argv_ptrs` (one i32 pointer
@@ -2356,6 +2445,24 @@ fn mapLinuxErrno(rc: usize) i32 {
         .NAMETOOLONG => @intCast(@intFromEnum(wasi.Errno.nametoolong)),
         .XDEV => @intCast(@intFromEnum(wasi.Errno.xdev)),
         .MLINK => @intCast(@intFromEnum(wasi.Errno.mlink)),
+        // Socket-relevant errnos for sock_accept / sock_recv / sock_send.
+        .AGAIN => @intCast(@intFromEnum(wasi.Errno.again)),
+        .INTR => @intCast(@intFromEnum(wasi.Errno.intr)),
+        .CONNABORTED => @intCast(@intFromEnum(wasi.Errno.connaborted)),
+        .CONNRESET => @intCast(@intFromEnum(wasi.Errno.connreset)),
+        .CONNREFUSED => @intCast(@intFromEnum(wasi.Errno.connrefused)),
+        .NOTCONN => @intCast(@intFromEnum(wasi.Errno.notconn)),
+        .NOTSOCK => @intCast(@intFromEnum(wasi.Errno.notsock)),
+        .PIPE => @intCast(@intFromEnum(wasi.Errno.pipe)),
+        .NOBUFS => @intCast(@intFromEnum(wasi.Errno.nobufs)),
+        .NOMEM => @intCast(@intFromEnum(wasi.Errno.nomem)),
+        .MFILE => @intCast(@intFromEnum(wasi.Errno.mfile)),
+        .NFILE => @intCast(@intFromEnum(wasi.Errno.nfile)),
+        .MSGSIZE => @intCast(@intFromEnum(wasi.Errno.msgsize)),
+        .HOSTUNREACH => @intCast(@intFromEnum(wasi.Errno.hostunreach)),
+        .NETUNREACH => @intCast(@intFromEnum(wasi.Errno.netunreach)),
+        .NETDOWN => @intCast(@intFromEnum(wasi.Errno.netdown)),
+        .FAULT => @intCast(@intFromEnum(wasi.Errno.fault)),
         else => wasi_core.WASI_EINVAL,
     };
 }
@@ -2815,6 +2922,253 @@ fn ctxSockShutdownCore(ctx: *wasi.WasiCtx, fd: i32, sdflags: i32) i32 {
     }
 }
 
+// ── sock_accept / sock_recv / sock_send (#437) ────────────────────────
+
+/// Max number of iovecs accepted in a single sock_recv/sock_send call.
+/// wasi-libc / wasmtime cap stack-allocated iovec arrays at small bounds;
+/// 16 mirrors common practice and avoids unbounded allocations from the
+/// guest. Guests that pass more than this many iovecs will see only the
+/// first 16 processed (the rest are silently dropped, matching the
+/// effective behavior of a short read/write at the iovec boundary).
+const SOCK_IOV_MAX: u32 = 16;
+
+/// Read an `iovec` array (`{u32 buf_ptr, u32 buf_len}` slots) out of guest
+/// memory and project it into a flat slice of host `posix.iovec_const`
+/// suitable for `sendmsg(2)`. Returns the number of iovecs successfully
+/// translated (clipped at `out.len` / `SOCK_IOV_MAX`) or a negative WASI
+/// errno on out-of-bounds access.
+fn readSendIovecs(
+    mem: []const u8,
+    iovs_ptr: u32,
+    iovs_len: u32,
+    out: []std.posix.iovec_const,
+) i32 {
+    var n: u32 = 0;
+    const limit = @min(iovs_len, @as(u32, @intCast(out.len)));
+    while (n < limit) : (n += 1) {
+        const slot = iovs_ptr + n * 8;
+        const buf_ptr = wasi_core.memReadU32(mem, slot) orelse return wasi_core.WASI_EINVAL;
+        const buf_len = wasi_core.memReadU32(mem, slot + 4) orelse return wasi_core.WASI_EINVAL;
+        if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
+        out[n] = .{
+            .base = @constCast(mem.ptr) + buf_ptr,
+            .len = buf_len,
+        };
+    }
+    return @intCast(n);
+}
+
+/// Mirror of `readSendIovecs` for `recvmsg(2)`. Writes a mutable
+/// `posix.iovec` slice pointing into guest memory.
+fn readRecvIovecs(
+    mem: []u8,
+    iovs_ptr: u32,
+    iovs_len: u32,
+    out: []std.posix.iovec,
+) i32 {
+    var n: u32 = 0;
+    const limit = @min(iovs_len, @as(u32, @intCast(out.len)));
+    while (n < limit) : (n += 1) {
+        const slot = iovs_ptr + n * 8;
+        const buf_ptr = wasi_core.memReadU32(mem, slot) orelse return wasi_core.WASI_EINVAL;
+        const buf_len = wasi_core.memReadU32(mem, slot + 4) orelse return wasi_core.WASI_EINVAL;
+        if (@as(u64, buf_ptr) + buf_len > mem.len) return wasi_core.WASI_EINVAL;
+        out[n] = .{
+            .base = mem.ptr + buf_ptr,
+            .len = buf_len,
+        };
+    }
+    return @intCast(n);
+}
+
+/// Accept an incoming connection on a listening socket fd. Returns
+/// `ESUCCESS` and writes the new guest fd to `ro_fd_ptr`, or a WASI errno
+/// on failure. `fdflags` may carry `FDFLAGS_NONBLOCK` — any other bit is
+/// rejected with `EINVAL`. The accepted fd is installed as a `.socket`
+/// `FdEntry` with `SOCKET_BASE_RIGHTS`.
+fn ctxSockAcceptCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    fdflags: i32,
+    ro_fd_ptr: u32,
+) i32 {
+    if (comptime builtin.os.tag == .windows) return wasi_core.WASI_ENOSYS;
+
+    if (fdflags < 0) return wasi_core.WASI_EINVAL;
+    const u_fdflags: u32 = @intCast(fdflags);
+    // Only FDFLAGS_NONBLOCK is meaningful on a freshly-accepted fd.
+    // APPEND / DSYNC / RSYNC / SYNC have no socket semantics.
+    if ((u_fdflags & ~@as(u32, wasi.FDFLAGS_NONBLOCK)) != 0) return wasi_core.WASI_EINVAL;
+
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+
+    if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
+    if ((entry.rights_base & wasi.RIGHTS_SOCK_ACCEPT) == 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
+
+    const host_listen_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
+
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var accept_flags: u32 = linux.SOCK.CLOEXEC;
+        if ((u_fdflags & wasi.FDFLAGS_NONBLOCK) != 0) accept_flags |= linux.SOCK.NONBLOCK;
+        const rc = linux.accept4(host_listen_fd, null, null, accept_flags);
+        const wasi_err = mapLinuxErrno(rc);
+        if (wasi_err != wasi_core.WASI_ESUCCESS) return wasi_err;
+        const new_host_fd: std.posix.fd_t = @intCast(@as(isize, @bitCast(rc)));
+
+        const new_guest_fd = ctx.fd_table.allocateFd();
+        ctx.fd_table.insert(new_guest_fd, .{
+            .kind = .socket,
+            .host_fd = new_host_fd,
+            .rights_base = wasi.SOCKET_BASE_RIGHTS,
+            .rights_inheriting = wasi.SOCKET_BASE_RIGHTS,
+            .fdflags = @intCast(u_fdflags & wasi.FDFLAGS_NONBLOCK),
+        }) catch {
+            _ = linux.close(new_host_fd);
+            return wasi_core.WASI_EINVAL;
+        };
+        if (!wasi_core.memWriteU32(mem, ro_fd_ptr, new_guest_fd)) {
+            _ = ctx.fd_close(new_guest_fd);
+            return wasi_core.WASI_EINVAL;
+        }
+        return wasi_core.WASI_ESUCCESS;
+    } else {
+        return wasi_core.WASI_ENOSYS;
+    }
+}
+
+/// Receive a message on a connected socket. Builds an `iovec` array from
+/// guest memory (capped at `SOCK_IOV_MAX`), maps the wasi `ri_flags`
+/// bitset onto `MSG_*`, and runs `recvmsg(2)`. Writes the byte count to
+/// `ro_datalen_ptr` and a (currently always 0) roflags bitset to
+/// `ro_flags_ptr`.
+fn ctxSockRecvCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    ri_data_ptr: u32,
+    ri_data_len: u32,
+    ri_flags: i32,
+    ro_datalen_ptr: u32,
+    ro_flags_ptr: u32,
+) i32 {
+    if (comptime builtin.os.tag == .windows) return wasi_core.WASI_ENOSYS;
+
+    if (ri_flags < 0) return wasi_core.WASI_EINVAL;
+    const u_riflags: u32 = @intCast(ri_flags);
+    if ((u_riflags & ~@as(u32, wasi.RIFLAGS_ALL)) != 0) return wasi_core.WASI_EINVAL;
+
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+
+    if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
+    if ((entry.rights_base & wasi.RIGHTS_FD_READ) == 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
+    const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
+
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var iovs: [SOCK_IOV_MAX]std.posix.iovec = undefined;
+        const n_or_err = readRecvIovecs(mem, ri_data_ptr, ri_data_len, &iovs);
+        if (n_or_err < 0) return n_or_err;
+        const n: u32 = @intCast(n_or_err);
+        if (n == 0) {
+            if (!wasi_core.memWriteU32(mem, ro_datalen_ptr, 0)) return wasi_core.WASI_EINVAL;
+            if (!wasi_core.memWriteU32(mem, ro_flags_ptr, 0)) return wasi_core.WASI_EINVAL;
+            return wasi_core.WASI_ESUCCESS;
+        }
+
+        var msg_flags: u32 = 0;
+        if ((u_riflags & wasi.RIFLAGS_RECV_PEEK) != 0) msg_flags |= linux.MSG.PEEK;
+        if ((u_riflags & wasi.RIFLAGS_RECV_WAITALL) != 0) msg_flags |= linux.MSG.WAITALL;
+
+        var mh: linux.msghdr = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&iovs[0]),
+            .iovlen = n,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        const rc = linux.recvmsg(host_fd, &mh, msg_flags);
+        const wasi_err = mapLinuxErrno(rc);
+        if (wasi_err != wasi_core.WASI_ESUCCESS) return wasi_err;
+        const got: u32 = @intCast(@as(isize, @bitCast(rc)));
+        if (!wasi_core.memWriteU32(mem, ro_datalen_ptr, got)) return wasi_core.WASI_EINVAL;
+        // roflags: we don't propagate MSG_TRUNC yet (follow-up).
+        if (!wasi_core.memWriteU32(mem, ro_flags_ptr, 0)) return wasi_core.WASI_EINVAL;
+        return wasi_core.WASI_ESUCCESS;
+    } else {
+        return wasi_core.WASI_ENOSYS;
+    }
+}
+
+/// Send a message on a connected socket. `si_flags` is reserved (must be
+/// 0). Builds an `iovec_const` array from guest memory (capped at
+/// `SOCK_IOV_MAX`) and runs `sendmsg(2)` with `MSG_NOSIGNAL` so a
+/// terminated peer surfaces as `EPIPE` instead of `SIGPIPE` on the host.
+fn ctxSockSendCore(
+    ctx: *wasi.WasiCtx,
+    mem: []u8,
+    fd: i32,
+    si_data_ptr: u32,
+    si_data_len: u32,
+    si_flags: i32,
+    so_datalen_ptr: u32,
+) i32 {
+    if (comptime builtin.os.tag == .windows) return wasi_core.WASI_ENOSYS;
+
+    if (si_flags != 0) return wasi_core.WASI_EINVAL;
+
+    if (fd < 0) return wasi_core.WASI_EBADF;
+    const u_fd: u32 = @intCast(fd);
+    const entry = ctx.fd_table.get(u_fd) orelse return wasi_core.WASI_EBADF;
+
+    if (entry.kind != .socket) return @intCast(@intFromEnum(wasi.Errno.notsock));
+    if ((entry.rights_base & wasi.RIGHTS_FD_WRITE) == 0) {
+        return @intCast(@intFromEnum(wasi.Errno.notcapable));
+    }
+    const host_fd = entry.host_fd orelse return wasi_core.WASI_EBADF;
+
+    if (comptime builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var iovs: [SOCK_IOV_MAX]std.posix.iovec_const = undefined;
+        const n_or_err = readSendIovecs(mem, si_data_ptr, si_data_len, &iovs);
+        if (n_or_err < 0) return n_or_err;
+        const n: u32 = @intCast(n_or_err);
+        if (n == 0) {
+            if (!wasi_core.memWriteU32(mem, so_datalen_ptr, 0)) return wasi_core.WASI_EINVAL;
+            return wasi_core.WASI_ESUCCESS;
+        }
+
+        const mh: linux.msghdr_const = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&iovs[0]),
+            .iovlen = n,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        const rc = linux.sendmsg(host_fd, &mh, linux.MSG.NOSIGNAL);
+        const wasi_err = mapLinuxErrno(rc);
+        if (wasi_err != wasi_core.WASI_ESUCCESS) return wasi_err;
+        const sent: u32 = @intCast(@as(isize, @bitCast(rc)));
+        if (!wasi_core.memWriteU32(mem, so_datalen_ptr, sent)) return wasi_core.WASI_EINVAL;
+        return wasi_core.WASI_ESUCCESS;
+    } else {
+        return wasi_core.WASI_ENOSYS;
+    }
+}
+
 // ── Import resolution ─────────────────────────────────────────────────
 
 /// Resolve WASI host functions for a module's imports.
@@ -2892,6 +3246,9 @@ fn resolveWasiFunction(name: []const u8) ?types.HostFn {
         .{ "path_readlink", &wasiPathReadlink },
         .{ "poll_oneoff", &wasiPollOneoff },
         .{ "sock_shutdown", &wasiSockShutdown },
+        .{ "sock_accept", &wasiSockAccept },
+        .{ "sock_recv", &wasiSockRecv },
+        .{ "sock_send", &wasiSockSend },
         .{ "clock_res_get", &wasiClockResGet },
         .{ "sched_yield", &wasiSchedYield },
         .{ "proc_raise", &wasiProcRaise },
@@ -3024,21 +3381,22 @@ test "resolveWasiFunction: unknown returns null" {
 
 test "resolveWasiFunction: all 44 functions resolve" {
     const names = [_][]const u8{
-        "proc_exit",          "thread-spawn",         "fd_write",
-        "fd_read",            "fd_pread",             "fd_pwrite",
-        "fd_readdir",         "fd_seek",              "fd_close",
-        "fd_renumber",        "fd_fdstat_get",        "fd_fdstat_set_flags",
-        "fd_fdstat_set_rights", "fd_filestat_get",    "fd_filestat_set_size",
-        "fd_filestat_set_times", "fd_advise",         "fd_allocate",
-        "fd_datasync",        "fd_sync",              "fd_tell",
-        "fd_prestat_get",     "fd_prestat_dir_name",  "clock_time_get",
-        "environ_sizes_get",  "environ_get",          "args_sizes_get",
-        "args_get",           "random_get",           "path_open",
-        "path_filestat_get",  "path_filestat_set_times", "path_create_directory",
-        "path_remove_directory", "path_unlink_file",  "path_link",
-        "path_rename",        "path_symlink",         "path_readlink",
-        "poll_oneoff",        "sock_shutdown",        "clock_res_get",
-        "sched_yield",        "proc_raise",
+        "proc_exit",             "thread-spawn",            "fd_write",
+        "fd_read",               "fd_pread",                "fd_pwrite",
+        "fd_readdir",            "fd_seek",                 "fd_close",
+        "fd_renumber",           "fd_fdstat_get",           "fd_fdstat_set_flags",
+        "fd_fdstat_set_rights",  "fd_filestat_get",         "fd_filestat_set_size",
+        "fd_filestat_set_times", "fd_advise",               "fd_allocate",
+        "fd_datasync",           "fd_sync",                 "fd_tell",
+        "fd_prestat_get",        "fd_prestat_dir_name",     "clock_time_get",
+        "environ_sizes_get",     "environ_get",             "args_sizes_get",
+        "args_get",              "random_get",              "path_open",
+        "path_filestat_get",     "path_filestat_set_times", "path_create_directory",
+        "path_remove_directory", "path_unlink_file",        "path_link",
+        "path_rename",           "path_symlink",            "path_readlink",
+        "poll_oneoff",           "sock_shutdown",           "clock_res_get",
+        "sock_accept",           "sock_recv",               "sock_send",
+        "sched_yield",           "proc_raise",
     };
     for (names) |name| {
         const result = resolveWasiFunction(name);
@@ -4863,7 +5221,7 @@ test "ctxSockShutdownCore: socket without RIGHTS_SOCK_SHUTDOWN → ENOTCAPABLE" 
     defer ctx.deinit();
     try ctx.fd_table.insert(102, .{
         .kind = .socket,
-        .host_fd = 0,
+        .host_fd = null,
         .rights_base = 0,
         .rights_inheriting = 0,
     });
@@ -4872,4 +5230,304 @@ test "ctxSockShutdownCore: socket without RIGHTS_SOCK_SHUTDOWN → ENOTCAPABLE" 
         expected,
         ctxSockShutdownCore(ctx, 102, @as(i32, wasi.SDFLAGS_RD)),
     );
+}
+
+// ── sock_accept / sock_recv / sock_send tests (#437) ───────────────────
+
+// Helper: install a `.socket` FdEntry with the given rights mask. Uses
+// host_fd = null so classification paths can be exercised without any
+// real kernel socket — the syscall path is reached only after passing
+// all rights/kind checks, and these tests target the negative paths
+// before the syscall ever fires. A null host_fd also keeps `WasiCtx.deinit`
+// from attempting to close a fake fd, which the std I/O path treats as
+// a use-after-free panic.
+fn insertSocketEntry(ctx: *wasi.WasiCtx, fd: u32, rights_base: u64) !void {
+    try ctx.fd_table.insert(fd, .{
+        .kind = .socket,
+        .host_fd = null,
+        .rights_base = rights_base,
+        .rights_inheriting = rights_base,
+    });
+}
+
+test "ctxSockAcceptCore: bad fd → EBADF" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [16]u8 = @splat(0);
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockAcceptCore(ctx, &mem, -1, 0, 0),
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockAcceptCore(ctx, &mem, 99, 0, 0),
+    );
+}
+
+test "ctxSockAcceptCore: stdout fd → ENOTSOCK" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [16]u8 = @splat(0);
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    try std.testing.expectEqual(expected, ctxSockAcceptCore(ctx, &mem, 1, 0, 0));
+}
+
+test "ctxSockAcceptCore: socket without RIGHTS_SOCK_ACCEPT → ENOTCAPABLE" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try insertSocketEntry(ctx, 102, 0);
+    var mem: [16]u8 = @splat(0);
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    try std.testing.expectEqual(expected, ctxSockAcceptCore(ctx, &mem, 102, 0, 0));
+}
+
+test "ctxSockAcceptCore: reserved fdflags bit → EINVAL" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try insertSocketEntry(ctx, 102, wasi.SOCKET_LISTEN_RIGHTS);
+    var mem: [16]u8 = @splat(0);
+    // FDFLAGS_APPEND has no socket semantics; reject.
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxSockAcceptCore(ctx, &mem, 102, @as(i32, wasi.FDFLAGS_APPEND), 0),
+    );
+}
+
+test "ctxSockRecvCore: bad fd → EBADF" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [64]u8 = @splat(0);
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockRecvCore(ctx, &mem, -1, 0, 0, 0, 0, 0),
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockRecvCore(ctx, &mem, 99, 0, 0, 0, 0, 0),
+    );
+}
+
+test "ctxSockRecvCore: stdout fd → ENOTSOCK" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [64]u8 = @splat(0);
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    try std.testing.expectEqual(expected, ctxSockRecvCore(ctx, &mem, 1, 0, 0, 0, 0, 0));
+}
+
+test "ctxSockRecvCore: socket without RIGHTS_FD_READ → ENOTCAPABLE" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    // Listener has SOCKET_LISTEN_RIGHTS which omits FD_READ on purpose.
+    try insertSocketEntry(ctx, 102, wasi.SOCKET_LISTEN_RIGHTS);
+    var mem: [64]u8 = @splat(0);
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    try std.testing.expectEqual(expected, ctxSockRecvCore(ctx, &mem, 102, 0, 0, 0, 0, 0));
+}
+
+test "ctxSockRecvCore: reserved ri_flags bit → EINVAL" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try insertSocketEntry(ctx, 102, wasi.SOCKET_BASE_RIGHTS);
+    var mem: [64]u8 = @splat(0);
+    // 0x10 is outside RIFLAGS_RECV_PEEK | RIFLAGS_RECV_WAITALL.
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxSockRecvCore(ctx, &mem, 102, 0, 0, 0x10, 0, 0),
+    );
+}
+
+test "ctxSockSendCore: bad fd → EBADF" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [64]u8 = @splat(0);
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockSendCore(ctx, &mem, -1, 0, 0, 0, 0),
+    );
+    try std.testing.expectEqual(
+        wasi_core.WASI_EBADF,
+        ctxSockSendCore(ctx, &mem, 99, 0, 0, 0, 0),
+    );
+}
+
+test "ctxSockSendCore: stdout fd → ENOTSOCK" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    var mem: [64]u8 = @splat(0);
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notsock));
+    try std.testing.expectEqual(expected, ctxSockSendCore(ctx, &mem, 1, 0, 0, 0, 0));
+}
+
+test "ctxSockSendCore: socket without RIGHTS_FD_WRITE → ENOTCAPABLE" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try insertSocketEntry(ctx, 102, wasi.SOCKET_LISTEN_RIGHTS);
+    var mem: [64]u8 = @splat(0);
+    const expected: i32 = @intCast(@intFromEnum(wasi.Errno.notcapable));
+    try std.testing.expectEqual(expected, ctxSockSendCore(ctx, &mem, 102, 0, 0, 0, 0));
+}
+
+test "ctxSockSendCore: si_flags != 0 → EINVAL" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    try insertSocketEntry(ctx, 102, wasi.SOCKET_BASE_RIGHTS);
+    var mem: [64]u8 = @splat(0);
+    try std.testing.expectEqual(
+        wasi_core.WASI_EINVAL,
+        ctxSockSendCore(ctx, &mem, 102, 0, 0, 1, 0),
+    );
+}
+
+// ── socketpair round-trip (Linux only) ─────────────────────────────────
+// Exercise the full syscall path of sock_recv / sock_send against a
+// kernel-backed connected socket pair. The pair member we install as a
+// .socket FdEntry is owned by WasiCtx and closed in deinit; the
+// non-installed peer is closed manually.
+
+test "ctxSockSendCore + ctxSockRecvCore: UNIX socketpair round-trip" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+
+    var pair: [2]std.posix.fd_t = .{ -1, -1 };
+    {
+        const rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &pair);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    }
+    // Peer (pair[1]) stays host-side; pair[0] becomes the guest socket.
+    defer _ = linux.close(pair[1]);
+
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const guest_fd: u32 = 200;
+    try ctx.fd_table.insert(guest_fd, .{
+        .kind = .socket,
+        .host_fd = pair[0],
+        .rights_base = wasi.SOCKET_BASE_RIGHTS,
+        .rights_inheriting = wasi.SOCKET_BASE_RIGHTS,
+    });
+
+    // Simulated guest linear memory:
+    //   [0..8)   iovec slot 0: { buf_ptr=16, buf_len=5 }
+    //   [8..12)  so_datalen_ptr / ro_datalen_ptr scratch
+    //   [12..16) ro_flags_ptr scratch
+    //   [16..21) payload bytes
+    var mem: [128]u8 = @splat(0);
+    std.mem.writeInt(u32, mem[0..4], 16, .little);
+    std.mem.writeInt(u32, mem[4..8], 5, .little);
+    @memcpy(mem[16..21], "hello");
+
+    // send "hello"
+    const send_rc = ctxSockSendCore(ctx, &mem, @intCast(guest_fd), 0, 1, 0, 8);
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, send_rc);
+    const sent = std.mem.readInt(u32, mem[8..12], .little);
+    try std.testing.expectEqual(@as(u32, 5), sent);
+
+    // Read on the peer to verify the bytes left the host fd.
+    var peer_buf: [16]u8 = undefined;
+    const got_rc = linux.read(pair[1], peer_buf[0..], 16);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(got_rc));
+    const got: usize = @intCast(@as(isize, @bitCast(got_rc)));
+    try std.testing.expectEqualSlices(u8, "hello", peer_buf[0..got]);
+
+    // Now send back from the peer and recv on the guest side.
+    const write_rc = linux.write(pair[1], "world", 5);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(write_rc));
+
+    // Reuse the iovec at mem[0..8] pointing at mem[32..37].
+    @memset(mem[16..], 0);
+    std.mem.writeInt(u32, mem[0..4], 32, .little);
+    std.mem.writeInt(u32, mem[4..8], 5, .little);
+    const recv_rc = ctxSockRecvCore(ctx, &mem, @intCast(guest_fd), 0, 1, 0, 8, 12);
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, recv_rc);
+    const recvd = std.mem.readInt(u32, mem[8..12], .little);
+    try std.testing.expectEqual(@as(u32, 5), recvd);
+    try std.testing.expectEqualSlices(u8, "world", mem[32..37]);
+}
+
+test "ctxSockAcceptCore: TCP listener accepts a host-side connection" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+
+    // Bind a listener on 127.0.0.1:0 (ephemeral port).
+    const lfd_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, linux.IPPROTO.TCP);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(lfd_rc));
+    const listen_fd: std.posix.fd_t = @intCast(@as(isize, @bitCast(lfd_rc)));
+    defer _ = linux.close(listen_fd);
+    var sa: linux.sockaddr.in = .{
+        .port = 0,
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    {
+        const rc = linux.bind(listen_fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    }
+    {
+        const rc = linux.listen(listen_fd, 1);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    }
+
+    // Read back the kernel-assigned port via getsockname.
+    var bound: linux.sockaddr.in = undefined;
+    var bound_len: linux.socklen_t = @sizeOf(@TypeOf(bound));
+    {
+        const rc = linux.getsockname(listen_fd, @ptrCast(&bound), &bound_len);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+    }
+
+    // Spawn a client thread that connects, exchanges nothing, and closes.
+    const ConnectArg = struct { port: u16 };
+    const arg: ConnectArg = .{ .port = std.mem.bigToNative(u16, bound.port) };
+    const Connector = struct {
+        fn run(a: ConnectArg) void {
+            const l = std.os.linux;
+            const c_rc = l.socket(l.AF.INET, l.SOCK.STREAM | l.SOCK.CLOEXEC, l.IPPROTO.TCP);
+            if (l.errno(c_rc) != .SUCCESS) return;
+            const cfd: std.posix.fd_t = @intCast(@as(isize, @bitCast(c_rc)));
+            defer _ = l.close(cfd);
+            const dst: l.sockaddr.in = .{
+                .port = std.mem.nativeToBig(u16, a.port),
+                .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+            };
+            _ = l.connect(cfd, @ptrCast(&dst), @sizeOf(@TypeOf(dst)));
+        }
+    };
+    var thread = try std.Thread.spawn(.{}, Connector.run, .{arg});
+    defer thread.join();
+
+    // Wire the listener as a socket preopen and accept once.
+    const ctx = try wasi.WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+    const guest_listen_fd: u32 = 200;
+    try ctx.fd_table.insert(guest_listen_fd, .{
+        .kind = .socket,
+        .host_fd = listen_fd,
+        .rights_base = wasi.SOCKET_LISTEN_RIGHTS,
+        .rights_inheriting = wasi.SOCKET_BASE_RIGHTS,
+    });
+
+    var mem: [16]u8 = @splat(0);
+    const rc = ctxSockAcceptCore(ctx, &mem, @intCast(guest_listen_fd), 0, 0);
+    try std.testing.expectEqual(wasi_core.WASI_ESUCCESS, rc);
+    const new_guest_fd = std.mem.readInt(u32, mem[0..4], .little);
+    try std.testing.expect(new_guest_fd >= 3);
+    const entry = ctx.fd_table.get(new_guest_fd) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(wasi.FdEntry.FdKind.socket, entry.kind);
+    // listen_fd is owned by the test; rewire its FdEntry to drop ownership
+    // before deinit closes a fd the deferred linux.close also closes.
+    var lis = ctx.fd_table.entries.getPtr(guest_listen_fd).?;
+    lis.host_fd = null;
 }

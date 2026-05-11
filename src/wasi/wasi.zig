@@ -218,6 +218,21 @@ pub const EVENT_SIZE: usize = 32;
 pub const SDFLAGS_RD: u16 = 0x0001;
 pub const SDFLAGS_WR: u16 = 0x0002;
 
+// ── sock_recv riflags ───────────────────────────────────────────────────
+// Witx `riflags` is a bitset. Only the two below are defined; any other
+// bit must be rejected with `EINVAL`. `WAITALL` maps to `MSG_WAITALL`,
+// `PEEK` to `MSG_PEEK`.
+pub const RIFLAGS_RECV_PEEK: u16 = 0x0001;
+pub const RIFLAGS_RECV_WAITALL: u16 = 0x0002;
+pub const RIFLAGS_ALL: u16 = RIFLAGS_RECV_PEEK | RIFLAGS_RECV_WAITALL;
+
+// ── sock_recv roflags ───────────────────────────────────────────────────
+// Currently only `DATA_TRUNCATED` is defined (set when the host kernel
+// reports `MSG_TRUNC`). wamr's `sock_recv` does not surface this yet —
+// the bit is defined for forward compatibility and for the guest-side
+// header layout.
+pub const ROFLAGS_RECV_DATA_TRUNCATED: u16 = 0x0001;
+
 // ── WASI rights (bitset, u64) — only the bits we currently consult ──────
 // Full taxonomy in the preview1 spec; extend on demand.
 
@@ -300,6 +315,27 @@ pub const FILE_BASE_RIGHTS: u64 =
 /// `path_open`. Same as base + the file rights so opening a regular
 /// file inside still gets read/write/seek capabilities.
 pub const DIRECTORY_INHERITING_RIGHTS: u64 = DIRECTORY_BASE_RIGHTS | FILE_BASE_RIGHTS;
+
+/// Rights granted to a connected stream socket — what `sock_accept`
+/// installs on the new fd. wasi-libc expects an accepted socket to
+/// support `read`/`write`/`poll`/`shutdown`; it does not expect the
+/// child fd to be able to `accept` again.
+pub const SOCKET_BASE_RIGHTS: u64 =
+    RIGHTS_FD_READ |
+    RIGHTS_FD_WRITE |
+    RIGHTS_FD_FDSTAT_SET_FLAGS |
+    RIGHTS_POLL_FD_READWRITE |
+    RIGHTS_SOCK_SHUTDOWN;
+
+/// Rights granted to a listening socket preopen (the `--listen=` fd).
+/// It accepts new connections and is poll-able; it cannot itself be
+/// read from or written to, mirroring wasi-libc's expectation for a
+/// passive `socket(2)` + `listen(2)` fd.
+pub const SOCKET_LISTEN_RIGHTS: u64 =
+    RIGHTS_SOCK_ACCEPT |
+    RIGHTS_POLL_FD_READWRITE |
+    RIGHTS_SOCK_SHUTDOWN |
+    RIGHTS_FD_FDSTAT_SET_FLAGS;
 
 // ── WASI fstflags (bitset, u16) for `*_filestat_set_times` ──────────────
 
@@ -441,7 +477,7 @@ pub const WasiCtx = struct {
                 d.close(self.io);
             }
             if (entry.host_fd) |host_fd| {
-                if (entry.kind == .regular_file) {
+                if (entry.kind == .regular_file or entry.kind == .socket) {
                     const file = File{ .handle = host_fd, .flags = .{ .nonblocking = false } };
                     file.close(self.io);
                 }
@@ -493,6 +529,24 @@ pub const WasiCtx = struct {
             d.close(self.io);
         }
         return try self.addPreopen(guest_name, dir);
+    }
+
+    /// Register an already-listening host TCP socket as a socket preopen.
+    /// Allocates a fresh fd ≥ 3 and takes ownership of `host_fd` (closed
+    /// on `WasiCtx.deinit`). The preopen is *not* recorded in
+    /// `self.preopens` — preview1's `fd_prestat_*` surface only exposes
+    /// directory preopens; socket preopens are discoverable by convention
+    /// (wasi-libc walks fds 3.. and reports `ENOTDIR` for non-dir prestats
+    /// to enumerate them). Returns the assigned fd.
+    pub fn addPreopenSocket(self: *WasiCtx, host_fd: std.posix.fd_t) !u32 {
+        const fd = self.fd_table.allocateFd();
+        try self.fd_table.insert(fd, .{
+            .kind = .socket,
+            .host_fd = host_fd,
+            .rights_base = SOCKET_LISTEN_RIGHTS,
+            .rights_inheriting = SOCKET_BASE_RIGHTS,
+        });
+        return fd;
     }
 
     /// Look up a preopen by its assigned fd; returns the guest name or null.
