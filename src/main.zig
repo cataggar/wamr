@@ -49,16 +49,26 @@ pub fn main(init: std.process.Init) !u8 {
     };
 
     return switch (subcmd) {
-        .version => blk: {
-            writeStdout(init.io, "wamr " ++ wamr.version.string ++ "\n");
-            break :blk 0;
-        },
+        .version => try runVersion(init.io, args[2..]),
         .help => runHelp(init.io, args[2..]),
         .run => try runRun(init, allocator, args[2..]),
     };
 }
 
+fn runVersion(io: std.Io, args: []const []const u8) !u8 {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) {
+        writeStdout(io, version_usage);
+        return 0;
+    }
+    writeStdout(io, "wamr " ++ wamr.version.string ++ "\n");
+    return 0;
+}
+
 fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []const []const u8) !u8 {
+    if (run_args.len == 1 and std.mem.eql(u8, run_args[0], "help")) {
+        writeStdout(init.io, run_usage);
+        return 0;
+    }
     var wasm_path: ?[]const u8 = null;
     var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer wasm_args.deinit(allocator);
@@ -74,9 +84,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     while (i < run_args.len) : (i += 1) {
         const arg = run_args[i];
         if (!past_options and arg.len > 0 and arg[0] == '-') {
-            if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-                return runHelp(init.io, &.{"run"});
-            } else if (std.mem.startsWith(u8, arg, "--stack-size=")) {
+            if (std.mem.startsWith(u8, arg, "--stack-size=")) {
                 stack_size = std.fmt.parseInt(u32, arg["--stack-size=".len..], 10) catch {
                     std.debug.print("error: invalid --stack-size value\n", .{});
                     return 2;
@@ -124,7 +132,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
-                std.debug.print("error: unknown option '{s}' — try `wamr help run`\n", .{arg});
+                std.debug.print("error: unknown option '{s}' — try `wamr run help`\n", .{arg});
                 return 2;
             }
         } else if (wasm_path == null) {
@@ -581,7 +589,9 @@ const top_usage =
     \\Subcommands:
     \\  run       Run a .wasm or .cwasm file
     \\  version   Print version and exit
-    \\  help      Print this help; `wamr help <subcommand>` for details
+    \\  help      Print this help
+    \\
+    \\Run `wamr <subcommand> help` to show help for a specific subcommand.
     \\
 ;
 
@@ -598,7 +608,6 @@ const run_usage =
     \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
     \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
     \\                           inside the guest WASI sandbox (repeatable)
-    \\  -h, --help               Show this help
     \\
 ;
 
@@ -610,26 +619,18 @@ const version_usage =
 ;
 
 const help_usage =
-    \\Usage: wamr help [subcommand]
+    \\Usage: wamr help
     \\
-    \\Print top-level help, or help for a specific subcommand.
+    \\Print top-level help and exit.
     \\
 ;
 
 fn runHelp(io: std.Io, args: []const []const u8) u8 {
-    if (args.len == 0) {
-        writeStdout(io, top_usage);
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) {
+        writeStdout(io, help_usage);
         return 0;
     }
-    const sub = parseSubcommand(args[0]) orelse {
-        std.debug.print("error: unknown subcommand '{s}' — try `wamr help`\n", .{args[0]});
-        return 2;
-    };
-    writeStdout(io, switch (sub) {
-        .run => run_usage,
-        .version => version_usage,
-        .help => help_usage,
-    });
+    writeStdout(io, top_usage);
     return 0;
 }
 

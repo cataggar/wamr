@@ -37,19 +37,25 @@ pub fn main(init: std.process.Init) !void {
     };
 
     switch (subcmd) {
-        .version => {
-            writeStdout(init.io, "wamrc " ++ wamr.version.string ++ "\n");
-            return;
-        },
-        .help => {
-            runHelp(init.io, args[2..]);
-            return;
-        },
+        .version => try runVersion(init.io, args[2..]),
+        .help => runHelp(init.io, args[2..]),
         .compile => try runCompile(init, allocator, args[2..]),
     }
 }
 
+fn runVersion(io: std.Io, args: []const []const u8) !void {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) {
+        writeStdout(io, version_usage);
+        return;
+    }
+    writeStdout(io, "wamrc " ++ wamr.version.string ++ "\n");
+}
+
 fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len == 1 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, compile_usage);
+        return;
+    }
     var input_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
     var optimize = true;
@@ -63,10 +69,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const a = sub_args[i];
-        if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            runHelp(init.io, &.{"compile"});
-            return;
-        } else if (std.mem.eql(u8, a, "-o") and i + 1 < sub_args.len) {
+        if (std.mem.eql(u8, a, "-o") and i + 1 < sub_args.len) {
             i += 1;
             output_path = sub_args[i];
         } else if (std.mem.eql(u8, a, "-O0")) {
@@ -96,7 +99,7 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         } else if (std.mem.eql(u8, a, "--aarch64-no-xreg-alloc")) {
             enable_aarch64_xreg_alloc = false;
         } else if (a.len > 0 and a[0] == '-') {
-            std.debug.print("error: unknown option '{s}' — try `wamrc help compile`\n", .{a});
+            std.debug.print("error: unknown option '{s}' — try `wamrc compile help`\n", .{a});
             std.process.exit(1);
         } else if (input_path == null) {
             input_path = a;
@@ -423,7 +426,9 @@ const top_usage =
     \\Subcommands:
     \\  compile   Compile a .wasm module to a .cwasm AOT binary
     \\  version   Print version and exit
-    \\  help      Print this help; `wamrc help <subcommand>` for details
+    \\  help      Print this help
+    \\
+    \\Run `wamrc <subcommand> help` to show help for a specific subcommand.
     \\
 ;
 
@@ -440,7 +445,6 @@ const compile_usage =
     \\  -O0                           Disable IR optimizations
     \\  --aarch64-no-scheduler        Disable AArch64 instruction scheduler
     \\  --aarch64-no-xreg-alloc       Disable AArch64 X-register allocator
-    \\  -h, --help                    Show this help
     \\
 ;
 
@@ -452,26 +456,18 @@ const version_usage =
 ;
 
 const help_usage =
-    \\Usage: wamrc help [subcommand]
+    \\Usage: wamrc help
     \\
-    \\Print top-level help, or help for a specific subcommand.
+    \\Print top-level help and exit.
     \\
 ;
 
 fn runHelp(io: std.Io, args: []const []const u8) void {
-    if (args.len == 0) {
-        writeStdout(io, top_usage);
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) {
+        writeStdout(io, help_usage);
         return;
     }
-    const sub = parseSubcommand(args[0]) orelse {
-        std.debug.print("error: unknown subcommand '{s}' — try `wamrc help`\n", .{args[0]});
-        std.process.exit(1);
-    };
-    writeStdout(io, switch (sub) {
-        .compile => compile_usage,
-        .version => version_usage,
-        .help => help_usage,
-    });
+    writeStdout(io, top_usage);
 }
 
 /// Derive an output `.cwasm` path from the input wasm path. Strips a
