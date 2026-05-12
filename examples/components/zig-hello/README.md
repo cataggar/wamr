@@ -15,10 +15,10 @@ zig build-exe -target wasm32-wasi -O ReleaseSmall \
     -fno-entry --export=_start \
     src/main.zig
 
-# 2. Wrap it as a component using the wasi-preview1 command adapter.
-wabt component new main.wasm \
-    --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm \
-    -o zig-hello.component.wasm
+# 2. Wrap it as a component. `wabt component new` auto-attaches the
+#    bundled wasi-preview1 → preview2 adapter when the embed imports
+#    `wasi_snapshot_preview1.*`.
+wabt component new main.wasm -o zig-hello.component.wasm
 ```
 
 The repo's root `build.zig` automates both steps:

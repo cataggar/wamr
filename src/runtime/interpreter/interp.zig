@@ -9,7 +9,6 @@ const types = @import("../common/types.zig");
 const ExecEnv = @import("../common/exec_env.zig").ExecEnv;
 const CallFrame = @import("../common/exec_env.zig").CallFrame;
 const HostTrapInfo = @import("../common/exec_env.zig").HostTrapInfo;
-const wasi_host_functions = @import("../../wasi/host_functions.zig");
 
 // NaN canonicalization per Wasm spec
 inline fn canonF32(val: f32) f32 {
@@ -869,34 +868,6 @@ fn executeFunctionWithFuel(env: *ExecEnv, func_idx: u32, fuel: *FuelBudget) Trap
             }
             // Dispatch to the imported module's actual function
             if (current_func_idx < env.module_inst.import_functions.len) {
-                // Interception (#436 / #448): when a guest's preview1
-                // `proc_exit(rc)` is cross-bound to a component-level
-                // wasi-preview1 adapter, the wasmtime adapter funnels
-                // the call through `wasi:cli/exit.exit(result)` — a
-                // single bit. Numeric i32 codes are structurally lost
-                // (no `exit-with-code(u8)` even in v44). Short-circuit
-                // through `wasiProcExit` so the host can observe the
-                // original code via `ModuleInstance.exit_code_sink`
-                // (wired to `WasiCliAdapter.exit_code` by
-                // `runLoadedComponent`). Surface the resulting trap as
-                // `error.WasiExit` so `callComponentFunc`'s
-                // `[component trap]` suppression treats it as benign
-                // control flow rather than a real fault.
-                //
-                // Retirable once we ship a wamr-native preview1
-                // adapter with a real `exit-with-code` export (#453).
-                if (lookupCoreFuncImport(module, current_func_idx)) |imp| {
-                    if (std.mem.eql(u8, imp.module_name, "wasi_snapshot_preview1") and
-                        std.mem.eql(u8, imp.field_name, "proc_exit") and
-                        env.module_inst.exit_code_sink != null)
-                    {
-                        wasi_host_functions.wasiProcExit(@ptrCast(env)) catch {
-                            recordHostTrap(env, current_func_idx, error.WasiExit);
-                            return error.Unreachable;
-                        };
-                        return;
-                    }
-                }
                 const imported = env.module_inst.import_functions[current_func_idx];
                 const saved_module_inst = env.module_inst;
                 env.module_inst = imported.module_inst;

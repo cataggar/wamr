@@ -42,10 +42,10 @@ zig build-exe -target wasm32-wasi -O ReleaseSmall \
 # 2. embed the world so component new can recognise the docs:adder import.
 wabt component embed --world app wit main.wasm -o main.embed.wasm
 
-# 3. encode + adapt.
-wabt component new main.embed.wasm \
-    --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm \
-    -o zig-calculator-cmd.component.wasm
+# 3. encode the component. `wabt component new` auto-attaches the
+#    bundled wasi-preview1 → preview2 adapter for the
+#    `wasi_snapshot_preview1.*` imports the embed leaves unresolved.
+wabt component new main.embed.wasm -o zig-calculator-cmd.component.wasm
 
 # 4. compose with an adder implementation (e.g. ../zig-adder).
 wabt component compose -d zig-adder.component.wasm \

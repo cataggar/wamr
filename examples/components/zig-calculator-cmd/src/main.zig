@@ -11,8 +11,8 @@
 //!   2. wabt component embed --world app wit main.wasm \
 //!         -o main.embed.wasm
 //!   3. wabt component new main.embed.wasm \
-//!         --adapt wasi_snapshot_preview1=wasi_snapshot_preview1.command.wasm \
-//!         -o zig-calculator-cmd.component.wasm
+//!         -o zig-calculator-cmd.component.wasm   ;; auto-attaches the
+//!                                                ;; wasi-preview1 adapter
 //!
 //! The `extern "docs:adder/add@0.1.0" fn add(...)` declaration becomes a
 //! component-level import of `docs:adder/add@0.1.0::add` after the embed
