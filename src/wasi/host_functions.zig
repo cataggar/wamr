@@ -77,20 +77,6 @@ pub fn wasiProcExit(env_opaque: *anyopaque) types.HostFnError!void {
         ctx.exit_code = @bitCast(code);
     }
 
-    // Component-model wiring (issues #436 / #448): the wamr component
-    // flow has no `WasiCtx`, so the writeback above is a no-op there.
-    // The wasmtime preview1 adapter's `wasi:cli/exit.exit(result)`
-    // structurally loses the numeric i32 (no `exit-with-code(u8)` even
-    // in v44), so for adapter-composed components the cross-dispatch
-    // interception in `src/runtime/interpreter/interp.zig` routes
-    // `wasi_snapshot_preview1.proc_exit` through this function instead
-    // of the adapter body. Stash the original code on the host-side
-    // slot so `runLoadedComponent`/`runComponent` can mirror it into
-    // the host process exit code. Pending wamr-native adapter #453.
-    if (env.module_inst.exit_code_sink) |sink| {
-        sink.* = @bitCast(code);
-    }
-
     if (env.module_inst.thread_manager) |tm| {
         tm.signalTrap();
     }
