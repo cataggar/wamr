@@ -632,7 +632,7 @@ pub fn build(b: *std.Build) void {
 /// Neither is reachable from `zig build` or `zig build test`.
 ///
 /// Pinned versions:
-///   * `cataggar/wabt` ≥ v3.0.0-dev.5 on PATH (provides `component embed`,
+///   * `cataggar/wabt` ≥ v3.0.0-dev.6 on PATH (provides `component embed`,
 ///     `component new`, `component compose`, `module validate`).
 ///     The wasi-preview1 → component adapter is embedded in `wabt` and
 ///     auto-attached by `wabt component new`; no external adapter fetch.
