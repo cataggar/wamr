@@ -55,8 +55,7 @@ zig-out/component-examples/
 | Tool                                  | Version    | Notes                                                    |
 |---------------------------------------|-----------:|----------------------------------------------------------|
 | Zig                                   | 0.16.x     | Toolchain already required by the rest of the repo.       |
-| `wabt` (cataggar/wabt)                | v3.0.0-dev.4 | Provides `component embed/new`, `validate`, `component compose`. |
-| Wasmtime preview1→component adapter   | v36.0.9    | Auto-fetched + sha256-pinned by the build (`build.zig`). |
+| `wabt` (cataggar/wabt)                | v3.0.0-dev.5 | Provides `component embed/new`, `module validate`, `component compose`. The wasi-preview1 → component adapter is bundled inside `wabt` and auto-attached by `wabt component new`. |
 | Rust toolchain (`cargo`, `rustup`)    | recent stable | Mixed example only.                                  |
 | `wasm32-wasip1` Rust target           | —          | `rustup target add wasm32-wasip1`. Mixed example only.    |
 
@@ -76,9 +75,7 @@ aliased-instance form `wasm-tools compose` historically used); both
 shapes are spec-valid, and wamr's component loader handles both.
 
 The `zig-hello` runtime test asserts that wamr exits 0 and emits the
-greeting. Note that the captured-stdout flush in
-[`src/main.zig`](../../src/main.zig) currently lands on the host's
-stderr fd; the assertion is pinned to that observed behaviour.
+greeting on host stdout (fd 1).
 
 [wasmtime]: https://wasmtime.dev/
 
@@ -87,7 +84,18 @@ stderr fd; the assertion is pinned to that observed behaviour.
 - Component-Model support in wamr is still in **preview**; behaviour
   may shift between releases. Each example's README pins its
   expectations to the current state of the runtime.
-- The wasi-preview1 → Component adapter shipped by Wasmtime is the
-  industry-standard escape hatch for languages (Zig, Rust, …) whose
-  toolchains target `wasm32-wasip1` natively but do not yet emit
-  Component Model artifacts directly.
+- The wasi-preview1 → Component adapter is bundled inside the
+  `cataggar/wabt` CLI (see `cataggar/wabt#145`/#156) and is
+  auto-attached by `wabt component new` for command-style embeds
+  whose `wasi_snapshot_preview1.*` imports are otherwise unresolved.
+  Languages (Zig, Rust, …) whose toolchains target `wasm32-wasip1`
+  natively but do not yet emit Component-Model artifacts directly
+  reach the preview2 surface through this adapter.
+- The adapter lowers preview1 `proc_exit(code)` through
+  `wasi:cli/exit.exit-with-code(u8)` (with a defensive fallback to
+  the stable `exit(result<_, _>)`). `exit-with-code` is the
+  `@unstable(feature = cli-exit-with-code)` extension of the
+  wasi-cli@0.2.6 interface — wamr supports it unconditionally,
+  while Wasmtime v44 gates the linker binding behind
+  `-S cli-exit-with-code`. To run `zig-exit` / `mixed-zig-rust-calc`
+  on wasmtime: `wasmtime run -S cli-exit-with-code <component>.wasm`.
