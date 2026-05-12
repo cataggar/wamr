@@ -44,7 +44,7 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
-      - name: Install cataggar/wabt v3.0.0-dev.5 (component CLI)
+      - name: Install cataggar/wabt v3.0.0-dev.6 (component CLI)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -59,7 +59,7 @@ jobs:
           # at 60/hr on Azure-hosted runners that share IPs across
           # tenants.
           pipx install ghr-bin==0.1.6
-          ghr install cataggar/wabt@v3.0.0-dev.5
+          ghr install cataggar/wabt@v3.0.0-dev.6
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/wabt" version
 
