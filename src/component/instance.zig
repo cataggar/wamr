@@ -278,6 +278,28 @@ pub const ComponentInstance = struct {
     /// (#478 sub-PR 1.)
     implicit_task_context: [async_mod.N_CONTEXT_SLOTS]u32 = [_]u32{0} ** async_mod.N_CONTEXT_SLOTS,
 
+    /// Per-instance async-handle tables for the WASIp3 canonical-ABI
+    /// surface (#478 sub-PR 3). Each table maps a u32 handle to the
+    /// host-side state allocated by the corresponding `.new` canon op:
+    /// futures, streams, error-contexts, and waitable-sets. Handles are
+    /// drawn from `next_async_handle` (starting at 1; zero is the spec
+    /// sentinel meaning "no value yet").
+    futures: std.AutoHashMapUnmanaged(u32, async_mod.Future) = .empty,
+    streams: std.AutoHashMapUnmanaged(u32, async_mod.AsyncStream) = .empty,
+    error_contexts: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    waitable_sets: std.AutoHashMapUnmanaged(u32, async_mod.WaitableSet) = .empty,
+    next_async_handle: u32 = 1,
+
+    /// Allocate a fresh async-handle (#478 sub-PR 3). Used by every
+    /// `.new`-flavoured canon-builtin to mint a unique key into the
+    /// per-instance future / stream / error-context / waitable-set
+    /// tables.
+    pub fn allocAsyncHandle(self: *ComponentInstance) u32 {
+        const h = self.next_async_handle;
+        self.next_async_handle += 1;
+        return h;
+    }
+
     pub const LinkState = enum { unlinked, linking, linked, poisoned };
 
     pub const CoreInstanceEntry = struct {
@@ -398,6 +420,8 @@ pub const ComponentInstance = struct {
             .task_yield,
             .context_get,
             .context_set,
+            .task_return,
+            .async_canon,
             => return null,
             .aliased => |alias_idx| {
                 const ie = self.component.aliases[alias_idx].instance_export;
@@ -1095,6 +1119,21 @@ pub const ComponentInstance = struct {
         var rt_it = self.resource_tables.valueIterator();
         while (rt_it.next()) |rt| rt.deinit(self.allocator);
         self.resource_tables.deinit(self.allocator);
+
+        // Tear down per-instance async-handle tables (#478 sub-PR 3).
+        // Streams and waitable-sets own heap memory; futures and
+        // error-contexts don't (the latter stores `[]u8` debug strings
+        // which we free below).
+        self.futures.deinit(self.allocator);
+        var stream_it = self.streams.valueIterator();
+        while (stream_it.next()) |s| s.deinit(self.allocator);
+        self.streams.deinit(self.allocator);
+        var ec_it = self.error_contexts.valueIterator();
+        while (ec_it.next()) |msg| self.allocator.free(msg.*);
+        self.error_contexts.deinit(self.allocator);
+        var ws_it = self.waitable_sets.valueIterator();
+        while (ws_it.next()) |ws| ws.deinit(self.allocator);
+        self.waitable_sets.deinit(self.allocator);
         for (self.trampoline_ctxs.items) |ctx| {
             ctx.deinit(self.allocator);
             self.allocator.destroy(ctx);
@@ -2007,6 +2046,8 @@ fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) 
         .task_yield,
         .context_get,
         .context_set,
+        .task_return,
+        .async_canon,
         .aliased,
         => null,
     };
@@ -2475,6 +2516,8 @@ fn resolveLiftedCoreFunc(
         .task_yield,
         .context_get,
         .context_set,
+        .task_return,
+        .async_canon,
         => return null,
         .aliased => |alias_idx| {
             const a = component.aliases[alias_idx];

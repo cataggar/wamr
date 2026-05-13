@@ -41,6 +41,18 @@ pub const ValType = union(enum) {
     own: u32, // resource type index
     borrow: u32, // resource type index
 
+    // Async ABI value types (Component Model 🔀 / 📝). Per Binary.md:
+    //   0x64                       => error-context
+    //   0x65 t?:<valtype>?         => (future t?)
+    //   0x66 t?:<valtype>?         => (stream t?)
+    // Sub-PR 3 of #478 only accepts the typeidx-carrying form; the
+    // payload-less spelling (`0x65 0x00` / `0x66 0x00`) is rejected at
+    // load with `error.InvalidEncoding` — Wasmtime's tests don't emit it
+    // either, and supporting it cleanly requires a payload variant.
+    error_context,
+    future: u32, // typeidx of payload element
+    stream: u32, // typeidx of payload element
+
     /// Type index reference (for recursive/named types).
     type_idx: u32,
 };
@@ -309,6 +321,15 @@ pub const CanonOpt = union(enum) {
     post_return: u32, // core func index
     /// String encoding to use.
     string_encoding: StringEncoding,
+    /// Lift this function asynchronously (Binary.md canonopt tag `0x06`).
+    /// Forces the canonical-ABI to return a packed status immediately and
+    /// expect `task.return` to deliver the real results. (#478 sub-PR 2.)
+    async_lift,
+    /// Callback core funcidx for resumption after an async yield
+    /// (Binary.md canonopt tag `0x07`). Single-threaded poll-cycle stub
+    /// in sub-PR 2; sub-PR 3 wires it into the real `future`/`stream`
+    /// polling story. (#478 sub-PR 2.)
+    callback: u32,
 };
 
 /// Canonical function definitions.
@@ -353,6 +374,81 @@ pub const Canon = union(enum) {
     /// Write a per-task context slot. Tag `0x0b`. Same `i32`-only restriction
     /// as `context_get`.
     context_set: struct { val_type: CoreValType, slot: u32 },
+
+    /// Deliver the results of an async-lifted callee. Tag `0x09`. The
+    /// `results` shape matches the lifted-callee's result types (encoded
+    /// identically to `FuncType.ResultList`: `0x00 valtype` for one
+    /// unnamed result, `0x01 0x00` for none). `opts` carries memory /
+    /// realloc / string-encoding needed to lower compound results back
+    /// into the caller's memory. The callee invokes this from inside the
+    /// core-wasm body to transition its task from `.started` to
+    /// `.returned`. (#478 sub-PR 2.)
+    task_return: struct { results: FuncType.ResultList, opts: []const CanonOpt },
+
+    /// Catch-all for the broader WASIp3 async-canon surface: subtask /
+    /// future / stream / error-context / waitable-set / waitable.join.
+    /// Each entry retains its binary-tag-specific payload via
+    /// `AsyncCanonOp`. Sub-PR 3 of #478 lands the IR + loader + a
+    /// minimum dispatch wiring so the conformance suite stops bailing
+    /// on `error.InvalidEncoding`; semantics for some operations remain
+    /// placeholders (documented per-arm in `dispatchCanonBuiltin`).
+    async_canon: AsyncCanonOp,
+};
+
+/// Per-tag payload for `Canon.async_canon`. Tag bytes come straight from
+/// Binary.md "Canonical Definitions" (the 🔀 / 📝-annotated entries that
+/// aren't handled by their own dedicated `Canon` variants). Keeping a
+/// single union variant on `Canon` (instead of ~17 separate ones) avoids
+/// rippling exhaustive switches across every consumer.
+pub const AsyncCanonOp = union(enum) {
+    /// `canon subtask.cancel async?` — Binary.md tag `0x06`.
+    subtask_cancel: struct { is_async: bool },
+    /// `canon subtask.drop` — tag `0x0d`.
+    subtask_drop,
+    /// `canon stream.new t` — tag `0x0e`.
+    stream_new: struct { type_idx: u32 },
+    /// `canon stream.read t opts` — tag `0x0f`.
+    stream_read: struct { type_idx: u32, opts: []const CanonOpt },
+    /// `canon stream.write t opts` — tag `0x10`.
+    stream_write: struct { type_idx: u32, opts: []const CanonOpt },
+    /// `canon stream.cancel-read t async?` — tag `0x11`.
+    stream_cancel_read: struct { type_idx: u32, is_async: bool },
+    /// `canon stream.cancel-write t async?` — tag `0x12`.
+    stream_cancel_write: struct { type_idx: u32, is_async: bool },
+    /// `canon stream.drop-readable t` — tag `0x13`.
+    stream_drop_readable: struct { type_idx: u32 },
+    /// `canon stream.drop-writable t` — tag `0x14`.
+    stream_drop_writable: struct { type_idx: u32 },
+    /// `canon future.new t` — tag `0x15`.
+    future_new: struct { type_idx: u32 },
+    /// `canon future.read t opts` — tag `0x16`.
+    future_read: struct { type_idx: u32, opts: []const CanonOpt },
+    /// `canon future.write t opts` — tag `0x17`.
+    future_write: struct { type_idx: u32, opts: []const CanonOpt },
+    /// `canon future.cancel-read t async?` — tag `0x18`.
+    future_cancel_read: struct { type_idx: u32, is_async: bool },
+    /// `canon future.cancel-write t async?` — tag `0x19`.
+    future_cancel_write: struct { type_idx: u32, is_async: bool },
+    /// `canon future.drop-readable t` — tag `0x1a`.
+    future_drop_readable: struct { type_idx: u32 },
+    /// `canon future.drop-writable t` — tag `0x1b`.
+    future_drop_writable: struct { type_idx: u32 },
+    /// `canon error-context.new opts` — tag `0x1c`.
+    error_context_new: struct { opts: []const CanonOpt },
+    /// `canon error-context.debug-message opts` — tag `0x1d`.
+    error_context_debug_message: struct { opts: []const CanonOpt },
+    /// `canon error-context.drop` — tag `0x1e`.
+    error_context_drop,
+    /// `canon waitable-set.new` — tag `0x1f`.
+    waitable_set_new,
+    /// `canon waitable-set.wait cancel? (memory m)` — tag `0x20`.
+    waitable_set_wait: struct { cancellable: bool, memory: u32 },
+    /// `canon waitable-set.poll cancel? (memory m)` — tag `0x21`.
+    waitable_set_poll: struct { cancellable: bool, memory: u32 },
+    /// `canon waitable-set.drop` — tag `0x22`.
+    waitable_set_drop,
+    /// `canon waitable.join` — tag `0x23`.
+    waitable_join,
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────
