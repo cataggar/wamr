@@ -5289,6 +5289,217 @@ fn findTerminatorIndex(block: *const ir.BasicBlock) usize {
     return block.instructions.items.len;
 }
 
+// ── Tail Duplication of Small Joins ────────────────────────────────────────
+
+/// Tail-duplicate small "join" blocks into each predecessor, eliminating an
+/// extra unconditional branch on every taken edge and exposing
+/// per-predecessor specialisation opportunities to downstream passes.
+///
+/// A candidate join block B satisfies all of:
+///   - B is not the entry block (id != 0).
+///   - B has >= 2 predecessors.
+///   - B has <= 4 non-terminator instructions plus a terminator that is
+///     `br`, `br_if`, or `ret` (multi-result returns, `br_table`, and
+///     `@"unreachable"` are excluded to keep duplication bounded and avoid
+///     owned-slice cloning issues).
+///   - Every predecessor P ends with `br B` (we only duplicate along
+///     simple unconditional edges so we don't have to rewrite a `br_if`
+///     operand).
+///   - B has no `phi` and no `call`/`call_indirect`/`call_ref`/
+///     `call_result` instructions in its body.
+///   - No VReg defined in B is used outside B. After tail duplication the
+///     original B is unreachable and its defs vanish; if any successor of
+///     B referenced one of B's defs, the rewrite would break SSA. In
+///     practice `lowerPhisToLocals` runs first, so cross-block dataflow
+///     lives in `local_get`/`local_set` and the typical CoreMark join
+///     blocks satisfy this guard.
+///
+/// When B qualifies, each predecessor's `br B` is replaced in place by a
+/// fresh copy of B's body (with renamed dests) followed by B's terminator.
+/// The original B is left in the function and becomes unreachable;
+/// `reorderBlocks` skips unreachable blocks during RPO, so codegen never
+/// emits them. The outer `runPasses` fixpoint loop (cap 8) bounds how
+/// many times this pass can re-run — in practice 1-2 invocations suffice.
+pub fn tailDuplicateSmallJoins(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    if (func.blocks.items.len < 2) return false;
+
+    var predecessors = try analysis.buildPredecessors(func, allocator);
+    defer {
+        var it = predecessors.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        predecessors.deinit();
+    }
+
+    var changed = false;
+
+    var b_id: ir.BlockId = 1;
+    while (b_id < func.blocks.items.len) : (b_id += 1) {
+        if (try tryAbsorbJoin(func, b_id, &predecessors, allocator)) {
+            changed = true;
+
+            // Predecessor map is now stale (preds of B disappeared; preds
+            // of B's successors gained the duplicated copies). Rebuild
+            // before considering further joins so the next iteration sees
+            // the current CFG.
+            var it = predecessors.iterator();
+            while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+            predecessors.deinit();
+            predecessors = try analysis.buildPredecessors(func, allocator);
+        }
+    }
+
+    return changed;
+}
+
+/// Attempt to tail-duplicate block `b_id` into each of its predecessors.
+/// Returns true iff the duplication was applied.
+fn tryAbsorbJoin(
+    func: *ir.IrFunction,
+    b_id: ir.BlockId,
+    predecessors: *const std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    allocator: std.mem.Allocator,
+) !bool {
+    const b = &func.blocks.items[b_id];
+    if (b.instructions.items.len == 0) return false;
+
+    const term_idx = findTerminatorIndex(b);
+    if (term_idx == b.instructions.items.len) return false;
+    if (term_idx != b.instructions.items.len - 1) return false;
+
+    const body_len = term_idx;
+    if (body_len > 4) return false;
+
+    switch (b.instructions.items[term_idx].op) {
+        .br, .br_if, .ret => {},
+        else => return false,
+    }
+
+    for (b.instructions.items[0..body_len]) |inst| {
+        switch (inst.op) {
+            .phi,
+            .call,
+            .call_indirect,
+            .call_ref,
+            .call_result,
+            .br,
+            .br_if,
+            .br_table,
+            .ret,
+            .ret_multi,
+            .@"unreachable",
+            => return false,
+            else => {},
+        }
+    }
+
+    const preds = predecessors.get(b_id) orelse return false;
+    if (preds.len < 2) return false;
+
+    for (preds) |p| {
+        if (p == b_id) return false;
+        if (p >= func.blocks.items.len) return false;
+        const pb = &func.blocks.items[p];
+        if (pb.instructions.items.len == 0) return false;
+        const pterm = pb.instructions.items[pb.instructions.items.len - 1];
+        switch (pterm.op) {
+            .br => |tgt| if (tgt != b_id) return false,
+            else => return false,
+        }
+    }
+
+    for (b.instructions.items) |inst| {
+        const dest = inst.dest orelse continue;
+        if (vregHasExternalUse(func, b_id, dest)) return false;
+    }
+
+    for (preds) |p| {
+        try cloneJoinIntoPred(func, p, b_id, allocator);
+    }
+    return true;
+}
+
+/// Is `vreg` used by any instruction in a block other than `home_block`?
+fn vregHasExternalUse(
+    func: *const ir.IrFunction,
+    home_block: ir.BlockId,
+    vreg: ir.VReg,
+) bool {
+    for (func.blocks.items, 0..) |block, idx| {
+        if (idx == home_block) continue;
+        for (block.instructions.items) |inst| {
+            for (getUsedVRegs(inst).slice()) |u| {
+                if (u == vreg) return true;
+            }
+            switch (inst.op) {
+                .call => |cl| for (cl.args) |a| {
+                    if (a == vreg) return true;
+                },
+                .call_indirect => |ci| {
+                    if (ci.elem_idx == vreg) return true;
+                    for (ci.args) |a| {
+                        if (a == vreg) return true;
+                    }
+                },
+                .call_ref => |cr| {
+                    if (cr.func_ref == vreg) return true;
+                    for (cr.args) |a| {
+                        if (a == vreg) return true;
+                    }
+                },
+                .ret_multi => |vregs| for (vregs) |v| {
+                    if (v == vreg) return true;
+                },
+                .phi => |edges| for (edges) |e| {
+                    if (e.val == vreg) return true;
+                },
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+/// Clone block `b_id`'s body and terminator into predecessor `p_id`,
+/// replacing P's tail `br b_id` with the duplicated content. Every dest
+/// VReg defined in B is renamed to a fresh VReg for this copy so each
+/// duplicate is independent.
+fn cloneJoinIntoPred(
+    func: *ir.IrFunction,
+    p_id: ir.BlockId,
+    b_id: ir.BlockId,
+    allocator: std.mem.Allocator,
+) !void {
+    const b_inst_count = func.blocks.items[b_id].instructions.items.len;
+
+    var rename = std.AutoHashMap(ir.VReg, ir.VReg).init(allocator);
+    defer rename.deinit();
+
+    var i: usize = 0;
+    while (i < b_inst_count) : (i += 1) {
+        const src = func.blocks.items[b_id].instructions.items[i];
+        if (src.dest) |old_dest| {
+            const fresh = func.newVReg();
+            try rename.put(old_dest, fresh);
+        }
+    }
+
+    // Drop P's terminator (`br b_id`).
+    _ = func.blocks.items[p_id].instructions.pop();
+
+    i = 0;
+    while (i < b_inst_count) : (i += 1) {
+        var cloned = func.blocks.items[b_id].instructions.items[i];
+        var rit = rename.iterator();
+        while (rit.next()) |entry| {
+            replaceInInst(&cloned, entry.key_ptr.*, entry.value_ptr.*);
+        }
+        if (cloned.dest) |old_dest| {
+            if (rename.get(old_dest)) |fresh| cloned.dest = fresh;
+        }
+        try func.blocks.items[p_id].instructions.append(func.allocator, cloned);
+    }
+}
+
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
     var total_changes: u32 = 0;
 
@@ -5371,6 +5582,7 @@ pub const default_passes: []const PassFn = &.{
     &foldConstantBranches,
     &foldInverseCompareEqz,
     &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
     &foldSelectOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
@@ -5390,6 +5602,15 @@ pub const default_passes: []const PassFn = &.{
 
 
 /// Default optimization pipeline for x86-64.
+///
+/// Note: `inductionVariableSimplification` and `unrollSmallFixedLoops`
+/// are intentionally omitted here pending a cost-model fix for issue
+/// #385. PR #413's own table reported x86_64 −2.45% on CoreMark (vs
+/// aarch64 −0.24%), confirmed in the #393 audit
+/// (https://github.com/cataggar/wamr/issues/393#issuecomment-4423326059)
+/// as "the cost model is still picking wrong loops". The aarch64
+/// pipeline keeps both passes for now — issue #385 tracks the
+/// cost-model rework that should let x86_64 re-enable them safely.
 const x86_64_default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
@@ -5401,14 +5622,15 @@ const x86_64_default_passes: []const PassFn = &.{
     &foldInverseCompareEqz,
     &foldBranchOnEqz,
     &threadChainedConditionalBranches,
+    &tailDuplicateSmallJoins,
     &foldSelectOnEqz,
     &foldSignExtendingLoad,
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
     &globalValueNumbering,
-    &inductionVariableSimplification,
     &hoistLoopInvariantCode,
-    &unrollSmallFixedLoops,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &deadStoreElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
@@ -5419,54 +5641,55 @@ const x86_64_default_passes: []const PassFn = &.{
 const default_passes_no_iv: []const PassFn = &.{
     &forwardLocalGet,                  &constantFold,            &algebraicSimplify,      &strengthReduceMul,
     &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,   &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,  &foldFloatUnaryIdempotents,
-    &foldWrapOfExtend,                 &globalValueNumbering,    &hoistLoopInvariantCode, &unrollSmallFixedLoops,
-    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,  &elideRedundantBoundsChecks,
-    &foldLoadStoreOffset,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,        &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,   &hoistLoopInvariantCode,
+    &unrollSmallFixedLoops,            &deadCodeElimination,     &deadLocalSetElimination, &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const default_passes_no_unroll: []const PassFn = &.{
     &forwardLocalGet,                  &constantFold,            &algebraicSimplify,               &strengthReduceMul,
     &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,            &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,           &foldFloatUnaryIdempotents,
-    &foldWrapOfExtend,                 &globalValueNumbering,    &inductionVariableSimplification, &hoistLoopInvariantCode,
-    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,           &elideRedundantBoundsChecks,
-    &foldLoadStoreOffset,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,                 &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,            &inductionVariableSimplification,
+    &hoistLoopInvariantCode,           &deadCodeElimination,     &deadLocalSetElimination,         &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const default_passes_no_iv_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,                  &constantFold,          &algebraicSimplify,          &strengthReduceMul,
-    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,  &foldConstantBranches,       &foldInverseCompareEqz,
-    &threadChainedConditionalBranches, &foldSelectOnEqz,       &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,
-    &foldWrapOfExtend,                 &globalValueNumbering,  &hoistLoopInvariantCode,     &deadCodeElimination,
-    &deadLocalSetElimination,          &hoistLoopBoundsChecks, &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+    &forwardLocalGet,                  &constantFold,            &algebraicSimplify,          &strengthReduceMul,
+    &strengthReduceMulShiftAdd,        &strengthReduceDivRem,    &foldConstantBranches,       &foldInverseCompareEqz,
+    &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,            &foldSignExtendingLoad,
+    &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,       &hoistLoopInvariantCode,
+    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,
+    &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_iv: []const PassFn = &.{
     &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
     &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,            &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,  &foldWrapOfExtend,                 &globalValueNumbering,    &hoistLoopInvariantCode,
-    &unrollSmallFixedLoops,      &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
+    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
+    &hoistLoopInvariantCode,     &unrollSmallFixedLoops,            &deadCodeElimination,     &deadLocalSetElimination,
+    &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_unroll: []const PassFn = &.{
     &forwardLocalGet,            &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
     &strengthReduceMulShiftAdd,  &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
-    &foldBranchOnEqz,            &threadChainedConditionalBranches, &foldSelectOnEqz,         &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents,  &foldWrapOfExtend,                 &globalValueNumbering,    &inductionVariableSimplification,
-    &hoistLoopInvariantCode,     &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
-    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
+    &foldBranchOnEqz,            &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
+    &foldSignExtendingLoad,      &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
+    &inductionVariableSimplification, &hoistLoopInvariantCode,      &deadCodeElimination,     &deadLocalSetElimination,
+    &hoistLoopBoundsChecks,      &elideRedundantBoundsChecks,       &foldLoadStoreOffset,
 };
 
 const x86_64_default_passes_no_iv_no_unroll: []const PassFn = &.{
-    &forwardLocalGet,           &constantFold,                     &algebraicSimplify,     &strengthReduceMul,
-    &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,  &foldInverseCompareEqz,
-    &foldBranchOnEqz,           &threadChainedConditionalBranches, &foldSelectOnEqz,       &foldSignExtendingLoad,
-    &foldFloatUnaryIdempotents, &foldWrapOfExtend,                 &globalValueNumbering,  &hoistLoopInvariantCode,
-    &deadCodeElimination,       &deadLocalSetElimination,          &hoistLoopBoundsChecks, &elideRedundantBoundsChecks,
-    &foldLoadStoreOffset,
+    &forwardLocalGet,           &constantFold,                     &algebraicSimplify,       &strengthReduceMul,
+    &strengthReduceMulShiftAdd, &strengthReduceDivRem,             &foldConstantBranches,    &foldInverseCompareEqz,
+    &foldBranchOnEqz,           &threadChainedConditionalBranches, &tailDuplicateSmallJoins, &foldSelectOnEqz,
+    &foldSignExtendingLoad,     &foldFloatUnaryIdempotents,        &foldWrapOfExtend,        &globalValueNumbering,
+    &hoistLoopInvariantCode,    &deadCodeElimination,              &deadLocalSetElimination, &hoistLoopBoundsChecks,
+    &elideRedundantBoundsChecks, &foldLoadStoreOffset,
 };
 
 pub fn defaultPassesForTarget(target: TargetArch) []const PassFn {
@@ -9848,4 +10071,320 @@ test "promoteLocalsToSSA + lowerPhis: two-local sum loop" {
             try std.testing.expect(inst.op != .phi);
         }
     }
+}
+
+test "tailDuplicateSmallJoins: 4-block diamond — join inlined into both arms" {
+    // b0 (cond br) → b1 → b3, b2 → b3
+    // b3 is a small join: add v0+v1 → ret.
+    // After tailDuplicateSmallJoins, b3's body should be cloned into both
+    // b1 and b2 (each ending in its own copy of the join's ret), and b3
+    // should be unreachable (no predecessors).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const v_join_add = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_join_add });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_join_add } });
+
+    const changed = try tailDuplicateSmallJoins(&func, allocator);
+    try std.testing.expect(changed);
+
+    // b1 and b2 should each now hold a copy of b3's body (the `add`) plus
+    // the cloned terminator (`ret`).
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(b1).instructions.items.len);
+    try std.testing.expectEqual(@as(usize, 2), func.getBlock(b2).instructions.items.len);
+
+    // The first instruction in each arm should be the duplicated add.
+    try std.testing.expect(func.getBlock(b1).instructions.items[0].op == .add);
+    try std.testing.expect(func.getBlock(b2).instructions.items[0].op == .add);
+
+    // The cloned add dests must be fresh (≠ v_join_add): both arms got
+    // independent renamed defs.
+    const b1_add_dest = func.getBlock(b1).instructions.items[0].dest.?;
+    const b2_add_dest = func.getBlock(b2).instructions.items[0].dest.?;
+    try std.testing.expect(b1_add_dest != v_join_add);
+    try std.testing.expect(b2_add_dest != v_join_add);
+    try std.testing.expect(b1_add_dest != b2_add_dest);
+
+    // Cloned add operands still reference the originals (v0, v1) defined
+    // in the dominating b0 — those vregs are not local to b3.
+    const b1_add_op = func.getBlock(b1).instructions.items[0].op.add;
+    try std.testing.expectEqual(v0, b1_add_op.lhs);
+    try std.testing.expectEqual(v1, b1_add_op.rhs);
+
+    // The cloned terminators reference the cloned (renamed) add dest.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = b1_add_dest }, func.getBlock(b1).instructions.items[1].op);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = b2_add_dest }, func.getBlock(b2).instructions.items[1].op);
+
+    // b3 must now be unreachable: its predecessor set is empty.
+    var preds = try analysis.buildPredecessors(&func, allocator);
+    defer {
+        var it = preds.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        preds.deinit();
+    }
+    if (preds.get(b3)) |p| {
+        try std.testing.expectEqual(@as(usize, 0), p.len);
+    }
+}
+
+test "tailDuplicateSmallJoins: triple predecessor with br terminator — all three duplicated" {
+    // b0,b1,b2 each unconditionally br to b3 (sub + br_if to b4 or b5).
+    // After duplication, all three predecessors should each contain the
+    // sub + br_if; b3 should be unreachable.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b_entry = try func.newBlock();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+    const b5 = try func.newBlock();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_cond = func.newVReg();
+    const v_join_sub = func.newVReg();
+
+    // Entry sets up the operands and dispatches via br_table-like sequence:
+    // we use three different small heads each branching to b3 for simplicity.
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v_a });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 3 }, .dest = v_b });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_cond });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b0, .else_block = b1 } } });
+
+    // b0 and b1 both directly br to b3. Also need a third predecessor b2.
+    // To keep this realistic we fall through b0 → b3 via br, then add b2
+    // as an additional br b3 path from b_entry's else… but br_if can only
+    // pick one of two targets. Instead, give b1 a br_if into either b2 or
+    // b3, and let b2 also br b3 — so b3 has three predecessors {b0, b1, b2}.
+    // Then change b1's terminator to br b3 to satisfy the pass's
+    // "all preds are unconditional br" precondition.
+    //
+    // Simpler structure: route b1 via b2 -> b3 to gather three predecessors.
+    // We achieve this by making b1's terminator a `br b2` and b2's a
+    // `br b3`, but that yields only one predecessor pointing at b3 from
+    // b2. So we re-route: b0 → b3, b1 → b3, and inject a separate br
+    // chain that joins via b2 → b3.
+    try func.getBlock(b0).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+
+    // Body of b3: small sub + conditional branch to b4/b5.
+    try func.getBlock(b3).append(.{ .op = .{ .sub = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_join_sub });
+    try func.getBlock(b3).append(.{ .op = .{ .br_if = .{ .cond = v_join_sub, .then_block = b4, .else_block = b5 } } });
+
+    try func.getBlock(b4).append(.{ .op = .{ .ret = v_a } });
+    try func.getBlock(b5).append(.{ .op = .{ .ret = v_b } });
+
+    // b2 has no predecessor from the entry CFG in this synthetic test —
+    // tailDuplicateSmallJoins works on the predecessor set without
+    // requiring full reachability, which mirrors how passes operate over
+    // raw IR blocks. The pass should still duplicate b3 into b0, b1, b2.
+
+    const changed = try tailDuplicateSmallJoins(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Each of b0, b1, b2 should now end in a cloned sub + br_if (2 insts).
+    inline for (.{ b0, b1, b2 }) |pid| {
+        const pb = func.getBlock(pid);
+        try std.testing.expectEqual(@as(usize, 2), pb.instructions.items.len);
+        try std.testing.expect(pb.instructions.items[0].op == .sub);
+        try std.testing.expect(pb.instructions.items[1].op == .br_if);
+    }
+
+    // The three cloned sub-dests must be pairwise distinct fresh vregs.
+    const d0 = func.getBlock(b0).instructions.items[0].dest.?;
+    const d1 = func.getBlock(b1).instructions.items[0].dest.?;
+    const d2 = func.getBlock(b2).instructions.items[0].dest.?;
+    try std.testing.expect(d0 != d1);
+    try std.testing.expect(d0 != d2);
+    try std.testing.expect(d1 != d2);
+    try std.testing.expect(d0 != v_join_sub);
+
+    // b3 is unreachable: zero predecessors in the rebuilt map.
+    var preds = try analysis.buildPredecessors(&func, allocator);
+    defer {
+        var it = preds.iterator();
+        while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+        preds.deinit();
+    }
+    if (preds.get(b3)) |p| {
+        try std.testing.expectEqual(@as(usize, 0), p.len);
+    }
+}
+
+test "tailDuplicateSmallJoins: join with `ret` terminator is duplicated" {
+    // Two predecessors both br to a small join whose terminator is a
+    // single-value ret.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v_x = func.newVReg();
+    const v_y = func.newVReg();
+    const v_cond = func.newVReg();
+    const v_join = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 100 }, .dest = v_x });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_y });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v_x, .rhs = v_y } }, .dest = v_join });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_join } });
+
+    const changed = try tailDuplicateSmallJoins(&func, allocator);
+    try std.testing.expect(changed);
+
+    // Both arms must hold an add + ret of the renamed add dest.
+    inline for (.{ b1, b2 }) |pid| {
+        const pb = func.getBlock(pid);
+        try std.testing.expectEqual(@as(usize, 2), pb.instructions.items.len);
+        try std.testing.expect(pb.instructions.items[0].op == .add);
+        const fresh = pb.instructions.items[0].dest.?;
+        try std.testing.expect(fresh != v_join);
+        try std.testing.expectEqual(ir.Inst.Op{ .ret = fresh }, pb.instructions.items[1].op);
+    }
+}
+
+test "tailDuplicateSmallJoins: oversized join (>4 body inst) is NOT duplicated" {
+    // Join block has 5 non-terminator instructions — exceeds the cap.
+    // The pass must leave the CFG unchanged.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    const v_c = func.newVReg();
+    const v_d = func.newVReg();
+    const v_e = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    // 5 instructions before terminator → oversized.
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_a });
+    try func.getBlock(b3).append(.{ .op = .{ .sub = .{ .lhs = v_a, .rhs = v0 } }, .dest = v_b });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v_b, .rhs = v1 } }, .dest = v_c });
+    try func.getBlock(b3).append(.{ .op = .{ .sub = .{ .lhs = v_c, .rhs = v0 } }, .dest = v_d });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v_d, .rhs = v1 } }, .dest = v_e });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_e } });
+
+    const before_b1_len = func.getBlock(b1).instructions.items.len;
+    const before_b2_len = func.getBlock(b2).instructions.items.len;
+    const before_b3_len = func.getBlock(b3).instructions.items.len;
+
+    const changed = try tailDuplicateSmallJoins(&func, allocator);
+    try std.testing.expect(!changed);
+
+    try std.testing.expectEqual(before_b1_len, func.getBlock(b1).instructions.items.len);
+    try std.testing.expectEqual(before_b2_len, func.getBlock(b2).instructions.items.len);
+    try std.testing.expectEqual(before_b3_len, func.getBlock(b3).instructions.items.len);
+}
+
+test "tailDuplicateSmallJoins: pred ending in br_if (not br) is NOT duplicated" {
+    // b1's terminator is br_if (conditional). The pass requires all preds
+    // to end in an unconditional `br B`, so it must refuse the rewrite.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock(); // join
+    const b4 = try func.newBlock(); // other br_if target
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond1 = func.newVReg();
+    const cond2 = func.newVReg();
+    const v_join = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 5 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 6 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond1 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond1, .then_block = b1, .else_block = b2 } } });
+    // b1 ends in br_if → b3 or b4 (conditional, not unconditional br).
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 0 }, .dest = cond2 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = cond2, .then_block = b3, .else_block = b4 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_join });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_join } });
+    try func.getBlock(b4).append(.{ .op = .{ .ret = v0 } });
+
+    const before_b1_len = func.getBlock(b1).instructions.items.len;
+    const before_b3_len = func.getBlock(b3).instructions.items.len;
+
+    const changed = try tailDuplicateSmallJoins(&func, allocator);
+    try std.testing.expect(!changed);
+    try std.testing.expectEqual(before_b1_len, func.getBlock(b1).instructions.items.len);
+    try std.testing.expectEqual(before_b3_len, func.getBlock(b3).instructions.items.len);
+}
+
+test "tailDuplicateSmallJoins: join def with external use is NOT duplicated" {
+    // Join b3 defines v_join via add; b4 (successor of b3) reads v_join.
+    // After hypothetical duplication, b3 would be unreachable and v_join
+    // would have no def for b4's read — SSA violation. The pass must
+    // refuse.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const b4 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const v_join = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_join });
+    try func.getBlock(b3).append(.{ .op = .{ .br = b4 } });
+    // b4 reads v_join — an external use of a vreg defined in b3.
+    try func.getBlock(b4).append(.{ .op = .{ .ret = v_join } });
+
+    const changed = try tailDuplicateSmallJoins(&func, allocator);
+    try std.testing.expect(!changed);
 }

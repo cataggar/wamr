@@ -32,6 +32,16 @@ pub const ImportContext = struct {
     tables: []const *types.TableInstance = &.{},
     functions: []const types.ImportedFunction = &.{},
     tags: []const *types.TagInstance = &.{},
+    /// Per-function-import mask (indexed identically to `functions`):
+    /// `true` means the slot has been satisfied by a binding from
+    /// another module instance (cross-instance wiring), so neither the
+    /// `HostImports` layer nor WASI auto-resolution may overwrite it.
+    /// Issue #448: without this, the component layer's careful binding
+    /// of e.g. `wasi_snapshot_preview1.proc_exit` to the wasm-tools
+    /// adapter's exported `proc_exit` is clobbered by `wasiProcExit`
+    /// and the adapter body (which routes through `wasi:cli/exit`) is
+    /// never executed.
+    cross_instance_mask: []const bool = &.{},
 };
 
 /// Optional knobs for `instantiateWithOptions`. The bare `instantiate` /
@@ -154,9 +164,15 @@ fn instantiateImpl(
 
     // Resolve host functions for function imports.
     // Priority: custom HostImports (if provided) > WASI auto-resolution.
+    // Slots already satisfied by a cross-instance binding (e.g. the
+    // component layer wired a preview1 import to a sibling instance's
+    // exported function — issue #448) are skipped by both layers so
+    // the importer's binding wins at interp dispatch.
     if (module.import_function_count > 0) {
         const host_fns = allocator.alloc(?types.HostFn, module.import_function_count) catch return error.OutOfMemory;
         @memset(host_fns, null);
+
+        const cross_mask: []const bool = if (import_ctx) |c| c.cross_instance_mask else &.{};
 
         // Layer 1: custom host functions from HostImports (comptime-resolved)
         if (HostImportsT) |HI| {
@@ -164,8 +180,11 @@ fn instantiateImpl(
             for (module.imports) |imp| {
                 if (imp.kind == .function) {
                     if (func_idx < module.import_function_count) {
-                        if (HI.resolve(imp.module_name, imp.field_name)) |entry| {
-                            host_fns[func_idx] = entry.interp_fn;
+                        const is_cross = func_idx < cross_mask.len and cross_mask[func_idx];
+                        if (!is_cross) {
+                            if (HI.resolve(imp.module_name, imp.field_name)) |entry| {
+                                host_fns[func_idx] = entry.interp_fn;
+                            }
                         }
                     }
                     func_idx += 1;
@@ -178,7 +197,9 @@ fn instantiateImpl(
         const wasi_fns = wasi_host.resolveWasiHostFunctions(module, allocator) catch return error.OutOfMemory;
         defer allocator.free(wasi_fns);
         for (wasi_fns, 0..) |wasi_fn, i| {
-            if (host_fns[i] == null) host_fns[i] = wasi_fn;
+            if (host_fns[i] != null) continue;
+            if (i < cross_mask.len and cross_mask[i]) continue;
+            host_fns[i] = wasi_fn;
         }
 
         inst.host_functions = host_fns;
@@ -1203,4 +1224,56 @@ test "attachHostFuncEntries: null entry falls through to legacy host_functions" 
     // Legacy WASI resolver should still be active at slot 0.
     try testing.expect(inst.host_functions[0] != null);
     try testing.expect(inst.host_func_entries[0] == null);
+}
+
+test "instantiate: cross_instance_mask gates WASI auto-resolution (#448)" {
+    // A core module that imports `wasi_snapshot_preview1.proc_exit` —
+    // a name wamr's WASI auto-resolver normally recognises and wires
+    // to `wasiProcExit`. The component layer reports the slot as
+    // cross-instance (e.g. bound to the wasm-tools adapter's exported
+    // `proc_exit`), so `instantiateImpl` must leave
+    // `host_functions[0]` null and let interp dispatch fall through to
+    // the configured `import_functions[0]`.
+    const imports = [_]types.ImportDesc{
+        .{
+            .module_name = "wasi_snapshot_preview1",
+            .field_name = "proc_exit",
+            .kind = .function,
+            .func_type_idx = 0,
+        },
+    };
+    const func_types = [_]types.FuncType{
+        .{ .params = &.{.i32}, .results = &.{} },
+    };
+    var module = types.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+
+    // First: with no mask the auto-resolver wins (existing behaviour).
+    {
+        const inst = try instantiate(&module, testing.allocator);
+        defer destroy(inst);
+        try testing.expect(inst.host_functions[0] != null);
+    }
+
+    // Now: build a sibling `ModuleInstance` and present it as the
+    // cross-instance source via `ImportContext`. Mask = [true] →
+    // auto-resolver must skip the slot.
+    var sibling_module = types.WasmModule{};
+    const sibling = try instantiate(&sibling_module, testing.allocator);
+    defer destroy(sibling);
+
+    const ctx = ImportContext{
+        .functions = &[_]types.ImportedFunction{.{ .module_inst = sibling, .func_idx = 0 }},
+        .cross_instance_mask = &[_]bool{true},
+    };
+    const inst = try instantiateWithImports(&module, testing.allocator, ctx);
+    defer destroy(inst);
+
+    try testing.expectEqual(@as(usize, 1), inst.host_functions.len);
+    try testing.expect(inst.host_functions[0] == null);
+    try testing.expectEqual(@as(usize, 1), inst.import_functions.len);
+    try testing.expectEqual(sibling, inst.import_functions[0].module_inst);
 }

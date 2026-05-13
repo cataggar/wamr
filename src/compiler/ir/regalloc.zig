@@ -197,18 +197,57 @@ pub fn allocateFromRangesWithHints(
                 .end = range.end,
                 .reg_idx = reg_idx,
                 .type = range.type,
+                .max_loop_depth = range.max_loop_depth,
             });
         } else {
             // No safe free register — try to evict an active interval
-            // whose register IS safe for this range.
+            // whose register IS safe for this range. Eviction strategy
+            // depends on whether the new range is itself inside a
+            // genuinely hot inner loop (`max_loop_depth >= HOT_LOOP_THRESHOLD`):
+            //
+            //   * **Hot newcomer** (depth ≥ HOT_LOOP_THRESHOLD): the
+            //     value we're trying to keep pays an iteration-level
+            //     load/store per spill, so prefer evicting the
+            //     **coldest** safe candidate (smallest
+            //     `max_loop_depth`); tie-break by largest end. Also
+            //     refuse to spill any candidate hotter than the
+            //     newcomer — doing so just shifts iteration-paid spill
+            //     cost rather than removing it.
+            //
+            //   * **Shallow newcomer** (depth < HOT_LOOP_THRESHOLD):
+            //     fall back to the original Poletto–Sarkar "largest
+            //     end" rule. The depth-aware defense above was
+            //     measurably worse on tight register files (notably
+            //     x86_64 with 15 alloc regs vs aarch64's 16) because
+            //     it forced spills of short-lived shallow newcomers
+            //     to protect actives that don't actually pay
+            //     iteration-paid spill cost. See PR #440 supervisor
+            //     note on issue #393.
+            //
+            // If no safe eviction candidate exists in either branch
+            // we fall through to spilling the incoming range itself.
+            const HOT_LOOP_THRESHOLD: u8 = 2;
+            const range_in_hot_loop = range.max_loop_depth >= HOT_LOOP_THRESHOLD;
             var best_evict: ?usize = null;
             for (active.items, 0..) |ai, idx| {
-                if (ai.end > range.end and
-                    regSafeForRange(ai.reg_idx, range.start, range.end, clobbers))
-                {
-                    if (best_evict == null or ai.end > active.items[best_evict.?].end) {
-                        best_evict = idx;
+                if (ai.end <= range.end) continue;
+                if (!regSafeForRange(ai.reg_idx, range.start, range.end, clobbers)) continue;
+                if (range_in_hot_loop and ai.max_loop_depth > range.max_loop_depth) continue;
+                if (best_evict) |bi| {
+                    const cur = active.items[bi];
+                    if (range_in_hot_loop) {
+                        if (ai.max_loop_depth < cur.max_loop_depth or
+                            (ai.max_loop_depth == cur.max_loop_depth and ai.end > cur.end))
+                        {
+                            best_evict = idx;
+                        }
+                    } else {
+                        if (ai.end > cur.end) {
+                            best_evict = idx;
+                        }
                     }
+                } else {
+                    best_evict = idx;
                 }
             }
 
@@ -223,6 +262,7 @@ pub fn allocateFromRangesWithHints(
                     .end = range.end,
                     .reg_idx = stolen_reg,
                     .type = range.type,
+                    .max_loop_depth = range.max_loop_depth,
                 });
             } else {
                 // No safe eviction candidate — spill the new interval
@@ -412,6 +452,12 @@ const ActiveInterval = struct {
     end: u32,
     reg_idx: u8,
     type: ir.IrType,
+    /// Max loop-nest depth of the originating live range. The eviction
+    /// heuristic prefers to spill the active interval with the smallest
+    /// `max_loop_depth` (i.e. the coldest), which keeps loop-invariant
+    /// pointers in registers across iterations on hot wasm loops like
+    /// CoreMark's `core_state_transition`.
+    max_loop_depth: u8,
 };
 
 /// Remove intervals from `active` whose end position is <= `pos`.
@@ -839,6 +885,160 @@ test "allocateFromRangesWithHints: empty hint list behaves like allocateFromRang
 
     try std.testing.expectEqual(result_a.get(0).?, result_b.get(0).?);
     try std.testing.expectEqual(result_a.get(1).?, result_b.get(1).?);
+}
+
+
+// ── Loop-depth-weighted eviction (issue #382) ───────────────────────────
+
+test "allocateFromRanges: cold vreg evicted over hot vreg under pressure" {
+    // Two-register pool with one free-reg conflict. Both candidates are
+    // longer than the incoming range, so the old end-only heuristic
+    // would pick whichever has the larger `.end`. Here we set the
+    // *cold* candidate to have the larger end and the *hot* candidate
+    // (max_loop_depth > 0) to have the smaller end. The new heuristic
+    // must still evict the cold one because it is at depth 0.
+    const allocator = std.testing.allocator;
+    const two_reg_set: RegSet = .{
+        .alloc_regs = &.{ 7, 8 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    // vreg 0: cold (depth 0), end=100 → would be the legacy eviction
+    // pick because it has the largest end.
+    // vreg 1: hot (depth 2), end=60 → legacy heuristic would *keep* it
+    // (smaller end) but it's already what we want; flipped end values
+    // below ensure we're really testing the depth signal, not a happy
+    // accident.
+    // vreg 2: incoming, start=2, end=10 → forces eviction because both
+    // registers are taken at this point.
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 100, .type = .i64, .max_loop_depth = 0 },
+        .{ .vreg = 1, .start = 1, .end = 60, .type = .i64, .max_loop_depth = 2 },
+        .{ .vreg = 2, .start = 2, .end = 10, .type = .i64, .max_loop_depth = 0 },
+    };
+
+    var result = try allocateFromRanges(allocator, two_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    // The hot vreg (1) must remain in a register; the cold vreg (0)
+    // must have been spilled.
+    try std.testing.expect(result.get(1).? == .reg);
+    try std.testing.expect(result.get(0).? == .stack);
+    // And vreg 2 (the one that triggered eviction) must have taken
+    // vreg 0's slot.
+    try std.testing.expect(result.get(2).? == .reg);
+    try std.testing.expectEqual(@as(u32, 1), result.spill_count);
+}
+
+test "allocateFromRanges: tie on loop depth falls back to longest end" {
+    // When all active intervals share the same loop depth, the
+    // heuristic must reproduce the original Poletto–Sarkar rule
+    // (evict the longest-remaining).
+    const allocator = std.testing.allocator;
+    const two_reg_set: RegSet = .{
+        .alloc_regs = &.{ 7, 8 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 50, .type = .i64, .max_loop_depth = 1 },
+        .{ .vreg = 1, .start = 1, .end = 100, .type = .i64, .max_loop_depth = 1 },
+        .{ .vreg = 2, .start = 2, .end = 10, .type = .i64, .max_loop_depth = 1 },
+    };
+
+    var result = try allocateFromRanges(allocator, two_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    // Both candidates share depth 1; the longer one (vreg 1, end=100)
+    // must be evicted, matching the pre-change behavior.
+    try std.testing.expect(result.get(0).? == .reg);
+    try std.testing.expect(result.get(1).? == .stack);
+    try std.testing.expect(result.get(2).? == .reg);
+    try std.testing.expectEqual(@as(u32, 1), result.spill_count);
+}
+
+test "allocateFromRanges: hot incoming range (depth >= 2) respects hot actives" {
+    // The incoming range is itself inside a deep inner loop (depth 2),
+    // so the hot-loop protection kicks in: refuse to evict any active
+    // hotter than the newcomer. With both actives at depth 3 and 2
+    // (both ≥ newcomer's depth 2), neither is a valid eviction
+    // candidate — the newcomer spills itself.
+    //
+    // Mirrors the supervisor-gated rule from PR #440 follow-up: the
+    // depth-aware defense only fires for genuinely deep inner-loop
+    // newcomers (`max_loop_depth >= 2`).
+    const allocator = std.testing.allocator;
+    const two_reg_set: RegSet = .{
+        .alloc_regs = &.{ 7, 8 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        .{ .vreg = 0, .start = 0, .end = 100, .type = .i64, .max_loop_depth = 3 },
+        .{ .vreg = 1, .start = 1, .end = 80, .type = .i64, .max_loop_depth = 2 },
+        // Incoming range at depth 2 — same depth as vreg 1 but strictly
+        // colder than vreg 0. The filter `ai.depth > range.depth` skips
+        // vreg 0 (hotter) but keeps vreg 1 (same depth). vreg 1 has
+        // larger end than the newcomer (80 > 50) so it's a valid
+        // candidate — wait, vreg 1's depth = newcomer's depth, so
+        // priority falls back to "largest end" within the same depth.
+        // Both eligible candidates (only vreg 1 here) keep the
+        // newcomer in a register.
+        .{ .vreg = 2, .start = 2, .end = 50, .type = .i64, .max_loop_depth = 2 },
+    };
+
+    var result = try allocateFromRanges(allocator, two_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    // vreg 0 (depth 3) is protected from the depth-2 newcomer.
+    // vreg 1 (depth 2, end=80) is the only eligible candidate; it gets
+    // evicted to make room for the newcomer.
+    try std.testing.expect(result.get(0).? == .reg);
+    try std.testing.expect(result.get(1).? == .stack);
+    try std.testing.expect(result.get(2).? == .reg);
+    try std.testing.expectEqual(@as(u32, 1), result.spill_count);
+}
+
+test "allocateFromRanges: shallow incoming range (depth < 2) falls back to largest-end rule" {
+    // The incoming range is *not* inside a deep loop (depth 0), so the
+    // hot-loop protection is bypassed and the pre-change
+    // Poletto–Sarkar "largest remaining" rule applies. This restores
+    // the eviction behavior PR #440 originally regressed on x86_64.
+    const allocator = std.testing.allocator;
+    const two_reg_set: RegSet = .{
+        .alloc_regs = &.{ 7, 8 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    const ranges = [_]analysis.LiveRange{
+        // vreg 0 is hot (depth 3) with largest end (100). Under the
+        // shallow-newcomer rule it MUST still be evicted: x86_64
+        // CoreMark regressed precisely because shallow merge-block
+        // vregs were being spilled to protect actives like this one
+        // that don't actually pay per-iteration spill cost.
+        .{ .vreg = 0, .start = 0, .end = 100, .type = .i64, .max_loop_depth = 3 },
+        .{ .vreg = 1, .start = 1, .end = 80, .type = .i64, .max_loop_depth = 2 },
+        // Shallow incoming (depth 0) — gate triggers pre-change rule.
+        .{ .vreg = 2, .start = 2, .end = 50, .type = .i64, .max_loop_depth = 0 },
+    };
+
+    var result = try allocateFromRanges(allocator, two_reg_set, &.{}, &ranges);
+    defer result.deinit();
+
+    // Largest-end active (vreg 0, end=100) is evicted; the shallow
+    // newcomer takes its register.
+    try std.testing.expect(result.get(0).? == .stack);
+    try std.testing.expect(result.get(1).? == .reg);
+    try std.testing.expect(result.get(2).? == .reg);
+    try std.testing.expectEqual(@as(u32, 1), result.spill_count);
 }
 
 // ── coalesceMoves tests (issue #386) ────────────────────────────────────

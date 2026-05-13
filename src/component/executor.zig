@@ -264,18 +264,26 @@ pub fn callComponentFuncByLocal(
     // 5. Call the core function
     interp.executeFunction(env, exported.core_func_idx) catch {
         if (env.host_trap) |ht| {
-            std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
-            if (ht.component_func_idx != std.math.maxInt(u32))
-                std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
-            if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+            // Suppress the diagnostic when this trap is actually a
+            // `wasi:cli/exit.{exit, exit-with-code}` unwind — that's
+            // normal control flow (the host code is already stashed on
+            // `WasiCliAdapter.exit_code`), not a real error (issue
+            // #436 / #448).
+            const is_wasi_exit = std.mem.eql(u8, ht.err_name, "WasiExit");
+            if (!is_wasi_exit) {
+                std.debug.print("[component trap] core_func_idx={d}", .{ht.core_func_idx});
+                if (ht.component_func_idx != std.math.maxInt(u32))
+                    std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
+                if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+                    std.debug.print(
+                        " import='{s}.{s}'",
+                        .{ ht.import_module_name, ht.import_field_name },
+                    );
                 std.debug.print(
-                    " import='{s}.{s}'",
-                    .{ ht.import_module_name, ht.import_field_name },
+                    " stage={s} error={s}\n",
+                    .{ @tagName(ht.stage), ht.err_name },
                 );
-            std.debug.print(
-                " stage={s} error={s}\n",
-                .{ @tagName(ht.stage), ht.err_name },
-            );
+            }
         }
         return error.TrapInCoreFunction;
     };

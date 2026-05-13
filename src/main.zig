@@ -24,34 +24,51 @@ fn parseSubcommand(s: []const u8) ?Subcommand {
     return null;
 }
 
-pub fn main(init: std.process.Init) !void {
+/// Returns the host process exit code. Returning (rather than calling
+/// `std.process.exit`) lets the Zig 0.16 startup runtime run its own
+/// teardown — most importantly the `DebugAllocator` leak hook on
+/// `init.gpa` in Debug builds (#449, #450). Exit-code policy:
+///   * 0 — successful guest run / `help` / `version`
+///   * `outcome.exit_code` / `ctx.exit_code` — guest-requested
+///     (preview1 `proc_exit`, `wasi:cli/exit.exit-with-code`)
+///   * 1 — runtime failure (trap, load/instantiate fail, host-side OOM
+///     during guest setup, etc.)
+///   * 2 — CLI / arg-parsing / usage error
+pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         std.debug.print("error: missing subcommand — try `wamr help`\n", .{});
-        std.process.exit(1);
+        return 2;
     }
 
     const subcmd = parseSubcommand(args[1]) orelse {
         std.debug.print("error: unknown subcommand '{s}' — try `wamr help`\n", .{args[1]});
-        std.process.exit(1);
+        return 2;
     };
 
-    switch (subcmd) {
-        .version => {
-            writeStdout(init.io, "wamr " ++ wamr.version.string ++ "\n");
-            return;
-        },
-        .help => {
-            runHelp(init.io, args[2..]);
-            return;
-        },
+    return switch (subcmd) {
+        .version => try runVersion(init.io, args[2..]),
+        .help => runHelp(init.io, args[2..]),
         .run => try runRun(init, allocator, args[2..]),
-    }
+    };
 }
 
-fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []const []const u8) !void {
+fn runVersion(io: std.Io, args: []const []const u8) !u8 {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) {
+        writeStdout(io, version_usage);
+        return 0;
+    }
+    writeStdout(io, "wamr " ++ wamr.version.string ++ "\n");
+    return 0;
+}
+
+fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []const []const u8) !u8 {
+    if (run_args.len == 1 and std.mem.eql(u8, run_args[0], "help")) {
+        writeStdout(init.io, run_usage);
+        return 0;
+    }
     var wasm_path: ?[]const u8 = null;
     var wasm_args: std.ArrayListUnmanaged([]const u8) = .empty;
     defer wasm_args.deinit(allocator);
@@ -67,19 +84,20 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     while (i < run_args.len) : (i += 1) {
         const arg = run_args[i];
         if (!past_options and arg.len > 0 and arg[0] == '-') {
-            if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-                runHelp(init.io, &.{"run"});
-                return;
-            } else if (std.mem.startsWith(u8, arg, "--stack-size=")) {
+            if (std.mem.startsWith(u8, arg, "--stack-size=")) {
                 stack_size = std.fmt.parseInt(u32, arg["--stack-size=".len..], 10) catch {
                     std.debug.print("error: invalid --stack-size value\n", .{});
-                    std.process.exit(1);
+                    return 2;
                 };
             } else if (std.mem.startsWith(u8, arg, "--listen=")) {
+                if (listen_address != null) {
+                    std.debug.print("error: --listen specified more than once; only one listening socket preopen is supported\n", .{});
+                    return 2;
+                }
                 const spec = arg["--listen=".len..];
                 listen_address = parseListenAddress(spec) catch {
                     std.debug.print("error: invalid --listen address '{s}'\n", .{spec});
-                    std.process.exit(1);
+                    return 2;
                 };
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
                 // Reserved for future WASI heap allocation
@@ -88,34 +106,34 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     i += 1;
                     if (i >= run_args.len) {
                         std.debug.print("error: --env requires KEY=VALUE\n", .{});
-                        std.process.exit(1);
+                        return 2;
                     }
                     break :blk run_args[i];
                 } else arg["--env=".len..];
                 if (std.mem.indexOfScalar(u8, spec, '=') == null) {
                     std.debug.print("error: --env value '{s}' is missing '='\n", .{spec});
-                    std.process.exit(1);
+                    return 2;
                 }
-                env_flags.append(allocator, spec) catch std.process.exit(1);
+                try env_flags.append(allocator, spec);
             } else if (std.mem.eql(u8, arg, "--map-dir") or std.mem.startsWith(u8, arg, "--map-dir=")) {
                 const spec = if (std.mem.eql(u8, arg, "--map-dir")) blk: {
                     i += 1;
                     if (i >= run_args.len) {
                         std.debug.print("error: --map-dir requires HOST::GUEST\n", .{});
-                        std.process.exit(1);
+                        return 2;
                     }
                     break :blk run_args[i];
                 } else arg["--map-dir=".len..];
                 const md = parseMapDir(spec) catch {
                     std.debug.print("error: --map-dir value '{s}' must be 'HOST::GUEST'\n", .{spec});
-                    std.process.exit(1);
+                    return 2;
                 };
-                map_dirs.append(allocator, md) catch std.process.exit(1);
+                try map_dirs.append(allocator, md);
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
-                std.debug.print("error: unknown option '{s}' — try `wamr help run`\n", .{arg});
-                std.process.exit(1);
+                std.debug.print("error: unknown option '{s}' — try `wamr run help`\n", .{arg});
+                return 2;
             }
         } else if (wasm_path == null) {
             wasm_path = arg;
@@ -127,7 +145,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
 
     const path = wasm_path orelse {
         std.debug.print("error: missing wasm/cwasm file — usage: wamr run <file> [args...]\n", .{});
-        std.process.exit(1);
+        return 2;
     };
 
     const io = init.io;
@@ -140,11 +158,10 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // Detect file type by magic bytes: AOT (\0aot) vs Wasm (\0asm)
     if (wasm_data.len >= 4 and std.mem.readInt(u32, wasm_data[0..4], .little) == wamr.types.aot_magic) {
         if (listen_address != null) {
-            std.debug.print("Error: --listen is only supported for WASI HTTP components\n", .{});
-            std.process.exit(1);
+            std.debug.print("Error: --listen is not supported for AOT modules; rerun without --aot\n", .{});
+            return 2;
         }
-        runAot(wasm_data, allocator);
-        return;
+        return runAot(wasm_data, allocator);
     }
 
     // Distinguish core wasm from a component by the version word
@@ -169,21 +186,17 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 }
             }
             if (listen_address) |addr| {
-                runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr);
-                return;
+                return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr);
             }
-            runComponent(wasm_data, allocator, io, path, wasm_args.items, env_list.items);
-            return;
+            return runComponent(wasm_data, allocator, io, path, wasm_args.items, env_list.items);
         }
     }
 
-    if (listen_address != null) {
-        std.debug.print("Error: --listen is only supported for WASI HTTP components\n", .{});
-        std.process.exit(1);
-    }
-
-    // Wasm module (core)
-    runWasm(wasm_data, stack_size, path, &wasm_args, env_flags.items, map_dirs.items, allocator, io);
+    // Wasm module (core). `--listen` registers a TCP listening socket as a
+    // socket preopen (kind = .socket, fd ≥ 3) for the guest's WASI preview1
+    // sock_accept. The component-model branch above already handled --listen
+    // for HTTP servers.
+    return runWasm(wasm_data, stack_size, path, &wasm_args, env_flags.items, map_dirs.items, listen_address, allocator, io);
 }
 
 fn parseMapDir(spec: []const u8) !MapDir {
@@ -231,21 +244,36 @@ fn runComponent(
     wasm_path: []const u8,
     wasm_args: []const []const u8,
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
-) void {
+) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
     defer adapter.deinit();
 
     // argv[0] = wasm path, rest = user args (matches wasmtime convention).
     var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch
-        std.process.exit(1);
+        return 1;
     defer allocator.free(argv_buf);
     argv_buf[0] = wasm_path;
     for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);
 
-    const outcome = adapter_mod.runComponentBytes(data, allocator, &adapter) catch |err| {
+    // The component loader has no `Component.deinit` yet (#142 Phase 1B);
+    // its allocations (and the matching `ComponentInstance` machinery, whose
+    // `inst.deinit()` would otherwise have to mirror every loader-owned
+    // slice) are gathered into an arena that we tear down here. Mirrors the
+    // AOT path's `defer aot_loader.unload(...)` (PR #449) and matches the
+    // established pattern used by every component end-to-end test in the
+    // repo (see `wasi_cli_adapter.zig` test "stdio-echo: end-to-end real
+    // wasi-p2 component" and the explicit comment at `runLoadedComponent`
+    // about "hand-rolled callers ... which pass an arena"). Without this,
+    // DebugAllocator drowns the real component-path leak signal in
+    // hundreds of loader-allocated slices on every Debug-build run.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const outcome = adapter_mod.runComponentBytes(data, arena_alloc, &adapter) catch |err| {
         switch (err) {
             error.NoRunExport => std.debug.print(
                 "Error: component does not expose a top-level `run` export. " ++
@@ -266,7 +294,7 @@ fn runComponent(
             error.Trap => std.debug.print("Error: component trapped during run\n", .{}),
             else => std.debug.print("Error: component run failed: {}\n", .{err}),
         }
-        std.process.exit(1);
+        return 1;
     };
 
     // Flush captured stdout to the host. Buffered + flush at end is the
@@ -278,7 +306,13 @@ fn runComponent(
         stdout_file.writeStreamingAll(io, captured) catch {};
     }
 
-    std.process.exit(if (outcome.is_ok) 0 else 1);
+    // Prefer the explicit numeric exit code recorded by
+    // `wasi:cli/exit.exit-with-code` / preview1 `proc_exit` (#436);
+    // fall back to the boolean is_ok mapping when the component
+    // returned normally without recording a code. POSIX exit codes
+    // are 8-bit on most hosts, so saturate to 1 on overflow.
+    if (outcome.exit_code) |code| return std.math.cast(u8, code) orelse 1;
+    return if (outcome.is_ok) 0 else 1;
 }
 
 fn runHttpComponent(
@@ -288,20 +322,26 @@ fn runHttpComponent(
     wasm_args: []const []const u8,
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
     listen_address: std.Io.net.IpAddress,
-) void {
+) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     var adapter = adapter_mod.WasiCliAdapter.init(allocator);
     defer adapter.deinit();
 
     var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch
-        std.process.exit(1);
+        return 1;
     defer allocator.free(argv_buf);
     argv_buf[0] = wasm_path;
     for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);
 
-    adapter_mod.serveHttpComponentBytes(data, allocator, &adapter, .{
+    // See `runComponent` for the rationale behind the arena wrapper —
+    // same loader/instance allocation story applies on the HTTP path.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    adapter_mod.serveHttpComponentBytes(data, arena_alloc, &adapter, .{
         .listen_address = listen_address,
     }) catch |err| {
         switch (err) {
@@ -323,53 +363,65 @@ fn runHttpComponent(
             error.InstantiateFailed => std.debug.print("Error: failed to instantiate component\n", .{}),
             else => std.debug.print("Error: HTTP server failed: {}\n", .{err}),
         }
-        std.process.exit(1);
+        return 1;
     };
+    // `serveHttpComponentBytes` runs an accept loop that today never returns
+    // normally; this path keeps the function's u8 return well-defined.
+    return 0;
 }
 
-fn runAot(data: []const u8, allocator: std.mem.Allocator) void {
+fn runAot(data: []const u8, allocator: std.mem.Allocator) u8 {
     if (comptime aot_supported) {
-        runAotReal(data, allocator);
+        return runAotReal(data, allocator);
     } else {
         std.debug.print("Error: AOT execution not supported on this architecture\n", .{});
-        std.process.exit(1);
+        return 1;
     }
 }
 
-fn runAotReal(data: []const u8, allocator: std.mem.Allocator) void {
+fn runAotReal(data: []const u8, allocator: std.mem.Allocator) u8 {
     const aot_loader = wamr.aot_loader;
     const aot_runtime = wamr.aot_runtime;
 
     const aot_module = aot_loader.load(data, allocator) catch |err| {
         std.debug.print("Error: failed to load AOT module: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
+    // Mirror the load/unload pairing used by every other `aot_loader.load`
+    // call site in the repo (compiler/emit_aot.zig, tests/coldstart_test.zig,
+    // tests/aot_harness.zig). Without this, `runAotReal` leaks every owned
+    // slice on `AotModule` — func_offsets, local_func_type_indices,
+    // func_types, exports, memories, data_segments, tables, imports,
+    // global_inits, elem_segments — which DebugAllocator prints to stderr
+    // on exit, even though the AOT image executes successfully.
+    defer aot_loader.unload(&aot_module, allocator);
 
     const aot_inst = aot_runtime.instantiate(&aot_module, allocator) catch |err| {
         std.debug.print("Error: failed to instantiate AOT module: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
     defer aot_runtime.destroy(aot_inst);
 
     // Map native code as executable
     aot_runtime.mapCodeExecutable(aot_inst) catch |err| {
         std.debug.print("Error: failed to map code as executable: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
 
     // Find _start or main export
     const func_idx = aot_runtime.findExportFunc(aot_inst, "_start") orelse
         aot_runtime.findExportFunc(aot_inst, "main") orelse {
         std.debug.print("Error: no _start or main function exported in AOT module\n", .{});
-        std.process.exit(1);
+        return 1;
     };
 
     // Execute
     const result = aot_runtime.callFunc(aot_inst, func_idx, i32) catch |err| {
         std.debug.print("Error: AOT execution failed: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
     std.debug.print("{d}\n", .{result});
+    return 0;
 }
 
 fn runWasm(
@@ -379,28 +431,29 @@ fn runWasm(
     wasm_args: *std.ArrayListUnmanaged([]const u8),
     env_flags: []const []const u8,
     map_dirs: []const MapDir,
+    listen_address: ?std.Io.net.IpAddress,
     allocator: std.mem.Allocator,
     io: std.Io,
-) void {
+) u8 {
     var runtime = wamr.wamr.Runtime.init(allocator);
     defer runtime.deinit();
 
     var module = runtime.loadModule(wasm_data) catch |err| {
         std.debug.print("Error: failed to load module: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
     defer module.deinit();
 
     var instance = module.instantiate() catch |err| {
         std.debug.print("Error: failed to instantiate: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
     defer instance.deinit();
 
     const start_func = module.findExport("_start", .function) orelse
         module.findExport("main", .function) orelse {
         std.debug.print("Error: no _start or main function exported\n", .{});
-        std.process.exit(1);
+        return 1;
     };
 
     const func_type = module.inner.getFuncType(start_func.index);
@@ -408,19 +461,19 @@ fn runWasm(
 
     var env = wamr.exec_env.ExecEnv.create(instance.inner, stack_size, allocator) catch |err| {
         std.debug.print("Error: failed to create execution environment: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
     defer env.destroy();
 
     // Build argv for WASI: [wasm_path, wasm_args...]
     var argv_list: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv_list.deinit(allocator);
-    argv_list.append(allocator, wasm_path) catch std.process.exit(1);
-    for (wasm_args.items) |a| argv_list.append(allocator, a) catch std.process.exit(1);
+    argv_list.append(allocator, wasm_path) catch return 1;
+    for (wasm_args.items) |a| argv_list.append(allocator, a) catch return 1;
 
     var ctx = wamr.WasiCtx.init(allocator, io) catch |err| {
         std.debug.print("Error: failed to create WASI context: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
     defer ctx.deinit();
 
@@ -430,7 +483,18 @@ fn runWasm(
     for (map_dirs) |md| {
         _ = ctx.openMappedDir(md.host_path, md.guest_name) catch |err| {
             std.debug.print("Error: cannot pre-open '{s}' as '{s}': {}\n", .{ md.host_path, md.guest_name, err });
-            std.process.exit(1);
+            return 1;
+        };
+    }
+
+    if (listen_address) |addr| {
+        const listen_fd = openListenSocket(addr) catch |err| {
+            std.debug.print("Error: --listen bind failed: {}\n", .{err});
+            return 1;
+        };
+        _ = ctx.addPreopenSocket(listen_fd) catch |err| {
+            std.debug.print("Error: cannot register --listen socket preopen: {}\n", .{err});
+            return 1;
         };
     }
 
@@ -442,12 +506,74 @@ fn runWasm(
     }
 
     wamr.interp.executeFunction(env, start_func.index) catch |err| {
-        if (ctx.exit_code) |code| std.process.exit(@intCast(code));
+        if (ctx.exit_code) |code| return @intCast(code);
         std.debug.print("Error: execution trapped: {}\n", .{err});
-        std.process.exit(1);
+        return 1;
     };
 
-    if (ctx.exit_code) |code| std.process.exit(@intCast(code));
+    if (ctx.exit_code) |code| return @intCast(code);
+    return 0;
+}
+
+/// Bind a TCP socket to `addr` and put it in the listen state. Used by the
+/// core wasm `--listen=` flow to register the listener as a socket
+/// preopen (fd ≥ 3) for the guest's WASI preview1 sock_accept. Backlog
+/// matches `SOMAXCONN` on modern Linux (128 is the historical floor).
+///
+/// Implemented with raw `std.os.linux` syscalls because the cross-platform
+/// `std.posix.{socket,bind,listen,close}` wrappers were removed in Zig 0.16.0.
+/// `--listen` is therefore Linux-only on the core-wasm path; the CLI
+/// front-end rejects it elsewhere.
+fn openListenSocket(addr: std.Io.net.IpAddress) !std.posix.fd_t {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const linux = std.os.linux;
+
+    const family: u32 = switch (addr) {
+        .ip4 => linux.AF.INET,
+        .ip6 => linux.AF.INET6,
+    };
+    const sock_type: u32 = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+    const sock_rc = linux.socket(family, sock_type, linux.IPPROTO.TCP);
+    if (linux.errno(sock_rc) != .SUCCESS) return error.SocketFailed;
+    const fd: std.posix.fd_t = @intCast(@as(isize, @bitCast(sock_rc)));
+    errdefer _ = linux.close(fd);
+
+    // SO_REUSEADDR: lets the host re-bind quickly after a restart while
+    // a previous accepted client lingers in TIME_WAIT.
+    const one: c_int = 1;
+    const so_rc = linux.setsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.REUSEADDR,
+        @ptrCast(&one),
+        @sizeOf(c_int),
+    );
+    if (linux.errno(so_rc) != .SUCCESS) return error.SetSockOptFailed;
+
+    switch (addr) {
+        .ip4 => |v4| {
+            const sa = linux.sockaddr.in{
+                .port = std.mem.nativeToBig(u16, v4.port),
+                .addr = @bitCast(v4.bytes),
+            };
+            const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            if (linux.errno(b) != .SUCCESS) return error.BindFailed;
+        },
+        .ip6 => |v6| {
+            const sa = linux.sockaddr.in6{
+                .port = std.mem.nativeToBig(u16, v6.port),
+                .flowinfo = v6.flow,
+                .addr = v6.bytes,
+                .scope_id = v6.interface.index,
+            };
+            const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
+            if (linux.errno(b) != .SUCCESS) return error.BindFailed;
+        },
+    }
+
+    const lr = linux.listen(fd, 128);
+    if (linux.errno(lr) != .SUCCESS) return error.ListenFailed;
+    return fd;
 }
 
 fn writeStdout(io: std.Io, text: []const u8) void {
@@ -463,7 +589,9 @@ const top_usage =
     \\Subcommands:
     \\  run       Run a .wasm or .cwasm file
     \\  version   Print version and exit
-    \\  help      Print this help; `wamr help <subcommand>` for details
+    \\  help      Print this help
+    \\
+    \\Run `wamr <subcommand> help` to show help for a specific subcommand.
     \\
 ;
 
@@ -473,11 +601,13 @@ const run_usage =
     \\Options:
     \\  --stack-size=<bytes>     Stack size for the interpreter (default: 65536)
     \\  --heap-size=<bytes>      Reserved (currently ignored)
-    \\  --listen=<ip:port>       Serve a WASI HTTP component on a TCP address
+    \\  --listen=<ip:port>       For components: serve WASI HTTP on the address.
+    \\                           For core wasm: bind a TCP listening socket and
+    \\                           expose it to the guest as the next preopen fd
+    \\                           (≥ 3) for `sock_accept` (single use only).
     \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
     \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
     \\                           inside the guest WASI sandbox (repeatable)
-    \\  -h, --help               Show this help
     \\
 ;
 
@@ -489,26 +619,19 @@ const version_usage =
 ;
 
 const help_usage =
-    \\Usage: wamr help [subcommand]
+    \\Usage: wamr help
     \\
-    \\Print top-level help, or help for a specific subcommand.
+    \\Print top-level help and exit.
     \\
 ;
 
-fn runHelp(io: std.Io, args: []const []const u8) void {
-    if (args.len == 0) {
-        writeStdout(io, top_usage);
-        return;
+fn runHelp(io: std.Io, args: []const []const u8) u8 {
+    if (args.len == 1 and std.mem.eql(u8, args[0], "help")) {
+        writeStdout(io, help_usage);
+        return 0;
     }
-    const sub = parseSubcommand(args[0]) orelse {
-        std.debug.print("error: unknown subcommand '{s}' — try `wamr help`\n", .{args[0]});
-        std.process.exit(1);
-    };
-    writeStdout(io, switch (sub) {
-        .run => run_usage,
-        .version => version_usage,
-        .help => help_usage,
-    });
+    writeStdout(io, top_usage);
+    return 0;
 }
 
 test "subcommand parsing" {
