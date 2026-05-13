@@ -5622,6 +5622,8 @@ const x86_64_default_passes: []const PassFn = &.{
     &inductionVariableSimplification,
     &hoistLoopInvariantCode,
     &unrollSmallFixedLoops,
+    &@import("forward_redundant_loads.zig").forwardRedundantLoads,
+    &deadStoreElimination,
     &deadCodeElimination,
     &deadLocalSetElimination,
     &hoistLoopBoundsChecks,
