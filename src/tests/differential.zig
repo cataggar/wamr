@@ -4460,6 +4460,36 @@ test "differential: memory.grow then memory.size" {
     try expectDiffI32(wasm, "f", 3);
 }
 
+test "differential: memory.grow then store+load in the new page (issue #466)" {
+    // (module (memory 1) (func (export "f") (result i32)
+    //   i32.const 2 memory.grow drop
+    //   i32.const 131072 i32.const 0xDEADBEEF i32.store
+    //   i32.const 131072 i32.load))
+    //
+    // Address 131072 (page 2 start) is OUT OF BOUNDS in the original
+    // 1-page memory but valid after the grow. If codegen fails to
+    // refresh the pinned memory_base register after memory.grow
+    // (issue #466), the store/load would use the *old* (potentially
+    // freed) base — either crashing or returning the wrong value.
+    // Encoded by `wabt text parse` (5-byte LEB128 padded section
+    // headers; functionally identical to the compact form used by
+    // the surrounding tests).
+    const wasm = &[_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x85, 0x80, 0x80, 0x80, 0x00, 0x01, 0x60,
+        0x00, 0x01, 0x7f, 0x03, 0x82, 0x80, 0x80, 0x80,
+        0x00, 0x01, 0x00, 0x05, 0x83, 0x80, 0x80, 0x80,
+        0x00, 0x01, 0x00, 0x01, 0x07, 0x85, 0x80, 0x80,
+        0x80, 0x00, 0x01, 0x01, 0x66, 0x00, 0x00, 0x0a,
+        0xa1, 0x80, 0x80, 0x80, 0x00, 0x01, 0x9b, 0x80,
+        0x80, 0x80, 0x00, 0x00, 0x41, 0x02, 0x40, 0x00,
+        0x1a, 0x41, 0x80, 0x80, 0x08, 0x41, 0xef, 0xfd,
+        0xb6, 0xf5, 0x7d, 0x36, 0x00, 0x00, 0x41, 0x80,
+        0x80, 0x08, 0x28, 0x00, 0x00, 0x0b,
+    };
+    try expectDiffI32(wasm, "f", @bitCast(@as(u32, 0xDEADBEEF)));
+}
+
 test "differential: memory.fill writes value and readback" {
     // (module (memory 1) (func (export "f") (result i32)
     //   i32.const 100 i32.const 0x5a i32.const 4 memory.fill
