@@ -1,42 +1,34 @@
-# zig-http (WIP — blocked on [cataggar/wabt#191][wabt-191])
+# zig-http
 
 Pure-Zig WebAssembly component mirroring the bytecodealliance
 [Rust HTTP-in-components tutorial][bca-http]:
 
-* `GET /` → `200 "Hello, world!\n"`
-* anything else → `404`
+* `GET /`        → `200 "Hello, world!\n"`
+* anything else  → `404`
 
-Designed to run end-to-end through wamr via
-`wamr run --listen=127.0.0.1:8080 zig-http.component.wasm` and
-`curl -i http://127.0.0.1:8080/`.
+Runs end-to-end through wamr today:
+
+```console
+$ ./zig-out/bin/wamr run --listen=127.0.0.1:8080 \
+        zig-out/component-examples/zig-http.component.wasm &
+$ curl -i http://127.0.0.1:8080/
+HTTP/1.1 200 OK
+Content-Length: 14
+Connection: close
+
+Hello, world!
+$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/missing
+404
+```
+
+The repo's root `build.zig` automates everything:
+
+```sh
+zig build component-examples       # build + validate
+zig build component-examples-run   # build + spin-up + smoke (curl-equivalent in Zig)
+```
 
 [bca-http]: https://component-model.bytecodealliance.org/language-support/using-http-in-components/rust.html
-[wabt-191]: https://github.com/cataggar/wabt/issues/191
-
-## Current state
-
-| Step                                | Status                                |
-|-------------------------------------|---------------------------------------|
-| `wabt component embed --world …`    | ✓ encodes (verified)                  |
-| `wabt component new`                | ✗ `error: building component: UnsupportedShape` ([wabt#191][wabt-191]) |
-| Zig source (canonical-ABI handler)  | placeholder; full impl gated on the above |
-| `build.zig` wiring                  | unwired; see plan.md                  |
-| `wamr run --listen=…` smoke         | gated                                 |
-
-Two follow-up wabt issues filed during the audit:
-
-* [cataggar/wabt#191][wabt-191] — `metadata_decode` rejects
-  encoder-emitted alias decls. This is the gate for
-  `wabt component new`.
-* [cataggar/wabt#192][wabt-192] — leading doc comment before
-  `package` makes the parser eat the `package` keyword. Working
-  around in the WIT files by using plain `//` comments at the
-  file head.
-
-The WIT layout, world shape, and handler skeleton are in this tree so
-that the rest of the example can land in a single follow-up the moment
-[wabt#191][wabt-191] ships and `cataggar/wamr` bumps its `build.zig.zon`
-wabt pin.
 
 ## WIT layout
 
@@ -53,97 +45,132 @@ wit/
 
 Each dep is the **minimum subset** of the canonical upstream WIT that
 the handler links against. We deliberately don't ship the canonical
-`wasi:http/proxy` world (it uses `include wasi:clocks/imports;`, which
-the cataggar/wabt encoder doesn't support yet) and don't ship a full
-`wasi:http/types` (we'd pull in `wasi:io/poll` for pollables, the
-30-case `error-code` variant, futures, outgoing-handler, etc.).
+`wasi:http/proxy` world — it pulls in clocks / random / cli / etc., none
+of which our handler uses, and a leaner WIT keeps the example tight.
+The Zig source is shorter than the WIT it consumes.
 
-Constraints surfaced by the audit ([cataggar/wabt#191][wabt-191],
-[cataggar/wabt#192][wabt-192]) and already encoded in the layout
-above:
+```wit
+package example:zig-http;
+
+world http-hello {
+    import wasi:io/streams@0.2.6;   // imported BEFORE wasi:http/types
+    import wasi:http/types@0.2.6;   // (which has `use wasi:io/streams.{output-stream}`)
+    export wasi:http/incoming-handler@0.2.6;
+}
+```
+
+World-declaration order matters: when one imported interface `use`s
+another, the source must be imported BEFORE the consumer (else the
+encoder's alias-emit pass references a slot that hasn't been
+populated yet). Worth noting because the order is the opposite of
+how a reader might intuitively write it ("the entry point first").
+
+## Source walkthrough
+
+The Zig handler is hand-written canonical-ABI — no Zig
+`wit-bindgen` equivalent exists, so each call into
+`wasi:http/types@0.2.6` / `wasi:io/streams@0.2.6` declares the
+lowered core signature directly. The lowering rules
+(`MAX_FLAT_PARAMS=16`, `MAX_FLAT_RESULTS=1`) are documented at the
+`extern "wasi:…"` declarations in `src/main.zig`; any result whose
+flat representation exceeds 1 core value is returned through a
+guest-allocated ret-area pointer passed as the last param.
+
+`cabi_realloc` is a tiny bump-arena allocator (64 KiB, reset at the
+top of every `handle` call). The host uses it to materialize the
+host-side string returned by `incoming-request.path-with-query`
+into our linear memory; we also reuse the same arena for the
+canon-ABI ret-area buffers we pass to spilled-result imports.
+
+The handler flow mirrors the Rust tutorial:
+
+1. Read request path via `[method]incoming-request.path-with-query`.
+2. Branch: `/` → 200 + "Hello, world!\n"; else → 404 + empty body.
+3. Build a (default-empty) `fields` map and an `outgoing-response`
+   referencing it.
+4. For 404, bump `set-status-code`.
+5. Acquire `outgoing-body` from the response, then `output-stream`
+   from the body, then `blocking-write-and-flush` the body bytes.
+6. `[static]outgoing-body.finish(body, none)` releases the body.
+7. `[static]response-outparam.set(outp, ok(resp))` delivers the
+   response back to the host.
+
+## Build pipeline
+
+```sh
+# 1. Core wasm with the canonical-ABI export + cabi_realloc.
+zig build-exe -target wasm32-freestanding -O ReleaseSmall \
+    -fno-entry \
+    --export="wasi:http/incoming-handler@0.2.6#handle" \
+    --export=cabi_realloc \
+    src/main.zig
+
+# 2. Embed the WIT subset.
+wabt component embed --world http-hello wit main.wasm \
+    -o main.embed.wasm
+
+# 3. Wrap into a component. No preview1 imports → wabt's plain
+#    (non-adapter) component_new wraps it directly; canon.lower
+#    trampolines for every imported method are auto-emitted
+#    (cataggar/wabt#202/#205/#207), and `cabi_realloc` is used
+#    as the canon-options realloc.
+wabt component new main.embed.wasm -o zig-http.component.wasm
+```
+
+## What this exercises
+
+* The first end-to-end exercise of wamr's
+  `runHttpComponent` / `serveHttpComponentBytes` path with a
+  Zig-emitted handler. Pre-this example, only one synthetic unit
+  test (`http: discovers versioned incoming-handler export (#201)`)
+  drove the export scanner.
+* The cataggar/wabt v3 series feature stack:
+  `metadata_decode` alias-tolerance ([wabt#191][w191]),
+  doc-comment-before-`package` ([wabt#192][w192]),
+  resource-handle refs in func sigs ([wabt#194][w194]),
+  cross-iface-use resource hoisting ([wabt#198][w198]),
+  canon.lower trampolines + memory/realloc opts for imports
+  ([wabt#202][w202] / [wabt#205][w205] / [wabt#207][w207]).
+* wamr executor's flat lift of `option<T>` / `result<T,E>` args —
+  required for `[static]outgoing-body.finish`'s
+  `option<own<fields>>` trailers arg and
+  `[static]response-outparam.set`'s
+  `result<own<outgoing-response>, error-code>` arg. Lands as part
+  of this PR.
+
+[w191]: https://github.com/cataggar/wabt/issues/191
+[w192]: https://github.com/cataggar/wabt/issues/192
+[w194]: https://github.com/cataggar/wabt/issues/194
+[w198]: https://github.com/cataggar/wabt/issues/198
+[w202]: https://github.com/cataggar/wabt/issues/202
+[w205]: https://github.com/cataggar/wabt/issues/205
+[w207]: https://github.com/cataggar/wabt/issues/207
+
+## Implementation notes / gotchas
+
+A handful of constraints fell out of bringing this up; each is
+already encoded in the example tree:
 
 * Empty resource bodies use `resource foo {}` — the wabt parser
   rejects the bare `resource foo;` form (`parser.zig:parseResource`
   requires `{`).
-* No trailing commas in func param lists.
-* In a multi-`*.wit` directory, only the file sorting first
-  alphabetically may carry the `package` declaration. wabt's
+* Multi-`*.wit` directory: only the file sorting first
+  alphabetically may carry the `package <id>;` declaration. wabt's
   `readWitDir` concatenates files in alpha order, and the parser
   chokes on a second `kw_package` mid-document.
-* `world http-hello` must explicitly `import` every interface a
-  used interface references. The encoder's pre-pass populates
-  `alias_requests` keyed by source-qname; the main loop only emits
-  matching alias decls when the world visits the source as
-  `import` / `export`, so without the explicit import you get
+* `world` must explicitly `import` every interface a `use` clause
+  references. The encoder's pre-pass populates `alias_requests`
+  keyed by source-qname; the main loop only emits matching alias
+  decls when the world visits the source as `import` / `export`,
+  so without the explicit import you get
   `error: encoding world: InvalidWit`.
-* World-declaration order matters when one imported interface
-  `use`s another. Imports are emitted (and their `use`-target
-  alias slots populated) in textual order, so the *consumer* must
-  appear after its *source*. We import `wasi:io/streams` before
-  `wasi:http/types` (which has `use wasi:io/streams.{output-stream};`)
-  to keep the alias-slot reference forward-only.
-* Use `result<T>` (no err arm) rather than `result<T, _>` in
-  return-type positions — the parser only special-cases the `_`
-  placeholder in the **ok** slot (`parser.zig:kw_result`).
-* File-header comments use plain `//`, not `///` — a `///` block
-  before `package <id>;` triggers [cataggar/wabt#192][wabt-192].
-
-[wabt-192]: https://github.com/cataggar/wabt/issues/192
-
-## Build pipeline (planned — pseudocode until [wabt#191][wabt-191])
-
-```sh
-# 1. core wasm with canonical-ABI export. Freestanding (not -wasi)
-#    because reactor-shape adapters have no scratch-memory source.
-zig build-exe -target wasm32-freestanding -O ReleaseSmall \
-    -fno-entry \
-    --export="wasi:http/incoming-handler@0.2.6#handle" \
-    src/main.zig
-
-# 2. embed the trimmed WIT.
-wabt component embed --world http-hello wit main.wasm \
-    -o main.embed.wasm
-
-# 3. wrap into a component. The embed has no `_start`, so wabt's
-#    auto-selection picks the reactor-shape preview1 adapter.
-wabt component new main.embed.wasm -o zig-http.component.wasm
-```
-
-## Run (planned)
-
-```console
-$ ./zig-out/bin/wamr run --listen=127.0.0.1:8080 \
-        zig-out/component-examples/zig-http.component.wasm &
-$ curl -i http://127.0.0.1:8080/
-HTTP/1.1 200 OK
-content-length: 14
-
-Hello, world!
-$ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/missing
-404
-```
-
-## What this exercises (once unblocked)
-
-* The first real-world end-to-end exercise of wamr's
-  `runHttpComponent` / `serveHttpComponentBytes` path — today only
-  one synthetic unit test (`http: discovers versioned
-  incoming-handler export (#201)`) drives the export scanner.
-* The first real fixture for wabt's **reactor-shape** wasi-preview1
-  adapter ([cataggar/wabt#167][wabt-167]); its README explicitly
-  notes the deferred validation gap.
-
-[wabt-167]: https://github.com/cataggar/wabt/issues/167
-
-## Notes / open follow-ups
-
-* The handler will need a small (~30-line) hand-written
-  `cabi_realloc` bump arena so the canonical-ABI lowering of
-  `[method]incoming-request.path-with-query`'s `option<string>`
-  return value lands somewhere — wamr's host writes into guest
-  memory through the standard realloc protocol.
+* World-import order matters when one imported interface `use`s
+  another — see the WIT layout note above.
+* `result<T, _>` placeholder in the err arm isn't supported —
+  the parser only special-cases `_` in the ok slot
+  (`parser.zig:kw_result`). Use `result<T>` (one-arm) instead.
 * Resource lifecycle: wamr's `serveOneHttpConnection` calls
   `cleanupHttpResources` after every request, so the handler is
-  not required to call `[resource-drop]…` itself. We still emit a
-  defensive drop on `output-stream` because the host registers
-  one and the canon stage synthesizes the import.
+  not required to call `[resource-drop]…` itself — and currently
+  doesn't. Real production code on other hosts should drop the
+  output-stream before `outgoing-body.finish` per WIT semantics.

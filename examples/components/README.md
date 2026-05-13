@@ -25,7 +25,7 @@ examples/components/
 ├── zig-calculator-cmd/             Zig command importing docs:adder
 ├── mixed-zig-rust-calc/            Zig adder + Rust command, composed
 │   └── command/                    cargo + wit-bindgen, wasm32-wasip1
-└── zig-http/                       Zig wasi:http/incoming-handler (WIP, see cataggar/wabt#191)
+└── zig-http/                       Zig wasi:http/incoming-handler component
 ```
 
 Each example directory has its own `README.md` with example-specific
@@ -39,17 +39,19 @@ on machines that do not have the external toolchain installed.
 
 | Step                            | What it does                                                     |
 |---------------------------------|------------------------------------------------------------------|
-| `zig build component-examples`     | Build, encode, and validate all four components.                 |
-| `zig build component-examples-run` | Run `zig-hello` through `./zig-out/bin/wamr` (smoke test).       |
+| `zig build component-examples`     | Build, encode, and validate every component below.               |
+| `zig build component-examples-run` | Run the runnable examples through `./zig-out/bin/wamr` — `zig-hello` greeting, `zig-exit` exit-code path, the two composed calculator commands, and the `zig-http` curl-equivalent smoke (spin up `wamr run --listen=…`, send two requests, assert `200 "Hello, world!\n"` / `404`). |
 
 Outputs land under `zig-out/component-examples/`:
 
 ```
 zig-out/component-examples/
 ├── zig-hello.component.wasm
+├── zig-exit.component.wasm
 ├── zig-adder.component.wasm
 ├── zig-calculator-cmd.composed.wasm
-└── mixed-zig-rust-calc.composed.wasm
+├── mixed-zig-rust-calc.composed.wasm
+└── zig-http.component.wasm
 ```
 
 ## Pinned tool versions
@@ -70,7 +72,7 @@ zig-out/component-examples/
 | `zig-adder`               |   ✓    |     ✓     |        n/a         | Library component — no `wasi:cli/run`.                     |
 | `zig-calculator-cmd` (composed) | ✓ |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
 | `mixed-zig-rust-calc`     |   ✓    |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
-| `zig-http`                |   —    |     —     |         —          | WIT skeleton only — `wabt component new` blocks on [cataggar/wabt#191](https://github.com/cataggar/wabt/issues/191). See `zig-http/README.md`. |
+| `zig-http`                |   ✓    |     ✓     |         ✓          | Hand-rolled canonical-ABI handler; first real-world end-to-end exercise of wamr's `runHttpComponent`. |
 
 All composed examples produce valid components that run in
 [Wasmtime][wasmtime] and on wamr today. `wabt component compose` emits
