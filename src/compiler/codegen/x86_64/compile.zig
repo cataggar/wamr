@@ -1487,21 +1487,23 @@ const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
 
 /// x86-64 allocatable GPR set: rdx(2), rsi(6), rdi(7), r8(8), r9(9),
-/// r12(12), r13(13), r14(14), r15(15). `rbx`(3) is permanently pinned to
-/// `vmctx` for the function body (issue #465) and excluded from the
-/// allocator pool; the prologue copies `param_regs[0]` (rdi/rcx) into
-/// rbx once, and every site that previously reloaded vmctx from
-/// `[rbp - 8]` reads rbx directly.
+/// r12(12), r13(13), r14(14). `rbx`(3) is permanently pinned to
+/// `vmctx` for the function body (issue #465) and `r15`(15) is
+/// permanently pinned to `memory_base` (issue #466); both are excluded
+/// from the allocator pool. The prologue copies `param_regs[0]`
+/// (rdi/rcx) into rbx and loads `[rbx + 0]` into r15 once. Every
+/// linear-memory access reads r15 directly; every site that previously
+/// reloaded vmctx from `[rbp - 8]` reads rbx directly.
 ///
 /// `caller_saved_indices` / `callee_saved_indices` are stable indices
 /// into `alloc_regs` and match the bit positions used in clobber masks below.
-const x86_64_alloc_regs = [_]regalloc.PhysReg{ 2, 6, 7, 8, 9, 12, 13, 14, 15 };
+const x86_64_alloc_regs = [_]regalloc.PhysReg{ 2, 6, 7, 8, 9, 12, 13, 14 };
 
 /// Indices into `x86_64_alloc_regs` of callee-saved registers (same on
-/// Win64 and SysV): r12..r15 (idx 5..8). rbx is excluded — it is the
-/// pinned vmctx register and saved/restored unconditionally by the
-/// prologue/epilogue rather than by the allocator.
-const x86_64_callee_saved_indices = [_]u8{ 5, 6, 7, 8 };
+/// Win64 and SysV): r12..r14 (idx 5..7). rbx (vmctx, issue #465) and
+/// r15 (memory_base, issue #466) are excluded — both are saved/restored
+/// unconditionally by the prologue/epilogue rather than by the allocator.
+const x86_64_callee_saved_indices = [_]u8{ 5, 6, 7 };
 
 /// Indices into `x86_64_alloc_regs` of caller-saved registers, by ABI.
 /// On Win64: rdx, r8, r9. On SysV: add rsi, rdi.
@@ -1850,6 +1852,15 @@ fn compileFunctionRAWithGlobalOffsets(
     // preserve the caller's value) before the prologue copies vmctx
     // (`param_regs[0]`) into it.
     used_callee_saved[0] = true;
+    // r15 is permanently pinned to memory_base for the function body
+    // (issue #466). Locate it in `callee_saved_alloc` (Win64 index 6,
+    // SysV index 4) and force its slot on so the prologue / epilogue
+    // push-pop it around the body, and so the prologue's
+    // `mov r15, [rbx + 0]` load can rely on its caller value having
+    // been preserved.
+    inline for (callee_saved_alloc, 0..) |cs_reg, i| {
+        if (cs_reg == .r15) used_callee_saved[i] = true;
+    }
     {
         var it = alloc_result.assignments.iterator();
         while (it.next()) |entry| {
@@ -1980,6 +1991,14 @@ fn compileFunctionRAWithGlobalOffsets(
     // rax). Doing the move AFTER `push rbx` preserves the caller's
     // rbx in the slot reserved by the push.
     try code.movRegReg(.rbx, vmctx_reg);
+
+    // Pin VmCtx.memory_base in r15 for the whole function body
+    // (issue #466). `push r15` above preserved the caller's r15, so
+    // we can now overwrite it. Every linear-memory access reads r15
+    // directly instead of doing `mov r10, rbx; mov r10, [r10 + 0]`.
+    // memory.grow and every wasm call reload r15 from [rbx + 0]
+    // afterward because either can invalidate the cached base.
+    try code.movRegMem(.r15, .rbx, vmctx_membase_field);
 
     var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
     defer block_offsets.deinit();
@@ -2147,12 +2166,11 @@ fn emitSmallMemoryCopy(
     try emitStaticBulkMemBoundsCheck(code, alloc_result, src, len);
     if (len == 0) return;
 
-    try code.movRegReg(.r10, .rbx);
+    // Address arithmetic uses the pinned memory_base in r15 (issue #466).
     try loadWasmU32Addr(code, alloc_result, dst, .rax);
-    try code.movRegMem(.r10, .r10, vmctx_membase_field);
-    try code.addRegReg(.rax, .r10);
+    try code.addRegReg(.rax, .r15);
     try loadWasmU32Addr(code, alloc_result, src, .rcx);
-    try code.addRegReg(.rcx, .r10);
+    try code.addRegReg(.rcx, .r15);
 
     try code.cmpRegReg(.rax, .rcx);
     const forward_jcc = code.len();
@@ -2175,10 +2193,9 @@ fn emitSmallMemoryFill(
     try emitStaticBulkMemBoundsCheck(code, alloc_result, dst, len);
     if (len == 0) return;
 
-    try code.movRegReg(.r10, .rbx);
+    // Address arithmetic uses the pinned memory_base in r15 (issue #466).
     try loadWasmU32Addr(code, alloc_result, dst, .rax);
-    try code.movRegMem(.r10, .r10, vmctx_membase_field);
-    try code.addRegReg(.rax, .r10);
+    try code.addRegReg(.rax, .r15);
 
     const val_reg = try useVReg(code, alloc_result, val, .r11);
     if (val_reg != .r11) try code.movRegReg(.r11, val_reg);
@@ -2830,6 +2847,15 @@ fn compileInstRA(
                 return;
             }
 
+            // Refresh the pinned memory_base in r15 (issue #466). The
+            // callee may have invoked `memory.grow`, which reallocs
+            // the wasm linear memory and updates `[vmctx + 0]`. The
+            // callee's epilogue restored *our* (pre-call) r15, so our
+            // cached value is stale; reload from the now-current
+            // `[vmctx + 0]`. Skip after tail-calls (control doesn't
+            // return to us).
+            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
@@ -2984,6 +3010,11 @@ fn compileInstRA(
                 return;
             }
 
+            // Refresh pinned memory_base in r15 (issue #466) — the
+            // called function may have invoked `memory.grow`; see the
+            // .call handler for the full rationale.
+            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
@@ -3077,6 +3108,11 @@ fn compileInstRA(
                 return;
             }
 
+            // Refresh pinned memory_base in r15 (issue #466) — the
+            // called function may have invoked `memory.grow`; see the
+            // .call handler for the full rationale.
+            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
+
             if (inst.dest) |dest| {
                 try writeDefTyped(code, alloc_result, dest, .rax, inst.type);
             }
@@ -3095,10 +3131,10 @@ fn compileInstRA(
         // ── Memory ────────────────────────────────────────────────────
         .load => |ld| {
             const dest = inst.dest orelse return;
-            // Load memory base from VMContext frame slot, add wasm offset.
-            // Bounds check is inserted between vmctx load and mem_base load so
-            // the check can read VmCtx.memory_size while r10 still holds the
-            // VmCtx pointer.
+            // Bounds check reads memory_size from `[vmctx + 8]`, so we
+            // still need vmctx in r10 across the check. The actual
+            // address arithmetic uses the pinned memory_base in r15
+            // (issue #466) — no per-access reload of `[vmctx + 0]`.
             try code.movRegReg(.r10, .rbx); // load VmCtx*
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
@@ -3107,8 +3143,7 @@ fn compileInstRA(
                 const end_offset = if (ld.checked_end > 0) ld.checked_end else @as(u64, ld.offset) + @as(u64, ld.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
-            try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
+            try code.addRegReg(.rax, .r15); // rax = mem_base + wasm_addr
             // Fold wasm offset into mov displacement when it fits in i32.
             // For out-of-range offsets (address.wast uses 0xFFFFFFFF), first
             // add the offset to rax via a 64-bit imm.
@@ -3140,10 +3175,10 @@ fn compileInstRA(
             }
         },
         .store => |st| {
-            // Load memory base from VMContext frame slot into r10.
-            // Bounds check is inserted between vmctx load and mem_base load so
-            // the check can read VmCtx.memory_size while r10 still holds the
-            // VmCtx pointer.
+            // Bounds check reads memory_size from `[vmctx + 8]`, so we
+            // still need vmctx in r10 across the check. The actual
+            // address arithmetic uses the pinned memory_base in r15
+            // (issue #466) — no per-access reload of `[vmctx + 0]`.
             try code.movRegReg(.r10, .rbx); // load VmCtx*
             // Compute final address in rax (not allocatable — safe to clobber).
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
@@ -3153,8 +3188,7 @@ fn compileInstRA(
                 const end_offset = if (st.checked_end > 0) st.checked_end else @as(u64, st.offset) + @as(u64, st.size);
                 try emitMemBoundsCheck(code, end_offset);
             }
-            try code.movRegMem(.r10, .r10, vmctx_membase_field); // load VmCtx.memory_base
-            try code.addRegReg(.rax, .r10); // rax = mem_base + wasm_addr
+            try code.addRegReg(.rax, .r15); // rax = mem_base + wasm_addr
             // Load value into rcx (not allocatable — safe to clobber).
             // useVReg writes spill loads into scratch=.rcx, so rax is preserved.
             const val_reg = try useVReg(code, alloc_result, st.val, .rcx);
@@ -3254,6 +3288,12 @@ fn compileInstRA(
             if (stack_adjust > 0) try code.subRegImm32(.rsp, @intCast(stack_adjust));
             try code.callReg(.rax);
             if (stack_adjust > 0) try code.addRegImm32(.rsp, @intCast(stack_adjust));
+
+            // mem_grow_fn may realloc the wasm linear memory and
+            // invalidate the pinned memory_base in r15 (issue #466).
+            // Refresh from [vmctx + 0] now so subsequent memory
+            // accesses see the new base.
+            try code.movRegMem(.r15, .rbx, vmctx_membase_field);
 
             // Helper returns i32 (old pages or -1); sign-extend not needed since
             // writeDefTyped honors inst.type and consumers use 32-bit semantics.
@@ -4974,11 +5014,13 @@ test "compileFunctionRA: iconst_32 + ret" {
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
 }
 
-test "compileFunctionRA: prologue pins vmctx in rbx (issue #465)" {
+test "compileFunctionRA: prologue pins vmctx in rbx (#465) and memory_base in r15 (#466)" {
     // Every function's prologue must (a) `push rbx` (preserve the
-    // caller's rbx, since x86-64 callee-saved discipline requires it)
-    // and (b) `mov rbx, param_regs[0]` (capture vmctx). The two
-    // instructions must appear together in the prologue.
+    // caller's rbx, since x86-64 callee-saved discipline requires it),
+    // (b) `mov rbx, param_regs[0]` (capture vmctx), (c) `push r15`
+    // (preserve caller's r15), and (d) `mov r15, [rbx + 0]` (capture
+    // memory_base). The mov of vmctx must precede the load of
+    // memory_base, since the load reads through rbx.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -4996,6 +5038,8 @@ test "compileFunctionRA: prologue pins vmctx in rbx (issue #465)" {
 
     // `push rbx` = 0x53 (single byte, low-8 register, no REX prefix).
     const push_rbx: u8 = 0x53;
+    // `push r15` = REX.B (0x41) + 0x57 = 41 57.
+    const push_r15: [2]u8 = .{ 0x41, 0x57 };
     // `mov rbx, param_regs[0]`:
     //   SysV:  rdi → rbx → REX.W 0x48, MOV opcode 0x89, ModR/M 0xFB
     //          (mod=11, reg=rdi=7, r/m=rbx=3) = 48 89 FB.
@@ -5006,13 +5050,71 @@ test "compileFunctionRA: prologue pins vmctx in rbx (issue #465)" {
     else
         .{ 0x48, 0x89, 0xFB };
 
-    const idx_mov = std.mem.indexOf(u8, code, &mov_rbx) orelse
+    // `mov r15, [rbx + 0]` via movRegMem (always disp32):
+    //   REX.WR (0x4C) + opcode 0x8B + ModR/M 0xBB (mod=10, reg=r15=7
+    //   low3, rm=rbx=3) + disp32 = 00 00 00 00.
+    const mov_r15_membase: [7]u8 = .{ 0x4C, 0x8B, 0xBB, 0x00, 0x00, 0x00, 0x00 };
+
+    const idx_mov_rbx = std.mem.indexOf(u8, code, &mov_rbx) orelse
         return error.TestExpectedMovRbxFromParam0;
+    const idx_mov_r15 = std.mem.indexOf(u8, code, &mov_r15_membase) orelse
+        return error.TestExpectedMovR15FromMembase;
     // The `push rbx` byte must appear earlier in the prologue.
-    const prologue = code[0..idx_mov];
-    const idx_push = std.mem.indexOfScalar(u8, prologue, push_rbx) orelse
+    const prologue_before_rbx = code[0..idx_mov_rbx];
+    const idx_push_rbx = std.mem.indexOfScalar(u8, prologue_before_rbx, push_rbx) orelse
         return error.TestExpectedPushRbxBeforeMov;
-    try std.testing.expect(idx_push < idx_mov);
+    try std.testing.expect(idx_push_rbx < idx_mov_rbx);
+    // `push r15` must appear before the r15 load (caller's r15 is
+    // preserved on stack before we overwrite it).
+    const prologue_before_r15 = code[0..idx_mov_r15];
+    const idx_push_r15 = std.mem.indexOf(u8, prologue_before_r15, &push_r15) orelse
+        return error.TestExpectedPushR15BeforeMov;
+    try std.testing.expect(idx_push_r15 < idx_mov_r15);
+    // rbx must be set BEFORE r15 (the load reads `[rbx + 0]`).
+    try std.testing.expect(idx_mov_rbx < idx_mov_r15);
+}
+
+test "compileFunctionRA: memory.grow refreshes pinned r15 (issue #466)" {
+    // The helper call to mem_grow_fn can realloc the linear memory and
+    // invalidate r15's cached `[vmctx + 0]`. Codegen must emit a fresh
+    // mov r15, [rbx + 0] right after the call returns.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .memory_grow = v0 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v1 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // The mem_grow_fn dispatch is `call rax` (FF D0). Find the LAST
+    // such pair — there may be earlier `call` patches for other
+    // operations, and we want the grow helper itself.
+    const call_rax: [2]u8 = .{ 0xFF, 0xD0 };
+    var idx_call: ?usize = null;
+    var i: usize = 0;
+    while (i + 2 <= code.len) : (i += 1) {
+        if (std.mem.eql(u8, code[i..][0..2], &call_rax)) idx_call = i;
+    }
+    try std.testing.expect(idx_call != null);
+
+    // After the call, we expect `mov r15, [rbx + 0]` =
+    //   4C 8B BB 00 00 00 00.
+    const reload: [7]u8 = .{ 0x4C, 0x8B, 0xBB, 0x00, 0x00, 0x00, 0x00 };
+    const tail = code[idx_call.? + 2 ..];
+    const reload_off = std.mem.indexOf(u8, tail, &reload) orelse
+        return error.TestExpectedR15ReloadAfterGrow;
+    // The reload must come BEFORE any later writeDef or return. Just
+    // assert it exists in the post-call region — codegen places it
+    // immediately after the stack adjust, before writeDefTyped.
+    _ = reload_off;
 }
 
 test "compileFunctionRA: add two constants" {

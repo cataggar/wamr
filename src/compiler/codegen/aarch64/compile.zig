@@ -40,16 +40,22 @@ const RegMap = struct {
     // callee-saved, calls (to wasm helpers, trap helpers, host
     // functions) preserve it without a save/restore at the call site.
     //
-    // X20–X28 are AAPCS64 callee-saved and appended after the caller-
+    // X20 is reserved as the pinned `memory_base` register (issue
+    // #466). The prologue loads `[x19 + 0]` (= VmCtx.memory_base) into
+    // x20 once, and every linear-memory access reads x20 directly
+    // instead of rematerialising the base. memory.grow and every wasm
+    // call site emit a reload `ldr x20, [x19, #0]` because either op
+    // can invalidate the cached base.
+    //
+    // X21–X28 are AAPCS64 callee-saved and appended after the caller-
     // saved block. They survive calls (no save around BL), trading one
     // extra STR/LDR pair per function per reg that the body allocates.
     pub const caller_saved_count: usize = 15;
     pub const scratch_regs = [_]emit.Reg{
         .x0,  .x1,  .x2,  .x3,  .x4,  .x5,  .x6,  .x7,
         .x8,  .x9,  .x10, .x11, .x12, .x13, .x14,
-        // Callee-saved (x19 is pinned to vmctx, not allocatable):
-        .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27,
-        .x28,
+        // Callee-saved (x19 is pinned to vmctx, x20 to memory_base; neither allocatable):
+        .x21, .x22, .x23, .x24, .x25, .x26, .x27, .x28,
     };
 
     /// Non-allocatable scratch registers usable by any handler.
@@ -82,12 +88,14 @@ const RegMap = struct {
             .entries = std.AutoHashMap(ir.VReg, Location).init(allocator),
             .spill_base = spill_base,
             .spill_capacity = spill_capacity,
-            // x19 is permanently pinned to vmctx (issue #465). Mark it
-            // as used in `used_callee_mask` (bit 0) so the prologue STR
-            // / epilogue LDR for x19 is never NOP-patched. The prologue
-            // STR happens BEFORE we clobber x19 with x0, so the
-            // caller's x19 is correctly preserved across our frame.
-            .used_callee_mask = 1,
+            // x19 (vmctx, issue #465) and x20 (memory_base, issue #466)
+            // are permanently pinned. Mark both as used in
+            // `used_callee_mask` (bits 0 and 1) so the prologue STR /
+            // epilogue LDR pair for each is never NOP-patched. The
+            // prologue STRs happen BEFORE we clobber x19/x20 with their
+            // pinned values, so each caller's value is correctly
+            // preserved across our frame.
+            .used_callee_mask = 0b11,
         };
     }
 
@@ -106,17 +114,23 @@ const RegMap = struct {
                 switch (a) {
                     .reg => |r| {
                         // `r` is the aarch64 register NUMBER (0..14 or
-                        // 20..28; x19 is excluded — pinned to vmctx).
+                        // 21..28; x19 is excluded — pinned to vmctx —
+                        // and x20 is excluded — pinned to memory_base).
                         // Find its index in `scratch_regs` to update
                         // `reg_used` / `used_callee_mask`. After
                         // skipping x15..x18 (4 non-allocatable) plus
-                        // x19 (pinned), reg_num N >= 20 maps to
-                        // scratch_regs index N - 5.
+                        // x19+x20 (pinned), reg_num N >= 21 maps to
+                        // scratch_regs index N - 6.
                         const reg_num: u32 = @intCast(r);
-                        const idx: usize = if (reg_num <= 14) reg_num else reg_num - 5;
+                        const idx: usize = if (reg_num <= 14) reg_num else reg_num - 6;
                         self.reg_used[idx] = true;
                         if (idx >= caller_saved_count) {
-                            self.used_callee_mask |= (@as(u16, 1) << @intCast(idx - caller_saved_count + 1));
+                            // scratch_regs callee-saved tail starts at
+                            // x21 (idx 15). callee_saved_regs (the array
+                            // used for prologue STR/LDR, still
+                            // [.x19..x28]) has x21 at index 2, so the
+                            // mask bit is (idx - caller_saved_count) + 2.
+                            self.used_callee_mask |= (@as(u16, 1) << @intCast(idx - caller_saved_count + 2));
                         }
                         const loc = Location{ .reg = scratch_regs[idx] };
                         try self.entries.put(vreg, loc);
@@ -142,11 +156,11 @@ const RegMap = struct {
             if (!self.reg_used[i]) {
                 self.reg_used[i] = true;
                 if (i >= caller_saved_count) {
-                    // scratch_regs callee-saved tail starts at x20 (x19
-                    // is pinned to vmctx). callee_saved_regs (used for
+                    // scratch_regs callee-saved tail starts at x21 (x19
+                    // and x20 are pinned). callee_saved_regs (used for
                     // prologue STR/LDR) still starts at x19 at bit 0,
-                    // so x20 occupies bit 1.
-                    self.used_callee_mask |= (@as(u16, 1) << @intCast(i - caller_saved_count + 1));
+                    // so x21 occupies bit 2.
+                    self.used_callee_mask |= (@as(u16, 1) << @intCast(i - caller_saved_count + 2));
                 }
                 const loc = Location{ .reg = r };
                 try self.entries.put(vreg, loc);
@@ -1370,6 +1384,15 @@ pub fn compileFunctionImpl(
     // a `mov Xd, x19` (or a `mov x0, x19` when staging arg0 for a
     // helper / cross-function call).
     try code.movRegReg(.x19, .x0);
+
+    // Pin VmCtx.memory_base in callee-saved x20 for the whole function
+    // body (issue #466). The preceding callee-save STR preserved the
+    // caller's x20, and `RegMap.init` forces x20's bit in
+    // `used_callee_mask`. Every linear-memory access reads `x20`
+    // directly instead of rematerialising via
+    // `mov tmp, x19; ldr tmp, [tmp]`. `memory.grow` and every wasm
+    // call emit `ldr x20, [x19, #0]` afterward to refresh the base.
+    try code.ldrImm(.x20, .x19, 0);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
     try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, hrp_save_off, frame_size, allocator);
@@ -5671,6 +5694,14 @@ fn emitCall(
     }
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
+    // Refresh the pinned memory_base in x20 (issue #466). The callee
+    // may have invoked `memory.grow`, which reallocs the wasm linear
+    // memory and updates `[vmctx + 0]`. The callee's callee-save
+    // discipline restored *our* (pre-call) x20 in its epilogue, so the
+    // value we hold is stale; reload from the now-current
+    // `[vmctx + 0]`.
+    try code.ldrImm(.x20, .x19, 0);
+
     // Commit result (in x0 or q0) to dest's location BEFORE restoring saved regs,
     // so restoration can't clobber the result holder (dest.reg is always a
     // reg that was FREE at snapshot time — i.e. not in `used_snapshot`).
@@ -5741,9 +5772,9 @@ fn emitMemAddrImpl(
             try code.addRegReg(RegMap.tmp1, RegMap.tmp1, RegMap.tmp2);
         }
 
-        // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1).
-        try code.movRegReg(RegMap.tmp0, .x19);
-        try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 1);
+        // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1)
+        // directly from the pinned vmctx in x19.
+        try code.ldrImm(RegMap.tmp0, .x19, vmctx_memsize_slot);
 
         // Step 4: cmp end, mem_size; B.LS over_trap.
         try code.cmpRegReg(RegMap.tmp1, RegMap.tmp0);
@@ -5768,14 +5799,10 @@ fn emitMemAddrImpl(
         code.patch32(over_patch, new_word);
     }
 
-    // Step 5: load mem_base into tmp0.
-    try code.movRegReg(RegMap.tmp0, .x19);
-    try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
+    // Step 5: ea = mem_base (pinned x20, issue #466) + zext(wasm_addr).
+    try code.addRegReg(RegMap.tmp0, .x20, RegMap.tmp2);
 
-    // Step 6: tmp0 = mem_base + zext(wasm_addr).
-    try code.addRegReg(RegMap.tmp0, RegMap.tmp0, RegMap.tmp2);
-
-    // Step 7: fold constant offset.
+    // Step 6: fold constant offset.
     if (offset != 0) {
         if (offset <= 0xFFF) {
             try code.addImm(RegMap.tmp0, RegMap.tmp0, @intCast(offset));
@@ -5954,6 +5981,10 @@ fn emitMemoryGrow(
 ) !void {
     const args = [_]ir.VReg{pages_vreg};
     try emitVmctxHelperCall(code, &args, vmctx_mem_grow_fn_slot, reg_map, fctx, inst.dest);
+    // mem_grow_fn may realloc the wasm linear memory and invalidate the
+    // pinned memory_base in x20 (issue #466). Refresh from
+    // [vmctx + 0] now so subsequent memory accesses see the new base.
+    try code.ldrImm(.x20, .x19, 0);
 }
 
 fn emitMemoryFill(
@@ -6375,6 +6406,11 @@ fn emitCallIndirect(
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
+    // Refresh pinned memory_base in x20 (issue #466) — the called
+    // function may have invoked `memory.grow`; see emitCall for
+    // rationale.
+    try code.ldrImm(.x20, .x19, 0);
+
     try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
     for (used_snapshot, 0..) |used, i| {
@@ -6455,6 +6491,11 @@ fn emitCallRef(
     try code.movRegReg(.x0, .x19);
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
+
+    // Refresh pinned memory_base in x20 (issue #466) — the called
+    // function may have invoked `memory.grow`; see emitCall for
+    // rationale.
+    try code.ldrImm(.x20, .x19, 0);
 
     try emitCapturePrimaryCallResult(code, inst, reg_map, v128_map, v128_cache);
 
@@ -7471,13 +7512,14 @@ pub fn compileModuleWithOptions(
 /// Allocatable aarch64 GPRs, in stable index order used by clobber masks.
 ///
 /// Indices 0..14 map to x0..x14 (AAPCS64 caller-saved; x15 is reserved as
-/// a non-allocatable scratch `RegMap.tmp2`). Indices 15..23 map to
-/// x20..x28 (callee-saved). x16/x17 are `RegMap.tmp0/tmp1`, x18 is the
-/// platform register, x19 is pinned to `vmctx` for the function body
-/// (issue #465), x29/x30 are FP/LR, and x31 is SP — all excluded.
+/// a non-allocatable scratch `RegMap.tmp2`). Indices 15..22 map to
+/// x21..x28 (callee-saved). x16/x17 are `RegMap.tmp0/tmp1`, x18 is the
+/// platform register, x19 is pinned to `vmctx` (issue #465), x20 is
+/// pinned to `memory_base` (issue #466), x29/x30 are FP/LR, and x31 is
+/// SP — all excluded.
 pub const aarch64_alloc_regs = [_]regalloc.PhysReg{
     0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,
-    20, 21, 22, 23, 24, 25, 26, 27, 28,
+    21, 22, 23, 24, 25, 26, 27, 28,
 };
 
 /// Indices into `aarch64_alloc_regs` of AAPCS64 caller-saved registers
@@ -7488,11 +7530,12 @@ pub const aarch64_caller_saved_indices = [_]u8{
 };
 
 /// Indices into `aarch64_alloc_regs` of AAPCS64 callee-saved registers
-/// (x20..x28). Preferred for live ranges that span a call, since they
-/// survive without save/restore. x19 is excluded — it is permanently
-/// pinned to `vmctx` for the whole function body (issue #465).
+/// (x21..x28). Preferred for live ranges that span a call, since they
+/// survive without save/restore. x19 is excluded — pinned to `vmctx`
+/// (issue #465). x20 is excluded — pinned to `memory_base` (issue
+/// #466).
 pub const aarch64_callee_saved_indices = [_]u8{
-    15, 16, 17, 18, 19, 20, 21, 22, 23,
+    15, 16, 17, 18, 19, 20, 21, 22,
 };
 
 /// Bitmask over `aarch64_alloc_regs` of registers destroyed by any
@@ -7687,9 +7730,10 @@ fn addCallArgScalarHints(
 }
 
 /// Emit a single `Hint` for `vreg` targeting AAPCS64 register `xN` if
-/// `xN` is allocatable in `aarch64_alloc_regs`. x0..x14 are; x15..x18
-/// and x19 (pinned to vmctx, issue #465) are not. The callee-saved
-/// x20..x28 are reachable but not used for ABI-fixed call-arg slots.
+/// `xN` is allocatable in `aarch64_alloc_regs`. x0..x14 are; x15..x18,
+/// x19 (pinned to vmctx, issue #465) and x20 (pinned to memory_base,
+/// issue #466) are not. The callee-saved x21..x28 are reachable but
+/// not used for ABI-fixed call-arg slots.
 fn appendArgRegHint(
     list: *std.ArrayList(regalloc.Hint),
     allocator: std.mem.Allocator,
@@ -8100,6 +8144,52 @@ test "compileFunction: memory.grow compiles" {
     const code = try compileFunction(&func, allocator);
     defer allocator.free(code);
     try std.testing.expect(code.len > 0);
+}
+
+test "compileFunction: memory.grow refreshes pinned x20 (issue #466)" {
+    // The helper call to mem_grow_fn can realloc the linear memory and
+    // invalidate x20's cached `[vmctx + 0]`. Codegen must emit a fresh
+    // LDR x20, [x19, #0] right after the grow call's BLR returns.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .memory_grow = v0 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .ret = v1 } });
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
+    defer allocator.free(code);
+
+    // BLR x16 (the indirect call through vmctx.mem_grow_fn) encodes as
+    //   1101011000111111000000 | Rn=10000 | 00000  → 0xD63F0200.
+    const blr_x16: u32 = 0xD63F0200;
+    var blr_off: ?usize = null;
+    var i: usize = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if (w == blr_x16) {
+            blr_off = i;
+            // Don't break; we want the LAST blr — the mem_grow call
+            // happens after any earlier setup BLRs.
+        }
+    }
+    try std.testing.expect(blr_off != null);
+
+    // After the BLR, scan for LDR x20, [x19, #0]:
+    //   0xF9400000 | (imm12=0 << 10) | (Rn=19 << 5) | Rt=20 = 0xF9400274
+    const ldr_x20: u32 = 0xF9400274;
+    var saw_reload = false;
+    var j: usize = blr_off.? + 4;
+    while (j + 4 <= code.len) : (j += 4) {
+        const w = std.mem.readInt(u32, code[j..][0..4], .little);
+        if (w == ldr_x20) {
+            saw_reload = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_reload);
 }
 
 test "compileModule: records offsets" {
@@ -11797,10 +11887,11 @@ test "compile: br_if with two blocks" {
 
 // ── Phase 1b: VMContext ABI + locals tests ───────────────────────────────────
 
-test "compile: entry pins vmctx in x19 (issue #465)" {
+test "compile: entry pins vmctx in x19 and memory_base in x20 (issues #465 / #466)" {
     // Function with no params, no locals: prologue must copy x0 → x19
-    // after the 10 callee-save STRs (vmctx is pinned in x19 for the
-    // whole function body).
+    // and load `[x19 + 0]` → x20 after the 10 callee-save STRs
+    // (vmctx pinned in x19, memory_base pinned in x20 for the whole
+    // function body).
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -11811,11 +11902,17 @@ test "compile: entry pins vmctx in x19 (issue #465)" {
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
     // Layout: prologue (STP + ADD fp,sp,0 = 8 bytes), then 10 callee-save
-    // STRs for x19..x28 (40 bytes), then MOV x19, x0 (= ORR x19, xzr, x0).
-    //   encoding: 0xAA000000 | (rm=0 << 16) | (rn=31 << 5) | rd=19
+    // STRs for x19..x28 (40 bytes), then MOV x19, x0 (= ORR x19, xzr, x0),
+    // then LDR x20, [x19, #0] (memory_base pin).
+    //   MOV encoding: 0xAA000000 | (rm=0 << 16) | (rn=31 << 5) | rd=19
     //   = 0xAA000000 | 0x3E0 | 0x13 = 0xAA0003F3
     const mov_word = std.mem.readInt(u32, code[48..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xAA0003F3), mov_word);
+    //   LDR encoding (LDR Xt, [Xn, #imm12*8]):
+    //     0xF9400000 | (imm12=0 << 10) | (rn=19 << 5) | rt=20
+    //     = 0xF9400000 | 0x260 | 0x14 = 0xF9400274
+    const ldr_word = std.mem.readInt(u32, code[52..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0xF9400274), ldr_word);
 }
 
 test "compile: param spill — STR x1 into first local slot" {
@@ -11829,17 +11926,17 @@ test "compile: param spill — STR x1 into first local slot" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
-    // Layout: STP, ADD fp,sp,0, 10× callee-save STRs (40 bytes), STR x0
-    // vmctx, STR x1 local0.
+    // Layout: STP, ADD fp,sp,0, 10× callee-save STRs (40 bytes), MOV x19, x0
+    // (#465 vmctx pin), LDR x20, [x19, #0] (#466 memory_base pin), STR x1 local0.
     //   STR x1, [fp, #24]: rt=1, rn=29, imm12=3
     //   = 0xF9000000 | (3<<10) | (29<<5) | 1 = 0xF9000FA1
-    const str_param = std.mem.readInt(u32, code[52..][0..4], .little);
+    const str_param = std.mem.readInt(u32, code[56..][0..4], .little);
     try std.testing.expectEqual(@as(u32, 0xF9000FA1), str_param);
 }
 
 test "compile: zero-init of declared local (beyond params)" {
-    // 0 params, 2 locals. After spilling x0 (vmctx), we MOVZ x16,#0 then
-    // STR x16 to both local slots.
+    // 0 params, 2 locals. After pinning vmctx + memory_base, we MOVZ x16,#0
+    // then STR x16 to both local slots.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 2);
     defer func.deinit();
@@ -11855,14 +11952,17 @@ test "compile: zero-init of declared local (beyond params)" {
     //   [0]   STP FP, LR, [SP, #-frame_size]!
     //   [4]   MOV FP, SP
     //   [8]..[44] 10× callee-save STR (40 bytes)
-    //   [48]  STR x0 vmctx, [52] MOVZ x16, [56]/[60] STR x16 → locals.
-    const movz_word = std.mem.readInt(u32, code[52..][0..4], .little);
+    //   [48]  MOV x19, x0 (#465 vmctx pin)
+    //   [52]  LDR x20, [x19, #0] (#466 memory_base pin)
+    //   [56]  MOVZ x16, #0
+    //   [60]/[64]  STR x16 → locals
+    const movz_word = std.mem.readInt(u32, code[56..][0..4], .little);
     // MOVZ X16, #0, LSL #0 = 0xD2800000 | (0<<5) | 16 = 0xD2800010
     try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
-    const str0 = std.mem.readInt(u32, code[56..][0..4], .little);
+    const str0 = std.mem.readInt(u32, code[60..][0..4], .little);
     // STR x16, [fp, #24]: rt=16, rn=29, imm12=3 → 0xF9000000|(3<<10)|(29<<5)|16
     try std.testing.expectEqual(@as(u32, 0xF9000FB0), str0);
-    const str1 = std.mem.readInt(u32, code[60..][0..4], .little);
+    const str1 = std.mem.readInt(u32, code[64..][0..4], .little);
     // STR x16, [fp, #32]: imm12=4 → 0xF9000000|(4<<10)|(29<<5)|16
     try std.testing.expectEqual(@as(u32, 0xF90013B0), str1);
 }
@@ -12743,11 +12843,12 @@ test "collectClobberPoints: positions are monotonic across blocks" {
 
 test "aarch64RegSet: sane layout for a tiny function" {
     const rs = aarch64RegSet(0);
-    // 24 allocatable GPRs, 15 caller-saved + 9 callee-saved (x19 is
-    // pinned to vmctx per issue #465 and not in the allocator pool).
-    try std.testing.expectEqual(@as(usize, 24), rs.alloc_regs.len);
+    // 23 allocatable GPRs, 15 caller-saved + 8 callee-saved (x19 is
+    // pinned to vmctx per issue #465 and x20 is pinned to memory_base
+    // per issue #466; neither is in the allocator pool).
+    try std.testing.expectEqual(@as(usize, 23), rs.alloc_regs.len);
     try std.testing.expectEqual(@as(usize, 15), rs.caller_saved_indices.len);
-    try std.testing.expectEqual(@as(usize, 9), rs.callee_saved_indices.len);
+    try std.testing.expectEqual(@as(usize, 8), rs.callee_saved_indices.len);
     // Spill stride grows upward (away from fp).
     try std.testing.expect(rs.spill_stride > 0);
     // Spills live above the locals area (saved fp/lr + vmctx + locals = 24 bytes min).
