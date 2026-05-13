@@ -5602,6 +5602,15 @@ pub const default_passes: []const PassFn = &.{
 
 
 /// Default optimization pipeline for x86-64.
+///
+/// Note: `inductionVariableSimplification` and `unrollSmallFixedLoops`
+/// are intentionally omitted here pending a cost-model fix for issue
+/// #385. PR #413's own table reported x86_64 −2.45% on CoreMark (vs
+/// aarch64 −0.24%), confirmed in the #393 audit
+/// (https://github.com/cataggar/wamr/issues/393#issuecomment-4423326059)
+/// as "the cost model is still picking wrong loops". The aarch64
+/// pipeline keeps both passes for now — issue #385 tracks the
+/// cost-model rework that should let x86_64 re-enable them safely.
 const x86_64_default_passes: []const PassFn = &.{
     &forwardLocalGet,
     &constantFold,
@@ -5619,9 +5628,7 @@ const x86_64_default_passes: []const PassFn = &.{
     &foldFloatUnaryIdempotents,
     &foldWrapOfExtend,
     &globalValueNumbering,
-    &inductionVariableSimplification,
     &hoistLoopInvariantCode,
-    &unrollSmallFixedLoops,
     &@import("forward_redundant_loads.zig").forwardRedundantLoads,
     &deadStoreElimination,
     &deadCodeElimination,
