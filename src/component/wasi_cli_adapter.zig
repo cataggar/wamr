@@ -9697,6 +9697,11 @@ pub const ServeHttpOptions = struct {
     listen_address: std.Io.net.IpAddress,
     /// Null means serve forever. Tests can set a finite count.
     max_requests: ?usize = null,
+    /// If true, write a `Listening on <ip:port>\n` line to stdout after
+    /// the socket is bound — useful for ephemeral-port (`:0`) flows where
+    /// the caller can't know the resolved port in advance. The driver
+    /// scrapes this line to discover where to connect.
+    announce_listening: bool = false,
 };
 
 pub fn serveHttpComponentBytes(
@@ -9734,11 +9739,29 @@ pub fn serveLoadedHttpComponent(
     defer allocator.free(handler_name);
 
     const io = std.Io.Threaded.global_single_threaded.io();
+    // Exclusive bind: leave `reuse_address` at its `false` default so a
+    // second wamr started on the same port fails with `AddressInUse`
+    // rather than silently joining a SO_REUSEPORT pool (stdlib's
+    // `reuse_address` flag sets both SO_REUSEADDR *and* SO_REUSEPORT on
+    // POSIX). The kernel briefly holds the port in TIME_WAIT for a few
+    // seconds after a clean shutdown; that's the intended trade-off.
     var server = std.Io.net.IpAddress.listen(&options.listen_address, io, .{
         .kernel_backlog = 128,
-        .reuse_address = true,
-    }) catch return error.ListenFailed;
+    }) catch |err| switch (err) {
+        error.AddressInUse => return error.AddressInUse,
+        else => return error.ListenFailed,
+    };
     defer server.deinit(io);
+
+    if (options.announce_listening) {
+        // `server.socket.address` carries the kernel-resolved port
+        // (matches what `getsockname(2)` would report). Print it to
+        // stdout so a parent test driver can scrape the ephemeral port.
+        var stdout_file = std.Io.File.stdout();
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "Listening on {f}\n", .{server.socket.address}) catch buf[0..0];
+        stdout_file.writeStreamingAll(io, line) catch {};
+    }
 
     var served: usize = 0;
     while (options.max_requests == null or served < options.max_requests.?) {
