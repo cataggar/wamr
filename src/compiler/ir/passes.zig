@@ -2462,6 +2462,15 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
 /// Wasm locals are function-private, so calls cannot mutate them and
 /// `local_get` only needs `local_set` exclusion.
 ///
+/// Trapping wasm loads (`load`, `v128_load*`) are speculatively hoisted
+/// when (a) the loop body contains no memory-mutating op or call, and
+/// (b) the load lives in the loop header. Condition (b) guarantees the
+/// load executes on every loop entry (since the header runs on every
+/// entry and each block has exactly one terminator at its tail, so any
+/// load in the header precedes the exit check), making the hoist
+/// trap-equivalent: the hoisted load traps in the preheader at the same
+/// input the original would have on iteration 1.
+///
 /// When the loop lacks a dedicated `.br`-terminated preheader (either no
 /// preheader at all, or a `br_if` / `br_table` entry, or multiple
 /// non-loop predecessors), a preheader is synthesized in-place by
@@ -2497,22 +2506,38 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
         const ph = (try obtainLoopPreheader(func, loop, &predecessors, &dom, allocator)) orelse continue;
 
         // One-shot scan of the loop body: which wasm-local / wasm-global
-        // indices are written, and does the body contain any call?
+        // indices are written, and does the body contain any call or
+        // memory-mutating op?
         var set_locals = std.AutoHashMap(u32, void).init(allocator);
         defer set_locals.deinit();
         var set_globals = std.AutoHashMap(u32, void).init(allocator);
         defer set_globals.deinit();
         var loop_has_call = false;
+        var loop_has_memory_write = false;
         for (loop.blocks) |bid| {
             for (func.blocks.items[bid].instructions.items) |inst| {
                 switch (inst.op) {
                     .local_set => |ls| try set_locals.put(ls.idx, {}),
                     .global_set => |gs| try set_globals.put(gs.idx, {}),
                     .call, .call_indirect, .call_ref => loop_has_call = true,
+                    .store,
+                    .v128_store,
+                    .v128_store_lane,
+                    .memory_copy,
+                    .memory_fill,
+                    .memory_init,
+                    .memory_grow,
+                    .atomic_store,
+                    .atomic_rmw,
+                    .atomic_cmpxchg,
+                    .atomic_notify,
+                    .atomic_wait,
+                    => loop_has_memory_write = true,
                     else => {},
                 }
             }
         }
+        const loop_can_hoist_load = !loop_has_call and !loop_has_memory_write;
 
         var any = true;
         while (any) {
@@ -2534,7 +2559,30 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
                         .global_get => |idx| !loop_has_call and !set_globals.contains(idx),
                         else => false,
                     };
-                    const eligible_by_kind = is_invariant_local_get or is_invariant_global_get or
+                    // Speculative load hoisting (Stage C). A trapping
+                    // load is safe to hoist iff:
+                    //  (a) the loop body has no memory-mutating op and
+                    //      no call (else the load could observe a
+                    //      different value across iterations);
+                    //  (b) the load's containing block is the loop
+                    //      header. The header is reached on every loop
+                    //      entry, and any load in it precedes the
+                    //      header's terminator (each block has exactly
+                    //      one terminator at its tail), so the load
+                    //      runs on every iteration the loop is entered
+                    //      — including the 0-iter early-exit path.
+                    //      Hoisting then preserves the trap point.
+                    const is_speculative_load = loop_can_hoist_load and bid == loop.header and switch (inst.op) {
+                        .load,
+                        .v128_load,
+                        .v128_load_splat,
+                        .v128_load_zero,
+                        .v128_load_extend,
+                        .v128_load_lane,
+                        => true,
+                        else => false,
+                    };
+                    const eligible_by_kind = is_invariant_local_get or is_invariant_global_get or is_speculative_load or
                         (inst.dest != null and isPure(inst) and !hasSideEffect(inst));
                     if (!eligible_by_kind) {
                         i += 1;
@@ -7639,6 +7687,199 @@ test "hoistLoopInvariantCode: existing dedicated preheader not duplicated" {
     try std.testing.expect(changed);
     // No new block needed when an existing clean preheader is present.
     try std.testing.expect(func.blocks.items.len == blocks_before);
+}
+
+test "hoistLoopInvariantCode: load in header hoisted when no memory writes or calls in loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 256 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // Header has a load whose base is loop-invariant; no memory writes
+    // and no calls in the loop body.
+    const v_loaded = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_loaded }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_loaded } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+
+    var ph_has_load = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .load) {
+            ph_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(ph_has_load);
+
+    var body_has_load = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .load) {
+            body_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(!body_has_load);
+}
+
+test "hoistLoopInvariantCode: load NOT hoisted when loop contains a store" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_zero = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 256 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_zero, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_loaded = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_zero } } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_loaded }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_loaded } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var body_has_load = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .load) {
+            body_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(body_has_load);
+}
+
+test "hoistLoopInvariantCode: load NOT hoisted when loop contains a call" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_base = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 256 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v_loaded = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_loaded }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_loaded } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var body_has_load = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .load) {
+            body_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(body_has_load);
+}
+
+test "hoistLoopInvariantCode: load NOT hoisted when load lives outside the loop header" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b_pre = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_body = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_base = func.newVReg();
+    try func.getBlock(b_pre).append(.{ .op = .{ .iconst_32 = 256 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b_pre).append(.{ .op = .{ .br = b_header } });
+
+    // Header branches conditionally to body or exit. The load lives in
+    // body, NOT in the header — so on a 0-iter exit the load would not
+    // run. Stage C must keep the load in body to preserve trap point.
+    const v_gate = func.newVReg();
+    try func.getBlock(b_header).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_gate, .type = .i32 });
+    try func.getBlock(b_header).append(.{ .op = .{ .br_if = .{ .cond = v_gate, .then_block = b_body, .else_block = b_exit } } });
+
+    const v_loaded = func.newVReg();
+    try func.getBlock(b_body).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b_body).append(.{ .op = .{ .br = b_header } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_base } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var body_has_load = false;
+    for (func.getBlock(b_body).instructions.items) |inst| {
+        if (inst.op == .load) {
+            body_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(body_has_load);
+
+    var ph_has_load = false;
+    for (func.getBlock(b_pre).instructions.items) |inst| {
+        if (inst.op == .load) {
+            ph_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(!ph_has_load);
+}
+
+test "hoistLoopInvariantCode: load NOT hoisted when base operand is loop-variant" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // Base is local_get of an idx that IS updated in the loop, so the
+    // base VReg is loop-variant.
+    const v_base = func.newVReg();
+    const v_loaded = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_base, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_loaded }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_loaded } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var body_has_load = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .load) {
+            body_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(body_has_load);
 }
 
 test "inductionVariableSimplification: single induction address is strength reduced" {
