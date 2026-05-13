@@ -512,7 +512,7 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
         .u64 => try env.pushI64(@bitCast(val.u64)),
         .f32 => try env.push(.{ .f32 = @bitCast(val.f32) }),
         .f64 => try env.push(.{ .f64 = @bitCast(val.f64) }),
-        .own, .borrow => try env.pushI32(@bitCast(val.handle)),
+        .own, .borrow, .future, .stream, .error_context => try env.pushI32(@bitCast(val.handle)),
         .string => {
             try env.pushI32(@bitCast(val.string.ptr));
             try env.pushI32(@bitCast(val.string.len));
@@ -621,7 +621,7 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
                 else => 0,
             } };
         },
-        .own, .borrow => .{ .handle = @bitCast(try env.popI32()) },
+        .own, .borrow, .future, .stream, .error_context => .{ .handle = @bitCast(try env.popI32()) },
         .string => .{ .string = .{
             .len = @bitCast(try env.popI32()),
             .ptr = @bitCast(try env.popI32()),
@@ -904,7 +904,156 @@ pub fn dispatchCanonBuiltin(
             }
             async_canon.asyncReturn(tm, handle, flat);
         },
+        .async_canon => |op| try dispatchAsyncCanon(comp_inst, op, env, task_manager, allocator),
         .lift, .lower => {}, // Handled by callComponentFunc
+    }
+}
+
+/// Dispatch the WASIp3 async-canon surface (#478 sub-PR 3): subtask /
+/// future / stream / error-context / waitable-set / waitable.join.
+///
+/// **Scope**: this is the minimum dispatch needed for the conformance
+/// suite to stop failing at load. Every `.new`-flavoured op allocates
+/// a per-instance handle; every `.drop` releases it. The read / write /
+/// cancel-* ops trap with `error.FunctionNotFound` — they require
+/// real fiber-based scheduling integration that lands as a follow-up.
+fn dispatchAsyncCanon(
+    comp_inst: *ComponentInstance,
+    op: ctypes.AsyncCanonOp,
+    env: *ExecEnv,
+    task_manager: ?*async_mod.TaskManager,
+    allocator: Allocator,
+) ExecutionError!void {
+    switch (op) {
+        .subtask_drop => {
+            // Pop the subtask handle. We simply discard — the task's
+            // memory belongs to the TaskManager whose lifetime exceeds
+            // any single subtask.drop call.
+            _ = env.popI32() catch return error.StackUnderflow;
+        },
+        .subtask_cancel => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            if (task_manager) |tm| tm.cancelTask(handle);
+            // `async?` info is ignored: cancellation is idempotent and
+            // synchronous in the single-threaded runtime.
+        },
+
+        // ── Stream handles ──────────────────────────────────────────────
+        .stream_new => |info| {
+            _ = info;
+            const handle = comp_inst.allocAsyncHandle();
+            comp_inst.streams.put(comp_inst.allocator, handle, .{}) catch return error.OutOfMemory;
+            // Spec packs read+write handles into one i64; in our
+            // single-handle prototype we publish the same idx for both
+            // ends to keep the wire format compatible with i64 pops.
+            const packed_handles: u64 = (@as(u64, handle) << 32) | @as(u64, handle);
+            env.pushI64(@bitCast(packed_handles)) catch return error.StackOverflow;
+        },
+        .stream_drop_readable => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            if (comp_inst.streams.fetchRemove(handle)) |kv| {
+                var s = kv.value;
+                s.deinit(comp_inst.allocator);
+            }
+        },
+        .stream_drop_writable => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            if (comp_inst.streams.fetchRemove(handle)) |kv| {
+                var s = kv.value;
+                s.deinit(comp_inst.allocator);
+            }
+        },
+        .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write => return error.FunctionNotFound,
+
+        // ── Future handles ──────────────────────────────────────────────
+        .future_new => |info| {
+            _ = info;
+            const handle = comp_inst.allocAsyncHandle();
+            comp_inst.futures.put(comp_inst.allocator, handle, .{}) catch return error.OutOfMemory;
+            const packed_handles: u64 = (@as(u64, handle) << 32) | @as(u64, handle);
+            env.pushI64(@bitCast(packed_handles)) catch return error.StackOverflow;
+        },
+        .future_drop_readable => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            _ = comp_inst.futures.remove(handle);
+        },
+        .future_drop_writable => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            _ = comp_inst.futures.remove(handle);
+        },
+        .future_read, .future_write, .future_cancel_read, .future_cancel_write => return error.FunctionNotFound,
+
+        // ── error-context ───────────────────────────────────────────────
+        .error_context_new => |info| {
+            _ = info;
+            // Per spec: pops (ptr, len) for the debug-message string and
+            // returns a new error-context handle. We don't yet eagerly
+            // copy the message from guest memory — that requires
+            // memory/realloc options threading. Store an empty string;
+            // `debug-message` returns it as-is.
+            _ = env.popI32() catch return error.StackUnderflow; // len
+            _ = env.popI32() catch return error.StackUnderflow; // ptr
+            const handle = comp_inst.allocAsyncHandle();
+            const empty = allocator.alloc(u8, 0) catch return error.OutOfMemory;
+            comp_inst.error_contexts.put(comp_inst.allocator, handle, empty) catch {
+                allocator.free(empty);
+                return error.OutOfMemory;
+            };
+            env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
+        },
+        .error_context_debug_message => |info| {
+            _ = info;
+            // Pops error-context handle + (ptr, length) of the
+            // caller-allocated buffer; writes the debug message into
+            // guest memory. We don't yet bridge into guest memory, so
+            // pop and no-op for now.
+            _ = env.popI32() catch return error.StackUnderflow;
+            _ = env.popI32() catch return error.StackUnderflow;
+            _ = env.popI32() catch return error.StackUnderflow;
+        },
+        .error_context_drop => {
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            if (comp_inst.error_contexts.fetchRemove(handle)) |kv| {
+                comp_inst.allocator.free(kv.value);
+            }
+        },
+
+        // ── Waitable-set ────────────────────────────────────────────────
+        .waitable_set_new => {
+            const handle = comp_inst.allocAsyncHandle();
+            comp_inst.waitable_sets.put(comp_inst.allocator, handle, .{}) catch return error.OutOfMemory;
+            env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
+        },
+        .waitable_set_drop => {
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            if (comp_inst.waitable_sets.fetchRemove(handle)) |kv| {
+                var ws = kv.value;
+                ws.deinit(comp_inst.allocator);
+            }
+        },
+        .waitable_set_wait, .waitable_set_poll => {
+            // wait/poll expect a (ws_handle, out_ptr) and write a 2-tuple
+            // (event-kind, payload) into guest memory. Without
+            // guest-memory bridging we can't honour that contract — pop
+            // arguments and push a zero status to keep the core stack
+            // balanced for the conformance "load + don't crash" target.
+            _ = env.popI32() catch return error.StackUnderflow; // ws handle
+            _ = env.popI32() catch return error.StackUnderflow; // out ptr
+            env.pushI32(0) catch return error.StackOverflow;
+        },
+
+        .waitable_join => {
+            // Pops (waitable_handle, ws_handle). We simply drop both —
+            // the join becomes a no-op until real WaitableItem-typed
+            // registration lands alongside the read/write canon ops.
+            _ = env.popI32() catch return error.StackUnderflow;
+            _ = env.popI32() catch return error.StackUnderflow;
+        },
     }
 }
 
@@ -1582,6 +1731,174 @@ test "dispatchCanonBuiltin: task.return without a task manager is malformed" {
     const result = dispatchCanonBuiltin(
         inst,
         .{ .task_return = .{ .results = .none, .opts = &.{} } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectError(error.FunctionNotFound, result);
+}
+
+// ── Sub-PR 3: async_canon smoke tests ────────────────────────────────────────
+
+test "dispatchCanonBuiltin: waitable-set.new allocates a fresh handle; drop frees it" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_set_new },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @bitCast(try env.popI32());
+    try testing.expect(handle > 0);
+    try testing.expectEqual(@as(u32, 1), inst.waitable_sets.count());
+
+    // Drop releases it from the table.
+    try env.pushI32(@bitCast(handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_set_drop },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 0), inst.waitable_sets.count());
+}
+
+test "dispatchCanonBuiltin: future.new + drop-readable round-trip" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    // future.new pushes i64 packed handle pair — pop and unpack.
+    const packed_handles: u64 = @bitCast(try env.popI64());
+    const r_idx: u32 = @truncate(packed_handles >> 32);
+    const w_idx: u32 = @truncate(packed_handles & 0xFFFF_FFFF);
+    try testing.expectEqual(r_idx, w_idx); // sub-PR 3 stub uses the same idx for both ends
+    try testing.expect(r_idx > 0);
+    try testing.expectEqual(@as(u32, 1), inst.futures.count());
+
+    try env.pushI32(@bitCast(r_idx));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_drop_readable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 0), inst.futures.count());
+}
+
+test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    // error-context.new pops (ptr, len) for the debug-message — push
+    // synthetic values; the sub-PR 3 stub doesn't actually read from
+    // guest memory yet.
+    try env.pushI32(0); // ptr
+    try env.pushI32(0); // len
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .error_context_new = .{ .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @bitCast(try env.popI32());
+    try testing.expect(handle > 0);
+    try testing.expectEqual(@as(u32, 1), inst.error_contexts.count());
+
+    try env.pushI32(@bitCast(handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .error_context_drop },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 0), inst.error_contexts.count());
+}
+
+test "dispatchCanonBuiltin: stream.read traps with FunctionNotFound (sub-PR 3 scope)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const result = dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
         env,
         null,
         testing.allocator,

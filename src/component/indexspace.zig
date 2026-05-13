@@ -253,6 +253,11 @@ pub const CoreFuncRef = union(enum) {
     context_set: u32,
     /// Index into `component.canons` for a `.task_return` entry. (#478)
     task_return: u32,
+    /// Index into `component.canons` for a `.async_canon` entry —
+    /// covers the broader WASIp3 async surface (subtask / future /
+    /// stream / error-context / waitable-set). The inner
+    /// `AsyncCanonOp` tag is the actual semantic discriminator. (#478)
+    async_canon: u32,
     /// Index into `component.aliases`.
     aliased: u32,
 };
@@ -276,6 +281,7 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
                 .context_get => .{ .context_get = canon_idx },
                 .context_set => .{ .context_set = canon_idx },
                 .task_return => .{ .task_return = canon_idx },
+                .async_canon => .{ .async_canon = canon_idx },
                 .lift => null, // lift never contributes to core-func indexspace
             },
         };
@@ -315,6 +321,10 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
             },
             .task_return => {
                 if (n == idx) return .{ .task_return = @intCast(i) };
+                n += 1;
+            },
+            .async_canon => {
+                if (n == idx) return .{ .async_canon = @intCast(i) };
                 n += 1;
             },
             .lift => {},
@@ -730,6 +740,10 @@ test "resolveCoreFunc: async ABI built-ins contribute core-func slots" {
         .{ .context_get = .{ .val_type = .i32, .slot = 0 } },
         .{ .context_set = .{ .val_type = .i32, .slot = 0 } },
         .{ .task_return = .{ .results = .none, .opts = &.{} } },
+        .{ .async_canon = .subtask_drop },
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        .{ .async_canon = .waitable_set_new },
     };
     const comp = ctypes.Component{
         .core_modules = &.{},
@@ -748,7 +762,11 @@ test "resolveCoreFunc: async ABI built-ins contribute core-func slots" {
     try testing.expect(resolveCoreFunc(&comp, 2).? == .context_get);
     try testing.expect(resolveCoreFunc(&comp, 3).? == .context_set);
     try testing.expect(resolveCoreFunc(&comp, 4).? == .task_return);
-    try testing.expect(resolveCoreFunc(&comp, 5) == null);
+    try testing.expect(resolveCoreFunc(&comp, 5).? == .async_canon);
+    try testing.expect(resolveCoreFunc(&comp, 6).? == .async_canon);
+    try testing.expect(resolveCoreFunc(&comp, 7).? == .async_canon);
+    try testing.expect(resolveCoreFunc(&comp, 8).? == .async_canon);
+    try testing.expect(resolveCoreFunc(&comp, 9) == null);
 }
 
 test "lookupLocalInstanceMember: finds named export in inline-exports instance" {
