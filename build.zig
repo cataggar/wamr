@@ -626,10 +626,13 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Wires up the Component-Model example pipeline (sources under
-/// `examples/components/`). Two opt-in steps are exposed:
-///   * `zig build component-examples`     — build + validate all four
-///   * `zig build component-examples-run` — runs `zig-hello` through `wamr`
-/// Neither is reachable from `zig build` or `zig build test`.
+/// `examples/components/`). Three opt-in steps are exposed:
+///   * `zig build component-examples`               — build + validate all four
+///   * `zig build component-examples-run`           — run them through `./zig-out/bin/wamr`
+///   * `zig build component-examples-run-wasmtime`  — run them through
+///                                                    `wasmtime run -S cli-exit-with-code`
+///                                                    (cross-runtime parity gate; wasmtime v44+).
+/// None are reachable from `zig build` or `zig build test`.
 ///
 /// Pinned versions:
 ///   * `cataggar/wabt` ≥ v3.0.0-dev.6 on PATH (provides `component embed`,
@@ -644,8 +647,20 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     );
     const run_step = b.step(
         "component-examples-run",
-        "Run the runnable component examples (zig-hello) through ./zig-out/bin/wamr",
+        "Run the runnable component examples through ./zig-out/bin/wamr",
     );
+    // Cross-runtime parity step (cataggar/wamr#457): the same four
+    // fixtures + assertions, but run under `wasmtime run -S
+    // cli-exit-with-code` (v44+ required for the `@unstable`
+    // `wasi:cli/exit.exit-with-code` feature gate the wabt-bundled
+    // adapter lowers `proc_exit` through). Opt-in — failure mode
+    // when `wasmtime` is missing from PATH is a clear systemcommand
+    // error.
+    const run_step_wasmtime = b.step(
+        "component-examples-run-wasmtime",
+        "Run the runnable component examples through `wasmtime run -S cli-exit-with-code` for cross-runtime parity validation",
+    );
+    const runs: ComponentRunSteps = .{ .wamr = run_step, .wasmtime = run_step_wasmtime };
 
     // ── zig-hello ──────────────────────────────────────────────────
     // Pure-Zig WASI command: `_start` writes a greeting via fd_write.
@@ -661,18 +676,11 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     });
     installAndValidate(b, examples_step, hello, "zig-hello.component.wasm");
 
-    // The hello component is the only example that runs end-to-end on
-    // wamr today; wire it into `component-examples-run`. The wabt
-    // adapter lowers `fd_write(1, …)` through
+    // The wabt-bundled adapter lowers `fd_write(1, …)` through
     // `wasi:io/streams.blocking-write-and-flush` against
-    // `wasi:cli/stdout.get-stdout`, which wamr's
-    // `WasiCliAdapter` flushes to the host's actual stdout.
-    const run_hello = b.addRunArtifact(wamr_exe);
-    run_hello.addArg("run");
-    run_hello.addFileArg(hello);
-    run_hello.expectExitCode(0);
-    run_hello.expectStdOutEqual("hello from zig component\n");
-    run_step.dependOn(&run_hello.step);
+    // `wasi:cli/stdout.get-stdout`, which both runtimes flush to
+    // the host's actual stdout.
+    wireComponentRun(b, runs, wamr_exe, hello, "hello from zig component\n", 0);
 
     // ── zig-exit ───────────────────────────────────────────────────
     // Exercises the component exit-code path (issue #436): `_start`
@@ -693,12 +701,7 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     });
     installAndValidate(b, examples_step, exit_component, "zig-exit.component.wasm");
 
-    const run_exit = b.addRunArtifact(wamr_exe);
-    run_exit.addArg("run");
-    run_exit.addFileArg(exit_component);
-    run_exit.expectExitCode(7);
-    run_exit.expectStdOutEqual("exiting with code 7\n");
-    run_step.dependOn(&run_exit.step);
+    wireComponentRun(b, runs, wamr_exe, exit_component, "exiting with code 7\n", 7);
 
     // ── zig-adder ──────────────────────────────────────────────────
     // Library component (no `run`): exports `docs:adder/add@0.1.0`.
@@ -754,17 +757,11 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
 
     // Run the composed Zig calculator command. The wabt-bundled
     // wasi-preview1 adapter lowers `fd_write(1, …)` through
-    // `wasi:io/streams.blocking-write-and-flush`, which wamr's
-    // `WasiCliAdapter` flushes to the host's actual stdout. Issue
-    // #355 wired the alias chain + sub-component instantiation
-    // that this composed command needs to reach its `wasi:cli/run`
-    // export.
-    const run_calc = b.addRunArtifact(wamr_exe);
-    run_calc.addArg("run");
-    run_calc.addFileArg(calc_final);
-    run_calc.expectExitCode(0);
-    run_calc.expectStdOutEqual("40 + 2 = 42\n100 + 200 = 300\n");
-    run_step.dependOn(&run_calc.step);
+    // `wasi:io/streams.blocking-write-and-flush`, which both runtimes
+    // flush to the host's actual stdout. Issue #355 wired the alias
+    // chain + sub-component instantiation that this composed command
+    // needs to reach its `wasi:cli/run` export.
+    wireComponentRun(b, runs, wamr_exe, calc_final, "40 + 2 = 42\n100 + 200 = 300\n", 0);
 
     // ── mixed-zig-rust-calc (Zig adder + Rust command, composed) ───
     // Rust command builds via cargo on `wasm32-wasip1`; we then run the
@@ -810,14 +807,50 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // Run the composed Rust-command + Zig-adder. Same alias-walking
     // path as `zig-calculator-cmd` (issue #355); produces the same
     // two-line output. With the wabt-bundled adapter (#453) wamr +
-    // wasmtime both run the composed component end-to-end, so the
-    // run step is wired in.
-    const run_mixed = b.addRunArtifact(wamr_exe);
-    run_mixed.addArg("run");
-    run_mixed.addFileArg(mixed_final);
-    run_mixed.expectExitCode(0);
-    run_mixed.expectStdOutEqual("40 + 2 = 42\n100 + 200 = 300\n");
-    run_step.dependOn(&run_mixed.step);
+    // wasmtime both run the composed component end-to-end.
+    wireComponentRun(b, runs, wamr_exe, mixed_final, "40 + 2 = 42\n100 + 200 = 300\n", 0);
+}
+
+const ComponentRunSteps = struct {
+    /// Parent build-step for the wamr in-tree run.
+    wamr: *std.Build.Step,
+    /// Parent build-step for the cross-runtime parity run under
+    /// `wasmtime run -S cli-exit-with-code` (assumed on `PATH`;
+    /// wasmtime v44+ required for the `cli-exit-with-code`
+    /// `@unstable` feature gate).
+    wasmtime: *std.Build.Step,
+};
+
+/// Register one component fixture against both run parents. Wires
+/// up the wamr arm via `b.addRunArtifact(wamr_exe)` and the wasmtime
+/// arm via `b.addSystemCommand({"wasmtime", "run", "-S",
+/// "cli-exit-with-code"})`. Both arms assert the same expected
+/// stdout + exit code, so byte-equivalent output across runtimes is
+/// the parity invariant the CI cross-validation job enforces
+/// (cataggar/wamr#457).
+fn wireComponentRun(
+    b: *std.Build,
+    runs: ComponentRunSteps,
+    wamr_exe: *std.Build.Step.Compile,
+    component: std.Build.LazyPath,
+    expected_stdout: []const u8,
+    expected_exit: u8,
+) void {
+    {
+        const run = b.addRunArtifact(wamr_exe);
+        run.addArg("run");
+        run.addFileArg(component);
+        run.expectExitCode(expected_exit);
+        run.expectStdOutEqual(expected_stdout);
+        runs.wamr.dependOn(&run.step);
+    }
+    {
+        const run = b.addSystemCommand(&.{ "wasmtime", "run", "-S", "cli-exit-with-code" });
+        run.addFileArg(component);
+        run.expectExitCode(expected_exit);
+        run.expectStdOutEqual(expected_stdout);
+        runs.wasmtime.dependOn(&run.step);
+    }
 }
 
 const ZigWasmCompile = struct {

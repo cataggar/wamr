@@ -44,24 +44,8 @@ jobs:
       - name: Configure Zig caches
         uses: ./.github/actions/zig-cache
 
-      - name: Install cataggar/wabt v3.0.0-dev.6 (component CLI)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # ghr-bin is a tiny PyPI wrapper that downloads sha256-verified
-          # GitHub release archives and links the chosen binary into
-          # ~/.local/bin. pipx is preinstalled on ubuntu-latest; pip is
-          # blocked by PEP 668. Pin both ghr-bin and the wabt release.
-          # GH_TOKEN is forwarded so `ghr` uses the workflow's
-          # authenticated quota (5000/hr) instead of the runner IP's
-          # unauthenticated 60/hr GitHub API limit — observed flaking
-          # at 60/hr on Azure-hosted runners that share IPs across
-          # tenants.
-          pipx install ghr-bin==0.1.6
-          ghr install cataggar/wabt@v3.0.0-dev.6
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/wabt" version
+      - name: Install cataggar/wabt (component CLI)
+        uses: ./.github/actions/wabt-install
 
       - name: Cache Zig global cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
