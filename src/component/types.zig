@@ -330,6 +330,29 @@ pub const Canon = union(enum) {
     resource_drop: u32, // resource type index
     /// Get the representation of a resource handle.
     resource_rep: u32, // resource type index
+
+    // ── Async ABI canonical built-ins (WASIp3 / Component Model 🔀) ──────────
+    //
+    // Binary tags per design/mvp/Binary.md "Canonical Definitions". The current
+    // upstream spec renames `task.yield` → `thread.yield` but the surface lives
+    // on the per-task state machine; #478 still calls it `task_yield` and
+    // sub-PR 1 keeps that name. Tags here are sub-PR-1 scope; sub-PR 2/3 will
+    // grow the union with subtask/future/stream variants.
+
+    /// Cooperatively suspend the currently executing task. Tag `0x0c`.
+    /// `cancellable == true` corresponds to `cancel? = 0x01` in the binary
+    /// format; when set, the returned discriminant indicates whether the
+    /// suspending task was cancelled while parked.
+    task_yield: struct { cancellable: bool },
+
+    /// Read a per-task context slot. Tag `0x0a`. The spec allows arbitrary
+    /// `valtype`, but sub-PR 1 only admits `i32` (Wasmtime's current limit);
+    /// other types are rejected at load with `error.InvalidEncoding`.
+    context_get: struct { val_type: CoreValType, slot: u32 },
+
+    /// Write a per-task context slot. Tag `0x0b`. Same `i32`-only restriction
+    /// as `context_get`.
+    context_set: struct { val_type: CoreValType, slot: u32 },
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────
@@ -485,8 +508,8 @@ pub const Component = struct {
 /// A single contributor to the core-func index space.
 pub const CoreFuncContributor = union(enum) {
     /// Index into `component.canons`. Only canon kinds that contribute
-    /// to the core-func indexspace (`.lower`, `.resource_drop`,
-    /// `.resource_new`, `.resource_rep`) appear here; `.lift` does not.
+    /// to the core-func indexspace appear here — every kind except
+    /// `.lift` (which produces a *component* func, not a core func).
     canon: u32,
     /// Index into `component.aliases`.
     alias: u32,

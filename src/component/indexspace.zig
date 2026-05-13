@@ -245,6 +245,12 @@ pub const CoreFuncRef = union(enum) {
     resource_new: u32,
     /// Index into `component.canons` for a `.resource_rep` entry.
     resource_rep: u32,
+    /// Index into `component.canons` for a `.task_yield` entry. (#478)
+    task_yield: u32,
+    /// Index into `component.canons` for a `.context_get` entry. (#478)
+    context_get: u32,
+    /// Index into `component.canons` for a `.context_set` entry. (#478)
+    context_set: u32,
     /// Index into `component.aliases`.
     aliased: u32,
 };
@@ -264,6 +270,9 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
                 .resource_drop => .{ .resource_drop = canon_idx },
                 .resource_new => .{ .resource_new = canon_idx },
                 .resource_rep => .{ .resource_rep = canon_idx },
+                .task_yield => .{ .task_yield = canon_idx },
+                .context_get => .{ .context_get = canon_idx },
+                .context_set => .{ .context_set = canon_idx },
                 .lift => null, // lift never contributes to core-func indexspace
             },
         };
@@ -287,6 +296,18 @@ pub fn resolveCoreFunc(component: *const ctypes.Component, idx: u32) ?CoreFuncRe
             },
             .resource_rep => {
                 if (n == idx) return .{ .resource_rep = @intCast(i) };
+                n += 1;
+            },
+            .task_yield => {
+                if (n == idx) return .{ .task_yield = @intCast(i) };
+                n += 1;
+            },
+            .context_get => {
+                if (n == idx) return .{ .context_get = @intCast(i) };
+                n += 1;
+            },
+            .context_set => {
+                if (n == idx) return .{ .context_set = @intCast(i) };
                 n += 1;
             },
             .lift => {},
@@ -693,6 +714,32 @@ test "resolveCoreFunc: canon.lowers → core(.func) aliases" {
     try testing.expect(resolveCoreFunc(&comp, 1).? == .lowered);
     try testing.expect(resolveCoreFunc(&comp, 2).? == .aliased);
     try testing.expect(resolveCoreFunc(&comp, 3) == null);
+}
+
+test "resolveCoreFunc: async ABI built-ins contribute core-func slots" {
+    const canons = [_]ctypes.Canon{
+        .{ .lower = .{ .func_idx = 0, .opts = &.{} } },
+        .{ .task_yield = .{ .cancellable = false } },
+        .{ .context_get = .{ .val_type = .i32, .slot = 0 } },
+        .{ .context_set = .{ .val_type = .i32, .slot = 0 } },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+    };
+    try testing.expect(resolveCoreFunc(&comp, 0).? == .lowered);
+    try testing.expect(resolveCoreFunc(&comp, 1).? == .task_yield);
+    try testing.expect(resolveCoreFunc(&comp, 2).? == .context_get);
+    try testing.expect(resolveCoreFunc(&comp, 3).? == .context_set);
+    try testing.expect(resolveCoreFunc(&comp, 4) == null);
 }
 
 test "lookupLocalInstanceMember: finds named export in inline-exports instance" {

@@ -251,7 +251,14 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                     // Every canon kind except `.lift` contributes a slot
                     // to the core-func indexspace.
                     const contributes = switch (c) {
-                        .lower, .resource_drop, .resource_new, .resource_rep => true,
+                        .lower,
+                        .resource_drop,
+                        .resource_new,
+                        .resource_rep,
+                        .task_yield,
+                        .context_get,
+                        .context_set,
+                        => true,
                         .lift => false,
                     };
                     if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
@@ -695,7 +702,33 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
         0x02 => .{ .resource_new = try reader.readU32() },
         0x03 => .{ .resource_drop = try reader.readU32() },
         0x04 => .{ .resource_rep = try reader.readU32() },
+        0x0a => try parseContextCanon(reader, .get),
+        0x0b => try parseContextCanon(reader, .set),
+        0x0c => blk: {
+            // canon thread.yield (formerly task.yield) — Binary.md tag 0x0c
+            // immediate is a single `cancel?` byte: 0x00 = plain, 0x01 = cancellable.
+            const cancel = try reader.readByte();
+            const cancellable = switch (cancel) {
+                0x00 => false,
+                0x01 => true,
+                else => return error.InvalidEncoding,
+            };
+            break :blk .{ .task_yield = .{ .cancellable = cancellable } };
+        },
         else => error.InvalidEncoding,
+    };
+}
+
+/// Parse the immediate of `canon context.get v i` / `canon context.set v i`
+/// (Binary.md tags 0x0a / 0x0b). The valtype byte is restricted to `i32`
+/// in sub-PR 1; widen later as conformance grows.
+fn parseContextCanon(reader: *BinaryReader, comptime kind: enum { get, set }) LoadError!ctypes.Canon {
+    const val_byte = try reader.readByte();
+    if (val_byte != @intFromEnum(ctypes.CoreValType.i32)) return error.InvalidEncoding;
+    const slot = try reader.readU32();
+    return switch (kind) {
+        .get => .{ .context_get = .{ .val_type = ctypes.CoreValType.i32, .slot = slot } },
+        .set => .{ .context_set = .{ .val_type = ctypes.CoreValType.i32, .slot = slot } },
     };
 }
 
@@ -889,6 +922,53 @@ test "readValType: rejects unknown negative code" {
     // 0x67 decodes as signed LEB -25, which has no primitive mapping.
     var reader = BinaryReader{ .data = &[_]u8{0x67} };
     try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+}
+
+test "parseCanon: task.yield with cancel? = 0x00" {
+    // tag 0x0c, cancel? 0x00 → task_yield with cancellable=false
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0c, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_yield);
+    try std.testing.expectEqual(false, c.task_yield.cancellable);
+}
+
+test "parseCanon: task.yield with cancel? = 0x01 (cancellable)" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0c, 0x01 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_yield);
+    try std.testing.expectEqual(true, c.task_yield.cancellable);
+}
+
+test "parseCanon: task.yield rejects invalid cancel byte" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0c, 0x02 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
+}
+
+test "parseCanon: context.get i32 slot=0" {
+    // tag 0x0a, valtype byte for i32 = 0x7F, slot LEB = 0x00
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0a, 0x7F, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .context_get);
+    try std.testing.expectEqual(ctypes.CoreValType.i32, c.context_get.val_type);
+    try std.testing.expectEqual(@as(u32, 0), c.context_get.slot);
+}
+
+test "parseCanon: context.set i32 slot=1" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0b, 0x7F, 0x01 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .context_set);
+    try std.testing.expectEqual(@as(u32, 1), c.context_set.slot);
+}
+
+test "parseCanon: context.get rejects non-i32 valtype" {
+    // tag 0x0a, valtype byte for i64 = 0x7E → rejected in sub-PR 1
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0a, 0x7E, 0x00 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
+}
+
+test "parseCanon: context.set rejects non-i32 valtype" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0b, 0x7D, 0x00 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
 }
 
 test "parseTypeDef: instance type with `sub resource` type decl" {

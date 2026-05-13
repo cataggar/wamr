@@ -704,11 +704,19 @@ pub fn canonResourceRep(
 }
 
 /// Dispatch a canonical built-in function call. Used when the canon section
-/// references resource.new/drop/rep instead of lift/lower.
+/// references resource.new/drop/rep, task.yield, or context.{get,set}
+/// instead of lift/lower.
+///
+/// `task_manager` is the async runtime state for this dispatch (nullable
+/// because synchronous canon-lift paths don't construct one). When null,
+/// `task.yield` is a no-op resume and `context.{get,set}` operate on
+/// `comp_inst.implicit_task_context`, matching Wasmtime's per-instance
+/// fallback for sync calls. (#478 sub-PR 1.)
 pub fn dispatchCanonBuiltin(
     comp_inst: *ComponentInstance,
     canon: ctypes.Canon,
     env: *ExecEnv,
+    task_manager: ?*async_mod.TaskManager,
     allocator: Allocator,
 ) ExecutionError!void {
     switch (canon) {
@@ -731,6 +739,46 @@ pub fn dispatchCanonBuiltin(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             const rep_val = canonResourceRep(rt, handle) orelse 0;
             env.pushI32(@bitCast(rep_val)) catch return error.StackOverflow;
+        },
+        .task_yield => |info| {
+            // `canon thread.yield cancel?` — Binary.md tag 0x0c. Pushes
+            // an i32 discriminant: 0 on normal resume, 1 if the task was
+            // cancelled while parked (cancellable-only).
+            const outcome: u32 = if (task_manager) |tm| blk: {
+                const handle = tm.current_task orelse break :blk 0;
+                break :blk @intFromEnum(async_canon.taskYield(tm, handle, info.cancellable, allocator));
+            } else 0;
+            env.pushI32(@bitCast(outcome)) catch return error.StackOverflow;
+        },
+        .context_get => |info| {
+            // Sub-PR 1 only admits i32; the loader rejects others. Defend
+            // here too so a hand-constructed Canon doesn't bypass the
+            // limit silently.
+            if (info.val_type != .i32) return error.FunctionNotFound;
+            const value: u32 = blk: {
+                if (task_manager) |tm| {
+                    if (tm.current_task) |handle| {
+                        if (tm.getContextSlot(handle, info.slot)) |v| break :blk v;
+                        // Slot out of range on a known task → trap.
+                        return error.StackUnderflow;
+                    }
+                }
+                if (info.slot >= async_mod.N_CONTEXT_SLOTS) return error.StackUnderflow;
+                break :blk comp_inst.implicit_task_context[info.slot];
+            };
+            env.pushI32(@bitCast(value)) catch return error.StackOverflow;
+        },
+        .context_set => |info| {
+            if (info.val_type != .i32) return error.FunctionNotFound;
+            const value: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            if (task_manager) |tm| {
+                if (tm.current_task) |handle| {
+                    if (!tm.setContextSlot(handle, info.slot, value)) return error.StackUnderflow;
+                    return;
+                }
+            }
+            if (info.slot >= async_mod.N_CONTEXT_SLOTS) return error.StackUnderflow;
+            comp_inst.implicit_task_context[info.slot] = value;
         },
         .lift, .lower => {}, // Handled by callComponentFunc
     }
@@ -800,6 +848,14 @@ pub fn callComponentFuncAsync(
         task_manager.cancelTask(handle);
         return error.OutOfMemory;
     };
+
+    // Make the just-created subtask discoverable to context.{get,set} and
+    // task.yield invoked from inside the synchronous body. Restored on
+    // return regardless of success/failure so nested calls see the
+    // surrounding caller's task afterwards. (#478 sub-PR 1.)
+    const saved_current_task = task_manager.current_task;
+    task_manager.current_task = handle;
+    defer task_manager.current_task = saved_current_task;
 
     callComponentFunc(comp_inst, func_name, args, results, allocator) catch |e| {
         allocator.free(results);
@@ -1076,6 +1132,224 @@ test "async waitable set: multiple subtasks" {
     var vals2 = [_]u32{20};
     async_canon.asyncReturn(&tm, r2.subtask_handle, &vals2);
     try std.testing.expect(async_canon.asyncPollResult(&tm, r2.subtask_handle) != null);
+}
+
+// ── dispatchCanonBuiltin: async ABI built-ins (#478 sub-PR 1) ────────────────
+
+test "dispatchCanonBuiltin: task.yield pushes resumed=0 with no task manager" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_yield = .{ .cancellable = false } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+}
+
+test "dispatchCanonBuiltin: task.yield observes cancellation via TaskManager" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+
+    const lift = try async_canon.asyncLift(.{
+        .task_manager = &tm,
+        .allocator = testing.allocator,
+    });
+    tm.current_task = lift.subtask_handle;
+    async_canon.asyncCancel(&tm, lift.subtask_handle);
+
+    // Non-cancellable yield: opaque, always reports resumed=0.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_yield = .{ .cancellable = false } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+
+    // Cancellable yield: surfaces the pending cancellation as 1.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_yield = .{ .cancellable = true } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 1), try env.popI32());
+}
+
+test "dispatchCanonBuiltin: context set+get round-trip on implicit task" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    // Push 0x1234 then `context.set i32 0` → stored on implicit task.
+    try env.pushI32(@bitCast(@as(u32, 0x1234)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .context_set = .{ .val_type = .i32, .slot = 0 } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 0x1234), inst.implicit_task_context[0]);
+
+    // `context.get i32 0` → pushes the value back onto the stack.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .context_get = .{ .val_type = .i32, .slot = 0 } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0x1234), try env.popI32());
+}
+
+test "dispatchCanonBuiltin: context set+yield+get round-trip on async task" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+    const lift = try async_canon.asyncLift(.{
+        .task_manager = &tm,
+        .allocator = testing.allocator,
+    });
+    tm.current_task = lift.subtask_handle;
+
+    // `context.set i32 1`(value=0xDEAD_BEEF) → task.yield → `context.get i32 1`
+    try env.pushI32(@bitCast(@as(u32, 0xDEAD_BEEF)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .context_set = .{ .val_type = .i32, .slot = 1 } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_yield = .{ .cancellable = false } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    // task.yield pushes its outcome — pop and discard.
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .context_get = .{ .val_type = .i32, .slot = 1 } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 0xDEAD_BEEF), @as(u32, @bitCast(try env.popI32())));
+
+    // Slot stored on the task, NOT on the instance's implicit context.
+    try testing.expectEqual(@as(u32, 0), inst.implicit_task_context[1]);
+    try testing.expectEqual(@as(?u32, 0xDEAD_BEEF), tm.getContextSlot(lift.subtask_handle, 1));
+}
+
+test "dispatchCanonBuiltin: context.get out-of-range slot traps" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const oob_slot: u32 = async_mod.N_CONTEXT_SLOTS;
+    const result = dispatchCanonBuiltin(
+        inst,
+        .{ .context_get = .{ .val_type = .i32, .slot = oob_slot } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectError(error.StackUnderflow, result);
 }
 
 // ── Canon-lower host trampoline ─────────────────────────────────────────────
