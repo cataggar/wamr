@@ -1224,7 +1224,7 @@ fn compileInst(
         },
         .elem_drop => {},
         .table_size => {
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
             try code.movRegMemNoRex(.rax, .r10, vmctx_func_table_len_field);
             try stack.push(code, .rax);
         },
@@ -1244,7 +1244,7 @@ fn compileInst(
             try stack.push(code, .rax);
         },
         .ref_func => |fidx| {
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
             try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
             try code.movRegMem(.rax, .r10, @as(i32, @intCast(fidx * 8)));
             try stack.push(code, .rax);
@@ -1486,22 +1486,29 @@ const GlobalCallPatch = struct {
 const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
 
-/// x86-64 allocatable GPR set: rdx(2), rbx(3), rsi(6), rdi(7), r8(8), r9(9),
-/// r12(12), r13(13), r14(14), r15(15). Order matches the legacy mask layout,
-/// so `caller_saved_indices` / `callee_saved_indices` are stable indices
+/// x86-64 allocatable GPR set: rdx(2), rsi(6), rdi(7), r8(8), r9(9),
+/// r12(12), r13(13), r14(14), r15(15). `rbx`(3) is permanently pinned to
+/// `vmctx` for the function body (issue #465) and excluded from the
+/// allocator pool; the prologue copies `param_regs[0]` (rdi/rcx) into
+/// rbx once, and every site that previously reloaded vmctx from
+/// `[rbp - 8]` reads rbx directly.
+///
+/// `caller_saved_indices` / `callee_saved_indices` are stable indices
 /// into `alloc_regs` and match the bit positions used in clobber masks below.
-const x86_64_alloc_regs = [_]regalloc.PhysReg{ 2, 3, 6, 7, 8, 9, 12, 13, 14, 15 };
+const x86_64_alloc_regs = [_]regalloc.PhysReg{ 2, 6, 7, 8, 9, 12, 13, 14, 15 };
 
 /// Indices into `x86_64_alloc_regs` of callee-saved registers (same on
-/// Win64 and SysV): rbx(idx 1), r12..r15 (idx 6..9).
-const x86_64_callee_saved_indices = [_]u8{ 1, 6, 7, 8, 9 };
+/// Win64 and SysV): r12..r15 (idx 5..8). rbx is excluded — it is the
+/// pinned vmctx register and saved/restored unconditionally by the
+/// prologue/epilogue rather than by the allocator.
+const x86_64_callee_saved_indices = [_]u8{ 5, 6, 7, 8 };
 
 /// Indices into `x86_64_alloc_regs` of caller-saved registers, by ABI.
 /// On Win64: rdx, r8, r9. On SysV: add rsi, rdi.
 const x86_64_caller_saved_indices = if (builtin.os.tag == .windows)
-    [_]u8{ 0, 4, 5 }
+    [_]u8{ 0, 3, 4 }
 else
-    [_]u8{ 0, 2, 3, 4, 5 };
+    [_]u8{ 0, 1, 2, 3, 4 };
 
 /// Bitmask over `x86_64_alloc_regs` indices of caller-saved registers
 /// clobbered by a normal call / host runtime call (memory.grow, table.set,
@@ -1526,8 +1533,8 @@ fn x86_64_alloc_idx(reg: emit.Reg) ?u8 {
 /// registers (rcx on SysV, rcx on Win64 since param_regs[0]=rcx is
 /// non-allocatable) are null.
 ///
-/// SysV: rdi(idx 3), rsi(idx 2), rdx(idx 0), rcx(null), r8(idx 4), r9(idx 5)
-/// Win64: rcx(null), rdx(idx 0), r8(idx 4), r9(idx 5)
+/// SysV: rdi(idx 2), rsi(idx 1), rdx(idx 0), rcx(null), r8(idx 3), r9(idx 4)
+/// Win64: rcx(null), rdx(idx 0), r8(idx 3), r9(idx 4)
 const param_reg_hint_idx: [param_regs.len]?u8 = blk: {
     var t: [param_regs.len]?u8 = undefined;
     for (param_regs, 0..) |r, i| t[i] = x86_64_alloc_idx(r);
@@ -1837,6 +1844,12 @@ fn compileFunctionRAWithGlobalOffsets(
     var used_caller_saved: [caller_saved_alloc.len]bool = .{false} ** caller_saved_alloc.len;
     // Track which callee-saved registers are used (for prologue/epilogue preservation).
     var used_callee_saved: [callee_saved_alloc.len]bool = .{false} ** callee_saved_alloc.len;
+    // rbx is permanently pinned to vmctx for the function body (issue
+    // #465). It's at index 0 of `callee_saved_alloc` on both Win64 and
+    // SysV, so always mark it used: the prologue must `push rbx` (to
+    // preserve the caller's value) before the prologue copies vmctx
+    // (`param_regs[0]`) into it.
+    used_callee_saved[0] = true;
     {
         var it = alloc_result.assignments.iterator();
         while (it.next()) |entry| {
@@ -1894,10 +1907,13 @@ fn compileFunctionRAWithGlobalOffsets(
     const frame_size: u32 = if (callee_save_count % 2 == 0) aligned else aligned | 8;
     try code.emitPrologue(frame_size);
 
-    // Save memory base (VMContext) from first ABI register to [rbp - 8]
-    // The runtime passes the linear memory base pointer as a hidden first parameter.
+    // VMContext is pinned in rbx for the whole function body (issue
+    // #465). The slot at `[rbp - 8]` remains structurally reserved
+    // (locals start at `[rbp - 16]`) but is no longer initialized —
+    // every reload site reads `rbx` directly. The `push rbx` below
+    // (always emitted because `used_callee_saved[0]` is forced true)
+    // preserves the caller's rbx before we overwrite it.
     const vmctx_reg = param_regs[0]; // rcx on Win64, rdi on SysV
-    try code.movMemReg(.rbp, vmctx_offset, vmctx_reg);
 
     // Spill wasm parameters from ABI registers to stack frame slots.
     // Wasm params are shifted by 1 because the first ABI register is the VMContext.
@@ -1950,10 +1966,20 @@ fn compileFunctionRAWithGlobalOffsets(
     }
 
     // Save callee-saved registers used by this function.
-    // Win64: rsi, rdi, r12, r13. SysV: r12, r13.
+    // rbx is always pushed (pinned vmctx, issue #465). Win64: rsi, rdi,
+    // r12..r15 if used. SysV: r12..r15 if used.
     for (callee_saved_alloc, 0..) |reg, i| {
         if (used_callee_saved[i]) try code.pushReg(reg);
     }
+
+    // Capture vmctx into rbx (pinned for the whole function body).
+    // `vmctx_reg` (param_regs[0] = rdi on SysV / rcx on Win64) still
+    // holds the runtime-supplied VmCtx*: param_regs[0] is never
+    // overwritten by the param-spill loop above (which copies
+    // param_regs[1..]) nor by the zero-locals / HRP setup (both use
+    // rax). Doing the move AFTER `push rbx` preserves the caller's
+    // rbx in the slot reserved by the push.
+    try code.movRegReg(.rbx, vmctx_reg);
 
     var block_offsets = std.AutoHashMap(ir.BlockId, usize).init(allocator);
     defer block_offsets.deinit();
@@ -2054,7 +2080,7 @@ fn emitStaticBulkMemBoundsCheck(
     addr: ir.VReg,
     len: u8,
 ) !void {
-    try code.movRegMem(.r10, .rbp, vmctx_offset);
+    try code.movRegReg(.r10, .rbx);
     try loadWasmU32Addr(code, alloc_result, addr, .rax);
     try emitMemBoundsCheck(code, len);
 }
@@ -2121,7 +2147,7 @@ fn emitSmallMemoryCopy(
     try emitStaticBulkMemBoundsCheck(code, alloc_result, src, len);
     if (len == 0) return;
 
-    try code.movRegMem(.r10, .rbp, vmctx_offset);
+    try code.movRegReg(.r10, .rbx);
     try loadWasmU32Addr(code, alloc_result, dst, .rax);
     try code.movRegMem(.r10, .r10, vmctx_membase_field);
     try code.addRegReg(.rax, .r10);
@@ -2149,7 +2175,7 @@ fn emitSmallMemoryFill(
     try emitStaticBulkMemBoundsCheck(code, alloc_result, dst, len);
     if (len == 0) return;
 
-    try code.movRegMem(.r10, .rbp, vmctx_offset);
+    try code.movRegReg(.r10, .rbx);
     try loadWasmU32Addr(code, alloc_result, dst, .rax);
     try code.movRegMem(.r10, .r10, vmctx_membase_field);
     try code.addRegReg(.rax, .r10);
@@ -2701,7 +2727,7 @@ fn compileInstRA(
                 // is in caller_saved_alloc, so it may hold an arg vreg that
                 // emitCallRegArgMoves must consume. Loading vmctx earlier would
                 // clobber that vreg.
-                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                try code.movRegReg(param_regs[0], .rbx);
                 if (has_hrp) {
                     const hrp_save_off: i32 = -@as(i32, @intCast((local_count + 2) * 8));
                     const hrp_dst = param_regs[1 + n_args];
@@ -2729,7 +2755,7 @@ fn compileInstRA(
                 // rdi is in caller_saved_alloc and may hold an arg vreg that
                 // emitCallRegArgMoves below consumes. We load vmctx → rdi
                 // only after all arg setup is complete.
-                try code.movRegMem(.r10, .rbp, vmctx_offset);
+                try code.movRegReg(.r10, .rbx);
                 try code.movRegMem(.r10, .r10, vmctx_host_functions_field);
                 if (cl.func_idx > 0) {
                     try code.addRegImm32(.r10, @intCast(@as(u32, cl.func_idx) * 8));
@@ -2743,7 +2769,7 @@ fn compileInstRA(
                     try code.movMemReg(.rsp, @intCast(shadow + j * 8), arg_reg);
                 }
                 try emitCallRegArgMoves(code, alloc_result, cl.args, max_reg_args);
-                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                try code.movRegReg(param_regs[0], .rbx);
                 if (has_hrp) {
                     if (hrp_in_reg) {
                         const hrp_dst = param_regs[1 + n_args];
@@ -2769,7 +2795,7 @@ fn compileInstRA(
                 // on SysV) is in caller_saved_alloc, so an arg vreg may be live in
                 // rdi at the call (e.g. arg 2 of a 3-arg call). Loading vmctx into
                 // rdi before emitCallRegArgMoves would clobber that vreg.
-                try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+                try code.movRegReg(param_regs[0], .rbx);
                 if (has_hrp) {
                     if (hrp_in_reg) {
                         const hrp_dst = param_regs[1 + n_args];
@@ -2822,7 +2848,7 @@ fn compileInstRA(
             // Load vmctx into r10. For table 0 we use the fast path that
             // reads vmctx.func_table_ptr/len directly. For higher-numbered
             // tables we go through vmctx.tables_info_ptr[table_idx].
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
 
             if (ci.table_idx == 0) {
                 // cmp eax, dword ptr [r10 + func_table_len]
@@ -2913,7 +2939,7 @@ fn compileInstRA(
             // Load vmctx into param_regs[0] AFTER arg setup: rdi (param_regs[0] on
             // SysV) is in caller_saved_alloc, so it may hold an arg vreg consumed
             // by emitCallRegArgMoves. Loading vmctx earlier would clobber it.
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             if (has_hrp) {
                 if (hrp_in_reg) {
                     const hrp_dst = param_regs[1 + n_args];
@@ -2970,7 +2996,7 @@ fn compileInstRA(
 
             // Null check: if r11 == 0, trap via trap_unreachable_fn.
             // Load vmctx into r10 first so the trap call has it handy.
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
             // test r11, r11  → 0x4D 0x85 0xDB
             try code.emitSlice(&.{ 0x4D, 0x85, 0xDB });
             // jne over_trap (rel8). Trap block is 3 + 7 + 2 = 12 bytes.
@@ -3007,7 +3033,7 @@ fn compileInstRA(
             // Load vmctx into param_regs[0] AFTER arg setup: rdi (param_regs[0] on
             // SysV) is in caller_saved_alloc, so it may hold an arg vreg consumed
             // by emitCallRegArgMoves. Loading vmctx earlier would clobber it.
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             if (has_hrp) {
                 if (hrp_in_reg) {
                     const hrp_dst = param_regs[1 + n_args];
@@ -3073,7 +3099,7 @@ fn compileInstRA(
             // Bounds check is inserted between vmctx load and mem_base load so
             // the check can read VmCtx.memory_size while r10 still holds the
             // VmCtx pointer.
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegReg(.r10, .rbx); // load VmCtx*
             const base_reg = try useVReg(code, alloc_result, ld.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
             try code.zeroExtend32(.rax); // wasm addresses are i32
@@ -3118,7 +3144,7 @@ fn compileInstRA(
             // Bounds check is inserted between vmctx load and mem_base load so
             // the check can read VmCtx.memory_size while r10 still holds the
             // VmCtx pointer.
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegReg(.r10, .rbx); // load VmCtx*
             // Compute final address in rax (not allocatable — safe to clobber).
             const base_reg = try useVReg(code, alloc_result, st.base, .rax);
             if (base_reg != .rax) try code.movRegReg(.rax, base_reg);
@@ -3159,7 +3185,7 @@ fn compileInstRA(
             try code.zeroExtend32(param_regs[2]);
             try code.zeroExtend32(param_regs[3]);
             // Load vmctx + helper fn pointer (uses rax + param_regs[0]).
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             try code.movRegMem(.rax, param_regs[0], vmctx_mem_copy_fn_field);
 
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
@@ -3176,7 +3202,7 @@ fn compileInstRA(
             // REP STOSB: rdi=dst, al=val, rcx=len
             //
             // Bounds check semantics (wasm spec): trap if dst + len > mem_size.
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // load VmCtx*
+            try code.movRegReg(.r10, .rbx); // load VmCtx*
             const len_reg = try useVReg(code, alloc_result, mf.len, .rcx);
             if (len_reg != .rcx) try code.movRegReg(.rcx, len_reg);
             try code.zeroExtend32(.rcx); // wasm lengths are u32
@@ -3200,7 +3226,7 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
             // Read current page count from VmCtx
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
             try code.movRegMemNoRex(dr, .r10, vmctx_mem_pages_field);
             // 32-bit load already zero-extends
             try writeDef(code, alloc_result, dest, dr);
@@ -3219,7 +3245,7 @@ fn compileInstRA(
             try code.zeroExtend32(arg_pages);
 
             // Load vmctx into param_regs[0].
-            try code.movRegMem(arg_vmctx, .rbp, vmctx_offset);
+            try code.movRegReg(arg_vmctx, .rbx);
             // Load grow helper pointer into rax.
             try code.movRegMem(.rax, arg_vmctx, vmctx_mem_grow_fn_field);
 
@@ -3283,7 +3309,7 @@ fn compileInstRA(
             try code.movRegImm64(arg_packed_st_reg, packed_st);
 
             // vmctx into param_regs[0]; helper ptr into rax.
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             try code.movRegMem(.rax, param_regs[0], vmctx_table_init_fn_field);
 
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
@@ -3297,7 +3323,7 @@ fn compileInstRA(
             //   Win64: rcx=vmctx, rdx=seg_idx
             //   SysV:  rdi=vmctx, rsi=seg_idx
             try code.movRegImm32(param_regs[1], @bitCast(seg_idx));
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             try code.movRegMem(.rax, param_regs[0], vmctx_elem_drop_fn_field);
 
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
@@ -3312,7 +3338,7 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
             // r10 = vmctx.tables_info_ptr; read len (u32) from slot [table_idx].
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
             try code.movRegMem(.r10, .r10, vmctx_tables_info_field);
             const len_off: i32 = @as(i32, @intCast(table_idx)) * table_info_stride + table_info_len_off;
             try code.movRegMemNoRex(dr, .r10, len_off);
@@ -3327,7 +3353,7 @@ fn compileInstRA(
             try code.zeroExtend32(.rax);
 
             // r10 = vmctx.tables_info_ptr.
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
             try code.movRegMem(.r10, .r10, vmctx_tables_info_field);
 
             // cmp eax, [r10 + table_idx*16 + 8]   (table len, u32)
@@ -3374,7 +3400,7 @@ fn compileInstRA(
                 try code.movRegReg(.rdx, .rax);
                 try code.movRegImm32(.rsi, @bitCast(ts.table_idx));
             }
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             try code.movRegMem(.rax, param_regs[0], vmctx_table_set_fn_field);
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
             const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
@@ -3385,7 +3411,7 @@ fn compileInstRA(
         .ref_func => |fidx| {
             const dest = inst.dest orelse return;
             // Load funcptrs array, then [funcptrs + fidx*8].
-            try code.movRegMem(.r10, .rbp, vmctx_offset);
+            try code.movRegReg(.r10, .rbx);
             try code.movRegMem(.r10, .r10, vmctx_funcptrs_field);
             const dr = destReg(alloc_result, dest);
             try code.movRegMem(dr, .r10, @as(i32, @intCast(fidx * 8)));
@@ -3417,7 +3443,7 @@ fn compileInstRA(
             }
 
             // Load vmctx into param_regs[0] and grow fn ptr into rax.
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             try code.movRegMem(.rax, param_regs[0], vmctx_table_grow_fn_field);
 
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
@@ -3713,14 +3739,14 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             const dr = destReg(alloc_result, dest);
             // Load globals_base from VmCtx, then load global value
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
+            try code.movRegReg(.r10, .rbx); // VmCtx*
             try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
             try code.movRegMem(dr, .r10, try globalByteOffset(global_offsets, idx)); // global[idx]
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
         },
         .global_set => |gs| {
             const val_reg = try useVReg(code, alloc_result, gs.val, .rax);
-            try code.movRegMem(.r10, .rbp, vmctx_offset); // VmCtx*
+            try code.movRegReg(.r10, .rbx); // VmCtx*
             try code.movRegMem(.r10, .r10, vmctx_globals_field); // globals_base
             try code.movMemReg(.r10, try globalByteOffset(global_offsets, gs.idx), val_reg); // global[idx] = val
         },
@@ -4447,7 +4473,7 @@ fn compileInstRA(
                 try code.movRegReg(.rdx, .rax); // count
                 try code.movRegReg(.rsi, .rcx); // addr
             }
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
             try code.movRegMem(.rax, param_regs[0], vmctx_futex_notify_fn_field);
             const shadow: u32 = if (comptime builtin.os.tag == .windows) 32 else 0;
             const stack_adjust: u32 = (shadow + 15) & ~@as(u32, 15);
@@ -4474,7 +4500,7 @@ fn compileInstRA(
             if (timeout_reg != .rcx) try code.movRegReg(.rcx, timeout_reg);
 
             // Set up ABI args and call the appropriate helper
-            try code.movRegMem(param_regs[0], .rbp, vmctx_offset);
+            try code.movRegReg(param_regs[0], .rbx);
 
             if (aw.size == 4) {
                 if (comptime builtin.os.tag == .windows) {
@@ -4946,6 +4972,47 @@ test "compileFunctionRA: iconst_32 + ret" {
 
     try std.testing.expect(code.len > 5);
     try std.testing.expectEqual(@as(u8, 0xC3), code[code.len - 1]);
+}
+
+test "compileFunctionRA: prologue pins vmctx in rbx (issue #465)" {
+    // Every function's prologue must (a) `push rbx` (preserve the
+    // caller's rbx, since x86-64 callee-saved discipline requires it)
+    // and (b) `mov rbx, param_regs[0]` (capture vmctx). The two
+    // instructions must appear together in the prologue.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    const compile_result = try compileFunctionRA(&func, 0, allocator);
+    const code = compile_result.code;
+    defer allocator.free(compile_result.call_patches);
+    defer allocator.free(code);
+
+    // `push rbx` = 0x53 (single byte, low-8 register, no REX prefix).
+    const push_rbx: u8 = 0x53;
+    // `mov rbx, param_regs[0]`:
+    //   SysV:  rdi → rbx → REX.W 0x48, MOV opcode 0x89, ModR/M 0xFB
+    //          (mod=11, reg=rdi=7, r/m=rbx=3) = 48 89 FB.
+    //   Win64: rcx → rbx → REX.W 0x48, opcode 0x89, ModR/M 0xCB
+    //          (mod=11, reg=rcx=1, r/m=rbx=3) = 48 89 CB.
+    const mov_rbx: [3]u8 = if (builtin.os.tag == .windows)
+        .{ 0x48, 0x89, 0xCB }
+    else
+        .{ 0x48, 0x89, 0xFB };
+
+    const idx_mov = std.mem.indexOf(u8, code, &mov_rbx) orelse
+        return error.TestExpectedMovRbxFromParam0;
+    // The `push rbx` byte must appear earlier in the prologue.
+    const prologue = code[0..idx_mov];
+    const idx_push = std.mem.indexOfScalar(u8, prologue, push_rbx) orelse
+        return error.TestExpectedPushRbxBeforeMov;
+    try std.testing.expect(idx_push < idx_mov);
 }
 
 test "compileFunctionRA: add two constants" {
@@ -6011,12 +6078,17 @@ test "emitCallRegArgMoves: regression — arg[1] source equals arg[0] target (co
     }
 }
 
-test "compileModule: regression #406 — vmctx → rdi load deferred past arg moves at call (SysV)" {
+test "compileModule: regression #406 — vmctx → rdi setup deferred past arg moves at call (SysV)" {
     // Issue #406: when an arg vreg is bound to rdi at a call site, the
-    // call-site `mov rdi, [rbp-vmctx_offset]` must be emitted AFTER
+    // call-site vmctx setup into rdi must be emitted AFTER
     // emitCallRegArgMoves. The buggy order clobbered the arg vreg with
     // vmctx before the parallel-move algorithm read it; the parallel move
     // then propagated vmctx into the wrong arg register.
+    //
+    // With the pinned-vmctx change (issue #465) the setup is now
+    // `mov rdi, rbx` (rbx holds vmctx for the whole function body)
+    // rather than `mov rdi, [rbp - 8]`, but the ordering invariant
+    // still applies.
     //
     // On Win64 rdi/rsi are not parameter registers, so the bug is
     // SysV-specific.
@@ -6069,19 +6141,19 @@ test "compileModule: regression #406 — vmctx → rdi load deferred past arg mo
     const idx_call = std.mem.lastIndexOfScalar(u8, caller_code, 0xE8) orelse
         return error.TestExpectedCallEmitted;
 
-    // The vmctx → rdi load is `mov rdi, [rbp-8]` encoded as the disp32 form
-    // movRegMem always emits: REX.W (0x48), opcode 0x8B, ModR/M=0xBD
-    // (mod=10, reg=rdi=7, r/m=rbp=5), disp32 = 0xFFFFFFF8.
-    const vmctx_load: [7]u8 = .{ 0x48, 0x8B, 0xBD, 0xF8, 0xFF, 0xFF, 0xFF };
-    const idx_vmctx = std.mem.lastIndexOf(u8, caller_code[0..idx_call], &vmctx_load) orelse
-        return error.TestExpectedVmctxLoadBeforeCall;
+    // The vmctx → rdi setup is now `mov rdi, rbx`. Encoding:
+    //   REX.W (0x48), opcode 0x89 (MOV r/m64, r64), ModR/M = 0xDF
+    //   (mod=11 reg-reg, reg=rbx=3, r/m=rdi=7).
+    const vmctx_setup: [3]u8 = .{ 0x48, 0x89, 0xDF };
+    const idx_vmctx = std.mem.lastIndexOf(u8, caller_code[0..idx_call], &vmctx_setup) orelse
+        return error.TestExpectedVmctxSetupBeforeCall;
 
-    // After the fix, the vmctx load is the LAST emit before HRP setup +
+    // After the fix, the vmctx setup is the LAST emit before HRP setup +
     // CALL. Crucially, no `mov dst, rdi` (reading rdi as source via
     // REX.W 0x89 with ModR/M reg-field = 7, mod = 11) may appear between
-    // vmctx_load and the CALL — such a move would propagate vmctx (not
+    // vmctx_setup and the CALL — such a move would propagate vmctx (not
     // the original arg vreg) into the destination register.
-    const tail = caller_code[idx_vmctx + vmctx_load.len .. idx_call];
+    const tail = caller_code[idx_vmctx + vmctx_setup.len .. idx_call];
     var i: usize = 0;
     while (i + 2 < tail.len) : (i += 1) {
         // REX.W only (0x48): mov reg64, reg64 with both reg and r/m in
@@ -6093,7 +6165,7 @@ test "compileModule: regression #406 — vmctx → rdi load deferred past arg mo
             const mod = (modrm >> 6) & 0x3;
             const reg_field = (modrm >> 3) & 0x7;
             if (mod == 0b11 and reg_field == 7) {
-                // Found `mov ?, rdi` between vmctx load and CALL — bug shape.
+                // Found `mov ?, rdi` between vmctx setup and CALL — bug shape.
                 return error.TestVmctxLoadClobbersArgVreg;
             }
         }
