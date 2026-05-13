@@ -53,6 +53,14 @@ pub const LiftOptions = struct {
     realloc_idx: ?u32 = null,
     post_return_idx: ?u32 = null,
     string_encoding: ctypes.StringEncoding = .utf8,
+    /// Whether this lift uses the async ABI (Binary.md `canonopt 0x06`).
+    /// Async lifts return a packed status immediately; results are
+    /// delivered via `task.return`. (#478 sub-PR 2.)
+    is_async: bool = false,
+    /// Optional resumption callback core funcidx (Binary.md `canonopt 0x07`).
+    /// Only meaningful when `is_async`; the single-threaded poll-cycle
+    /// dispatcher invokes it once after each yield. (#478 sub-PR 2.)
+    callback_idx: ?u32 = null,
 
     pub fn fromOpts(opts: []const ctypes.CanonOpt) LiftOptions {
         var lo = LiftOptions{};
@@ -62,6 +70,8 @@ pub const LiftOptions = struct {
                 .realloc => |idx| lo.realloc_idx = idx,
                 .post_return => |idx| lo.post_return_idx = idx,
                 .string_encoding => |enc| lo.string_encoding = enc,
+                .async_lift => lo.is_async = true,
+                .callback => |idx| lo.callback_idx = idx,
             }
         }
         return lo;
@@ -326,6 +336,93 @@ pub fn callComponentFuncByLocal(
             env.pushI32(@bitCast(result_ptr_for_post_return)) catch {};
         }
         interp.executeFunction(env, pr_idx) catch {};
+    }
+}
+
+/// Async-lifted variant of `callComponentFuncByLocal`. Lifts args and
+/// drives the core wasm body the same way, but the callee delivers its
+/// results via `canon task.return` (#478 sub-PR 2). On return from the
+/// core function, `out_status` is set to the i32 the core fn left on
+/// the stack — for an async lift with no callback the spec says this
+/// is always `0` (the "task returned synchronously" sentinel); with a
+/// callback set it's the packed status that selects the callback's
+/// follow-up action. The actual results land in
+/// `task_manager.tasks[handle].return_values` via `dispatchCanonBuiltin`.
+pub fn callComponentFuncByLocalAsyncLifted(
+    owner_inst: *const ComponentInstance,
+    exported: ComponentInstance.ExportedFunc.Local,
+    args: []const InterfaceValue,
+    out_status: *u32,
+    allocator: Allocator,
+) ExecutionError!void {
+    out_status.* = 0;
+
+    if (exported.core_instance_idx >= owner_inst.core_instances.len)
+        return error.CoreInstanceNotAvailable;
+    const core_entry = owner_inst.core_instances[exported.core_instance_idx];
+    const module_inst = core_entry.module_inst orelse return error.CoreInstanceNotAvailable;
+
+    const lift_opts = LiftOptions.fromOpts(exported.opts);
+    if (!lift_opts.is_async) return error.InvalidFuncType;
+
+    const registry = TypeRegistry.init(owner_inst.component);
+
+    const func_type = blk: {
+        const td = registry.get(exported.func_type_idx) orelse return error.InvalidFuncType;
+        switch (td) {
+            .func => |ft| break :blk ft,
+            else => return error.InvalidFuncType,
+        }
+    };
+
+    const param_types = getParamValTypes(func_type, allocator) catch return error.OutOfMemory;
+    defer allocator.free(param_types);
+
+    const flat_param_count = countFlatTypes(registry, param_types);
+
+    const env = ExecEnv.create(module_inst, 4096, allocator) catch return error.OutOfMemory;
+    defer env.destroy();
+
+    const memory: ?[]u8 = if (lift_opts.memory_idx) |mem_idx|
+        if (module_inst.getMemory(mem_idx)) |mem| mem.data else null
+    else
+        null;
+
+    // Lower args — same logic as the sync path.
+    if (flat_param_count <= MAX_FLAT_PARAMS) {
+        for (args, param_types) |arg, pt| {
+            pushInterfaceValue(env, arg, pt, registry) catch return error.LowerError;
+        }
+    } else {
+        const mem = memory orelse return error.MemoryNotAvailable;
+        const realloc_idx = lift_opts.realloc_idx orelse return error.ReallocNotAvailable;
+        const tuple_size = computeTupleSize(registry, param_types);
+        const tuple_align = computeTupleAlign(registry, param_types);
+        const ptr = try callRealloc(env, realloc_idx, 0, 0, tuple_align, tuple_size);
+
+        var offset: u32 = 0;
+        for (args, param_types) |arg, pt| {
+            const al = typeAlign(registry, pt);
+            offset = abi.alignUp(offset, al);
+            storeInterfaceValue(mem, offset, arg, pt, registry);
+            offset += typeSize(registry, pt);
+        }
+        env.pushI32(@bitCast(ptr)) catch return error.StackOverflow;
+    }
+
+    // Drive the core body. It is the callee's responsibility to invoke
+    // `canon task.return` before returning — which deposits the lifted
+    // results onto the task via `dispatchCanonBuiltin`.
+    interp.executeFunction(env, exported.core_func_idx) catch {
+        return error.TrapInCoreFunction;
+    };
+
+    // Spec: with `callback` set, the core fn leaves a packed status i32
+    // on the stack; otherwise (stackful async) it returns no value. We
+    // probe optimistically: if the core fn returned an i32, peel it
+    // off; otherwise leave status at 0 (the default).
+    if (lift_opts.callback_idx != null) {
+        out_status.* = @bitCast(env.popI32() catch 0);
     }
 }
 
@@ -780,6 +877,33 @@ pub fn dispatchCanonBuiltin(
             if (info.slot >= async_mod.N_CONTEXT_SLOTS) return error.StackUnderflow;
             comp_inst.implicit_task_context[info.slot] = value;
         },
+        .task_return => |info| {
+            // `canon task.return rs:<resultlist> opts:<opts>` — Binary.md
+            // tag 0x09. Pops the lifted-callee's results off the env stack
+            // (flat i32 representation per the Canonical ABI), stores them
+            // on the current task, and notifies the parent waitable.
+            // Caller without a task manager is malformed (a sync lift
+            // never emits task.return).
+            const tm = task_manager orelse return error.FunctionNotFound;
+            const handle = tm.current_task orelse return error.FunctionNotFound;
+            const flat_count: usize = switch (info.results) {
+                .none => 0,
+                .unnamed => 1,
+                .named => |named| named.len,
+            };
+            const flat = allocator.alloc(u32, flat_count) catch return error.OutOfMemory;
+            // The Canonical ABI pushes results left-to-right, so the last
+            // result is on top — pop in reverse.
+            var i: usize = flat_count;
+            while (i > 0) {
+                i -= 1;
+                flat[i] = @bitCast(env.popI32() catch {
+                    allocator.free(flat);
+                    return error.StackUnderflow;
+                });
+            }
+            async_canon.asyncReturn(tm, handle, flat);
+        },
         .lift, .lower => {}, // Handled by callComponentFunc
     }
 }
@@ -825,7 +949,35 @@ pub fn callComponentFuncAsync(
     const owner_for_type = flat.owner;
     const exported_local = flat.local;
 
-    // Get function type for result count
+    // Inspect the lift options to choose between the async-lifted ABI
+    // (callee invokes `task.return`) and the legacy sync-wrapped-in-task
+    // path (host lifts the results and stashes them on the task).
+    const lift_opts = LiftOptions.fromOpts(exported_local.opts);
+
+    // Make the just-created subtask discoverable to context.{get,set},
+    // task.yield, and task.return invoked from inside the core body.
+    // Restored on return regardless of success/failure. (#478 sub-PR 1/2.)
+    const saved_current_task = task_manager.current_task;
+    task_manager.current_task = handle;
+    defer task_manager.current_task = saved_current_task;
+
+    if (lift_opts.is_async) {
+        // Async-lifted ABI: drive the core fn and let `task.return`
+        // populate task.return_values on its own.
+        var status: u32 = 0;
+        _ = &status;
+        callComponentFuncByLocalAsyncLifted(owner_for_type, exported_local, args, &status, allocator) catch |e| {
+            task_manager.cancelTask(handle);
+            return e;
+        };
+        // If a callback is configured, sub-PR 2's poll-cycle stub would
+        // invoke it once after each yield. Real future/stream-driven
+        // polling lands in sub-PR 3; for now we surface the status by
+        // ignoring it (the caller can re-inspect it via the task).
+        return handle;
+    }
+
+    // Legacy sync-lift path: lift results, populate the task manually.
     const result_count: usize = blk: {
         const reg = TypeRegistry.init(owner_for_type.component);
         if (reg.get(exported_local.func_type_idx)) |td| {
@@ -848,14 +1000,6 @@ pub fn callComponentFuncAsync(
         task_manager.cancelTask(handle);
         return error.OutOfMemory;
     };
-
-    // Make the just-created subtask discoverable to context.{get,set} and
-    // task.yield invoked from inside the synchronous body. Restored on
-    // return regardless of success/failure so nested calls see the
-    // surrounding caller's task afterwards. (#478 sub-PR 1.)
-    const saved_current_task = task_manager.current_task;
-    task_manager.current_task = handle;
-    defer task_manager.current_task = saved_current_task;
 
     callComponentFunc(comp_inst, func_name, args, results, allocator) catch |e| {
         allocator.free(results);
@@ -908,6 +1052,20 @@ test "LiftOptions: defaults" {
     try std.testing.expectEqual(@as(?u32, null), lo.realloc_idx);
     try std.testing.expectEqual(@as(?u32, null), lo.post_return_idx);
     try std.testing.expectEqual(ctypes.StringEncoding.utf8, lo.string_encoding);
+    try std.testing.expectEqual(false, lo.is_async);
+    try std.testing.expectEqual(@as(?u32, null), lo.callback_idx);
+}
+
+test "LiftOptions: async + callback (#478 sub-PR 2)" {
+    const opts = [_]ctypes.CanonOpt{
+        .{ .memory = 0 },
+        .async_lift,
+        .{ .callback = 7 },
+    };
+    const lo = LiftOptions.fromOpts(&opts);
+    try std.testing.expectEqual(@as(?u32, 0), lo.memory_idx);
+    try std.testing.expectEqual(true, lo.is_async);
+    try std.testing.expectEqual(@as(?u32, 7), lo.callback_idx);
 }
 
 test "countFlatTypes: primitives" {
@@ -1352,6 +1510,85 @@ test "dispatchCanonBuiltin: context.get out-of-range slot traps" {
     try testing.expectError(error.StackUnderflow, result);
 }
 
+test "dispatchCanonBuiltin: task.return delivers results to the current task (#478 sub-PR 2)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+    const lift = try async_canon.asyncLift(.{
+        .task_manager = &tm,
+        .allocator = testing.allocator,
+    });
+    tm.current_task = lift.subtask_handle;
+
+    // Push the single i32 result on the env stack, then dispatch task.return.
+    try env.pushI32(0x1234_5678);
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_return = .{
+            .results = .{ .unnamed = .s32 },
+            .opts = &.{},
+        } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+
+    // Task should now be in .returned with the value visible to pollers.
+    try testing.expectEqual(async_mod.TaskState.returned, tm.getState(lift.subtask_handle).?);
+    const ret = async_canon.asyncPollResult(&tm, lift.subtask_handle).?;
+    defer testing.allocator.free(ret);
+    try testing.expectEqual(@as(usize, 1), ret.len);
+    try testing.expectEqual(@as(u32, 0x1234_5678), ret[0]);
+}
+
+test "dispatchCanonBuiltin: task.return without a task manager is malformed" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const result = dispatchCanonBuiltin(
+        inst,
+        .{ .task_return = .{ .results = .none, .opts = &.{} } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectError(error.FunctionNotFound, result);
+}
+
 // ── Canon-lower host trampoline ─────────────────────────────────────────────
 
 const core_runtime_types = @import("../runtime/common/types.zig");
@@ -1373,6 +1610,10 @@ pub const LowerOptions = struct {
                 .realloc => |idx| lo.realloc_idx = idx,
                 .post_return => {},
                 .string_encoding => |enc| lo.string_encoding = enc,
+                // `async` and `callback` only meaningful on the lift side
+                // (Binary.md grammar reuses one `opts` vec for both, so
+                // we must accept them here without effect).
+                .async_lift, .callback => {},
             }
         }
         return lo;

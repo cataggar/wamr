@@ -398,6 +398,7 @@ pub const ComponentInstance = struct {
             .task_yield,
             .context_get,
             .context_set,
+            .task_return,
             => return null,
             .aliased => |alias_idx| {
                 const ie = self.component.aliases[alias_idx].instance_export;
@@ -2007,6 +2008,7 @@ fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) 
         .task_yield,
         .context_get,
         .context_set,
+        .task_return,
         .aliased,
         => null,
     };
@@ -2475,6 +2477,7 @@ fn resolveLiftedCoreFunc(
         .task_yield,
         .context_get,
         .context_set,
+        .task_return,
         => return null,
         .aliased => |alias_idx| {
             const a = component.aliases[alias_idx];

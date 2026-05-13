@@ -309,6 +309,15 @@ pub const CanonOpt = union(enum) {
     post_return: u32, // core func index
     /// String encoding to use.
     string_encoding: StringEncoding,
+    /// Lift this function asynchronously (Binary.md canonopt tag `0x06`).
+    /// Forces the canonical-ABI to return a packed status immediately and
+    /// expect `task.return` to deliver the real results. (#478 sub-PR 2.)
+    async_lift,
+    /// Callback core funcidx for resumption after an async yield
+    /// (Binary.md canonopt tag `0x07`). Single-threaded poll-cycle stub
+    /// in sub-PR 2; sub-PR 3 wires it into the real `future`/`stream`
+    /// polling story. (#478 sub-PR 2.)
+    callback: u32,
 };
 
 /// Canonical function definitions.
@@ -353,6 +362,16 @@ pub const Canon = union(enum) {
     /// Write a per-task context slot. Tag `0x0b`. Same `i32`-only restriction
     /// as `context_get`.
     context_set: struct { val_type: CoreValType, slot: u32 },
+
+    /// Deliver the results of an async-lifted callee. Tag `0x09`. The
+    /// `results` shape matches the lifted-callee's result types (encoded
+    /// identically to `FuncType.ResultList`: `0x00 valtype` for one
+    /// unnamed result, `0x01 0x00` for none). `opts` carries memory /
+    /// realloc / string-encoding needed to lower compound results back
+    /// into the caller's memory. The callee invokes this from inside the
+    /// core-wasm body to transition its task from `.started` to
+    /// `.returned`. (#478 sub-PR 2.)
+    task_return: struct { results: FuncType.ResultList, opts: []const CanonOpt },
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────

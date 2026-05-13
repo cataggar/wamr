@@ -258,6 +258,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                         .task_yield,
                         .context_get,
                         .context_set,
+                        .task_return,
                         => true,
                         .lift => false,
                     };
@@ -715,6 +716,23 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
             };
             break :blk .{ .task_yield = .{ .cancellable = cancellable } };
         },
+        0x09 => blk: {
+            // canon task.return rs:<resultlist> opts:<opts>. The resultlist
+            // shares its encoding with `FuncType` results (see parseTypeDef
+            // 0x40 above).
+            const result_tag = try reader.readByte();
+            const results: ctypes.FuncType.ResultList = switch (result_tag) {
+                0x00 => .{ .unnamed = try readValType(reader) },
+                0x01 => blk2: {
+                    const zero = try reader.readByte();
+                    if (zero != 0x00) return error.InvalidEncoding;
+                    break :blk2 .none;
+                },
+                else => return error.InvalidEncoding,
+            };
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .task_return = .{ .results = results, .opts = opts } };
+        },
         else => error.InvalidEncoding,
     };
 }
@@ -745,6 +763,8 @@ fn readCanonOpts(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
             0x03 => .{ .memory = try reader.readU32() },
             0x04 => .{ .realloc = try reader.readU32() },
             0x05 => .{ .post_return = try reader.readU32() },
+            0x06 => .async_lift,
+            0x07 => .{ .callback = try reader.readU32() },
             else => return error.InvalidEncoding,
         };
     }
@@ -968,6 +988,39 @@ test "parseCanon: context.get rejects non-i32 valtype" {
 
 test "parseCanon: context.set rejects non-i32 valtype" {
     var reader = BinaryReader{ .data = &[_]u8{ 0x0b, 0x7D, 0x00 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
+}
+
+test "readCanonOpts: async_lift + callback opts (#478 sub-PR 2)" {
+    // count=2, [0x06], [0x07 0x09]
+    var reader = BinaryReader{ .data = &[_]u8{ 0x02, 0x06, 0x07, 0x09 } };
+    const opts = try readCanonOpts(&reader, std.testing.allocator);
+    defer std.testing.allocator.free(opts);
+    try std.testing.expectEqual(@as(usize, 2), opts.len);
+    try std.testing.expect(opts[0] == .async_lift);
+    try std.testing.expect(opts[1] == .callback);
+    try std.testing.expectEqual(@as(u32, 9), opts[1].callback);
+}
+
+test "parseCanon: task.return with one unnamed i32 result" {
+    // tag 0x09, resultlist `0x00 0x7F` (unnamed i32 valtype), no opts (count=0)
+    var reader = BinaryReader{ .data = &[_]u8{ 0x09, 0x00, 0x7F, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_return);
+    try std.testing.expect(c.task_return.results == .unnamed);
+    try std.testing.expectEqual(@as(usize, 0), c.task_return.opts.len);
+}
+
+test "parseCanon: task.return with no results" {
+    // tag 0x09, resultlist `0x01 0x00`, no opts.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x09, 0x01, 0x00, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_return);
+    try std.testing.expect(c.task_return.results == .none);
+}
+
+test "parseCanon: task.return rejects malformed resultlist" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x09, 0x02, 0x7F, 0x00 } };
     try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
 }
 
