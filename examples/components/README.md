@@ -20,10 +20,12 @@ examples/components/
 ├── README.md                       (this file)
 ├── stdio-echo/                     (existing Rust example, see #156)
 ├── zig-hello/                      smallest end-to-end Zig command
+├── zig-exit/                       exercises preview1 proc_exit → cli/exit (#436)
 ├── zig-adder/                      library exporting docs:adder/add@0.1.0
 ├── zig-calculator-cmd/             Zig command importing docs:adder
-└── mixed-zig-rust-calc/            Zig adder + Rust command, composed
-    └── command/                    cargo + wit-bindgen, wasm32-wasip1
+├── mixed-zig-rust-calc/            Zig adder + Rust command, composed
+│   └── command/                    cargo + wit-bindgen, wasm32-wasip1
+└── zig-http/                       Zig wasi:http/incoming-handler (WIP, see cataggar/wabt#191)
 ```
 
 Each example directory has its own `README.md` with example-specific
@@ -64,9 +66,11 @@ zig-out/component-examples/
 | Example                   | Builds | Validates | Runs in wamr today | Notes                                                      |
 |---------------------------|:------:|:---------:|:------------------:|------------------------------------------------------------|
 | `zig-hello`               |   ✓    |     ✓     |         ✓          | End-to-end (greeting written via the captured-stdout flush). |
+| `zig-exit`                |   ✓    |     ✓     |         ✓          | Exercises `proc_exit(7)` → `wasi:cli/exit.exit-with-code(7)` (#436). |
 | `zig-adder`               |   ✓    |     ✓     |        n/a         | Library component — no `wasi:cli/run`.                     |
 | `zig-calculator-cmd` (composed) | ✓ |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
 | `mixed-zig-rust-calc`     |   ✓    |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
+| `zig-http`                |   —    |     —     |         —          | WIT skeleton only — `wabt component new` blocks on [cataggar/wabt#191](https://github.com/cataggar/wabt/issues/191). See `zig-http/README.md`. |
 
 All composed examples produce valid components that run in
 [Wasmtime][wasmtime] and on wamr today. `wabt component compose` emits

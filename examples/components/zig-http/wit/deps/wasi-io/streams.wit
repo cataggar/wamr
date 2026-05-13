@@ -1,0 +1,34 @@
+// Trimmed `wasi:io/streams@0.2.6` — only the output-stream surface
+// the zig-http handler imports. Sorts first (and only) in this
+// directory so it carries the package declaration.
+//
+// The handler imports `[method]output-stream.blocking-write-and-flush`
+// to push the body bytes, and `[resource-drop]output-stream` is
+// synthesized by cataggar/wabt's canon stage for every resource.
+// We deliberately omit `input-stream`, `subscribe`, `check-write`,
+// and the `stream-error.last-operation-failed(own<error>)` arm
+// (which would require pulling `wasi:io/error` into the dep
+// graph) — the catch-all `closed` arm is enough to make the
+// `result<_, stream-error>` return type valid, and wamr's host
+// resolves the success path on every legitimate write.
+//
+// Plain `//` comments before `package` per cataggar/wabt#192.
+package wasi:io@0.2.6;
+
+interface streams {
+    /// Reduced stream-error variant. Upstream defines
+    /// `last-operation-failed(own<error>)` referencing
+    /// `wasi:io/error` — we drop that arm to keep the dep graph
+    /// down to just `wasi:io/streams`. `closed` alone is enough to
+    /// make `result<_, stream-error>` valid for the host's
+    /// `[method]output-stream.blocking-write-and-flush` import.
+    variant stream-error {
+        closed,
+    }
+
+    resource output-stream {
+        blocking-write-and-flush: func(
+            contents: list<u8>
+        ) -> result<_, stream-error>;
+    }
+}
