@@ -2461,6 +2461,12 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
 /// contain no calls — a call can `global_set` through the callee.
 /// Wasm locals are function-private, so calls cannot mutate them and
 /// `local_get` only needs `local_set` exclusion.
+///
+/// When the loop lacks a dedicated `.br`-terminated preheader (either no
+/// preheader at all, or a `br_if` / `br_table` entry, or multiple
+/// non-loop predecessors), a preheader is synthesized in-place by
+/// retargeting each non-loop predecessor's header edge through a fresh
+/// `.br header` block. See `synthesizeLoopPreheader`.
 pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
@@ -2488,27 +2494,7 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
 
     var changed = false;
     for (lf.loops) |*loop| {
-        const header_preds = predecessors.get(loop.header) orelse continue;
-        var preheader: ?ir.BlockId = null;
-        for (header_preds) |p| {
-            if (!loop.containsBlock(p)) {
-                if (preheader != null) {
-                    preheader = null;
-                    break;
-                }
-                preheader = p;
-            }
-        }
-        const ph = preheader orelse continue;
-        const ph_insts = func.blocks.items[ph].instructions.items;
-        if (ph_insts.len == 0) continue;
-        switch (ph_insts[ph_insts.len - 1].op) {
-            .br => |t| {
-                if (t != loop.header) continue;
-            },
-            else => continue,
-        }
-        if (!dom.dominates(ph, loop.header)) continue;
+        const ph = (try obtainLoopPreheader(func, loop, &predecessors, &dom, allocator)) orelse continue;
 
         // One-shot scan of the loop body: which wasm-local / wasm-global
         // indices are written, and does the body contain any call?
@@ -2580,6 +2566,131 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
         }
     }
     return changed;
+}
+
+/// Resolve a dedicated preheader for `loop`: either an existing block
+/// whose sole terminator is `.br loop.header` and which dominates the
+/// header, or — failing that — a freshly synthesized one. Returns
+/// `null` only when the loop header has no non-loop predecessor at all
+/// (i.e., the header is unreachable from outside the loop).
+fn obtainLoopPreheader(
+    func: *ir.IrFunction,
+    loop: *const analysis.Loop,
+    predecessors: *std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    dom: *const analysis.DomTree,
+    allocator: std.mem.Allocator,
+) !?ir.BlockId {
+    const header_preds = predecessors.get(loop.header) orelse return null;
+
+    var unique_non_loop_pred: ?ir.BlockId = null;
+    var multiple_non_loop = false;
+    var any_non_loop = false;
+    for (header_preds) |p| {
+        if (loop.containsBlock(p)) continue;
+        any_non_loop = true;
+        if (unique_non_loop_pred != null) {
+            multiple_non_loop = true;
+        } else {
+            unique_non_loop_pred = p;
+        }
+    }
+    if (!any_non_loop) return null;
+
+    if (!multiple_non_loop) {
+        if (unique_non_loop_pred) |p| {
+            const ph_insts = func.blocks.items[p].instructions.items;
+            if (ph_insts.len > 0) {
+                const last = ph_insts[ph_insts.len - 1];
+                const is_clean_br = switch (last.op) {
+                    .br => |t| t == loop.header,
+                    else => false,
+                };
+                if (is_clean_br and dom.dominates(p, loop.header)) {
+                    return p;
+                }
+            }
+        }
+    }
+
+    return try synthesizeLoopPreheader(func, loop, header_preds, predecessors, allocator);
+}
+
+/// Allocate a fresh block, retarget every non-loop predecessor's
+/// header-bound edge through it, and emit `.br loop.header` as its
+/// sole instruction. The synthesized block trivially dominates the
+/// header by construction.
+///
+/// `predecessors` is updated in-place: the new block's pred list is
+/// the set of non-loop preds, and the header's pred list now lists
+/// the new block in place of those preds (latches preserved).
+fn synthesizeLoopPreheader(
+    func: *ir.IrFunction,
+    loop: *const analysis.Loop,
+    header_preds: []const ir.BlockId,
+    predecessors: *std.AutoHashMap(ir.BlockId, []const ir.BlockId),
+    allocator: std.mem.Allocator,
+) !?ir.BlockId {
+    var non_loop_preds: std.ArrayList(ir.BlockId) = .empty;
+    defer non_loop_preds.deinit(allocator);
+    for (header_preds) |p| {
+        if (!loop.containsBlock(p)) try non_loop_preds.append(allocator, p);
+    }
+    if (non_loop_preds.items.len == 0) return null;
+
+    const ph_new: ir.BlockId = try func.newBlock();
+    try func.blocks.items[ph_new].append(.{ .op = .{ .br = loop.header } });
+
+    for (non_loop_preds.items) |p| {
+        const pred_block = &func.blocks.items[p];
+        const ninsts = pred_block.instructions.items.len;
+        if (ninsts == 0) continue;
+        const term = &pred_block.instructions.items[ninsts - 1];
+        switch (term.op) {
+            .br => |t| if (t == loop.header) {
+                term.op = .{ .br = ph_new };
+            },
+            .br_if => |*bi| {
+                if (bi.then_block == loop.header) bi.then_block = ph_new;
+                if (bi.else_block == loop.header) bi.else_block = ph_new;
+            },
+            .br_table => |*bt| {
+                if (bt.default == loop.header) bt.default = ph_new;
+                var has_header_target = false;
+                for (bt.targets) |t| {
+                    if (t == loop.header) {
+                        has_header_target = true;
+                        break;
+                    }
+                }
+                if (has_header_target) {
+                    const new_targets = try allocator.alloc(ir.BlockId, bt.targets.len);
+                    for (bt.targets, 0..) |t, idx| {
+                        new_targets[idx] = if (t == loop.header) ph_new else t;
+                    }
+                    try func.owned_br_table_targets.append(allocator, new_targets);
+                    bt.targets = new_targets;
+                }
+            },
+            else => {},
+        }
+    }
+
+    const ph_preds = try allocator.alloc(ir.BlockId, non_loop_preds.items.len);
+    @memcpy(ph_preds, non_loop_preds.items);
+    try predecessors.put(ph_new, ph_preds);
+
+    var header_remaining: std.ArrayList(ir.BlockId) = .empty;
+    defer header_remaining.deinit(allocator);
+    for (header_preds) |p| {
+        if (loop.containsBlock(p)) try header_remaining.append(allocator, p);
+    }
+    try header_remaining.append(allocator, ph_new);
+    const new_header_preds = try allocator.alloc(ir.BlockId, header_remaining.items.len);
+    @memcpy(new_header_preds, header_remaining.items);
+    if (predecessors.fetchRemove(loop.header)) |kv| allocator.free(kv.value);
+    try predecessors.put(loop.header, new_header_preds);
+
+    return ph_new;
 }
 
 const DefSite = struct { block: ir.BlockId, inst: usize };
@@ -7315,6 +7426,219 @@ test "hoistLoopInvariantCode: cascading via hoisted local_get exposes invariant 
         }
     }
     try std.testing.expect(ph_has_add);
+}
+
+test "hoistLoopInvariantCode: preheader synthesized when entry is br_if" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const b_entry = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    // Entry block conditionally enters the loop via br_if — no dedicated
+    // preheader exists, so Stage A would skip this loop entirely.
+    const v_gate = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_gate, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_a, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .br_if = .{ .cond = v_gate, .then_block = b_header, .else_block = b_exit } } });
+
+    // Loop body computes an invariant add and a self-edge back to header.
+    const v_sum = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b_header).append(.{ .op = .{ .add = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_sum, .type = .i32 });
+    try func.getBlock(b_header).append(.{ .op = .{ .eqz = v_sum }, .dest = v_cond });
+    try func.getBlock(b_header).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_exit, .else_block = b_header } } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_a } });
+
+    const blocks_before = func.blocks.items.len;
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+    // A fresh preheader block must have been synthesized.
+    try std.testing.expect(func.blocks.items.len == blocks_before + 1);
+
+    // The entry's br_if must no longer point directly at the header on
+    // its then-branch; instead, it routes through the synthesized
+    // preheader. The else-branch (going to b_exit) must be untouched.
+    const entry_term = func.getBlock(b_entry).instructions.items[func.getBlock(b_entry).instructions.items.len - 1];
+    try std.testing.expect(entry_term.op == .br_if);
+    try std.testing.expect(entry_term.op.br_if.then_block != b_header);
+    try std.testing.expect(entry_term.op.br_if.else_block == b_exit);
+    const ph_new = entry_term.op.br_if.then_block;
+
+    // The synthesized preheader has `add` (hoisted) followed by `.br header`.
+    const ph_block = func.getBlock(ph_new);
+    var ph_has_add = false;
+    var ph_last_is_br_header = false;
+    for (ph_block.instructions.items, 0..) |inst, idx| {
+        if (inst.op == .add) ph_has_add = true;
+        if (idx == ph_block.instructions.items.len - 1) {
+            ph_last_is_br_header = (inst.op == .br and inst.op.br == b_header);
+        }
+    }
+    try std.testing.expect(ph_has_add);
+    try std.testing.expect(ph_last_is_br_header);
+
+    // Body must no longer contain the hoisted add.
+    var body_has_add = false;
+    for (func.getBlock(b_header).instructions.items) |inst| {
+        if (inst.op == .add) {
+            body_has_add = true;
+            break;
+        }
+    }
+    try std.testing.expect(!body_has_add);
+}
+
+test "hoistLoopInvariantCode: preheader synthesized when loop has two non-loop entries" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b_split = try func.newBlock();
+    const b_left = try func.newBlock();
+    const b_right = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    // Split into two paths that both `.br` directly into the header.
+    const v_gate = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try func.getBlock(b_split).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_gate, .type = .i32 });
+    try func.getBlock(b_split).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_a, .type = .i32 });
+    try func.getBlock(b_split).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_b, .type = .i32 });
+    try func.getBlock(b_split).append(.{ .op = .{ .br_if = .{ .cond = v_gate, .then_block = b_left, .else_block = b_right } } });
+    try func.getBlock(b_left).append(.{ .op = .{ .br = b_header } });
+    try func.getBlock(b_right).append(.{ .op = .{ .br = b_header } });
+
+    const v_sum = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b_header).append(.{ .op = .{ .add = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_sum, .type = .i32 });
+    try func.getBlock(b_header).append(.{ .op = .{ .eqz = v_sum }, .dest = v_cond });
+    try func.getBlock(b_header).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_exit, .else_block = b_header } } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_a } });
+
+    const blocks_before = func.blocks.items.len;
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expect(func.blocks.items.len == blocks_before + 1);
+
+    // Both predecessor branches must now route through the new preheader,
+    // not directly to b_header.
+    const left_term = func.getBlock(b_left).instructions.items[0];
+    const right_term = func.getBlock(b_right).instructions.items[0];
+    try std.testing.expect(left_term.op == .br);
+    try std.testing.expect(right_term.op == .br);
+    try std.testing.expect(left_term.op.br != b_header);
+    try std.testing.expect(right_term.op.br != b_header);
+    try std.testing.expect(left_term.op.br == right_term.op.br); // same preheader
+
+    // Hoisted add lives in the synthesized preheader; loop body free of it.
+    const ph_new = left_term.op.br;
+    var ph_has_add = false;
+    for (func.getBlock(ph_new).instructions.items) |inst| {
+        if (inst.op == .add) {
+            ph_has_add = true;
+            break;
+        }
+    }
+    try std.testing.expect(ph_has_add);
+
+    var body_has_add = false;
+    for (func.getBlock(b_header).instructions.items) |inst| {
+        if (inst.op == .add) {
+            body_has_add = true;
+            break;
+        }
+    }
+    try std.testing.expect(!body_has_add);
+}
+
+test "hoistLoopInvariantCode: preheader synthesized when entry is br_table" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b_entry = try func.newBlock();
+    const b_other = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_idx = func.newVReg();
+    const v_a = func.newVReg();
+    const v_b = func.newVReg();
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_idx, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_a, .type = .i32 });
+    try func.getBlock(b_entry).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v_b, .type = .i32 });
+
+    // br_table with header appearing both in `targets` and as `default`.
+    const targets = try allocator.alloc(ir.BlockId, 2);
+    targets[0] = b_header;
+    targets[1] = b_other;
+    try func.owned_br_table_targets.append(allocator, targets);
+    try func.getBlock(b_entry).append(.{ .op = .{ .br_table = .{ .index = v_idx, .targets = targets, .default = b_header } } });
+
+    try func.getBlock(b_other).append(.{ .op = .{ .br = b_exit } });
+
+    const v_sum = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b_header).append(.{ .op = .{ .add = .{ .lhs = v_a, .rhs = v_b } }, .dest = v_sum, .type = .i32 });
+    try func.getBlock(b_header).append(.{ .op = .{ .eqz = v_sum }, .dest = v_cond });
+    try func.getBlock(b_header).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_exit, .else_block = b_header } } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_a } });
+
+    const blocks_before = func.blocks.items.len;
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expect(func.blocks.items.len == blocks_before + 1);
+
+    // br_table default and matching target are rewritten away from header.
+    const entry_term = func.getBlock(b_entry).instructions.items[func.getBlock(b_entry).instructions.items.len - 1];
+    try std.testing.expect(entry_term.op == .br_table);
+    try std.testing.expect(entry_term.op.br_table.default != b_header);
+    try std.testing.expect(entry_term.op.br_table.targets[0] != b_header);
+    try std.testing.expect(entry_term.op.br_table.targets[1] == b_other);
+    try std.testing.expect(entry_term.op.br_table.default == entry_term.op.br_table.targets[0]);
+
+    const ph_new = entry_term.op.br_table.default;
+    var ph_has_add = false;
+    for (func.getBlock(ph_new).instructions.items) |inst| {
+        if (inst.op == .add) {
+            ph_has_add = true;
+            break;
+        }
+    }
+    try std.testing.expect(ph_has_add);
+}
+
+test "hoistLoopInvariantCode: existing dedicated preheader not duplicated" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 20 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v2 }, .dest = v3 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v3, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v2 } });
+
+    const blocks_before = func.blocks.items.len;
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+    // No new block needed when an existing clean preheader is present.
+    try std.testing.expect(func.blocks.items.len == blocks_before);
 }
 
 test "inductionVariableSimplification: single induction address is strength reduced" {
