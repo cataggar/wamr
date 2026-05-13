@@ -5501,10 +5501,15 @@ const DfsEntry = struct { block: ir.BlockId, child_idx: usize };
 ///   * Successor lists are sorted ascending by callee frequency before the
 ///     DFS, which causes the hottest successor to land directly after its
 ///     parent in the reversed post-order.
-///   * "Cold" blocks — those containing `.@"unreachable"` *or* whose
-///     estimated frequency is below 10% of the entry's — are moved to the
-///     end of the layout, preserving relative RPO order within each
-///     hot/cold group.
+///   * "Cold" blocks — those containing `.@"unreachable"` — are moved
+///     to the end of the layout, preserving relative RPO order within
+///     each hot/cold group.
+///
+/// The original PR #443 also sank blocks whose estimated frequency fell
+/// below 10% of the entry's, but that broke the def-precedes-use flat
+/// order invariant on which `computeLiveRangesWithOrder` relies whenever
+/// a "cold" block contained an SSA def feeding a hot successor — surfaced
+/// as an x86_64 CoreMark AOT trap. See issue #393 PR #443 follow-up.
 ///
 /// Returns a permutation of all BlockIds (caller owns the slice).
 /// Block 0 (entry) is always first. Unreachable blocks are appended at the
@@ -5606,15 +5611,16 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
     // Reverse → RPO
     std.mem.reverse(ir.BlockId, post_order.items);
 
-    // Detect cold blocks: either they contain `.@"unreachable"` (a hard
-    // signal — these are dead-end traps that should never execute on a
-    // hot path) or their estimated frequency falls below 10% of the entry
-    // frequency. The entry itself is always kept hot.
+    // Detect cold blocks: blocks containing `.@"unreachable"` — dead-end
+    // traps that should never execute on a hot path. The freq-based
+    // threshold from the original PR #443 was reverted because it could
+    // sink blocks containing SSA defs used by hot successors, breaking
+    // the def-precedes-use flat-order invariant `computeLiveRangesWithOrder`
+    // relies on (issue #393, supervisor note on PR #443).
     const is_cold = try allocator.alloc(bool, n);
     defer allocator.free(is_cold);
     @memset(is_cold, false);
 
-    const cold_threshold: f32 = freq[0] * 0.1;
     for (func.blocks.items, 0..) |block, idx| {
         // `.@"unreachable"` always sinks.
         for (block.instructions.items) |inst| {
@@ -5622,12 +5628,6 @@ pub fn reorderBlocks(func: *const ir.IrFunction, allocator: std.mem.Allocator) !
                 is_cold[idx] = true;
                 break;
             }
-        }
-        // Frequency-based cold: must have non-zero (reachable) freq below
-        // threshold. Zero-frequency blocks are unreachable and handled
-        // separately via the !visited check below.
-        if (!is_cold[idx] and freq[idx] > 0.0 and freq[idx] < cold_threshold) {
-            is_cold[idx] = true;
         }
     }
     // Entry block is never treated as cold.
