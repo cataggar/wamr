@@ -2453,6 +2453,14 @@ pub fn hoistLoopBoundsChecks(func: *ir.IrFunction, allocator: std.mem.Allocator)
 /// ALL operand VRegs are defined outside the loop body.  Iterates to
 /// a fixed point so cascading works (e.g. hoisting a constant exposes
 /// an add that depends on it).
+///
+/// `local_get` and `global_get` are not in `isPure` (they read external
+/// state, not a pure VReg computation) but are still safe to hoist when
+/// the corresponding wasm-local / wasm-global is never written inside
+/// the loop. For `global_get` we additionally require the loop body to
+/// contain no calls — a call can `global_set` through the callee.
+/// Wasm locals are function-private, so calls cannot mutate them and
+/// `local_get` only needs `local_set` exclusion.
 pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     if (func.blocks.items.len == 0) return false;
 
@@ -2502,6 +2510,24 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
         }
         if (!dom.dominates(ph, loop.header)) continue;
 
+        // One-shot scan of the loop body: which wasm-local / wasm-global
+        // indices are written, and does the body contain any call?
+        var set_locals = std.AutoHashMap(u32, void).init(allocator);
+        defer set_locals.deinit();
+        var set_globals = std.AutoHashMap(u32, void).init(allocator);
+        defer set_globals.deinit();
+        var loop_has_call = false;
+        for (loop.blocks) |bid| {
+            for (func.blocks.items[bid].instructions.items) |inst| {
+                switch (inst.op) {
+                    .local_set => |ls| try set_locals.put(ls.idx, {}),
+                    .global_set => |gs| try set_globals.put(gs.idx, {}),
+                    .call, .call_indirect, .call_ref => loop_has_call = true,
+                    else => {},
+                }
+            }
+        }
+
         var any = true;
         while (any) {
             any = false;
@@ -2510,7 +2536,21 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
                 var i: usize = 0;
                 while (i < block.instructions.items.len) {
                     const inst = block.instructions.items[i];
-                    if (inst.dest == null or !isPure(inst) or hasSideEffect(inst)) {
+
+                    // local_get / global_get are not in `isPure` because
+                    // they read external state, but are safe to hoist
+                    // under the per-loop invariance conditions above.
+                    const is_invariant_local_get = switch (inst.op) {
+                        .local_get => |idx| !set_locals.contains(idx),
+                        else => false,
+                    };
+                    const is_invariant_global_get = switch (inst.op) {
+                        .global_get => |idx| !loop_has_call and !set_globals.contains(idx),
+                        else => false,
+                    };
+                    const eligible_by_kind = is_invariant_local_get or is_invariant_global_get or
+                        (inst.dest != null and isPure(inst) and !hasSideEffect(inst));
+                    if (!eligible_by_kind) {
                         i += 1;
                         continue;
                     }
@@ -7047,6 +7087,234 @@ test "hoistLoopInvariantCode: trapping op not hoisted" {
     const changed = try hoistLoopInvariantCode(&func, allocator);
     try std.testing.expect(!changed);
     try std.testing.expect(func.getBlock(b1).instructions.items[0].op == .div_u);
+}
+
+test "hoistLoopInvariantCode: local_get hoisted when idx never set in loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    // preheader: br loop_header
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // loop body reads local 0 (never written in loop) and branches back.
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v0 }, .dest = v1 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v0 } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+
+    var ph_has_local_get = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .local_get) {
+            ph_has_local_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(ph_has_local_get);
+
+    var body_has_local_get = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .local_get) {
+            body_has_local_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(!body_has_local_get);
+}
+
+test "hoistLoopInvariantCode: local_get NOT hoisted when idx is local_set in loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // loop body reads AND writes local 0, so local_get is not invariant.
+    const v0 = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_next }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_next } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    // local_get must remain inside the loop body; add+iconst are also not
+    // invariant (add depends on the loop-modified local).
+    var body_has_local_get = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .local_get) {
+            body_has_local_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(body_has_local_get);
+
+    var ph_has_local_get = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .local_get) {
+            ph_has_local_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(!ph_has_local_get);
+}
+
+test "hoistLoopInvariantCode: global_get hoisted when idx never set in loop and no calls" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .global_get = 3 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v0 }, .dest = v1 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v0 } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+
+    var ph_has_global_get = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .global_get) {
+            ph_has_global_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(ph_has_global_get);
+
+    var body_has_global_get = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .global_get) {
+            body_has_global_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(!body_has_global_get);
+}
+
+test "hoistLoopInvariantCode: global_get NOT hoisted when idx is global_set in loop" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v0 = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .global_get = 7 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .global_set = .{ .idx = 7, .val = v_next } } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_next }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_next } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var body_has_global_get = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .global_get) {
+            body_has_global_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(body_has_global_get);
+}
+
+test "hoistLoopInvariantCode: global_get NOT hoisted when loop contains a call" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    // The call has no args and no result captured here; its presence alone
+    // is what blocks hoisting global_get (the callee may global_set).
+    try func.getBlock(b1).append(.{ .op = .{ .global_get = 2 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .call = .{ .func_idx = 0 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v0 }, .dest = v1 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v1, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v0 } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var body_has_global_get = false;
+    for (func.getBlock(b1).instructions.items) |inst| {
+        if (inst.op == .global_get) {
+            body_has_global_get = true;
+            break;
+        }
+    }
+    try std.testing.expect(body_has_global_get);
+}
+
+test "hoistLoopInvariantCode: cascading via hoisted local_get exposes invariant add" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 1);
+    defer func.deinit();
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_k = func.newVReg();
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v_k, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    // local_get of an untouched local + add with an external constant.
+    // After local_get hoists, the add becomes loop-invariant and cascades.
+    const v_lg = func.newVReg();
+    const v_sum = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b1).append(.{ .op = .{ .local_get = 0 }, .dest = v_lg, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_lg, .rhs = v_k } }, .dest = v_sum, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .eqz = v_sum }, .dest = v_cond });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b2, .else_block = b1 } } });
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_sum } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+
+    var ph_has_add = false;
+    for (func.getBlock(b0).instructions.items) |inst| {
+        if (inst.op == .add) {
+            ph_has_add = true;
+            break;
+        }
+    }
+    try std.testing.expect(ph_has_add);
 }
 
 test "inductionVariableSimplification: single induction address is strength reduced" {
