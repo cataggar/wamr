@@ -93,26 +93,5 @@ runs:
 
         echo "::notice::wasi-sdk-25 installed on Windows"
 
-    - name: Install wabt via ghr (Ubuntu, macOS)
-      if: ${{ startsWith(inputs.os, 'ubuntu') || startsWith(inputs.os, 'macos') }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        # ghr-bin downloads sha256-verified GitHub release archives and
-        # links the chosen binary into ~/.local/bin. Pin both versions.
-        pipx install ghr-bin==0.1.6
-        ghr install cataggar/wabt@v3.0.0-dev.4
-        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-        "$HOME/.local/bin/wabt" version
-        echo "::notice::cataggar/wabt v3.0.0-dev.4 installed on ${{ inputs.os }}"
-
-    - name: Install wabt via ghr (Windows)
-      if: ${{ startsWith(inputs.os, 'windows') }}
-      shell: pwsh
-      run: |
-        $ErrorActionPreference = "Stop"
-        pipx install ghr-bin==0.1.6
-        ghr install cataggar/wabt@v3.0.0-dev.4
-        Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
-        & "$env:USERPROFILE\.local\bin\wabt.exe" version
-        Write-Host "::notice::cataggar/wabt v3.0.0-dev.4 installed on Windows"
+    - name: Install wabt via ghr
+      uses: ./.github/actions/wabt-install
