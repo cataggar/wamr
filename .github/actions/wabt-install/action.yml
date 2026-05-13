@@ -1,0 +1,55 @@
+name: 'Install cataggar/wabt CLI'
+description: |
+  Installs `wabt` from a pinned cataggar/wabt release into ~/.local/bin (and
+  prepends it to GITHUB_PATH) using `ghr install`. Forwards `GH_TOKEN` so the
+  GitHub API calls `ghr` makes use the workflow's authenticated 5000/hr quota
+  instead of the unauthenticated 60/hr-per-IP limit observed flaking on
+  Azure-hosted runners that share IPs across tenants.
+
+  Used by `.github/workflows/copilot-setup-steps.yml` and the
+  `component-examples` / `component-examples-wasmtime` jobs in
+  `.github/workflows/ci.yml`. The `install-wasi-sdk-wabt` composite also
+  delegates here for its wabt half so the pin lives in one place.
+
+inputs:
+  version:
+    description: |
+      cataggar/wabt release tag (e.g. v3.0.0-dev.6). Bump the default here to
+      roll the pinned version across every caller.
+    required: false
+    default: 'v3.0.0-dev.6'
+
+runs:
+  using: composite
+  steps:
+    - name: Install wabt via ghr (Linux + macOS)
+      if: runner.os != 'Windows'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WABT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # ghr-bin is a tiny PyPI wrapper that downloads sha256-verified
+        # GitHub release archives and links the chosen binary into
+        # ~/.local/bin. pipx is preinstalled on ubuntu-latest; pip is
+        # blocked by PEP 668. Pin both ghr-bin and the wabt release.
+        pipx install ghr-bin==0.1.6
+        ghr install "cataggar/wabt@${WABT_VERSION}"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/wabt" version
+        echo "::notice::cataggar/wabt ${WABT_VERSION} installed"
+
+    - name: Install wabt via ghr (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        GH_TOKEN: ${{ github.token }}
+        WABT_VERSION: ${{ inputs.version }}
+      run: |
+        $ErrorActionPreference = "Stop"
+        pipx install ghr-bin==0.1.6
+        ghr install "cataggar/wabt@$env:WABT_VERSION"
+        Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.local\bin"
+        & "$env:USERPROFILE\.local\bin\wabt.exe" version
+        Write-Host "::notice::cataggar/wabt $env:WABT_VERSION installed"

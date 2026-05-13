@@ -9255,8 +9255,17 @@ pub const RunComponentError = error{
 
 pub const RunOutcome = struct {
     /// The component exited normally. `is_ok=true` means run returned ok;
-    /// false means the component returned `result::error(_)`.
+    /// false means the component returned `result::error(_)` or
+    /// trapped via `wasi:cli/exit.exit{,-with-code}` / preview1
+    /// `proc_exit` with a nonzero code.
     is_ok: bool,
+    /// Numeric exit code recorded when the component called
+    /// `wasi:cli/exit.exit-with-code(rc)` (or the preview1
+    /// `proc_exit(rc)` path, which the wasm-tools adapter rewrites into
+    /// `exit-with-code`). `null` on a normal return — callers should
+    /// fall back to `is_ok` in that case. When set, the CLI translates
+    /// it into the host process exit code (saturated to `u8`).
+    exit_code: ?u32 = null,
 };
 
 /// Whether a component import name matches a WASI interface prefix,
@@ -9604,8 +9613,10 @@ pub fn runLoadedComponent(
         } };
     } else |_| {
         // `wasi:cli/exit.{exit, exit-with-code}` traps after stashing
-        // a code on the adapter; translate that into a normal outcome.
-        if (adapter.exit_code) |code| return .{ .is_ok = code == 0 };
+        // a code on the adapter; translate that into a normal outcome
+        // that carries the numeric exit code so the CLI can mirror it
+        // into the host process exit code (see issue #436).
+        if (adapter.exit_code) |code| return .{ .is_ok = code == 0, .exit_code = code };
         return error.Trap;
     }
 }

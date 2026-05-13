@@ -486,6 +486,13 @@ pub const CompileOptions = struct {
     /// Use the Stage-B SIMD V-register linear-scan allocator.
     /// When disabled, v128 codegen falls back to V128StackMap/V128RegCache.
     enable_vreg_alloc: bool = true,
+    /// Run the post-allocation move-coalescing pass (issue #386). After
+    /// `regalloc.allocateFromRangesWithHints` assigns physregs, walk the
+    /// IR for copy-like ops (currently `.reinterpret`) and retarget the
+    /// dest vreg onto the source vreg's physreg when no live-range
+    /// conflict prevents it. The emit-time `if (src != dest) movRegReg`
+    /// guard then elides the now-redundant mov entirely.
+    enable_move_coalesce: bool = true,
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -1146,6 +1153,26 @@ pub fn compileFunctionImpl(
             scalar_live_ranges.items,
             hint_points.items,
         );
+
+        // Post-allocation move coalescing (issue #386). Retarget the
+        // dest vreg of each copy-like IR op (.reinterpret) onto its
+        // source vreg's physreg when safe, so the emit-time guard
+        // `if (src != dest) movRegReg(...)` elides the now-redundant
+        // mov entirely. Coalescing only mutates the AllocResult's
+        // assignments map — codegen consumes the rewritten mapping
+        // through `RegMap.assign` unchanged.
+        if (ctx.options.enable_move_coalesce) {
+            var copy_hints = try collectCopyHints(func, block_order, &scheduled, allocator);
+            defer copy_hints.deinit(allocator);
+            _ = try regalloc.coalesceMoves(
+                allocator,
+                &alloc_result_storage.?,
+                aarch64RegSetForSpillBase(spill_base),
+                clobbers.items,
+                scalar_live_ranges.items,
+                copy_hints.items,
+            );
+        }
     }
 
     const scalar_spill_capacity_for_vregs: u32 = if (alloc_result_storage) |ar|
@@ -7747,6 +7774,56 @@ fn collectHintPoints(
     }
     return hints;
 }
+
+/// Collect copy-like IR ops whose emitted reg-to-reg `mov` can be
+/// elided by post-allocation move coalescing (issue #386). The
+/// regalloc.coalesceMoves pass tries to retarget each `dest` onto
+/// `src`'s physreg; when both endpoints end up on the same reg, the
+/// emit-site guard `if (src != info.reg) movRegReg(...)` swallows the
+/// move entirely.
+///
+/// Currently produced for `.reinterpret` — the only IR op whose
+/// codegen is exactly a guarded reg-to-reg mov (`emitReinterpret`).
+/// Other potential candidates (`wrap_i64`, `extend_i32_u`) emit
+/// `UXTW`, which differs from MOV when src==dest (no-op for upper
+/// bits) but is not architecturally elidable when src!=dest — so they
+/// are out of scope here.
+fn collectCopyHints(
+    func: *const ir.IrFunction,
+    block_order_opt: ?[]const ir.BlockId,
+    scheduled: ?*const schedule.FunctionSchedule,
+    allocator: std.mem.Allocator,
+) !std.ArrayList(regalloc.CopyHint) {
+    var hints: std.ArrayList(regalloc.CopyHint) = .empty;
+    errdefer hints.deinit(allocator);
+
+    var owns_order = false;
+    const block_order: []const ir.BlockId = if (block_order_opt) |bo| bo else blk: {
+        const raw = try allocator.alloc(ir.BlockId, func.blocks.items.len);
+        for (raw, 0..) |*r, i| r.* = @intCast(i);
+        owns_order = true;
+        break :blk raw;
+    };
+    defer if (owns_order) allocator.free(block_order);
+
+    for (block_order) |bo_bid| {
+        const insts = if (scheduled) |s|
+            s.instructions(bo_bid)
+        else
+            func.blocks.items[bo_bid].instructions.items;
+        for (insts) |ci| {
+            switch (ci.op) {
+                .reinterpret => |src_vreg| {
+                    const dest = ci.dest orelse continue;
+                    try hints.append(allocator, .{ .dest = dest, .src = src_vreg });
+                },
+                else => {},
+            }
+        }
+    }
+    return hints;
+}
+
 /// so bugs surface here before Phase 3 depends on the output.
 ///
 /// This is called unconditionally from `compileFunctionImpl` and will be
@@ -12487,6 +12564,39 @@ test "compileFunction: enable_xreg_alloc false keeps legacy fallback working" {
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_xreg_alloc = false });
     defer allocator.free(code);
     try std.testing.expect(code.len > 0);
+}
+
+test "compileFunction: enable_move_coalesce elides reinterpret mov" {
+    // Issue #386: with the post-allocation move-coalescing pass enabled,
+    // a `reinterpret` whose source's last use is the reinterpret itself
+    // collapses to zero instructions — the dest vreg shares the source
+    // vreg's physreg, and the emit-time guard
+    // `if (src != info.reg) movRegReg(...)` in `emitReinterpret`
+    // suppresses the otherwise-redundant mov.
+    //
+    // This test pins the strong direction: with coalescing on, no
+    // reg-to-reg mov (ORR Xd, XZR, Xn pattern) appears in the body.
+    // The asymmetry between on/off is unit-tested at the regalloc
+    // layer (see `regalloc.zig`'s coalesceMoves tests).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const a = func.newVReg();
+    const r = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_64 = 0x4000_0000_0000_0000 }, .dest = a, .type = .i64 });
+    try func.getBlock(bid).append(.{ .op = .{ .reinterpret = a }, .dest = r, .type = .f64 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = r } });
+
+    // ORR Xd, XZR, Xn (the MOV alias `movRegReg` emits): mask
+    // `0xFFE0_FC1F` keeps sf+opc+shift+N+imm6+Rn; masked value
+    // `0xAA00_03E0` has Rn=11111 (XZR). Rm and Rd are wildcarded.
+    const mov_mask: u32 = 0xFFE0_FC1F;
+    const mov_value: u32 = 0xAA00_03E0;
+
+    const code_on = try compileFunctionWithOptions(&func, allocator, .{ .enable_move_coalesce = true });
+    defer allocator.free(code_on);
+    try std.testing.expect(!testCodeContainsMasked(code_on, mov_mask, mov_value));
 }
 
 test "compileFunction: FMA fusion does not skip mul with non-arith uses" {
