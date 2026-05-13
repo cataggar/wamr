@@ -20,10 +20,12 @@ examples/components/
 ├── README.md                       (this file)
 ├── stdio-echo/                     (existing Rust example, see #156)
 ├── zig-hello/                      smallest end-to-end Zig command
+├── zig-exit/                       exercises preview1 proc_exit → cli/exit (#436)
 ├── zig-adder/                      library exporting docs:adder/add@0.1.0
 ├── zig-calculator-cmd/             Zig command importing docs:adder
-└── mixed-zig-rust-calc/            Zig adder + Rust command, composed
-    └── command/                    cargo + wit-bindgen, wasm32-wasip1
+├── mixed-zig-rust-calc/            Zig adder + Rust command, composed
+│   └── command/                    cargo + wit-bindgen, wasm32-wasip1
+└── zig-http/                       Zig wasi:http/incoming-handler component
 ```
 
 Each example directory has its own `README.md` with example-specific
@@ -37,17 +39,19 @@ on machines that do not have the external toolchain installed.
 
 | Step                            | What it does                                                     |
 |---------------------------------|------------------------------------------------------------------|
-| `zig build component-examples`     | Build, encode, and validate all four components.                 |
-| `zig build component-examples-run` | Run `zig-hello` through `./zig-out/bin/wamr` (smoke test).       |
+| `zig build component-examples`     | Build, encode, and validate every component below.               |
+| `zig build component-examples-run` | Run the runnable examples through `./zig-out/bin/wamr` — `zig-hello` greeting, `zig-exit` exit-code path, the two composed calculator commands, and the `zig-http` curl-equivalent smoke (spin up `wamr run --listen=…`, send two requests, assert `200 "Hello, world!\n"` / `404`). |
 
 Outputs land under `zig-out/component-examples/`:
 
 ```
 zig-out/component-examples/
 ├── zig-hello.component.wasm
+├── zig-exit.component.wasm
 ├── zig-adder.component.wasm
 ├── zig-calculator-cmd.composed.wasm
-└── mixed-zig-rust-calc.composed.wasm
+├── mixed-zig-rust-calc.composed.wasm
+└── zig-http.component.wasm
 ```
 
 ## Pinned tool versions
@@ -64,9 +68,11 @@ zig-out/component-examples/
 | Example                   | Builds | Validates | Runs in wamr today | Notes                                                      |
 |---------------------------|:------:|:---------:|:------------------:|------------------------------------------------------------|
 | `zig-hello`               |   ✓    |     ✓     |         ✓          | End-to-end (greeting written via the captured-stdout flush). |
+| `zig-exit`                |   ✓    |     ✓     |         ✓          | Exercises `proc_exit(7)` → `wasi:cli/exit.exit-with-code(7)` (#436). |
 | `zig-adder`               |   ✓    |     ✓     |        n/a         | Library component — no `wasi:cli/run`.                     |
 | `zig-calculator-cmd` (composed) | ✓ |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
 | `mixed-zig-rust-calc`     |   ✓    |     ✓     |         ✓          | Composed end-to-end through `wabt component compose`.       |
+| `zig-http`                |   ✓    |     ✓     |         ✓          | Hand-rolled canonical-ABI handler; first real-world end-to-end exercise of wamr's `runHttpComponent`. |
 
 All composed examples produce valid components that run in
 [Wasmtime][wasmtime] and on wamr today. `wabt component compose` emits

@@ -480,6 +480,23 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
     }
 }
 
+/// Resolve a `.type_idx` ValType chain to a more concrete form so that
+/// flat lift/lower in `popInterfaceValue` / `liftFlat` can handle the
+/// common `result<own<R>, …>` / `option<own<R>>` shapes wabt emits
+/// (where R lives under `.type_idx -> .resource`).
+fn resolveArmType(t: ctypes.ValType, registry: TypeRegistry) ctypes.ValType {
+    var resolved = t;
+    while (resolved == .type_idx) {
+        const td = registry.get(resolved.type_idx) orelse return resolved;
+        resolved = switch (td) {
+            .val => |v| v,
+            .resource => return .{ .own = resolved.type_idx },
+            else => return resolved,
+        };
+    }
+    return resolved;
+}
+
 fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, allocator: Allocator) !InterfaceValue {
     return switch (t) {
         .bool => .{ .bool = (try env.popI32()) != 0 },
@@ -516,26 +533,90 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             .len = @bitCast(try env.popI32()),
             .ptr = @bitCast(try env.popI32()),
         } },
-        // result<T, E>: pop the discriminant, then pop and discard all
-        // remaining payload slots (caller currently doesn't inspect the
-        // typed payload; a future slice can lift it through `loadValReg`-
-        // style logic). See pushInterfaceValue for the join rationale.
+        // `result<T, E>`: pop all payload slots into a scratch buffer
+        // (we don't know the active arm's typing until we've popped the
+        // discriminant), then pop the disc, then re-lift the active arm
+        // from the buffered slots via `liftFlat`. For simple arm types
+        // (own/borrow handles, primitives, string, list), `liftFlat`
+        // succeeds; complex arms (variant, record, etc. — e.g. the
+        // canonical `error-code` variant) currently leave `payload =
+        // null`, which matches the pre-existing behaviour and is fine
+        // for host imports (like `httpOutgoingBodyFinish`) that don't
+        // inspect the err arm.
         .result => |idx| blk: {
             const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
-            _ = switch (td) {
-                .result => |rt| rt,
+            const rt = switch (td) {
+                .result => |r| r,
                 else => return error.CompoundNeedsRegistry,
             };
             const total_payload_slots = abi.flattenCount(registry, t) - 1;
-            // Payload slots are pushed last, so they pop first.
-            var i: u32 = 0;
-            while (i < total_payload_slots) : (i += 1) {
-                _ = try env.popI32();
+            var slot_buf: [16]u32 = undefined;
+            if (total_payload_slots > slot_buf.len) return error.CompoundNeedsRegistry;
+            // Pop in stack order: top of stack is the last-pushed slot,
+            // so it lands in slot_buf[total-1] first.
+            var i: u32 = total_payload_slots;
+            while (i > 0) {
+                i -= 1;
+                slot_buf[i] = @bitCast(try env.popI32());
             }
             const disc = try env.popI32();
-            break :blk .{ .result_val = .{ .is_ok = disc == 0, .payload = null } };
+            const is_ok = disc == 0;
+            const arm_type: ?ctypes.ValType = if (is_ok) rt.ok else rt.err;
+            var payload: ?*InterfaceValue = null;
+            if (arm_type) |at| {
+                // Resolve through `type_idx` hops so a resource handle
+                // referenced as `.type_idx -> .resource` is treated as a
+                // direct `own<R>` for the purpose of lifting.
+                const resolved = resolveArmType(at, registry);
+                const arm_slots = abi.flattenCount(registry, resolved);
+                if (abi.liftFlat(slot_buf[0..arm_slots], resolved)) |lifted| {
+                    const p = try allocator.create(InterfaceValue);
+                    p.* = lifted;
+                    payload = p;
+                } else |_| {
+                    // Compound arm type — leave payload null. Host
+                    // imports that need the typed payload should ship
+                    // its data through a different surface (e.g. raw
+                    // handle args).
+                }
+            }
+            break :blk .{ .result_val = .{ .is_ok = is_ok, .payload = payload } };
         },
-        .record, .variant, .tuple, .flags, .enum_, .option => error.CompoundNeedsRegistry,
+        // `option<T>`: symmetric to `.result` above. Pop payload slots,
+        // pop disc; if `is_some`, lift the buffered slots via `liftFlat`
+        // for simple inner types.
+        .option => |idx| blk: {
+            const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
+            const inner_type: ctypes.ValType = switch (td) {
+                .option => |o| o.inner,
+                else => return error.CompoundNeedsRegistry,
+            };
+            const total_payload_slots = abi.flattenCount(registry, t) - 1;
+            var slot_buf: [16]u32 = undefined;
+            if (total_payload_slots > slot_buf.len) return error.CompoundNeedsRegistry;
+            var i: u32 = total_payload_slots;
+            while (i > 0) {
+                i -= 1;
+                slot_buf[i] = @bitCast(try env.popI32());
+            }
+            const disc = try env.popI32();
+            const is_some = disc != 0;
+            var payload: ?*InterfaceValue = null;
+            if (is_some) {
+                const resolved = resolveArmType(inner_type, registry);
+                const inner_slots = abi.flattenCount(registry, resolved);
+                if (abi.liftFlat(slot_buf[0..inner_slots], resolved)) |lifted| {
+                    const p = try allocator.create(InterfaceValue);
+                    p.* = lifted;
+                    payload = p;
+                } else |_| {
+                    // Compound inner — leave payload null. Same caveat
+                    // as the `.result` branch above.
+                }
+            }
+            break :blk .{ .option_val = .{ .is_some = is_some, .payload = payload } };
+        },
+        .record, .variant, .tuple, .flags, .enum_ => error.CompoundNeedsRegistry,
         // Mirror `pushInterfaceValue`: resolve `.type_idx` and re-pop on
         // the reified ValType.
         .type_idx => |idx| blk: {

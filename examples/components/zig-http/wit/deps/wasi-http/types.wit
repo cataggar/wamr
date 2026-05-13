@@ -1,0 +1,83 @@
+// Trimmed `wasi:http/types@0.2.6` interface — only the resources
+// and methods the zig-http handler actually links against. No
+// `package` directive: `incoming-handler.wit` (sorts first
+// alphabetically) carries it, and cataggar/wabt's WIT loader
+// concatenates files in a directory before parsing.
+//
+// Resource ordering is significant: cataggar/wabt's encoder binds
+// resource names left-to-right as decls are emitted, so every
+// resource must appear before any other resource that references
+// it. Dep chain:
+//
+//   fields  ─┐
+//            ├─►  outgoing-body  ──►  outgoing-response  ──┐
+//   error-code (variant) ─┘                                ├─► response-outparam
+//   incoming-request                                       │
+//                                                          ▼
+//                                                 (handler param type)
+
+interface types {
+    /// `wasi:io/streams` output-stream handle — returned by
+    /// `[method]outgoing-body.write`. The world's
+    /// `import wasi:io/streams@0.2.6;` makes the resource available
+    /// at the world's type-indexspace; this short-form `use` pulls
+    /// it into the interface body for in-place references.
+    use wasi:io/streams@0.2.6.{output-stream};
+
+    /// Headers / trailers map. We construct one for the response
+    /// without populating it (no `set` / `append` import needed at
+    /// the example level — a default-headers response is enough to
+    /// match the Rust tutorial's "Hello, world!" output).
+    resource fields {
+        constructor();
+    }
+
+    /// HTTP transport error variant. Trimmed to a single case — we
+    /// never *construct* one (only `response-outparam.set`'s
+    /// `result<_, error-code>` payload references the type), so a
+    /// catch-all `internal-error` is enough to make the type signature
+    /// valid. Upstream wasi:http@0.2.6 enumerates ~30 cases.
+    variant error-code {
+        internal-error(option<string>),
+    }
+
+    /// Outgoing-body. `write` peels off a single `output-stream`;
+    /// `[static]finish` releases the body resource and resolves the
+    /// `result<_, error-code>` returned to the caller.
+    resource outgoing-body {
+        write: func() -> result<output-stream>;
+        finish: static func(
+            this: own<outgoing-body>,
+            trailers: option<own<fields>>
+        ) -> result<_, error-code>;
+    }
+
+    /// Outgoing-response. We construct one with a default-empty
+    /// headers map, optionally bump `set-status-code`, then call
+    /// `body` to obtain the `outgoing-body` we stream the response
+    /// payload through.
+    resource outgoing-response {
+        constructor(headers: own<fields>);
+        set-status-code: func(status-code: u16) -> result;
+        body: func() -> result<outgoing-body>;
+    }
+
+    /// Incoming-request — we only read the request path to route
+    /// between `/` (200 "Hello, world!\n") and everything else
+    /// (404). The Rust tutorial's branching mirrors this; argument
+    /// parsing / body reading / header inspection are all out of
+    /// scope.
+    resource incoming-request {
+        path-with-query: func() -> option<string>;
+    }
+
+    /// Response-outparam — the slot the host passes us so we can
+    /// hand back the constructed `outgoing-response` (or an
+    /// `error-code`). The handler calls `set` exactly once.
+    resource response-outparam {
+        set: static func(
+            param: own<response-outparam>,
+            response: result<own<outgoing-response>, error-code>
+        );
+    }
+}

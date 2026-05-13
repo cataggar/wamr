@@ -809,6 +809,60 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     // two-line output. With the wabt-bundled adapter (#453) wamr +
     // wasmtime both run the composed component end-to-end.
     wireComponentRun(b, runs, wamr_exe, mixed_final, "40 + 2 = 42\n100 + 200 = 300\n", 0);
+
+    // ── zig-http (Zig wasi:http/incoming-handler component) ────────
+    // Mirrors the bytecodealliance Rust HTTP-in-components tutorial:
+    // `GET /` → `200 "Hello, world!\n"`, anything else → `404`.
+    // Built `wasm32-freestanding` so no preview1 imports leak into
+    // the core wasm — wabt's plain (non-adapter) component_new
+    // wraps it directly. `cabi_realloc` is exported alongside
+    // `wasi:http/incoming-handler@0.2.6#handle` for the canonical
+    // ABI lifts of `option<string>` / `list<u8>` payloads the host
+    // materializes into guest memory.
+    const http_core = compileZigWasm(b, .{
+        .source = "examples/components/zig-http/src/main.zig",
+        .target_triple = "wasm32-freestanding",
+        .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
+        .output = "zig-http.core.wasm",
+    });
+    const http_embed = b.addSystemCommand(&.{ "wabt", "component", "embed", "--world", "http-hello" });
+    http_embed.addDirectoryArg(b.path("examples/components/zig-http/wit"));
+    http_embed.addFileArg(http_core);
+    http_embed.addArg("-o");
+    const http_embedded = http_embed.addOutputFileArg("zig-http.embed.wasm");
+
+    const http_new = b.addSystemCommand(&.{ "wabt", "component", "new" });
+    http_new.addFileArg(http_embedded);
+    http_new.addArg("-o");
+    const http_component = http_new.addOutputFileArg("zig-http.component.wasm");
+    installAndValidate(b, examples_step, http_component, "zig-http.component.wasm");
+
+    // End-to-end serve smoke: a small driver (tests/component-http-smoke/
+    // driver.zig) spawns `wamr run --listen=127.0.0.1:<port>` against the
+    // built component, then hits `/` and `/missing` over TCP and asserts
+    // the expected `200 "Hello, world!\n"` / `404` shapes. Mirrors the
+    // wasi-sock driver pattern (#437).
+    //
+    // Wamr-only for now — `wireComponentRun` registers both arms on a
+    // single stdout/exit-code assertion, which doesn't fit a serve loop.
+    // Cross-runtime parity through `wasmtime serve -Scli -Shttp` is a
+    // future follow-up.
+    const http_smoke_driver = b.addExecutable(.{
+        .name = "component-http-smoke-driver",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/component-http-smoke/driver.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_http_smoke = b.addRunArtifact(http_smoke_driver);
+    run_http_smoke.addFileArg(wamr_exe.getEmittedBin());
+    run_http_smoke.addFileArg(http_component);
+    // Fixed port; CI is single-tenant so collisions are unlikely. Override
+    // by editing this literal if it ever conflicts.
+    run_http_smoke.addArg("18080");
+    run_http_smoke.expectExitCode(0);
+    runs.wamr.dependOn(&run_http_smoke.step);
 }
 
 const ComponentRunSteps = struct {
