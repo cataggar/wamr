@@ -8,6 +8,7 @@ const ctypes = @import("types.zig");
 const core_types = @import("../runtime/common/types.zig");
 const executor_mod = @import("executor.zig");
 const indexspace = @import("indexspace.zig");
+const async_mod = @import("async.zig");
 
 // ── Resource Table ──────────────────────────────────────────────────────────
 
@@ -268,6 +269,14 @@ pub const ComponentInstance = struct {
     /// as `.poisoned` lets `deinit` and external callers reject reuse
     /// without depending on hashmap occupancy. (Issue #355.)
     link_state: LinkState = .unlinked,
+    /// Per-instance context slots for `canon context.{get,set}` invoked
+    /// outside any async task (the synchronous canon-lift call path).
+    /// Mirrors Wasmtime's implicit-task fallback: when no async task is
+    /// on the dispatch stack, context.get/set still works, scoped to
+    /// the instance rather than to any caller task. Initialised to all
+    /// zeros — the spec doesn't define a non-zero initial value.
+    /// (#478 sub-PR 1.)
+    implicit_task_context: [async_mod.N_CONTEXT_SLOTS]u32 = [_]u32{0} ** async_mod.N_CONTEXT_SLOTS,
 
     pub const LinkState = enum { unlinked, linking, linked, poisoned };
 
@@ -382,7 +391,14 @@ pub const ComponentInstance = struct {
     ) ?struct { mi: *core_types.ModuleInstance, local_idx: u32 } {
         const ref = indexspace.resolveCoreFunc(self.component, idx) orelse return null;
         switch (ref) {
-            .lowered, .resource_drop, .resource_new, .resource_rep => return null,
+            .lowered,
+            .resource_drop,
+            .resource_new,
+            .resource_rep,
+            .task_yield,
+            .context_get,
+            .context_set,
+            => return null,
             .aliased => |alias_idx| {
                 const ie = self.component.aliases[alias_idx].instance_export;
                 if (ie.instance_idx >= self.core_instances.len) return null;
@@ -1985,7 +2001,14 @@ fn isWasiCliRunName(name: []const u8) bool {
 fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) ?u32 {
     return switch (indexspace.resolveCoreFunc(component, core_func_idx) orelse return null) {
         .lowered => |i| i,
-        .resource_drop, .resource_new, .resource_rep, .aliased => null,
+        .resource_drop,
+        .resource_new,
+        .resource_rep,
+        .task_yield,
+        .context_get,
+        .context_set,
+        .aliased,
+        => null,
     };
 }
 
@@ -2442,10 +2465,17 @@ fn resolveLiftedCoreFunc(
 ) ?struct { core_instance_idx: u32, local_func_idx: u32 } {
     const ref = indexspace.resolveCoreFunc(component, core_func_idx) orelse return null;
     switch (ref) {
-        // Canon entries (lowers and resource.{new,drop,rep}) all produce
-        // imports/host-bound core funcs — not exported callables — so a
-        // canon.lift pointing at one is malformed.
-        .lowered, .resource_drop, .resource_new, .resource_rep => return null,
+        // Canon entries (lowers, resource.{new,drop,rep}, async builtins)
+        // all produce imports/host-bound core funcs — not exported
+        // callables — so a canon.lift pointing at one is malformed.
+        .lowered,
+        .resource_drop,
+        .resource_new,
+        .resource_rep,
+        .task_yield,
+        .context_get,
+        .context_set,
+        => return null,
         .aliased => |alias_idx| {
             const a = component.aliases[alias_idx];
             const ie = a.instance_export;
