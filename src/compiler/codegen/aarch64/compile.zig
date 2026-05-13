@@ -33,15 +33,21 @@ const RegMap = struct {
     // X15 is reserved as `tmp2` for multi-operand sequences (e.g., bounds
     // check needs vmctx + zext_addr + mem_size live simultaneously).
     //
-    // X19–X28 are AAPCS64 callee-saved and appended after the caller-saved
-    // block. They survive calls (no save around BL), trading one extra
-    // STR/LDR pair per function per reg that the body allocates.
+    // X19 is reserved as the pinned `vmctx` register for the entire
+    // function body (issue #465). The prologue copies x0 (AAPCS64 arg0
+    // = vmctx) into x19 once, and every site that previously reloaded
+    // vmctx from `[fp + 16]` reads x19 directly. Because x19 is AAPCS64
+    // callee-saved, calls (to wasm helpers, trap helpers, host
+    // functions) preserve it without a save/restore at the call site.
+    //
+    // X20–X28 are AAPCS64 callee-saved and appended after the caller-
+    // saved block. They survive calls (no save around BL), trading one
+    // extra STR/LDR pair per function per reg that the body allocates.
     pub const caller_saved_count: usize = 15;
     pub const scratch_regs = [_]emit.Reg{
         .x0,  .x1,  .x2,  .x3,  .x4,  .x5,  .x6,  .x7,
         .x8,  .x9,  .x10, .x11, .x12, .x13, .x14,
-        // Callee-saved:
-        .x19,
+        // Callee-saved (x19 is pinned to vmctx, not allocatable):
         .x20, .x21, .x22, .x23, .x24, .x25, .x26, .x27,
         .x28,
     };
@@ -76,6 +82,12 @@ const RegMap = struct {
             .entries = std.AutoHashMap(ir.VReg, Location).init(allocator),
             .spill_base = spill_base,
             .spill_capacity = spill_capacity,
+            // x19 is permanently pinned to vmctx (issue #465). Mark it
+            // as used in `used_callee_mask` (bit 0) so the prologue STR
+            // / epilogue LDR for x19 is never NOP-patched. The prologue
+            // STR happens BEFORE we clobber x19 with x0, so the
+            // caller's x19 is correctly preserved across our frame.
+            .used_callee_mask = 1,
         };
     }
 
@@ -94,13 +106,17 @@ const RegMap = struct {
                 switch (a) {
                     .reg => |r| {
                         // `r` is the aarch64 register NUMBER (0..14 or
-                        // 19..28). Find its index in `scratch_regs` to
-                        // update `reg_used` / `used_callee_mask`.
+                        // 20..28; x19 is excluded — pinned to vmctx).
+                        // Find its index in `scratch_regs` to update
+                        // `reg_used` / `used_callee_mask`. After
+                        // skipping x15..x18 (4 non-allocatable) plus
+                        // x19 (pinned), reg_num N >= 20 maps to
+                        // scratch_regs index N - 5.
                         const reg_num: u32 = @intCast(r);
-                        const idx: usize = if (reg_num <= 14) reg_num else reg_num - 4;
+                        const idx: usize = if (reg_num <= 14) reg_num else reg_num - 5;
                         self.reg_used[idx] = true;
                         if (idx >= caller_saved_count) {
-                            self.used_callee_mask |= (@as(u16, 1) << @intCast(idx - caller_saved_count));
+                            self.used_callee_mask |= (@as(u16, 1) << @intCast(idx - caller_saved_count + 1));
                         }
                         const loc = Location{ .reg = scratch_regs[idx] };
                         try self.entries.put(vreg, loc);
@@ -126,7 +142,11 @@ const RegMap = struct {
             if (!self.reg_used[i]) {
                 self.reg_used[i] = true;
                 if (i >= caller_saved_count) {
-                    self.used_callee_mask |= (@as(u16, 1) << @intCast(i - caller_saved_count));
+                    // scratch_regs callee-saved tail starts at x20 (x19
+                    // is pinned to vmctx). callee_saved_regs (used for
+                    // prologue STR/LDR) still starts at x19 at bit 0,
+                    // so x20 occupies bit 1.
+                    self.used_callee_mask |= (@as(u16, 1) << @intCast(i - caller_saved_count + 1));
                 }
                 const loc = Location{ .reg = r };
                 try self.entries.put(vreg, loc);
@@ -1342,6 +1362,15 @@ pub fn compileFunctionImpl(
     try code.emitPrologue(frame_size);
     try emitCalleeSaveStoreTracked(&code, &fctx);
 
+    // Pin vmctx (AAPCS64 arg0 = x0) in callee-saved x19 for the whole
+    // function body (issue #465). The preceding callee-save STR has
+    // already preserved the caller's x19, and `RegMap.init` forces
+    // x19's bit in `used_callee_mask` so the STR is not NOP-patched.
+    // Every former `ldr Xd, [fp + vmctx_slot_offset/8]` is replaced by
+    // a `mov Xd, x19` (or a `mov x0, x19` when staging arg0 for a
+    // helper / cross-function call).
+    try code.movRegReg(.x19, .x0);
+
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
     try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, hrp_save_off, frame_size, allocator);
 
@@ -1886,8 +1915,11 @@ fn emitEntrySpill(
     frame_size: u32,
     allocator: std.mem.Allocator,
 ) !void {
-    // VMContext → [fp + 16]
-    try code.strImm(.x0, .fp, vmctx_slot_offset / 8);
+    // VMContext (x0) is pinned in x19 by `compileFunctionImpl`'s
+    // prologue (issue #465); no spill to `[fp + 16]` is needed. The
+    // slot itself is retained in the frame layout (locals still start
+    // at `[fp + 24]`) to avoid rippling the offset math through HRP,
+    // RegMap.spill_base, and v128 local-slot computations.
 
     var abi = try buildEntryAbiPlan(allocator, func, local_types);
     defer abi.deinit();
@@ -5584,14 +5616,15 @@ fn emitCall(
         if (cl.extra_results > 0) (if (cl.tail) HrpSource.forwarded else HrpSource.caller_scratch) else null,
     );
 
-    // Load VMContext into x0 (was saved above if previously live).
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    // Load VMContext into x0 (pinned in x19, issue #465).
+    try code.movRegReg(.x0, .x19);
 
     if (cl.tail) {
         // For imports the target lives in a vmctx slot; load it into
-        // tmp0 BEFORE tearing down the frame (vmctx reads need FP).
-        // tmp0 (x16) is a caller-save register not touched by the
-        // epilogue, so it survives to the `br` below.
+        // tmp0 BEFORE tearing down the frame (the callee-save restore
+        // below will overwrite x19 with the caller's value, and x0 is
+        // also live with vmctx). tmp0 (x16) is a caller-save register
+        // not touched by the epilogue, so it survives to the `br` below.
         if (is_import) {
             try code.ldrImm(RegMap.tmp0, .x0, vmctx_host_functions_slot);
             const fn_slot: u12 = @intCast(cl.func_idx);
@@ -5709,7 +5742,7 @@ fn emitMemAddrImpl(
         }
 
         // Step 3: load VmCtx.memory_size (at +8, scaled-by-8 offset = 1).
-        try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(RegMap.tmp0, .x19);
         try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 1);
 
         // Step 4: cmp end, mem_size; B.LS over_trap.
@@ -5718,7 +5751,7 @@ fn emitMemAddrImpl(
         try code.bCond(.ls, 0); // placeholder
 
         // Trap path.
-        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(.x0, .x19);
         try code.ldrImm(RegMap.tmp0, .x0, vmctx_trap_oob_fn_slot);
         try code.blr(RegMap.tmp0);
         try code.brk(0);
@@ -5736,7 +5769,7 @@ fn emitMemAddrImpl(
     }
 
     // Step 5: load mem_base into tmp0.
-    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(RegMap.tmp0, .x19);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, 0);
 
     // Step 6: tmp0 = mem_base + zext(wasm_addr).
@@ -5824,7 +5857,7 @@ fn emitGlobalGet(
     const byte_offset = try globalByteOffset(fctx, idx);
     if (ty == .v128) {
         const vt = try v128_cache.defineFresh(code, v128_map, dest, null);
-        try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(RegMap.tmp0, .x19);
         try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
         try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, RegMap.tmp1);
         try code.ldrQ(vt, RegMap.tmp0);
@@ -5832,7 +5865,7 @@ fn emitGlobalGet(
     }
 
     // tmp0 = vmctx; tmp0 = globals_base
-    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(RegMap.tmp0, .x19);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
 
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
@@ -5862,7 +5895,7 @@ fn emitGlobalSet(
     const byte_offset = try globalByteOffset(fctx, gs.idx);
     if (ty == .v128) {
         const vt = try v128_cache.ensure(code, v128_map, gs.val, null);
-        try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(RegMap.tmp0, .x19);
         try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
         try addGlobalByteOffset(code, RegMap.tmp0, byte_offset, RegMap.tmp1);
         try code.strQ(vt, RegMap.tmp0);
@@ -5871,7 +5904,7 @@ fn emitGlobalSet(
 
     const val_r = try useInto(code, reg_map, gs.val, RegMap.tmp1);
     // tmp0 = vmctx; tmp0 = globals_base
-    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(RegMap.tmp0, .x19);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_globals_slot);
     // Scalar/reference globals use 8-byte slots. i32/f32 consumers read the
     // low 32 bits, matching the pre-v128 layout and preserving old behaviour.
@@ -5894,7 +5927,7 @@ fn emitMemorySize(
     // Load vmctx into tmp0 first, then allocate dest (dest's scratch is
     // tmp1, so even if dest spills we don't alias tmp0 until after the
     // vmctx load).
-    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(RegMap.tmp0, .x19);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     try code.ldrImm32(info.reg, RegMap.tmp0, vmctx_mem_pages_slot_w);
     try destCommit(code, reg_map, info);
@@ -5948,7 +5981,7 @@ fn emitMemoryCopy(
 /// Uses `RegMap.tmp0` internally if `dest` == vmctx register (it won't,
 /// since `dest` is always a scratch caller like tmp0/tmp1 at call sites).
 fn loadTableInfoAddr(code: *emit.CodeBuffer, dest: emit.Reg, table_idx: u32) !void {
-    try code.ldrImm(dest, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(dest, .x19);
     try code.ldrImm(dest, dest, vmctx_tables_info_slot);
     const off: u32 = table_idx * table_info_stride;
     if (off != 0) {
@@ -6023,7 +6056,7 @@ fn emitTableSet(
     try code.movImm32(.x1, @intCast(ts.table_idx));
     try stageArgFromSaved(code, reg_map, fctx, .x2, ts.idx, 0);
     try stageArgFromSaved(code, reg_map, fctx, .x3, ts.val, 0);
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, vmctx_table_set_fn_slot);
     try code.blr(RegMap.tmp0);
 
@@ -6177,7 +6210,7 @@ fn emitTableGrow(
     try stageArgFromSaved(code, reg_map, fctx, .x1, tg.init, 0);
     try stageArgFromSaved(code, reg_map, fctx, .x2, tg.delta, 0);
     try code.movImm32(.x3, @intCast(tg.table_idx));
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, vmctx_table_grow_fn_slot);
     try code.blr(RegMap.tmp0);
 
@@ -6206,7 +6239,7 @@ fn emitRefFunc(
     reg_map: *RegMap,
 ) !void {
     const dest = inst.dest orelse return;
-    try code.ldrImm(RegMap.tmp0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(RegMap.tmp0, .x19);
     try code.ldrImm(RegMap.tmp0, RegMap.tmp0, vmctx_funcptrs_slot);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     const slot: u12 = @intCast(func_idx);
@@ -6293,7 +6326,7 @@ fn emitCallIndirect(
     try code.ldrImm32(RegMap.tmp1, RegMap.tmp1, 0); // tmp1 = actual_sig
 
     // Load expected_sig from vmctx.sig_table_ptr[type_idx].
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(.x0, .x0, vmctx_sig_table_slot);
     try code.ldrImm32(RegMap.tmp0, .x0, @intCast(ci.type_idx)); // scale 4
 
@@ -6331,14 +6364,14 @@ fn emitCallIndirect(
         if (ci.extra_results > 0) (if (ci.tail) HrpSource.forwarded else HrpSource.caller_scratch) else null,
     );
     if (ci.tail) {
-        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(.x0, .x19);
         try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogueNoRet(fctx.frame_size);
         try code.br(RegMap.tmp0);
         return;
     }
 
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
@@ -6390,7 +6423,7 @@ fn emitCallRef(
     const cbz_site = code.len();
     try code.cbz64(RegMap.tmp0, 0); // patched below
     // trap: load vmctx, load fn, blr (noreturn)
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp1, .x0, vmctx_trap_unreachable_fn_slot);
     try code.blr(RegMap.tmp1);
     // CBZ shares the b.cond imm19 encoding at bits [23:5], so the same
@@ -6412,14 +6445,14 @@ fn emitCallRef(
         if (cr.extra_results > 0) (if (cr.tail) HrpSource.forwarded else HrpSource.caller_scratch) else null,
     );
     if (cr.tail) {
-        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(.x0, .x19);
         try emitCalleeSaveRestoreTracked(code, fctx);
         try code.emitEpilogueNoRet(fctx.frame_size);
         try code.br(RegMap.tmp0);
         return;
     }
 
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.blr(RegMap.tmp0);
     if (abi.stack_size > 0) try emitSpAdjust(code, abi.stack_size, .add);
 
@@ -6561,7 +6594,7 @@ fn emitVmctxHelperCall(
     _ = &arg_regs;
 
     // x0 = vmctx; tmp0 = vmctx.<fn_slot>; BLR tmp0.
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, fn_slot);
     try code.blr(RegMap.tmp0);
 
@@ -6645,7 +6678,7 @@ fn emitTableInit(
     try code.movImm64(.x2, packed_st);
 
     // x0 = vmctx; tmp0 = vmctx.table_init_fn; BLR tmp0.
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, vmctx_table_init_fn_slot);
     try code.blr(RegMap.tmp0);
 
@@ -6672,7 +6705,7 @@ fn emitElemDrop(
     try saveCallerSaveForCall(code, reg_map, fctx, &used_snapshot, &.{});
 
     try code.movImm32(.x1, @bitCast(seg_idx));
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, vmctx_elem_drop_fn_slot);
     try code.blr(RegMap.tmp0);
 
@@ -6705,7 +6738,7 @@ fn patchBCondHere(code: *emit.CodeBuffer, patch_off: usize) void {
 /// Clobbers x0, tmp0, LR — but this path is noreturn, so callers do not
 /// care what survives it.
 fn emitTrapHelperCall(code: *emit.CodeBuffer, slot: u12) !void {
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, slot);
     try code.blr(RegMap.tmp0);
     try code.brk(0);
@@ -7090,7 +7123,7 @@ fn emitAtomicNotify(
     // x2 = count
     try stageArgFromSaved(code, reg_map, fctx, .x2, an.count, 0);
     // x0 = vmctx, tmp0 = helper, BLR.
-    try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+    try code.movRegReg(.x0, .x19);
     try code.ldrImm(RegMap.tmp0, .x0, vmctx_futex_notify_fn_slot);
     try code.blr(RegMap.tmp0);
 
@@ -7150,7 +7183,7 @@ fn emitAtomicWait(
         try code.movRegReg(.x4, .x3);
         try code.lsrImm(.x4, .x4, 32);
         try code.uxtw(.x3, .x3);
-        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(.x0, .x19);
         try code.ldrImm(RegMap.tmp0, .x0, vmctx_futex_wait32_fn_slot);
     } else {
         // wait64: expected is i64 → exp_lo (x2) / exp_hi (x3).
@@ -7163,7 +7196,7 @@ fn emitAtomicWait(
         try code.movRegReg(.x5, .x4);
         try code.lsrImm(.x5, .x5, 32);
         try code.uxtw(.x4, .x4);
-        try code.ldrImm(.x0, .fp, vmctx_slot_offset / 8);
+        try code.movRegReg(.x0, .x19);
         try code.ldrImm(RegMap.tmp0, .x0, vmctx_futex_wait64_fn_slot);
     }
 
@@ -7438,12 +7471,13 @@ pub fn compileModuleWithOptions(
 /// Allocatable aarch64 GPRs, in stable index order used by clobber masks.
 ///
 /// Indices 0..14 map to x0..x14 (AAPCS64 caller-saved; x15 is reserved as
-/// a non-allocatable scratch `RegMap.tmp2`). Indices 15..24 map to
-/// x19..x28 (callee-saved). x16/x17 are `RegMap.tmp0/tmp1`, x18 is the
-/// platform register, x29/x30 are FP/LR, and x31 is SP — all excluded.
+/// a non-allocatable scratch `RegMap.tmp2`). Indices 15..23 map to
+/// x20..x28 (callee-saved). x16/x17 are `RegMap.tmp0/tmp1`, x18 is the
+/// platform register, x19 is pinned to `vmctx` for the function body
+/// (issue #465), x29/x30 are FP/LR, and x31 is SP — all excluded.
 pub const aarch64_alloc_regs = [_]regalloc.PhysReg{
     0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,
-    19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    20, 21, 22, 23, 24, 25, 26, 27, 28,
 };
 
 /// Indices into `aarch64_alloc_regs` of AAPCS64 caller-saved registers
@@ -7454,10 +7488,11 @@ pub const aarch64_caller_saved_indices = [_]u8{
 };
 
 /// Indices into `aarch64_alloc_regs` of AAPCS64 callee-saved registers
-/// (x19..x28). Preferred for live ranges that span a call, since they
-/// survive without save/restore.
+/// (x20..x28). Preferred for live ranges that span a call, since they
+/// survive without save/restore. x19 is excluded — it is permanently
+/// pinned to `vmctx` for the whole function body (issue #465).
 pub const aarch64_callee_saved_indices = [_]u8{
-    15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+    15, 16, 17, 18, 19, 20, 21, 22, 23,
 };
 
 /// Bitmask over `aarch64_alloc_regs` of registers destroyed by any
@@ -7653,8 +7688,8 @@ fn addCallArgScalarHints(
 
 /// Emit a single `Hint` for `vreg` targeting AAPCS64 register `xN` if
 /// `xN` is allocatable in `aarch64_alloc_regs`. x0..x14 are; x15..x18
-/// and the callee-saved x19..x28 are (callee-saved are reachable but
-/// not used for ABI-fixed call-arg slots).
+/// and x19 (pinned to vmctx, issue #465) are not. The callee-saved
+/// x20..x28 are reachable but not used for ABI-fixed call-arg slots.
 fn appendArgRegHint(
     list: *std.ArrayList(regalloc.Hint),
     allocator: std.mem.Allocator,
@@ -11762,8 +11797,10 @@ test "compile: br_if with two blocks" {
 
 // ── Phase 1b: VMContext ABI + locals tests ───────────────────────────────────
 
-test "compile: entry spills vmctx to [fp+16]" {
-    // Function with no params, no locals: prologue must still spill x0 → [fp+16].
+test "compile: entry pins vmctx in x19 (issue #465)" {
+    // Function with no params, no locals: prologue must copy x0 → x19
+    // after the 10 callee-save STRs (vmctx is pinned in x19 for the
+    // whole function body).
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 0);
     defer func.deinit();
@@ -11773,12 +11810,12 @@ test "compile: entry spills vmctx to [fp+16]" {
     try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
-    // Layout: prologue (STP + ADD fp,sp,0), then 10 callee-save STRs for
-    // x19..x28 (40 bytes), then STR x0 → [fp+16].
-    //   opcode 0xF9000000 | (imm12=2 << 10) | (rn=29 << 5) | rt=0
-    //   = 0xF9000000 | 0x800 | 0x3A0 | 0 = 0xF9000BA0
-    const str_word = std.mem.readInt(u32, code[48..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 0xF9000BA0), str_word);
+    // Layout: prologue (STP + ADD fp,sp,0 = 8 bytes), then 10 callee-save
+    // STRs for x19..x28 (40 bytes), then MOV x19, x0 (= ORR x19, xzr, x0).
+    //   encoding: 0xAA000000 | (rm=0 << 16) | (rn=31 << 5) | rd=19
+    //   = 0xAA000000 | 0x3E0 | 0x13 = 0xAA0003F3
+    const mov_word = std.mem.readInt(u32, code[48..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0xAA0003F3), mov_word);
 }
 
 test "compile: param spill — STR x1 into first local slot" {
@@ -12706,10 +12743,11 @@ test "collectClobberPoints: positions are monotonic across blocks" {
 
 test "aarch64RegSet: sane layout for a tiny function" {
     const rs = aarch64RegSet(0);
-    // 25 allocatable GPRs, 15 caller-saved + 10 callee-saved.
-    try std.testing.expectEqual(@as(usize, 25), rs.alloc_regs.len);
+    // 24 allocatable GPRs, 15 caller-saved + 9 callee-saved (x19 is
+    // pinned to vmctx per issue #465 and not in the allocator pool).
+    try std.testing.expectEqual(@as(usize, 24), rs.alloc_regs.len);
     try std.testing.expectEqual(@as(usize, 15), rs.caller_saved_indices.len);
-    try std.testing.expectEqual(@as(usize, 10), rs.callee_saved_indices.len);
+    try std.testing.expectEqual(@as(usize, 9), rs.callee_saved_indices.len);
     // Spill stride grows upward (away from fp).
     try std.testing.expect(rs.spill_stride > 0);
     // Spills live above the locals area (saved fp/lr + vmctx + locals = 24 bytes min).
