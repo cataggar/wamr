@@ -394,6 +394,18 @@ pub fn build(b: *std.Build) void {
     const run_ir_print_tests = b.addRunArtifact(ir_print_tests);
     test_step.dependOn(&run_ir_print_tests.step);
 
+    // Dominator-aware redundant-load forwarder tests (#391).
+    const dom_frl_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/forward_redundant_loads_dominator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const dom_frl_tests = b.addTest(.{
+        .root_module = dom_frl_test_module,
+    });
+    const run_dom_frl_tests = b.addRunArtifact(dom_frl_tests);
+    test_step.dependOn(&run_dom_frl_tests.step);
+
     // Interp-vs-AOT differential tests. Own module (with its own `wamr`
     // alias) so `aot_harness.zig` — which `differential.zig` imports — is
     // reached through the `wamr` module and not duplicated into it. The
