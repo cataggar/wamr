@@ -895,10 +895,11 @@ pub fn compileFunctionImpl(
     // ranges are computed below. No-op for functions without eligible
     // loops. Gated by a CompileOption to ease bisection of any regression.
     if (ctx.options.enable_range_split) {
-        const rs_stats = try range_split.splitLiveRangesAtLoopBoundaries(
+        const rs_stats = try range_split.splitLiveRangesAtLoopBoundariesWithConfig(
             @constCast(func),
             &scheduled,
             allocator,
+            .{ .num_phys_regs = aarch64_alloc_regs.len },
         );
         if (range_split_debug and rs_stats.loops_considered > 0) {
             std.debug.print(
