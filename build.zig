@@ -341,6 +341,18 @@ pub fn build(b: *std.Build) void {
     const run_regalloc_tests = b.addRunArtifact(regalloc_tests);
     test_step.dependOn(&run_regalloc_tests.step);
 
+    // Compiler IR printer tests
+    const ir_print_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/print_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ir_print_tests = b.addTest(.{
+        .root_module = ir_print_test_module,
+    });
+    const run_ir_print_tests = b.addRunArtifact(ir_print_tests);
+    test_step.dependOn(&run_ir_print_tests.step);
+
     // Interp-vs-AOT differential tests. Own module (with its own `wamr`
     // alias) so `aot_harness.zig` — which `differential.zig` imports — is
     // reached through the `wamr` module and not duplicated into it. The

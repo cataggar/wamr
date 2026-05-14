@@ -43,3 +43,4 @@ tests/benchmarks/**/*.aot
 tests/benchmarks/**/*.exe
 bin/
 examples/components/**/target/
+.zig-global-cache/

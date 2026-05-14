@@ -28,6 +28,20 @@ from pathlib import Path
 
 ITER_PATTERN = re.compile(r"Iterations/Sec\s*:\s*([0-9]+(?:\.[0-9]+)?)")
 
+# Signature of the known x86_64 native AOT-run flake from issue #406:
+# `wamr run` traps with `out of bounds memory access (..., local_func[-1], ...)`
+# at a native PC that isn't inside any local function. The trap is
+# non-deterministic on shared GitHub-hosted x86_64 runners — it has been
+# observed firing on baseline `main` (run 3/3 after two clean runs of the
+# same binary), proving it's not introduced by any single change. Retry
+# this exact failure mode up to `_TRAP_RETRY_MAX` times before treating
+# it as a real regression.
+_TRAP_FLAKE_PATTERN = re.compile(
+    r"wasm trap: out of bounds memory access.*local_func\[-1\]",
+    re.IGNORECASE,
+)
+_TRAP_RETRY_MAX = 3
+
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> str:
     try:
@@ -127,7 +141,7 @@ def build_and_run(wt: Path, runs: int, coremark_src: Path) -> list[float]:
 
     results: list[float] = []
     for i in range(runs):
-        out = run(["zig", "build", "run-aot"], cwd=cm, env=env)
+        out = _run_aot_with_retry(cm, env, run_idx=i, runs_total=runs)
         m = ITER_PATTERN.search(out)
         if not m:
             raise RuntimeError(
@@ -137,6 +151,33 @@ def build_and_run(wt: Path, runs: int, coremark_src: Path) -> list[float]:
         print(f"[harness]   run {i + 1}/{runs}: {val:.1f} iter/s", file=sys.stderr)
         results.append(val)
     return results
+
+
+def _run_aot_with_retry(cm: Path, env: dict, run_idx: int, runs_total: int) -> str:
+    """Wrap `zig build run-aot` so the issue-#406 x86_64 trap flake doesn't
+    fail the gate on the first incidence. Real failures still propagate
+    after `_TRAP_RETRY_MAX` retries."""
+    last_exc = None
+    for attempt in range(1 + _TRAP_RETRY_MAX):
+        try:
+            return run(["zig", "build", "run-aot"], cwd=cm, env=env)
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr or ""
+            if not _TRAP_FLAKE_PATTERN.search(stderr):
+                # Not the known x86_64 trap flake — let it propagate.
+                raise
+            if attempt == _TRAP_RETRY_MAX:
+                last_exc = exc
+                break
+            print(
+                f"[harness]   run {run_idx + 1}/{runs_total}: x86_64 AOT trap flake "
+                f"(issue #406) — retry {attempt + 1}/{_TRAP_RETRY_MAX}",
+                file=sys.stderr,
+            )
+    # Re-raise the last exception so the original stderr + diagnostic
+    # formatting from `run()` are visible.
+    assert last_exc is not None
+    raise last_exc
 
 
 def fmt_stats(values: list[float]) -> tuple[float, float, float]:
