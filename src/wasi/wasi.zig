@@ -800,6 +800,37 @@ test "FdTable allocateFd" {
     try std.testing.expectEqual(@as(u32, 4), fd2);
 }
 
+test "addPreopen: directory rights default omits fd file-side bits (#476)" {
+    // wasi-libc and wasmtime mask `path_open` results that yield a directory
+    // so the four file-side rights — FD_READ, FD_WRITE, FD_TELL, FD_SEEK —
+    // never appear on a preopen's `rights_base`. Regression-guard the
+    // default mask used by `WasiCtx.addPreopen`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
+    defer ctx.deinit();
+
+    const fd = try ctx.addPreopen("/pre", tmp.dir);
+    const entry = ctx.fd_table.get(fd) orelse return error.MissingFd;
+
+    // The four file-side bits must be off on a preopen directory fd.
+    try std.testing.expectEqual(@as(u64, 0), entry.rights_base & RIGHTS_FD_READ);
+    try std.testing.expectEqual(@as(u64, 0), entry.rights_base & RIGHTS_FD_WRITE);
+    try std.testing.expectEqual(@as(u64, 0), entry.rights_base & RIGHTS_FD_TELL);
+    try std.testing.expectEqual(@as(u64, 0), entry.rights_base & RIGHTS_FD_SEEK);
+
+    // Sanity: the canonical preopen mask is exactly DIRECTORY_BASE_RIGHTS
+    // and the inheriting mask exposes file rights so children opened via
+    // `path_open` from this preopen still get read/write/seek caps.
+    try std.testing.expectEqual(DIRECTORY_BASE_RIGHTS, entry.rights_base);
+    try std.testing.expectEqual(DIRECTORY_INHERITING_RIGHTS, entry.rights_inheriting);
+
+    // Prevent the test's `tmp.cleanup()` from racing the ctx's deinit on
+    // the same Dir handle — the ctx now owns it.
+    ctx.fd_table.remove(fd);
+}
+
 test "args_sizes_get with known args" {
     const ctx = try WasiCtx.init(std.testing.allocator, testing_io);
     defer ctx.deinit();
