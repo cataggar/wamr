@@ -1,0 +1,4 @@
+{
+    "_comment": "Curated WASI Preview 2 conformance gate skiplist (issue #479). Mirrors the format of tests/wasi-testsuite-skip.json. Today's set of component fixtures (zig-hello, zig-exit, zig-calculator-cmd, mixed-zig-rust-calc, zig-http) all pass on every supported platform — the `skip` array is empty. Future entries: { \"name\": \"<component-basename>\", \"reason\": \"<why>\", \"issue\": \"#NNN\" }. The harness consuming this file (= `zig build wasi-p2-testsuite`, see build.zig:660) iterates the curated set declared in build.zig and is expected to drop any entry whose basename matches.",
+    "skip": []
+}

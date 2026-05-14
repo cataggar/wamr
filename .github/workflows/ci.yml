@@ -183,6 +183,38 @@ jobs:
       - name: Build and run component-examples (wamr golden)
         run: zig build install component-examples component-examples-run
 
+  wasi-p2-testsuite:
+    name: Build & Test (wasi-p2-testsuite)
+    runs-on: ubuntu-22.04
+    # Mirrors `component-examples` (same toolchain prereqs: cataggar/wabt
+    # for the component-new/embed/compose pipeline + Rust wasm32-wasip1
+    # for the mixed-zig-rust-calc fixture); runs the curated WASI
+    # Preview 2 conformance gate (#479) — a strict superset of
+    # `component-examples-run` with a CI-discoverable, named step that
+    # parallels the existing Preview 1 `wasi-testsuite` job.
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: true
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.16.0
+          use-cache: false
+
+      - name: Configure Zig caches
+        uses: ./.github/actions/zig-cache
+
+      - name: Install cataggar/wabt (component CLI)
+        uses: ./.github/actions/wabt-install
+
+      - name: Install Rust wasm32-wasip1 target
+        run: rustup target add wasm32-wasip1
+
+      - name: Run WASI Preview 2 conformance gate
+        run: zig build wasi-p2-testsuite
+
   component-examples-wasmtime:
     name: Build & Test (component-examples-wasmtime)
     runs-on: ubuntu-22.04
@@ -222,12 +254,12 @@ jobs:
   ci-summary:
     name: Build & Test
     runs-on: ubuntu-22.04
-    needs: [build-and-test, wasi-test, wasi-testsuite, component-examples]
+    needs: [build-and-test, wasi-test, wasi-testsuite, component-examples, wasi-p2-testsuite]
     if: always()
     steps:
       - name: Check results
         run: |
-          if [ "${{ needs.build-and-test.result }}" != "success" ] || [ "${{ needs.wasi-test.result }}" != "success" ] || [ "${{ needs.wasi-testsuite.result }}" != "success" ] || [ "${{ needs.component-examples.result }}" != "success" ]; then
+          if [ "${{ needs.build-and-test.result }}" != "success" ] || [ "${{ needs.wasi-test.result }}" != "success" ] || [ "${{ needs.wasi-testsuite.result }}" != "success" ] || [ "${{ needs.component-examples.result }}" != "success" ] || [ "${{ needs.wasi-p2-testsuite.result }}" != "success" ]; then
             echo "::error::One or more CI jobs failed"
             exit 1
           fi
