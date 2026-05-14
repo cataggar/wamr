@@ -1525,12 +1525,57 @@ pub const WasiCliAdapter = struct {
     insecure_prng: ?std.Random.DefaultPrng = null,
 
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
-    /// after the component runs to inspect captured output.
+    /// after the component runs to inspect captured output. This is the
+    /// test-/embedding-friendly constructor — every existing test in
+    /// this file uses it. For the `wamr run` CLI path that streams
+    /// live to the host process's stdio, use `initWithHostStdio`.
     pub fn init(allocator: Allocator) WasiCliAdapter {
         return .{
             .allocator = allocator,
             .stdout = streams.OutputStream.toBuffer(),
             .stderr = streams.OutputStream.toBuffer(),
+        };
+    }
+
+    /// Initialize with stdout/stderr/stdin wired directly to the host
+    /// process's standard file descriptors. Used by `wamr run` so the
+    /// component's output streams incrementally to the user's terminal
+    /// instead of buffering for the entire run. Stdin reads block on
+    /// the host's stdin fd (#474).
+    ///
+    /// `getStdoutBytes` / `getStderrBytes` / `setStdinBytes` are
+    /// **not valid** with this constructor — they expect buffer-backed
+    /// sinks. Use the regular `init` for embedding / tests that need
+    /// to inspect captured output.
+    ///
+    /// Cross-platform: pulls handles from `std.Io.File.{stdin,stdout,
+    /// stderr}` rather than `std.posix.STDIN_FILENO` etc. because on
+    /// Windows `posix.fd_t` is `*anyopaque` (HANDLE), so the comptime
+    /// integers `0/1/2` don't coerce.
+    pub fn initWithHostStdio(allocator: Allocator) WasiCliAdapter {
+        return initWithHostStdioFds(
+            allocator,
+            std.Io.File.stdin().handle,
+            std.Io.File.stdout().handle,
+            std.Io.File.stderr().handle,
+        );
+    }
+
+    /// Variant of `initWithHostStdio` that takes explicit fds — used
+    /// by tests that redirect stdin/stdout/stderr through pipes to
+    /// observe the live-streaming path without touching the test
+    /// process's own stdio (#474).
+    pub fn initWithHostStdioFds(
+        allocator: Allocator,
+        stdin_fd: std.posix.fd_t,
+        stdout_fd: std.posix.fd_t,
+        stderr_fd: std.posix.fd_t,
+    ) WasiCliAdapter {
+        return .{
+            .allocator = allocator,
+            .stdout = streams.OutputStream.toFd(stdout_fd),
+            .stderr = streams.OutputStream.toFd(stderr_fd),
+            .stdin = streams.InputStream.fromFd(stdin_fd),
         };
     }
 
@@ -10430,6 +10475,80 @@ test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
 
     try testing.expect(outcome.is_ok);
     try testing.expectEqualStrings("echo: hello\n", adapter.getStdoutBytes());
+}
+
+test "stdio-echo: live host stdio via pipe-redirected fds (#474)" {
+    if (comptime @import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (comptime @import("builtin").os.tag == .linux) {
+        const testing = std.testing;
+        const data = @embedFile("fixtures/stdio-echo.wasm");
+        const linux = std.os.linux;
+
+        // Two pipe pairs: one for stdin (test writes, adapter reads), one
+        // for stdout (adapter writes, test reads). Stderr is wired to the
+        // test's own stderr fd — not redirected here, but separate from
+        // stdout so a noisy fixture doesn't pollute the assertion.
+        var stdin_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&stdin_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+        defer _ = linux.close(stdin_fds[0]);
+        // stdin_fds[1] is closed below after writing "hello\n".
+
+        var stdout_fds: [2]i32 = undefined;
+        if (linux.errno(linux.pipe2(&stdout_fds, .{})) != .SUCCESS) {
+            _ = linux.close(stdin_fds[1]);
+            return error.SkipZigTest;
+        }
+        defer _ = linux.close(stdout_fds[0]);
+        // stdout_fds[1] is closed explicitly after the run.
+
+        // Preload the "hello\n" line into the stdin pipe and close the
+        // write-end so the guest's read sees EOF after the line.
+        _ = linux.write(stdin_fds[1], "hello\n", 6);
+        _ = linux.close(stdin_fds[1]);
+
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        // Use the host-stdio constructor with the pipe fds redirected in
+        // place of STDIN/STDOUT. Stderr gets the test process's own
+        // stderr fd (the adapter doesn't take ownership of it).
+        var adapter = WasiCliAdapter.initWithHostStdioFds(
+            testing.allocator,
+            stdin_fds[0],
+            stdout_fds[1],
+            std.Io.File.stderr().handle,
+        );
+        defer adapter.deinit();
+
+        const outcome = runComponentBytes(data, arena_alloc, &adapter) catch |err| {
+            _ = linux.close(stdout_fds[1]);
+            std.debug.print("stdio-echo (live) run failed: {s}\n", .{@errorName(err)});
+            return err;
+        };
+        // Close the adapter's stdout-write fd so the drain below hits EOF.
+        _ = linux.close(stdout_fds[1]);
+
+        // Drain everything the component wrote to the pipe. If the
+        // OutputStream `.fd` write branch were still a no-op stub
+        // (pre-#474), this drain would return 0 bytes and the assertion
+        // would fail.
+        var buf: [256]u8 = undefined;
+        var captured: std.ArrayList(u8) = .empty;
+        defer captured.deinit(testing.allocator);
+        while (true) {
+            const rc = linux.read(stdout_fds[0], &buf, buf.len);
+            const err = linux.errno(rc);
+            if (err == .INTR) continue;
+            if (err != .SUCCESS) break;
+            const n: usize = @intCast(rc);
+            if (n == 0) break;
+            try captured.appendSlice(testing.allocator, buf[0..n]);
+        }
+
+        try testing.expect(outcome.is_ok);
+        try testing.expectEqualStrings("echo: hello\n", captured.items);
+    }
 }
 
 test "populateWasiProviders: binds wasi:clocks/wall-clock + monotonic-clock (#146)" {
