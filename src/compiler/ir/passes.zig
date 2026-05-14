@@ -2539,6 +2539,21 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
         }
         const loop_can_hoist_load = !loop_has_call and !loop_has_memory_write;
 
+        // Speculation anchors for `load` hoisting (Stage C extension, #494).
+        // A speculative load in block B is safe iff B dominates every
+        // anchor: every latch (so the load runs before each back-edge) and
+        // every exiting block (so the load runs before each loop exit).
+        // Together these guarantee the load runs once on every iteration,
+        // preserving the original trap point.
+        var anchors: std.ArrayList(ir.BlockId) = .empty;
+        defer anchors.deinit(allocator);
+        if (loop_can_hoist_load) {
+            for (loop.latches) |latch| try anchors.append(allocator, latch);
+            for (loop.blocks) |bid| {
+                if (isLoopExitingBlock(func, loop, bid)) try anchors.append(allocator, bid);
+            }
+        }
+
         var any = true;
         while (any) {
             any = false;
@@ -2559,20 +2574,27 @@ pub fn hoistLoopInvariantCode(func: *ir.IrFunction, allocator: std.mem.Allocator
                         .global_get => |idx| !loop_has_call and !set_globals.contains(idx),
                         else => false,
                     };
-                    // Speculative load hoisting (Stage C). A trapping
-                    // load is safe to hoist iff:
+                    // Speculative load hoisting (Stage C, #446, extended
+                    // per #494). A trapping load is safe to hoist iff:
                     //  (a) the loop body has no memory-mutating op and
                     //      no call (else the load could observe a
                     //      different value across iterations);
-                    //  (b) the load's containing block is the loop
-                    //      header. The header is reached on every loop
-                    //      entry, and any load in it precedes the
-                    //      header's terminator (each block has exactly
-                    //      one terminator at its tail), so the load
-                    //      runs on every iteration the loop is entered
-                    //      — including the 0-iter early-exit path.
-                    //      Hoisting then preserves the trap point.
-                    const is_speculative_load = loop_can_hoist_load and bid == loop.header and switch (inst.op) {
+                    //  (b) the load's containing block dominates every
+                    //      loop latch AND every exiting block — i.e.,
+                    //      every iteration must transit through it
+                    //      before either looping back or leaving the
+                    //      loop. The header is the common special case
+                    //      (it dominates every block in the loop by
+                    //      definition); we short-circuit it to avoid
+                    //      the per-anchor loop.
+                    //      In both cases the load runs on every entered
+                    //      iteration (including the 0-iter early-exit
+                    //      path), so hoisting preserves the trap point.
+                    const speculation_safe = loop_can_hoist_load and (bid == loop.header or blk: {
+                        for (anchors.items) |x| if (!dom.dominates(bid, x)) break :blk false;
+                        break :blk true;
+                    });
+                    const is_speculative_load = speculation_safe and switch (inst.op) {
                         .load,
                         .v128_load,
                         .v128_load_splat,
@@ -2661,6 +2683,28 @@ fn obtainLoopPreheader(
     }
 
     return try synthesizeLoopPreheader(func, loop, header_preds, predecessors, allocator);
+}
+
+/// True iff `bid` is an exiting block of `loop`: its terminator has
+/// at least one successor outside `loop.blocks`, or it is a function-
+/// exit terminator (`ret`/`unreachable`) and therefore leaves the loop
+/// implicitly. A block with no instructions is treated as exiting as a
+/// fail-safe — such a block is malformed and conservatively blocks any
+/// speculative hoist that would rely on dominating it.
+fn isLoopExitingBlock(func: *const ir.IrFunction, loop: *const analysis.Loop, bid: ir.BlockId) bool {
+    const block = func.blocks.items[bid];
+    if (block.instructions.items.len == 0) return true;
+    const term = block.instructions.items[block.instructions.items.len - 1].op;
+    return switch (term) {
+        .br => |t| !loop.containsBlock(t),
+        .br_if => |bi| !loop.containsBlock(bi.then_block) or !loop.containsBlock(bi.else_block),
+        .br_table => |bt| blk: {
+            if (!loop.containsBlock(bt.default)) break :blk true;
+            for (bt.targets) |t| if (!loop.containsBlock(t)) break :blk true;
+            break :blk false;
+        },
+        else => true,
+    };
 }
 
 /// Allocate a fresh block, retarget every non-loop predecessor's
@@ -7880,6 +7924,155 @@ test "hoistLoopInvariantCode: load NOT hoisted when base operand is loop-variant
         }
     }
     try std.testing.expect(body_has_load);
+}
+
+test "hoistLoopInvariantCode: load in non-header block hoisted when block dominates all anchors" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    // b_pre → b_header → b_body. b_header is a pass-through; b_body
+    // holds the load and is both the sole latch (br header) and the
+    // sole exit (br_if header/exit). b_body dominates itself and is
+    // therefore a safe speculation site under the relaxed rule (#494).
+    const b_pre = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_body = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_base = func.newVReg();
+    try func.getBlock(b_pre).append(.{ .op = .{ .iconst_32 = 256 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b_pre).append(.{ .op = .{ .br = b_header } });
+
+    try func.getBlock(b_header).append(.{ .op = .{ .br = b_body } });
+
+    const v_loaded = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b_body).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b_body).append(.{ .op = .{ .eqz = v_loaded }, .dest = v_cond });
+    try func.getBlock(b_body).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_exit, .else_block = b_header } } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_loaded } });
+
+    const changed = try hoistLoopInvariantCode(&func, allocator);
+    try std.testing.expect(changed);
+
+    var body_has_load = false;
+    for (func.getBlock(b_body).instructions.items) |inst| {
+        if (inst.op == .load) {
+            body_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(!body_has_load);
+}
+
+test "hoistLoopInvariantCode: load NOT hoisted when on one diamond branch only" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    // Diamond inside the loop:
+    //   pre → header → {then(load), else} → join → header | exit
+    // The load lives in `then`. `then` does not dominate `join` (the
+    // sole latch + exit anchor) because the else-side reaches `join`
+    // independently. Stage C extension must not hoist.
+    const b_pre = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_then = try func.newBlock();
+    const b_else = try func.newBlock();
+    const b_join = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_gate = func.newVReg();
+    try func.getBlock(b_pre).append(.{ .op = .{ .iconst_32 = 256 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b_pre).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_gate, .type = .i32 });
+    try func.getBlock(b_pre).append(.{ .op = .{ .br = b_header } });
+
+    try func.getBlock(b_header).append(.{ .op = .{ .br_if = .{ .cond = v_gate, .then_block = b_then, .else_block = b_else } } });
+
+    const v_loaded = func.newVReg();
+    try func.getBlock(b_then).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b_then).append(.{ .op = .{ .br = b_join } });
+
+    try func.getBlock(b_else).append(.{ .op = .{ .br = b_join } });
+
+    const v_cond = func.newVReg();
+    try func.getBlock(b_join).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b_join).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_exit, .else_block = b_header } } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_base } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var then_has_load = false;
+    for (func.getBlock(b_then).instructions.items) |inst| {
+        if (inst.op == .load) {
+            then_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(then_has_load);
+
+    var pre_has_load = false;
+    for (func.getBlock(b_pre).instructions.items) |inst| {
+        if (inst.op == .load) {
+            pre_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(!pre_has_load);
+}
+
+test "hoistLoopInvariantCode: load NOT hoisted when one of multiple latches is not dominated" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    // Two latches, both back-edge to header:
+    //   pre → header → {path_a(load, latch+exit), path_b(latch)}
+    // path_a holds the load and is one latch; path_b is the other
+    // latch. path_a does not dominate path_b (path_b is reached from
+    // header directly, not via path_a). Stage C extension must not
+    // hoist.
+    const b_pre = try func.newBlock();
+    const b_header = try func.newBlock();
+    const b_path_a = try func.newBlock();
+    const b_path_b = try func.newBlock();
+    const b_exit = try func.newBlock();
+
+    const v_base = func.newVReg();
+    const v_gate = func.newVReg();
+    try func.getBlock(b_pre).append(.{ .op = .{ .iconst_32 = 256 }, .dest = v_base, .type = .i32 });
+    try func.getBlock(b_pre).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_gate, .type = .i32 });
+    try func.getBlock(b_pre).append(.{ .op = .{ .br = b_header } });
+
+    try func.getBlock(b_header).append(.{ .op = .{ .br_if = .{ .cond = v_gate, .then_block = b_path_a, .else_block = b_path_b } } });
+
+    const v_loaded = func.newVReg();
+    const v_cond = func.newVReg();
+    try func.getBlock(b_path_a).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_loaded, .type = .i32 });
+    try func.getBlock(b_path_a).append(.{ .op = .{ .eqz = v_loaded }, .dest = v_cond });
+    try func.getBlock(b_path_a).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b_exit, .else_block = b_header } } });
+
+    try func.getBlock(b_path_b).append(.{ .op = .{ .br = b_header } });
+    try func.getBlock(b_exit).append(.{ .op = .{ .ret = v_loaded } });
+
+    _ = try hoistLoopInvariantCode(&func, allocator);
+
+    var path_a_has_load = false;
+    for (func.getBlock(b_path_a).instructions.items) |inst| {
+        if (inst.op == .load) {
+            path_a_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(path_a_has_load);
+
+    var pre_has_load = false;
+    for (func.getBlock(b_pre).instructions.items) |inst| {
+        if (inst.op == .load) {
+            pre_has_load = true;
+            break;
+        }
+    }
+    try std.testing.expect(!pre_has_load);
 }
 
 test "inductionVariableSimplification: single induction address is strength reduced" {
