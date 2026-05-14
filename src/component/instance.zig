@@ -1121,9 +1121,11 @@ pub const ComponentInstance = struct {
         self.resource_tables.deinit(self.allocator);
 
         // Tear down per-instance async-handle tables (#478 sub-PR 3).
-        // Streams and waitable-sets own heap memory; futures and
-        // error-contexts don't (the latter stores `[]u8` debug strings
-        // which we free below).
+        // Streams and waitable-sets own heap memory; futures buffer
+        // their lowered payload (#478 sub-PR 3a) and error-contexts
+        // store `[]u8` debug strings which we free below.
+        var fut_it = self.futures.valueIterator();
+        while (fut_it.next()) |f| f.deinit(self.allocator);
         self.futures.deinit(self.allocator);
         var stream_it = self.streams.valueIterator();
         while (stream_it.next()) |s| s.deinit(self.allocator);

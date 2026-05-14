@@ -970,23 +970,186 @@ fn dispatchAsyncCanon(
 
         // ── Future handles ──────────────────────────────────────────────
         .future_new => |info| {
-            _ = info;
             const handle = comp_inst.allocAsyncHandle();
-            comp_inst.futures.put(comp_inst.allocator, handle, .{}) catch return error.OutOfMemory;
+            comp_inst.futures.put(comp_inst.allocator, handle, .{
+                .elem_type_idx = info.type_idx,
+            }) catch return error.OutOfMemory;
             const packed_handles: u64 = (@as(u64, handle) << 32) | @as(u64, handle);
             env.pushI64(@bitCast(packed_handles)) catch return error.StackOverflow;
+        },
+        .future_read => |info| {
+            // Stack: (handle, ptr) → status. The destination pointer
+            // is on top; `handle` is below it.
+            const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            const fut = comp_inst.futures.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+
+            // Writer dropped without ever delivering a value → cancelled.
+            if (fut.write_closed and fut.payload == null) {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // Writer already buffered — deliver and wake any read waitable.
+            if (fut.payload) |buf| {
+                const dst = comp_inst.writableGuestBytes(guest_ptr, @intCast(buf.len)) orelse
+                    return error.MemoryNotAvailable;
+                @memcpy(dst, buf);
+                comp_inst.allocator.free(buf);
+                fut.payload = null;
+                fut.state = .ready;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // No writer yet — park. `info.type_idx` is captured into the
+            // table entry at `future.new` time; we only need the guest
+            // ptr here.
+            _ = info;
+            fut.pending_read = .{ .guest_ptr = guest_ptr };
+            env.pushI32(@bitCast(async_canon.packStatus(.starting, 0))) catch
+                return error.StackOverflow;
+        },
+        .future_write => |info| {
+            // Stack: (handle, ptr) → status.
+            const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            const fut = comp_inst.futures.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+
+            // Reader already dropped → writer is cancelled.
+            if (fut.read_closed) {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // Already buffered (double-write); reject with cancelled. Spec
+            // forbids two writes on a one-shot future.
+            if (fut.payload != null) {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            const registry = TypeRegistry.init(comp_inst.component);
+            const elem_size = abi.sizeOfType(registry, ctypes.ValType{ .type_idx = info.type_idx });
+            if (elem_size == 0) return error.LowerError;
+
+            const src = comp_inst.readGuestBytes(guest_ptr, elem_size) orelse
+                return error.MemoryNotAvailable;
+
+            // Reader parked first: copy straight into its destination,
+            // skip allocating a heap buffer.
+            if (fut.pending_read) |pr| {
+                const dst = comp_inst.writableGuestBytes(pr.guest_ptr, elem_size) orelse
+                    return error.MemoryNotAvailable;
+                @memcpy(dst, src);
+                fut.pending_read = null;
+                fut.state = .ready;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // No reader yet — buffer the payload on the heap. Reader's
+            // future arrival will memcpy out of `payload` and free it.
+            const heap_buf = comp_inst.allocator.alloc(u8, elem_size) catch
+                return error.OutOfMemory;
+            @memcpy(heap_buf, src);
+            fut.payload = heap_buf;
+            fut.state = .ready;
+            if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                ws.setReady(idx, allocator);
+            env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                return error.StackOverflow;
+        },
+        .future_cancel_read => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const fut = comp_inst.futures.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+            // If a value was already delivered before cancel arrived,
+            // surface RETURNED so the caller still observes the transfer.
+            if (fut.state == .ready and fut.payload == null) {
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                    return error.StackOverflow;
+                return;
+            }
+            fut.pending_read = null;
+            env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                return error.StackOverflow;
+        },
+        .future_cancel_write => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const fut = comp_inst.futures.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+            // If the reader already consumed the buffered payload, the
+            // write completed before cancel; report RETURNED.
+            if (fut.state == .ready and fut.payload == null and fut.pending_read == null) {
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                    return error.StackOverflow;
+                return;
+            }
+            // Otherwise reclaim any unconsumed buffered payload so the
+            // future returns to the empty state.
+            if (fut.payload) |buf| {
+                comp_inst.allocator.free(buf);
+                fut.payload = null;
+            }
+            env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                return error.StackOverflow;
         },
         .future_drop_readable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            _ = comp_inst.futures.remove(handle);
+            if (comp_inst.futures.getPtr(handle)) |fut| {
+                fut.read_closed = true;
+                // Wake a parked writer so it can observe CANCELLED.
+                if (fut.waitable_set) |ws| if (fut.write_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                if (fut.read_closed and fut.write_closed) {
+                    fut.deinit(comp_inst.allocator);
+                    _ = comp_inst.futures.remove(handle);
+                }
+            }
         },
         .future_drop_writable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            _ = comp_inst.futures.remove(handle);
+            if (comp_inst.futures.getPtr(handle)) |fut| {
+                fut.write_closed = true;
+                // Wake a parked reader so it can observe CANCELLED.
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                if (fut.read_closed and fut.write_closed) {
+                    fut.deinit(comp_inst.allocator);
+                    _ = comp_inst.futures.remove(handle);
+                }
+            }
         },
-        .future_read, .future_write, .future_cancel_read, .future_cancel_write => return error.FunctionNotFound,
 
         // ── error-context ───────────────────────────────────────────────
         .error_context_new => |info| {
@@ -1783,7 +1946,7 @@ test "dispatchCanonBuiltin: waitable-set.new allocates a fresh handle; drop free
     try testing.expectEqual(@as(u32, 0), inst.waitable_sets.count());
 }
 
-test "dispatchCanonBuiltin: future.new + drop-readable round-trip" {
+test "dispatchCanonBuiltin: future.new + drop both ends round-trip" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
     const inst_mod_core = @import("../runtime/interpreter/instance.zig");
@@ -1818,10 +1981,22 @@ test "dispatchCanonBuiltin: future.new + drop-readable round-trip" {
     try testing.expect(r_idx > 0);
     try testing.expectEqual(@as(u32, 1), inst.futures.count());
 
+    // Drop-readable alone retains the table entry — only marks read_closed.
     try env.pushI32(@bitCast(r_idx));
     try dispatchCanonBuiltin(
         inst,
         .{ .async_canon = .{ .future_drop_readable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 1), inst.futures.count());
+
+    // Dropping the second end removes the table entry.
+    try env.pushI32(@bitCast(w_idx));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_drop_writable = .{ .type_idx = 0 } } },
         env,
         null,
         testing.allocator,
