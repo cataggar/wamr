@@ -2004,6 +2004,393 @@ test "dispatchCanonBuiltin: future.new + drop both ends round-trip" {
     try testing.expectEqual(@as(u32, 0), inst.futures.count());
 }
 
+// ── #478 sub-PR 3a: future.read/write rendezvous tests ──────────────────────
+//
+// Each test wires a minimal `ComponentInstance` whose component-type-index
+// space carries a single `(type u32)` entry; `future.new t=0` therefore
+// names a `future<u32>`. `enableTestMem` provides a 4 KiB backing buffer
+// for the lift/lower memcpy on each side of the rendezvous.
+
+fn newFutureU32Inst(testing_allocator: std.mem.Allocator) !*instance_mod.ComponentInstance {
+    // Static lifetimes — the `Component` and its types live as long as
+    // the instance, so we leak them deliberately. Tests run in their
+    // own process; the test allocator releases bookkeeping on exit.
+    const FutureTypeFixture = struct {
+        var types_array = [_]ctypes.TypeDef{.{ .val = .u32 }};
+        var comp: ctypes.Component = .{
+            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+            .components = &.{},       .instances = &.{},      .aliases = &.{},
+            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .exports = &.{},
+        };
+    };
+    FutureTypeFixture.comp.types = &FutureTypeFixture.types_array;
+    const inst = try instance_mod.instantiate(&FutureTypeFixture.comp, testing_allocator);
+    try inst.enableTestMem(testing_allocator, 4096);
+    return inst;
+}
+
+fn destroyFutureInst(inst: *instance_mod.ComponentInstance) void {
+    inst.disableTestMem();
+    inst.deinit();
+}
+
+test "future.new: returns packed read|write handles" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const packed_handles: u64 = @bitCast(try env.popI64());
+    const r_idx: u32 = @truncate(packed_handles >> 32);
+    const w_idx: u32 = @truncate(packed_handles & 0xFFFF_FFFF);
+    // Single-handle prototype: read+write share the same idx.
+    try testing.expectEqual(r_idx, w_idx);
+    try testing.expect(r_idx > 0);
+    try testing.expectEqual(@as(u32, 1), inst.futures.count());
+
+    const fut = inst.futures.getPtr(r_idx).?;
+    try testing.expectEqual(@as(u32, 0), fut.elem_type_idx);
+    try testing.expect(fut.payload == null);
+    try testing.expect(fut.pending_read == null);
+}
+
+test "future.write then future.read: round-trips a u32" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    // Allocate the handle.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Stage the source u32 in test memory at offset 0; destination at 32.
+    const src_ptr: u32 = 0;
+    const dst_ptr: u32 = 32;
+    const src_bytes = inst.writableGuestBytes(src_ptr, 4).?;
+    std.mem.writeInt(u32, src_bytes[0..4], 0xDEAD_BEEF, .little);
+
+    // Issue future.write — should buffer the bytes (no reader parked yet).
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const write_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 1), write_status);
+    try testing.expect(inst.futures.getPtr(handle).?.payload != null);
+
+    // Issue future.read — should copy buffered bytes into dst.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const read_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 1), read_status);
+
+    const dst_bytes = inst.writableGuestBytes(dst_ptr, 4).?;
+    try testing.expectEqual(@as(u32, 0xDEAD_BEEF), std.mem.readInt(u32, dst_bytes[0..4], .little));
+    // Payload drained.
+    try testing.expect(inst.futures.getPtr(handle).?.payload == null);
+}
+
+test "future.read parks then future.write wakes a waitable" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Wire a waitable set + register the future's read side. This is
+    // the manual plumbing the eventual `waitable.join` arm will set up;
+    // the rendezvous logic only checks that the slots are populated.
+    var ws = async_mod.WaitableSet{};
+    defer ws.deinit(testing.allocator);
+    {
+        const fut = inst.futures.getPtr(handle).?;
+        fut.waitable_set = &ws;
+        const idx = try ws.register(.{ .kind = .future_read, .handle = handle }, testing.allocator);
+        fut.read_waitable_idx = idx;
+    }
+
+    const src_ptr: u32 = 0;
+    const dst_ptr: u32 = 16;
+    const src_bytes = inst.writableGuestBytes(src_ptr, 4).?;
+    std.mem.writeInt(u32, src_bytes[0..4], 0xCAFE_F00D, .little);
+
+    // Reader arrives first — must park with STARTING and remember the dst.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const read_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.starting, 0), read_status);
+    try testing.expectEqual(@as(u32, dst_ptr), inst.futures.getPtr(handle).?.pending_read.?.guest_ptr);
+
+    // Writer arrives — copies straight into the parked dst, returns RETURNED.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const write_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 1), write_status);
+
+    // Destination memory updated, payload not buffered, waitable woken.
+    const dst_bytes = inst.writableGuestBytes(dst_ptr, 4).?;
+    try testing.expectEqual(@as(u32, 0xCAFE_F00D), std.mem.readInt(u32, dst_bytes[0..4], .little));
+    try testing.expect(inst.futures.getPtr(handle).?.payload == null);
+    try testing.expect(inst.futures.getPtr(handle).?.pending_read == null);
+    var ready: [4]u32 = undefined;
+    try testing.expectEqual(@as(u32, 1), ws.pollReady(&ready));
+}
+
+test "future.cancel-read on empty future returns CANCELLED" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Park a reader so cancel has something to clear.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(@as(u32, 0)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32(); // discard STARTING
+    try testing.expect(inst.futures.getPtr(handle).?.pending_read != null);
+
+    // Cancel — should clear pending_read and return CANCELLED.
+    try env.pushI32(@bitCast(handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_cancel_read = .{ .type_idx = 0, .is_async = false } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.cancelled, 0), status);
+    try testing.expect(inst.futures.getPtr(handle).?.pending_read == null);
+}
+
+test "future.drop-writable while reader parked: subsequent read is CANCELLED" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const packed_handles: u64 = @bitCast(try env.popI64());
+    const r_idx: u32 = @truncate(packed_handles >> 32);
+    const w_idx: u32 = @truncate(packed_handles & 0xFFFF_FFFF);
+
+    // Park a reader first so the drop-writable code path observes it.
+    try env.pushI32(@bitCast(r_idx));
+    try env.pushI32(@bitCast(@as(u32, 16)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32(); // discard STARTING
+
+    // Writer drops without ever writing.
+    try env.pushI32(@bitCast(w_idx));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_drop_writable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    // Entry remains until the reader also drops.
+    try testing.expectEqual(@as(u32, 1), inst.futures.count());
+    try testing.expect(inst.futures.getPtr(r_idx).?.write_closed);
+
+    // Clear the parked-reader slot and re-issue read — it should observe
+    // CANCELLED because the writer is closed and no payload was buffered.
+    inst.futures.getPtr(r_idx).?.pending_read = null;
+    try env.pushI32(@bitCast(r_idx));
+    try env.pushI32(@bitCast(@as(u32, 16)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.cancelled, 0), status);
+}
+
+test "future.drop both ends: table entry is freed" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const packed_handles: u64 = @bitCast(try env.popI64());
+    const r_idx: u32 = @truncate(packed_handles >> 32);
+    const w_idx: u32 = @truncate(packed_handles & 0xFFFF_FFFF);
+
+    // Buffer a payload to verify drop frees it (no leak diagnostic from
+    // the test allocator).
+    const src_ptr: u32 = 0;
+    const src_bytes = inst.writableGuestBytes(src_ptr, 4).?;
+    std.mem.writeInt(u32, src_bytes[0..4], 0x1234_5678, .little);
+    try env.pushI32(@bitCast(r_idx));
+    try env.pushI32(@bitCast(src_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32(); // discard RETURNED
+
+    try testing.expectEqual(@as(u32, 1), inst.futures.count());
+    try testing.expect(inst.futures.getPtr(r_idx).?.payload != null);
+
+    try env.pushI32(@bitCast(w_idx));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_drop_writable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 1), inst.futures.count());
+
+    try env.pushI32(@bitCast(r_idx));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_drop_readable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 0), inst.futures.count());
+}
+
 test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
