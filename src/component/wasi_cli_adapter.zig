@@ -29,6 +29,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+const build_options = @import("config");
+
 const instance_mod = @import("instance.zig");
 const ComponentInstance = instance_mod.ComponentInstance;
 const HostFunc = instance_mod.HostFunc;
@@ -11924,17 +11926,14 @@ pub const WasiCliAdapter = struct {
     ///   option<own<request-options>>)
     ///   -> result<own<future-incoming-response>, error-code>`.
     ///
-    /// Cleartext-only today (#477): `https://` (or any non-`http`
-    /// scheme) returns `error-code::HTTP_protocol_error`. The
-    /// `std.http.Client` upstream doesn't ship TLS in Zig 0.16, and
-    /// parent issue #451 explicitly disallows reimplementing it in
-    /// the runtime.
-    ///
-    /// When `sockets_allow_list_template` is non-empty AND the
-    /// scheme is `"http"`, performs a real outbound HTTP request via
-    /// `std.http.Client` (#176). Otherwise returns
-    /// `HTTP_request_denied` (empty allow-list) or
-    /// `HTTP_protocol_error` (encrypted / unsupported scheme).
+    /// Performs a real outbound HTTP/HTTPS request via
+    /// `std.http.Client.fetch` when `sockets_allow_list_template` is
+    /// non-empty. TLS is delegated to `std.crypto.tls` (#521 — the
+    /// earlier `HTTP_protocol_error` short-circuit added by #477 /
+    /// #501 has been removed now that Zig 0.16 ships a working TLS
+    /// client). The empty allow-list path still returns
+    /// `HTTP_request_denied`; transport / parse failures return
+    /// `internal_error`.
     fn httpOutgoingHandlerHandle(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
@@ -11962,25 +11961,15 @@ pub const WasiCliAdapter = struct {
             return httpHandlerDeny(self, results, allocator, .HTTP_request_denied);
         };
 
-        // Build scheme string
+        // Build scheme string. `std.http.Client.fetch` handles `http`
+        // and `https` natively (TLS via `std.crypto.tls`, #521). Any
+        // other scheme value falls through to `Uri.parse`, which will
+        // reject it and surface as `internal_error` below.
         const scheme: []const u8 = if (r.scheme_disc) |d| switch (d) {
             0 => "http",
             1 => "https",
             else => if (r.scheme_other) |s| s else "https",
         } else "https";
-
-        // #477: std.http.Client doesn't ship TLS yet. Refuse `https://`
-        // (and any non-`http` custom scheme) explicitly rather than
-        // silently fall through to a plaintext connect attempt.
-        // `HTTP_protocol_error` (variant 35) is the cleanest existing
-        // `error-code` value: the spec describes it as "the response was
-        // not a valid HTTP response", which subsumes "we could not speak
-        // the requested protocol". Re-evaluate once upstream lands TLS
-        // (then this whole branch goes away and the handler proceeds).
-        // TODO(#477): remove when std.http.Client supports TLS.
-        if (!std.mem.eql(u8, scheme, "http")) {
-            return httpHandlerDeny(self, results, allocator, .HTTP_protocol_error);
-        }
 
         const authority = r.authority orelse {
             return httpHandlerDeny(self, results, allocator, .HTTP_request_URI_invalid);
@@ -12037,7 +12026,11 @@ pub const WasiCliAdapter = struct {
             .allocator = self.allocator,
             .io = io,
         };
-        defer client.connection_pool.deinit(io);
+        // `client.deinit()` releases the connection pool AND the
+        // lazily-populated TLS CA bundle (#521). The earlier
+        // `connection_pool.deinit(io)`-only path leaked the bundle
+        // on every `https://` request.
+        defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -13289,9 +13282,11 @@ pub const WasiCliAdapter = struct {
     // --- client.send (P3) — host-provided outbound HTTP ---
 
     /// `wasi:http/client.send: async func(request) -> result<response, error-code>` (#487).
-    /// Synchronous HTTP/1.1 implementation via std.http.Client. The
-    /// async lift on the guest side observes a value-ready return.
-    /// Cleartext HTTP only (#477 gate).
+    /// Synchronous HTTP/1.1 implementation via `std.http.Client.fetch`.
+    /// The async lift on the guest side observes a value-ready return.
+    /// Both `http://` and `https://` are accepted — TLS is provided by
+    /// `std.crypto.tls` (#521 — replaces the `HTTP_protocol_error`
+    /// gate originally added in #477 / #501).
     fn httpClientSendP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -13313,16 +13308,13 @@ pub const WasiCliAdapter = struct {
             return httpClientDenyP3(results, allocator, .HTTP_request_denied);
         }
 
+        // Scheme — `http` and `https` are both supported (#521).
+        // `std.http.Client.fetch` handles TLS via `std.crypto.tls`.
         const scheme: []const u8 = if (r.scheme_disc) |d| switch (d) {
             0 => "http",
             1 => "https",
             else => if (r.scheme_other) |s| s else "https",
         } else "https";
-
-        // #477 https gate.
-        if (!std.mem.eql(u8, scheme, "http")) {
-            return httpClientDenyP3(results, allocator, .HTTP_protocol_error);
-        }
 
         const authority = r.authority orelse {
             return httpClientDenyP3(results, allocator, .HTTP_request_URI_invalid);
@@ -13358,7 +13350,9 @@ pub const WasiCliAdapter = struct {
 
         const io = std.Io.Threaded.global_single_threaded.io();
         var client: std.http.Client = .{ .allocator = self.allocator, .io = io };
-        defer client.connection_pool.deinit(io);
+        // `client.deinit()` covers both the connection pool and the
+        // lazily-allocated TLS CA bundle (#521).
+        defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
@@ -20436,22 +20430,78 @@ test "http #176: handle returns denied when allow-list empty" {
     );
 }
 
-test "http #477: https outgoing-handler returns HTTP_protocol_error (no TLS in std)" {
+test "wasi:http #521: https outgoing-handler proceeds past the TLS gate" {
+    // Regression for #521: the `HTTP_protocol_error` short-circuit
+    // added by #477/#501 has been removed. `https://` requests now
+    // flow into `std.http.Client.fetch`, which delegates TLS to
+    // `std.crypto.tls`. The destination (`127.0.0.1:1`) is almost
+    // certainly closed, so `fetch` returns a transport error and
+    // the handler surfaces `internal_error`. The point of this test
+    // is the *absence* of `HTTP_protocol_error` — that variant must
+    // never again be produced by a well-formed `https://` request.
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     var ci: ComponentInstance = undefined;
 
-    // Non-empty allow-list so the empty-list deny path doesn't mask
-    // the scheme rejection.
+    // Non-empty allow-list so the empty-list deny path doesn't fire.
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0, // GET
+        .scheme_disc = 1, // https
+        .authority = try testing.allocator.dupe(u8, "127.0.0.1:1"),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    try testing.expect(fut.state == .ready_err);
+    // The gate is gone — `HTTP_protocol_error` must never be the
+    // result of a scheme check on `https://`.
+    try testing.expect(fut.state.ready_err != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
+    // Connection refused / parse failure surfaces as `internal_error`.
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        fut.state.ready_err,
+    );
+}
+
+test "wasi:http #521: opt-in real HTTPS outgoing-handler against example.com" {
+    // Real-network smoke test, gated by `-Dnetwork_tests=true`. CI
+    // and the default `zig build test` skip this path so the suite
+    // does not depend on external connectivity. Enable locally with:
+    //   zig build test -Dnetwork_tests=true
+    if (!build_options.network_tests) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
     const allow = try testing.allocator.alloc(IpCidr, 1);
     allow[0] = try IpCidr.parse("0.0.0.0/0");
     adapter.sockets_allow_list_template = allow;
 
-    // Headers + outgoing-request with scheme = https (disc=1). Both
-    // are pushed into adapter-owned tables; adapter.deinit frees the
-    // strings (duped with adapter.allocator == testing.allocator) and
-    // destroys the structs.
     const fields = try testing.allocator.create(HttpFields);
     fields.* = .{};
     const fh = try adapter.pushHttpFields(fields);
@@ -20478,11 +20528,10 @@ test "http #477: https outgoing-handler returns HTTP_protocol_error (no TLS in s
     try testing.expect(results[0].result_val.is_ok);
     const fut_handle = results[0].result_val.payload.?.handle;
     const fut = adapter.http_future_responses.items[fut_handle].?;
-    try testing.expect(fut.state == .ready_err);
-    try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)),
-        fut.state.ready_err,
-    );
+    try testing.expect(fut.state == .ready_ok);
+    const ir = adapter.http_incoming_responses.items[fut.state.ready_ok].?;
+    // example.com canonically returns 200 (or 30x to https itself).
+    try testing.expect(ir.status >= 200 and ir.status < 400);
 }
 
 test "http #477: http outgoing-handler without allow-list returns HTTP_request_denied (regression)" {
@@ -22559,14 +22608,17 @@ test "wasi:http@0.3 (#487): client.send denies when allow-list empty" {
     );
 }
 
-test "wasi:http@0.3 (#487): client.send rejects https with HTTP_protocol_error (#477 gate)" {
+test "wasi:http@0.3 #521: client.send proceeds past the TLS gate for https" {
+    // Counterpart to the P2 test: the #477/#501 `HTTP_protocol_error`
+    // short-circuit is gone for `wasi:http/client.send@0.3.0` as
+    // well. `https://127.0.0.1:1/` has no listener so we expect a
+    // transport-level `internal_error`, never `HTTP_protocol_error`.
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
     var ci = p3HttpTestCi(testing.allocator);
     defer p3HttpTestCiDeinit(&ci);
 
-    // Non-empty allow-list so the deny path doesn't preempt the gate.
     try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
 
     const trailers_h = ci.allocAsyncHandle();
@@ -22597,10 +22649,58 @@ test "wasi:http@0.3 (#487): client.send rejects https with HTTP_protocol_error (
 
     try testing.expect(send_results[0] == .result_val);
     try testing.expect(!send_results[0].result_val.is_ok);
-    try testing.expectEqual(
-        @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)),
-        send_results[0].result_val.payload.?.variant_val.discriminant,
-    );
+    const code = send_results[0].result_val.payload.?.variant_val.discriminant;
+    // The scheme gate is gone — `HTTP_protocol_error` must not be the
+    // outcome of a well-formed `https://` request.
+    try testing.expect(code != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
+    try testing.expectEqual(@as(u32, @intFromEnum(HttpErrorCode.internal_error)), code);
+}
+
+test "wasi:http@0.3 #521: opt-in real HTTPS client.send against example.com" {
+    // Real-network smoke test for the 0.3 client.send path. Gated by
+    // `-Dnetwork_tests=true` (see build.zig) so the default suite
+    // remains hermetic. Enable locally with:
+    //   zig build test -Dnetwork_tests=true
+    if (!build_options.network_tests) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    try adapter.setSocketsAllowList(&.{"0.0.0.0/0"});
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const new_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+        .{ .handle = trailers_h },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var new_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestNewP3(&adapter, &ci, &new_args, &new_results, testing.allocator);
+    defer new_results[0].deinit(testing.allocator);
+    const req_handle = new_results[0].tuple_val[0].handle;
+
+    const r = adapter.lookupHttpRequestP3(req_handle).?;
+    r.scheme_disc = 1; // https
+    r.authority = try testing.allocator.dupe(u8, "example.com");
+
+    const send_args = [_]InterfaceValue{.{ .handle = req_handle }};
+    var send_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
+    defer send_results[0].deinit(testing.allocator);
+
+    try testing.expect(send_results[0] == .result_val);
+    try testing.expect(send_results[0].result_val.is_ok);
+    const resp_h = send_results[0].result_val.payload.?.handle;
+    const resp = adapter.lookupHttpResponseP3(resp_h).?;
+    try testing.expect(resp.status >= 200 and resp.status < 400);
 }
 
 test "wasi:http@0.3 (#487): response.new + consume-body roundtrips status, body, trailers" {

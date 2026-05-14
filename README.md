@@ -78,17 +78,36 @@ the gate against regressions in already-shipped WASI host functions.
 
 ## WASI limitations
 
-### `wasi:http` — outbound HTTP only
+### `wasi:http` — outbound HTTP and HTTPS
 
-`wamr`'s `wasi:http/outgoing-handler.handle` issues real outbound HTTP requests
-via `std.http.Client` when a non-empty `sockets_allow_list_template` is
-configured. **`https://` is not yet supported** — Zig 0.16's `std.http.Client`
-does not ship a TLS implementation, and per the project's WASI roadmap
-([#451](https://github.com/cataggar/wamr/issues/451)) we do not reimplement
-TLS in the runtime. `https://` URLs (and any other non-`http` scheme) return
-`error-code::HTTP_protocol_error`. Once upstream Zig lands TLS, this
-restriction will lift (see
-[#477](https://github.com/cataggar/wamr/issues/477)).
+`wamr`'s `wasi:http/outgoing-handler.handle` (Preview 2) and
+`wasi:http/client.send` (Preview 3) issue real outbound HTTP and **HTTPS**
+requests via `std.http.Client.fetch`. TLS is delegated to Zig 0.16's
+[`std.crypto.tls`](https://ziglang.org/documentation/master/std/#std.crypto.tls)
+client — system root certificates are loaded via
+`std.crypto.Certificate.Bundle.rescan` (see
+[#521](https://github.com/cataggar/wamr/issues/521)). Both `http://` and
+`https://` schemes are accepted when `sockets_allow_list_template` is
+non-empty; the empty allow-list still surfaces
+`error-code::HTTP_request_denied`.
+
+Transport, TLS handshake, and parse failures collapse into
+`error-code::internal_error` — finer-grained diagnostic mapping is left to
+follow-up work. Response headers are not yet surfaced (a `std.http.Client`
+limitation: `FetchResult` only exposes the status line) and incoming-handler
+server semantics remain a stub.
+
+The earlier `error-code::HTTP_protocol_error` short-circuit on `https://`
+(introduced in [#477](https://github.com/cataggar/wamr/issues/477) /
+[#501](https://github.com/cataggar/wamr/pull/501)) was removed once we
+confirmed Zig 0.16 ships a working TLS client in `std.crypto.tls`.
+
+To exercise the real outbound HTTPS path in unit tests (off by default
+so CI stays hermetic):
+
+```console
+$ zig build test -Dnetwork_tests=true
+```
 
 ## License
 
