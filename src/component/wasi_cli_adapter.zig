@@ -1426,6 +1426,53 @@ pub const ResponseOutparam = struct {
     state: State = .unset,
 };
 
+/// `wasi:http/types@0.3.0` unified request resource (#487).
+/// Merges 0.2's `incoming-request` + `outgoing-request` into a single
+/// resource. Body data lives in `ComponentInstance.streams`; trailers
+/// and transmission-result live in `ComponentInstance.futures`. Field
+/// strings are owned host slices.
+pub const HttpRequestP3 = struct {
+    method_disc: u32 = 0, // .get
+    method_other: ?[]u8 = null,
+    path_with_query: ?[]u8 = null,
+    scheme_disc: ?u32 = null,
+    scheme_other: ?[]u8 = null,
+    authority: ?[]u8 = null,
+    headers_handle: u32 = 0,
+    options_handle: ?u32 = null,
+    /// Handle into `ComponentInstance.streams` (AsyncStream) for the
+    /// body stream<u8>. `null` means no body / zero-length.
+    body_stream_handle: ?u32 = null,
+    /// Handle into `ComponentInstance.futures` for
+    /// `future<result<option<trailers>, error-code>>` (trailers channel).
+    trailers_future_handle: u32 = 0,
+    /// Handle into `ComponentInstance.futures` for
+    /// `future<result<_, error-code>>` (transmission result).
+    transmission_future_handle: u32 = 0,
+
+    pub fn deinit(self: *HttpRequestP3, allocator: Allocator) void {
+        if (self.method_other) |s| allocator.free(s);
+        if (self.path_with_query) |s| allocator.free(s);
+        if (self.scheme_other) |s| allocator.free(s);
+        if (self.authority) |s| allocator.free(s);
+    }
+};
+
+/// `wasi:http/types@0.3.0` unified response resource (#487).
+/// Merges 0.2's `incoming-response` + `outgoing-response`.
+pub const HttpResponseP3 = struct {
+    status: u16 = 200,
+    headers_handle: u32 = 0,
+    /// Handle into `ComponentInstance.streams` for body stream<u8>.
+    body_stream_handle: ?u32 = null,
+    /// Handle into `ComponentInstance.futures` for trailers future.
+    trailers_future_handle: u32 = 0,
+    /// Handle into `ComponentInstance.futures` for transmission future.
+    transmission_future_handle: u32 = 0,
+
+    pub fn deinit(_: *HttpResponseP3, _: Allocator) void {}
+};
+
 /// `(string, string)` pair forwarded to `wasi:cli/environment.get-environment`.
 /// The slices are borrowed by the adapter — the caller is responsible for
 /// keeping them alive across the run.
@@ -1524,8 +1571,11 @@ pub const WasiCliAdapter = struct {
     fs_types_p3_iface: HostInstance = .{},
     fs_preopens_p3_iface: HostInstance = .{},
     http_types_p3_iface: HostInstance = .{},
-    http_outgoing_handler_p3_iface: HostInstance = .{},
-    http_incoming_handler_p3_iface: HostInstance = .{},
+    // wasi:http@0.3.0 collapses outgoing-handler/incoming-handler into
+    // `wasi:http/handler` (guest-export, host-import stub) and
+    // `wasi:http/client` (host-provided send) (#487).
+    http_handler_p3_iface: HostInstance = .{},
+    http_client_p3_iface: HostInstance = .{},
     io_error_p3_iface: HostInstance = .{},
     io_streams_p3_iface: HostInstance = .{},
     random_p3_iface: HostInstance = .{},
@@ -1608,6 +1658,14 @@ pub const WasiCliAdapter = struct {
     http_outgoing_bodies: std.ArrayListUnmanaged(?*OutgoingBody) = .empty,
     http_future_responses: std.ArrayListUnmanaged(?*FutureIncomingResponse) = .empty,
     http_future_trailers: std.ArrayListUnmanaged(?*FutureTrailers) = .empty,
+    /// `wasi:http/types@0.3.0` unified request table (#487).
+    http_requests_p3: std.ArrayListUnmanaged(?*HttpRequestP3) = .empty,
+    /// `wasi:http/types@0.3.0` unified response table (#487).
+    http_responses_p3: std.ArrayListUnmanaged(?*HttpResponseP3) = .empty,
+    /// `wasi:http/types@0.3.0` request-options table (#487). Separate
+    /// from the 0.2 `http_request_options` to avoid index aliasing
+    /// across surfaces; the rep struct is the same.
+    http_request_options_p3: std.ArrayListUnmanaged(?*RequestOptions) = .empty,
     /// `wasi:io/poll.pollable` table. Pollables borrow their source
     /// resources and become ready if that source is dropped/closed, so the
     /// guest can observe the underlying closed/error condition without UAF.
@@ -1750,8 +1808,8 @@ pub const WasiCliAdapter = struct {
         self.fs_types_p3_iface.deinit(self.allocator);
         self.fs_preopens_p3_iface.deinit(self.allocator);
         self.http_types_p3_iface.deinit(self.allocator);
-        self.http_outgoing_handler_p3_iface.deinit(self.allocator);
-        self.http_incoming_handler_p3_iface.deinit(self.allocator);
+        self.http_handler_p3_iface.deinit(self.allocator);
+        self.http_client_p3_iface.deinit(self.allocator);
         self.io_error_p3_iface.deinit(self.allocator);
         self.io_streams_p3_iface.deinit(self.allocator);
         self.random_p3_iface.deinit(self.allocator);
@@ -1898,6 +1956,25 @@ pub const WasiCliAdapter = struct {
             if (maybe) |f| self.allocator.destroy(f);
         }
         self.http_future_trailers.deinit(self.allocator);
+        // wasi:http@0.3.0 P3 resource tables (#487).
+        for (self.http_requests_p3.items) |maybe| {
+            if (maybe) |r| {
+                r.deinit(self.allocator);
+                self.allocator.destroy(r);
+            }
+        }
+        self.http_requests_p3.deinit(self.allocator);
+        for (self.http_responses_p3.items) |maybe| {
+            if (maybe) |r| {
+                r.deinit(self.allocator);
+                self.allocator.destroy(r);
+            }
+        }
+        self.http_responses_p3.deinit(self.allocator);
+        for (self.http_request_options_p3.items) |maybe| {
+            if (maybe) |r| self.allocator.destroy(r);
+        }
+        self.http_request_options_p3.deinit(self.allocator);
         self.pollable_table.deinit(self.allocator);
     }
 
@@ -11853,6 +11930,1042 @@ pub const WasiCliAdapter = struct {
         _: Allocator,
     ) anyerror!void {}
 
+    // ───────────────────────────────────────────────────────────────────
+    // wasi:http@0.3.0 (#487) — resource collapse 11→4, async handlers,
+    // stream<u8> bodies, future<option<trailers>> on response.
+    // ───────────────────────────────────────────────────────────────────
+
+    fn pushHttpRequestP3(self: *WasiCliAdapter, r: *HttpRequestP3) !u32 {
+        for (self.http_requests_p3.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_requests_p3.items[i] = r;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_requests_p3.items.len);
+        try self.http_requests_p3.append(self.allocator, r);
+        return idx;
+    }
+    fn lookupHttpRequestP3(self: *WasiCliAdapter, h: u32) ?*HttpRequestP3 {
+        if (h >= self.http_requests_p3.items.len) return null;
+        return self.http_requests_p3.items[h];
+    }
+    fn pushHttpResponseP3(self: *WasiCliAdapter, r: *HttpResponseP3) !u32 {
+        for (self.http_responses_p3.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_responses_p3.items[i] = r;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_responses_p3.items.len);
+        try self.http_responses_p3.append(self.allocator, r);
+        return idx;
+    }
+    fn lookupHttpResponseP3(self: *WasiCliAdapter, h: u32) ?*HttpResponseP3 {
+        if (h >= self.http_responses_p3.items.len) return null;
+        return self.http_responses_p3.items[h];
+    }
+    fn pushRequestOptionsP3(self: *WasiCliAdapter, r: *RequestOptions) !u32 {
+        for (self.http_request_options_p3.items, 0..) |slot, i| {
+            if (slot == null) {
+                self.http_request_options_p3.items[i] = r;
+                return @intCast(i);
+            }
+        }
+        const idx: u32 = @intCast(self.http_request_options_p3.items.len);
+        try self.http_request_options_p3.append(self.allocator, r);
+        return idx;
+    }
+    fn lookupRequestOptionsP3(self: *WasiCliAdapter, h: u32) ?*RequestOptions {
+        if (h >= self.http_request_options_p3.items.len) return null;
+        return self.http_request_options_p3.items[h];
+    }
+
+    /// Allocate a unit-type future entry in `ci.futures` and immediately
+    /// mark it ready. Used by `httpClientSendP3` for transmission and
+    /// trailers futures that complete synchronously alongside the
+    /// fetch. `read_closed` stays false so guests can still read it.
+    fn allocReadyUnitFuture(ci: *ComponentInstance) !u32 {
+        const h = ci.allocAsyncHandle();
+        try ci.futures.put(ci.allocator, h, .{
+            .elem_type_idx = 0,
+            .state = .ready,
+            .write_closed = true,
+        });
+        return h;
+    }
+
+    /// Allocate a pending unit-type future entry in `ci.futures`.
+    fn allocPendingUnitFuture(ci: *ComponentInstance) !u32 {
+        const h = ci.allocAsyncHandle();
+        try ci.futures.put(ci.allocator, h, .{
+            .elem_type_idx = 0,
+            .state = .pending,
+        });
+        return h;
+    }
+
+    /// Allocate an empty (write-closed/EOF) byte stream entry. The
+    /// guest reads zero bytes and then sees EOF.
+    fn allocEmptyByteStream(ci: *ComponentInstance) !u32 {
+        const h = ci.allocAsyncHandle();
+        try ci.streams.put(ci.allocator, h, .{
+            .elem_type_idx = 0,
+            .write_closed = true,
+        });
+        return h;
+    }
+
+    /// Drain a `stream<u8>` handle into a host byte slice (caller-owned).
+    /// Returns null + 0-len if the handle is unknown. The stream's
+    /// internal buffer is moved into the returned slice.
+    fn drainByteStream(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        handle: u32,
+    ) !?[]u8 {
+        const s = ci.streams.getPtr(handle) orelse return null;
+        if (s.buffer.items.len == 0) return try self.allocator.alloc(u8, 0);
+        const out = try self.allocator.dupe(u8, s.buffer.items);
+        s.buffer.clearRetainingCapacity();
+        return out;
+    }
+
+    // --- fields.get-and-delete (new in 0.3) ---
+
+    /// `[method]fields.get-and-delete: (field-name)
+    ///   -> result<list<field-value>, header-error>` (#487).
+    /// Atomically reads-and-removes all entries matching `name`.
+    fn httpFieldsGetAndDelete(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const f = self.lookupHttpFields(handle) orelse {
+            results[0] = try httpResultOk(allocator, .{ .list = .{ .ptr = 0, .len = 0 } });
+            return;
+        };
+
+        const name_bytes: ?[]const u8 = extractArgBytes(ci, args[1]);
+        const name_alloc = if (name_bytes == null) try extractArgBytesAlloc(self.allocator, ci, args[1]) else null;
+        defer if (name_alloc) |n| self.allocator.free(n);
+        const name = name_bytes orelse (name_alloc orelse {
+            results[0] = try httpResultOk(allocator, .{ .list = .{ .ptr = 0, .len = 0 } });
+            return;
+        });
+
+        var matches: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer matches.deinit(self.allocator);
+        for (f.entries.items) |e| {
+            if (std.mem.eql(u8, e.name, name)) {
+                try matches.append(self.allocator, e.value);
+            }
+        }
+        const list_val = try lowerByteListList(ci, matches.items);
+
+        // Now remove the entries. Free the duped name/value backing.
+        httpFieldsRemoveByName(f, self.allocator, name);
+
+        results[0] = try httpResultOk(allocator, .{ .list = list_val });
+    }
+
+    // --- request (unified, P3) ---
+
+    /// `[static]request.new: (headers, contents: option<stream<u8>>,
+    ///   trailers: future<result<option<trailers>,error-code>>,
+    ///   options: option<request-options>)
+    ///   -> tuple<request, future<result<_,error-code>>>` (#487).
+    fn httpRequestNewP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 4 or results.len == 0) return error.InvalidArgs;
+
+        const headers_handle: u32 = switch (args[0]) { .handle => |h| h, else => 0 };
+        const body_handle: ?u32 = switch (args[1]) {
+            .option_val => |opt| if (opt.is_some and opt.payload != null) blk: {
+                break :blk switch (opt.payload.?.*) { .handle => |h| h, else => null };
+            } else null,
+            else => null,
+        };
+        const trailers_handle: u32 = switch (args[2]) {
+            .handle => |h| h,
+            else => try allocReadyUnitFuture(ci),
+        };
+        const options_handle: ?u32 = switch (args[3]) {
+            .option_val => |opt| if (opt.is_some and opt.payload != null) blk: {
+                break :blk switch (opt.payload.?.*) { .handle => |h| h, else => null };
+            } else null,
+            else => null,
+        };
+
+        // Pre-allocate a pending transmission future. Real send sets
+        // it to ready; for the constructor path it stays pending until
+        // the request is sent or dropped.
+        const tx_handle = try allocPendingUnitFuture(ci);
+
+        const r = try self.allocator.create(HttpRequestP3);
+        r.* = .{
+            .headers_handle = headers_handle,
+            .body_stream_handle = body_handle,
+            .trailers_future_handle = trailers_handle,
+            .transmission_future_handle = tx_handle,
+            .options_handle = options_handle,
+        };
+        const rh = try self.pushHttpRequestP3(r);
+
+        const tuple_fields = try allocator.alloc(InterfaceValue, 2);
+        tuple_fields[0] = .{ .handle = rh };
+        tuple_fields[1] = .{ .handle = tx_handle };
+        results[0] = .{ .tuple_val = tuple_fields };
+    }
+
+    fn httpRequestGetMethodP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .variant_val = .{ .discriminant = 0, .payload = null } };
+            return;
+        };
+        if (r.method_disc == 9 and r.method_other != null) {
+            results[0] = try httpVariantWithOptionalBytes(ci, allocator, 9, r.method_other);
+            return;
+        }
+        results[0] = .{ .variant_val = .{ .discriminant = r.method_disc, .payload = null } };
+    }
+
+    fn httpRequestSetMethodP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        const disc: u32 = switch (args[1]) {
+            .variant_val => |v| v.discriminant,
+            .enum_val => |d| d,
+            .u32 => |d| d,
+            else => 0,
+        };
+        r.method_disc = disc;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpRequestGetPathP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        results[0] = try httpOptionBytes(ci, allocator, r.path_with_query);
+    }
+
+    fn httpRequestSetPathP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        if (r.path_with_query) |old| self.allocator.free(old);
+        r.path_with_query = null;
+        switch (args[1]) {
+            .option_val => |opt| {
+                if (opt.is_some and opt.payload != null) {
+                    r.path_with_query = try extractArgBytesAlloc(self.allocator, ci, opt.payload.?.*);
+                }
+            },
+            else => r.path_with_query = try extractArgBytesAlloc(self.allocator, ci, args[1]),
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpRequestGetSchemeP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const disc = r.scheme_disc orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const inner = try allocator.create(InterfaceValue);
+        inner.* = try httpVariantWithOptionalBytes(ci, allocator, disc, if (disc == 2) r.scheme_other else null);
+        results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
+    }
+
+    fn httpRequestSetSchemeP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        switch (args[1]) {
+            .option_val => |opt| {
+                if (opt.is_some and opt.payload != null) {
+                    switch (opt.payload.?.*) {
+                        .variant_val => |v| r.scheme_disc = v.discriminant,
+                        .enum_val => |d| r.scheme_disc = d,
+                        .u32 => |d| r.scheme_disc = d,
+                        else => {},
+                    }
+                } else {
+                    r.scheme_disc = null;
+                }
+            },
+            .variant_val => |v| r.scheme_disc = v.discriminant,
+            .enum_val => |d| r.scheme_disc = d,
+            .u32 => |d| r.scheme_disc = d,
+            else => {},
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpRequestGetAuthorityP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        results[0] = try httpOptionBytes(ci, allocator, r.authority);
+    }
+
+    fn httpRequestSetAuthorityP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        if (r.authority) |old| self.allocator.free(old);
+        r.authority = null;
+        switch (args[1]) {
+            .option_val => |opt| {
+                if (opt.is_some and opt.payload != null) {
+                    r.authority = try extractArgBytesAlloc(self.allocator, ci, opt.payload.?.*);
+                }
+            },
+            else => r.authority = try extractArgBytesAlloc(self.allocator, ci, args[1]),
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpRequestGetOptionsP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const opt_h = r.options_handle orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const inner = try allocator.create(InterfaceValue);
+        inner.* = .{ .handle = opt_h };
+        results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
+    }
+
+    fn httpRequestGetHeadersP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse {
+            results[0] = .{ .handle = 0 };
+            return;
+        };
+        results[0] = .{ .handle = r.headers_handle };
+    }
+
+    /// `[static]request.consume-body: (this, res)
+    ///   -> tuple<stream<u8>, future<result<option<trailers>,error-code>>>`.
+    fn httpRequestConsumeBodyP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpRequestP3(handle) orelse return error.InvalidHandle;
+
+        const body_h: u32 = r.body_stream_handle orelse try allocEmptyByteStream(ci);
+        const trailers_h: u32 = r.trailers_future_handle;
+
+        const tuple_fields = try allocator.alloc(InterfaceValue, 2);
+        tuple_fields[0] = .{ .handle = body_h };
+        tuple_fields[1] = .{ .handle = trailers_h };
+        results[0] = .{ .tuple_val = tuple_fields };
+    }
+
+    fn httpRequestDropP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        if (handle >= self.http_requests_p3.items.len) return;
+        if (self.http_requests_p3.items[handle]) |r| {
+            r.deinit(self.allocator);
+            self.allocator.destroy(r);
+            self.http_requests_p3.items[handle] = null;
+        }
+    }
+
+    // --- request-options (P3 — getters/setters renamed) ---
+
+    fn httpRequestOptionsConstructorP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const r = try self.allocator.create(RequestOptions);
+        r.* = .{};
+        const h = try self.pushRequestOptionsP3(r);
+        results[0] = .{ .handle = h };
+    }
+
+    fn httpRequestOptionsDropP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        if (handle >= self.http_request_options_p3.items.len) return;
+        if (self.http_request_options_p3.items[handle]) |r| {
+            self.allocator.destroy(r);
+            self.http_request_options_p3.items[handle] = null;
+        }
+    }
+
+    fn requestOptionsGetTimeout(
+        self: *WasiCliAdapter,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+        comptime field: []const u8,
+    ) !void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupRequestOptionsP3(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const v = @field(r, field) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const inner = try allocator.create(InterfaceValue);
+        inner.* = .{ .u64 = v };
+        results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
+    }
+
+    fn requestOptionsSetTimeout(
+        self: *WasiCliAdapter,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        comptime field: []const u8,
+    ) !void {
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupRequestOptionsP3(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        const new_val: ?u64 = switch (args[1]) {
+            .option_val => |opt| if (opt.is_some and opt.payload != null) blk: {
+                break :blk switch (opt.payload.?.*) {
+                    .u64 => |v| v,
+                    .s64 => |v| @intCast(v),
+                    .u32 => |v| v,
+                    else => null,
+                };
+            } else null,
+            .u64 => |v| v,
+            else => null,
+        };
+        @field(r, field) = new_val;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpRequestOptionsGetConnectTimeoutP3(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsGetTimeout(self, args, results, allocator, "connect_timeout_ns");
+    }
+    fn httpRequestOptionsSetConnectTimeoutP3(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsSetTimeout(self, args, results, "connect_timeout_ns");
+    }
+    fn httpRequestOptionsGetFirstByteTimeoutP3(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsGetTimeout(self, args, results, allocator, "first_byte_timeout_ns");
+    }
+    fn httpRequestOptionsSetFirstByteTimeoutP3(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsSetTimeout(self, args, results, "first_byte_timeout_ns");
+    }
+    fn httpRequestOptionsGetBetweenBytesTimeoutP3(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsGetTimeout(self, args, results, allocator, "between_bytes_timeout_ns");
+    }
+    fn httpRequestOptionsSetBetweenBytesTimeoutP3(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsSetTimeout(self, args, results, "between_bytes_timeout_ns");
+    }
+
+    fn httpRequestOptionsCloneP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const src = self.lookupRequestOptionsP3(handle) orelse {
+            const dst = try self.allocator.create(RequestOptions);
+            dst.* = .{};
+            const h = try self.pushRequestOptionsP3(dst);
+            results[0] = .{ .handle = h };
+            return;
+        };
+        const dst = try self.allocator.create(RequestOptions);
+        dst.* = src.*;
+        const h = try self.pushRequestOptionsP3(dst);
+        results[0] = .{ .handle = h };
+    }
+
+    // --- response (unified, P3) ---
+
+    /// `[static]response.new: (headers, contents: option<stream<u8>>,
+    ///   trailers: future<result<option<trailers>,error-code>>)
+    ///   -> tuple<response, future<result<_,error-code>>>` (#487).
+    fn httpResponseNewP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const headers_handle: u32 = switch (args[0]) { .handle => |h| h, else => 0 };
+        const body_handle: ?u32 = switch (args[1]) {
+            .option_val => |opt| if (opt.is_some and opt.payload != null) blk: {
+                break :blk switch (opt.payload.?.*) { .handle => |h| h, else => null };
+            } else null,
+            else => null,
+        };
+        const trailers_handle: u32 = switch (args[2]) {
+            .handle => |h| h,
+            else => try allocReadyUnitFuture(ci),
+        };
+        const tx_handle = try allocPendingUnitFuture(ci);
+
+        const r = try self.allocator.create(HttpResponseP3);
+        r.* = .{
+            .headers_handle = headers_handle,
+            .body_stream_handle = body_handle,
+            .trailers_future_handle = trailers_handle,
+            .transmission_future_handle = tx_handle,
+        };
+        const rh = try self.pushHttpResponseP3(r);
+
+        const tuple_fields = try allocator.alloc(InterfaceValue, 2);
+        tuple_fields[0] = .{ .handle = rh };
+        tuple_fields[1] = .{ .handle = tx_handle };
+        results[0] = .{ .tuple_val = tuple_fields };
+    }
+
+    fn httpResponseGetStatusCodeP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpResponseP3(handle) orelse {
+            results[0] = .{ .u16 = 200 };
+            return;
+        };
+        results[0] = .{ .u16 = r.status };
+    }
+
+    fn httpResponseSetStatusCodeP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpResponseP3(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        r.status = switch (args[1]) {
+            .u16 => |v| v,
+            .u32 => |v| @intCast(v & 0xFFFF),
+            .s32 => |v| @intCast(@as(u32, @bitCast(v)) & 0xFFFF),
+            else => r.status,
+        };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpResponseGetHeadersP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpResponseP3(handle) orelse {
+            results[0] = .{ .handle = 0 };
+            return;
+        };
+        results[0] = .{ .handle = r.headers_handle };
+    }
+
+    fn httpResponseConsumeBodyP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        const r = self.lookupHttpResponseP3(handle) orelse return error.InvalidHandle;
+        const body_h: u32 = r.body_stream_handle orelse try allocEmptyByteStream(ci);
+        const trailers_h: u32 = r.trailers_future_handle;
+        const tuple_fields = try allocator.alloc(InterfaceValue, 2);
+        tuple_fields[0] = .{ .handle = body_h };
+        tuple_fields[1] = .{ .handle = trailers_h };
+        results[0] = .{ .tuple_val = tuple_fields };
+    }
+
+    fn httpResponseDropP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) { .handle => |h| h, else => return error.InvalidArgs };
+        if (handle >= self.http_responses_p3.items.len) return;
+        if (self.http_responses_p3.items[handle]) |r| {
+            r.deinit(self.allocator);
+            self.allocator.destroy(r);
+            self.http_responses_p3.items[handle] = null;
+        }
+    }
+
+    // --- handler.handle (P3) — host-import stub; guests EXPORT this ---
+
+    /// No-op stub for the imported `wasi:http/handler@0.3.0.handle` (#487).
+    /// Components that act as HTTP servers EXPORT this function;
+    /// importing it is rare and only needed for middleware composition.
+    fn httpHandlerHandleP3(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {}
+
+    // --- client.send (P3) — host-provided outbound HTTP ---
+
+    /// `wasi:http/client.send: async func(request) -> result<response, error-code>` (#487).
+    /// Synchronous HTTP/1.1 implementation via std.http.Client. The
+    /// async lift on the guest side observes a value-ready return.
+    /// Cleartext HTTP only (#477 gate).
+    fn httpClientSendP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+
+        const req_handle: u32 = if (args.len > 0) switch (args[0]) {
+            .handle => |h| h, else => 0,
+        } else 0;
+        const r = self.lookupHttpRequestP3(req_handle) orelse {
+            return httpClientDenyP3(results, allocator, .HTTP_request_denied);
+        };
+
+        if (self.sockets_allow_list_template.len == 0) {
+            return httpClientDenyP3(results, allocator, .HTTP_request_denied);
+        }
+
+        const scheme: []const u8 = if (r.scheme_disc) |d| switch (d) {
+            0 => "http",
+            1 => "https",
+            else => if (r.scheme_other) |s| s else "https",
+        } else "https";
+
+        // #477 https gate.
+        if (!std.mem.eql(u8, scheme, "http")) {
+            return httpClientDenyP3(results, allocator, .HTTP_protocol_error);
+        }
+
+        const authority = r.authority orelse {
+            return httpClientDenyP3(results, allocator, .HTTP_request_URI_invalid);
+        };
+        const path = r.path_with_query orelse "/";
+
+        const url = std.fmt.allocPrint(self.allocator, "{s}://{s}{s}", .{ scheme, authority, path }) catch {
+            return httpClientDenyP3(results, allocator, .internal_error);
+        };
+        defer self.allocator.free(url);
+
+        const method: std.http.Method = switch (r.method_disc) {
+            0 => .GET, 1 => .HEAD, 2 => .POST, 3 => .PUT, 4 => .DELETE,
+            5 => .CONNECT, 6 => .OPTIONS, 7 => .TRACE, 8 => .PATCH,
+            else => .GET,
+        };
+
+        var extra_hdrs: std.ArrayListUnmanaged(std.http.Header) = .empty;
+        defer extra_hdrs.deinit(self.allocator);
+        if (self.lookupHttpFields(r.headers_handle)) |hf| {
+            for (hf.entries.items) |e| {
+                extra_hdrs.append(self.allocator, .{ .name = e.name, .value = e.value }) catch break;
+            }
+        }
+
+        // Drain the body stream (if any) into a contiguous buffer.
+        var body_buf: ?[]u8 = null;
+        defer if (body_buf) |b| self.allocator.free(b);
+        if (r.body_stream_handle) |sh| {
+            body_buf = self.drainByteStream(ci, sh) catch null;
+        }
+        const payload: ?[]const u8 = if (body_buf) |b| (if (b.len > 0) b else null) else null;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var client: std.http.Client = .{ .allocator = self.allocator, .io = io };
+        defer client.connection_pool.deinit(io);
+
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+
+        const fetch_result = client.fetch(.{
+            .location = .{ .url = url },
+            .method = method,
+            .payload = payload,
+            .extra_headers = extra_hdrs.items,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        }) catch {
+            return httpClientDenyP3(results, allocator, .internal_error);
+        };
+
+        // Mark transmission future as ready (request was sent).
+        if (ci.futures.getPtr(r.transmission_future_handle)) |tx| {
+            tx.state = .ready;
+            tx.write_closed = true;
+        }
+
+        var resp_al = aw.toArrayList();
+        const resp_body = resp_al.toOwnedSlice(self.allocator) catch {
+            return httpClientDenyP3(results, allocator, .internal_error);
+        };
+
+        // Build response body stream prefilled + write-closed (EOF).
+        const body_stream_h = ci.allocAsyncHandle();
+        var body_stream: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+        body_stream.buffer = std.ArrayListUnmanaged(u8).fromOwnedSlice(resp_body);
+        body_stream.write_closed = true;
+        try ci.streams.put(ci.allocator, body_stream_h, body_stream);
+
+        // Trailers future: ready with `ok(none)` — std.http.Client.fetch
+        // does not surface trailers on this path. Unit-payload fast-path
+        // in executor.future_read drains it.
+        const trailers_h = try allocReadyUnitFuture(ci);
+
+        // Empty response headers (FetchResult does not expose them).
+        const resp_fields = try self.allocator.create(HttpFields);
+        resp_fields.* = .{};
+        const resp_fields_h = try self.pushHttpFields(resp_fields);
+
+        const tx_h_resp = try allocReadyUnitFuture(ci);
+
+        const resp = try self.allocator.create(HttpResponseP3);
+        resp.* = .{
+            .status = @intFromEnum(fetch_result.status),
+            .headers_handle = resp_fields_h,
+            .body_stream_handle = body_stream_h,
+            .trailers_future_handle = trailers_h,
+            .transmission_future_handle = tx_h_resp,
+        };
+        const resp_h = try self.pushHttpResponseP3(resp);
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .handle = resp_h };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    fn httpClientDenyP3(
+        results: []InterfaceValue,
+        allocator: Allocator,
+        code: HttpErrorCode,
+    ) anyerror!void {
+        const err_payload = try allocator.create(InterfaceValue);
+        err_payload.* = .{ .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null } };
+        results[0] = .{ .result_val = .{ .is_ok = false, .payload = err_payload } };
+    }
+
+    /// Drive a guest-exported `wasi:http/handler@0.3.0.handle: async
+    /// func(request) -> result<response, error-code>` via the
+    /// async-lifted canonical ABI (#487). Used by the host server
+    /// dispatch path (out-of-PR scope to wire); exposed here so the
+    /// machinery is exercised by the unit test.
+    pub fn dispatchHttpHandlerP3(
+        _: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        export_dotted_name: []const u8,
+        request_handle: u32,
+        allocator: Allocator,
+    ) !u32 {
+        const exported = ci.getExport(export_dotted_name) orelse return error.NoHandleExport;
+        const local = switch (exported) {
+            .local => |l| l,
+            else => return error.ForwardedExportUnsupported,
+        };
+        const args: [1]InterfaceValue = .{ .{ .handle = request_handle } };
+        var status: u32 = 0;
+        try executor_root.callComponentFuncByLocalAsyncLifted(
+            ci, local, &args, &status, allocator,
+        );
+        return status;
+    }
+
+    /// Register `wasi:http/types@0.3.0-*` (#487).
+    pub fn populateWasiHttpTypesP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        iface_name: []const u8,
+    ) !void {
+        const M = struct {
+            name: []const u8,
+            call: *const fn (?*anyopaque, *ComponentInstance,
+                []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void,
+        };
+        const members = [_]M{
+            // fields (mostly reused from 0.2)
+            .{ .name = "[constructor]fields", .call = &httpFieldsConstructor },
+            .{ .name = "[static]fields.from-list", .call = &httpFieldsFromList },
+            .{ .name = "[method]fields.get", .call = &httpFieldsGet },
+            .{ .name = "[method]fields.has", .call = &httpFieldsHas },
+            .{ .name = "[method]fields.set", .call = &httpFieldsSet },
+            .{ .name = "[method]fields.delete", .call = &httpFieldsDelete },
+            .{ .name = "[method]fields.get-and-delete", .call = &httpFieldsGetAndDelete },
+            .{ .name = "[method]fields.append", .call = &httpFieldsAppend },
+            .{ .name = "[method]fields.copy-all", .call = &httpFieldsEntries },
+            .{ .name = "[method]fields.clone", .call = &httpFieldsClone },
+            .{ .name = "[resource-drop]fields", .call = &httpFieldsDrop },
+            // request (unified)
+            .{ .name = "[static]request.new", .call = &httpRequestNewP3 },
+            .{ .name = "[method]request.get-method", .call = &httpRequestGetMethodP3 },
+            .{ .name = "[method]request.set-method", .call = &httpRequestSetMethodP3 },
+            .{ .name = "[method]request.get-path-with-query", .call = &httpRequestGetPathP3 },
+            .{ .name = "[method]request.set-path-with-query", .call = &httpRequestSetPathP3 },
+            .{ .name = "[method]request.get-scheme", .call = &httpRequestGetSchemeP3 },
+            .{ .name = "[method]request.set-scheme", .call = &httpRequestSetSchemeP3 },
+            .{ .name = "[method]request.get-authority", .call = &httpRequestGetAuthorityP3 },
+            .{ .name = "[method]request.set-authority", .call = &httpRequestSetAuthorityP3 },
+            .{ .name = "[method]request.get-options", .call = &httpRequestGetOptionsP3 },
+            .{ .name = "[method]request.get-headers", .call = &httpRequestGetHeadersP3 },
+            .{ .name = "[static]request.consume-body", .call = &httpRequestConsumeBodyP3 },
+            .{ .name = "[resource-drop]request", .call = &httpRequestDropP3 },
+            // request-options (renamed timeout getters/setters)
+            .{ .name = "[constructor]request-options", .call = &httpRequestOptionsConstructorP3 },
+            .{ .name = "[method]request-options.get-connect-timeout", .call = &httpRequestOptionsGetConnectTimeoutP3 },
+            .{ .name = "[method]request-options.set-connect-timeout", .call = &httpRequestOptionsSetConnectTimeoutP3 },
+            .{ .name = "[method]request-options.get-first-byte-timeout", .call = &httpRequestOptionsGetFirstByteTimeoutP3 },
+            .{ .name = "[method]request-options.set-first-byte-timeout", .call = &httpRequestOptionsSetFirstByteTimeoutP3 },
+            .{ .name = "[method]request-options.get-between-bytes-timeout", .call = &httpRequestOptionsGetBetweenBytesTimeoutP3 },
+            .{ .name = "[method]request-options.set-between-bytes-timeout", .call = &httpRequestOptionsSetBetweenBytesTimeoutP3 },
+            .{ .name = "[method]request-options.clone", .call = &httpRequestOptionsCloneP3 },
+            .{ .name = "[resource-drop]request-options", .call = &httpRequestOptionsDropP3 },
+            // response (unified)
+            .{ .name = "[static]response.new", .call = &httpResponseNewP3 },
+            .{ .name = "[method]response.get-status-code", .call = &httpResponseGetStatusCodeP3 },
+            .{ .name = "[method]response.set-status-code", .call = &httpResponseSetStatusCodeP3 },
+            .{ .name = "[method]response.get-headers", .call = &httpResponseGetHeadersP3 },
+            .{ .name = "[static]response.consume-body", .call = &httpResponseConsumeBodyP3 },
+            .{ .name = "[resource-drop]response", .call = &httpResponseDropP3 },
+        };
+        for (members) |m| {
+            try self.http_types_p3_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, iface_name, .{
+            .host_instance = &self.http_types_p3_iface,
+        });
+    }
+
+    /// Register `wasi:http/handler@0.3.0-*` import stub (#487).
+    pub fn populateWasiHttpHandlerP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        iface_name: []const u8,
+    ) !void {
+        try self.http_handler_p3_iface.members.put(self.allocator, "handle", .{
+            .func = .{ .context = self, .call = &httpHandlerHandleP3 },
+        });
+        try providers.put(self.allocator, iface_name, .{
+            .host_instance = &self.http_handler_p3_iface,
+        });
+    }
+
+    /// Register `wasi:http/client@0.3.0-*` (#487).
+    pub fn populateWasiHttpClientP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        iface_name: []const u8,
+    ) !void {
+        try self.http_client_p3_iface.members.put(self.allocator, "send", .{
+            .func = .{ .context = self, .call = &httpClientSendP3 },
+        });
+        try providers.put(self.allocator, iface_name, .{
+            .host_instance = &self.http_client_p3_iface,
+        });
+    }
+
     /// Register `wasi:http/types` (#149).
     pub fn populateWasiHttpTypes(
         self: *WasiCliAdapter,
@@ -12338,6 +13451,9 @@ pub fn populateWasiProviders(
     var matched_http_types: ?[]const u8 = null;
     var matched_http_outgoing_handler: ?[]const u8 = null;
     var matched_http_incoming_handler: ?[]const u8 = null;
+    var matched_http_types_p3: ?[]const u8 = null;
+    var matched_http_handler_p3: ?[]const u8 = null;
+    var matched_http_client_p3: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         // wasi:cli/* — version-multiplex onto either the 0.2 (P2) or
@@ -12504,8 +13620,21 @@ pub fn populateWasiProviders(
             matched_http_outgoing_handler = imp.name;
         if (matched_http_incoming_handler == null and matchesWasiPrefix(imp.name, "wasi:http/incoming-handler"))
             matched_http_incoming_handler = imp.name;
-        if (matched_http_types == null and matchesWasiPrefix(imp.name, "wasi:http/types"))
-            matched_http_types = imp.name;
+        // wasi:http@0.3.0 (#487). New `handler`/`client` interfaces have
+        // distinct prefixes from the 0.2 `incoming-handler`/`outgoing-handler`
+        // (matchesWasiPrefix matches at interface granularity), so order
+        // is irrelevant. `types` is split by `@version` so 0.2 and 0.3
+        // imports route to different HostInstances.
+        if (matched_http_handler_p3 == null and matchesWasiPrefix(imp.name, "wasi:http/handler"))
+            matched_http_handler_p3 = imp.name;
+        if (matched_http_client_p3 == null and matchesWasiPrefix(imp.name, "wasi:http/client"))
+            matched_http_client_p3 = imp.name;
+        if (matchesWasiPrefix(imp.name, "wasi:http/types")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_http_types_p3 = matched_http_types_p3 orelse imp.name,
+                else => matched_http_types = matched_http_types orelse imp.name,
+            }
+        }
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -12774,6 +13903,17 @@ pub fn populateWasiProviders(
         matched_http_incoming_handler orelse "wasi:http/incoming-handler",
     );
     if (matched_http_incoming_handler == null) _ = providers.remove("wasi:http/incoming-handler");
+
+    // wasi:http@0.3.0 (#487). Conditionally bind only when imported.
+    if (matched_http_types_p3) |name| {
+        try adapter.populateWasiHttpTypesP3(providers, name);
+    }
+    if (matched_http_handler_p3) |name| {
+        try adapter.populateWasiHttpHandlerP3(providers, name);
+    }
+    if (matched_http_client_p3) |name| {
+        try adapter.populateWasiHttpClientP3(providers, name);
+    }
 }
 
 /// Run an already-loaded component. See `runComponentBytes` for the
@@ -20092,4 +21232,227 @@ test "findRunP3ExportName: returns null when no wasi:cli/run export (#482)" {
     inst.exported_funcs = .{};
     const got = try findRunP3ExportName(&component, &inst, testing.allocator);
     try testing.expect(got == null);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// wasi:http@0.3.0 unit tests (#487)
+// ───────────────────────────────────────────────────────────────────
+
+/// Minimal `ComponentInstance` shim for testing P3 http callbacks
+/// without standing up a full module. We only need the four fields
+/// the http callbacks touch (`allocator`, `streams`, `futures`,
+/// `next_async_handle`); everything else stays `undefined`.
+fn p3HttpTestCi(allocator: std.mem.Allocator) ComponentInstance {
+    var ci: ComponentInstance = undefined;
+    ci.allocator = allocator;
+    ci.streams = .empty;
+    ci.futures = .empty;
+    ci.next_async_handle = 1;
+    return ci;
+}
+
+fn p3HttpTestCiDeinit(ci: *ComponentInstance) void {
+    var sit = ci.streams.iterator();
+    while (sit.next()) |e| e.value_ptr.deinit(ci.allocator);
+    ci.streams.deinit(ci.allocator);
+    var fit = ci.futures.iterator();
+    while (fit.next()) |e| e.value_ptr.deinit(ci.allocator);
+    ci.futures.deinit(ci.allocator);
+}
+
+test "wasi:http@0.3 (#487): request.new + consume-body returns body stream + trailers future" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    // Pre-build a body stream<u8> handle in ci.streams holding "hello".
+    const body_handle = ci.allocAsyncHandle();
+    var body: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+    try body.buffer.appendSlice(testing.allocator, "hello");
+    body.write_closed = true;
+    try ci.streams.put(testing.allocator, body_handle, body);
+
+    // Pre-build a ready trailers future.
+    const trailers_handle = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_handle, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    // Build option<stream<u8>> = some(body_handle).
+    var body_inner: InterfaceValue = .{ .handle = body_handle };
+    const body_opt: InterfaceValue = .{ .option_val = .{ .is_some = true, .payload = &body_inner } };
+    const trailers_arg: InterfaceValue = .{ .handle = trailers_handle };
+    const options_opt: InterfaceValue = .{ .option_val = .{ .is_some = false, .payload = null } };
+
+    // request.new(headers=0, contents=some(body), trailers, options=none)
+    const new_args = [_]InterfaceValue{
+        .{ .handle = 0 }, // headers
+        body_opt,
+        trailers_arg,
+        options_opt,
+    };
+    var new_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestNewP3(&adapter, &ci, &new_args, &new_results, testing.allocator);
+    defer new_results[0].deinit(testing.allocator);
+
+    try testing.expect(new_results[0] == .tuple_val);
+    try testing.expectEqual(@as(usize, 2), new_results[0].tuple_val.len);
+    const req_handle = new_results[0].tuple_val[0].handle;
+    try testing.expect(adapter.lookupHttpRequestP3(req_handle) != null);
+
+    // consume-body should return tuple<body-stream-handle, trailers-handle>.
+    const cb_args = [_]InterfaceValue{ .{ .handle = req_handle } };
+    var cb_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestConsumeBodyP3(&adapter, &ci, &cb_args, &cb_results, testing.allocator);
+    defer cb_results[0].deinit(testing.allocator);
+
+    try testing.expect(cb_results[0] == .tuple_val);
+    try testing.expectEqual(@as(usize, 2), cb_results[0].tuple_val.len);
+    try testing.expectEqual(body_handle, cb_results[0].tuple_val[0].handle);
+    try testing.expectEqual(trailers_handle, cb_results[0].tuple_val[1].handle);
+
+    // Body stream should still hold "hello".
+    const s = ci.streams.getPtr(body_handle).?;
+    try testing.expectEqualStrings("hello", s.buffer.items);
+}
+
+test "wasi:http@0.3 (#487): client.send denies when allow-list empty" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    // Build a request via the constructor so all bookkeeping is real.
+    var trailers_inner_arg: InterfaceValue = .{
+        .option_val = .{ .is_some = false, .payload = null },
+    };
+    _ = &trailers_inner_arg;
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const new_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+        .{ .handle = trailers_h },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var new_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestNewP3(&adapter, &ci, &new_args, &new_results, testing.allocator);
+    defer new_results[0].deinit(testing.allocator);
+    const req_handle = new_results[0].tuple_val[0].handle;
+
+    // Empty allow-list (default) → HTTP_request_denied.
+    const send_args = [_]InterfaceValue{.{ .handle = req_handle }};
+    var send_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
+    defer send_results[0].deinit(testing.allocator);
+
+    try testing.expect(send_results[0] == .result_val);
+    try testing.expect(!send_results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        send_results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "wasi:http@0.3 (#487): client.send rejects https with HTTP_protocol_error (#477 gate)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    // Non-empty allow-list so the deny path doesn't preempt the gate.
+    try adapter.setSocketsAllowList(&.{"127.0.0.0/8"});
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const new_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+        .{ .handle = trailers_h },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var new_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpRequestNewP3(&adapter, &ci, &new_args, &new_results, testing.allocator);
+    defer new_results[0].deinit(testing.allocator);
+    const req_handle = new_results[0].tuple_val[0].handle;
+
+    // Set scheme=https (discriminant 1) and authority.
+    const r = adapter.lookupHttpRequestP3(req_handle).?;
+    r.scheme_disc = 1;
+    r.authority = try testing.allocator.dupe(u8, "127.0.0.1:1");
+
+    const send_args = [_]InterfaceValue{.{ .handle = req_handle }};
+    var send_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpClientSendP3(&adapter, &ci, &send_args, &send_results, testing.allocator);
+    defer send_results[0].deinit(testing.allocator);
+
+    try testing.expect(send_results[0] == .result_val);
+    try testing.expect(!send_results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)),
+        send_results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "wasi:http@0.3 (#487): response.new + consume-body roundtrips status, body, trailers" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    // Pre-build empty body stream + ready trailers future.
+    const body_h = ci.allocAsyncHandle();
+    var body: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+    try body.buffer.appendSlice(testing.allocator, "OK");
+    body.write_closed = true;
+    try ci.streams.put(testing.allocator, body_h, body);
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    var body_inner: InterfaceValue = .{ .handle = body_h };
+    const body_opt: InterfaceValue = .{ .option_val = .{ .is_some = true, .payload = &body_inner } };
+
+    const new_args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        body_opt,
+        .{ .handle = trailers_h },
+    };
+    var new_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpResponseNewP3(&adapter, &ci, &new_args, &new_results, testing.allocator);
+    defer new_results[0].deinit(testing.allocator);
+
+    try testing.expect(new_results[0] == .tuple_val);
+    const resp_handle = new_results[0].tuple_val[0].handle;
+
+    // Default status is 200; bump it via set-status-code.
+    const set_args = [_]InterfaceValue{ .{ .handle = resp_handle }, .{ .u16 = 201 } };
+    var set_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpResponseSetStatusCodeP3(&adapter, &ci, &set_args, &set_results, testing.allocator);
+    try testing.expect(set_results[0].result_val.is_ok);
+
+    const get_args = [_]InterfaceValue{.{ .handle = resp_handle }};
+    var get_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpResponseGetStatusCodeP3(&adapter, &ci, &get_args, &get_results, testing.allocator);
+    try testing.expectEqual(@as(u16, 201), get_results[0].u16);
+
+    var cb_results: [1]InterfaceValue = undefined;
+    try WasiCliAdapter.httpResponseConsumeBodyP3(&adapter, &ci, &get_args, &cb_results, testing.allocator);
+    defer cb_results[0].deinit(testing.allocator);
+    try testing.expectEqual(body_h, cb_results[0].tuple_val[0].handle);
+    try testing.expectEqual(trailers_h, cb_results[0].tuple_val[1].handle);
 }
