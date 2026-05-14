@@ -242,6 +242,11 @@ pub const spec_test = opt("spec_test", false);
 /// Build for the WASI test suite.
 pub const wasi_test = opt("wasi_test", false);
 
+/// Enable opt-in unit tests that perform real outbound HTTPS requests
+/// (#521). Defaults to false so CI does not depend on external network.
+/// Toggle via `zig build -Dnetwork_tests=true`.
+pub const network_tests = opt("network_tests", false);
+
 /// Enable the tail-call proposal.
 pub const tail_call = opt("tail_call", false);
 
