@@ -72,6 +72,25 @@ pub const YieldOutcome = enum(u32) {
     cancelled = 1,
 };
 
+/// Discriminant for `future.read` / `future.write` / `future.cancel-*`
+/// status words (Binary.md "Async Calls"). The on-the-wire status word
+/// is `packStatus(status, count)` — bits 0..3 carry the discriminant,
+/// bits 4..31 carry the number of elements transferred (for `future<T>`
+/// always 0 or 1 since the channel is one-shot).
+pub const FutureStatus = enum(u32) {
+    starting = 0,
+    started = 1,
+    returned = 2,
+    cancelled = 3,
+};
+
+/// Pack a future read/write status discriminant + element count into the
+/// single i32 status word the spec returns from `future.{read,write}` and
+/// `future.cancel-{read,write}`.
+pub fn packStatus(status: FutureStatus, count: u32) u32 {
+    return @intFromEnum(status) | (count << 4);
+}
+
 /// Execute `canon thread.yield cancel?` for the currently executing task.
 ///
 /// Single-threaded runtime semantics: a "yield" is the smallest possible
@@ -225,4 +244,14 @@ test "taskYield: unknown handle is a no-op" {
     defer tm.deinit(allocator);
 
     try std.testing.expectEqual(YieldOutcome.resumed, taskYield(&tm, 999, true, allocator));
+}
+
+test "packStatus: encodes discriminant + element count" {
+    try std.testing.expectEqual(@as(u32, 0), packStatus(.starting, 0));
+    try std.testing.expectEqual(@as(u32, 1), packStatus(.started, 0));
+    try std.testing.expectEqual(@as(u32, 2), packStatus(.returned, 0));
+    // `future<T>` only ever transfers 0 or 1 elements; verify the count
+    // lands in bits 4..31.
+    try std.testing.expectEqual(@as(u32, 2 | (1 << 4)), packStatus(.returned, 1));
+    try std.testing.expectEqual(@as(u32, 3), packStatus(.cancelled, 0));
 }

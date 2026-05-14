@@ -174,35 +174,51 @@ pub const TaskManager = struct {
 
 // ── Futures ─────────────────────────────────────────────────────────────────
 
-/// A future represents a single async value (one-shot channel).
+/// A future represents a single async value (one-shot channel) parameterised
+/// on element type `T`. Per the component-model spec, a future has two
+/// ends — a readable side and a writable side — and a single value flows
+/// from writer to reader (or the future is dropped before either occurs).
+///
+/// The host-side representation buffers the lowered bytes of T between the
+/// producer `future.write` and consumer `future.read` rendezvous. If the
+/// reader arrives first it parks, recording its destination guest pointer;
+/// the next writer copies straight into that location instead of allocating
+/// a buffer.
 pub const Future = struct {
-    state: State = .pending,
-    value: ?u32 = null,
+    /// Type index of `T`, captured from the originating `future.new t`'s
+    /// `type_idx`. Used by `future.read` / `future.write` to compute the
+    /// byte size of the payload via `canonical_abi.sizeOfType`.
+    elem_type_idx: u32 = 0,
+    /// Buffered payload bytes, set when a writer arrives before a reader.
+    /// Owned by this `Future`; freed by the reader (on consumption) or by
+    /// the `future_drop_*` arm once both ends are closed.
+    payload: ?[]u8 = null,
+    /// Set when a `future.read` arrives before any writer. The destination
+    /// guest pointer is stashed so that a subsequent `future.write` can
+    /// copy straight into the parked reader's memory and complete.
+    pending_read: ?PendingRead = null,
+    /// Waitable plumbing for `waitable.join` integration.
     waitable_set: ?*WaitableSet = null,
-    waitable_idx: ?u32 = null,
+    read_waitable_idx: ?u32 = null,
+    write_waitable_idx: ?u32 = null,
+    state: State = .pending,
+    /// Both ends are closed only after both `drop-readable` and
+    /// `drop-writable`. Tracked separately so cancellation observes the
+    /// correct end (see `dispatchAsyncCanon.future_read`/`future_write`).
+    read_closed: bool = false,
+    write_closed: bool = false,
 
     pub const State = enum { pending, ready, closed };
 
-    /// Write a value to the future (producer side).
-    pub fn write(self: *Future, val: u32, allocator: std.mem.Allocator) bool {
-        if (self.state != .pending) return false;
-        self.value = val;
-        self.state = .ready;
-        if (self.waitable_set) |ws| {
-            if (self.waitable_idx) |idx| {
-                ws.setReady(idx, allocator);
-            }
-        }
-        return true;
-    }
+    pub const PendingRead = struct { guest_ptr: u32 };
 
-    /// Read the value from the future (consumer side).
-    pub fn read(self: *Future) ?u32 {
-        if (self.state == .ready) {
-            self.state = .closed;
-            return self.value;
+    /// Free any heap-owned state (currently just the buffered `payload`).
+    /// Safe to call multiple times.
+    pub fn deinit(self: *Future, allocator: std.mem.Allocator) void {
+        if (self.payload) |b| {
+            allocator.free(b);
+            self.payload = null;
         }
-        return null;
     }
 };
 
@@ -341,20 +357,27 @@ test "WaitableSet: register and poll" {
     try std.testing.expectEqual(idx1, out[0]);
 }
 
-test "Future: write then read" {
+test "Future: state transitions through pending/ready" {
     var f = Future{};
-    try std.testing.expect(f.read() == null);
-
-    try std.testing.expect(f.write(42, std.testing.allocator));
-    try std.testing.expectEqual(@as(?u32, 42), f.read());
-    // Second read returns null (closed)
-    try std.testing.expect(f.read() == null);
+    try std.testing.expectEqual(Future.State.pending, f.state);
+    f.state = .ready;
+    try std.testing.expectEqual(Future.State.ready, f.state);
 }
 
-test "Future: double write fails" {
+test "Future: deinit frees buffered payload" {
+    const allocator = std.testing.allocator;
     var f = Future{};
-    try std.testing.expect(f.write(1, std.testing.allocator));
-    try std.testing.expect(!f.write(2, std.testing.allocator));
+    f.payload = try allocator.alloc(u8, 8);
+    f.deinit(allocator);
+    try std.testing.expect(f.payload == null);
+    // Second deinit is a no-op.
+    f.deinit(allocator);
+}
+
+test "Future: pending_read records guest_ptr" {
+    var f = Future{};
+    f.pending_read = .{ .guest_ptr = 0x1234 };
+    try std.testing.expectEqual(@as(u32, 0x1234), f.pending_read.?.guest_ptr);
 }
 
 test "AsyncStream: write and read" {
