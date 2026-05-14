@@ -1507,6 +1507,14 @@ pub const WasiCliAdapter = struct {
     sockets_udp_p3_iface: HostInstance = .{},
     sockets_udp_create_p3_iface: HostInstance = .{},
     sockets_ip_name_lookup_p3_iface: HostInstance = .{},
+    /// `wasi:sockets/types@0.3.0-*` (#486). The 0.3 WIT collapses the six
+    /// 0.2 sockets interfaces (network, instance-network, tcp,
+    /// tcp-create-socket, udp, udp-create-socket) into a single `types`
+    /// interface that holds every tcp-socket and udp-socket method plus
+    /// the static constructors. The 0.2 `network` / `instance-network`
+    /// sub-interfaces have no 0.3 equivalent — bind/connect take no
+    /// network arg in 0.3.
+    sockets_types_p3_iface: HostInstance = .{},
 
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
@@ -1705,6 +1713,7 @@ pub const WasiCliAdapter = struct {
         self.sockets_udp_p3_iface.deinit(self.allocator);
         self.sockets_udp_create_p3_iface.deinit(self.allocator);
         self.sockets_ip_name_lookup_p3_iface.deinit(self.allocator);
+        self.sockets_types_p3_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -7883,6 +7892,386 @@ pub const WasiCliAdapter = struct {
         });
     }
 
+    // ===== wasi:sockets@0.3.0 (#486) =====
+
+    // The 0.3.0 surface collapses the six 0.2 socket interfaces into
+    // two: `wasi:sockets/types@0.3.0-*` (every tcp-socket and udp-socket
+    // method plus the static constructors) and
+    // `wasi:sockets/ip-name-lookup@0.3.0-*` (a single async
+    // `resolve-addresses` call). Key 0.3 changes:
+    //
+    //  - The `network` / `instance-network` resources are gone:
+    //    `bind` / `connect` no longer take a network handle.
+    //  - The TCP `start-X` / `finish-X` lifecycle pairs collapse to
+    //    single calls (`bind` is sync; `connect` is `async func`).
+    //  - `tcp-socket.listen` returns `stream<tcp-socket>` instead of
+    //    being a 2-phase `start-listen` + `finish-listen` + `accept`.
+    //  - `tcp-socket.send` / `receive` move from sibling `wasi:io`
+    //    streams to a `stream<u8>` + `future<result<_, error-code>>`
+    //    pair.
+    //  - `udp-socket` adds `connect` / `disconnect`; `send` / `receive`
+    //    are `async func` that take/return raw byte lists rather than
+    //    `incoming-datagram-stream` / `outgoing-datagram-stream`
+    //    sub-resources.
+    //  - All getters are renamed with a `get-` prefix
+    //    (`local-address` → `get-local-address`, etc.).
+    //  - `subscribe` and `shutdown` are gone (no pollables in 0.3).
+    //  - `resolve-addresses` returns `list<ip-address>` directly via
+    //    an async subtask — no `resolve-address-stream` sub-resource.
+    //
+    // Sync ops (bind, getters, setters, static constructors,
+    // udp-socket.connect/disconnect, resource-drop) are wired through
+    // to real implementations: `bind` uses the adapter-level
+    // `sockets_allow_list_template` directly (since there is no
+    // network rep), getters/setters reuse the existing 0.2 callbacks
+    // unchanged, and the static constructors wrap `pushSocket` like
+    // the 0.2 `create-tcp-socket` / `create-udp-socket` did. Async
+    // / stream ops (`tcp-socket.connect` / `listen` / `send` /
+    // `receive`, `udp-socket.send` / `receive`,
+    // `ip-name-lookup.resolve-addresses`) require host integration
+    // with the canonical-ABI subtask + stream/future runtime
+    // (#478/#502/#505) which the adapter does not yet drive end to
+    // end. Those bindings exist (so guests linking against the 0.3
+    // surface satisfy their imports) and return
+    // `error-code.access-denied` synchronously, matching the
+    // default-deny posture of the 0.2 surface when no allow-list /
+    // network capability has been provisioned.
+
+    /// `[static]tcp-socket.create: (ip-address-family) ->
+    ///   result<tcp-socket, error-code>`. Same body as the 0.2
+    /// `create-tcp-socket` callback — only the WIT key differs.
+    fn tcpCreateP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        return createTcpSocket(ctx_opaque, ci, args, results, allocator);
+    }
+
+    /// `[static]udp-socket.create: (ip-address-family) ->
+    ///   result<udp-socket, error-code>`.
+    fn udpCreateP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        return createUdpSocket(ctx_opaque, ci, args, results, allocator);
+    }
+
+    /// `[method]tcp-socket.bind: (borrow<tcp-socket>, ip-socket-address)
+    ///   -> result<_, error-code>` (#486).
+    ///
+    /// Collapses 0.2 `start-bind` + `finish-bind` into one synchronous
+    /// call and drops the `borrow<network>` parameter — 0.3 has no
+    /// network resource. Allow-list checking consults the adapter-level
+    /// `sockets_allow_list_template` directly.
+    fn tcpBindP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const sock_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(sock_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .tcp or s.state != .unbound) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const local = liftIpSocketAddress(args[1], s.family) catch |err| switch (err) {
+            error.FamilyMismatch => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+            error.InvalidArgs => return error.InvalidArgs,
+        };
+        if (!templateAllows(self.sockets_allow_list_template, local)) {
+            results[0] = try socketResultErr(allocator, .access_denied);
+            return;
+        }
+        s.local_addr = local;
+        s.state = .bound;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]udp-socket.bind: (borrow<udp-socket>, ip-socket-address)
+    ///   -> result<_, error-code>` (#486). 0.3 collapses the 0.2 start/
+    /// finish pair and drops the network handle.
+    fn udpBindP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const sock_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(sock_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp or s.state != .unbound) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const local = liftIpSocketAddress(args[1], s.family) catch |err| switch (err) {
+            error.FamilyMismatch => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+            error.InvalidArgs => return error.InvalidArgs,
+        };
+        if (!templateAllows(self.sockets_allow_list_template, local)) {
+            results[0] = try socketResultErr(allocator, .access_denied);
+            return;
+        }
+        s.local_addr = local;
+        s.state = .bound;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]udp-socket.connect: (borrow<udp-socket>,
+    ///   ip-socket-address) -> result<_, error-code>` (#486). 0.3-only.
+    /// Records the remote address; subsequent `send` calls use it as the
+    /// implicit destination.
+    fn udpConnectP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const sock_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(sock_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        const remote = liftIpSocketAddress(args[1], s.family) catch |err| switch (err) {
+            error.FamilyMismatch => {
+                results[0] = try socketResultErr(allocator, .invalid_argument);
+                return;
+            },
+            error.InvalidArgs => return error.InvalidArgs,
+        };
+        if (!templateAllows(self.sockets_allow_list_template, remote)) {
+            results[0] = try socketResultErr(allocator, .access_denied);
+            return;
+        }
+        s.remote_addr = remote;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// `[method]udp-socket.disconnect: (borrow<udp-socket>) ->
+    ///   result<_, error-code>` (#486). Clears the remote address set by
+    /// a prior `connect`.
+    fn udpDisconnectP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const sock_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const s = self.lookupSocket(sock_handle) orelse {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        };
+        if (s.kind != .udp or s.remote_addr == null) {
+            results[0] = try socketResultErr(allocator, .invalid_state);
+            return;
+        }
+        s.remote_addr = null;
+        results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
+    }
+
+    /// Default-deny placeholder for 0.3 async / stream sockets methods
+    /// (`tcp-socket.connect` / `listen` / `send` / `receive`,
+    /// `udp-socket.send` / `receive`, `ip-name-lookup.resolve-addresses`).
+    /// Returns `result<X, error-code>::err(.access_denied)` synchronously.
+    /// Matches the existing 0.2 default-deny posture (no network →
+    /// access-denied) and lets guests linking the 0.3 surface load and
+    /// run; full async/stream wiring is a follow-up once the canonical
+    /// ABI subtask + future/stream runtime is plumbed through host
+    /// callbacks.
+    fn socketsP3AccessDenied(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = try socketResultErr(allocator, .access_denied);
+    }
+
+    /// `[method]tcp-socket.receive` returns
+    /// `tuple<stream<u8>, future<result<_, error-code>>>` rather than a
+    /// `result<...>`. Default-deny stub: emit a tuple of two
+    /// pre-closed handles (sentinel value 0) with no underlying stream
+    /// or future allocated. Guests that read from the stream will
+    /// observe an end-of-stream condition; guests that await the
+    /// future see it as never-ready. Production wiring lands together
+    /// with the executor-side stream/future dispatch.
+    fn tcpReceiveP3Stub(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        const pair = try allocator.alloc(InterfaceValue, 2);
+        pair[0] = .{ .handle = 0 };
+        pair[1] = .{ .handle = 0 };
+        results[0] = .{ .tuple_val = pair };
+    }
+
+    /// `[method]tcp-socket.send` returns
+    /// `future<result<_, error-code>>`. Default-deny stub: emit a
+    /// pre-closed future handle (sentinel value 0).
+    fn tcpSendP3Stub(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .handle = 0 };
+    }
+
+    /// Adapter-level allow-list match. The 0.2 path consults a
+    /// per-`network` allow-list snapshot; the 0.3 path has no network
+    /// rep and consults the adapter-level template directly. Empty
+    /// template = deny-all (the default).
+    fn templateAllows(template: []const IpCidr, addr: std.Io.net.IpAddress) bool {
+        if (template.len == 0) return false;
+        for (template) |cidr| if (cidr.containsAddr(addr)) return true;
+        return false;
+    }
+
+    /// Register `wasi:sockets/types@0.3.0-*` (#486). Binds all 26
+    /// tcp-socket members + 16 udp-socket members under their 0.3 WIT
+    /// names. Sync ops route to real implementations (sometimes shared
+    /// with the 0.2 callback, sometimes a new P3-specific function);
+    /// async / stream ops route to the default-deny stub described
+    /// above.
+    pub fn populateWasiSocketsTypesP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct {
+            name: []const u8,
+            call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void,
+        };
+        const members = [_]M{
+            // ── tcp-socket static + lifecycle ────────────────────
+            .{ .name = "[static]tcp-socket.create", .call = &tcpCreateP3 },
+            .{ .name = "[method]tcp-socket.bind", .call = &tcpBindP3 },
+            .{ .name = "[method]tcp-socket.connect", .call = &socketsP3AccessDenied },
+            .{ .name = "[method]tcp-socket.listen", .call = &socketsP3AccessDenied },
+            .{ .name = "[method]tcp-socket.send", .call = &tcpSendP3Stub },
+            .{ .name = "[method]tcp-socket.receive", .call = &tcpReceiveP3Stub },
+            // ── tcp-socket renamed getters (delegate to 0.2) ─────
+            .{ .name = "[method]tcp-socket.get-local-address", .call = &tcpLocalAddress },
+            .{ .name = "[method]tcp-socket.get-remote-address", .call = &tcpRemoteAddress },
+            .{ .name = "[method]tcp-socket.get-is-listening", .call = &tcpIsListening },
+            .{ .name = "[method]tcp-socket.get-address-family", .call = &socketAddressFamily },
+            .{ .name = "[method]tcp-socket.set-listen-backlog-size", .call = &tcpSetListenBacklogSize },
+            .{ .name = "[method]tcp-socket.get-keep-alive-enabled", .call = &tcpGetKeepAliveEnabled },
+            .{ .name = "[method]tcp-socket.set-keep-alive-enabled", .call = &tcpSetKeepAliveEnabled },
+            .{ .name = "[method]tcp-socket.get-keep-alive-idle-time", .call = &tcpGetKeepAliveIdleTime },
+            .{ .name = "[method]tcp-socket.set-keep-alive-idle-time", .call = &tcpSetKeepAliveIdleTime },
+            .{ .name = "[method]tcp-socket.get-keep-alive-interval", .call = &tcpGetKeepAliveInterval },
+            .{ .name = "[method]tcp-socket.set-keep-alive-interval", .call = &tcpSetKeepAliveInterval },
+            .{ .name = "[method]tcp-socket.get-keep-alive-count", .call = &tcpGetKeepAliveCount },
+            .{ .name = "[method]tcp-socket.set-keep-alive-count", .call = &tcpSetKeepAliveCount },
+            .{ .name = "[method]tcp-socket.get-hop-limit", .call = &socketGetHopLimit },
+            .{ .name = "[method]tcp-socket.set-hop-limit", .call = &socketSetHopLimit },
+            .{ .name = "[method]tcp-socket.get-receive-buffer-size", .call = &socketGetReceiveBufferSize },
+            .{ .name = "[method]tcp-socket.set-receive-buffer-size", .call = &socketSetReceiveBufferSize },
+            .{ .name = "[method]tcp-socket.get-send-buffer-size", .call = &socketGetSendBufferSize },
+            .{ .name = "[method]tcp-socket.set-send-buffer-size", .call = &socketSetSendBufferSize },
+            .{ .name = "[resource-drop]tcp-socket", .call = &socketResourceDrop },
+            // ── udp-socket static + lifecycle ────────────────────
+            .{ .name = "[static]udp-socket.create", .call = &udpCreateP3 },
+            .{ .name = "[method]udp-socket.bind", .call = &udpBindP3 },
+            .{ .name = "[method]udp-socket.connect", .call = &udpConnectP3 },
+            .{ .name = "[method]udp-socket.disconnect", .call = &udpDisconnectP3 },
+            .{ .name = "[method]udp-socket.send", .call = &socketsP3AccessDenied },
+            .{ .name = "[method]udp-socket.receive", .call = &socketsP3AccessDenied },
+            // ── udp-socket renamed getters (delegate to 0.2) ─────
+            .{ .name = "[method]udp-socket.get-local-address", .call = &udpLocalAddress },
+            .{ .name = "[method]udp-socket.get-remote-address", .call = &udpRemoteAddress },
+            .{ .name = "[method]udp-socket.get-address-family", .call = &socketAddressFamily },
+            .{ .name = "[method]udp-socket.get-unicast-hop-limit", .call = &socketGetHopLimit },
+            .{ .name = "[method]udp-socket.set-unicast-hop-limit", .call = &socketSetHopLimit },
+            .{ .name = "[method]udp-socket.get-receive-buffer-size", .call = &socketGetReceiveBufferSize },
+            .{ .name = "[method]udp-socket.set-receive-buffer-size", .call = &socketSetReceiveBufferSize },
+            .{ .name = "[method]udp-socket.get-send-buffer-size", .call = &socketGetSendBufferSize },
+            .{ .name = "[method]udp-socket.set-send-buffer-size", .call = &socketSetSendBufferSize },
+            .{ .name = "[resource-drop]udp-socket", .call = &socketResourceDrop },
+        };
+        for (members) |m| {
+            try self.sockets_types_p3_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_types_p3_iface,
+        });
+    }
+
+    /// Register `wasi:sockets/ip-name-lookup@0.3.0-*` (#486). The 0.3
+    /// surface is a single `resolve-addresses: async func(name: string)
+    /// -> result<list<ip-address>, error-code>` — no network arg, no
+    /// stream sub-resource. Returns access-denied today (default-deny);
+    /// real lookup is gated behind the same allow-list capability the
+    /// 0.2 path uses.
+    pub fn populateWasiSocketsIpNameLookupP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.sockets_ip_name_lookup_p3_iface.members.put(self.allocator, "resolve-addresses", .{
+            .func = .{ .context = self, .call = &socketsP3AccessDenied },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.sockets_ip_name_lookup_p3_iface,
+        });
+    }
+
     // ----- wasi:http (#149) -----
 
     /// Build a `result<X, http error-code>` err InterfaceValue.
@@ -10851,6 +11240,8 @@ pub fn populateWasiProviders(
     var matched_sockets_udp: ?[]const u8 = null;
     var matched_sockets_udp_create: ?[]const u8 = null;
     var matched_sockets_ip_name_lookup: ?[]const u8 = null;
+    var matched_sockets_types_p3: ?[]const u8 = null;
+    var matched_sockets_ip_name_lookup_p3: ?[]const u8 = null;
     var matched_http_types: ?[]const u8 = null;
     var matched_http_outgoing_handler: ?[]const u8 = null;
     var matched_http_incoming_handler: ?[]const u8 = null;
@@ -10927,8 +11318,18 @@ pub fn populateWasiProviders(
             matched_sockets_tcp_create = imp.name;
         if (matched_sockets_udp_create == null and matchesWasiPrefix(imp.name, "wasi:sockets/udp-create-socket"))
             matched_sockets_udp_create = imp.name;
-        if (matched_sockets_ip_name_lookup == null and matchesWasiPrefix(imp.name, "wasi:sockets/ip-name-lookup"))
-            matched_sockets_ip_name_lookup = imp.name;
+        if (matchesWasiPrefix(imp.name, "wasi:sockets/ip-name-lookup")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_sockets_ip_name_lookup_p3 = matched_sockets_ip_name_lookup_p3 orelse imp.name,
+                else => matched_sockets_ip_name_lookup = matched_sockets_ip_name_lookup orelse imp.name,
+            }
+        }
+        // wasi:sockets/types is new in 0.3 — collapses tcp + tcp-create
+        // + udp + udp-create. No 0.2 alias, but version-gate anyway.
+        if (matched_sockets_types_p3 == null and
+            matchesWasiPrefix(imp.name, "wasi:sockets/types") and
+            wasiVersion(imp.name) == .p3)
+            matched_sockets_types_p3 = imp.name;
         if (matched_sockets_tcp == null and matchesWasiPrefix(imp.name, "wasi:sockets/tcp"))
             matched_sockets_tcp = imp.name;
         if (matched_sockets_udp == null and matchesWasiPrefix(imp.name, "wasi:sockets/udp"))
@@ -11113,6 +11514,15 @@ pub fn populateWasiProviders(
         matched_sockets_ip_name_lookup orelse "wasi:sockets/ip-name-lookup",
     );
     if (matched_sockets_ip_name_lookup == null) _ = providers.remove("wasi:sockets/ip-name-lookup");
+
+    // wasi:sockets@0.3.0 (#486). Conditionally bind only the 0.3
+    // surface a guest actually imports — same pattern as #485 random.
+    if (matched_sockets_types_p3) |name| {
+        try adapter.populateWasiSocketsTypesP3(providers, name);
+    }
+    if (matched_sockets_ip_name_lookup_p3) |name| {
+        try adapter.populateWasiSocketsIpNameLookupP3(providers, name);
+    }
 
     try adapter.populateWasiHttpTypes(
         providers,
@@ -14042,6 +14452,262 @@ test "populateWasiProviders: binds wasi:sockets/* (#148)" {
     try testing.expect(adapter.sockets_ip_name_lookup_iface.members.contains("resolve-addresses"));
     try testing.expect(adapter.sockets_ip_name_lookup_iface.members.contains("[method]resolve-address-stream.resolve-next-address"));
     try testing.expect(adapter.sockets_ip_name_lookup_iface.members.contains("[resource-drop]resolve-address-stream"));
+}
+
+test "populateWasiProviders: binds wasi:sockets@0.3.0 types + ip-name-lookup (#486)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const v = "0.3.0-rc-2026-03-15";
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:sockets/types@" ++ v, .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/ip-name-lookup@" ++ v, .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:sockets/types@" ++ v));
+    try testing.expect(providers.contains("wasi:sockets/ip-name-lookup@" ++ v));
+    // Pure-P3 guest: 0.2 names must NOT have leaked into the providers map.
+    try testing.expect(!providers.contains("wasi:sockets/tcp"));
+    try testing.expect(!providers.contains("wasi:sockets/udp"));
+    try testing.expect(!providers.contains("wasi:sockets/network"));
+    try testing.expect(!providers.contains("wasi:sockets/instance-network"));
+    try testing.expect(!providers.contains("wasi:sockets/ip-name-lookup"));
+
+    // Spot-check a representative binding from each cluster:
+    // tcp-socket static + sync + async-stub + getter + udp counterparts.
+    const types_iface = &adapter.sockets_types_p3_iface;
+    try testing.expect(types_iface.members.contains("[static]tcp-socket.create"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.bind"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.connect"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.listen"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.send"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.receive"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.get-local-address"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.get-remote-address"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.get-is-listening"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.get-address-family"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.get-keep-alive-enabled"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.set-keep-alive-enabled"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.get-hop-limit"));
+    try testing.expect(types_iface.members.contains("[method]tcp-socket.set-receive-buffer-size"));
+    try testing.expect(types_iface.members.contains("[resource-drop]tcp-socket"));
+    try testing.expect(types_iface.members.contains("[static]udp-socket.create"));
+    try testing.expect(types_iface.members.contains("[method]udp-socket.bind"));
+    try testing.expect(types_iface.members.contains("[method]udp-socket.connect"));
+    try testing.expect(types_iface.members.contains("[method]udp-socket.disconnect"));
+    try testing.expect(types_iface.members.contains("[method]udp-socket.send"));
+    try testing.expect(types_iface.members.contains("[method]udp-socket.receive"));
+    try testing.expect(types_iface.members.contains("[method]udp-socket.get-unicast-hop-limit"));
+    try testing.expect(types_iface.members.contains("[method]udp-socket.set-unicast-hop-limit"));
+    try testing.expect(types_iface.members.contains("[resource-drop]udp-socket"));
+
+    // Old 0.2 method names removed in 0.3 must NOT be in the P3 iface.
+    try testing.expect(!types_iface.members.contains("[method]tcp-socket.start-bind"));
+    try testing.expect(!types_iface.members.contains("[method]tcp-socket.subscribe"));
+    try testing.expect(!types_iface.members.contains("[method]tcp-socket.shutdown"));
+    try testing.expect(!types_iface.members.contains("[method]udp-socket.subscribe"));
+    try testing.expect(!types_iface.members.contains("[method]udp-socket.stream"));
+    try testing.expect(!types_iface.members.contains("[method]tcp-socket.local-address"));
+
+    // ip-name-lookup P3: only `resolve-addresses` (no stream sub-resource).
+    const dns_iface = &adapter.sockets_ip_name_lookup_p3_iface;
+    try testing.expect(dns_iface.members.contains("resolve-addresses"));
+    try testing.expect(!dns_iface.members.contains("[method]resolve-address-stream.resolve-next-address"));
+    try testing.expect(!dns_iface.members.contains("[method]resolve-address-stream.subscribe"));
+    try testing.expect(!dns_iface.members.contains("[resource-drop]resolve-address-stream"));
+}
+
+test "populateWasiProviders: 0.2 and 0.3 sockets coexist with distinct host instances (#486)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const v = "0.3.0-rc-2026-03-15";
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:sockets/tcp@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/ip-name-lookup@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/types@" ++ v, .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/ip-name-lookup@" ++ v, .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:sockets/tcp@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/ip-name-lookup@0.2.6"));
+    try testing.expect(providers.contains("wasi:sockets/types@" ++ v));
+    try testing.expect(providers.contains("wasi:sockets/ip-name-lookup@" ++ v));
+    // The ip-name-lookup imports must route to *different* HostInstances
+    // per version (this is the property #486 adds — previously both names
+    // would have collided on `sockets_ip_name_lookup_iface`).
+    try testing.expect(providers.get("wasi:sockets/ip-name-lookup@0.2.6").?.host_instance !=
+        providers.get("wasi:sockets/ip-name-lookup@" ++ v).?.host_instance);
+}
+
+test "sockets P3: tcp-socket.create / udp-socket.create allocate slots (#486)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // tcp-socket.create(ipv4) → result<own<tcp-socket>, error-code>::ok(0).
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u32, 0), results[0].result_val.payload.?.handle);
+        try testing.expectEqual(SocketKind.tcp, adapter.socket_table.items[0].?.kind);
+        try testing.expectEqual(IpAddressFamily.ipv4, adapter.socket_table.items[0].?.family);
+    }
+    // udp-socket.create(ipv6) → result<own<udp-socket>, error-code>::ok(1).
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 1 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u32, 1), results[0].result_val.payload.?.handle);
+        try testing.expectEqual(SocketKind.udp, adapter.socket_table.items[1].?.kind);
+        try testing.expectEqual(IpAddressFamily.ipv6, adapter.socket_table.items[1].?.family);
+    }
+}
+
+test "sockets P3: udp-socket.connect / disconnect round-trip remote_addr (#486)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Provision an allow-list covering 127.0.0.0/8 so the connect call
+    // is not refused by the default-deny policy.
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 0 }, .prefix = 8 } };
+    adapter.sockets_allow_list_template = allow;
+
+    // Create a UDP/IPv4 socket.
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+
+    // Build an ip-socket-address variant for 127.0.0.1:9999 (ipv4 arm = 0).
+    const addr_octets = try testing.allocator.alloc(InterfaceValue, 4);
+    defer testing.allocator.free(addr_octets);
+    addr_octets[0] = .{ .u8 = 127 };
+    addr_octets[1] = .{ .u8 = 0 };
+    addr_octets[2] = .{ .u8 = 0 };
+    addr_octets[3] = .{ .u8 = 1 };
+    const v4_fields = try testing.allocator.alloc(InterfaceValue, 2);
+    defer testing.allocator.free(v4_fields);
+    v4_fields[0] = .{ .u16 = 9999 };
+    v4_fields[1] = .{ .tuple_val = addr_octets };
+    const inner = try testing.allocator.create(InterfaceValue);
+    defer testing.allocator.destroy(inner);
+    inner.* = .{ .record_val = v4_fields };
+    const sock_addr: InterfaceValue = .{ .variant_val = .{ .discriminant = 0, .payload = inner } };
+
+    // connect: ok + remote_addr populated.
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, sock_addr };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpConnectP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expect(adapter.socket_table.items[0].?.remote_addr != null);
+    }
+
+    // disconnect: ok + remote_addr cleared.
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpDisconnectP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expect(adapter.socket_table.items[0].?.remote_addr == null);
+    }
+
+    // disconnect when not connected: invalid-state error.
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpDisconnectP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+            results[0].result_val.payload.?.variant_val.discriminant,
+        );
+    }
+}
+
+test "sockets P3: tcp-socket.connect / listen / udp-socket.send default-deny (#486)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+
+    // Async-stub callbacks return result<...>::err(.access_denied) without
+    // touching the socket_table, so calling them with a stub handle is safe.
+    try WasiCliAdapter.socketsP3AccessDenied(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(SocketErrorCode.access_denied)),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+
+    // tcp-socket.send returns a bare future handle; the stub yields the
+    // sentinel handle 0 (a never-ready future).
+    var send_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpSendP3Stub(&adapter, &ci, &args, &send_results, testing.allocator);
+    try testing.expectEqual(@as(u32, 0), send_results[0].handle);
+
+    // tcp-socket.receive returns tuple<stream<u8>, future<...>>; both
+    // sentinels are 0 from the stub.
+    var recv_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpReceiveP3Stub(&adapter, &ci, &args, &recv_results, testing.allocator);
+    defer testing.allocator.free(recv_results[0].tuple_val);
+    try testing.expectEqual(@as(usize, 2), recv_results[0].tuple_val.len);
+    try testing.expectEqual(@as(u32, 0), recv_results[0].tuple_val[0].handle);
+    try testing.expectEqual(@as(u32, 0), recv_results[0].tuple_val[1].handle);
 }
 
 test "sockets: create-tcp-socket allocates slot (#148)" {
