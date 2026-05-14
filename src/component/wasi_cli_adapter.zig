@@ -142,6 +142,7 @@ fn lowerFieldEntriesList(ci: *ComponentInstance, entries: []const HttpFieldEntry
 
 const streams = @import("../wasi/preview2/streams.zig");
 const wasi_p2_core = @import("../wasi/preview2/core.zig");
+const async_mod = @import("async.zig");
 
 /// Captured stdout adapter. Owns its `OutputStream` and the `HostInstance`
 /// objects exposed to the runtime via `populateProviders`.
@@ -1504,6 +1505,20 @@ pub const WasiCliAdapter = struct {
     cli_exit_p3_iface: HostInstance = .{},
     cli_environment_p3_iface: HostInstance = .{},
     cli_run_p3_iface: HostInstance = .{},
+    // #482: cli@0.3.0 adds a `wasi:cli/types` interface (enum
+    // `error-code { io, illegal-byte-sequence, pipe }`) — type-only,
+    // no function bindings. The instance entry exists only for guest
+    // binding satisfaction.
+    cli_types_p3_iface: HostInstance = .{},
+    // #482: P3 terminal interfaces. Members are identical to 0.2
+    // (get-terminal-* → none, [resource-drop]terminal-{input,output}
+    // → no-op) but kept as separate HostInstance values so version
+    // routing in `populateWasiProviders` is symmetric.
+    cli_terminal_stdin_p3_iface: HostInstance = .{},
+    cli_terminal_stdout_p3_iface: HostInstance = .{},
+    cli_terminal_stderr_p3_iface: HostInstance = .{},
+    cli_terminal_input_p3_iface: HostInstance = .{},
+    cli_terminal_output_p3_iface: HostInstance = .{},
     clocks_wall_p3_iface: HostInstance = .{},
     clocks_monotonic_p3_iface: HostInstance = .{},
     fs_types_p3_iface: HostInstance = .{},
@@ -1724,6 +1739,12 @@ pub const WasiCliAdapter = struct {
         self.cli_exit_p3_iface.deinit(self.allocator);
         self.cli_environment_p3_iface.deinit(self.allocator);
         self.cli_run_p3_iface.deinit(self.allocator);
+        self.cli_types_p3_iface.deinit(self.allocator);
+        self.cli_terminal_stdin_p3_iface.deinit(self.allocator);
+        self.cli_terminal_stdout_p3_iface.deinit(self.allocator);
+        self.cli_terminal_stderr_p3_iface.deinit(self.allocator);
+        self.cli_terminal_input_p3_iface.deinit(self.allocator);
+        self.cli_terminal_output_p3_iface.deinit(self.allocator);
         self.clocks_wall_p3_iface.deinit(self.allocator);
         self.clocks_monotonic_p3_iface.deinit(self.allocator);
         self.fs_types_p3_iface.deinit(self.allocator);
@@ -2161,6 +2182,351 @@ pub const WasiCliAdapter = struct {
         try providers.put(self.allocator, cli_stdin_name, .{
             .host_instance = &self.cli_stdin_iface,
         });
+    }
+
+    // ── wasi:cli@0.3.0 — adapter (#482) ────────────────────────────────
+    //
+    // The 0.3 cli surface drops `input-stream` / `output-stream`
+    // resource handles; stdin/stdout/stderr now flow through the
+    // canonical `stream<u8>` machinery (`comp_inst.streams`, #505).
+    // Members live on dedicated `*_p3_iface` HostInstances so 0.2 and
+    // 0.3 imports can coexist on the same component (the
+    // `populateWasiProviders` version-multiplex from #481 routes each
+    // `@x.y.z` import to the right instance).
+    //
+    // Function inventory:
+    //   - stdin.read-via-stream:  () -> tuple<stream<u8>, future<result<_,error-code>>>
+    //   - stdout.write-via-stream: (stream<u8>) -> future<result<_,error-code>>
+    //   - stderr.write-via-stream: same as stdout
+    //   - exit.exit / exit-with-code: same impls as 0.2 (cliExit / cliExitWithCode)
+    //   - environment.get-{environment,arguments,initial-cwd}
+    //                            (note `get-initial-cwd` is renamed
+    //                             from 0.2's `initial-cwd`)
+    //   - terminal-* / types: stub-equivalents (return `none` / no-op
+    //                         resource-drops / type-only)
+    //
+    // `wasi:cli/run.run` is an *export*, not an import — see
+    // `findRunP3ExportName` and `runLoadedComponentP3` below.
+
+    /// Register all `wasi:cli@0.3.0-*` import bindings that the
+    /// component asks for. Caller passes the import names matched in
+    /// `populateWasiProviders`; missing names default to a synthesised
+    /// well-known string and are pruned by the caller.
+    pub fn populateWasiCliP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        stdin_name: []const u8,
+        stdout_name: []const u8,
+        stderr_name: []const u8,
+        exit_name: []const u8,
+        env_name: []const u8,
+        types_name: []const u8,
+        terminal_stdin_name: []const u8,
+        terminal_stdout_name: []const u8,
+        terminal_stderr_name: []const u8,
+        terminal_input_name: []const u8,
+        terminal_output_name: []const u8,
+    ) !void {
+        try self.populateWasiCliStdinP3(providers, stdin_name);
+        try self.populateWasiCliStdoutP3(providers, stdout_name);
+        try self.populateWasiCliStderrP3(providers, stderr_name);
+        try self.populateWasiCliExitP3(providers, exit_name);
+        try self.populateWasiCliEnvironmentP3(providers, env_name);
+        try self.populateWasiCliTypesP3(providers, types_name);
+        try self.populateWasiCliTerminalP3(
+            providers,
+            terminal_stdin_name,
+            terminal_stdout_name,
+            terminal_stderr_name,
+            terminal_input_name,
+            terminal_output_name,
+        );
+    }
+
+    /// `wasi:cli/stdin@0.3.x.read-via-stream`.
+    pub fn populateWasiCliStdinP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        stdin_name: []const u8,
+    ) !void {
+        try self.cli_stdin_p3_iface.members.put(self.allocator, "read-via-stream", .{
+            .func = .{ .context = self, .call = &stdinReadViaStreamP3 },
+        });
+        try providers.put(self.allocator, stdin_name, .{
+            .host_instance = &self.cli_stdin_p3_iface,
+        });
+    }
+
+    /// `wasi:cli/stdout@0.3.x.write-via-stream`.
+    pub fn populateWasiCliStdoutP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        stdout_name: []const u8,
+    ) !void {
+        try self.cli_stdout_p3_iface.members.put(self.allocator, "write-via-stream", .{
+            .func = .{ .context = self, .call = &stdoutWriteViaStreamP3 },
+        });
+        try providers.put(self.allocator, stdout_name, .{
+            .host_instance = &self.cli_stdout_p3_iface,
+        });
+    }
+
+    /// `wasi:cli/stderr@0.3.x.write-via-stream`.
+    pub fn populateWasiCliStderrP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        stderr_name: []const u8,
+    ) !void {
+        try self.cli_stderr_p3_iface.members.put(self.allocator, "write-via-stream", .{
+            .func = .{ .context = self, .call = &stderrWriteViaStreamP3 },
+        });
+        try providers.put(self.allocator, stderr_name, .{
+            .host_instance = &self.cli_stderr_p3_iface,
+        });
+    }
+
+    /// `wasi:cli/exit@0.3.x.{exit, exit-with-code}`. Identical
+    /// semantics to 0.2 — both functions reuse `cliExit` /
+    /// `cliExitWithCode`.
+    ///
+    /// Note: `exit-with-code` is `@unstable(feature = cli-exit-with-code)`
+    /// in both 0.2 and 0.3 packages. wamr unconditionally registers it
+    /// (no `--cli-exit-with-code` gate), matching the 0.2 policy in
+    /// `populateWasiCliExit`. This is a deliberate divergence from
+    /// wasmtime.
+    pub fn populateWasiCliExitP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        exit_name: []const u8,
+    ) !void {
+        try self.cli_exit_p3_iface.members.put(self.allocator, "exit", .{
+            .func = .{ .context = self, .call = &cliExit },
+        });
+        try self.cli_exit_p3_iface.members.put(self.allocator, "exit-with-code", .{
+            .func = .{ .context = self, .call = &cliExitWithCode },
+        });
+        try providers.put(self.allocator, exit_name, .{
+            .host_instance = &self.cli_exit_p3_iface,
+        });
+    }
+
+    /// `wasi:cli/environment@0.3.x.{get-environment, get-arguments, get-initial-cwd}`.
+    /// Reuses the 0.2 implementations (`getEnvironment`, `getArguments`,
+    /// `initialCwd`); the only delta is the `initial-cwd` → `get-initial-cwd`
+    /// rename in 0.3 — see the `wasi-cli-0.3.0-rc-2026-03-15` package.wit.
+    pub fn populateWasiCliEnvironmentP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        env_name: []const u8,
+    ) !void {
+        try self.cli_environment_p3_iface.members.put(self.allocator, "get-environment", .{
+            .func = .{ .context = self, .call = &getEnvironment },
+        });
+        try self.cli_environment_p3_iface.members.put(self.allocator, "get-arguments", .{
+            .func = .{ .context = self, .call = &getArguments },
+        });
+        // 0.3 rename: `initial-cwd` → `get-initial-cwd`.
+        try self.cli_environment_p3_iface.members.put(self.allocator, "get-initial-cwd", .{
+            .func = .{ .context = self, .call = &initialCwd },
+        });
+        try providers.put(self.allocator, env_name, .{
+            .host_instance = &self.cli_environment_p3_iface,
+        });
+    }
+
+    /// `wasi:cli/types@0.3.x` — type-only interface (enum
+    /// `error-code { io, illegal-byte-sequence, pipe }`). No function
+    /// members; the `error-code` enum is lifted as a u8 discriminant
+    /// in canonical ABI without host dispatch.
+    pub fn populateWasiCliTypesP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        types_name: []const u8,
+    ) !void {
+        try providers.put(self.allocator, types_name, .{
+            .host_instance = &self.cli_types_p3_iface,
+        });
+    }
+
+    /// `wasi:cli/terminal-{stdin,stdout,stderr,input,output}@0.3.x`.
+    /// Identical member surface to 0.2 — captured-buffer mode has no
+    /// real TTY so `get-terminal-*` returns `none`.
+    pub fn populateWasiCliTerminalP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        terminal_stdin_name: []const u8,
+        terminal_stdout_name: []const u8,
+        terminal_stderr_name: []const u8,
+        terminal_input_name: []const u8,
+        terminal_output_name: []const u8,
+    ) !void {
+        try self.cli_terminal_stdin_p3_iface.members.put(self.allocator, "get-terminal-stdin", .{
+            .func = .{ .context = self, .call = &getTerminalNone },
+        });
+        try providers.put(self.allocator, terminal_stdin_name, .{
+            .host_instance = &self.cli_terminal_stdin_p3_iface,
+        });
+        try self.cli_terminal_stdout_p3_iface.members.put(self.allocator, "get-terminal-stdout", .{
+            .func = .{ .context = self, .call = &getTerminalNone },
+        });
+        try providers.put(self.allocator, terminal_stdout_name, .{
+            .host_instance = &self.cli_terminal_stdout_p3_iface,
+        });
+        try self.cli_terminal_stderr_p3_iface.members.put(self.allocator, "get-terminal-stderr", .{
+            .func = .{ .context = self, .call = &getTerminalNone },
+        });
+        try providers.put(self.allocator, terminal_stderr_name, .{
+            .host_instance = &self.cli_terminal_stderr_p3_iface,
+        });
+        try self.cli_terminal_input_p3_iface.members.put(self.allocator, "[resource-drop]terminal-input", .{
+            .func = .{ .context = self, .call = &noopResourceDrop },
+        });
+        try providers.put(self.allocator, terminal_input_name, .{
+            .host_instance = &self.cli_terminal_input_p3_iface,
+        });
+        try self.cli_terminal_output_p3_iface.members.put(self.allocator, "[resource-drop]terminal-output", .{
+            .func = .{ .context = self, .call = &noopResourceDrop },
+        });
+        try providers.put(self.allocator, terminal_output_name, .{
+            .host_instance = &self.cli_terminal_output_p3_iface,
+        });
+    }
+
+    /// `wasi:cli/stdin@0.3.x.read-via-stream:
+    ///   () -> tuple<stream<u8>, future<result<_, error-code>>>`.
+    ///
+    /// Allocates a `stream<u8>` entry in `comp_inst.streams` and
+    /// pre-seeds its FIFO with all currently available stdin bytes
+    /// (drained eagerly because wamr's single-threaded executor has no
+    /// scheduler that could deliver more bytes after this returns).
+    /// The writable end is immediately closed so subsequent
+    /// `stream.read` calls observe EOF once the buffer drains.
+    ///
+    /// The companion `future<result<_,error-code>>` is settled to
+    /// `ok` (discriminant 0). It represents the eventual completion
+    /// of the host-side producer; for the buffered model that's
+    /// "now".
+    fn stdinReadViaStreamP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+
+        // 1. Allocate a stream<u8> handle in the per-instance table.
+        const stream_handle = ci.allocAsyncHandle();
+        var stream_entry = async_mod.AsyncStream{};
+        // Drain stdin eagerly into the stream FIFO using the
+        // cross-platform `InputStream.read` (which dispatches by
+        // source variant — buffer/fd/host_file/tcp_stream/closed —
+        // and works on Windows where `std.posix.read` doesn't compile
+        // for raw fd_t values).
+        var tmp: [4096]u8 = undefined;
+        drain: while (true) {
+            switch (self.stdin.read(&tmp)) {
+                .ok => |n| {
+                    if (n == 0) break :drain;
+                    stream_entry.buffer.appendSlice(self.allocator, tmp[0..n]) catch {
+                        stream_entry.deinit(self.allocator);
+                        return error.OutOfMemory;
+                    };
+                },
+                .closed, .err => break :drain,
+            }
+        }
+        stream_entry.write_closed = true;
+        ci.streams.put(self.allocator, stream_handle, stream_entry) catch {
+            stream_entry.deinit(self.allocator);
+            return error.OutOfMemory;
+        };
+
+        // 2. Allocate a `future<result<_,error-code>>` already settled
+        //    to ok. Lowered ABI for `result<_,error-code>` is a single
+        //    discriminant byte (0 = ok). The payload is owned by the
+        //    Future and freed when it transitions to .closed.
+        const future_handle = ci.allocAsyncHandle();
+        const ok_payload = self.allocator.alloc(u8, 1) catch return error.OutOfMemory;
+        ok_payload[0] = 0;
+        const fut_entry = async_mod.Future{ .state = .ready, .payload = ok_payload };
+        ci.futures.put(self.allocator, future_handle, fut_entry) catch {
+            self.allocator.free(ok_payload);
+            return error.OutOfMemory;
+        };
+
+        // 3. Build tuple<handle, handle>.
+        const tuple = try allocator.alloc(InterfaceValue, 2);
+        tuple[0] = .{ .handle = stream_handle };
+        tuple[1] = .{ .handle = future_handle };
+        results[0] = .{ .tuple_val = tuple };
+    }
+
+    /// `wasi:cli/stdout@0.3.x.write-via-stream:
+    ///   (stream<u8>) -> future<result<_, error-code>>`.
+    fn stdoutWriteViaStreamP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        return writeViaStreamImplP3(self, &self.stdout, ci, args, results, allocator);
+    }
+
+    /// `wasi:cli/stderr@0.3.x.write-via-stream:
+    ///   (stream<u8>) -> future<result<_, error-code>>`.
+    fn stderrWriteViaStreamP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        return writeViaStreamImplP3(self, &self.stderr, ci, args, results, allocator);
+    }
+
+    /// Common body for `stdout.write-via-stream` / `stderr.write-via-stream`.
+    /// Drains any bytes currently buffered in the guest's `stream<u8>`
+    /// into the captured/host sink, marks the stream's read end closed
+    /// (we've consumed it), and returns a settled-ok future handle.
+    fn writeViaStreamImplP3(
+        self: *WasiCliAdapter,
+        target: *streams.OutputStream,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) !void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const stream_handle: u32 = switch (args[0]) {
+            .handle, .u32 => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        if (ci.streams.getPtr(stream_handle)) |s| {
+            if (s.buffer.items.len > 0) {
+                switch (target.write(s.buffer.items, self.allocator)) {
+                    .ok => {},
+                    .err, .closed => return error.IoError,
+                }
+                s.buffer.clearRetainingCapacity();
+            }
+            s.read_closed = true;
+        }
+
+        const future_handle = ci.allocAsyncHandle();
+        const ok_payload = self.allocator.alloc(u8, 1) catch return error.OutOfMemory;
+        ok_payload[0] = 0;
+        const fut_entry = async_mod.Future{ .state = .ready, .payload = ok_payload };
+        ci.futures.put(self.allocator, future_handle, fut_entry) catch {
+            self.allocator.free(ok_payload);
+            return error.OutOfMemory;
+        };
+        results[0] = .{ .handle = future_handle };
     }
 
     fn pushPollable(self: *WasiCliAdapter, pollable: Pollable) !u32 {
@@ -11488,6 +11854,19 @@ pub fn populateWasiProviders(
     var matched_terminal_stderr: ?[]const u8 = null;
     var matched_terminal_input: ?[]const u8 = null;
     var matched_terminal_output: ?[]const u8 = null;
+    // #482: P3 cli matches. Populated only when an `@0.3.x` import
+    // appears alongside (or instead of) the legacy 0.2 surface.
+    var matched_stdout_p3: ?[]const u8 = null;
+    var matched_stderr_p3: ?[]const u8 = null;
+    var matched_stdin_p3: ?[]const u8 = null;
+    var matched_exit_p3: ?[]const u8 = null;
+    var matched_environment_p3: ?[]const u8 = null;
+    var matched_cli_types_p3: ?[]const u8 = null;
+    var matched_terminal_stdin_p3: ?[]const u8 = null;
+    var matched_terminal_stdout_p3: ?[]const u8 = null;
+    var matched_terminal_stderr_p3: ?[]const u8 = null;
+    var matched_terminal_input_p3: ?[]const u8 = null;
+    var matched_terminal_output_p3: ?[]const u8 = null;
     var matched_streams: ?[]const u8 = null;
     var matched_streams_p3: ?[]const u8 = null;
     var matched_poll: ?[]const u8 = null;
@@ -11519,26 +11898,73 @@ pub fn populateWasiProviders(
     var matched_http_incoming_handler: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
-        if (matched_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/stdout"))
-            matched_stdout = imp.name;
-        if (matched_stderr == null and matchesWasiPrefix(imp.name, "wasi:cli/stderr"))
-            matched_stderr = imp.name;
-        if (matched_stdin == null and matchesWasiPrefix(imp.name, "wasi:cli/stdin"))
-            matched_stdin = imp.name;
-        if (matched_exit == null and matchesWasiPrefix(imp.name, "wasi:cli/exit"))
-            matched_exit = imp.name;
-        if (matched_environment == null and matchesWasiPrefix(imp.name, "wasi:cli/environment"))
-            matched_environment = imp.name;
-        if (matched_terminal_stdin == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-stdin"))
-            matched_terminal_stdin = imp.name;
-        if (matched_terminal_stdout == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-stdout"))
-            matched_terminal_stdout = imp.name;
-        if (matched_terminal_stderr == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-stderr"))
-            matched_terminal_stderr = imp.name;
-        if (matched_terminal_input == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-input"))
-            matched_terminal_input = imp.name;
-        if (matched_terminal_output == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-output"))
-            matched_terminal_output = imp.name;
+        // wasi:cli/* — version-multiplex onto either the 0.2 (P2) or
+        // 0.3 (P3) HostInstance set. `terminal-input` aliases against
+        // `terminal-stdin/output` only via the more-specific prefix
+        // matcher (`matchesWasiPrefix`), so the order doesn't matter.
+        if (matchesWasiPrefix(imp.name, "wasi:cli/stdout")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_stdout_p3 = matched_stdout_p3 orelse imp.name,
+                else => matched_stdout = matched_stdout orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/stderr")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_stderr_p3 = matched_stderr_p3 orelse imp.name,
+                else => matched_stderr = matched_stderr orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/stdin")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_stdin_p3 = matched_stdin_p3 orelse imp.name,
+                else => matched_stdin = matched_stdin orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/exit")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_exit_p3 = matched_exit_p3 orelse imp.name,
+                else => matched_exit = matched_exit orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/environment")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_environment_p3 = matched_environment_p3 orelse imp.name,
+                else => matched_environment = matched_environment orelse imp.name,
+            }
+        }
+        // `wasi:cli/types` is new in 0.3 — no 0.2 counterpart.
+        if (matched_cli_types_p3 == null and matchesWasiPrefix(imp.name, "wasi:cli/types") and wasiVersion(imp.name) == .p3)
+            matched_cli_types_p3 = imp.name;
+        if (matchesWasiPrefix(imp.name, "wasi:cli/terminal-stdin")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_terminal_stdin_p3 = matched_terminal_stdin_p3 orelse imp.name,
+                else => matched_terminal_stdin = matched_terminal_stdin orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/terminal-stdout")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_terminal_stdout_p3 = matched_terminal_stdout_p3 orelse imp.name,
+                else => matched_terminal_stdout = matched_terminal_stdout orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/terminal-stderr")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_terminal_stderr_p3 = matched_terminal_stderr_p3 orelse imp.name,
+                else => matched_terminal_stderr = matched_terminal_stderr orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/terminal-input")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_terminal_input_p3 = matched_terminal_input_p3 orelse imp.name,
+                else => matched_terminal_input = matched_terminal_input orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:cli/terminal-output")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_terminal_output_p3 = matched_terminal_output_p3 orelse imp.name,
+                else => matched_terminal_output = matched_terminal_output orelse imp.name,
+            }
+        }
         if (matchesWasiPrefix(imp.name, "wasi:io/streams")) {
             switch (wasiVersion(imp.name)) {
                 .p3 => matched_streams_p3 = matched_streams_p3 orelse imp.name,
@@ -11680,6 +12106,60 @@ pub fn populateWasiProviders(
     if (matched_terminal_stderr == null) _ = providers.remove("wasi:cli/terminal-stderr");
     if (matched_terminal_input == null) _ = providers.remove("wasi:cli/terminal-input");
     if (matched_terminal_output == null) _ = providers.remove("wasi:cli/terminal-output");
+
+    // #482: wasi:cli@0.3.0 — register the P3 cli surface only when
+    // the component imports any P3 cli interface. We always call into
+    // `populateWasiCliP3` (it registers all members on the P3 ifaces
+    // unconditionally so they're well-formed for tests) but synthesise
+    // dummy provider names for unmatched imports and prune them
+    // immediately, mirroring the 0.2 pattern above.
+    {
+        const any_p3 = matched_stdin_p3 != null or matched_stdout_p3 != null or
+            matched_stderr_p3 != null or matched_exit_p3 != null or
+            matched_environment_p3 != null or matched_cli_types_p3 != null or
+            matched_terminal_stdin_p3 != null or matched_terminal_stdout_p3 != null or
+            matched_terminal_stderr_p3 != null or matched_terminal_input_p3 != null or
+            matched_terminal_output_p3 != null;
+        if (any_p3) {
+            const default_ver = "@0.3.0";
+            const stdin_p3 = matched_stdin_p3 orelse "wasi:cli/stdin" ++ default_ver;
+            const stdout_p3 = matched_stdout_p3 orelse "wasi:cli/stdout" ++ default_ver;
+            const stderr_p3 = matched_stderr_p3 orelse "wasi:cli/stderr" ++ default_ver;
+            const exit_p3 = matched_exit_p3 orelse "wasi:cli/exit" ++ default_ver;
+            const env_p3 = matched_environment_p3 orelse "wasi:cli/environment" ++ default_ver;
+            const types_p3 = matched_cli_types_p3 orelse "wasi:cli/types" ++ default_ver;
+            const t_stdin_p3 = matched_terminal_stdin_p3 orelse "wasi:cli/terminal-stdin" ++ default_ver;
+            const t_stdout_p3 = matched_terminal_stdout_p3 orelse "wasi:cli/terminal-stdout" ++ default_ver;
+            const t_stderr_p3 = matched_terminal_stderr_p3 orelse "wasi:cli/terminal-stderr" ++ default_ver;
+            const t_input_p3 = matched_terminal_input_p3 orelse "wasi:cli/terminal-input" ++ default_ver;
+            const t_output_p3 = matched_terminal_output_p3 orelse "wasi:cli/terminal-output" ++ default_ver;
+            try adapter.populateWasiCliP3(
+                providers,
+                stdin_p3,
+                stdout_p3,
+                stderr_p3,
+                exit_p3,
+                env_p3,
+                types_p3,
+                t_stdin_p3,
+                t_stdout_p3,
+                t_stderr_p3,
+                t_input_p3,
+                t_output_p3,
+            );
+            if (matched_stdin_p3 == null) _ = providers.remove(stdin_p3);
+            if (matched_stdout_p3 == null) _ = providers.remove(stdout_p3);
+            if (matched_stderr_p3 == null) _ = providers.remove(stderr_p3);
+            if (matched_exit_p3 == null) _ = providers.remove(exit_p3);
+            if (matched_environment_p3 == null) _ = providers.remove(env_p3);
+            if (matched_cli_types_p3 == null) _ = providers.remove(types_p3);
+            if (matched_terminal_stdin_p3 == null) _ = providers.remove(t_stdin_p3);
+            if (matched_terminal_stdout_p3 == null) _ = providers.remove(t_stdout_p3);
+            if (matched_terminal_stderr_p3 == null) _ = providers.remove(t_stderr_p3);
+            if (matched_terminal_input_p3 == null) _ = providers.remove(t_input_p3);
+            if (matched_terminal_output_p3 == null) _ = providers.remove(t_output_p3);
+        }
+    }
 
     try adapter.populateWasiIoPollError(
         providers,
@@ -11908,6 +12388,113 @@ pub fn runComponentBytes(
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
     return runLoadedComponent(component_storage, allocator, adapter);
+}
+
+// ── wasi:cli/run@0.3.0 entry-point (#482) ──────────────────────────────
+//
+// `run.run` is `async func() -> result<_, _>`. It's an *export*, not
+// an import — the host locates it via the component's instance-export
+// table and calls it through the async-lifted dispatch path
+// (`callComponentFuncAsync` → `callComponentFuncByLocalAsyncLifted`,
+// `executor.zig:351`/`:1435`). The callee invokes `canon task.return`
+// to deposit the lowered `result<_,_>` discriminant on the
+// owning task; this code reads it back from `task.return_values`.
+
+/// Locate the 0.3 async run export. Returns an allocator-owned string
+/// of the form `"wasi:cli/run@<version>/run"`, or null if no
+/// `wasi:cli/run` export with a callable `run` member is present.
+/// Mirrors `findHttpIncomingHandlerExportName`.
+pub fn findRunP3ExportName(
+    component: *const ctypes_root.Component,
+    inst: *const ComponentInstance,
+    allocator: Allocator,
+) !?[]const u8 {
+    for (component.exports) |exp| {
+        if (exp.desc != .instance) continue;
+        if (!matchesWasiPrefix(exp.name, "wasi:cli/run")) continue;
+        // Only treat 0.3 (or unspecified, for hand-authored test
+        // fixtures) as P3. A 0.2 `wasi:cli/run` export should fall
+        // through to the legacy synchronous path.
+        const v = wasiVersion(exp.name);
+        if (v != .p3 and v != .unspecified) continue;
+        const dotted = try std.fmt.allocPrint(allocator, "{s}/run", .{exp.name});
+        if (inst.getExport(dotted) != null) return dotted;
+        allocator.free(dotted);
+    }
+    return null;
+}
+
+/// P3 variant of `runLoadedComponent`. Wires WASI imports the same
+/// way, then dispatches the exported `wasi:cli/run@.../run` through
+/// the async-lifted task path. Settles the resulting task's
+/// `return_values` (lowered `result<_,_>` is a single u32 discriminant
+/// where 0 = ok, 1 = err) into a `RunOutcome`.
+///
+/// `wasi:cli/exit.{exit, exit-with-code}` traps stash the requested
+/// code on the adapter exactly the same way as the 0.2 path; we
+/// surface it as a normal `RunOutcome` carrying that code.
+pub fn runLoadedComponentP3(
+    component: *const ctypes_root.Component,
+    allocator: Allocator,
+    adapter: *WasiCliAdapter,
+) RunComponentError!RunOutcome {
+    const inst = instance_mod.instantiate(component, allocator) catch return error.InstantiateFailed;
+    defer inst.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(adapter.allocator);
+    populateWasiProviders(adapter, component, &providers) catch return error.OutOfMemory;
+    inst.linkImports(providers) catch |err| switch (err) {
+        error.StartFunctionFailed => return error.StartTrapped,
+        else => return error.LinkFailed,
+    };
+
+    const run_name = (findRunP3ExportName(component, inst, allocator) catch return error.OutOfMemory) orelse
+        return error.NoRunExport;
+    defer allocator.free(run_name);
+
+    var task_mgr = async_mod.TaskManager{};
+    defer task_mgr.deinit(allocator);
+
+    const task_handle = executor_root.callComponentFuncAsync(
+        inst,
+        run_name,
+        &.{},
+        &task_mgr,
+        null,
+        allocator,
+    ) catch |e| {
+        // Translate exit-trap into a normal outcome so the CLI can
+        // mirror it into the host process exit code.
+        if (adapter.exit_code) |code| return .{ .is_ok = code == 0, .exit_code = code };
+        return switch (e) {
+            error.FunctionNotFound => error.NoRunExport,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Trap,
+        };
+    };
+
+    if (adapter.exit_code) |code| return .{ .is_ok = code == 0, .exit_code = code };
+
+    if (task_handle >= task_mgr.tasks.items.len) return error.Trap;
+    const task = &task_mgr.tasks.items[task_handle];
+    // Lowered `result<_, _>` flat representation: a single i32
+    // discriminant (`0 = ok`, `1 = err`). If the callee never invoked
+    // `task.return`, default to `is_ok = true` — the run completed
+    // without error per the task-state machine.
+    const is_ok: bool = if (task.return_values.len > 0) task.return_values[0] == 0 else true;
+    return .{ .is_ok = is_ok };
+}
+
+pub fn runComponentBytesP3(
+    data: []const u8,
+    allocator: Allocator,
+    adapter: *WasiCliAdapter,
+) RunComponentError!RunOutcome {
+    const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
+    defer allocator.destroy(component_storage);
+    component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
+    return runLoadedComponentP3(component_storage, allocator, adapter);
 }
 
 pub const ServeHttpOptions = struct {
@@ -12699,7 +13286,6 @@ test "wasi:io@0.3 stream<u8> round-trip via 0.2 polyfill virtual handles (#481)"
     // polyfill path the wave-B/C PRs (#482-#487) will exercise.
     const testing = std.testing;
     const polyfill = @import("../wasi/preview3/p2_to_p3_io_polyfill.zig");
-    const async_mod = @import("async.zig");
 
     var s = async_mod.AsyncStream{};
     defer s.deinit(testing.allocator);
@@ -18580,4 +19166,242 @@ test "populateWasiProviders: binds wasi:clocks@0.3 monotonic + system (#483)" {
     try testing.expect(sys_p3.host_instance == &adapter.clocks_wall_p3_iface);
     try testing.expect(adapter.clocks_wall_p3_iface.members.contains("now"));
     try testing.expect(adapter.clocks_wall_p3_iface.members.contains("get-resolution"));
+}
+
+// ── #482 wasi:cli@0.3.0 unit tests ──────────────────────────────────────
+
+test "populateWasiCliP3: registers all expected member names (#482)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try adapter.populateWasiCliP3(
+        &providers,
+        "wasi:cli/stdin@0.3.0",
+        "wasi:cli/stdout@0.3.0",
+        "wasi:cli/stderr@0.3.0",
+        "wasi:cli/exit@0.3.0",
+        "wasi:cli/environment@0.3.0",
+        "wasi:cli/types@0.3.0",
+        "wasi:cli/terminal-stdin@0.3.0",
+        "wasi:cli/terminal-stdout@0.3.0",
+        "wasi:cli/terminal-stderr@0.3.0",
+        "wasi:cli/terminal-input@0.3.0",
+        "wasi:cli/terminal-output@0.3.0",
+    );
+
+    // stdin: read-via-stream replaces 0.2's get-stdin/own<input-stream>.
+    try testing.expect(adapter.cli_stdin_p3_iface.members.contains("read-via-stream"));
+    try testing.expect(!adapter.cli_stdin_p3_iface.members.contains("get-stdin"));
+
+    // stdout/stderr: write-via-stream replaces 0.2's get-{stdout,stderr}.
+    try testing.expect(adapter.cli_stdout_p3_iface.members.contains("write-via-stream"));
+    try testing.expect(adapter.cli_stderr_p3_iface.members.contains("write-via-stream"));
+
+    // exit: identical surface to 0.2 (both functions register).
+    try testing.expect(adapter.cli_exit_p3_iface.members.contains("exit"));
+    try testing.expect(adapter.cli_exit_p3_iface.members.contains("exit-with-code"));
+
+    // environment: 0.3 renames `initial-cwd` → `get-initial-cwd`.
+    try testing.expect(adapter.cli_environment_p3_iface.members.contains("get-environment"));
+    try testing.expect(adapter.cli_environment_p3_iface.members.contains("get-arguments"));
+    try testing.expect(adapter.cli_environment_p3_iface.members.contains("get-initial-cwd"));
+    try testing.expect(!adapter.cli_environment_p3_iface.members.contains("initial-cwd"));
+
+    // types: type-only interface — zero function bindings.
+    try testing.expectEqual(@as(usize, 0), adapter.cli_types_p3_iface.members.count());
+
+    // Terminals: identical surface to 0.2.
+    try testing.expect(adapter.cli_terminal_stdin_p3_iface.members.contains("get-terminal-stdin"));
+    try testing.expect(adapter.cli_terminal_stdout_p3_iface.members.contains("get-terminal-stdout"));
+    try testing.expect(adapter.cli_terminal_stderr_p3_iface.members.contains("get-terminal-stderr"));
+    try testing.expect(adapter.cli_terminal_input_p3_iface.members.contains("[resource-drop]terminal-input"));
+    try testing.expect(adapter.cli_terminal_output_p3_iface.members.contains("[resource-drop]terminal-output"));
+
+    // All 11 provider names resolved.
+    try testing.expect(providers.contains("wasi:cli/stdin@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/stdout@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/stderr@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/exit@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/environment@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/types@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/terminal-stdin@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/terminal-stdout@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/terminal-stderr@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/terminal-input@0.3.0"));
+    try testing.expect(providers.contains("wasi:cli/terminal-output@0.3.0"));
+}
+
+test "populateWasiCliP3: cliExitWithCode(7) routes through P3 exit iface (#482)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try adapter.populateWasiCliExitP3(&providers, "wasi:cli/exit@0.3.0");
+
+    const member = adapter.cli_exit_p3_iface.members.get("exit-with-code") orelse return error.MissingMember;
+    const args: [1]InterfaceValue = .{.{ .u8 = 7 }};
+    var ci: ComponentInstance = undefined;
+
+    try testing.expectError(error.WasiExit, member.func.call.?(member.func.context, &ci, &args, &.{}, testing.allocator));
+    try testing.expectEqual(@as(?u32, 7), adapter.exit_code);
+}
+
+test "populateWasiCliP3: stdinReadViaStreamP3 pre-seeds stream with stdin bytes (#482)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    adapter.setStdinBytes("hello\n");
+
+    // Minimal ComponentInstance: only the async-handle table fields
+    // are touched by `stdinReadViaStreamP3`.
+    var ci: ComponentInstance = undefined;
+    ci.streams = .empty;
+    ci.futures = .empty;
+    ci.next_async_handle = 1;
+    defer {
+        var sit = ci.streams.iterator();
+        while (sit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        ci.streams.deinit(testing.allocator);
+        var fit = ci.futures.iterator();
+        while (fit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        ci.futures.deinit(testing.allocator);
+    }
+
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.stdinReadViaStreamP3(&adapter, &ci, &.{}, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    // Result is a 2-tuple of handles: (stream<u8>, future<result<...>>).
+    try testing.expect(results[0] == .tuple_val);
+    try testing.expectEqual(@as(usize, 2), results[0].tuple_val.len);
+    const stream_h = results[0].tuple_val[0].handle;
+    const future_h = results[0].tuple_val[1].handle;
+
+    const s = ci.streams.getPtr(stream_h) orelse return error.MissingStream;
+    try testing.expectEqualStrings("hello\n", s.buffer.items);
+    try testing.expect(s.write_closed);
+
+    const f = ci.futures.getPtr(future_h) orelse return error.MissingFuture;
+    try testing.expectEqual(async_mod.Future.State.ready, f.state);
+    try testing.expect(f.payload != null);
+    try testing.expectEqual(@as(u8, 0), f.payload.?[0]); // result<_,_> ok discriminant
+}
+
+test "populateWasiCliP3: writeViaStreamImplP3 drains stream into adapter.stdout (#482)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    ci.streams = .empty;
+    ci.futures = .empty;
+    ci.next_async_handle = 1;
+    defer {
+        var sit = ci.streams.iterator();
+        while (sit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        ci.streams.deinit(testing.allocator);
+        var fit = ci.futures.iterator();
+        while (fit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        ci.futures.deinit(testing.allocator);
+    }
+
+    // Pre-populate a stream with bytes the guest wrote into.
+    const stream_h = ci.allocAsyncHandle();
+    var s = async_mod.AsyncStream{};
+    try s.buffer.appendSlice(testing.allocator, "world");
+    try ci.streams.put(testing.allocator, stream_h, s);
+
+    const args: [1]InterfaceValue = .{.{ .handle = stream_h }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.stdoutWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expectEqualStrings("world", adapter.getStdoutBytes());
+    const drained = ci.streams.getPtr(stream_h) orelse return error.MissingStream;
+    try testing.expectEqual(@as(usize, 0), drained.buffer.items.len);
+    try testing.expect(drained.read_closed);
+
+    // Returned future is settled-ok.
+    try testing.expect(results[0] == .handle);
+    const f = ci.futures.getPtr(results[0].handle) orelse return error.MissingFuture;
+    try testing.expectEqual(async_mod.Future.State.ready, f.state);
+}
+
+test "populateWasiProviders: routes wasi:cli/*@0.3.x to P3 host instances (#482)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:cli/stdin@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/stdout@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/stderr@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/exit@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/environment@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/types@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/terminal-stdin@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    const stdin_b = providers.get("wasi:cli/stdin@0.3.0-rc-2026-03-15") orelse return error.MissingP3Stdin;
+    const stdout_b = providers.get("wasi:cli/stdout@0.3.0-rc-2026-03-15") orelse return error.MissingP3Stdout;
+    const exit_b = providers.get("wasi:cli/exit@0.3.0-rc-2026-03-15") orelse return error.MissingP3Exit;
+    const env_b = providers.get("wasi:cli/environment@0.3.0-rc-2026-03-15") orelse return error.MissingP3Env;
+    const types_b = providers.get("wasi:cli/types@0.3.0-rc-2026-03-15") orelse return error.MissingP3Types;
+    try testing.expect(stdin_b.host_instance == &adapter.cli_stdin_p3_iface);
+    try testing.expect(stdout_b.host_instance == &adapter.cli_stdout_p3_iface);
+    try testing.expect(exit_b.host_instance == &adapter.cli_exit_p3_iface);
+    try testing.expect(env_b.host_instance == &adapter.cli_environment_p3_iface);
+    try testing.expect(types_b.host_instance == &adapter.cli_types_p3_iface);
+
+    // Unmatched 0.2 names must not appear (the component imports
+    // *only* P3, so the synthesised P2 defaults were pruned).
+    try testing.expect(!providers.contains("wasi:cli/stdin"));
+    try testing.expect(!providers.contains("wasi:cli/stdout"));
+    try testing.expect(!providers.contains("wasi:cli/exit"));
+
+    // P3 names that the component didn't import are also absent.
+    try testing.expect(!providers.contains("wasi:cli/terminal-stdout@0.3.0"));
+    try testing.expect(!providers.contains("wasi:cli/terminal-input@0.3.0"));
+}
+
+test "findRunP3ExportName: returns null when no wasi:cli/run export (#482)" {
+    const testing = std.testing;
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+    };
+    var inst: ComponentInstance = undefined;
+    inst.exported_funcs = .{};
+    const got = try findRunP3ExportName(&component, &inst, testing.allocator);
+    try testing.expect(got == null);
 }
