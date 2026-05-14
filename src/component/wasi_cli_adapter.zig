@@ -1473,6 +1473,41 @@ pub const WasiCliAdapter = struct {
     http_outgoing_handler_iface: HostInstance = .{},
     http_incoming_handler_iface: HostInstance = .{},
 
+    // ── WASIp3 stub host instances (#481 wave A) ─────────────────────
+    // These fields exist so wave B/C PRs (#482-#487) only need to add
+    // `populateWasi*P3` implementations, not new struct fields. The
+    // version-multiplex in `populateWasiProviders` routes versioned
+    // `@0.3.x` imports here. Declared in alphabetical order by
+    // interface family (cli, clocks, fs, http, io, random, sockets)
+    // and mirrors the surface of the corresponding `*_iface` field
+    // above. Wave A only wires `io_streams_p3_iface` /
+    // `io_error_p3_iface`; the rest are stub-only placeholders.
+    cli_stdout_p3_iface: HostInstance = .{},
+    cli_stderr_p3_iface: HostInstance = .{},
+    cli_stdin_p3_iface: HostInstance = .{},
+    cli_exit_p3_iface: HostInstance = .{},
+    cli_environment_p3_iface: HostInstance = .{},
+    cli_run_p3_iface: HostInstance = .{},
+    clocks_wall_p3_iface: HostInstance = .{},
+    clocks_monotonic_p3_iface: HostInstance = .{},
+    fs_types_p3_iface: HostInstance = .{},
+    fs_preopens_p3_iface: HostInstance = .{},
+    http_types_p3_iface: HostInstance = .{},
+    http_outgoing_handler_p3_iface: HostInstance = .{},
+    http_incoming_handler_p3_iface: HostInstance = .{},
+    io_error_p3_iface: HostInstance = .{},
+    io_streams_p3_iface: HostInstance = .{},
+    random_p3_iface: HostInstance = .{},
+    random_insecure_p3_iface: HostInstance = .{},
+    random_insecure_seed_p3_iface: HostInstance = .{},
+    sockets_network_p3_iface: HostInstance = .{},
+    sockets_instance_network_p3_iface: HostInstance = .{},
+    sockets_tcp_p3_iface: HostInstance = .{},
+    sockets_tcp_create_p3_iface: HostInstance = .{},
+    sockets_udp_p3_iface: HostInstance = .{},
+    sockets_udp_create_p3_iface: HostInstance = .{},
+    sockets_ip_name_lookup_p3_iface: HostInstance = .{},
+
     stream_table: std.ArrayListUnmanaged(?*streams.OutputStream) = .empty,
     input_stream_table: std.ArrayListUnmanaged(?*streams.InputStream) = .empty,
     /// Heap-allocated input streams created by `descriptor.read-via-stream`.
@@ -1643,6 +1678,33 @@ pub const WasiCliAdapter = struct {
         self.http_types_iface.deinit(self.allocator);
         self.http_outgoing_handler_iface.deinit(self.allocator);
         self.http_incoming_handler_iface.deinit(self.allocator);
+
+        // P3 stub interfaces (#481).
+        self.cli_stdout_p3_iface.deinit(self.allocator);
+        self.cli_stderr_p3_iface.deinit(self.allocator);
+        self.cli_stdin_p3_iface.deinit(self.allocator);
+        self.cli_exit_p3_iface.deinit(self.allocator);
+        self.cli_environment_p3_iface.deinit(self.allocator);
+        self.cli_run_p3_iface.deinit(self.allocator);
+        self.clocks_wall_p3_iface.deinit(self.allocator);
+        self.clocks_monotonic_p3_iface.deinit(self.allocator);
+        self.fs_types_p3_iface.deinit(self.allocator);
+        self.fs_preopens_p3_iface.deinit(self.allocator);
+        self.http_types_p3_iface.deinit(self.allocator);
+        self.http_outgoing_handler_p3_iface.deinit(self.allocator);
+        self.http_incoming_handler_p3_iface.deinit(self.allocator);
+        self.io_error_p3_iface.deinit(self.allocator);
+        self.io_streams_p3_iface.deinit(self.allocator);
+        self.random_p3_iface.deinit(self.allocator);
+        self.random_insecure_p3_iface.deinit(self.allocator);
+        self.random_insecure_seed_p3_iface.deinit(self.allocator);
+        self.sockets_network_p3_iface.deinit(self.allocator);
+        self.sockets_instance_network_p3_iface.deinit(self.allocator);
+        self.sockets_tcp_p3_iface.deinit(self.allocator);
+        self.sockets_tcp_create_p3_iface.deinit(self.allocator);
+        self.sockets_udp_p3_iface.deinit(self.allocator);
+        self.sockets_udp_create_p3_iface.deinit(self.allocator);
+        self.sockets_ip_name_lookup_p3_iface.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -2456,6 +2518,28 @@ pub const WasiCliAdapter = struct {
         });
         try providers.put(self.allocator, io_error_name, .{
             .host_instance = &self.io_error_iface,
+        });
+    }
+
+    /// Register `wasi:io/streams@0.3.x` and `wasi:io/error@0.3.x` host
+    /// bindings (#481).
+    ///
+    /// The 0.3 `wasi:io` surface drops the `pollable`,
+    /// `input-stream`, and `output-stream` resources — `stream<u8>`
+    /// and `error-context` (wired via #478/#480) are canonical-ABI
+    /// built-ins. The instances exist only for guest binding
+    /// satisfaction: no methods are registered.
+    pub fn populateWasiIoStreamsP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        io_streams_name: []const u8,
+        io_error_name: []const u8,
+    ) !void {
+        try providers.put(self.allocator, io_streams_name, .{
+            .host_instance = &self.io_streams_p3_iface,
+        });
+        try providers.put(self.allocator, io_error_name, .{
+            .host_instance = &self.io_error_p3_iface,
         });
     }
 
@@ -10625,6 +10709,25 @@ fn matchesWasiPrefix(import_name: []const u8, prefix: []const u8) bool {
     return rest.len == 0 or rest[0] == '@';
 }
 
+/// WASI surface version (#481). Derived from the `@x.y.z` suffix on
+/// a component import name. Routing P2 vs P3 imports to different
+/// host instances lets a single `WasiCliAdapter` host both surfaces
+/// simultaneously — required for the 0.2 → 0.3 polyfill path.
+pub const WasiVersion = enum { unspecified, p2, p3 };
+
+/// Classify the WASI surface version from a component import name
+/// like `wasi:io/streams@0.3.0-rc-2026-03-15`. Names without an `@`
+/// suffix are `.unspecified` (caller decides default; for legacy
+/// bare names we treat them as `.p2`-equivalent). Anything outside
+/// the 0.2 / 0.3 majors is `.unspecified`.
+pub fn wasiVersion(import_name: []const u8) WasiVersion {
+    const at = std.mem.indexOfScalar(u8, import_name, '@') orelse return .unspecified;
+    const ver = import_name[at + 1 ..];
+    if (std.mem.startsWith(u8, ver, "0.3")) return .p3;
+    if (std.mem.startsWith(u8, ver, "0.2")) return .p2;
+    return .unspecified;
+}
+
 /// Find the callable export name for
 /// `wasi:http/incoming-handler.handle`. `ComponentInstance` registers
 /// exported instance members under `<instance-export>/<member>`, so a
@@ -10669,8 +10772,10 @@ pub fn populateWasiProviders(
     var matched_terminal_input: ?[]const u8 = null;
     var matched_terminal_output: ?[]const u8 = null;
     var matched_streams: ?[]const u8 = null;
+    var matched_streams_p3: ?[]const u8 = null;
     var matched_poll: ?[]const u8 = null;
     var matched_error: ?[]const u8 = null;
+    var matched_error_p3: ?[]const u8 = null;
     var matched_wall_clock: ?[]const u8 = null;
     var matched_monotonic_clock: ?[]const u8 = null;
     var matched_random: ?[]const u8 = null;
@@ -10710,12 +10815,20 @@ pub fn populateWasiProviders(
             matched_terminal_input = imp.name;
         if (matched_terminal_output == null and matchesWasiPrefix(imp.name, "wasi:cli/terminal-output"))
             matched_terminal_output = imp.name;
-        if (matched_streams == null and matchesWasiPrefix(imp.name, "wasi:io/streams"))
-            matched_streams = imp.name;
+        if (matchesWasiPrefix(imp.name, "wasi:io/streams")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_streams_p3 = matched_streams_p3 orelse imp.name,
+                else => matched_streams = matched_streams orelse imp.name,
+            }
+        }
         if (matched_poll == null and matchesWasiPrefix(imp.name, "wasi:io/poll"))
             matched_poll = imp.name;
-        if (matched_error == null and matchesWasiPrefix(imp.name, "wasi:io/error"))
-            matched_error = imp.name;
+        if (matchesWasiPrefix(imp.name, "wasi:io/error")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_error_p3 = matched_error_p3 orelse imp.name,
+                else => matched_error = matched_error orelse imp.name,
+            }
+        }
         if (matched_wall_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/wall-clock"))
             matched_wall_clock = imp.name;
         if (matched_monotonic_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/monotonic-clock"))
@@ -10819,6 +10932,19 @@ pub fn populateWasiProviders(
     );
     if (matched_poll == null) _ = providers.remove("wasi:io/poll");
     if (matched_error == null) _ = providers.remove("wasi:io/error");
+
+    // #481: separately bind any `wasi:io/streams@0.3.x` and
+    // `wasi:io/error@0.3.x` imports. The 0.3 surface has no methods —
+    // these are stub-only registrations for guest binding
+    // satisfaction. The P3 stream<u8> machinery itself lives in the
+    // canonical-ABI (#478/#505), not on the adapter.
+    try adapter.populateWasiIoStreamsP3(
+        providers,
+        matched_streams_p3 orelse "wasi:io/streams@0.3.0",
+        matched_error_p3 orelse "wasi:io/error@0.3.0",
+    );
+    if (matched_streams_p3 == null) _ = providers.remove("wasi:io/streams@0.3.0");
+    if (matched_error_p3 == null) _ = providers.remove("wasi:io/error@0.3.0");
 
     try adapter.populateWasiClocksWallClock(
         providers,
@@ -11675,6 +11801,131 @@ test "populateWasiProviders: binds wasi:io/poll and wasi:io/error (#154)" {
     try testing.expect(adapter.io_poll_iface.members.contains("[method]pollable.block"));
     try testing.expect(adapter.io_poll_iface.members.contains("[resource-drop]pollable"));
     try testing.expect(adapter.io_error_iface.members.contains("[resource-drop]error"));
+}
+
+test "wasiVersion: detects @0.2 / @0.3 / unspecified" {
+    const testing = std.testing;
+    try testing.expectEqual(WasiVersion.p2, wasiVersion("wasi:io/streams@0.2.6"));
+    try testing.expectEqual(WasiVersion.p2, wasiVersion("wasi:io/streams@0.2"));
+    try testing.expectEqual(WasiVersion.p3, wasiVersion("wasi:io/streams@0.3.0"));
+    try testing.expectEqual(WasiVersion.p3, wasiVersion("wasi:io/streams@0.3.0-rc-2026-03-15"));
+    try testing.expectEqual(WasiVersion.unspecified, wasiVersion("wasi:io/streams"));
+    try testing.expectEqual(WasiVersion.unspecified, wasiVersion("wasi:io/streams@0.4.0"));
+    try testing.expectEqual(WasiVersion.unspecified, wasiVersion("wasi:io/streams@1.0.0"));
+}
+
+test "populateWasiProviders: routes @0.3.x to P3 stub host instances (#481)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // P3-only imports — must land on the *_p3_iface fields.
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:io/streams@0.3.0", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/error@0.3.0", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    // The P3 names resolve.
+    const streams_p3 = providers.get("wasi:io/streams@0.3.0") orelse return error.MissingStreamsP3;
+    const error_p3 = providers.get("wasi:io/error@0.3.0") orelse return error.MissingErrorP3;
+
+    // They route to the P3 stub instances, not the legacy P2 ones.
+    try testing.expect(streams_p3.host_instance == &adapter.io_streams_p3_iface);
+    try testing.expect(error_p3.host_instance == &adapter.io_error_p3_iface);
+
+    // 0.3 surface is stub-only: zero registered methods.
+    try testing.expectEqual(@as(usize, 0), adapter.io_streams_p3_iface.members.count());
+    try testing.expectEqual(@as(usize, 0), adapter.io_error_p3_iface.members.count());
+
+    // No P2-version bindings appeared.
+    try testing.expect(!providers.contains("wasi:io/streams"));
+    try testing.expect(!providers.contains("wasi:io/error"));
+}
+
+test "populateWasiProviders: P2 + P3 streams imports coexist on the same component (#481)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // A component asking for BOTH the 0.2 and the 0.3 streams
+    // surfaces is the polyfill-active configuration.
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.3.0", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/error@0.3.0", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    // Both versions bind under their versioned names, to different
+    // HostInstance backings.
+    const p2 = providers.get("wasi:io/streams@0.2.6") orelse return error.MissingP2;
+    const p3 = providers.get("wasi:io/streams@0.3.0") orelse return error.MissingP3;
+    try testing.expect(p2.host_instance == &adapter.io_streams_iface);
+    try testing.expect(p3.host_instance == &adapter.io_streams_p3_iface);
+    try testing.expect(p2.host_instance != p3.host_instance);
+
+    // P2 surface still has its methods registered.
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]input-stream.read"));
+    // P3 surface is stub-only.
+    try testing.expectEqual(@as(usize, 0), adapter.io_streams_p3_iface.members.count());
+}
+
+test "wasi:io@0.3 stream<u8> round-trip via 0.2 polyfill virtual handles (#481)" {
+    // Foundational round-trip: spin a 0.3 stream<u8>, write through
+    // the P2-shaped virtual output handle, then read through the
+    // P2-shaped virtual input handle. The bytes must survive
+    // intact. This is the host-side rendezvous proof point for the
+    // polyfill path the wave-B/C PRs (#482-#487) will exercise.
+    const testing = std.testing;
+    const polyfill = @import("../wasi/preview3/p2_to_p3_io_polyfill.zig");
+    const async_mod = @import("async.zig");
+
+    var s = async_mod.AsyncStream{};
+    defer s.deinit(testing.allocator);
+
+    const vos = polyfill.VirtualOutputStream{ .stream_handle = 1 };
+    const vis = polyfill.VirtualInputStream{ .stream_handle = 1 };
+
+    const write_out = try vos.write(&s, testing.allocator, "wasi:io@0.3 says hi");
+    try testing.expectEqual(@as(usize, 19), write_out.ok);
+
+    var buf: [32]u8 = undefined;
+    const read_out = vis.read(&s, &buf);
+    try testing.expectEqualStrings("wasi:io@0.3 says hi", read_out.ok);
 }
 
 test "populateWasiProviders: binds wasi:cli/stdin (#152)" {
