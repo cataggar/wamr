@@ -19,6 +19,13 @@ pub const TaskState = enum(u8) {
     cancelled = 3,
 };
 
+/// Per-task `context.{get,set} i32 i` slots. The spec allows arbitrary
+/// `valtype` and arbitrary index range; sub-PR 1 of #478 caps both
+/// (`i32` only, `slot < N_CONTEXT_SLOTS`). Wasmtime currently exposes a
+/// single `i32` slot; pick a small headroom value here so we don't have
+/// to revisit the constant on the first conformance suite that uses 2.
+pub const N_CONTEXT_SLOTS: u32 = 2;
+
 /// A task represents an in-flight async component function call.
 pub const Task = struct {
     id: u32,
@@ -27,6 +34,9 @@ pub const Task = struct {
     return_values: []u32 = &.{},
     /// Waiters to notify when state changes.
     waitable_set: ?*WaitableSet = null,
+    /// Per-task `context.{get,set} i32` slots. Default-initialised to 0
+    /// to match Wasmtime's behaviour for a freshly-started task.
+    context_slots: [N_CONTEXT_SLOTS]u32 = [_]u32{0} ** N_CONTEXT_SLOTS,
 };
 
 // ── Waitable Set ────────────────────────────────────────────────────────────
@@ -90,6 +100,12 @@ pub const WaitableSet = struct {
 pub const TaskManager = struct {
     tasks: std.ArrayListUnmanaged(Task) = .empty,
     next_id: u32 = 1,
+    /// Handle of the task currently executing a core-wasm body, or `null`
+    /// when no async task is on the dispatch stack. `context.{get,set}`
+    /// and `task.yield` consult this to find their target task; when it's
+    /// `null` (synchronous canon-lift call path), callers should fall
+    /// back to `ComponentInstance.implicit_task`.
+    current_task: ?u32 = null,
 
     /// Create a new task. Returns the task handle.
     pub fn createTask(self: *TaskManager, allocator: std.mem.Allocator) !u32 {
@@ -131,6 +147,24 @@ pub const TaskManager = struct {
     pub fn getState(self: *const TaskManager, handle: u32) ?TaskState {
         if (handle >= self.tasks.items.len) return null;
         return self.tasks.items[handle].state;
+    }
+
+    /// Read a per-task `context.get i32 i` slot. Returns `null` if the
+    /// task handle is unknown or the slot index is out of range.
+    pub fn getContextSlot(self: *const TaskManager, handle: u32, slot: u32) ?u32 {
+        if (handle >= self.tasks.items.len) return null;
+        if (slot >= N_CONTEXT_SLOTS) return null;
+        return self.tasks.items[handle].context_slots[slot];
+    }
+
+    /// Write a per-task `context.set i32 i` slot. Returns `false` if the
+    /// task handle is unknown or the slot index is out of range; the
+    /// caller surfaces this as a component trap.
+    pub fn setContextSlot(self: *TaskManager, handle: u32, slot: u32, value: u32) bool {
+        if (handle >= self.tasks.items.len) return false;
+        if (slot >= N_CONTEXT_SLOTS) return false;
+        self.tasks.items[handle].context_slots[slot] = value;
+        return true;
     }
 
     pub fn deinit(self: *TaskManager, allocator: std.mem.Allocator) void {
@@ -242,6 +276,53 @@ test "TaskManager: cancel" {
     const h = try tm.createTask(allocator);
     tm.cancelTask(h);
     try std.testing.expectEqual(TaskState.cancelled, tm.getState(h).?);
+}
+
+test "TaskManager: context slot get/set round-trip" {
+    const allocator = std.testing.allocator;
+    var tm = TaskManager{};
+    defer tm.deinit(allocator);
+
+    const h = try tm.createTask(allocator);
+
+    // Fresh task → all slots zero.
+    try std.testing.expectEqual(@as(?u32, 0), tm.getContextSlot(h, 0));
+    try std.testing.expectEqual(@as(?u32, 0), tm.getContextSlot(h, 1));
+
+    try std.testing.expect(tm.setContextSlot(h, 0, 0xDEAD_BEEF));
+    try std.testing.expect(tm.setContextSlot(h, 1, 42));
+    try std.testing.expectEqual(@as(?u32, 0xDEAD_BEEF), tm.getContextSlot(h, 0));
+    try std.testing.expectEqual(@as(?u32, 42), tm.getContextSlot(h, 1));
+}
+
+test "TaskManager: context slot bounds" {
+    const allocator = std.testing.allocator;
+    var tm = TaskManager{};
+    defer tm.deinit(allocator);
+
+    const h = try tm.createTask(allocator);
+
+    // Out-of-range slot index.
+    try std.testing.expect(tm.getContextSlot(h, N_CONTEXT_SLOTS) == null);
+    try std.testing.expect(!tm.setContextSlot(h, N_CONTEXT_SLOTS, 1));
+
+    // Unknown handle.
+    try std.testing.expect(tm.getContextSlot(h + 999, 0) == null);
+    try std.testing.expect(!tm.setContextSlot(h + 999, 0, 1));
+}
+
+test "TaskManager: context slots are per-task" {
+    const allocator = std.testing.allocator;
+    var tm = TaskManager{};
+    defer tm.deinit(allocator);
+
+    const a = try tm.createTask(allocator);
+    const b = try tm.createTask(allocator);
+
+    try std.testing.expect(tm.setContextSlot(a, 0, 10));
+    try std.testing.expect(tm.setContextSlot(b, 0, 20));
+    try std.testing.expectEqual(@as(?u32, 10), tm.getContextSlot(a, 0));
+    try std.testing.expectEqual(@as(?u32, 20), tm.getContextSlot(b, 0));
 }
 
 test "WaitableSet: register and poll" {

@@ -230,6 +230,9 @@ pub fn alignment(t: ctypes.ValType) u32 {
         .s64, .u64, .f64 => 8,
         .string => 4,
         .own, .borrow => 4,
+        // Async ABI handle types (future / stream / error-context) share
+        // the resource-handle layout: a 4-byte i32 handle. (#478 sub-PR 3.)
+        .future, .stream, .error_context => 4,
         .list => 4,
         .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => 0,
     };
@@ -245,6 +248,7 @@ pub fn elemSize(t: ctypes.ValType) u32 {
         .s64, .u64, .f64 => 8,
         .string => 8,
         .own, .borrow => 4,
+        .future, .stream, .error_context => 4,
         .list => 8,
         .record, .variant, .tuple, .flags, .enum_, .option, .result, .type_idx => 0,
     };
@@ -410,6 +414,7 @@ pub const MAX_FLAT_RESULTS: u32 = 1;
 pub fn flatten(t: ctypes.ValType) []const ctypes.CoreValType {
     return switch (t) {
         .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char, .own, .borrow => &.{.i32},
+        .future, .stream, .error_context => &.{.i32},
         .s64, .u64 => &.{.i64},
         .f32 => &.{.f32},
         .f64 => &.{.f64},
@@ -426,6 +431,7 @@ pub fn flatten(t: ctypes.ValType) []const ctypes.CoreValType {
 pub fn flattenCount(reg: TypeRegistry, t: ctypes.ValType) u32 {
     return switch (t) {
         .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char, .own, .borrow => 1,
+        .future, .stream, .error_context => 1,
         .s64, .u64 => 1,
         .f32, .f64 => 1,
         .string => 2,
@@ -527,7 +533,7 @@ pub fn loadVal(memory: []const u8, ptr: u32, t: ctypes.ValType) !InterfaceValue 
         .f32 => .{ .f32 = @bitCast(loadU32(memory, ptr)) },
         .f64 => .{ .f64 = @bitCast(loadU64(memory, ptr)) },
         .char => .{ .char = loadU32(memory, ptr) },
-        .own, .borrow => .{ .handle = loadU32(memory, ptr) },
+        .own, .borrow, .future, .stream, .error_context => .{ .handle = loadU32(memory, ptr) },
         .string => .{ .string = .{
             .ptr = loadU32(memory, ptr),
             .len = loadU32At(memory, ptr, 4),
@@ -552,7 +558,7 @@ pub const LoadError = error{
 pub fn loadValReg(memory: []const u8, ptr: u32, t: ctypes.ValType, reg: TypeRegistry, alloc: Allocator) LoadError!InterfaceValue {
     return switch (t) {
         // Primitives delegate to existing path
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .string, .list => loadVal(memory, ptr, t),
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .future, .stream, .error_context, .string, .list => loadVal(memory, ptr, t),
         .enum_ => |idx| blk: {
             const td = reg.get(idx) orelse break :blk error.InvalidTypeIndex;
             const disc_sz = discriminantSize(td.enum_.names.len);
@@ -769,7 +775,7 @@ pub fn storeVal(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValue) 
         .f32 => storeU32(memory, ptr, @bitCast(val.f32)),
         .f64 => storeU64(memory, ptr, @bitCast(val.f64)),
         .char => storeU32(memory, ptr, val.char),
-        .own, .borrow => storeU32(memory, ptr, val.handle),
+        .own, .borrow, .future, .stream, .error_context => storeU32(memory, ptr, val.handle),
         .string => {
             storeU32(memory, ptr, val.string.ptr);
             storeU32At(memory, ptr, 4, val.string.len);
@@ -791,7 +797,7 @@ pub const StoreError = error{
 /// Store any value to linear memory, resolving compound types via registry.
 pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValue, reg: TypeRegistry) StoreError!void {
     switch (t) {
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .string, .list => try storeVal(memory, ptr, t, val),
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .own, .borrow, .future, .stream, .error_context, .string, .list => try storeVal(memory, ptr, t, val),
         .enum_ => {
             const idx = t.enum_;
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
@@ -1004,7 +1010,7 @@ pub fn liftFlat(core_vals: []const u32, t: ctypes.ValType) !InterfaceValue {
         .u64 => .{ .u64 = if (core_vals.len > 1) @as(u64, core_vals[1]) << 32 | core_vals[0] else core_vals[0] },
         .f32 => .{ .f32 = core_vals[0] },
         .f64 => .{ .f64 = if (core_vals.len > 1) @as(u64, core_vals[1]) << 32 | core_vals[0] else core_vals[0] },
-        .own, .borrow => .{ .handle = core_vals[0] },
+        .own, .borrow, .future, .stream, .error_context => .{ .handle = core_vals[0] },
         .string => .{ .string = .{
             .ptr = core_vals[0],
             .len = if (core_vals.len > 1) core_vals[1] else 0,
@@ -1069,7 +1075,7 @@ pub fn lowerFlat(val: InterfaceValue, t: ctypes.ValType, out: []u32) !u32 {
             if (out.len > 1) out[1] = @truncate(val.f64 >> 32);
             return 2;
         },
-        .own, .borrow => {
+        .own, .borrow, .future, .stream, .error_context => {
             out[0] = val.handle;
             return 1;
         },

@@ -251,7 +251,16 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                     // Every canon kind except `.lift` contributes a slot
                     // to the core-func indexspace.
                     const contributes = switch (c) {
-                        .lower, .resource_drop, .resource_new, .resource_rep => true,
+                        .lower,
+                        .resource_drop,
+                        .resource_new,
+                        .resource_rep,
+                        .task_yield,
+                        .context_get,
+                        .context_set,
+                        .task_return,
+                        .async_canon,
+                        => true,
                         .lift => false,
                     };
                     if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
@@ -664,7 +673,31 @@ fn readValType(reader: *BinaryReader) LoadError!ctypes.ValType {
         0x73 => .string,
         0x69 => .{ .own = try reader.readU32() },
         0x68 => .{ .borrow = try reader.readU32() },
+        0x64 => .error_context,
+        0x66 => try readPayloadedValType(reader, .stream),
+        0x65 => try readPayloadedValType(reader, .future),
         else => error.InvalidEncoding,
+    };
+}
+
+/// Read `(stream|future) t?` per defvaltype 0x66/0x65. Sub-PR 3 of #478
+/// accepts only the `t?` = present form (`0x01 valtype`); the empty
+/// form is rejected with `InvalidEncoding` until a follow-up wires
+/// payload-less streams/futures. The inner valtype must be a typeidx —
+/// the host-side `async_mod.{Future,AsyncStream}` only carries `u32`
+/// values today, so primitive-only payloads suffice but aren't yet
+/// modelled in the IR.
+fn readPayloadedValType(reader: *BinaryReader, comptime kind: enum { future, stream }) LoadError!ctypes.ValType {
+    const present = try reader.readByte();
+    if (present != 0x01) return error.InvalidEncoding;
+    const inner = try readValType(reader);
+    const idx = switch (inner) {
+        .type_idx => |i| i,
+        else => return error.InvalidEncoding,
+    };
+    return switch (kind) {
+        .future => .{ .future = idx },
+        .stream => .{ .stream = idx },
     };
 }
 
@@ -695,8 +728,139 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
         0x02 => .{ .resource_new = try reader.readU32() },
         0x03 => .{ .resource_drop = try reader.readU32() },
         0x04 => .{ .resource_rep = try reader.readU32() },
+        0x0a => try parseContextCanon(reader, .get),
+        0x0b => try parseContextCanon(reader, .set),
+        0x0c => blk: {
+            // canon thread.yield (formerly task.yield) — Binary.md tag 0x0c
+            // immediate is a single `cancel?` byte: 0x00 = plain, 0x01 = cancellable.
+            const cancel = try reader.readByte();
+            const cancellable = switch (cancel) {
+                0x00 => false,
+                0x01 => true,
+                else => return error.InvalidEncoding,
+            };
+            break :blk .{ .task_yield = .{ .cancellable = cancellable } };
+        },
+        0x09 => blk: {
+            // canon task.return rs:<resultlist> opts:<opts>. The resultlist
+            // shares its encoding with `FuncType` results (see parseTypeDef
+            // 0x40 above).
+            const result_tag = try reader.readByte();
+            const results: ctypes.FuncType.ResultList = switch (result_tag) {
+                0x00 => .{ .unnamed = try readValType(reader) },
+                0x01 => blk2: {
+                    const zero = try reader.readByte();
+                    if (zero != 0x00) return error.InvalidEncoding;
+                    break :blk2 .none;
+                },
+                else => return error.InvalidEncoding,
+            };
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .task_return = .{ .results = results, .opts = opts } };
+        },
+        // ── Async ABI canon tags (#478 sub-PR 3) ────────────────────────────
+        // All of these route through the unified `Canon.async_canon` union.
+        0x06 => blk: {
+            const async_byte = try parseAsyncByte(reader);
+            break :blk .{ .async_canon = .{ .subtask_cancel = .{ .is_async = async_byte } } };
+        },
+        0x0d => .{ .async_canon = .subtask_drop },
+        0x0e => .{ .async_canon = .{ .stream_new = .{ .type_idx = try reader.readU32() } } },
+        0x0f => blk: {
+            const ti = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .async_canon = .{ .stream_read = .{ .type_idx = ti, .opts = opts } } };
+        },
+        0x10 => blk: {
+            const ti = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .async_canon = .{ .stream_write = .{ .type_idx = ti, .opts = opts } } };
+        },
+        0x11 => blk: {
+            const ti = try reader.readU32();
+            const is_async = try parseAsyncByte(reader);
+            break :blk .{ .async_canon = .{ .stream_cancel_read = .{ .type_idx = ti, .is_async = is_async } } };
+        },
+        0x12 => blk: {
+            const ti = try reader.readU32();
+            const is_async = try parseAsyncByte(reader);
+            break :blk .{ .async_canon = .{ .stream_cancel_write = .{ .type_idx = ti, .is_async = is_async } } };
+        },
+        0x13 => .{ .async_canon = .{ .stream_drop_readable = .{ .type_idx = try reader.readU32() } } },
+        0x14 => .{ .async_canon = .{ .stream_drop_writable = .{ .type_idx = try reader.readU32() } } },
+        0x15 => .{ .async_canon = .{ .future_new = .{ .type_idx = try reader.readU32() } } },
+        0x16 => blk: {
+            const ti = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .async_canon = .{ .future_read = .{ .type_idx = ti, .opts = opts } } };
+        },
+        0x17 => blk: {
+            const ti = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .async_canon = .{ .future_write = .{ .type_idx = ti, .opts = opts } } };
+        },
+        0x18 => blk: {
+            const ti = try reader.readU32();
+            const is_async = try parseAsyncByte(reader);
+            break :blk .{ .async_canon = .{ .future_cancel_read = .{ .type_idx = ti, .is_async = is_async } } };
+        },
+        0x19 => blk: {
+            const ti = try reader.readU32();
+            const is_async = try parseAsyncByte(reader);
+            break :blk .{ .async_canon = .{ .future_cancel_write = .{ .type_idx = ti, .is_async = is_async } } };
+        },
+        0x1a => .{ .async_canon = .{ .future_drop_readable = .{ .type_idx = try reader.readU32() } } },
+        0x1b => .{ .async_canon = .{ .future_drop_writable = .{ .type_idx = try reader.readU32() } } },
+        0x1c => .{ .async_canon = .{ .error_context_new = .{ .opts = try readCanonOpts(reader, allocator) } } },
+        0x1d => .{ .async_canon = .{ .error_context_debug_message = .{ .opts = try readCanonOpts(reader, allocator) } } },
+        0x1e => .{ .async_canon = .error_context_drop },
+        0x1f => .{ .async_canon = .waitable_set_new },
+        0x20 => blk: {
+            const cancellable = try parseCancelByte(reader);
+            const mem = try reader.readU32();
+            break :blk .{ .async_canon = .{ .waitable_set_wait = .{ .cancellable = cancellable, .memory = mem } } };
+        },
+        0x21 => blk: {
+            const cancellable = try parseCancelByte(reader);
+            const mem = try reader.readU32();
+            break :blk .{ .async_canon = .{ .waitable_set_poll = .{ .cancellable = cancellable, .memory = mem } } };
+        },
+        0x22 => .{ .async_canon = .waitable_set_drop },
+        0x23 => .{ .async_canon = .waitable_join },
         else => error.InvalidEncoding,
     };
+}
+
+/// Parse the immediate of `canon context.get v i` / `canon context.set v i`
+/// (Binary.md tags 0x0a / 0x0b). The valtype byte is restricted to `i32`
+/// in sub-PR 1; widen later as conformance grows.
+fn parseContextCanon(reader: *BinaryReader, comptime kind: enum { get, set }) LoadError!ctypes.Canon {
+    const val_byte = try reader.readByte();
+    if (val_byte != @intFromEnum(ctypes.CoreValType.i32)) return error.InvalidEncoding;
+    const slot = try reader.readU32();
+    return switch (kind) {
+        .get => .{ .context_get = .{ .val_type = ctypes.CoreValType.i32, .slot = slot } },
+        .set => .{ .context_set = .{ .val_type = ctypes.CoreValType.i32, .slot = slot } },
+    };
+}
+
+/// Parse the `async?` immediate byte: 0x00 → false, 0x01 → true, else
+/// InvalidEncoding. Used by `subtask.cancel` and the stream/future
+/// `cancel-*` tags. (#478 sub-PR 3.)
+fn parseAsyncByte(reader: *BinaryReader) LoadError!bool {
+    const b = try reader.readByte();
+    return switch (b) {
+        0x00 => false,
+        0x01 => true,
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Parse the `cancel?` immediate byte. Same encoding as `async?` but
+/// different semantic name — kept distinct so the IR matches Binary.md
+/// vocabulary at the leaf. (#478 sub-PR 3.)
+fn parseCancelByte(reader: *BinaryReader) LoadError!bool {
+    return parseAsyncByte(reader);
 }
 
 fn readCanonOpts(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError![]const ctypes.CanonOpt {
@@ -712,6 +876,8 @@ fn readCanonOpts(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
             0x03 => .{ .memory = try reader.readU32() },
             0x04 => .{ .realloc = try reader.readU32() },
             0x05 => .{ .post_return = try reader.readU32() },
+            0x06 => .async_lift,
+            0x07 => .{ .callback = try reader.readU32() },
             else => return error.InvalidEncoding,
         };
     }
@@ -889,6 +1055,198 @@ test "readValType: rejects unknown negative code" {
     // 0x67 decodes as signed LEB -25, which has no primitive mapping.
     var reader = BinaryReader{ .data = &[_]u8{0x67} };
     try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+}
+
+test "parseCanon: task.yield with cancel? = 0x00" {
+    // tag 0x0c, cancel? 0x00 → task_yield with cancellable=false
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0c, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_yield);
+    try std.testing.expectEqual(false, c.task_yield.cancellable);
+}
+
+test "parseCanon: task.yield with cancel? = 0x01 (cancellable)" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0c, 0x01 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_yield);
+    try std.testing.expectEqual(true, c.task_yield.cancellable);
+}
+
+test "parseCanon: task.yield rejects invalid cancel byte" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0c, 0x02 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
+}
+
+test "parseCanon: context.get i32 slot=0" {
+    // tag 0x0a, valtype byte for i32 = 0x7F, slot LEB = 0x00
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0a, 0x7F, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .context_get);
+    try std.testing.expectEqual(ctypes.CoreValType.i32, c.context_get.val_type);
+    try std.testing.expectEqual(@as(u32, 0), c.context_get.slot);
+}
+
+test "parseCanon: context.set i32 slot=1" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0b, 0x7F, 0x01 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .context_set);
+    try std.testing.expectEqual(@as(u32, 1), c.context_set.slot);
+}
+
+test "parseCanon: context.get rejects non-i32 valtype" {
+    // tag 0x0a, valtype byte for i64 = 0x7E → rejected in sub-PR 1
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0a, 0x7E, 0x00 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
+}
+
+test "parseCanon: context.set rejects non-i32 valtype" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0b, 0x7D, 0x00 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
+}
+
+test "readCanonOpts: async_lift + callback opts (#478 sub-PR 2)" {
+    // count=2, [0x06], [0x07 0x09]
+    var reader = BinaryReader{ .data = &[_]u8{ 0x02, 0x06, 0x07, 0x09 } };
+    const opts = try readCanonOpts(&reader, std.testing.allocator);
+    defer std.testing.allocator.free(opts);
+    try std.testing.expectEqual(@as(usize, 2), opts.len);
+    try std.testing.expect(opts[0] == .async_lift);
+    try std.testing.expect(opts[1] == .callback);
+    try std.testing.expectEqual(@as(u32, 9), opts[1].callback);
+}
+
+test "parseCanon: task.return with one unnamed i32 result" {
+    // tag 0x09, resultlist `0x00 0x7F` (unnamed i32 valtype), no opts (count=0)
+    var reader = BinaryReader{ .data = &[_]u8{ 0x09, 0x00, 0x7F, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_return);
+    try std.testing.expect(c.task_return.results == .unnamed);
+    try std.testing.expectEqual(@as(usize, 0), c.task_return.opts.len);
+}
+
+test "parseCanon: task.return with no results" {
+    // tag 0x09, resultlist `0x01 0x00`, no opts.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x09, 0x01, 0x00, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .task_return);
+    try std.testing.expect(c.task_return.results == .none);
+}
+
+test "parseCanon: task.return rejects malformed resultlist" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x09, 0x02, 0x7F, 0x00 } };
+    try std.testing.expectError(error.InvalidEncoding, parseCanon(&reader, std.testing.allocator));
+}
+
+// ── Sub-PR 3: future / stream / error-context / waitable-set canon tags ──
+
+test "readValType: error-context (0x64)" {
+    var reader = BinaryReader{ .data = &[_]u8{0x64} };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .error_context);
+}
+
+test "readValType: future<u32>" {
+    // 0x65 0x01 0x79 (future + present + u32 primvaltype). Inner u32 is
+    // a primvaltype, so it lands as `.u32` not `.type_idx`; sub-PR 3
+    // only accepts the typeidx form so this is `error.InvalidEncoding`.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x01, 0x79 } };
+    try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+}
+
+test "readValType: stream with typeidx payload" {
+    // typeidx 3 = 0x03 (signed LEB single byte).
+    var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x03 } };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .stream);
+    try std.testing.expectEqual(@as(u32, 3), v.stream);
+}
+
+test "readValType: future with typeidx payload" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x01, 0x05 } };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .future);
+    try std.testing.expectEqual(@as(u32, 5), v.future);
+}
+
+test "readValType: stream rejects empty payload (sub-PR 3 scope)" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x00 } };
+    try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+}
+
+test "parseCanon: subtask.cancel async?=0x01" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x06, 0x01 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .async_canon);
+    try std.testing.expect(c.async_canon == .subtask_cancel);
+    try std.testing.expectEqual(true, c.async_canon.subtask_cancel.is_async);
+}
+
+test "parseCanon: subtask.drop" {
+    var reader = BinaryReader{ .data = &[_]u8{0x0d} };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .async_canon);
+    try std.testing.expect(c.async_canon == .subtask_drop);
+}
+
+test "parseCanon: stream.new with typeidx" {
+    // tag 0x0e, typeidx u32 = 7
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0e, 0x07 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .async_canon);
+    try std.testing.expect(c.async_canon == .stream_new);
+    try std.testing.expectEqual(@as(u32, 7), c.async_canon.stream_new.type_idx);
+}
+
+test "parseCanon: future.new with typeidx" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x15, 0x02 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .async_canon);
+    try std.testing.expect(c.async_canon == .future_new);
+}
+
+test "parseCanon: stream.read with opts" {
+    // tag 0x0f, typeidx=1, opts count=1, memory=0
+    var reader = BinaryReader{ .data = &[_]u8{ 0x0f, 0x01, 0x01, 0x03, 0x00 } };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    defer std.testing.allocator.free(c.async_canon.stream_read.opts);
+    try std.testing.expect(c == .async_canon);
+    try std.testing.expect(c.async_canon == .stream_read);
+    try std.testing.expectEqual(@as(u32, 1), c.async_canon.stream_read.type_idx);
+    try std.testing.expectEqual(@as(usize, 1), c.async_canon.stream_read.opts.len);
+}
+
+test "parseCanon: error-context.{new,drop,debug-message}" {
+    // new with no opts
+    var r1 = BinaryReader{ .data = &[_]u8{ 0x1c, 0x00 } };
+    const c1 = try parseCanon(&r1, std.testing.allocator);
+    try std.testing.expect(c1.async_canon == .error_context_new);
+    // debug-message with no opts
+    var r2 = BinaryReader{ .data = &[_]u8{ 0x1d, 0x00 } };
+    const c2 = try parseCanon(&r2, std.testing.allocator);
+    try std.testing.expect(c2.async_canon == .error_context_debug_message);
+    // drop
+    var r3 = BinaryReader{ .data = &[_]u8{0x1e} };
+    const c3 = try parseCanon(&r3, std.testing.allocator);
+    try std.testing.expect(c3.async_canon == .error_context_drop);
+}
+
+test "parseCanon: waitable-set.{new,wait,poll,drop} + waitable.join" {
+    var r1 = BinaryReader{ .data = &[_]u8{0x1f} };
+    try std.testing.expect((try parseCanon(&r1, std.testing.allocator)).async_canon == .waitable_set_new);
+    // wait cancel?=0, memory=0
+    var r2 = BinaryReader{ .data = &[_]u8{ 0x20, 0x00, 0x00 } };
+    try std.testing.expect((try parseCanon(&r2, std.testing.allocator)).async_canon == .waitable_set_wait);
+    // poll
+    var r3 = BinaryReader{ .data = &[_]u8{ 0x21, 0x01, 0x00 } };
+    const c3 = try parseCanon(&r3, std.testing.allocator);
+    try std.testing.expect(c3.async_canon == .waitable_set_poll);
+    try std.testing.expectEqual(true, c3.async_canon.waitable_set_poll.cancellable);
+    // drop
+    var r4 = BinaryReader{ .data = &[_]u8{0x22} };
+    try std.testing.expect((try parseCanon(&r4, std.testing.allocator)).async_canon == .waitable_set_drop);
+    // join
+    var r5 = BinaryReader{ .data = &[_]u8{0x23} };
+    try std.testing.expect((try parseCanon(&r5, std.testing.allocator)).async_canon == .waitable_join);
 }
 
 test "parseTypeDef: instance type with `sub resource` type decl" {

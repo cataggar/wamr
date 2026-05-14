@@ -8,6 +8,7 @@ const ctypes = @import("types.zig");
 const core_types = @import("../runtime/common/types.zig");
 const executor_mod = @import("executor.zig");
 const indexspace = @import("indexspace.zig");
+const async_mod = @import("async.zig");
 
 // ── Resource Table ──────────────────────────────────────────────────────────
 
@@ -268,6 +269,36 @@ pub const ComponentInstance = struct {
     /// as `.poisoned` lets `deinit` and external callers reject reuse
     /// without depending on hashmap occupancy. (Issue #355.)
     link_state: LinkState = .unlinked,
+    /// Per-instance context slots for `canon context.{get,set}` invoked
+    /// outside any async task (the synchronous canon-lift call path).
+    /// Mirrors Wasmtime's implicit-task fallback: when no async task is
+    /// on the dispatch stack, context.get/set still works, scoped to
+    /// the instance rather than to any caller task. Initialised to all
+    /// zeros — the spec doesn't define a non-zero initial value.
+    /// (#478 sub-PR 1.)
+    implicit_task_context: [async_mod.N_CONTEXT_SLOTS]u32 = [_]u32{0} ** async_mod.N_CONTEXT_SLOTS,
+
+    /// Per-instance async-handle tables for the WASIp3 canonical-ABI
+    /// surface (#478 sub-PR 3). Each table maps a u32 handle to the
+    /// host-side state allocated by the corresponding `.new` canon op:
+    /// futures, streams, error-contexts, and waitable-sets. Handles are
+    /// drawn from `next_async_handle` (starting at 1; zero is the spec
+    /// sentinel meaning "no value yet").
+    futures: std.AutoHashMapUnmanaged(u32, async_mod.Future) = .empty,
+    streams: std.AutoHashMapUnmanaged(u32, async_mod.AsyncStream) = .empty,
+    error_contexts: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
+    waitable_sets: std.AutoHashMapUnmanaged(u32, async_mod.WaitableSet) = .empty,
+    next_async_handle: u32 = 1,
+
+    /// Allocate a fresh async-handle (#478 sub-PR 3). Used by every
+    /// `.new`-flavoured canon-builtin to mint a unique key into the
+    /// per-instance future / stream / error-context / waitable-set
+    /// tables.
+    pub fn allocAsyncHandle(self: *ComponentInstance) u32 {
+        const h = self.next_async_handle;
+        self.next_async_handle += 1;
+        return h;
+    }
 
     pub const LinkState = enum { unlinked, linking, linked, poisoned };
 
@@ -382,7 +413,16 @@ pub const ComponentInstance = struct {
     ) ?struct { mi: *core_types.ModuleInstance, local_idx: u32 } {
         const ref = indexspace.resolveCoreFunc(self.component, idx) orelse return null;
         switch (ref) {
-            .lowered, .resource_drop, .resource_new, .resource_rep => return null,
+            .lowered,
+            .resource_drop,
+            .resource_new,
+            .resource_rep,
+            .task_yield,
+            .context_get,
+            .context_set,
+            .task_return,
+            .async_canon,
+            => return null,
             .aliased => |alias_idx| {
                 const ie = self.component.aliases[alias_idx].instance_export;
                 if (ie.instance_idx >= self.core_instances.len) return null;
@@ -1079,6 +1119,21 @@ pub const ComponentInstance = struct {
         var rt_it = self.resource_tables.valueIterator();
         while (rt_it.next()) |rt| rt.deinit(self.allocator);
         self.resource_tables.deinit(self.allocator);
+
+        // Tear down per-instance async-handle tables (#478 sub-PR 3).
+        // Streams and waitable-sets own heap memory; futures and
+        // error-contexts don't (the latter stores `[]u8` debug strings
+        // which we free below).
+        self.futures.deinit(self.allocator);
+        var stream_it = self.streams.valueIterator();
+        while (stream_it.next()) |s| s.deinit(self.allocator);
+        self.streams.deinit(self.allocator);
+        var ec_it = self.error_contexts.valueIterator();
+        while (ec_it.next()) |msg| self.allocator.free(msg.*);
+        self.error_contexts.deinit(self.allocator);
+        var ws_it = self.waitable_sets.valueIterator();
+        while (ws_it.next()) |ws| ws.deinit(self.allocator);
+        self.waitable_sets.deinit(self.allocator);
         for (self.trampoline_ctxs.items) |ctx| {
             ctx.deinit(self.allocator);
             self.allocator.destroy(ctx);
@@ -1985,7 +2040,16 @@ fn isWasiCliRunName(name: []const u8) bool {
 fn resolveCoreFuncLower(component: *const ctypes.Component, core_func_idx: u32) ?u32 {
     return switch (indexspace.resolveCoreFunc(component, core_func_idx) orelse return null) {
         .lowered => |i| i,
-        .resource_drop, .resource_new, .resource_rep, .aliased => null,
+        .resource_drop,
+        .resource_new,
+        .resource_rep,
+        .task_yield,
+        .context_get,
+        .context_set,
+        .task_return,
+        .async_canon,
+        .aliased,
+        => null,
     };
 }
 
@@ -2442,10 +2506,19 @@ fn resolveLiftedCoreFunc(
 ) ?struct { core_instance_idx: u32, local_func_idx: u32 } {
     const ref = indexspace.resolveCoreFunc(component, core_func_idx) orelse return null;
     switch (ref) {
-        // Canon entries (lowers and resource.{new,drop,rep}) all produce
-        // imports/host-bound core funcs — not exported callables — so a
-        // canon.lift pointing at one is malformed.
-        .lowered, .resource_drop, .resource_new, .resource_rep => return null,
+        // Canon entries (lowers, resource.{new,drop,rep}, async builtins)
+        // all produce imports/host-bound core funcs — not exported
+        // callables — so a canon.lift pointing at one is malformed.
+        .lowered,
+        .resource_drop,
+        .resource_new,
+        .resource_rep,
+        .task_yield,
+        .context_get,
+        .context_set,
+        .task_return,
+        .async_canon,
+        => return null,
         .aliased => |alias_idx| {
             const a = component.aliases[alias_idx];
             const ie = a.instance_export;
