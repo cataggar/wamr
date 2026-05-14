@@ -1080,11 +1080,19 @@ fn mapFsError(err: anyerror) FsErrorCode {
         error.FileTooBig => .file_too_large,
         error.NoSpaceLeft => .insufficient_space,
         error.OutOfMemory => .insufficient_memory,
-        error.DeviceBusy => .busy,
+        error.DeviceBusy, error.FileBusy => .busy,
         error.WouldBlock => .would_block,
         error.BrokenPipe => .pipe,
         error.ReadOnlyFileSystem => .read_only,
         error.InvalidUtf8 => .illegal_byte_sequence,
+        // #476: directory-mutation surface needs cross-device, not-empty,
+        // unsupported-op, link-quota, disk-quota, and not-symlink mappings.
+        error.CrossDevice => .cross_device,
+        error.DirNotEmpty => .not_empty,
+        error.OperationUnsupported => .unsupported,
+        error.LinkQuotaExceeded => .too_many_links,
+        error.DiskQuota => .quota,
+        error.NotLink => .invalid,
         else => .io,
     };
 }
@@ -3346,6 +3354,14 @@ pub const WasiCliAdapter = struct {
             .{ .name = "[method]descriptor.is-same-object", .call = &fsDescriptorIsSameObject },
             .{ .name = "[method]descriptor.metadata-hash", .call = &fsDescriptorMetadataHash },
             .{ .name = "[method]descriptor.metadata-hash-at", .call = &fsDescriptorMetadataHashAt },
+            // #476: directory-mutation surface (commit 2 of B).
+            .{ .name = "[method]descriptor.create-directory-at", .call = &fsDescriptorCreateDirectoryAt },
+            .{ .name = "[method]descriptor.unlink-file-at", .call = &fsDescriptorUnlinkFileAt },
+            .{ .name = "[method]descriptor.remove-directory-at", .call = &fsDescriptorRemoveDirectoryAt },
+            .{ .name = "[method]descriptor.rename-at", .call = &fsDescriptorRenameAt },
+            .{ .name = "[method]descriptor.link-at", .call = &fsDescriptorLinkAt },
+            .{ .name = "[method]descriptor.symlink-at", .call = &fsDescriptorSymlinkAt },
+            .{ .name = "[method]descriptor.readlink-at", .call = &fsDescriptorReadlinkAt },
             .{ .name = "[resource-drop]descriptor", .call = &fsDescriptorDrop },
         };
         for (members) |m| {
@@ -4470,6 +4486,493 @@ pub const WasiCliAdapter = struct {
         const hash = computeMetadataHash(st);
         const rec = try buildMetadataHashRecord(allocator, @truncate(hash), @truncate(hash >> 64));
         results[0] = try fsResultOk(allocator, rec);
+    }
+
+    // ── wasi:filesystem/types — directory ops batch B (#476) ────────────
+    //
+    // Path-mutating sibling methods of `stat-at` / `set-times-at`. Each
+    // one follows the same lift-validate-lookup-asDir-mutate_directory
+    // pipeline; `rename-at` and `link-at` resolve two descriptors. The
+    // host never honors `path-flags.symlink-follow` on a pure mutation
+    // (create/unlink/remove/rename/symlink) because the WIT spec doesn't
+    // hand that bit to those methods; `link-at` is the only one that
+    // takes it explicitly and forwards it as `HardLinkOptions`.
+
+    /// `[method]descriptor.create-directory-at: (borrow<descriptor>, string)
+    ///   -> result<_, error-code>`.
+    fn fsDescriptorCreateDirectoryAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.createDir(io, path_bytes, .default_dir) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.unlink-file-at: (borrow<descriptor>, string)
+    ///   -> result<_, error-code>`.
+    fn fsDescriptorUnlinkFileAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.deleteFile(io, path_bytes) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.remove-directory-at: (borrow<descriptor>, string)
+    ///   -> result<_, error-code>`.
+    ///
+    /// Maps `error.DirNotEmpty` → `error-code.not-empty`.
+    fn fsDescriptorRemoveDirectoryAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.deleteDir(io, path_bytes) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.rename-at: (borrow<descriptor>, string,
+    ///   borrow<descriptor>, string) -> result<_, error-code>`.
+    ///
+    /// Lifts two descriptor handles (source parent + destination parent) and
+    /// requires `mutate_directory` on **both**. Sandbox-validates both paths.
+    /// Cross-filesystem moves surface as `error-code.cross-device`.
+    fn fsDescriptorRenameAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 4 or results.len == 0) return error.InvalidArgs;
+
+        const old_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const old_path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const new_handle = switch (args[2]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const new_path_pl = switch (args[3]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const old_d = self.lookupFsDescriptor(old_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const old_dir: std.Io.Dir = old_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!old_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const new_d = self.lookupFsDescriptor(new_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const new_dir: std.Io.Dir = new_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!new_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const old_path_bytes = ci.readGuestBytes(old_path_pl.ptr, old_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const new_path_bytes = ci.readGuestBytes(new_path_pl.ptr, new_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(old_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (validateSandboxPath(new_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.rename(old_dir, old_path_bytes, new_dir, new_path_bytes, io) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.link-at: (borrow<descriptor>, path-flags, string,
+    ///   borrow<descriptor>, string) -> result<_, error-code>`.
+    ///
+    /// Hard-links `old-path` (relative to the first descriptor) at
+    /// `new-path` (relative to the second). `path-flags.symlink-follow`
+    /// is forwarded into `HardLinkOptions.follow_symlinks`. Requires
+    /// `mutate_directory` on **both** base descriptors.
+    fn fsDescriptorLinkAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 5 or results.len == 0) return error.InvalidArgs;
+
+        const old_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_flags: u32 = switch (args[1]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
+        const follow_symlinks = (path_flags & 0b1) != 0;
+        const old_path_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const new_handle = switch (args[3]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const new_path_pl = switch (args[4]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const old_d = self.lookupFsDescriptor(old_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const old_dir: std.Io.Dir = old_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!old_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const new_d = self.lookupFsDescriptor(new_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const new_dir: std.Io.Dir = new_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!new_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const old_path_bytes = ci.readGuestBytes(old_path_pl.ptr, old_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const new_path_bytes = ci.readGuestBytes(new_path_pl.ptr, new_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(old_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (validateSandboxPath(new_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.hardLink(old_dir, old_path_bytes, new_dir, new_path_bytes, io, .{
+            .follow_symlinks = follow_symlinks,
+        }) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.symlink-at: (borrow<descriptor>, string, string)
+    ///   -> result<_, error-code>`.
+    ///
+    /// WIT parameter order: `old-path` is the symlink **target** (the
+    /// string contents stored in the link), `new-path` is the **link
+    /// name** that gets created. The target is *not* sandbox-validated
+    /// because a symlink may legitimately point outside the preopen
+    /// (resolution-time validation in `open-at` re-checks the resolved
+    /// path); the link path is.
+    fn fsDescriptorSymlinkAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        // WIT `old-path` = symlink target (link contents). NOT a path on
+        // the host — just a string stored verbatim in the symlink inode.
+        const target_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        // WIT `new-path` = the link name to create, relative to `handle`.
+        const link_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const target_bytes = ci.readGuestBytes(target_pl.ptr, target_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const link_bytes = ci.readGuestBytes(link_pl.ptr, link_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        // Only the link path is constrained to the sandbox; the symlink
+        // target (link contents) is intentionally unconstrained — see
+        // doc-comment.
+        if (validateSandboxPath(link_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.symLink(io, target_bytes, link_bytes, .{}) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.readlink-at: (borrow<descriptor>, string)
+    ///   -> result<string, error-code>`.
+    ///
+    /// Reads the contents of the symlink at `path` (relative to the base
+    /// descriptor) into a 4 KiB scratch buffer; copies the result into
+    /// guest memory via `hostAllocAndWrite`. Returns `.name_too_long` if
+    /// the link target exceeds the buffer (no incremental read API in
+    /// std.Io.Dir).
+    fn fsDescriptorReadlinkAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        var buf: [4096]u8 = undefined;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const n = base_dir.readLink(io, path_bytes, &buf) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+        // If the kernel reports the full buffer is used, the actual link
+        // target may be longer — report .name_too_long rather than return
+        // a silently truncated path.
+        if (n == buf.len) {
+            results[0] = try fsResultErr(allocator, .name_too_long);
+            return;
+        }
+
+        const guest_ptr = ci.hostAllocAndWrite(buf[0..n]) orelse {
+            results[0] = try fsResultErr(allocator, .insufficient_memory);
+            return;
+        };
+        results[0] = try fsResultOk(allocator, .{
+            .string = .{ .ptr = guest_ptr, .len = @intCast(n) },
+        });
     }
 
     /// `wasi:filesystem/types.[resource-drop]descriptor: (own<descriptor>) -> ()`.
