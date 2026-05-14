@@ -3337,6 +3337,15 @@ pub const WasiCliAdapter = struct {
             .{ .name = "[method]descriptor.read-via-stream", .call = &fsDescriptorReadViaStream },
             .{ .name = "[method]descriptor.write-via-stream", .call = &fsDescriptorWriteViaStream },
             .{ .name = "[method]descriptor.append-via-stream", .call = &fsDescriptorAppendViaStream },
+            .{ .name = "[method]descriptor.read", .call = &fsDescriptorRead },
+            .{ .name = "[method]descriptor.write", .call = &fsDescriptorWrite },
+            .{ .name = "[method]descriptor.sync", .call = &fsDescriptorSync },
+            .{ .name = "[method]descriptor.sync-data", .call = &fsDescriptorSyncData },
+            .{ .name = "[method]descriptor.set-size", .call = &fsDescriptorSetSize },
+            .{ .name = "[method]descriptor.advise", .call = &fsDescriptorAdvise },
+            .{ .name = "[method]descriptor.is-same-object", .call = &fsDescriptorIsSameObject },
+            .{ .name = "[method]descriptor.metadata-hash", .call = &fsDescriptorMetadataHash },
+            .{ .name = "[method]descriptor.metadata-hash-at", .call = &fsDescriptorMetadataHashAt },
             .{ .name = "[resource-drop]descriptor", .call = &fsDescriptorDrop },
         };
         for (members) |m| {
@@ -3503,9 +3512,10 @@ pub const WasiCliAdapter = struct {
 
     /// `[method]descriptor.stat: (borrow<descriptor>) -> result<descriptor-stat, error-code>`.
     /// The record fields are `(type, link-count, size, atime?, mtime?, ctime?)`.
-    /// Timestamps are reported as `none` to keep the implementation portable
-    /// across the std.Io vtable (whose `Timestamp` shape changed between
-    /// 0.15 and 0.16); a dedicated atime/mtime adapter is deferred.
+    /// All three timestamps are lifted from the host `Io.File.Stat` via
+    /// `buildDescriptorStatRecord` (#177); `mtime` / `ctime` always
+    /// surface as `option::some` on filesystems that record them, while
+    /// `atime` may be `option::none` if the host reports it as unset.
     fn fsDescriptorStat(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
@@ -3983,6 +3993,483 @@ pub const WasiCliAdapter = struct {
         );
         try self.owned_output_streams.append(self.allocator, stream);
         return try self.allocStreamHandle(stream);
+    }
+
+    /// `[method]descriptor.read: (borrow<descriptor>, filesize, filesize)
+    ///   -> result<tuple<list<u8>, bool>, error-code>`. (#475)
+    ///
+    /// The bool component is `true` when the read reached end-of-file
+    /// (less data returned than requested, or the underlying read
+    /// returned 0). The 64 MiB cap mirrors the canonical-ABI chunk
+    /// chosen elsewhere in the adapter to prevent a hostile `length`
+    /// from triggering a multi-exabyte host allocation.
+    fn fsDescriptorRead(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const length: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const offset: u64 = switch (args[2]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                results[0] = try fsResultErr(allocator, .is_directory);
+                return;
+            },
+        };
+        if (!fs_file.flags.read) {
+            results[0] = try fsResultErr(allocator, .access);
+            return;
+        }
+
+        const cap: usize = @intCast(@min(length, 64 * 1024 * 1024));
+        const buf = allocator.alloc(u8, cap) catch {
+            results[0] = try fsResultErr(allocator, .insufficient_memory);
+            return;
+        };
+        defer allocator.free(buf);
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const n: usize = if (cap == 0) 0 else fs_file.file.readPositional(io, &.{buf}, offset) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const guest_ptr: u32 = if (n == 0) 0 else (ci.hostAllocAndWrite(buf[0..n]) orelse return error.IoError);
+
+        const eof = (cap == 0) or (n < cap);
+        const tuple_fields = try allocator.alloc(InterfaceValue, 2);
+        tuple_fields[0] = .{ .list = .{ .ptr = guest_ptr, .len = @intCast(n) } };
+        tuple_fields[1] = .{ .bool = eof };
+        results[0] = try fsResultOk(allocator, .{ .tuple_val = tuple_fields });
+    }
+
+    /// `[method]descriptor.write: (borrow<descriptor>, list<u8>, filesize)
+    ///   -> result<filesize, error-code>`. (#475)
+    ///
+    /// Returns the number of bytes written. `writePositionalAll` either
+    /// writes every byte or fails, so on success the count equals the
+    /// input length.
+    fn fsDescriptorWrite(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const list = switch (args[1]) {
+            .list => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const offset: u64 = switch (args[2]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                results[0] = try fsResultErr(allocator, .is_directory);
+                return;
+            },
+        };
+        if (!fs_file.flags.write) {
+            results[0] = try fsResultErr(allocator, .access);
+            return;
+        }
+
+        const bytes = ci.readGuestBytes(list.ptr, list.len) orelse
+            return error.OutOfBoundsMemory;
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        fs_file.file.writePositionalAll(io, bytes, offset) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        results[0] = try fsResultOk(allocator, .{ .u64 = @intCast(bytes.len) });
+    }
+
+    /// `[method]descriptor.sync: (borrow<descriptor>) -> result<_, error-code>`. (#475)
+    fn fsDescriptorSync(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try fsDescriptorSyncImpl(self, args, results, allocator);
+    }
+
+    /// `[method]descriptor.sync-data: (borrow<descriptor>) -> result<_, error-code>`.
+    /// std.Io.File 0.16 exposes only `sync` (which flushes metadata too);
+    /// data-only sync would require a direct `fdatasync` syscall. Falling
+    /// back to a full sync is conformant — guests only require that the
+    /// data reaches durable storage. (#475)
+    fn fsDescriptorSyncData(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try fsDescriptorSyncImpl(self, args, results, allocator);
+    }
+
+    fn fsDescriptorSyncImpl(
+        self: *WasiCliAdapter,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                // Directory sync is not exposed via std.Io.Dir today.
+                // Report success; an `fsync` on a directory is advisory.
+                const ok_payload = try allocator.create(InterfaceValue);
+                ok_payload.* = .{ .tuple_val = &.{} };
+                results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+                return;
+            },
+        };
+        if (!fs_file.flags.write) {
+            results[0] = try fsResultErr(allocator, .access);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        fs_file.file.sync(io) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.set-size: (borrow<descriptor>, filesize)
+    ///   -> result<_, error-code>`. Truncates or extends the file. (#475)
+    fn fsDescriptorSetSize(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const new_size: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                results[0] = try fsResultErr(allocator, .is_directory);
+                return;
+            },
+        };
+        if (!fs_file.flags.write) {
+            results[0] = try fsResultErr(allocator, .access);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        fs_file.file.setLength(io, new_size) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.advise: (borrow<descriptor>, filesize, filesize, advice)
+    ///   -> result<_, error-code>`.
+    ///
+    /// On Linux, dispatches to `posix_fadvise(2)`. Other targets report
+    /// success without acting — the WIT describes the advice as purely
+    /// "advisory information", so a silent no-op is conformant. The WIT
+    /// advice discriminant order is `(normal, sequential, random,
+    /// will-need, dont-need, no-reuse)`, which does **not** match the
+    /// POSIX_FADV constants on most architectures (random and
+    /// sequential are swapped). (#475)
+    fn fsDescriptorAdvise(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 4 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const offset: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const length: u64 = switch (args[2]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const wit_advice: u32 = switch (args[3]) {
+            .enum_val => |v| v,
+            .u32 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        if (wit_advice > 5) return error.InvalidArgs;
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                results[0] = try fsResultErr(allocator, .is_directory);
+                return;
+            },
+        };
+
+        if (builtin.os.tag == .linux) {
+            const adv = mapWitAdviceToLinuxFadv(wit_advice);
+            const off_i64: i64 = @bitCast(offset);
+            const len_i64: i64 = @bitCast(length);
+            const rc = std.os.linux.fadvise(fs_file.file.handle, off_i64, len_i64, adv);
+            const errno = std.os.linux.errno(rc);
+            if (errno != .SUCCESS) {
+                const code: FsErrorCode = switch (errno) {
+                    .BADF => .bad_descriptor,
+                    .INVAL => .invalid,
+                    .SPIPE => .invalid_seek,
+                    else => .io,
+                };
+                results[0] = try fsResultErr(allocator, code);
+                return;
+            }
+        }
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.is-same-object: (borrow<descriptor>, borrow<descriptor>)
+    ///   -> bool`. (#475)
+    ///
+    /// Compares `Stat.inode` of both descriptors. Inode collisions
+    /// across distinct filesystems are theoretically possible but
+    /// extremely unlikely inside a single preopen sandbox; the WIT
+    /// docs themselves acknowledge that the result is "no guarantees
+    /// against cross-filesystem aliasing".
+    fn fsDescriptorIsSameObject(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const a_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const b_handle = switch (args[1]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        if (a_handle == b_handle) {
+            results[0] = .{ .bool = true };
+            return;
+        }
+
+        const a = self.lookupFsDescriptor(a_handle) orelse {
+            results[0] = .{ .bool = false };
+            return;
+        };
+        const b = self.lookupFsDescriptor(b_handle) orelse {
+            results[0] = .{ .bool = false };
+            return;
+        };
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const a_inode = (statFsDescriptorInode(a.*, io)) orelse {
+            results[0] = .{ .bool = false };
+            return;
+        };
+        const b_inode = (statFsDescriptorInode(b.*, io)) orelse {
+            results[0] = .{ .bool = false };
+            return;
+        };
+        results[0] = .{ .bool = a_inode == b_inode };
+    }
+
+    /// `[method]descriptor.metadata-hash: (borrow<descriptor>)
+    ///   -> result<metadata-hash-value, error-code>`. (#475)
+    ///
+    /// Hashes a deterministic byte view of `(inode, size, mtime, ctime)`
+    /// using FNV-1a 128. The result is the WIT
+    /// `record metadata-hash-value { lower: u64, upper: u64 }`.
+    fn fsDescriptorMetadataHash(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const stat_opt: ?std.Io.File.Stat = switch (d.*) {
+            .preopen => |dir| dir.dir.stat(io) catch null,
+            .dir => |dir| dir.dir.stat(io) catch null,
+            .file => |f| f.file.stat(io) catch |err| {
+                results[0] = try fsResultErr(allocator, mapFsError(err));
+                return;
+            },
+        };
+        const st = stat_opt orelse {
+            // The `.stat` call on directories silently returns null on
+            // hosts where the std.Io vtable lacks `dirStat`. Fall back
+            // to a zero hash rather than failing — the guest still gets
+            // a stable value for this descriptor session-to-session.
+            results[0] = try fsResultOk(allocator, buildMetadataHashRecord(allocator, 0, 0) catch unreachable);
+            return;
+        };
+
+        const hash = computeMetadataHash(st);
+        const rec = try buildMetadataHashRecord(allocator, @truncate(hash), @truncate(hash >> 64));
+        results[0] = try fsResultOk(allocator, rec);
+    }
+
+    /// `[method]descriptor.metadata-hash-at: (borrow<descriptor>, path-flags, string)
+    ///   -> result<metadata-hash-value, error-code>`. (#475)
+    fn fsDescriptorMetadataHashAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_flags: u32 = switch (args[1]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
+        const follow_symlinks = (path_flags & 0b1) != 0;
+        const path_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const st = base_dir.statFile(io, path_bytes, .{
+            .follow_symlinks = follow_symlinks,
+        }) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const hash = computeMetadataHash(st);
+        const rec = try buildMetadataHashRecord(allocator, @truncate(hash), @truncate(hash >> 64));
+        results[0] = try fsResultOk(allocator, rec);
     }
 
     /// `wasi:filesystem/types.[resource-drop]descriptor: (own<descriptor>) -> ()`.
@@ -9277,6 +9764,74 @@ fn liftNewTimestamp(arg: InterfaceValue) !std.Io.File.SetTimestamp {
     }
 }
 
+/// Map the WIT `advice` enum (#475) to the host POSIX_FADV constant.
+/// The WIT enum order is `(normal, sequential, random, will-need,
+/// dont-need, no-reuse)`, which intentionally differs from the POSIX
+/// order: `normal=0, random=1, sequential=2, willneed=3, dontneed=4,
+/// noreuse=5`. Returns an `usize` because `std.os.linux.fadvise`
+/// declares its `advice` parameter as `usize`.
+fn mapWitAdviceToLinuxFadv(wit_advice: u32) usize {
+    if (builtin.os.tag != .linux) return 0;
+    const F = std.os.linux.POSIX_FADV;
+    return switch (wit_advice) {
+        0 => F.NORMAL,
+        1 => F.SEQUENTIAL,
+        2 => F.RANDOM,
+        3 => F.WILLNEED,
+        4 => F.DONTNEED,
+        5 => F.NOREUSE,
+        else => F.NORMAL,
+    };
+}
+
+/// `wasi:filesystem/types.metadata-hash-value` record lift (#475).
+/// Layout per WIT: `record { lower: u64, upper: u64 }`.
+fn buildMetadataHashRecord(allocator: Allocator, lower: u64, upper: u64) !InterfaceValue {
+    const fields = try allocator.alloc(InterfaceValue, 2);
+    fields[0] = .{ .u64 = lower };
+    fields[1] = .{ .u64 = upper };
+    return .{ .record_val = fields };
+}
+
+/// Best-effort u64 view of `Stat.inode`. The host type is `u64` on
+/// Linux/WASI/macOS and `i64` on Windows; we preserve the bit pattern
+/// in both cases so the hash is stable for repeated stat()s of the
+/// same file.
+fn inodeToU64(inode: anytype) u64 {
+    const T = @TypeOf(inode);
+    if (T == u64) return inode;
+    if (T == i64) return @bitCast(inode);
+    return @intCast(inode);
+}
+
+/// Pack a `Stat` into a deterministic byte view and FNV-1a-128 hash it
+/// (#475). The view covers the four fields the WIT spec calls out
+/// (inode, size, mtime, ctime). All values are written little-endian
+/// so the hash is host-architecture-independent.
+fn computeMetadataHash(st: std.Io.File.Stat) u128 {
+    var buf: [56]u8 = @splat(0);
+    std.mem.writeInt(u64, buf[0..8], inodeToU64(st.inode), .little);
+    std.mem.writeInt(u64, buf[8..16], st.size, .little);
+    std.mem.writeInt(i128, buf[16..32], @intCast(st.mtime.nanoseconds), .little);
+    std.mem.writeInt(i128, buf[32..48], @intCast(st.ctime.nanoseconds), .little);
+    // nlink as the last 8 bytes — cheap extra entropy so unrelated
+    // files with the same (inode mod u64, size, mtime, ctime) tuple
+    // still hash distinctly when nlink differs.
+    std.mem.writeInt(u64, buf[48..56], @intCast(st.nlink), .little);
+    return std.hash.Fnv1a_128.hash(&buf);
+}
+
+/// Best-effort `Stat.inode` lookup for `is-same-object` (#475). Returns
+/// `null` if the host `std.Io` vtable cannot stat this descriptor
+/// (e.g. a directory on a target whose `dirStat` is unimplemented).
+fn statFsDescriptorInode(d: FsDescriptor, io: std.Io) ?u64 {
+    return switch (d) {
+        .file => |f| if (f.file.stat(io)) |st| inodeToU64(st.inode) else |_| null,
+        .dir => |dir| if (dir.dir.stat(io)) |st| inodeToU64(st.inode) else |_| null,
+        .preopen => |dir| if (dir.dir.stat(io)) |st| inodeToU64(st.inode) else |_| null,
+    };
+}
+
 // ── Top-level CLI dispatch ─────────────────────────────────────────────────
 
 const ctypes_root = @import("types.zig");
@@ -10911,6 +11466,16 @@ test "populateWasiProviders: binds wasi:filesystem/types + preopens (#145)" {
     try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.read-via-stream"));
     try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.write-via-stream"));
     try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.append-via-stream"));
+    // #475: positional I/O + sync + size + advise + identity + hash.
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.read"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.write"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.sync"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.sync-data"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.set-size"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.advise"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.is-same-object"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.metadata-hash"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.metadata-hash-at"));
     try testing.expect(adapter.fs_types_iface.members.contains("[resource-drop]descriptor"));
     try testing.expect(adapter.fs_preopens_iface.members.contains("get-directories"));
 }
@@ -11117,6 +11682,504 @@ test "filesystem: set-times on dir descriptor returns not_permitted (#177)" {
         @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
         results[0].result_val.payload.?.*.variant_val.discriminant,
     );
+}
+
+test "filesystem #475: positional read returns bytes and EOF flag" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "hello.txt", .data = "hello, world" });
+    const file = try tmp.dir.openFile(io, "hello.txt", .{ .mode = .read_only });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // Read 5 bytes at offset 7 — should return "world".
+    {
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .u64 = 5 },
+            .{ .u64 = 7 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorRead(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        const tup = results[0].result_val.payload.?.*.tuple_val;
+        try testing.expectEqual(@as(usize, 2), tup.len);
+        const list_pl = tup[0].list;
+        try testing.expectEqual(@as(u32, 5), list_pl.len);
+        const bytes = ci.test_mem.?.buffer[list_pl.ptr..][0..list_pl.len];
+        try testing.expectEqualStrings("world", bytes);
+        // "hello, world" is 12 bytes; offset 7 + len 5 = 12 (EOF reached).
+        // We got exactly the requested length so eof can be false here —
+        // implementations are free to report either. Don't assert it.
+    }
+
+    // Read past EOF — short read, eof should be true.
+    {
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .u64 = 100 },
+            .{ .u64 = 0 },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorRead(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0].result_val.is_ok);
+        const tup = results[0].result_val.payload.?.*.tuple_val;
+        try testing.expectEqual(@as(u32, 12), tup[0].list.len);
+        try testing.expect(tup[1].bool); // eof
+    }
+}
+
+test "filesystem #475: read without read flag returns access" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "x", .data = "x" });
+    const file = try tmp.dir.openFile(io, "x", .{ .mode = .read_only });
+    // Stored without read flag set.
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{} } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .u64 = 1 },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorRead(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.access)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #475: positional write extends file" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "abc" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true, .write = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const data = try testMakeListVal(&ci, testing.allocator, "DEF");
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        data,
+        .{ .u64 = 3 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWrite(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(u64, 3), results[0].result_val.payload.?.*.u64);
+
+    // Read it back via the host file directly.
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositional(io, &.{&buf}, 0);
+    try testing.expectEqualStrings("abcDEF", buf[0..n]);
+}
+
+test "filesystem #475: write without write flag returns access" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_only });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const data = try testMakeListVal(&ci, testing.allocator, "y");
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        data,
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWrite(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.access)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #475: set-size truncates and extends" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "abcdefghij" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true, .write = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+
+    // Truncate to 4.
+    {
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 4 } };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorSetSize(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        const st = try file.stat(io);
+        try testing.expectEqual(@as(u64, 4), st.size);
+    }
+
+    // Extend to 12 — new tail is zero-filled.
+    {
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 12 } };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorSetSize(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        const st = try file.stat(io);
+        try testing.expectEqual(@as(u64, 12), st.size);
+    }
+}
+
+test "filesystem #475: sync succeeds on writable file" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true, .write = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{.{ .handle = handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSync(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0].result_val.is_ok);
+
+    // sync-data follows the same path.
+    var data_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSyncData(&adapter, &ci, &args, &data_results, testing.allocator);
+    defer data_results[0].deinit(testing.allocator);
+    try testing.expect(data_results[0].result_val.is_ok);
+}
+
+test "filesystem #475: advise enum maps to host fadvise no-op" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "abcdefghij" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_only });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+
+    // Exercise every WIT advice value (0..5).
+    var adv: u32 = 0;
+    while (adv < 6) : (adv += 1) {
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .u64 = 0 },
+            .{ .u64 = 10 },
+            .{ .enum_val = adv },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorAdvise(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+
+    // Out-of-range advice is rejected at the lift boundary.
+    var bad_args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .u64 = 0 },
+        .{ .u64 = 10 },
+        .{ .enum_val = 99 },
+    };
+    var bad_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try testing.expectError(
+        error.InvalidArgs,
+        WasiCliAdapter.fsDescriptorAdvise(&adapter, &ci, &bad_args, &bad_results, testing.allocator),
+    );
+}
+
+test "filesystem #475: advise WIT enum mapping (normal/sequential/random swap)" {
+    const testing = std.testing;
+    if (@import("builtin").os.tag != .linux) return;
+    const F = std.os.linux.POSIX_FADV;
+    try testing.expectEqual(@as(usize, F.NORMAL), mapWitAdviceToLinuxFadv(0));
+    try testing.expectEqual(@as(usize, F.SEQUENTIAL), mapWitAdviceToLinuxFadv(1));
+    try testing.expectEqual(@as(usize, F.RANDOM), mapWitAdviceToLinuxFadv(2));
+    try testing.expectEqual(@as(usize, F.WILLNEED), mapWitAdviceToLinuxFadv(3));
+    try testing.expectEqual(@as(usize, F.DONTNEED), mapWitAdviceToLinuxFadv(4));
+    try testing.expectEqual(@as(usize, F.NOREUSE), mapWitAdviceToLinuxFadv(5));
+}
+
+test "filesystem #475: is-same-object same handle short-circuit" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_only });
+    const h = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{ .{ .handle = h }, .{ .handle = h } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorIsSameObject(&adapter, &ci, &args, &results, testing.allocator);
+    try testing.expect(results[0].bool);
+}
+
+test "filesystem #475: is-same-object distinguishes different files" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a", .data = "1" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b", .data = "2" });
+    const fa = try tmp.dir.openFile(io, "a", .{ .mode = .read_only });
+    const fb = try tmp.dir.openFile(io, "b", .{ .mode = .read_only });
+    const ha = try adapter.pushFsDescriptor(.{ .file = .{ .file = fa, .flags = .{ .read = true } } });
+    const hb = try adapter.pushFsDescriptor(.{ .file = .{ .file = fb, .flags = .{ .read = true } } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{ .{ .handle = ha }, .{ .handle = hb } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorIsSameObject(&adapter, &ci, &args, &results, testing.allocator);
+    try testing.expect(!results[0].bool);
+}
+
+test "filesystem #475: is-same-object true for two handles aliasing one inode" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "shared", .data = "x" });
+    const f1 = try tmp.dir.openFile(io, "shared", .{ .mode = .read_only });
+    const f2 = try tmp.dir.openFile(io, "shared", .{ .mode = .read_only });
+    const h1 = try adapter.pushFsDescriptor(.{ .file = .{ .file = f1, .flags = .{ .read = true } } });
+    const h2 = try adapter.pushFsDescriptor(.{ .file = .{ .file = f2, .flags = .{ .read = true } } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{ .{ .handle = h1 }, .{ .handle = h2 } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorIsSameObject(&adapter, &ci, &args, &results, testing.allocator);
+    try testing.expect(results[0].bool);
+}
+
+test "filesystem #475: metadata-hash is deterministic across repeated calls" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "hello" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_only });
+    const h = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true } } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{.{ .handle = h }};
+
+    var r1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorMetadataHash(&adapter, &ci, &args, &r1, testing.allocator);
+    defer r1[0].deinit(testing.allocator);
+    var r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorMetadataHash(&adapter, &ci, &args, &r2, testing.allocator);
+    defer r2[0].deinit(testing.allocator);
+
+    try testing.expect(r1[0].result_val.is_ok);
+    try testing.expect(r2[0].result_val.is_ok);
+    const rec1 = r1[0].result_val.payload.?.*.record_val;
+    const rec2 = r2[0].result_val.payload.?.*.record_val;
+    try testing.expectEqual(rec1[0].u64, rec2[0].u64);
+    try testing.expectEqual(rec1[1].u64, rec2[1].u64);
+    // Hash should not be the trivial all-zero one for a real file.
+    try testing.expect(rec1[0].u64 != 0 or rec1[1].u64 != 0);
+}
+
+test "filesystem #475: metadata-hash differs when mtime changes" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "v1" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_write });
+    const h = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true, .write = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{.{ .handle = h }};
+
+    var r1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorMetadataHash(&adapter, &ci, &args, &r1, testing.allocator);
+    defer r1[0].deinit(testing.allocator);
+
+    // Force a distinct mtime via set-times.
+    var dt_fields = [_]InterfaceValue{
+        .{ .u64 = 1_500_000_000 },
+        .{ .u32 = 0 },
+    };
+    const dt_iv = InterfaceValue{ .record_val = &dt_fields };
+    const ts_arg = InterfaceValue{ .variant_val = .{ .discriminant = 2, .payload = &dt_iv } };
+    var set_args = [_]InterfaceValue{ .{ .handle = h }, ts_arg, ts_arg };
+    var set_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSetTimes(&adapter, &ci, &set_args, &set_results, testing.allocator);
+    defer set_results[0].deinit(testing.allocator);
+    try testing.expect(set_results[0].result_val.is_ok);
+
+    var r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorMetadataHash(&adapter, &ci, &args, &r2, testing.allocator);
+    defer r2[0].deinit(testing.allocator);
+
+    const rec1 = r1[0].result_val.payload.?.*.record_val;
+    const rec2 = r2[0].result_val.payload.?.*.record_val;
+    try testing.expect(rec1[0].u64 != rec2[0].u64 or rec1[1].u64 != rec2[1].u64);
+}
+
+test "filesystem #475: metadata-hash-at on preopen sandbox-validates path" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "child", .data = "data" });
+
+    const preopen_handle = try adapter.addPreopen("/sb", tmp.dir);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // Rejected: leading slash.
+    {
+        const bad_path = try testMakeListVal(&ci, testing.allocator, "/etc/passwd");
+        var args = [_]InterfaceValue{
+            .{ .handle = preopen_handle },
+            .{ .flags_val = &[_]u32{0} },
+            .{ .string = bad_path.list },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorMetadataHashAt(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(!results[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            results[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+
+    // Allowed: relative path inside the sandbox.
+    {
+        const good_path = try testMakeListVal(&ci, testing.allocator, "child");
+        var args = [_]InterfaceValue{
+            .{ .handle = preopen_handle },
+            .{ .flags_val = &[_]u32{0} },
+            .{ .string = good_path.list },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorMetadataHashAt(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+
+    // Avoid double-close of tmp.dir: adapter.deinit would close the
+    // preopen slot's owned dir, but tmp.cleanup also closes tmp.dir.
+    adapter.fs_descriptor_table.items[preopen_handle] = null;
 }
 
 test "populateWasiProviders: binds wasi:sockets/* (#148)" {
