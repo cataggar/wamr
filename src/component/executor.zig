@@ -1311,31 +1311,58 @@ fn dispatchAsyncCanon(
 
         // ── error-context ───────────────────────────────────────────────
         .error_context_new => |info| {
-            _ = info;
-            // Per spec: pops (ptr, len) for the debug-message string and
-            // returns a new error-context handle. We don't yet eagerly
-            // copy the message from guest memory — that requires
-            // memory/realloc options threading. Store an empty string;
-            // `debug-message` returns it as-is.
-            _ = env.popI32() catch return error.StackUnderflow; // len
-            _ = env.popI32() catch return error.StackUnderflow; // ptr
+            _ = info; // opts.memory_idx / string_encoding ignored — we
+            // use the canonical-memory shim that every other async-canon
+            // arm uses (`readGuestBytes` / `hostAllocAndWrite`). Making
+            // this arm opts-aware is a follow-up across the whole
+            // dispatchAsyncCanon switch.
+            const len: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            const copy: []u8 = blk: {
+                if (len == 0) break :blk comp_inst.allocator.alloc(u8, 0) catch
+                    return error.OutOfMemory;
+                const bytes = comp_inst.readGuestBytes(ptr, len) orelse
+                    return error.MemoryNotAvailable;
+                break :blk comp_inst.allocator.dupe(u8, bytes) catch
+                    return error.OutOfMemory;
+            };
+
             const handle = comp_inst.allocAsyncHandle();
-            const empty = allocator.alloc(u8, 0) catch return error.OutOfMemory;
-            comp_inst.error_contexts.put(comp_inst.allocator, handle, empty) catch {
-                allocator.free(empty);
+            comp_inst.error_contexts.put(comp_inst.allocator, handle, copy) catch {
+                comp_inst.allocator.free(copy);
                 return error.OutOfMemory;
             };
             env.pushI32(@bitCast(handle)) catch return error.StackOverflow;
         },
         .error_context_debug_message => |info| {
-            _ = info;
-            // Pops error-context handle + (ptr, length) of the
-            // caller-allocated buffer; writes the debug message into
-            // guest memory. We don't yet bridge into guest memory, so
-            // pop and no-op for now.
-            _ = env.popI32() catch return error.StackUnderflow;
-            _ = env.popI32() catch return error.StackUnderflow;
-            _ = env.popI32() catch return error.StackUnderflow;
+            _ = info; // opts.realloc_idx implicit via hostAllocAndWrite
+            // WIT signature `func(borrow<error-context>) -> string`
+            // lowers to `[i32] -> [i32 i32]`: pop the handle, push the
+            // (ptr, len) of the debug-message materialized into guest
+            // memory.
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            const stored = comp_inst.error_contexts.get(handle) orelse {
+                // Unknown handle (e.g. borrow already dropped on the
+                // other end of a misbehaving guest): return an empty
+                // string rather than trapping.
+                env.pushI32(0) catch return error.StackOverflow;
+                env.pushI32(0) catch return error.StackOverflow;
+                return;
+            };
+
+            if (stored.len == 0) {
+                env.pushI32(0) catch return error.StackOverflow;
+                env.pushI32(0) catch return error.StackOverflow;
+                return;
+            }
+
+            const guest_ptr = comp_inst.hostAllocAndWrite(stored) orelse
+                return error.OutOfMemory;
+            env.pushI32(@bitCast(guest_ptr)) catch return error.StackOverflow;
+            env.pushI32(@bitCast(@as(u32, @intCast(stored.len)))) catch
+                return error.StackOverflow;
         },
         .error_context_drop => {
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
@@ -3028,6 +3055,159 @@ test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
         testing.allocator,
     );
     try testing.expectEqual(@as(u32, 0), inst.error_contexts.count());
+}
+
+// ── #480: error-context.new / debug-message copy through guest memory ──────
+
+test "dispatchCanonBuiltin: error_context.new captures debug-message bytes (#480)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    try inst.enableTestMem(testing.allocator, 4096);
+    defer inst.disableTestMem();
+
+    const msg = "hello error";
+    const ptr = inst.hostAllocAndWrite(msg).?;
+
+    try env.pushI32(@bitCast(ptr));
+    try env.pushI32(@intCast(msg.len));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .error_context_new = .{ .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const handle: u32 = @bitCast(try env.popI32());
+    try testing.expect(handle > 0);
+    const stored = inst.error_contexts.get(handle).?;
+    try testing.expectEqualStrings(msg, stored);
+}
+
+test "dispatchCanonBuiltin: error_context.debug_message returns stored bytes via guest memory (#480)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    try inst.enableTestMem(testing.allocator, 4096);
+    defer inst.disableTestMem();
+
+    // Pre-populate the error-context table directly so the test
+    // exercises only the .debug_message arm.
+    const stored = try testing.allocator.dupe(u8, "boom: out of resources");
+    const handle = inst.allocAsyncHandle();
+    try inst.error_contexts.put(testing.allocator, handle, stored);
+
+    try env.pushI32(@bitCast(handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .error_context_debug_message = .{ .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    // (ptr, len) pushed in that order → pop len first, then ptr.
+    const out_len: u32 = @bitCast(try env.popI32());
+    const out_ptr: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(@as(u32, @intCast(stored.len)), out_len);
+    const slice = inst.test_mem.?.buffer[out_ptr..][0..out_len];
+    try testing.expectEqualStrings(stored, slice);
+}
+
+test "dispatchCanonBuiltin: error_context.new + drop + new produces distinct handles, no leak (#480)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    try inst.enableTestMem(testing.allocator, 4096);
+    defer inst.disableTestMem();
+
+    const msg1 = "first failure";
+    const ptr1 = inst.hostAllocAndWrite(msg1).?;
+    try env.pushI32(@bitCast(ptr1));
+    try env.pushI32(@intCast(msg1.len));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .error_context_new = .{ .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const h1: u32 = @bitCast(try env.popI32());
+
+    try env.pushI32(@bitCast(h1));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .error_context_drop },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(u32, 0), inst.error_contexts.count());
+
+    const msg2 = "second failure";
+    const ptr2 = inst.hostAllocAndWrite(msg2).?;
+    try env.pushI32(@bitCast(ptr2));
+    try env.pushI32(@intCast(msg2.len));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .error_context_new = .{ .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const h2: u32 = @bitCast(try env.popI32());
+
+    try testing.expect(h1 != h2);
+    try testing.expectEqual(@as(u32, 1), inst.error_contexts.count());
+    try testing.expectEqualStrings(msg2, inst.error_contexts.get(h2).?);
+    // testing.allocator (GPA) fails the test on a leak; ComponentInstance.deinit
+    // frees the surviving entry's bytes.
 }
 
 // ── Canon-lower host trampoline ─────────────────────────────────────────────
