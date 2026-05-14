@@ -1547,12 +1547,17 @@ pub const WasiCliAdapter = struct {
     /// **not valid** with this constructor — they expect buffer-backed
     /// sinks. Use the regular `init` for embedding / tests that need
     /// to inspect captured output.
+    ///
+    /// Cross-platform: pulls handles from `std.Io.File.{stdin,stdout,
+    /// stderr}` rather than `std.posix.STDIN_FILENO` etc. because on
+    /// Windows `posix.fd_t` is `*anyopaque` (HANDLE), so the comptime
+    /// integers `0/1/2` don't coerce.
     pub fn initWithHostStdio(allocator: Allocator) WasiCliAdapter {
         return initWithHostStdioFds(
             allocator,
-            std.posix.STDIN_FILENO,
-            std.posix.STDOUT_FILENO,
-            std.posix.STDERR_FILENO,
+            std.Io.File.stdin().handle,
+            std.Io.File.stdout().handle,
+            std.Io.File.stderr().handle,
         );
     }
 
@@ -10512,7 +10517,7 @@ test "stdio-echo: live host stdio via pipe-redirected fds (#474)" {
             testing.allocator,
             stdin_fds[0],
             stdout_fds[1],
-            std.posix.STDERR_FILENO,
+            std.Io.File.stderr().handle,
         );
         defer adapter.deinit();
 
