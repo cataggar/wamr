@@ -1,6 +1,9 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const passes = @import("passes.zig");
+const alias_class = @import("alias_class.zig");
+
+const LoadKey = alias_class.MemKey;
 
 /// Forward redundant loads within a basic block: when a load at the
 /// same `(base, offset, size, sign_extend)` location was already
@@ -14,13 +17,6 @@ const passes = @import("passes.zig");
 /// in-bounds again. No intervening op modifies linear memory at the
 /// stored location, so the value is unchanged.
 pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
-    const LoadKey = struct {
-        base: ir.VReg,
-        offset: u32,
-        size: u8,
-        sign_extend: bool,
-    };
-
     var value_table = std.AutoHashMap(LoadKey, ir.VReg).init(allocator);
     defer value_table.deinit();
 
@@ -37,12 +33,7 @@ pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator)
             const inst = &block.instructions.items[i];
             switch (inst.op) {
                 .load => |ld| {
-                    const key = LoadKey{
-                        .base = ld.base,
-                        .offset = ld.offset,
-                        .size = ld.size,
-                        .sign_extend = ld.sign_extend,
-                    };
+                    const key = alias_class.memKeyFromLoad(ld);
                     if (value_table.get(key)) |held_vreg| {
                         if (inst.dest) |dest| {
                             passes.replaceVReg(func, dest, held_vreg);
@@ -59,12 +50,8 @@ pub fn forwardRedundantLoads(func: *ir.IrFunction, allocator: std.mem.Allocator)
                     aliasing_keys.clearRetainingCapacity();
                     var it = value_table.iterator();
                     while (it.next()) |entry| {
-                        const key = entry.key_ptr.*;
-                        if (key.base == st.base and
-                            !(key.offset + key.size <= st.offset or
-                                st.offset + st.size <= key.offset))
-                        {
-                            try aliasing_keys.append(allocator, key);
+                        if (alias_class.storeAliases(entry.key_ptr.*, st)) {
+                            try aliasing_keys.append(allocator, entry.key_ptr.*);
                         }
                     }
                     for (aliasing_keys.items) |k| _ = value_table.remove(k);
