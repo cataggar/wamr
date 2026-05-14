@@ -938,6 +938,18 @@ fn dispatchAsyncCanon(
             // `async?` info is ignored: cancellation is idempotent and
             // synchronous in the single-threaded runtime.
         },
+        .task_cancel => {
+            // `canon task.cancel` — Binary.md tag 0x05. Cancels the
+            // **currently executing** task (no handle on the stack,
+            // distinct from `subtask.cancel`). Core signature is
+            // `[] -> []`: no pops, no pushes. Traps when there is no
+            // async task manager or no current task — guest code that
+            // issues `task.cancel` from a non-async context is
+            // malformed by the spec.
+            const tm = task_manager orelse return error.FunctionNotFound;
+            const handle = tm.current_task orelse return error.FunctionNotFound;
+            tm.cancelTask(handle);
+        },
 
         // ── Stream handles ──────────────────────────────────────────────
         .stream_new => |info| {
@@ -1852,6 +1864,223 @@ test "dispatchCanonBuiltin: task.yield observes cancellation via TaskManager" {
     async_canon.asyncCancel(&tm, lift.subtask_handle);
 
     // Non-cancellable yield: opaque, always reports resumed=0.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_yield = .{ .cancellable = false } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 0), try env.popI32());
+
+    // Cancellable yield: surfaces the pending cancellation as 1.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .task_yield = .{ .cancellable = true } },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(@as(i32, 1), try env.popI32());
+}
+
+// ── dispatchCanonBuiltin: task.cancel (Binary.md tag 0x05, issue #488) ──
+
+test "dispatchCanonBuiltin: task.cancel without task manager traps with FunctionNotFound" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const result = dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .task_cancel },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectError(error.FunctionNotFound, result);
+    // Spec `[] -> []`: nothing popped, nothing pushed even on the trap path.
+    try testing.expectEqual(@as(u32, 0), env.sp);
+}
+
+test "dispatchCanonBuiltin: task.cancel without current_task traps with FunctionNotFound" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    // TaskManager present but `current_task` is null (default).
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+
+    const result = dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .task_cancel },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectError(error.FunctionNotFound, result);
+    try testing.expectEqual(@as(u32, 0), env.sp);
+}
+
+test "dispatchCanonBuiltin: task.cancel flips current task to .cancelled" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+    const h = try tm.createTask(testing.allocator);
+    tm.current_task = h;
+    try testing.expect(tm.getState(h).? != .cancelled);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .task_cancel },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(h).?);
+    // Core signature is `[] -> []`: nothing pushed.
+    try testing.expectEqual(@as(u32, 0), env.sp);
+}
+
+test "dispatchCanonBuiltin: task.cancel is idempotent" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+    const h = try tm.createTask(testing.allocator);
+    tm.current_task = h;
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .task_cancel },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(h).?);
+
+    // Second call must be a no-op: state stays `.cancelled`, no trap,
+    // no stack churn.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .task_cancel },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(h).?);
+    try testing.expectEqual(@as(u32, 0), env.sp);
+}
+
+test "dispatchCanonBuiltin: task.cancel + cancellable task.yield observes cancellation" {
+    // End-to-end propagation flow: a host invocation of `task.cancel`
+    // followed by a guest `task.yield cancel?=1` must surface the
+    // cancellation as discriminant `1`. Mirrors the existing
+    // `task.yield observes cancellation via TaskManager` test, but
+    // exercises the new `task.cancel` dispatch path instead of the
+    // direct `async_canon.asyncCancel` helper.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    var tm = async_mod.TaskManager{};
+    defer tm.deinit(testing.allocator);
+    const h = try tm.createTask(testing.allocator);
+    tm.current_task = h;
+
+    // Cancel the currently-executing task via the new dispatch arm.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .task_cancel },
+        env,
+        &tm,
+        testing.allocator,
+    );
+    try testing.expectEqual(async_mod.TaskState.cancelled, tm.getState(h).?);
+
+    // Non-cancellable yield: opaque, always reports resumed=0 even
+    // when the task has been cancelled.
     try dispatchCanonBuiltin(
         inst,
         .{ .task_yield = .{ .cancellable = false } },
