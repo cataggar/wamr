@@ -1385,6 +1385,22 @@ pub const Pollable = union(enum) {
     resolve_address_stream: u32,
     http_future_response: u32,
     http_future_trailers: u32,
+    /// `wasi:clocks/monotonic-clock@0.2.x` polyfill on a P3 backend (#483):
+    /// the pollable wraps a P3 timer-future handle. Goes ready when the
+    /// associated `TimerFuture` fires (deadline ≤ `monotonicNs()`).
+    /// Stored value is the future handle key into `ComponentInstance.futures`,
+    /// which is also the lookup key in `WasiCliAdapter.timer_future_ready`.
+    future_timer: u32,
+};
+
+/// One pending P3 `wait-for` / `wait-until` timer future (#483).
+///
+/// The future handle lives in `ComponentInstance.futures`; the host
+/// completes it when `deadline_ns <= monotonicNs()` by setting the
+/// future state to `.ready` and waking any read-waitable.
+pub const TimerFuture = struct {
+    handle: u32,
+    deadline_ns: u64,
 };
 
 /// `wasi:http/types.request-options`. Pure record of optional
@@ -1592,6 +1608,20 @@ pub const WasiCliAdapter = struct {
     /// to it). Defaults to live `std.time.Instant`.
     monotonic_clock_override: ?u64 = null,
 
+    /// Pending P3 async-timer futures (#483). Populated by
+    /// `wasi:clocks/monotonic-clock.wait-for` / `wait-until` and the
+    /// 0.2 → 0.3 `subscribe-duration` polyfill. Drained by
+    /// `completeDueTimerFutures` whenever a polling/blocking site is reached.
+    timer_futures: std.ArrayListUnmanaged(TimerFuture) = .empty,
+
+    /// Ready-flag map for `.future_timer` pollables (#483 polyfill). Keyed by
+    /// the P3 timer-future handle (== `Pollable.future_timer` payload). Set
+    /// to `true` by `completeDueTimerFutures` when the timer fires; checked
+    /// by `pollableIsReady`. Survives removal of the entry from
+    /// `timer_futures` because the `ComponentInstance.futures` handle is
+    /// stable until the guest calls `future.drop`.
+    timer_future_ready: std.AutoHashMapUnmanaged(u32, bool) = .empty,
+
     /// State for the insecure PRNG. When `null`, init-time auto-seed runs
     /// on first use. Tests can overwrite this before invoking the component
     /// to get deterministic output.
@@ -1714,6 +1744,8 @@ pub const WasiCliAdapter = struct {
         self.sockets_udp_create_p3_iface.deinit(self.allocator);
         self.sockets_ip_name_lookup_p3_iface.deinit(self.allocator);
         self.sockets_types_p3_iface.deinit(self.allocator);
+        self.timer_futures.deinit(self.allocator);
+        self.timer_future_ready.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -2283,6 +2315,7 @@ pub const WasiCliAdapter = struct {
                 break :blk future.polled or future.state != .pending;
             },
             .http_future_trailers => true,
+            .future_timer => |fut_handle| self.timer_future_ready.get(fut_handle) orelse false,
         };
     }
 
@@ -2605,6 +2638,63 @@ pub const WasiCliAdapter = struct {
         });
         try providers.put(self.allocator, monotonic_clock_name, .{
             .host_instance = &self.clocks_monotonic_iface,
+        });
+    }
+
+    /// Register `wasi:clocks/monotonic-clock@0.3.x` (#483).
+    ///
+    /// 0.3 surface:
+    ///   - `now: () -> mark`                      (mark = u64; same wire as 0.2 instant)
+    ///   - `get-resolution: () -> duration`       (renamed from 0.2 `resolution`)
+    ///   - `wait-for: async func(duration)`       (lowered as `() -> future<()>`)
+    ///   - `wait-until: async func(when: mark)`   (lowered as `() -> future<()>`)
+    ///
+    /// The 0.2 `subscribe-instant` / `subscribe-duration` constructors are
+    /// gone; guests use `wait-until` / `wait-for` instead. Timer completion
+    /// flows through `completeDueTimerFutures` and the executor's
+    /// `future_read` unit-type fast-path.
+    pub fn populateWasiClocksMonotonicClockP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        iface_name: []const u8,
+    ) !void {
+        try self.clocks_monotonic_p3_iface.members.put(self.allocator, "now", .{
+            .func = .{ .context = self, .call = &monotonicClockNowP3 },
+        });
+        try self.clocks_monotonic_p3_iface.members.put(self.allocator, "get-resolution", .{
+            .func = .{ .context = self, .call = &monotonicClockGetResolutionP3 },
+        });
+        try self.clocks_monotonic_p3_iface.members.put(self.allocator, "wait-for", .{
+            .func = .{ .context = self, .call = &monotonicWaitFor },
+        });
+        try self.clocks_monotonic_p3_iface.members.put(self.allocator, "wait-until", .{
+            .func = .{ .context = self, .call = &monotonicWaitUntil },
+        });
+        try providers.put(self.allocator, iface_name, .{
+            .host_instance = &self.clocks_monotonic_p3_iface,
+        });
+    }
+
+    /// Register `wasi:clocks/system-clock@0.3.x` (#483).
+    ///
+    /// 0.3 renames the 0.2 `wall-clock` interface to `system-clock` and
+    /// changes the `now` return type's `seconds` field from `u64` to `s64`.
+    /// `resolution` is also renamed to `get-resolution`. Both members are
+    /// implemented; the `clocks_wall_p3_iface` field declared by #481 is
+    /// reused as the host instance backing this interface.
+    pub fn populateWasiClocksSystemClockP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        iface_name: []const u8,
+    ) !void {
+        try self.clocks_wall_p3_iface.members.put(self.allocator, "now", .{
+            .func = .{ .context = self, .call = &systemClockNowP3 },
+        });
+        try self.clocks_wall_p3_iface.members.put(self.allocator, "get-resolution", .{
+            .func = .{ .context = self, .call = &systemClockGetResolutionP3 },
+        });
+        try providers.put(self.allocator, iface_name, .{
+            .host_instance = &self.clocks_wall_p3_iface,
         });
     }
 
@@ -2942,6 +3032,186 @@ pub const WasiCliAdapter = struct {
     fn monotonicNs(self: *const WasiCliAdapter) u64 {
         if (self.monotonic_clock_override) |v| return v;
         return readClockNs(.MONOTONIC);
+    }
+
+    // ── wasi:clocks@0.3.0 (#483) ───────────────────────────────────────────
+    //
+    // The 0.3 monotonic-clock surface drops the `subscribe-instant` /
+    // `subscribe-duration` `pollable` constructors and replaces them with
+    // two `async func`s — `wait-for(duration)` and `wait-until(when)` —
+    // each lowered as a host function returning a `future<()>` handle.
+    // The host completes the future when the deadline elapses; readers
+    // observe completion through `future.read` (unit-type fast-path in
+    // `executor.zig`) or, for the 0.2 polyfill, through a wrapping
+    // `.future_timer` pollable.
+
+    /// `wasi:clocks/monotonic-clock@0.3.x.now: () -> mark` (#483).
+    /// `mark` lifts as a flat `u64` (renamed from 0.2 `instant`; same wire).
+    fn monotonicClockNowP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .u64 = self.monotonicNs() };
+    }
+
+    /// `wasi:clocks/monotonic-clock@0.3.x.get-resolution: () -> duration` (#483).
+    /// Renamed from 0.2 `resolution`; we report 1ns.
+    fn monotonicClockGetResolutionP3(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .u64 = 1 };
+    }
+
+    /// Allocate a `future<()>` in `ci.futures` and register a host-side
+    /// timer in `self.timer_futures` against the given absolute deadline.
+    /// Returns the future handle, ready to be lowered as the `future<()>`
+    /// result of `wait-for` / `wait-until`. (#483.)
+    fn spawnTimerFuture(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        deadline_ns: u64,
+    ) !u32 {
+        const handle = ci.allocAsyncHandle();
+        try ci.futures.put(ci.allocator, handle, .{
+            .elem_type_idx = 0, // unit type
+            .state = .pending,
+        });
+        errdefer _ = ci.futures.remove(handle);
+        try self.timer_futures.append(self.allocator, .{
+            .handle = handle,
+            .deadline_ns = deadline_ns,
+        });
+        return handle;
+    }
+
+    /// `wasi:clocks/monotonic-clock@0.3.x.wait-for: async func(duration) -> future<()>`
+    /// (#483). Returns a future handle that completes after `how-long` ns.
+    fn monotonicWaitFor(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const duration = try u64Arg(args[0]);
+        const deadline = self.monotonicNs() +| duration;
+        const handle = try self.spawnTimerFuture(ci, deadline);
+        results[0] = .{ .handle = handle };
+    }
+
+    /// `wasi:clocks/monotonic-clock@0.3.x.wait-until: async func(when: mark) -> future<()>`
+    /// (#483). Returns a future handle that completes once the absolute
+    /// deadline `when` has been reached.
+    fn monotonicWaitUntil(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const when = try u64Arg(args[0]);
+        const handle = try self.spawnTimerFuture(ci, when);
+        results[0] = .{ .handle = handle };
+    }
+
+    /// `wasi:clocks/system-clock@0.3.x.now: () -> instant` (#483).
+    ///
+    /// `instant = record { seconds: s64, nanoseconds: u32 }`. Note `seconds`
+    /// is **signed** in 0.3 (was `u64` in 0.2's `wall-clock.datetime`).
+    /// Honors `wall_clock_override` for deterministic tests.
+    fn systemClockNowP3(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+        const dt = self.wall_clock_override orelse readClockDatetime(.REALTIME);
+        const fields = try allocator.alloc(InterfaceValue, 2);
+        fields[0] = .{ .s64 = @bitCast(dt.seconds) };
+        fields[1] = .{ .u32 = dt.nanoseconds };
+        results[0] = .{ .record_val = fields };
+    }
+
+    /// `wasi:clocks/system-clock@0.3.x.get-resolution: () -> duration` (#483).
+    /// Renamed from 0.2 `wall-clock.resolution`; lifts as `u64` ns (1ns).
+    fn systemClockGetResolutionP3(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .u64 = 1 };
+    }
+
+    /// 0.2-on-0.3 polyfill (#483): a `subscribe-duration` registered as
+    /// part of a P3-routed P2 guest world. Backed by a P3 timer-future
+    /// rather than the 0.2 `.monotonic_timer` pollable, so the
+    /// `completeDueTimerFutures` wakeup path drives both alike.
+    fn subscribeDurationP3Polyfill(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const duration = try u64Arg(args[0]);
+        const deadline = self.monotonicNs() +| duration;
+        const fut_handle = try self.spawnTimerFuture(ci, deadline);
+        try self.timer_future_ready.put(self.allocator, fut_handle, false);
+        const ph = try self.pushPollable(.{ .future_timer = fut_handle });
+        results[0] = .{ .handle = ph };
+    }
+
+    /// Drain any P3 timer-futures whose deadline has elapsed (#483).
+    /// Sets `Future.state = .ready`, wakes a registered read-waitable, and
+    /// flips the `.future_timer` polyfill ready flag. Returns whether any
+    /// timer fired. Safe to call from any polling site; idempotent.
+    pub fn completeDueTimerFutures(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        allocator: Allocator,
+    ) bool {
+        const now = self.monotonicNs();
+        var fired = false;
+        var i: usize = 0;
+        while (i < self.timer_futures.items.len) {
+            const tf = self.timer_futures.items[i];
+            if (tf.deadline_ns > now) {
+                i += 1;
+                continue;
+            }
+            if (ci.futures.getPtr(tf.handle)) |fut| {
+                fut.pending_read = null;
+                fut.state = .ready;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+            }
+            if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
+            _ = self.timer_futures.swapRemove(i);
+            fired = true;
+        }
+        return fired;
     }
 
     fn allocStreamHandle(self: *WasiCliAdapter, stream: *streams.OutputStream) !u32 {
@@ -11225,6 +11495,8 @@ pub fn populateWasiProviders(
     var matched_error_p3: ?[]const u8 = null;
     var matched_wall_clock: ?[]const u8 = null;
     var matched_monotonic_clock: ?[]const u8 = null;
+    var matched_monotonic_clock_p3: ?[]const u8 = null;
+    var matched_system_clock_p3: ?[]const u8 = null;
     var matched_random: ?[]const u8 = null;
     var matched_random_insecure: ?[]const u8 = null;
     var matched_random_insecure_seed: ?[]const u8 = null;
@@ -11281,10 +11553,23 @@ pub fn populateWasiProviders(
                 else => matched_error = matched_error orelse imp.name,
             }
         }
-        if (matched_wall_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/wall-clock"))
-            matched_wall_clock = imp.name;
-        if (matched_monotonic_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/monotonic-clock"))
-            matched_monotonic_clock = imp.name;
+        if (matchesWasiPrefix(imp.name, "wasi:clocks/wall-clock")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_system_clock_p3 = matched_system_clock_p3 orelse imp.name,
+                else => matched_wall_clock = matched_wall_clock orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:clocks/monotonic-clock")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_monotonic_clock_p3 = matched_monotonic_clock_p3 orelse imp.name,
+                else => matched_monotonic_clock = matched_monotonic_clock orelse imp.name,
+            }
+        }
+        // 0.3 renamed `wall-clock` → `system-clock` (#483). Some 0.3 WIT
+        // revisions retain the old `wall-clock` spelling (handled above).
+        if (matched_system_clock_p3 == null and
+            matchesWasiPrefix(imp.name, "wasi:clocks/system-clock"))
+            matched_system_clock_p3 = imp.name;
         // `wasi:random/insecure-seed` shares the `wasi:random/insecure`
         // prefix, so test the more-specific name first. #485 splits each
         // interface by version so 0.2 and 0.3 imports route to different
@@ -11428,6 +11713,14 @@ pub fn populateWasiProviders(
         matched_monotonic_clock orelse "wasi:clocks/monotonic-clock",
     );
     if (matched_monotonic_clock == null) _ = providers.remove("wasi:clocks/monotonic-clock");
+
+    // #483: P3 clocks (monotonic + system).
+    if (matched_monotonic_clock_p3) |name| {
+        try adapter.populateWasiClocksMonotonicClockP3(providers, name);
+    }
+    if (matched_system_clock_p3) |name| {
+        try adapter.populateWasiClocksSystemClockP3(providers, name);
+    }
 
     try adapter.populateWasiRandomRandom(
         providers,
@@ -18111,4 +18404,180 @@ test "sockets #200: set-listen-backlog-size on listening socket is invalid_state
             );
         }
     }.run);
+}
+
+// ── #483: wasi:clocks@0.3.0 adapter tests ──────────────────────────────────
+//
+// Helper: construct a bare `ComponentInstance` whose only meaningful fields
+// are `allocator` and `futures`. Sufficient for the host functions we test
+// (which never touch `core_instances`, resource tables, etc.). Caller frees
+// the futures map via `freeBareCi` after running `Future.deinit` on entries.
+
+fn makeBareCiForClocksTest() ComponentInstance {
+    return .{
+        .component = undefined,
+        .core_instances = &.{},
+        .resource_tables = .empty,
+        .exported_funcs = .empty,
+        .imports = .empty,
+        .module_arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+}
+
+fn freeBareCiForClocksTest(ci: *ComponentInstance) void {
+    var it = ci.futures.valueIterator();
+    while (it.next()) |fut| fut.deinit(ci.allocator);
+    ci.futures.deinit(ci.allocator);
+    ci.module_arena.deinit();
+}
+
+test "wasi:clocks/monotonic-clock@0.3 wait-for resolves future after duration (#483)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = makeBareCiForClocksTest();
+    defer freeBareCiForClocksTest(&ci);
+
+    adapter.monotonic_clock_override = 1_000;
+
+    const args = [_]InterfaceValue{.{ .u64 = 500 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.monotonicWaitFor(&adapter, &ci, &args, &results, testing.allocator);
+    const fh = results[0].handle;
+
+    // Future is pending while deadline (1500) > now (1000).
+    try testing.expectEqual(
+        @import("async.zig").Future.State.pending,
+        ci.futures.getPtr(fh).?.state,
+    );
+    try testing.expectEqual(@as(usize, 1), adapter.timer_futures.items.len);
+
+    // Not-yet-due drain is a no-op.
+    try testing.expect(!adapter.completeDueTimerFutures(&ci, testing.allocator));
+
+    // Advance clock past deadline; drain.
+    adapter.monotonic_clock_override = 1_500;
+    try testing.expect(adapter.completeDueTimerFutures(&ci, testing.allocator));
+
+    try testing.expectEqual(
+        @import("async.zig").Future.State.ready,
+        ci.futures.getPtr(fh).?.state,
+    );
+    try testing.expectEqual(@as(usize, 0), adapter.timer_futures.items.len);
+}
+
+test "wasi:clocks/monotonic-clock@0.3 wait-until past deadline fires immediately (#483)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = makeBareCiForClocksTest();
+    defer freeBareCiForClocksTest(&ci);
+
+    adapter.monotonic_clock_override = 9_000;
+
+    const args = [_]InterfaceValue{.{ .u64 = 5_000 }}; // when = 5000 (already past)
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.monotonicWaitUntil(&adapter, &ci, &args, &results, testing.allocator);
+    const fh = results[0].handle;
+
+    try testing.expect(adapter.completeDueTimerFutures(&ci, testing.allocator));
+    try testing.expectEqual(
+        @import("async.zig").Future.State.ready,
+        ci.futures.getPtr(fh).?.state,
+    );
+    try testing.expectEqual(@as(usize, 0), adapter.timer_futures.items.len);
+}
+
+test "wasi:clocks/monotonic-clock@0.3 polyfill: subscribe-duration pollable fires via P3 timer (#483)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = makeBareCiForClocksTest();
+    defer freeBareCiForClocksTest(&ci);
+
+    adapter.monotonic_clock_override = 0;
+
+    const args = [_]InterfaceValue{.{ .u64 = 200 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.subscribeDurationP3Polyfill(&adapter, &ci, &args, &results, testing.allocator);
+    const ph = results[0].handle;
+
+    const pollable = adapter.lookupPollable(ph) orelse return error.MissingPollable;
+    try testing.expect(pollable == .future_timer);
+    try testing.expect(!adapter.pollableIsReady(pollable));
+
+    // Drive the underlying P3 timer past its deadline.
+    adapter.monotonic_clock_override = 300;
+    _ = adapter.completeDueTimerFutures(&ci, testing.allocator);
+
+    try testing.expect(adapter.pollableIsReady(pollable));
+}
+
+test "wasi:clocks/system-clock@0.3 now lifts s64 seconds (#483)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    adapter.wall_clock_override = .{ .seconds = 1_700_000_000, .nanoseconds = 999 };
+
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.systemClockNowP3(&adapter, &ci, &.{}, &results, testing.allocator);
+    defer testing.allocator.free(results[0].record_val);
+
+    try testing.expect(results[0] == .record_val);
+    try testing.expectEqual(@as(usize, 2), results[0].record_val.len);
+    try testing.expectEqual(
+        @as(i64, @bitCast(@as(u64, 1_700_000_000))),
+        results[0].record_val[0].s64,
+    );
+    try testing.expectEqual(@as(u32, 999), results[0].record_val[1].u32);
+}
+
+test "populateWasiProviders: binds wasi:clocks@0.3 monotonic + system (#483)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:clocks/system-clock@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15"));
+    try testing.expect(providers.contains("wasi:clocks/system-clock@0.3.0-rc-2026-03-15"));
+    // Bare 0.2 names must NOT appear when only P3 imports are declared.
+    try testing.expect(!providers.contains("wasi:clocks/monotonic-clock"));
+    try testing.expect(!providers.contains("wasi:clocks/wall-clock"));
+
+    // Routed through P3 host instances with the expected method sets.
+    const mono_p3 = providers.get("wasi:clocks/monotonic-clock@0.3.0-rc-2026-03-15").?;
+    try testing.expect(mono_p3.host_instance == &adapter.clocks_monotonic_p3_iface);
+    try testing.expect(adapter.clocks_monotonic_p3_iface.members.contains("now"));
+    try testing.expect(adapter.clocks_monotonic_p3_iface.members.contains("get-resolution"));
+    try testing.expect(adapter.clocks_monotonic_p3_iface.members.contains("wait-for"));
+    try testing.expect(adapter.clocks_monotonic_p3_iface.members.contains("wait-until"));
+
+    const sys_p3 = providers.get("wasi:clocks/system-clock@0.3.0-rc-2026-03-15").?;
+    try testing.expect(sys_p3.host_instance == &adapter.clocks_wall_p3_iface);
+    try testing.expect(adapter.clocks_wall_p3_iface.members.contains("now"));
+    try testing.expect(adapter.clocks_wall_p3_iface.members.contains("get-resolution"));
 }

@@ -1166,6 +1166,20 @@ fn dispatchAsyncCanon(
                 return;
             }
 
+            // Unit-type (`future<()>`) fast-path (#483): a `wait-for` /
+            // `wait-until` timer fired and set `state = .ready` with no
+            // payload — there are zero bytes to copy. Distinct from the
+            // writer-dropped cancelled case above because `write_closed`
+            // is false here. `count = 1` reports one unit element.
+            if (fut.state == .ready and fut.payload == null and !fut.write_closed) {
+                fut.state = .closed;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
             // Writer already buffered — deliver and wake any read waitable.
             if (fut.payload) |buf| {
                 const dst = comp_inst.writableGuestBytes(guest_ptr, @intCast(buf.len)) orelse
