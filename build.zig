@@ -634,7 +634,29 @@ pub fn build(b: *std.Build) void {
     // examples under `examples/components/`. Opt-in: not reachable from
     // the default `zig build` or `zig build test` graphs. See
     // `examples/components/README.md` for prereqs and runtime status.
-    addComponentExamples(b, exe);
+    const component_runs = addComponentExamples(b, exe);
+
+    // ── WASI Preview 2 conformance gate (#479) ───────────────────────
+    // Curated set of Preview-2 component fixtures (sources under
+    // `examples/components/`) run through `./zig-out/bin/wamr` with
+    // byte-exact stdout + exit-code assertions. Strict superset of
+    // `component-examples-run`: every component the latter runs is
+    // also a member of this gate. The named step gives CI a
+    // discoverable entry point, mirroring `wasi-testsuite` for
+    // Preview 1.
+    //
+    // Curation rationale + future-skips: `tests/wasi-p2-testsuite-skip.json`
+    // (header `_comment` documents the format; mirrors the
+    // wasi-testsuite-skip.json shape). Currently empty — every
+    // wired component is expected to pass on every platform we ship.
+    //
+    // Opt-in: not in `zig build` / `zig build test`. Reach via
+    // `zig build wasi-p2-testsuite`.
+    const wasi_p2_step = b.step(
+        "wasi-p2-testsuite",
+        "Run the WASI Preview 2 conformance gate (curated component examples)",
+    );
+    wasi_p2_step.dependOn(component_runs.wamr);
 }
 
 /// Wires up the Component-Model example pipeline (sources under
@@ -646,13 +668,17 @@ pub fn build(b: *std.Build) void {
 ///                                                    (cross-runtime parity gate; wasmtime v44+).
 /// None are reachable from `zig build` or `zig build test`.
 ///
+/// Returns the two run-step parents so the caller can layer additional
+/// named entry points on top (e.g. `wasi-p2-testsuite` in #479, which
+/// is a strict superset of `component-examples-run`).
+///
 /// Pinned versions:
 ///   * `cataggar/wabt` ≥ v3.0.0-dev.6 on PATH (provides `component embed`,
 ///     `component new`, `component compose`, `module validate`).
 ///     The wasi-preview1 → component adapter is embedded in `wabt` and
 ///     auto-attached by `wabt component new`; no external adapter fetch.
 ///   * `cargo` with `wasm32-wasip1` target for the mixed example
-fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
+fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) ComponentRunSteps {
     const examples_step = b.step(
         "component-examples",
         "Build the WebAssembly Component examples in examples/components/",
@@ -875,6 +901,8 @@ fn addComponentExamples(b: *std.Build, wamr_exe: *std.Build.Step.Compile) void {
     run_http_smoke.addArg("18080");
     run_http_smoke.expectExitCode(0);
     runs.wamr.dependOn(&run_http_smoke.step);
+
+    return runs;
 }
 
 const ComponentRunSteps = struct {
