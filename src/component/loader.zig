@@ -728,6 +728,7 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
         0x02 => .{ .resource_new = try reader.readU32() },
         0x03 => .{ .resource_drop = try reader.readU32() },
         0x04 => .{ .resource_rep = try reader.readU32() },
+        0x05 => .{ .async_canon = .task_cancel },
         0x0a => try parseContextCanon(reader, .get),
         0x0b => try parseContextCanon(reader, .set),
         0x0c => blk: {
@@ -1179,6 +1180,16 @@ test "parseCanon: subtask.cancel async?=0x01" {
     try std.testing.expect(c == .async_canon);
     try std.testing.expect(c.async_canon == .subtask_cancel);
     try std.testing.expectEqual(true, c.async_canon.subtask_cancel.is_async);
+}
+
+test "parseCanon: task.cancel (tag 0x05, no immediates)" {
+    // Binary.md `canon task.cancel` is a single tag byte 0x05 with no
+    // payload. Distinct from `subtask.cancel` at tag 0x06 which has
+    // a one-byte `async?` immediate.
+    var reader = BinaryReader{ .data = &[_]u8{0x05} };
+    const c = try parseCanon(&reader, std.testing.allocator);
+    try std.testing.expect(c == .async_canon);
+    try std.testing.expect(c.async_canon == .task_cancel);
 }
 
 test "parseCanon: subtask.drop" {

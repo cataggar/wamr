@@ -401,6 +401,12 @@ pub const Canon = union(enum) {
 /// single union variant on `Canon` (instead of ~17 separate ones) avoids
 /// rippling exhaustive switches across every consumer.
 pub const AsyncCanonOp = union(enum) {
+    /// `canon task.cancel` — Binary.md tag `0x05`. Cancels the
+    /// **currently executing** task. No immediates, no stack args,
+    /// no result (core signature `[] -> []`). Per spec, traps if
+    /// there is no current task. Distinct from `subtask.cancel`
+    /// (tag `0x06`), which cancels a named child subtask.
+    task_cancel,
     /// `canon subtask.cancel async?` — Binary.md tag `0x06`.
     subtask_cancel: struct { is_async: bool },
     /// `canon subtask.drop` — tag `0x0d`.
