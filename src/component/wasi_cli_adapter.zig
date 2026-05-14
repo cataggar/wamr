@@ -1525,12 +1525,52 @@ pub const WasiCliAdapter = struct {
     insecure_prng: ?std.Random.DefaultPrng = null,
 
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
-    /// after the component runs to inspect captured output.
+    /// after the component runs to inspect captured output. This is the
+    /// test-/embedding-friendly constructor — every existing test in
+    /// this file uses it. For the `wamr run` CLI path that streams
+    /// live to the host process's stdio, use `initWithHostStdio`.
     pub fn init(allocator: Allocator) WasiCliAdapter {
         return .{
             .allocator = allocator,
             .stdout = streams.OutputStream.toBuffer(),
             .stderr = streams.OutputStream.toBuffer(),
+        };
+    }
+
+    /// Initialize with stdout/stderr/stdin wired directly to the host
+    /// process's standard file descriptors. Used by `wamr run` so the
+    /// component's output streams incrementally to the user's terminal
+    /// instead of buffering for the entire run. Stdin reads block on
+    /// the host's stdin fd (#474).
+    ///
+    /// `getStdoutBytes` / `getStderrBytes` / `setStdinBytes` are
+    /// **not valid** with this constructor — they expect buffer-backed
+    /// sinks. Use the regular `init` for embedding / tests that need
+    /// to inspect captured output.
+    pub fn initWithHostStdio(allocator: Allocator) WasiCliAdapter {
+        return initWithHostStdioFds(
+            allocator,
+            std.posix.STDIN_FILENO,
+            std.posix.STDOUT_FILENO,
+            std.posix.STDERR_FILENO,
+        );
+    }
+
+    /// Variant of `initWithHostStdio` that takes explicit fds — used
+    /// by tests that redirect stdin/stdout/stderr through pipes to
+    /// observe the live-streaming path without touching the test
+    /// process's own stdio (#474).
+    pub fn initWithHostStdioFds(
+        allocator: Allocator,
+        stdin_fd: std.posix.fd_t,
+        stdout_fd: std.posix.fd_t,
+        stderr_fd: std.posix.fd_t,
+    ) WasiCliAdapter {
+        return .{
+            .allocator = allocator,
+            .stdout = streams.OutputStream.toFd(stdout_fd),
+            .stderr = streams.OutputStream.toFd(stderr_fd),
+            .stdin = streams.InputStream.fromFd(stdin_fd),
         };
     }
 
