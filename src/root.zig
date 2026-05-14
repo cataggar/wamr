@@ -57,6 +57,9 @@ pub const wasi_core = @import("wasi/wasi_core.zig");
 /// Compiler IR (SSA-form intermediate representation).
 pub const ir = @import("compiler/ir/ir.zig");
 
+/// IR pretty-printer (used by `wamrc --dump-ir-after=…`).
+pub const ir_print = @import("compiler/ir/print.zig");
+
 /// Wasm → IR frontend (lowering).
 pub const frontend = @import("compiler/frontend.zig");
 

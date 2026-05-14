@@ -2242,6 +2242,95 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
 
 pub const PassFn = *const fn (*ir.IrFunction, std.mem.Allocator) anyerror!bool;
 
+/// Information passed to a `DumpHook` after a pass executes. Sufficient
+/// to identify the pass that just ran and the function it transformed.
+pub const DumpInfo = struct {
+    /// Canonical pass name (matches `passName(pass)` or one of the
+    /// synthetic names `"promoteLocalsToSSA"`, `"lowerPhisToLocals"`,
+    /// `"inlineSmallFunctions"`).
+    pass_name: []const u8,
+    /// The function the pass operated on. For module-level passes
+    /// (currently only `inlineSmallFunctions`), the hook is invoked
+    /// once per function with that function's post-pass state.
+    func: *const ir.IrFunction,
+    /// Module-level function index for the function being dumped.
+    func_index: u32,
+    /// Whether the pass reported a change (`pass()` returned true).
+    /// Used by callers to decide whether to re-emit an IR snapshot.
+    changed: bool,
+    /// 0-based per-function fixpoint iteration counter (matches the
+    /// outer `while (iter < 8)` loop in `runPassesWithOptions`).
+    iter: u32,
+    /// 0-based outer iteration counter (matches the outer
+    /// `while (outer_iter < outer_max)` loop).
+    outer_iter: u32,
+};
+
+/// User-supplied hook fired after each pass invocation by
+/// `runPassesWithOptions`. The hook is invoked unconditionally — pass
+/// selection (filtering by name or function) is the caller's job. Any
+/// error returned from the callback aborts the pipeline.
+pub const DumpHook = struct {
+    ctx: *anyopaque,
+    callback: *const fn (ctx: *anyopaque, info: DumpInfo) anyerror!void,
+};
+
+pub const RunOptions = struct {
+    /// Optional hook invoked after each per-function pass run, plus
+    /// once-per-function after `promoteLocalsToSSA` /
+    /// `lowerPhisToLocals` (first outer iteration) and once-per-function
+    /// after every successful round of `inlineSmallFunctions`.
+    dump_hook: ?DumpHook = null,
+};
+
+const PassNameEntry = struct { fn_ptr: PassFn, name: []const u8 };
+
+// Registry of every PassFn referenced from the default pipelines
+// (`default_passes`, `x86_64_default_passes`, and their `_no_iv` /
+// `_no_unroll` variants). `passName` linear-scans this table; the
+// pipelines are small enough (~30 entries) that a hash lookup isn't
+// worth the maintenance burden. New passes added to a pipeline MUST be
+// registered here so dump hooks see a stable name instead of
+// `"<unknown>"`.
+const pass_name_registry = [_]PassNameEntry{
+    .{ .fn_ptr = &forwardLocalGet, .name = "forwardLocalGet" },
+    .{ .fn_ptr = &constantFold, .name = "constantFold" },
+    .{ .fn_ptr = &algebraicSimplify, .name = "algebraicSimplify" },
+    .{ .fn_ptr = &strengthReduceMul, .name = "strengthReduceMul" },
+    .{ .fn_ptr = &strengthReduceMulShiftAdd, .name = "strengthReduceMulShiftAdd" },
+    .{ .fn_ptr = &strengthReduceDivRem, .name = "strengthReduceDivRem" },
+    .{ .fn_ptr = &foldConstantBranches, .name = "foldConstantBranches" },
+    .{ .fn_ptr = &foldInverseCompareEqz, .name = "foldInverseCompareEqz" },
+    .{ .fn_ptr = &foldBranchOnEqz, .name = "foldBranchOnEqz" },
+    .{ .fn_ptr = &threadChainedConditionalBranches, .name = "threadChainedConditionalBranches" },
+    .{ .fn_ptr = &tailDuplicateSmallJoins, .name = "tailDuplicateSmallJoins" },
+    .{ .fn_ptr = &foldSelectOnEqz, .name = "foldSelectOnEqz" },
+    .{ .fn_ptr = &foldSignExtendingLoad, .name = "foldSignExtendingLoad" },
+    .{ .fn_ptr = &foldFloatUnaryIdempotents, .name = "foldFloatUnaryIdempotents" },
+    .{ .fn_ptr = &foldWrapOfExtend, .name = "foldWrapOfExtend" },
+    .{ .fn_ptr = &globalValueNumbering, .name = "globalValueNumbering" },
+    .{ .fn_ptr = &inductionVariableSimplification, .name = "inductionVariableSimplification" },
+    .{ .fn_ptr = &hoistLoopInvariantCode, .name = "hoistLoopInvariantCode" },
+    .{ .fn_ptr = &unrollSmallFixedLoops, .name = "unrollSmallFixedLoops" },
+    .{ .fn_ptr = &@import("forward_redundant_loads.zig").forwardRedundantLoads, .name = "forwardRedundantLoads" },
+    .{ .fn_ptr = &deadStoreElimination, .name = "deadStoreElimination" },
+    .{ .fn_ptr = &deadCodeElimination, .name = "deadCodeElimination" },
+    .{ .fn_ptr = &deadLocalSetElimination, .name = "deadLocalSetElimination" },
+    .{ .fn_ptr = &hoistLoopBoundsChecks, .name = "hoistLoopBoundsChecks" },
+    .{ .fn_ptr = &elideRedundantBoundsChecks, .name = "elideRedundantBoundsChecks" },
+    .{ .fn_ptr = &foldLoadStoreOffset, .name = "foldLoadStoreOffset" },
+};
+
+/// Map a `PassFn` to its canonical name (used by `DumpHook` callers to
+/// match `--dump-ir-after=<name>` selectors). Returns `"<unknown>"` for
+/// passes not in the registry — that indicates a missing entry above.
+pub fn passName(p: PassFn) []const u8 {
+    for (pass_name_registry) |entry| {
+        if (p == entry.fn_ptr) return entry.name;
+    }
+    return "<unknown>";
+}
+
 // ── Loop-invariant bounds-check hoisting ────────────────────────────────────
 
 /// Hoist loop-invariant bounds checks to the loop preheader.
@@ -5744,6 +5833,29 @@ fn cloneJoinIntoPred(
 }
 
 pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.mem.Allocator) !u32 {
+    return runPassesWithOptions(module, passes, allocator, .{});
+}
+
+/// Same as `runPasses`, but accepts a `RunOptions` carrying an optional
+/// `dump_hook`. The hook fires once per pass per affected function:
+///
+///   - After each pass in the `passes` array (per per-function fixpoint
+///     iteration; `info.changed` reports whether the pass mutated the
+///     function).
+///   - After `promoteLocalsToSSA` and `lowerPhisToLocals` on the first
+///     outer iteration (only if promote actually fired; the hook for
+///     `lowerPhisToLocals` only fires when `promoteLocalsToSSA` did).
+///   - Once per local function after every successful round of the
+///     module-level `inlineSmallFunctions` pass. `info.func_index` is
+///     the module-local index of each function dumped.
+///
+/// Hook errors propagate and abort the pipeline.
+pub fn runPassesWithOptions(
+    module: *ir.IrModule,
+    passes: []const PassFn,
+    allocator: std.mem.Allocator,
+    opts: RunOptions,
+) !u32 {
     var total_changes: u32 = 0;
 
     // Outer loop: alternate between module-level inlining and per-function
@@ -5769,6 +5881,19 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
             if (iter_inlined == 0) break;
             inlined_count += iter_inlined;
             total_changes += 1;
+
+            if (opts.dump_hook) |hook| {
+                for (module.functions.items, 0..) |*f, fi| {
+                    try hook.callback(hook.ctx, .{
+                        .pass_name = "inlineSmallFunctions",
+                        .func = f,
+                        .func_index = @intCast(fi),
+                        .changed = true,
+                        .iter = inline_iter,
+                        .outer_iter = outer_iter,
+                    });
+                }
+            }
         }
         if (inlined_count != 0) {
             std.log.debug(
@@ -5782,7 +5907,8 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
             break;
         }
 
-        for (module.functions.items) |*func| {
+        for (module.functions.items, 0..) |*func, func_idx_usize| {
+            const func_idx: u32 = @intCast(func_idx_usize);
             // SSA promotion: only meaningful on the first outer round. On
             // later rounds the function is already past mem2reg and any new
             // local_set/get inserted by inlining is handled by
@@ -5790,7 +5916,29 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
             if (outer_iter == 0) {
                 if (try promoteLocalsToSSA(func, allocator)) {
                     total_changes += 1;
-                    if (try lowerPhisToLocals(func, allocator)) total_changes += 1;
+                    if (opts.dump_hook) |hook| {
+                        try hook.callback(hook.ctx, .{
+                            .pass_name = "promoteLocalsToSSA",
+                            .func = func,
+                            .func_index = func_idx,
+                            .changed = true,
+                            .iter = 0,
+                            .outer_iter = outer_iter,
+                        });
+                    }
+                    if (try lowerPhisToLocals(func, allocator)) {
+                        total_changes += 1;
+                        if (opts.dump_hook) |hook| {
+                            try hook.callback(hook.ctx, .{
+                                .pass_name = "lowerPhisToLocals",
+                                .func = func,
+                                .func_index = func_idx,
+                                .changed = true,
+                                .iter = 0,
+                                .outer_iter = outer_iter,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -5802,9 +5950,20 @@ pub fn runPasses(module: *ir.IrModule, passes: []const PassFn, allocator: std.me
             while (iter < 8) : (iter += 1) {
                 var any_changed = false;
                 for (passes) |pass| {
-                    if (try pass(func, allocator)) {
+                    const changed = try pass(func, allocator);
+                    if (changed) {
                         any_changed = true;
                         total_changes += 1;
+                    }
+                    if (opts.dump_hook) |hook| {
+                        try hook.callback(hook.ctx, .{
+                            .pass_name = passName(pass),
+                            .func = func,
+                            .func_index = func_idx,
+                            .changed = changed,
+                            .iter = iter,
+                            .outer_iter = outer_iter,
+                        });
                     }
                 }
                 if (!any_changed) break;

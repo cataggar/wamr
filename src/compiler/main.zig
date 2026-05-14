@@ -10,6 +10,8 @@ const emit_aot = wamr.emit_aot;
 const x86_64_compile = wamr.x86_64_compile;
 const aarch64_compile = wamr.aarch64_compile;
 const passes = wamr.passes;
+const ir_print = wamr.ir_print;
+const ir = wamr.ir;
 
 const TargetArch = passes.TargetArch;
 
@@ -66,6 +68,18 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         else => .x86_64,
     };
 
+    // --dump-ir-after / --dump-ir-functions / --dump-ir-out collection.
+    // `dump_pass_names` and `dump_func_globs` are owned by the arena
+    // below; their entries are borrowed slices of the input argv (and
+    // thus live for the whole subcommand). When no globs are provided
+    // we default to `*` (match every function).
+    var dump_arena = std.heap.ArenaAllocator.init(allocator);
+    defer dump_arena.deinit();
+    const dump_alloc = dump_arena.allocator();
+    var dump_pass_names: std.ArrayList([]const u8) = .empty;
+    var dump_func_globs: std.ArrayList([]const u8) = .empty;
+    var dump_out_dir: ?[]const u8 = null;
+
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const a = sub_args[i];
@@ -98,6 +112,12 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             enable_aarch64_scheduler = false;
         } else if (std.mem.eql(u8, a, "--aarch64-no-xreg-alloc")) {
             enable_aarch64_xreg_alloc = false;
+        } else if (std.mem.startsWith(u8, a, "--dump-ir-after=")) {
+            try dump_pass_names.append(dump_alloc, a["--dump-ir-after=".len..]);
+        } else if (std.mem.startsWith(u8, a, "--dump-ir-functions=")) {
+            try dump_func_globs.append(dump_alloc, a["--dump-ir-functions=".len..]);
+        } else if (std.mem.startsWith(u8, a, "--dump-ir-out=")) {
+            dump_out_dir = a["--dump-ir-out=".len..];
         } else if (a.len > 0 and a[0] == '-') {
             std.debug.print("error: unknown option '{s}' — try `wamrc compile help`\n", .{a});
             std.process.exit(1);
@@ -108,6 +128,8 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
             std.process.exit(1);
         }
     }
+
+    if (dump_func_globs.items.len == 0) try dump_func_globs.append(dump_alloc, "*");
 
     const in_path = input_path orelse {
         std.debug.print("error: missing input wasm file — usage: wamrc compile <input.wasm> [-o <output.cwasm>]\n", .{});
@@ -163,13 +185,83 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
 
     std.debug.print("Lowered {d} functions to IR\n", .{ir_module.functions.items.len});
 
+    // Build a func-index → exported-name lookup. Wasm name custom
+    // sections aren't currently parsed by the loader, so fall back to
+    // the first export pointing at each local function. Without this,
+    // `--dump-ir-functions=core_*` couldn't match anything for binaries
+    // built without a names section (CoreMark, hand-written .wat).
+    const ir_func_count = ir_module.functions.items.len;
+    const export_names = try allocator.alloc(?[]const u8, ir_func_count);
+    defer allocator.free(export_names);
+    for (export_names) |*slot| slot.* = null;
+    for (module.exports) |exp| {
+        if (exp.kind != .function) continue;
+        // Wasm function indices are imports-first, then locals.
+        if (exp.index < module.imports.len) continue;
+        const local_idx = exp.index - ir_module.import_count;
+        if (local_idx >= ir_func_count) continue;
+        if (export_names[local_idx] == null) export_names[local_idx] = exp.name;
+    }
+
+    // Set up the IR-dump hook (no-op when no `--dump-ir-after` flags
+    // were passed). The Dumper borrows the parsed `dump_pass_names` /
+    // `dump_func_globs` / `dump_out_dir` slices for the lifetime of
+    // `runCompile`. Synthetic pass names `"initial"` (post-frontend,
+    // pre-opt) and `"final"` (post-opt) are emitted directly here; all
+    // other names are matched against pass invocations inside
+    // `runPassesWithOptions`.
+    var dumper = Dumper{
+        .allocator = allocator,
+        .io = io,
+        .pass_names = dump_pass_names.items,
+        .func_globs = dump_func_globs.items,
+        .out_dir = dump_out_dir,
+        .export_names = export_names,
+    };
+    if (dumper.pass_names.len > 0 and dumper.out_dir != null) {
+        std.Io.Dir.cwd().createDirPath(io, dumper.out_dir.?) catch |err| {
+            std.debug.print("error: failed to create --dump-ir-out dir '{s}': {}\n", .{ dumper.out_dir.?, err });
+            std.process.exit(1);
+        };
+    }
+    if (dumper.matchesPass("initial")) {
+        for (ir_module.functions.items, 0..) |*f, fi| {
+            if (!dumper.matchesFunc(f, @intCast(fi))) continue;
+            try dumper.write(.{
+                .pass_name = "initial",
+                .func = f,
+                .func_index = @intCast(fi),
+                .changed = true,
+                .iter = 0,
+                .outer_iter = 0,
+            });
+        }
+    }
+
     // 4. Optimize IR (unless -O0)
     if (optimize) {
-        const opt_changes = passes.runPasses(&ir_module, passes.defaultPassesForTarget(target_arch), allocator) catch |err| {
+        const run_opts: passes.RunOptions = if (dumper.pass_names.len == 0) .{} else .{
+            .dump_hook = .{ .ctx = @ptrCast(&dumper), .callback = Dumper.callback },
+        };
+        const opt_changes = passes.runPassesWithOptions(&ir_module, passes.defaultPassesForTarget(target_arch), allocator, run_opts) catch |err| {
             std.debug.print("Error optimizing IR: {}\n", .{err});
             std.process.exit(1);
         };
         std.debug.print("Optimization: {d} passes made changes\n", .{opt_changes});
+    }
+
+    if (dumper.matchesPass("final")) {
+        for (ir_module.functions.items, 0..) |*f, fi| {
+            if (!dumper.matchesFunc(f, @intCast(fi))) continue;
+            try dumper.write(.{
+                .pass_name = "final",
+                .func = f,
+                .func_index = @intCast(fi),
+                .changed = true,
+                .iter = 0,
+                .outer_iter = 0,
+            });
+        }
     }
 
     // 5. Compile IR to native code (target-dependent)
@@ -446,6 +538,35 @@ const compile_usage =
     \\  --aarch64-no-scheduler        Disable AArch64 instruction scheduler
     \\  --aarch64-no-xreg-alloc       Disable AArch64 X-register allocator
     \\
+    \\IR diagnostics (post-frontend IR snapshots; one snapshot per
+    \\matching function-pass pair, last-write-wins on repeated runs):
+    \\  --dump-ir-after=<name>        Dump IR after the named pass. Use
+    \\                                 `initial` for the post-frontend
+    \\                                 pre-opt state and `final` for the
+    \\                                 fully-optimised state. Pass names
+    \\                                 are the Zig pipeline function
+    \\                                 names (e.g. `forwardLocalGet`,
+    \\                                 `forwardRedundantLoads`,
+    \\                                 `lowerPhisToLocals`). Repeat to
+    \\                                 dump after multiple passes.
+    \\  --dump-ir-functions=<glob>    Restrict dumps to functions whose
+    \\                                 wasm name matches the glob.
+    \\                                 Supports `*` wildcards. Repeat to
+    \\                                 union multiple globs. Default: `*`.
+    \\                                 Each function is tried against the
+    \\                                 glob under three names: its IR
+    \\                                 name (currently only set via
+    \\                                 frontend name-section parsing —
+    \\                                 not yet implemented), the first
+    \\                                 matching wasm export, and the
+    \\                                 synthetic `func<N>` /
+    \\                                 `func<0N>` (zero-padded) indices.
+    \\  --dump-ir-out=<dir>           Directory to write dumps into
+    \\                                 (created if missing). Default:
+    \\                                 stdout, one snapshot per pass per
+    \\                                 function preceded by a header
+    \\                                 comment.
+    \\
 ;
 
 const version_usage =
@@ -481,6 +602,135 @@ fn deriveOutputPath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return std.mem.concat(allocator, u8, &.{ stem, ".cwasm" });
 }
 
+/// IR dump hook target for `wamrc --dump-ir-after=…`. Borrows its
+/// `pass_names` / `func_globs` / `out_dir` / `export_names` slices from
+/// the parent `runCompile` invocation; `allocator` is used only for
+/// transient per-callback rendering buffers. `export_names[i]` carries
+/// the first matching export name for the i-th local function (or null
+/// if no export points at it) and is used as a display-friendly fallback
+/// when `IrFunction.name` isn't set.
+const Dumper = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    pass_names: []const []const u8,
+    func_globs: []const []const u8,
+    out_dir: ?[]const u8,
+    export_names: []const ?[]const u8,
+
+    /// Entry point for `passes.DumpHook.callback`. Filters by pass name
+    /// and function-glob before rendering.
+    fn callback(ctx: *anyopaque, info: passes.DumpInfo) anyerror!void {
+        const self: *Dumper = @ptrCast(@alignCast(ctx));
+        if (!self.matchesPass(info.pass_name)) return;
+        if (!self.matchesFunc(info.func, info.func_index)) return;
+        try self.write(info);
+    }
+
+    fn matchesPass(self: *const Dumper, name: []const u8) bool {
+        for (self.pass_names) |p| {
+            if (std.mem.eql(u8, p, name)) return true;
+        }
+        return false;
+    }
+
+    fn matchesFunc(self: *const Dumper, func: *const ir.IrFunction, func_index: u32) bool {
+        const ir_name = func.name orelse "";
+        const exp_name: []const u8 = if (func_index < self.export_names.len) (self.export_names[func_index] orelse "") else "";
+        var idx_buf: [24]u8 = undefined;
+        const idx_name = std.fmt.bufPrint(&idx_buf, "func{d}", .{func_index}) catch "func";
+        var padded_buf: [24]u8 = undefined;
+        const padded_name = std.fmt.bufPrint(&padded_buf, "func{d:0>4}", .{func_index}) catch "func";
+        for (self.func_globs) |g| {
+            if (matchGlob(g, ir_name)) return true;
+            if (exp_name.len > 0 and matchGlob(g, exp_name)) return true;
+            if (matchGlob(g, idx_name)) return true;
+            if (matchGlob(g, padded_name)) return true;
+        }
+        return false;
+    }
+
+    fn displayName(self: *const Dumper, func: *const ir.IrFunction, func_index: u32) []const u8 {
+        if (func.name) |n| return n;
+        if (func_index < self.export_names.len) {
+            if (self.export_names[func_index]) |n| return n;
+        }
+        return "<anon>";
+    }
+
+    fn write(self: *Dumper, info: passes.DumpInfo) !void {
+        var aw: std.Io.Writer.Allocating = .init(self.allocator);
+        defer aw.deinit();
+        try ir_print.formatFunc(info.func, info.func_index, &aw.writer);
+
+        const disp = self.displayName(info.func, info.func_index);
+
+        if (self.out_dir) |dir| {
+            const sanitized = try sanitizeFilename(self.allocator, disp);
+            defer self.allocator.free(sanitized);
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/func{d:0>4}_{s}.{s}.ir", .{
+                dir,
+                info.func_index,
+                sanitized,
+                info.pass_name,
+            });
+            defer self.allocator.free(path);
+            try std.Io.Dir.cwd().writeFile(self.io, .{
+                .sub_path = path,
+                .data = aw.written(),
+            });
+        } else {
+            const header = try std.fmt.allocPrint(self.allocator, "; === pass={s} func=#{d} {s} iter={d} outer={d} changed={any} ===\n", .{
+                info.pass_name,
+                info.func_index,
+                disp,
+                info.iter,
+                info.outer_iter,
+                info.changed,
+            });
+            defer self.allocator.free(header);
+            var stdout_file = std.Io.File.stdout();
+            stdout_file.writeStreamingAll(self.io, header) catch {};
+            stdout_file.writeStreamingAll(self.io, aw.written()) catch {};
+        }
+    }
+};
+
+/// Sanitize a wasm function name into a filesystem-safe basename:
+/// replaces every byte that isn't `[A-Za-z0-9_.\-+]` with `_`. Result
+/// is heap-allocated and owned by the caller.
+fn sanitizeFilename(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const max_len = 96;
+    const src_len = @min(name.len, max_len);
+    if (src_len == 0) return allocator.dupe(u8, "_");
+    const out = try allocator.alloc(u8, src_len);
+    for (name[0..src_len], 0..) |c, i| {
+        out[i] = if (isFsSafeByte(c)) c else '_';
+    }
+    return out;
+}
+
+fn isFsSafeByte(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or
+        (c >= 'a' and c <= 'z') or
+        (c >= '0' and c <= '9') or
+        c == '_' or c == '.' or c == '-' or c == '+';
+}
+
+/// Match a `name` against a shell-like glob with `*` wildcards. `*`
+/// matches zero or more bytes; every other byte is literal. Recursive
+/// backtracking — fine for the short patterns the CLI accepts.
+pub fn matchGlob(pattern: []const u8, name: []const u8) bool {
+    if (pattern.len == 0) return name.len == 0;
+    if (pattern[0] == '*') {
+        if (matchGlob(pattern[1..], name)) return true;
+        if (name.len == 0) return false;
+        return matchGlob(pattern, name[1..]);
+    }
+    if (name.len == 0) return false;
+    if (pattern[0] != name[0]) return false;
+    return matchGlob(pattern[1..], name[1..]);
+}
+
 test "subcommand parsing" {
     try std.testing.expectEqual(@as(?Subcommand, .compile), parseSubcommand("compile"));
     try std.testing.expectEqual(@as(?Subcommand, .version), parseSubcommand("version"));
@@ -508,4 +758,41 @@ test "deriveOutputPath strips .wasm and appends .cwasm" {
     const r4 = try deriveOutputPath(a, "weird.wasm.bin");
     defer a.free(r4);
     try std.testing.expectEqualStrings("weird.wasm.bin.cwasm", r4);
+}
+
+test "matchGlob: exact match" {
+    try std.testing.expect(matchGlob("foo", "foo"));
+    try std.testing.expect(!matchGlob("foo", "bar"));
+    try std.testing.expect(!matchGlob("foo", "foobar"));
+    try std.testing.expect(!matchGlob("foo", "fo"));
+}
+
+test "matchGlob: leading/trailing wildcards" {
+    try std.testing.expect(matchGlob("*", ""));
+    try std.testing.expect(matchGlob("*", "anything_goes"));
+    try std.testing.expect(matchGlob("core_*", "core_bench_list"));
+    try std.testing.expect(matchGlob("core_*", "core_"));
+    try std.testing.expect(!matchGlob("core_*", "no_match"));
+    try std.testing.expect(matchGlob("*_test", "foo_test"));
+    try std.testing.expect(!matchGlob("*_test", "foo_other"));
+}
+
+test "matchGlob: interior wildcards" {
+    try std.testing.expect(matchGlob("a*b*c", "abc"));
+    try std.testing.expect(matchGlob("a*b*c", "aXbYc"));
+    try std.testing.expect(!matchGlob("a*b*c", "axbxd"));
+}
+
+test "sanitizeFilename: keeps safe bytes, replaces unsafe with _" {
+    const a = std.testing.allocator;
+    const s = try sanitizeFilename(a, "core/bench/list:func()");
+    defer a.free(s);
+    try std.testing.expectEqualStrings("core_bench_list_func__", s);
+}
+
+test "sanitizeFilename: empty name yields placeholder" {
+    const a = std.testing.allocator;
+    const s = try sanitizeFilename(a, "");
+    defer a.free(s);
+    try std.testing.expectEqualStrings("_", s);
 }
