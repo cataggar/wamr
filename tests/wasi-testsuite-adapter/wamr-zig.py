@@ -38,7 +38,12 @@ def get_version() -> str:
 
 
 def get_wasi_versions() -> List[str]:
-    return ["wasm32-wasip1"]
+    # Declares both Preview 1 (covered by `zig build wasi-testsuite`) and
+    # Preview 3 (covered by `zig build wasi-p3-testsuite`, issue #489) so
+    # the upstream `UnsupportedWasiTestExcludeFilter` doesn't auto-skip
+    # the wasm32-wasip3 fixtures. Per-test gating for incomplete P3
+    # adapter coverage lives in `tests/wasi-p3-testsuite-skip.json`.
+    return ["wasm32-wasip1", "wasm32-wasip3"]
 
 
 def get_wasi_worlds() -> List[str]:

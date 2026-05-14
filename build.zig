@@ -233,6 +233,35 @@ pub fn build(b: *std.Build) void {
     );
     wasi_testsuite_step.dependOn(&wasi_runner.step);
 
+    // ── WASI Preview 3 conformance gate (#489) ────────────────────────
+    // Drives the vendored `wasm32-wasip3` fixtures at
+    // `tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/` through
+    // the just-built `wamr` CLI via the same in-tree adapter as the
+    // Preview 1 gate. Acts as a CI gate against regressions in the WASI
+    // Preview 3 adapter surface (`src/component/wasi_cli_adapter.zig`,
+    // P3 wave A–C: #481–#487). Skip-list entries must each carry a
+    // rationale + tracking issue — see `tests/wasi-p3-testsuite-skip.json`.
+    // Not wired into the default `test` aggregate (it requires Python 3
+    // + the runner's deps); CI gates regressions on every PR. Run
+    // locally with `zig build wasi-p3-testsuite`.
+    const wasi_p3_runner = b.addSystemCommand(&.{
+        "python3",
+        "tests/wasi-testsuite/test-runner/wasi_test_runner.py",
+        "--test-suite",
+        "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
+        "--runtime-adapter",
+        "tests/wasi-testsuite-adapter/wamr-zig.py",
+        "--exclude-filter",
+        "tests/wasi-p3-testsuite-skip.json",
+    });
+    wasi_p3_runner.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    wasi_p3_runner.step.dependOn(b.getInstallStep());
+    const wasi_p3_testsuite_step = b.step(
+        "wasi-p3-testsuite",
+        "Run the WASI Preview 3 conformance gate (wasm32-wasip3 fixtures)",
+    );
+    wasi_p3_testsuite_step.dependOn(&wasi_p3_runner.step);
+
     // ── Tests ──────────────────────────────────────────────────────────
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
