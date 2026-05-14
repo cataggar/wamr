@@ -1597,6 +1597,19 @@ fn computeMagicU32(d: u32) ?struct { magic: u64, shift: u6 } {
 }
 
 /// Remove instructions whose dest VReg is never used.
+///
+/// Also sweeps dest-less side-effect-free instructions: passes like
+/// `promoteLocalsToSSA`, `foldWrapOfExtend`, `foldSignExtendingLoad`,
+/// and the `*Mul*` strength-reducers neutralise an instruction in
+/// place by setting `inst.op = .{ .iconst_32 = 0 }` (and sometimes
+/// `inst.dest = null`) after rewriting users via `replaceVReg`. With
+/// the old "dest required" check these placeholders survived the
+/// pipeline indefinitely — codegen filtered them out at emit time
+/// (`iconst_32` with `dest == null` returns early), but they cluttered
+/// the IR dumps and forced every subsequent pass to walk them. The
+/// dest-less sweep here treats `inst.dest == null` + `!hasSideEffect`
+/// as unconditionally dead, matching the semantics codegen already
+/// relies on.
 pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     var changed = false;
     var iterate = true;
@@ -1619,6 +1632,13 @@ pub fn deadCodeElimination(func: *ir.IrFunction, allocator: std.mem.Allocator) !
                         iterate = true;
                         continue;
                     }
+                } else if (!hasSideEffect(inst)) {
+                    // Dest-less placeholder (neutralised rewrite from an
+                    // earlier pass): no observable effect, drop it.
+                    _ = block.instructions.orderedRemove(i);
+                    changed = true;
+                    iterate = true;
+                    continue;
                 }
                 i += 1;
             }
@@ -6404,6 +6424,86 @@ test "DCE: removes unused iconst" {
     try std.testing.expect(changed);
     // v1 (iconst 99) should be removed
     try std.testing.expectEqual(@as(usize, 2), block.instructions.items.len);
+}
+
+test "DCE: removes dest-less placeholder iconsts (#469)" {
+    // Passes like `promoteLocalsToSSA` neutralise an instruction in
+    // place by setting `inst.op = .{ .iconst_32 = 0 }` and
+    // `inst.dest = null`. With the legacy "dest required" guard these
+    // placeholders survived every subsequent pipeline iteration and
+    // cluttered IR dumps for CoreMark's hot functions
+    // (`core_state_transition` etc.). DCE must drop them.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v0 = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0 });
+    // Three dest-less placeholders sandwiched between live ops.
+    try block.append(.{ .op = .{ .iconst_32 = 0 } });
+    try block.append(.{ .op = .{ .iconst_32 = 0 } });
+    try block.append(.{ .op = .{ .iconst_32 = 0 } });
+    try block.append(.{ .op = .{ .ret = v0 } });
+
+    try std.testing.expectEqual(@as(usize, 5), block.instructions.items.len);
+    const changed = try deadCodeElimination(&func, allocator);
+    try std.testing.expect(changed);
+    // Only `iconst_32 42` and `ret v0` survive — the three placeholders
+    // are gone.
+    try std.testing.expectEqual(@as(usize, 2), block.instructions.items.len);
+    try std.testing.expectEqual(ir.Inst.Op{ .iconst_32 = 42 }, block.instructions.items[0].op);
+    try std.testing.expect(block.instructions.items[0].dest != null);
+}
+
+test "DCE: cascades after foldLoadStoreOffset-style rewrites (#469)" {
+    // After a load/store-offset fold, the original `add v_a, v_base, vK`
+    // becomes dead (v_a has zero uses because the load consumes v_base
+    // directly with a baked-in offset). DCE must remove the add on its
+    // first pass, then on the same call's fixpoint iteration also drop
+    // the iconst_32 that defined vK — otherwise the asm leaks dead
+    // `mov xN, #K` stomps documented in issue #469.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const block_id = try func.newBlock();
+    var block = &func.blocks.items[block_id];
+
+    const v_k = func.newVReg(); // iconst 16
+    const v_base = func.newVReg();
+    const v_addr = func.newVReg(); // = v_base + v_k, now dead
+    const v_val = func.newVReg();
+
+    try block.append(.{ .op = .{ .iconst_32 = 16 }, .dest = v_k, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_base, .type = .i32 });
+    try block.append(.{
+        .op = .{ .add = .{ .lhs = v_base, .rhs = v_k } },
+        .dest = v_addr,
+        .type = .i32,
+    });
+    // Mimic foldLoadStoreOffset's output: the load consumes v_base
+    // directly, not v_addr. v_addr becomes dead.
+    try block.append(.{
+        .op = .{ .load = .{ .base = v_base, .offset = 16, .size = 4 } },
+        .dest = v_val,
+        .type = .i32,
+    });
+    try block.append(.{ .op = .{ .ret = v_val } });
+
+    try std.testing.expectEqual(@as(usize, 5), block.instructions.items.len);
+    const changed = try deadCodeElimination(&func, allocator);
+    try std.testing.expect(changed);
+    // Both the iconst_32 16 (v_k) AND the add (v_addr) must be gone.
+    // What remains: v_base iconst, load, ret.
+    try std.testing.expectEqual(@as(usize, 3), block.instructions.items.len);
+    for (block.instructions.items) |inst| {
+        try std.testing.expect(inst.op != .add);
+        // The only surviving iconst_32 is v_base = 0.
+        if (inst.dest) |d| {
+            if (inst.op == .iconst_32) try std.testing.expectEqual(v_base, d);
+        }
+    }
 }
 
 test "DCE: preserves side-effect instructions" {
