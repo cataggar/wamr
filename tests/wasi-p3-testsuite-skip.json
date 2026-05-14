@@ -35,11 +35,9 @@
         "cli-exit":               "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
         "cli-stdio":              "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
         "cli-stdio-roundtrip":    "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
-        "cli-terminal":           "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
         "run-with-err":           "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
         "monotonic-clock":        "wasi:clocks@0.3.0 adapter not yet merged — tracking #483",
         "multi-clock-wait":       "wasi:clocks@0.3.0 adapter not yet merged — tracking #483",
-        "wall-clock":             "wasi:clocks@0.3.0 adapter not yet merged — tracking #483",
-        "random":                 "wamr CLI cannot yet load wasm32-wasip3 component fixtures end-to-end (host wiring for #481/#485 lands in follow-up); will be removed once `wamr run` resolves the wasi:random@0.3.0 binding"
+        "wall-clock":             "wasi:clocks@0.3.0 adapter not yet merged — tracking #483"
     }
 }

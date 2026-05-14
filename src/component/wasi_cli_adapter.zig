@@ -1963,6 +1963,15 @@ pub const WasiCliAdapter = struct {
     /// to get deterministic output.
     insecure_prng: ?std.Random.DefaultPrng = null,
 
+    /// Memoised `wasi:random/insecure-seed.{get-,}insecure-seed` value.
+    /// Per WASI's spec the function is meant to be called once and any
+    /// subsequent calls must return the same `tuple<u64, u64>`. The
+    /// wasi-p3-testsuite `random` fixture exercises this invariant by
+    /// asserting two successive calls yield equal tuples. We compute
+    /// the pair on first call and cache it for the lifetime of the
+    /// adapter. (#520)
+    insecure_seed_cache: ?[2]u64 = null,
+
     /// Initialize with a buffer-backed stdout sink. Use `getStdoutBytes`
     /// after the component runs to inspect captured output. This is the
     /// test-/embedding-friendly constructor — every existing test in
@@ -3608,17 +3617,30 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `wasi:random/insecure-seed.insecure-seed: () -> tuple<u64, u64>` (#147).
+    /// Per spec semantics, this is meant to be called only once; subsequent
+    /// calls return the same value (asserted by the `random` fixture in the
+    /// wasi-p3-testsuite). We memoise on the adapter so both 0.2 and 0.3
+    /// surfaces share a single cached pair. (#520)
     fn insecureSeed(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
         _: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
         if (results.len == 0) return error.InvalidArgs;
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        const pair = self.insecure_seed_cache orelse blk: {
+            const p = [_]u64{
+                wasi_p2_core.Random.getRandomU64(),
+                wasi_p2_core.Random.getRandomU64(),
+            };
+            self.insecure_seed_cache = p;
+            break :blk p;
+        };
         const fields = try allocator.alloc(InterfaceValue, 2);
-        fields[0] = .{ .u64 = wasi_p2_core.Random.getRandomU64() };
-        fields[1] = .{ .u64 = wasi_p2_core.Random.getRandomU64() };
+        fields[0] = .{ .u64 = pair[0] };
+        fields[1] = .{ .u64 = pair[1] };
         results[0] = .{ .tuple_val = fields };
     }
 
@@ -14988,7 +15010,30 @@ pub fn runComponentBytes(
     const component_storage = allocator.create(ctypes_root.Component) catch return error.OutOfMemory;
     defer allocator.destroy(component_storage);
     component_storage.* = component_loader.load(data, allocator) catch return error.LoadFailed;
+    // Route components that expose a `wasi:cli/run@0.3.x` instance export
+    // through the async-lifted P3 dispatch path. Components without a 0.3
+    // run export (bare `run`, or 0.2-only) keep the legacy synchronous
+    // path. This is the CLI's single entry point for both WASI surfaces —
+    // host adapters were already version-multiplexed by #481/#510 via
+    // `populateWasiProviders`; the missing piece was teaching the CLI to
+    // call the right export. (#520)
+    if (hasWasiCliRunP3Export(component_storage)) {
+        return runLoadedComponentP3(component_storage, allocator, adapter);
+    }
     return runLoadedComponent(component_storage, allocator, adapter);
+}
+
+/// Return true iff the top-level component exports a `wasi:cli/run@0.3.x`
+/// instance. Used by `runComponentBytes` to choose between the legacy
+/// synchronous and the async-lifted P3 dispatch paths without having to
+/// instantiate the component first.
+pub fn hasWasiCliRunP3Export(component: *const ctypes_root.Component) bool {
+    for (component.exports) |exp| {
+        if (exp.desc != .instance) continue;
+        if (!matchesWasiPrefix(exp.name, "wasi:cli/run")) continue;
+        if (wasiVersion(exp.name) == .p3) return true;
+    }
+    return false;
 }
 
 // ── wasi:cli/run@0.3.0 entry-point (#482) ──────────────────────────────
@@ -16363,7 +16408,7 @@ test "wasi:random/insecure-seed lifts tuple<u64, u64> via tuple_val (#147)" {
 
     var ci: ComponentInstance = undefined;
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
-    try WasiCliAdapter.insecureSeed(null, &ci, &.{}, &results, testing.allocator);
+    try WasiCliAdapter.insecureSeed(&adapter, &ci, &.{}, &results, testing.allocator);
     defer results[0].deinit(testing.allocator);
 
     try testing.expect(results[0] == .tuple_val);
@@ -23110,6 +23155,82 @@ test "findRunP3ExportName: returns null when no wasi:cli/run export (#482)" {
     inst.exported_funcs = .{};
     const got = try findRunP3ExportName(&component, &inst, testing.allocator);
     try testing.expect(got == null);
+}
+
+test "hasWasiCliRunP3Export: routes P3 components to async-lifted path (#520)" {
+    // The CLI dispatches `wamr run` against component bytes by checking
+    // for a 0.3.x `wasi:cli/run@…` instance export at the top level —
+    // present iff the component should drive the async-lifted dispatch
+    // path. wit-component-emitted P3 binaries carry BOTH a 0.2 and a
+    // 0.3 export side-by-side; we must pick the 0.3 path even when
+    // a 0.2 export is also present.
+    const testing = std.testing;
+    const exports_p3 = [_]ctypes_root.ExportDecl{
+        .{
+            .name = "wasi:cli/run@0.2.0",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+        .{
+            .name = "wasi:cli/run@0.3.0-rc-2026-03-15",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 2 },
+        },
+    };
+    const exports_p2_only = [_]ctypes_root.ExportDecl{
+        .{
+            .name = "wasi:cli/run@0.2.0",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+    const empty_exports: [0]ctypes_root.ExportDecl = .{};
+
+    const comp_p3 = ctypes_root.Component{
+        .core_modules = &.{},  .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},     .instances = &.{},      .aliases = &.{},
+        .types = &.{},          .canons = &.{},         .imports = &.{},
+        .exports = &exports_p3,
+    };
+    const comp_p2 = ctypes_root.Component{
+        .core_modules = &.{},  .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},     .instances = &.{},      .aliases = &.{},
+        .types = &.{},          .canons = &.{},         .imports = &.{},
+        .exports = &exports_p2_only,
+    };
+    const comp_empty = ctypes_root.Component{
+        .core_modules = &.{},  .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},     .instances = &.{},      .aliases = &.{},
+        .types = &.{},          .canons = &.{},         .imports = &.{},
+        .exports = &empty_exports,
+    };
+    try testing.expectEqual(true, hasWasiCliRunP3Export(&comp_p3));
+    try testing.expectEqual(false, hasWasiCliRunP3Export(&comp_p2));
+    try testing.expectEqual(false, hasWasiCliRunP3Export(&comp_empty));
+}
+
+test "insecureSeed memoises pair across calls (#520)" {
+    // Per WASI spec, `wasi:random/insecure-seed.{get-,}insecure-seed` is
+    // meant to be called only once; subsequent calls must return the
+    // same `tuple<u64, u64>`. The wasi-p3-testsuite `random` fixture
+    // asserts this invariant. Confirm two successive calls produce
+    // identical tuples.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var r1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var r2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.insecureSeed(&adapter, &ci, &.{}, &r1, testing.allocator);
+    defer r1[0].deinit(testing.allocator);
+    try WasiCliAdapter.insecureSeed(&adapter, &ci, &.{}, &r2, testing.allocator);
+    defer r2[0].deinit(testing.allocator);
+
+    try testing.expect(r1[0] == .tuple_val);
+    try testing.expect(r2[0] == .tuple_val);
+    try testing.expectEqual(r1[0].tuple_val[0].u64, r2[0].tuple_val[0].u64);
+    try testing.expectEqual(r1[0].tuple_val[1].u64, r2[0].tuple_val[1].u64);
 }
 
 // ───────────────────────────────────────────────────────────────────

@@ -94,12 +94,29 @@ pub fn resolveCompInstance(component: *const ctypes.Component, idx: u32) ?CompIn
     // components need this because instance-section and alias-section
     // (sort .instance) entries interleave (issue #355).
     if (component.comp_instance_indexspace.len > 0) {
-        if (idx >= component.comp_instance_indexspace.len) return null;
-        return switch (component.comp_instance_indexspace[idx]) {
-            .import => |i| .{ .imported = i },
-            .instance => |i| .{ .local = i },
-            .alias => |i| .{ .aliased = i },
-        };
+        // Defensive bound on `.exported_alias` chains. The deref chain
+        // is well-founded for valid binaries (each export points
+        // strictly backwards into the index space), so a small bound
+        // is plenty.
+        var cursor: u32 = idx;
+        var hops: u32 = 0;
+        while (hops < 32) : (hops += 1) {
+            if (cursor >= component.comp_instance_indexspace.len) return null;
+            switch (component.comp_instance_indexspace[cursor]) {
+                .import => |i| return .{ .imported = i },
+                .instance => |i| return .{ .local = i },
+                .alias => |i| return .{ .aliased = i },
+                .exported_alias => |export_idx| {
+                    // `(export <name> (instance N))` contributes a
+                    // slot that aliases the export's `sort_idx`.
+                    if (export_idx >= component.exports.len) return null;
+                    const si = component.exports[export_idx].sort_idx orelse return null;
+                    if (si.sort != .instance) return null;
+                    cursor = si.idx;
+                },
+            }
+        }
+        return null;
     }
     // Legacy path: hand-authored fixtures (no loader) and old
     // pre-#355 binaries that don't set the indexspace. Walk imports,
@@ -507,6 +524,71 @@ test "resolveCompInstance: imports → locals → aliases" {
     try testing.expect(resolveCompInstance(&comp, 1).? == .local);
     try testing.expect(resolveCompInstance(&comp, 2).? == .aliased);
     try testing.expect(resolveCompInstance(&comp, 3) == null);
+}
+
+test "resolveCompInstance: exported_alias derefs to underlying instance (#520)" {
+    // Models the wit-component P3 component shape: two top-level
+    // instance exports each contribute a fresh slot in the
+    // compinstance index space, aliased to the local instance they
+    // export. The second export's `sort_idx.idx` must resolve through
+    // both `.exported_alias` slots and a `.instance` slot. Without
+    // this, our loader emitted `idx out-of-range` for binaries that
+    // intersperse two `wasi:cli/run@…` instance exports.
+    //
+    // Layout (indexspace contributors, in section order):
+    //   0 -> instance #0 (local)
+    //   1 -> exported_alias #0 (export[0].sort_idx = (instance, 0))
+    //   2 -> instance #1 (local)
+    //   3 -> exported_alias #1 (export[1].sort_idx = (instance, 2))
+    const inline_exp = [_]ctypes.InlineExport{
+        .{ .name = "run", .sort_idx = .{ .sort = .func, .idx = 0 } },
+    };
+    const instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &inline_exp },
+        .{ .exports = &inline_exp },
+    };
+    const exports = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:cli/run@0.2.0",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+        .{
+            .name = "wasi:cli/run@0.3.0-rc-2026-03-15",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 2 },
+        },
+    };
+    const idx_space = [_]ctypes.CompInstanceContributor{
+        .{ .instance = 0 },
+        .{ .exported_alias = 0 },
+        .{ .instance = 1 },
+        .{ .exported_alias = 1 },
+    };
+    const comp = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &instances,
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &exports,
+        .comp_instance_indexspace = &idx_space,
+    };
+    // Direct local lookups round-trip as `.local`.
+    try testing.expect(resolveCompInstance(&comp, 0).? == .local);
+    try testing.expectEqual(@as(u32, 0), resolveCompInstance(&comp, 0).?.local);
+    try testing.expect(resolveCompInstance(&comp, 2).? == .local);
+    try testing.expectEqual(@as(u32, 1), resolveCompInstance(&comp, 2).?.local);
+    // `.exported_alias` slots deref back to their underlying local.
+    try testing.expect(resolveCompInstance(&comp, 1).? == .local);
+    try testing.expectEqual(@as(u32, 0), resolveCompInstance(&comp, 1).?.local);
+    try testing.expect(resolveCompInstance(&comp, 3).? == .local);
+    try testing.expectEqual(@as(u32, 1), resolveCompInstance(&comp, 3).?.local);
+    try testing.expect(resolveCompInstance(&comp, 4) == null);
 }
 
 test "resolveInstanceExpr: local instance returns .local" {
