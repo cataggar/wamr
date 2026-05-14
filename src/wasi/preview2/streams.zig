@@ -48,9 +48,18 @@ pub const InputStream = struct {
                 b.pos += n;
                 return .{ .ok = n };
             },
-            .fd => {
-                // Host fd reading would go here
-                return .{ .ok = 0 };
+            .fd => |fd| {
+                // Raw fd source for live host stdio (#474). Uses
+                // `std.posix.read`, which retries on EINTR internally
+                // and reports EAGAIN as `error.WouldBlock`. A zero-byte
+                // return is EOF and surfaces as `.closed`.
+                const n = std.posix.read(fd, buf) catch |err| return switch (err) {
+                    error.WouldBlock => .{ .err = .would_block },
+                    error.ConnectionResetByPeer, error.SocketUnconnected, error.Unexpected => .{ .closed = {} },
+                    else => .{ .err = .io_error },
+                };
+                if (n == 0) return .{ .closed = {} };
+                return .{ .ok = n };
             },
             .host_file => |*hf| {
                 const io = std.Io.Threaded.global_single_threaded.io();
@@ -75,6 +84,16 @@ pub const InputStream = struct {
     /// Create an input stream from a byte buffer.
     pub fn fromBuffer(data: []const u8) InputStream {
         return .{ .source = .{ .buffer = .{ .data = data } } };
+    }
+
+    /// Create an input stream that reads from a host file descriptor
+    /// using `std.posix.read` (non-positional). Use for streaming
+    /// sources like stdin or a pipe read-end — for seekable files,
+    /// prefer `fromHostFile` so multiple streams over the same file
+    /// stay independent. The fd is borrowed; the stream does not close
+    /// it on drop. Added for #474 live host stdio.
+    pub fn fromFd(fd: std.posix.fd_t) InputStream {
+        return .{ .source = .{ .fd = fd } };
     }
 
     /// Create an input stream that reads from a host file at the given offset.
@@ -133,11 +152,20 @@ pub const OutputStream = struct {
                 b.appendSlice(allocator, data) catch return .{ .err = .would_block };
                 return .{ .ok = data.len };
             },
-            .fd => {
-                // fd-backed sinks aren't yet used in production. Treating
-                // every write as a successful no-op keeps the API shape
-                // intact for future use without dragging in
-                // platform-specific write syscalls.
+            .fd => |fd| {
+                // Raw fd sink for live host stdio (#474). Uses
+                // `std.Io.File.writeStreamingAll` which is the
+                // non-positional streaming writer (vs `pwrite`-style
+                // `host_file`), suitable for stdout/stderr/pipes. EAGAIN
+                // surfaces as `error.WouldBlock`; `BrokenPipe` /
+                // `NotOpenForWriting` are treated as `.closed`.
+                const io = std.Io.Threaded.global_single_threaded.io();
+                const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+                file.writeStreamingAll(io, data) catch |err| return switch (err) {
+                    error.WouldBlock => .{ .err = .would_block },
+                    error.BrokenPipe, error.NotOpenForWriting => .{ .closed = {} },
+                    else => .{ .err = .io_error },
+                };
                 return .{ .ok = data.len };
             },
             .host_file => |*hf| {
@@ -314,6 +342,85 @@ test "OutputStream: write to buffer" {
     const r = stream.write("world", std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 5), r.ok);
     try std.testing.expectEqualSlices(u8, "world", stream.getBufferContents());
+}
+
+// Test helper: open a unix pipe pair. Linux-only — pipe2 is not in
+// std.posix for 0.16, and the live-stdio test path (#474) only needs
+// to run on the Linux CI builds (other archs/OSes test the buffer
+// path).
+fn linuxPipe2() ?[2]std.posix.fd_t {
+    if (@import("builtin").os.tag != .linux) return null;
+    var fds: [2]i32 = undefined;
+    const linux = std.os.linux;
+    const rc = linux.pipe2(&fds, .{});
+    if (linux.errno(rc) != .SUCCESS) return null;
+    return .{ fds[0], fds[1] };
+}
+
+test "OutputStream: write to fd writes through to peer (#474)" {
+    const fds = linuxPipe2() orelse return error.SkipZigTest;
+    const linux = std.os.linux;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    var stream = OutputStream.toFd(fds[1]);
+    const r = stream.write("hello", std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), r.ok);
+
+    var buf: [16]u8 = undefined;
+    const n = try std.posix.read(fds[0], &buf);
+    try std.testing.expectEqualSlices(u8, "hello", buf[0..n]);
+}
+
+test "OutputStream: write to fd returns closed when peer closed (#474)" {
+    const fds = linuxPipe2() orelse return error.SkipZigTest;
+    const linux = std.os.linux;
+    _ = linux.close(fds[0]); // close read-end first
+    defer _ = linux.close(fds[1]);
+
+    // Ignore SIGPIPE so the write surfaces as EPIPE instead of killing
+    // the test process.
+    var act: linux.Sigaction = .{
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    var oact: linux.Sigaction = undefined;
+    std.posix.sigaction(linux.SIG.PIPE, &act, &oact);
+    defer std.posix.sigaction(linux.SIG.PIPE, &oact, null);
+
+    var stream = OutputStream.toFd(fds[1]);
+    const r = stream.write("hello", std.testing.allocator);
+    try std.testing.expect(r == .closed);
+}
+
+test "InputStream: read from fd returns bytes written by peer (#474)" {
+    const fds = linuxPipe2() orelse return error.SkipZigTest;
+    const linux = std.os.linux;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+
+    // Preload bytes into the pipe write-end via the raw syscall
+    // (std.posix has no `write` wrapper in 0.16).
+    _ = linux.write(fds[1], "world", 5);
+
+    var stream = InputStream.fromFd(fds[0]);
+    var buf: [16]u8 = undefined;
+    const r = stream.read(&buf);
+    try std.testing.expectEqual(@as(usize, 5), r.ok);
+    try std.testing.expectEqualSlices(u8, "world", buf[0..5]);
+}
+
+test "InputStream: read from fd returns closed at EOF (#474)" {
+    const fds = linuxPipe2() orelse return error.SkipZigTest;
+    const linux = std.os.linux;
+    defer _ = linux.close(fds[0]);
+    _ = linux.close(fds[1]); // close write-end → next read sees EOF
+
+    var stream = InputStream.fromFd(fds[0]);
+    var buf: [16]u8 = undefined;
+    const r = stream.read(&buf);
+    try std.testing.expect(r == .closed);
 }
 
 test "Pollable: immediate is always ready" {
