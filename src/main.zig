@@ -188,7 +188,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             if (listen_address) |addr| {
                 return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr);
             }
-            return runComponent(wasm_data, allocator, io, path, wasm_args.items, env_list.items);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items);
         }
     }
 
@@ -240,13 +240,17 @@ fn parseListenAddress(spec: []const u8) !std.Io.net.IpAddress {
 fn runComponent(
     data: []const u8,
     allocator: std.mem.Allocator,
-    io: std.Io,
     wasm_path: []const u8,
     wasm_args: []const []const u8,
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
-    var adapter = adapter_mod.WasiCliAdapter.init(allocator);
+    // Wire the adapter's stdio directly to the host process's
+    // STDIN/STDOUT/STDERR so output streams live (no end-of-run
+    // flush) and stdin reads from the user's terminal / piped
+    // input (#474). For the test/embedding path that needs to
+    // inspect captured stdout, use `WasiCliAdapter.init` instead.
+    var adapter = adapter_mod.WasiCliAdapter.initWithHostStdio(allocator);
     defer adapter.deinit();
 
     // argv[0] = wasm path, rest = user args (matches wasmtime convention).
@@ -297,14 +301,8 @@ fn runComponent(
         return 1;
     };
 
-    // Flush captured stdout to the host. Buffered + flush at end is the
-    // simplest cross-platform path; streaming output is deferred until
-    // the io/poll-aware adapter lands (#154).
-    const captured = adapter.getStdoutBytes();
-    if (captured.len > 0) {
-        var stdout_file = std.Io.File.stdout();
-        stdout_file.writeStreamingAll(io, captured) catch {};
-    }
+    // Output has already streamed live to host STDOUT/STDERR via the
+    // fd-backed OutputStream sinks (#474); no end-of-run flush needed.
 
     // Prefer the explicit numeric exit code recorded by
     // `wasi:cli/exit.exit-with-code` / preview1 `proc_exit` (#436);
