@@ -89,16 +89,23 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     std.debug.print("error: invalid --stack-size value\n", .{});
                     return 2;
                 };
-            } else if (std.mem.startsWith(u8, arg, "--listen=")) {
+            } else if (std.mem.eql(u8, arg, "--listen") or std.mem.startsWith(u8, arg, "--listen=")) {
                 if (listen_address != null) {
                     std.debug.print("error: --listen specified more than once; only one listening socket preopen is supported\n", .{});
                     return 2;
                 }
-                const spec = arg["--listen=".len..];
-                listen_address = parseListenAddress(spec) catch {
-                    std.debug.print("error: invalid --listen address '{s}'\n", .{spec});
-                    return 2;
-                };
+                if (std.mem.eql(u8, arg, "--listen")) {
+                    // Bare `--listen` -> 127.0.0.1:0 (kernel-assigned ephemeral
+                    // port). The actual bound address is printed to stdout
+                    // after bind so test drivers can scrape it.
+                    listen_address = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable;
+                } else {
+                    const spec = arg["--listen=".len..];
+                    listen_address = parseListenAddress(spec) catch {
+                        std.debug.print("error: invalid --listen address '{s}'\n", .{spec});
+                        return 2;
+                    };
+                }
             } else if (std.mem.startsWith(u8, arg, "--heap-size=")) {
                 // Reserved for future WASI heap allocation
             } else if (std.mem.eql(u8, arg, "--env") or std.mem.startsWith(u8, arg, "--env=")) {
@@ -341,6 +348,7 @@ fn runHttpComponent(
 
     adapter_mod.serveHttpComponentBytes(data, arena_alloc, &adapter, .{
         .listen_address = listen_address,
+        .announce_listening = listen_address.getPort() == 0,
     }) catch |err| {
         switch (err) {
             error.NoIncomingHandlerExport => std.debug.print(
@@ -356,6 +364,10 @@ fn runHttpComponent(
                 .{},
             ),
             error.ListenFailed => std.debug.print("Error: failed to bind --listen address\n", .{}),
+            error.AddressInUse => std.debug.print(
+                "Error: --listen address already in use (another process is bound to this port)\n",
+                .{},
+            ),
             error.AcceptFailed => std.debug.print("Error: failed to accept HTTP connection\n", .{}),
             error.LoadFailed => std.debug.print("Error: failed to load component\n", .{}),
             error.InstantiateFailed => std.debug.print("Error: failed to instantiate component\n", .{}),
@@ -487,9 +499,24 @@ fn runWasm(
 
     if (listen_address) |addr| {
         const listen_fd = openListenSocket(addr) catch |err| {
-            std.debug.print("Error: --listen bind failed: {}\n", .{err});
+            switch (err) {
+                error.AddressInUse => std.debug.print(
+                    "Error: --listen address already in use (another process is bound to this port)\n",
+                    .{},
+                ),
+                else => std.debug.print("Error: --listen bind failed: {}\n", .{err}),
+            }
             return 1;
         };
+        if (addr.getPort() == 0) {
+            // Ephemeral-port bind requested. Read back the kernel-resolved
+            // address and print it so test drivers can scrape the line.
+            if (resolvedBoundAddress(listen_fd)) |bound| {
+                var buf: [128]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, "Listening on {f}\n", .{bound}) catch buf[0..0];
+                writeStdout(io, line);
+            } else |_| {}
+        }
         _ = ctx.addPreopenSocket(listen_fd) catch |err| {
             std.debug.print("Error: cannot register --listen socket preopen: {}\n", .{err});
             return 1;
@@ -522,7 +549,21 @@ fn runWasm(
 /// `std.posix.{socket,bind,listen,close}` wrappers were removed in Zig 0.16.0.
 /// `--listen` is therefore Linux-only on the core-wasm path; the CLI
 /// front-end rejects it elsewhere.
-fn openListenSocket(addr: std.Io.net.IpAddress) !std.posix.fd_t {
+/// Errors that can come back from `openListenSocket`. Explicitly
+/// declared (rather than `!`) so the caller's `catch |err| switch (err)`
+/// at line 503 sees the same set on every target — on non-Linux the
+/// comptime gate causes inference to narrow to just
+/// `{UnsupportedPlatform}`, and the macOS / Windows builds fail to
+/// type-check the `error.AddressInUse` arm.
+const OpenListenSocketError = error{
+    UnsupportedPlatform,
+    SocketFailed,
+    BindFailed,
+    AddressInUse,
+    ListenFailed,
+};
+
+fn openListenSocket(addr: std.Io.net.IpAddress) OpenListenSocketError!std.posix.fd_t {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
     const linux = std.os.linux;
 
@@ -536,17 +577,11 @@ fn openListenSocket(addr: std.Io.net.IpAddress) !std.posix.fd_t {
     const fd: std.posix.fd_t = @intCast(@as(isize, @bitCast(sock_rc)));
     errdefer _ = linux.close(fd);
 
-    // SO_REUSEADDR: lets the host re-bind quickly after a restart while
-    // a previous accepted client lingers in TIME_WAIT.
-    const one: c_int = 1;
-    const so_rc = linux.setsockopt(
-        fd,
-        linux.SOL.SOCKET,
-        linux.SO.REUSEADDR,
-        @ptrCast(&one),
-        @sizeOf(c_int),
-    );
-    if (linux.errno(so_rc) != .SUCCESS) return error.SetSockOptFailed;
+    // No SO_REUSEADDR / SO_REUSEPORT: exclusive bind so a second wamr
+    // started on the same port fails fast with `EADDRINUSE`. The kernel
+    // holds the port in TIME_WAIT for a few seconds after a clean
+    // shutdown; that's the intended trade-off (mirrors the component
+    // HTTP listener in `serveLoadedHttpComponent`).
 
     switch (addr) {
         .ip4 => |v4| {
@@ -555,7 +590,11 @@ fn openListenSocket(addr: std.Io.net.IpAddress) !std.posix.fd_t {
                 .addr = @bitCast(v4.bytes),
             };
             const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
-            if (linux.errno(b) != .SUCCESS) return error.BindFailed;
+            switch (linux.errno(b)) {
+                .SUCCESS => {},
+                .ADDRINUSE => return error.AddressInUse,
+                else => return error.BindFailed,
+            }
         },
         .ip6 => |v6| {
             const sa = linux.sockaddr.in6{
@@ -565,13 +604,50 @@ fn openListenSocket(addr: std.Io.net.IpAddress) !std.posix.fd_t {
                 .scope_id = v6.interface.index,
             };
             const b = linux.bind(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa)));
-            if (linux.errno(b) != .SUCCESS) return error.BindFailed;
+            switch (linux.errno(b)) {
+                .SUCCESS => {},
+                .ADDRINUSE => return error.AddressInUse,
+                else => return error.BindFailed,
+            }
         },
     }
 
     const lr = linux.listen(fd, 128);
     if (linux.errno(lr) != .SUCCESS) return error.ListenFailed;
     return fd;
+}
+
+/// Read back the kernel-resolved local address of a bound listening socket
+/// via `getsockname(2)`. Used to surface the ephemeral port assigned when
+/// the caller requested `:0`.
+fn resolvedBoundAddress(fd: std.posix.fd_t) !std.Io.net.IpAddress {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const linux = std.os.linux;
+
+    var storage: linux.sockaddr.storage = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.storage);
+    const rc = linux.getsockname(fd, @ptrCast(&storage), &len);
+    if (linux.errno(rc) != .SUCCESS) return error.GetSockNameFailed;
+
+    return switch (storage.family) {
+        linux.AF.INET => blk: {
+            const sa: *const linux.sockaddr.in = @ptrCast(@alignCast(&storage));
+            break :blk .{ .ip4 = .{
+                .port = std.mem.bigToNative(u16, sa.port),
+                .bytes = @bitCast(sa.addr),
+            } };
+        },
+        linux.AF.INET6 => blk: {
+            const sa: *const linux.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            break :blk .{ .ip6 = .{
+                .port = std.mem.bigToNative(u16, sa.port),
+                .flow = sa.flowinfo,
+                .bytes = sa.addr,
+                .interface = .{ .index = sa.scope_id },
+            } };
+        },
+        else => error.UnsupportedAddressFamily,
+    };
 }
 
 fn writeStdout(io: std.Io, text: []const u8) void {
@@ -599,10 +675,14 @@ const run_usage =
     \\Options:
     \\  --stack-size=<bytes>     Stack size for the interpreter (default: 65536)
     \\  --heap-size=<bytes>      Reserved (currently ignored)
-    \\  --listen=<ip:port>       For components: serve WASI HTTP on the address.
+    \\  --listen[=<ip:port>]     For components: serve WASI HTTP on the address.
     \\                           For core wasm: bind a TCP listening socket and
     \\                           expose it to the guest as the next preopen fd
     \\                           (≥ 3) for `sock_accept` (single use only).
+    \\                           Port 0 (and bare `--listen`, which means
+    \\                           127.0.0.1:0) requests a kernel-assigned
+    \\                           ephemeral port; the resolved address is
+    \\                           printed to stdout after bind.
     \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
     \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
     \\                           inside the guest WASI sandbox (repeatable)
