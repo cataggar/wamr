@@ -224,44 +224,48 @@ pub const Future = struct {
 
 // ── Streams (async multi-value channel) ─────────────────────────────────────
 
-/// A component-level async stream — multi-value channel with backpressure.
+/// A component-level async stream — FIFO byte channel parameterised on
+/// element type `T`. Mirrors the rendezvous-driven model used by `Future`
+/// but with a multi-value buffer instead of a one-shot payload.
+///
+/// The buffer holds raw lowered bytes; element boundaries are computed at
+/// each `stream.read` / `stream.write` op from
+/// `canonical_abi.sizeOfType(elem_type_idx)`.
 pub const AsyncStream = struct {
-    buffer: std.ArrayListUnmanaged(u32) = .empty,
-    state: State = .open,
+    /// Type index of `T`, captured from `stream.new t`'s `type_idx`. Used
+    /// by `stream.read` / `stream.write` to compute the per-element byte
+    /// size via `canonical_abi.sizeOfType`.
+    elem_type_idx: u32 = 0,
+    /// FIFO of raw lowered bytes. Element boundaries are recomputed at
+    /// op time from `elem_size = sizeOfType(...)`.
+    buffer: std.ArrayListUnmanaged(u8) = .empty,
+
+    /// A reader that ran while the buffer was empty. Resolved by the next
+    /// `write` (direct memcpy into the parked dst, no buffering).
+    pending_read: ?PendingRead = null,
+    /// A writer that ran with no parked reader and exhausted the buffer
+    /// cap. The initial implementation has no cap, so this stays `null`;
+    /// kept for the future high-water-mark backpressure PR.
+    pending_write: ?PendingWrite = null,
+
+    /// Waitable plumbing for `waitable.join` integration.
     waitable_set: ?*WaitableSet = null,
     read_waitable_idx: ?u32 = null,
+    write_waitable_idx: ?u32 = null,
+
+    state: State = .open,
+    /// Both ends are closed only after both `drop-readable` and
+    /// `drop-writable`. Tracked separately so cancellation observes the
+    /// correct end.
+    read_closed: bool = false,
+    write_closed: bool = false,
 
     pub const State = enum { open, closed };
+    pub const PendingRead = struct { guest_ptr: u32, max_count: u32 };
+    pub const PendingWrite = struct { guest_ptr: u32, count: u32 };
 
-    /// Write values to the stream (producer side).
-    pub fn writeValues(self: *AsyncStream, values: []const u32, allocator: std.mem.Allocator) !usize {
-        if (self.state == .closed) return 0;
-        try self.buffer.appendSlice(allocator, values);
-        // Notify reader
-        if (self.waitable_set) |ws| {
-            if (self.read_waitable_idx) |idx| {
-                ws.setReady(idx, allocator);
-            }
-        }
-        return values.len;
-    }
-
-    /// Read values from the stream (consumer side).
-    pub fn readValues(self: *AsyncStream, out: []u32) usize {
-        const avail = @min(self.buffer.items.len, out.len);
-        if (avail == 0) return 0;
-        @memcpy(out[0..avail], self.buffer.items[0..avail]);
-        // Remove consumed items from front
-        std.mem.copyForwards(u32, self.buffer.items[0 .. self.buffer.items.len - avail], self.buffer.items[avail..]);
-        self.buffer.items.len -= avail;
-        return avail;
-    }
-
-    /// Close the stream.
-    pub fn close(self: *AsyncStream) void {
-        self.state = .closed;
-    }
-
+    /// Free any heap-owned state (currently just the FIFO `buffer`).
+    /// Safe to call multiple times.
     pub fn deinit(self: *AsyncStream, allocator: std.mem.Allocator) void {
         self.buffer.deinit(allocator);
     }
@@ -380,33 +384,16 @@ test "Future: pending_read records guest_ptr" {
     try std.testing.expectEqual(@as(u32, 0x1234), f.pending_read.?.guest_ptr);
 }
 
-test "AsyncStream: write and read" {
+test "AsyncStream: deinit frees buffer" {
     const allocator = std.testing.allocator;
     var s = AsyncStream{};
-    defer s.deinit(allocator);
-
-    const written = try s.writeValues(&.{ 10, 20, 30 }, allocator);
-    try std.testing.expectEqual(@as(usize, 3), written);
-
-    var out: [2]u32 = undefined;
-    const n = s.readValues(&out);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(@as(u32, 10), out[0]);
-    try std.testing.expectEqual(@as(u32, 20), out[1]);
-
-    // Read remaining
-    var out2: [4]u32 = undefined;
-    const n2 = s.readValues(&out2);
-    try std.testing.expectEqual(@as(usize, 1), n2);
-    try std.testing.expectEqual(@as(u32, 30), out2[0]);
+    try s.buffer.appendSlice(allocator, &[_]u8{ 1, 2, 3, 4 });
+    s.deinit(allocator);
 }
 
-test "AsyncStream: close prevents write" {
-    const allocator = std.testing.allocator;
+test "AsyncStream: pending_read records guest_ptr and max_count" {
     var s = AsyncStream{};
-    defer s.deinit(allocator);
-
-    s.close();
-    const written = try s.writeValues(&.{1}, allocator);
-    try std.testing.expectEqual(@as(usize, 0), written);
+    s.pending_read = .{ .guest_ptr = 0x2000, .max_count = 7 };
+    try std.testing.expectEqual(@as(u32, 0x2000), s.pending_read.?.guest_ptr);
+    try std.testing.expectEqual(@as(u32, 7), s.pending_read.?.max_count);
 }

@@ -941,32 +941,190 @@ fn dispatchAsyncCanon(
 
         // ── Stream handles ──────────────────────────────────────────────
         .stream_new => |info| {
-            _ = info;
             const handle = comp_inst.allocAsyncHandle();
-            comp_inst.streams.put(comp_inst.allocator, handle, .{}) catch return error.OutOfMemory;
+            comp_inst.streams.put(comp_inst.allocator, handle, .{
+                .elem_type_idx = info.type_idx,
+            }) catch return error.OutOfMemory;
             // Spec packs read+write handles into one i64; in our
             // single-handle prototype we publish the same idx for both
             // ends to keep the wire format compatible with i64 pops.
             const packed_handles: u64 = (@as(u64, handle) << 32) | @as(u64, handle);
             env.pushI64(@bitCast(packed_handles)) catch return error.StackOverflow;
         },
+        .stream_read => |info| {
+            // Stack: (handle, ptr, max_count) → status. `max_count` is on
+            // top, then `ptr`, then `handle`.
+            const max_count: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            const s = comp_inst.streams.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+
+            const registry = TypeRegistry.init(comp_inst.component);
+            const elem_size = abi.sizeOfType(registry, ctypes.ValType{ .type_idx = info.type_idx });
+            if (elem_size == 0) return error.LowerError;
+
+            // Zero-length read: synchronous no-op completion.
+            if (max_count == 0) {
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // Drain buffered data first.
+            const buffered_elems: u32 = @intCast(s.buffer.items.len / elem_size);
+            if (buffered_elems > 0) {
+                const take = @min(max_count, buffered_elems);
+                const take_bytes = take * elem_size;
+                const dst = comp_inst.writableGuestBytes(guest_ptr, take_bytes) orelse
+                    return error.MemoryNotAvailable;
+                @memcpy(dst, s.buffer.items[0..take_bytes]);
+                // Slide FIFO forward; O(n) is fine until we swap to a ring buffer.
+                std.mem.copyForwards(
+                    u8,
+                    s.buffer.items[0 .. s.buffer.items.len - take_bytes],
+                    s.buffer.items[take_bytes..],
+                );
+                s.buffer.items.len -= take_bytes;
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, take))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // Writer dropped and buffer drained → cancelled (EOF).
+            if (s.write_closed) {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // No data yet — park.
+            s.pending_read = .{ .guest_ptr = guest_ptr, .max_count = max_count };
+            env.pushI32(@bitCast(async_canon.packStatus(.starting, 0))) catch
+                return error.StackOverflow;
+        },
+        .stream_write => |info| {
+            // Stack: (handle, ptr, count) → status. `count` is on top,
+            // then `ptr`, then `handle`.
+            const count: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const guest_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            const s = comp_inst.streams.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+
+            // Reader end already dropped → writer is cancelled.
+            if (s.read_closed) {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            const registry = TypeRegistry.init(comp_inst.component);
+            const elem_size = abi.sizeOfType(registry, ctypes.ValType{ .type_idx = info.type_idx });
+            if (elem_size == 0) return error.LowerError;
+
+            // Zero-length write: synchronous no-op completion.
+            if (count == 0) {
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            const byte_len: u32 = elem_size * count;
+            const src = comp_inst.readGuestBytes(guest_ptr, byte_len) orelse
+                return error.MemoryNotAvailable;
+
+            // Reader parked first: fulfil it directly (no buffering).
+            if (s.pending_read) |pr| {
+                const transfer_count = @min(count, pr.max_count);
+                const transfer_bytes = transfer_count * elem_size;
+                const dst = comp_inst.writableGuestBytes(pr.guest_ptr, transfer_bytes) orelse
+                    return error.MemoryNotAvailable;
+                @memcpy(dst, src[0..transfer_bytes]);
+
+                // Any tail past `transfer_count` overflows the parked
+                // reader's request; buffer it for the next reader.
+                if (count > transfer_count) {
+                    s.buffer.appendSlice(comp_inst.allocator, src[transfer_bytes..byte_len]) catch
+                        return error.OutOfMemory;
+                }
+
+                s.pending_read = null;
+                if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, transfer_count))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // No reader yet — append to FIFO.
+            s.buffer.appendSlice(comp_inst.allocator, src) catch
+                return error.OutOfMemory;
+            if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
+                ws.setReady(idx, allocator);
+            env.pushI32(@bitCast(async_canon.packStatus(.returned, count))) catch
+                return error.StackOverflow;
+        },
+        .stream_cancel_read => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const s = comp_inst.streams.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+            s.pending_read = null;
+            env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                return error.StackOverflow;
+        },
+        .stream_cancel_write => |info| {
+            _ = info;
+            const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const s = comp_inst.streams.getPtr(handle) orelse {
+                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            };
+            s.pending_write = null;
+            env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                return error.StackOverflow;
+        },
         .stream_drop_readable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            if (comp_inst.streams.fetchRemove(handle)) |kv| {
-                var s = kv.value;
-                s.deinit(comp_inst.allocator);
+            if (comp_inst.streams.getPtr(handle)) |s| {
+                s.read_closed = true;
+                // Wake a parked writer so it can observe CANCELLED.
+                if (s.waitable_set) |ws| if (s.write_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                if (s.read_closed and s.write_closed) {
+                    s.deinit(comp_inst.allocator);
+                    _ = comp_inst.streams.remove(handle);
+                }
             }
         },
         .stream_drop_writable => |info| {
             _ = info;
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
-            if (comp_inst.streams.fetchRemove(handle)) |kv| {
-                var s = kv.value;
-                s.deinit(comp_inst.allocator);
+            if (comp_inst.streams.getPtr(handle)) |s| {
+                s.write_closed = true;
+                // Wake a parked reader so it can observe CANCELLED.
+                if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                if (s.read_closed and s.write_closed) {
+                    s.deinit(comp_inst.allocator);
+                    _ = comp_inst.streams.remove(handle);
+                }
             }
         },
-        .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write => return error.FunctionNotFound,
 
         // ── Future handles ──────────────────────────────────────────────
         .future_new => |info| {
@@ -2391,6 +2549,440 @@ test "future.drop both ends: table entry is freed" {
     try testing.expectEqual(@as(u32, 0), inst.futures.count());
 }
 
+// ── #478 sub-PR 3b: stream.read/write rendezvous tests ──────────────────────
+//
+// Mirror of the future suite above. Each test wires a minimal
+// `ComponentInstance` whose component-type-index space carries a single
+// `(type u32)` entry, so `stream.new t=0` names a `stream<u32>` (4-byte
+// elements). `enableTestMem` provides a 4 KiB backing buffer for the
+// lift/lower memcpy on each side of the rendezvous.
+
+fn newStreamU32Inst(testing_allocator: std.mem.Allocator) !*instance_mod.ComponentInstance {
+    // Static lifetimes — the `Component` and its types outlive the
+    // instance, so we leak them deliberately. Tests run in their own
+    // process; the test allocator releases bookkeeping on exit.
+    const StreamTypeFixture = struct {
+        var types_array = [_]ctypes.TypeDef{.{ .val = .u32 }};
+        var comp: ctypes.Component = .{
+            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+            .components = &.{},       .instances = &.{},      .aliases = &.{},
+            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .exports = &.{},
+        };
+    };
+    StreamTypeFixture.comp.types = &StreamTypeFixture.types_array;
+    const inst = try instance_mod.instantiate(&StreamTypeFixture.comp, testing_allocator);
+    try inst.enableTestMem(testing_allocator, 4096);
+    return inst;
+}
+
+fn destroyStreamInst(inst: *instance_mod.ComponentInstance) void {
+    inst.disableTestMem();
+    inst.deinit();
+}
+
+test "stream.new: returns packed read|write handles and records elem_type_idx" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const packed_handles: u64 = @bitCast(try env.popI64());
+    const r_idx: u32 = @truncate(packed_handles >> 32);
+    const w_idx: u32 = @truncate(packed_handles & 0xFFFF_FFFF);
+    // Single-handle prototype: read+write share the same idx.
+    try testing.expectEqual(r_idx, w_idx);
+    try testing.expect(r_idx > 0);
+    try testing.expectEqual(@as(u32, 1), inst.streams.count());
+
+    const s = inst.streams.getPtr(r_idx).?;
+    try testing.expectEqual(@as(u32, 0), s.elem_type_idx);
+    try testing.expectEqual(@as(usize, 0), s.buffer.items.len);
+    try testing.expect(s.pending_read == null);
+}
+
+test "stream.write then stream.read: round-trips 3×u32" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Stage three u32s in test memory at offset 0; reader buffer at 64.
+    const src_ptr: u32 = 0;
+    const dst_ptr: u32 = 64;
+    const src_bytes = inst.writableGuestBytes(src_ptr, 12).?;
+    std.mem.writeInt(u32, src_bytes[0..4], 0x1111_1111, .little);
+    std.mem.writeInt(u32, src_bytes[4..8], 0x2222_2222, .little);
+    std.mem.writeInt(u32, src_bytes[8..12], 0x3333_3333, .little);
+
+    // stream.write with count=3 — no reader parked yet, buffers all 12 bytes.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, 3)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const write_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 3), write_status);
+    try testing.expectEqual(@as(usize, 12), inst.streams.getPtr(handle).?.buffer.items.len);
+
+    // stream.read with max_count=3 — drains the FIFO.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 3)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const read_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 3), read_status);
+
+    const dst_bytes = inst.writableGuestBytes(dst_ptr, 12).?;
+    try testing.expectEqual(@as(u32, 0x1111_1111), std.mem.readInt(u32, dst_bytes[0..4], .little));
+    try testing.expectEqual(@as(u32, 0x2222_2222), std.mem.readInt(u32, dst_bytes[4..8], .little));
+    try testing.expectEqual(@as(u32, 0x3333_3333), std.mem.readInt(u32, dst_bytes[8..12], .little));
+    try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(handle).?.buffer.items.len);
+}
+
+test "stream.read parks; stream.write delivers and wakes waitable" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Wire a waitable set + register the read side. This is the manual
+    // plumbing the eventual `waitable.join` arm will perform.
+    var ws = async_mod.WaitableSet{};
+    defer ws.deinit(testing.allocator);
+    {
+        const s = inst.streams.getPtr(handle).?;
+        s.waitable_set = &ws;
+        const idx = try ws.register(.{ .kind = .stream_read, .handle = handle }, testing.allocator);
+        s.read_waitable_idx = idx;
+    }
+
+    const src_ptr: u32 = 0;
+    const dst_ptr: u32 = 32;
+    const src_bytes = inst.writableGuestBytes(src_ptr, 8).?;
+    std.mem.writeInt(u32, src_bytes[0..4], 0xAAAA_AAAA, .little);
+    std.mem.writeInt(u32, src_bytes[4..8], 0xBBBB_BBBB, .little);
+
+    // Reader arrives first with max_count=2 — must park with STARTING.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 2)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const read_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.starting, 0), read_status);
+    try testing.expectEqual(@as(u32, dst_ptr), inst.streams.getPtr(handle).?.pending_read.?.guest_ptr);
+    try testing.expectEqual(@as(u32, 2), inst.streams.getPtr(handle).?.pending_read.?.max_count);
+
+    // Writer arrives with count=2 — copies straight into the parked dst.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, 2)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const write_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 2), write_status);
+
+    const dst_bytes = inst.writableGuestBytes(dst_ptr, 8).?;
+    try testing.expectEqual(@as(u32, 0xAAAA_AAAA), std.mem.readInt(u32, dst_bytes[0..4], .little));
+    try testing.expectEqual(@as(u32, 0xBBBB_BBBB), std.mem.readInt(u32, dst_bytes[4..8], .little));
+    try testing.expect(inst.streams.getPtr(handle).?.pending_read == null);
+    // No tail to buffer — exact-fit transfer.
+    try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(handle).?.buffer.items.len);
+    var ready: [4]u32 = undefined;
+    try testing.expectEqual(@as(u32, 1), ws.pollReady(&ready));
+}
+
+test "stream.write count > pending reader max: extra bytes buffer for next read" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    const src_ptr: u32 = 0;
+    const dst_ptr: u32 = 64;
+    const src_bytes = inst.writableGuestBytes(src_ptr, 12).?;
+    std.mem.writeInt(u32, src_bytes[0..4], 0xAAAA_0001, .little);
+    std.mem.writeInt(u32, src_bytes[4..8], 0xAAAA_0002, .little);
+    std.mem.writeInt(u32, src_bytes[8..12], 0xAAAA_0003, .little);
+
+    // Park a reader with max_count=1.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 1)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32(); // discard STARTING
+
+    // Writer pushes count=3 — reader takes 1, the rest is buffered.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, 3)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const write_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 1), write_status);
+
+    // Reader got the first element; remaining 2 elements (8 bytes)
+    // sit in the FIFO awaiting the next reader.
+    const dst_bytes = inst.writableGuestBytes(dst_ptr, 4).?;
+    try testing.expectEqual(@as(u32, 0xAAAA_0001), std.mem.readInt(u32, dst_bytes[0..4], .little));
+    try testing.expect(inst.streams.getPtr(handle).?.pending_read == null);
+    try testing.expectEqual(@as(usize, 8), inst.streams.getPtr(handle).?.buffer.items.len);
+
+    // A subsequent read with max_count=2 drains the buffered tail.
+    const dst2_ptr: u32 = 128;
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(dst2_ptr));
+    try env.pushI32(@bitCast(@as(u32, 2)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const read2_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.returned, 2), read2_status);
+
+    const dst2_bytes = inst.writableGuestBytes(dst2_ptr, 8).?;
+    try testing.expectEqual(@as(u32, 0xAAAA_0002), std.mem.readInt(u32, dst2_bytes[0..4], .little));
+    try testing.expectEqual(@as(u32, 0xAAAA_0003), std.mem.readInt(u32, dst2_bytes[4..8], .little));
+    try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(handle).?.buffer.items.len);
+}
+
+test "stream.cancel-read on parked reader returns CANCELLED and clears slot" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Park a reader so cancel has something to clear.
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(@as(u32, 0)));
+    try env.pushI32(@bitCast(@as(u32, 4)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32(); // discard STARTING
+    try testing.expect(inst.streams.getPtr(handle).?.pending_read != null);
+
+    // Cancel — clears pending_read and reports CANCELLED.
+    try env.pushI32(@bitCast(handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_cancel_read = .{ .type_idx = 0, .is_async = false } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.cancelled, 0), status);
+    try testing.expect(inst.streams.getPtr(handle).?.pending_read == null);
+}
+
+test "stream.drop-writable while buffer drained: subsequent read returns CANCELLED (EOF)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const packed_handles: u64 = @bitCast(try env.popI64());
+    const r_idx: u32 = @truncate(packed_handles >> 32);
+    const w_idx: u32 = @truncate(packed_handles & 0xFFFF_FFFF);
+
+    // Write 1×u32 then drain it via a matching read; buffer is now empty.
+    const src_ptr: u32 = 0;
+    const dst_ptr: u32 = 32;
+    const src_bytes = inst.writableGuestBytes(src_ptr, 4).?;
+    std.mem.writeInt(u32, src_bytes[0..4], 0xDEAD_BEEF, .little);
+    try env.pushI32(@bitCast(r_idx));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, 1)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32(); // discard RETURNED 1
+
+    try env.pushI32(@bitCast(r_idx));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 1)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    _ = try env.popI32(); // discard RETURNED 1
+    try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(r_idx).?.buffer.items.len);
+
+    // Writer drops without further writes.
+    try env.pushI32(@bitCast(w_idx));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_drop_writable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    // Reader end still open — entry remains until dual-close.
+    try testing.expectEqual(@as(u32, 1), inst.streams.count());
+    try testing.expect(inst.streams.getPtr(r_idx).?.write_closed);
+
+    // A subsequent read observes EOF as CANCELLED.
+    try env.pushI32(@bitCast(r_idx));
+    try env.pushI32(@bitCast(dst_ptr));
+    try env.pushI32(@bitCast(@as(u32, 1)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.cancelled, 0), status);
+}
+
 test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
@@ -2436,36 +3028,6 @@ test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
         testing.allocator,
     );
     try testing.expectEqual(@as(u32, 0), inst.error_contexts.count());
-}
-
-test "dispatchCanonBuiltin: stream.read traps with FunctionNotFound (sub-PR 3 scope)" {
-    const testing = std.testing;
-    const core_types_mod = @import("../runtime/common/types.zig");
-    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
-
-    var module = core_types_mod.WasmModule{};
-    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
-    defer inst_mod_core.destroy(core_inst);
-    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
-    defer env.destroy();
-
-    var comp = ctypes.Component{
-        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
-        .components = &.{},       .instances = &.{},      .aliases = &.{},
-        .types = &.{},            .canons = &.{},         .imports = &.{},
-        .exports = &.{},
-    };
-    const inst = try instance_mod.instantiate(&comp, testing.allocator);
-    defer inst.deinit();
-
-    const result = dispatchCanonBuiltin(
-        inst,
-        .{ .async_canon = .{ .stream_read = .{ .type_idx = 0, .opts = &.{} } } },
-        env,
-        null,
-        testing.allocator,
-    );
-    try testing.expectError(error.FunctionNotFound, result);
 }
 
 // ── Canon-lower host trampoline ─────────────────────────────────────────────
