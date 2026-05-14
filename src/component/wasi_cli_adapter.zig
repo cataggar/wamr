@@ -2661,6 +2661,64 @@ pub const WasiCliAdapter = struct {
         });
     }
 
+    /// Register `wasi:random/random@0.3.0-*` (#485).
+    ///
+    /// The 0.3 surface has identical signatures to 0.2.x and shares the
+    /// same host callbacks (`getRandomBytes`, `getRandomU64`). No
+    /// streams, futures, or resources — pure version-routing bind.
+    pub fn populateWasiRandomRandomP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        random_name: []const u8,
+    ) !void {
+        try self.random_p3_iface.members.put(self.allocator, "get-random-bytes", .{
+            .func = .{ .context = self, .call = &getRandomBytes },
+        });
+        try self.random_p3_iface.members.put(self.allocator, "get-random-u64", .{
+            .func = .{ .context = self, .call = &getRandomU64 },
+        });
+        try providers.put(self.allocator, random_name, .{
+            .host_instance = &self.random_p3_iface,
+        });
+    }
+
+    /// Register `wasi:random/insecure@0.3.0-*` (#485).
+    ///
+    /// Shares the 0.2.x callbacks and the same `insecure_prng` field.
+    pub fn populateWasiRandomInsecureP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        insecure_name: []const u8,
+    ) !void {
+        try self.random_insecure_p3_iface.members.put(self.allocator, "get-insecure-random-bytes", .{
+            .func = .{ .context = self, .call = &getInsecureRandomBytes },
+        });
+        try self.random_insecure_p3_iface.members.put(self.allocator, "get-insecure-random-u64", .{
+            .func = .{ .context = self, .call = &getInsecureRandomU64 },
+        });
+        try providers.put(self.allocator, insecure_name, .{
+            .host_instance = &self.random_insecure_p3_iface,
+        });
+    }
+
+    /// Register `wasi:random/insecure-seed@0.3.0-*` (#485).
+    ///
+    /// The 0.3.0 WIT renames the function from `insecure-seed` (0.2.x)
+    /// to `get-insecure-seed`. Return type (`tuple<u64, u64>`) and
+    /// callback (`insecureSeed`) are unchanged.
+    pub fn populateWasiRandomInsecureSeedP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        insecure_seed_name: []const u8,
+    ) !void {
+        try self.random_insecure_seed_p3_iface.members.put(self.allocator, "get-insecure-seed", .{
+            .func = .{ .context = self, .call = &insecureSeed },
+        });
+        try providers.put(self.allocator, insecure_seed_name, .{
+            .host_instance = &self.random_insecure_seed_p3_iface,
+        });
+    }
+
     /// `(own<R>) -> ()` no-op — the host never produces non-stream
     /// resources on the happy path, so dropping one is purely guest-side
     /// bookkeeping that we can swallow.
@@ -10781,6 +10839,9 @@ pub fn populateWasiProviders(
     var matched_random: ?[]const u8 = null;
     var matched_random_insecure: ?[]const u8 = null;
     var matched_random_insecure_seed: ?[]const u8 = null;
+    var matched_random_p3: ?[]const u8 = null;
+    var matched_random_insecure_p3: ?[]const u8 = null;
+    var matched_random_insecure_seed_p3: ?[]const u8 = null;
     var matched_fs_types: ?[]const u8 = null;
     var matched_fs_preopens: ?[]const u8 = null;
     var matched_sockets_network: ?[]const u8 = null;
@@ -10834,16 +10895,25 @@ pub fn populateWasiProviders(
         if (matched_monotonic_clock == null and matchesWasiPrefix(imp.name, "wasi:clocks/monotonic-clock"))
             matched_monotonic_clock = imp.name;
         // `wasi:random/insecure-seed` shares the `wasi:random/insecure`
-        // prefix, so test the more-specific name first.
-        if (matched_random_insecure_seed == null and matchesWasiPrefix(imp.name, "wasi:random/insecure-seed"))
-            matched_random_insecure_seed = imp.name;
-        if (matched_random_insecure == null and
-            !(matched_random_insecure_seed != null and
-                std.mem.eql(u8, matched_random_insecure_seed.?, imp.name)) and
-            matchesWasiPrefix(imp.name, "wasi:random/insecure"))
-            matched_random_insecure = imp.name;
-        if (matched_random == null and matchesWasiPrefix(imp.name, "wasi:random/random"))
-            matched_random = imp.name;
+        // prefix, so test the more-specific name first. #485 splits each
+        // interface by version so 0.2 and 0.3 imports route to different
+        // HostInstances.
+        if (matchesWasiPrefix(imp.name, "wasi:random/insecure-seed")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_random_insecure_seed_p3 = matched_random_insecure_seed_p3 orelse imp.name,
+                else => matched_random_insecure_seed = matched_random_insecure_seed orelse imp.name,
+            }
+        } else if (matchesWasiPrefix(imp.name, "wasi:random/insecure")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_random_insecure_p3 = matched_random_insecure_p3 orelse imp.name,
+                else => matched_random_insecure = matched_random_insecure orelse imp.name,
+            }
+        } else if (matchesWasiPrefix(imp.name, "wasi:random/random")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_random_p3 = matched_random_p3 orelse imp.name,
+                else => matched_random = matched_random orelse imp.name,
+            }
+        }
         if (matched_fs_types == null and matchesWasiPrefix(imp.name, "wasi:filesystem/types"))
             matched_fs_types = imp.name;
         if (matched_fs_preopens == null and matchesWasiPrefix(imp.name, "wasi:filesystem/preopens"))
@@ -10975,6 +11045,20 @@ pub fn populateWasiProviders(
         matched_random_insecure_seed orelse "wasi:random/insecure-seed",
     );
     if (matched_random_insecure_seed == null) _ = providers.remove("wasi:random/insecure-seed");
+
+    // wasi:random@0.3.0 (#485). Conditionally bind only when the
+    // component imports the 0.3 surface — no fallback-and-remove dance
+    // is needed because the 0.2.x calls above already keep the adapter
+    // HostInstance maps populated.
+    if (matched_random_p3) |name| {
+        try adapter.populateWasiRandomRandomP3(providers, name);
+    }
+    if (matched_random_insecure_p3) |name| {
+        try adapter.populateWasiRandomInsecureP3(providers, name);
+    }
+    if (matched_random_insecure_seed_p3) |name| {
+        try adapter.populateWasiRandomInsecureSeedP3(providers, name);
+    }
 
     try adapter.populateWasiFilesystemTypes(
         providers,
@@ -12427,6 +12511,100 @@ test "wasi:random secure helpers fill a host buffer (#147)" {
         break;
     };
     try testing.expect(any_nonzero);
+}
+
+test "wasi:random@0.3.0 get-random-bytes: 64-byte round-trip through P3 surface (#485)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const args = [_]InterfaceValue{.{ .u64 = 64 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    // The 0.3 binding shares the 0.2 callback — invoking it directly
+    // exercises the same lift path the 0.3 HostInstance dispatches to.
+    try WasiCliAdapter.getRandomBytes(null, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .list);
+    try testing.expectEqual(@as(u32, 64), results[0].list.len);
+    // Buffer must be readable from guest memory at the returned ptr
+    // (TestGuestMem may legitimately allocate at offset 0 — the
+    // round-trip itself is the proof, not a non-null ptr value).
+    const read_back = ci.readGuestBytes(results[0].list.ptr, results[0].list.len);
+    try testing.expect(read_back != null);
+    try testing.expectEqual(@as(usize, 64), read_back.?.len);
+}
+
+test "wasi:random@0.3.0 get-random-u64: high-bit and low-bit both vary over 20 calls (#485)" {
+    const testing = std.testing;
+    var ci: ComponentInstance = undefined;
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var saw_high_bit = false;
+    var saw_low_bit = false;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try WasiCliAdapter.getRandomU64(null, &ci, &.{}, &results, testing.allocator);
+        try testing.expect(results[0] == .u64);
+        if (results[0].u64 & (@as(u64, 1) << 63) != 0) saw_high_bit = true;
+        if (results[0].u64 & 1 != 0) saw_low_bit = true;
+    }
+    // With a real CSPRNG the chance of all 20 values sharing the same
+    // high or low bit is ~1 in 2^19 — astronomically small.
+    try testing.expect(saw_high_bit);
+    try testing.expect(saw_low_bit);
+}
+
+test "populateWasiProviders: wasi:random@0.2.6 and @0.3.0 coexist in same component (#485)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:random/random@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:random/insecure@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:random/insecure-seed@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:random/random@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:random/insecure@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:random/insecure-seed@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:random/random@0.2.6"));
+    try testing.expect(providers.contains("wasi:random/insecure@0.2.6"));
+    try testing.expect(providers.contains("wasi:random/insecure-seed@0.2.6"));
+    try testing.expect(providers.contains("wasi:random/random@0.3.0-rc-2026-03-15"));
+    try testing.expect(providers.contains("wasi:random/insecure@0.3.0-rc-2026-03-15"));
+    try testing.expect(providers.contains("wasi:random/insecure-seed@0.3.0-rc-2026-03-15"));
+    // Each version routes to its own HostInstance (distinct pointers).
+    try testing.expect(providers.get("wasi:random/random@0.2.6").?.host_instance !=
+        providers.get("wasi:random/random@0.3.0-rc-2026-03-15").?.host_instance);
+    try testing.expect(providers.get("wasi:random/insecure@0.2.6").?.host_instance !=
+        providers.get("wasi:random/insecure@0.3.0-rc-2026-03-15").?.host_instance);
+    try testing.expect(providers.get("wasi:random/insecure-seed@0.2.6").?.host_instance !=
+        providers.get("wasi:random/insecure-seed@0.3.0-rc-2026-03-15").?.host_instance);
+    // The 0.3.0 insecure-seed registers under the renamed key
+    // `get-insecure-seed`; the 0.2.x variant retains the old name.
+    try testing.expect(adapter.random_insecure_seed_p3_iface.members.contains("get-insecure-seed"));
+    try testing.expect(adapter.random_insecure_seed_iface.members.contains("insecure-seed"));
 }
 
 test "populateWasiProviders: binds wasi:filesystem/types + preopens (#145)" {
