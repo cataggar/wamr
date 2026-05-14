@@ -76,6 +76,20 @@ the gate against regressions in already-shipped WASI host functions.
 
 [wts]: https://github.com/WebAssembly/wasi-testsuite
 
+## WASI limitations
+
+### `wasi:http` — outbound HTTP only
+
+`wamr`'s `wasi:http/outgoing-handler.handle` issues real outbound HTTP requests
+via `std.http.Client` when a non-empty `sockets_allow_list_template` is
+configured. **`https://` is not yet supported** — Zig 0.16's `std.http.Client`
+does not ship a TLS implementation, and per the project's WASI roadmap
+([#451](https://github.com/cataggar/wamr/issues/451)) we do not reimplement
+TLS in the runtime. `https://` URLs (and any other non-`http` scheme) return
+`error-code::HTTP_protocol_error`. Once upstream Zig lands TLS, this
+restriction will lift (see
+[#477](https://github.com/cataggar/wamr/issues/477)).
+
 ## License
 
 [Apache 2.0](LICENSE)

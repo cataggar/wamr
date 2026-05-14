@@ -8930,9 +8930,17 @@ pub const WasiCliAdapter = struct {
     ///   option<own<request-options>>)
     ///   -> result<own<future-incoming-response>, error-code>`.
     ///
-    /// When `sockets_allow_list_template` is non-empty, performs a real
-    /// outbound HTTP request via `std.http.Client` (#176). Otherwise
-    /// returns `HTTP_request_denied` as before.
+    /// Cleartext-only today (#477): `https://` (or any non-`http`
+    /// scheme) returns `error-code::HTTP_protocol_error`. The
+    /// `std.http.Client` upstream doesn't ship TLS in Zig 0.16, and
+    /// parent issue #451 explicitly disallows reimplementing it in
+    /// the runtime.
+    ///
+    /// When `sockets_allow_list_template` is non-empty AND the
+    /// scheme is `"http"`, performs a real outbound HTTP request via
+    /// `std.http.Client` (#176). Otherwise returns
+    /// `HTTP_request_denied` (empty allow-list) or
+    /// `HTTP_protocol_error` (encrypted / unsupported scheme).
     fn httpOutgoingHandlerHandle(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
@@ -8966,6 +8974,19 @@ pub const WasiCliAdapter = struct {
             1 => "https",
             else => if (r.scheme_other) |s| s else "https",
         } else "https";
+
+        // #477: std.http.Client doesn't ship TLS yet. Refuse `https://`
+        // (and any non-`http` custom scheme) explicitly rather than
+        // silently fall through to a plaintext connect attempt.
+        // `HTTP_protocol_error` (variant 35) is the cleanest existing
+        // `error-code` value: the spec describes it as "the response was
+        // not a valid HTTP response", which subsumes "we could not speak
+        // the requested protocol". Re-evaluate once upstream lands TLS
+        // (then this whole branch goes away and the handler proceeds).
+        // TODO(#477): remove when std.http.Client supports TLS.
+        if (!std.mem.eql(u8, scheme, "http")) {
+            return httpHandlerDeny(self, results, allocator, .HTTP_protocol_error);
+        }
 
         const authority = r.authority orelse {
             return httpHandlerDeny(self, results, allocator, .HTTP_request_URI_invalid);
@@ -14124,6 +14145,97 @@ test "http #176: handle returns denied when allow-list empty" {
 
     const args = [_]InterfaceValue{
         .{ .handle = 0 },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    try testing.expect(fut.state == .ready_err);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        fut.state.ready_err,
+    );
+}
+
+test "http #477: https outgoing-handler returns HTTP_protocol_error (no TLS in std)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Non-empty allow-list so the empty-list deny path doesn't mask
+    // the scheme rejection.
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("0.0.0.0/0");
+    adapter.sockets_allow_list_template = allow;
+
+    // Headers + outgoing-request with scheme = https (disc=1). Both
+    // are pushed into adapter-owned tables; adapter.deinit frees the
+    // strings (duped with adapter.allocator == testing.allocator) and
+    // destroys the structs.
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0, // GET
+        .scheme_disc = 1, // https
+        .authority = try testing.allocator.dupe(u8, "example.com"),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    try testing.expect(fut.state == .ready_err);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)),
+        fut.state.ready_err,
+    );
+}
+
+test "http #477: http outgoing-handler without allow-list returns HTTP_request_denied (regression)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Allow-list intentionally left empty. Build a real `http://`
+    // request so we exercise both branches: the empty-allow-list
+    // check must trigger before the (passing) scheme check.
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0,
+        .scheme_disc = 0, // http
+        .authority = try testing.allocator.dupe(u8, "example.com"),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
         .{ .option_val = .{ .is_some = false, .payload = null } },
     };
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
