@@ -102,6 +102,267 @@ fn socketTypeRegistry() abi.TypeRegistry {
     return abi.TypeRegistry.fromTypes(&socket_local_types);
 }
 
+// ── wasi:filesystem@0.3.0 synthetic type registry (#522) ───────────────────
+//
+// Mirror of the WIT types declared in
+// `wasi-filesystem-0.3.0-rc-2026-03-15/package.wit` that 0.3 async-func
+// wrappers and `read-directory` need to lower into canonical bytes for
+// guest-side `future.read` / `stream.read`. Built as a static
+// `TypeRegistry` rather than threading the per-component registry
+// through every wrapper because the layout is fixed at WIT-spec time.
+//
+// Indices (consult `fs_p3_local_types` below):
+//    0: option<string>                                     (for `other(option<string>)` payloads)
+//    1: variant error-code                                 (38 cases; last is `other(option<string>)`)
+//    2: variant descriptor-type                            (8 cases; last is `other(option<string>)`)
+//    3: flags descriptor-flags                             (6 bits)
+//    4: record instant                                     ({ seconds: s64, nanoseconds: u32 })
+//    5: option<instant>
+//    6: record descriptor-stat                             ({ type, link-count, size, atime?, mtime?, ctime? })
+//    7: record metadata-hash-value                         ({ lower: u64, upper: u64 })
+//    8: record directory-entry                             ({ type, name })
+//    9: result<_, error-code>                              — bare-err returns (sync, set-size, …)
+//   10: result<descriptor (u32), error-code>               — open-at
+//   11: result<descriptor-type, error-code>                — get-type
+//   12: result<descriptor-flags, error-code>               — get-flags
+//   13: result<string, error-code>                         — readlink-at
+//   14: result<descriptor-stat, error-code>                — stat, stat-at
+//   15: result<metadata-hash-value, error-code>            — metadata-hash, metadata-hash-at
+
+const fs_p3_error_code_cases = [_]ctypes.Case{
+    .{ .name = "access", .type = null },
+    .{ .name = "already", .type = null },
+    .{ .name = "bad-descriptor", .type = null },
+    .{ .name = "busy", .type = null },
+    .{ .name = "deadlock", .type = null },
+    .{ .name = "quota", .type = null },
+    .{ .name = "exist", .type = null },
+    .{ .name = "file-too-large", .type = null },
+    .{ .name = "illegal-byte-sequence", .type = null },
+    .{ .name = "in-progress", .type = null },
+    .{ .name = "interrupted", .type = null },
+    .{ .name = "invalid", .type = null },
+    .{ .name = "io", .type = null },
+    .{ .name = "is-directory", .type = null },
+    .{ .name = "loop", .type = null },
+    .{ .name = "too-many-links", .type = null },
+    .{ .name = "message-size", .type = null },
+    .{ .name = "name-too-long", .type = null },
+    .{ .name = "no-device", .type = null },
+    .{ .name = "no-entry", .type = null },
+    .{ .name = "no-lock", .type = null },
+    .{ .name = "insufficient-memory", .type = null },
+    .{ .name = "insufficient-space", .type = null },
+    .{ .name = "not-directory", .type = null },
+    .{ .name = "not-empty", .type = null },
+    .{ .name = "not-recoverable", .type = null },
+    .{ .name = "unsupported", .type = null },
+    .{ .name = "no-tty", .type = null },
+    .{ .name = "no-such-device", .type = null },
+    .{ .name = "overflow", .type = null },
+    .{ .name = "not-permitted", .type = null },
+    .{ .name = "pipe", .type = null },
+    .{ .name = "read-only", .type = null },
+    .{ .name = "invalid-seek", .type = null },
+    .{ .name = "text-file-busy", .type = null },
+    .{ .name = "cross-device", .type = null },
+    // 37th case carries an `option<string>` payload — `other(option<string>)`.
+    // The host never emits this case but the variant size envelope must
+    // account for it so the result-arm alignment matches the guest.
+    .{ .name = "other", .type = .{ .option = 0 } },
+};
+
+const fs_p3_descriptor_type_cases = [_]ctypes.Case{
+    .{ .name = "block-device", .type = null },
+    .{ .name = "character-device", .type = null },
+    .{ .name = "directory", .type = null },
+    .{ .name = "fifo", .type = null },
+    .{ .name = "symbolic-link", .type = null },
+    .{ .name = "regular-file", .type = null },
+    .{ .name = "socket", .type = null },
+    // 7th case carries `option<string>` payload — `other(option<string>)`.
+    .{ .name = "other", .type = .{ .option = 0 } },
+};
+
+const fs_p3_descriptor_flags_names = [_][]const u8{
+    "read",
+    "write",
+    "file-integrity-sync",
+    "data-integrity-sync",
+    "requested-write-sync",
+    "mutate-directory",
+};
+
+const fs_p3_instant_fields = [_]ctypes.Field{
+    .{ .name = "seconds", .type = .s64 },
+    .{ .name = "nanoseconds", .type = .u32 },
+};
+
+const fs_p3_descriptor_stat_fields = [_]ctypes.Field{
+    .{ .name = "type", .type = .{ .variant = 2 } },
+    .{ .name = "link-count", .type = .u64 },
+    .{ .name = "size", .type = .u64 },
+    .{ .name = "data-access-timestamp", .type = .{ .option = 5 } },
+    .{ .name = "data-modification-timestamp", .type = .{ .option = 5 } },
+    .{ .name = "status-change-timestamp", .type = .{ .option = 5 } },
+};
+
+const fs_p3_metadata_hash_fields = [_]ctypes.Field{
+    .{ .name = "lower", .type = .u64 },
+    .{ .name = "upper", .type = .u64 },
+};
+
+const fs_p3_directory_entry_fields = [_]ctypes.Field{
+    .{ .name = "type", .type = .{ .variant = 2 } },
+    .{ .name = "name", .type = .string },
+};
+
+const fs_p3_local_types = [_]ctypes.TypeDef{
+    .{ .option = .{ .inner = .string } }, // 0: option<string>
+    .{ .variant = .{ .cases = &fs_p3_error_code_cases } }, // 1: error-code
+    .{ .variant = .{ .cases = &fs_p3_descriptor_type_cases } }, // 2: descriptor-type
+    .{ .flags = .{ .names = &fs_p3_descriptor_flags_names } }, // 3: descriptor-flags
+    .{ .record = .{ .fields = &fs_p3_instant_fields } }, // 4: instant
+    .{ .option = .{ .inner = .{ .type_idx = 4 } } }, // 5: option<instant>
+    .{ .record = .{ .fields = &fs_p3_descriptor_stat_fields } }, // 6: descriptor-stat
+    .{ .record = .{ .fields = &fs_p3_metadata_hash_fields } }, // 7: metadata-hash-value
+    .{ .record = .{ .fields = &fs_p3_directory_entry_fields } }, // 8: directory-entry
+    .{ .result = .{ .ok = null, .err = .{ .variant = 1 } } }, // 9: result<_, error-code>
+    .{ .result = .{ .ok = .{ .own = 0 }, .err = .{ .variant = 1 } } }, // 10: result<descriptor (own), error-code>
+    .{ .result = .{ .ok = .{ .variant = 2 }, .err = .{ .variant = 1 } } }, // 11: result<descriptor-type, ...>
+    .{ .result = .{ .ok = .{ .flags = 3 }, .err = .{ .variant = 1 } } }, // 12: result<descriptor-flags, ...>
+    .{ .result = .{ .ok = .string, .err = .{ .variant = 1 } } }, // 13: result<string, ...>
+    .{ .result = .{ .ok = .{ .record = 6 }, .err = .{ .variant = 1 } } }, // 14: result<descriptor-stat, ...>
+    .{ .result = .{ .ok = .{ .record = 7 }, .err = .{ .variant = 1 } } }, // 15: result<metadata-hash-value, ...>
+};
+
+const FS_P3_ERROR_CODE_IDX: u32 = 1;
+const FS_P3_DESCRIPTOR_TYPE_IDX: u32 = 2;
+const FS_P3_DESCRIPTOR_FLAGS_IDX: u32 = 3;
+const FS_P3_DESCRIPTOR_STAT_IDX: u32 = 6;
+const FS_P3_METADATA_HASH_IDX: u32 = 7;
+const FS_P3_DIRECTORY_ENTRY_IDX: u32 = 8;
+const FS_P3_RESULT_UNIT_ERR_IDX: u32 = 9;
+const FS_P3_RESULT_DESC_ERR_IDX: u32 = 10;
+const FS_P3_RESULT_DESC_TYPE_ERR_IDX: u32 = 11;
+const FS_P3_RESULT_DESC_FLAGS_ERR_IDX: u32 = 12;
+const FS_P3_RESULT_STRING_ERR_IDX: u32 = 13;
+const FS_P3_RESULT_DESC_STAT_ERR_IDX: u32 = 14;
+const FS_P3_RESULT_METADATA_HASH_ERR_IDX: u32 = 15;
+
+fn fsP3TypeRegistry() abi.TypeRegistry {
+    return abi.TypeRegistry.fromTypes(&fs_p3_local_types);
+}
+
+/// Shape of an `async func` return on the 0.3 `wasi:filesystem/types`
+/// surface. Each shape maps to a `ValType` resolvable in
+/// `fs_p3_local_types`; `fsP3LowerAsyncPayload` consumes a fully-lifted
+/// 0.2-shape `InterfaceValue` and writes its canonical lowering into a
+/// heap-owned `[]u8` ready to install on `Future.payload`.
+const FsP3AsyncReturn = enum {
+    /// `result<_, error-code>`
+    unit_err,
+    /// `result<descriptor, error-code>` — `descriptor` is a u32 own-handle.
+    desc_err,
+    /// `result<descriptor-type, error-code>`
+    desc_type_err,
+    /// `result<descriptor-flags, error-code>`
+    desc_flags_err,
+    /// `result<string, error-code>`
+    string_err,
+    /// `result<descriptor-stat, error-code>` — the 0.2 sync body emits
+    /// the `option<datetime>` timestamps with `.u64` seconds; this
+    /// kind triggers a fixup to `.s64` (matching 0.3's `instant`).
+    desc_stat_err,
+    /// `result<metadata-hash-value, error-code>`
+    metadata_hash_err,
+    /// Bare `bool` — used by `is-same-object`.
+    just_bool,
+
+    pub fn valType(self: FsP3AsyncReturn) ctypes.ValType {
+        return switch (self) {
+            .unit_err => .{ .result = FS_P3_RESULT_UNIT_ERR_IDX },
+            .desc_err => .{ .result = FS_P3_RESULT_DESC_ERR_IDX },
+            .desc_type_err => .{ .result = FS_P3_RESULT_DESC_TYPE_ERR_IDX },
+            .desc_flags_err => .{ .result = FS_P3_RESULT_DESC_FLAGS_ERR_IDX },
+            .string_err => .{ .result = FS_P3_RESULT_STRING_ERR_IDX },
+            .desc_stat_err => .{ .result = FS_P3_RESULT_DESC_STAT_ERR_IDX },
+            .metadata_hash_err => .{ .result = FS_P3_RESULT_METADATA_HASH_ERR_IDX },
+            .just_bool => .bool,
+        };
+    }
+};
+
+/// Fix-up the `option<datetime { u64 seconds, u32 nanoseconds }>` tag the
+/// 0.2 sync body produced into `option<instant { s64 seconds, u32 nanoseconds }>`
+/// for 0.3 canonical lowering. Operates in-place on the `result_val.ok`
+/// payload of a `descriptor-stat` record. The seconds bits are
+/// `@bitCast`-preserved so positive Unix timestamps survive the tag
+/// transition unchanged.
+fn fsP3FixupStatRecord(val: InterfaceValue) void {
+    if (val != .result_val) return;
+    if (!val.result_val.is_ok) return;
+    const ok_ptr = val.result_val.payload orelse return;
+    if (ok_ptr.* != .record_val) return;
+    const rec = ok_ptr.record_val;
+    if (rec.len < 6) return;
+    inline for ([_]usize{ 3, 4, 5 }) |i| {
+        fsP3FixupOptionalInstant(@constCast(&rec[i]));
+    }
+}
+
+fn fsP3FixupOptionalInstant(val_ptr: *InterfaceValue) void {
+    if (val_ptr.* != .option_val) return;
+    if (!val_ptr.option_val.is_some) return;
+    const some_ptr = val_ptr.option_val.payload orelse return;
+    if (some_ptr.* != .record_val) return;
+    const rec = some_ptr.record_val;
+    if (rec.len < 1) return;
+    // The 0.2 body writes `.u64` for the seconds field; reinterpret the
+    // bit pattern as the signed `.s64` 0.3 spec expects.
+    switch (rec[0]) {
+        .u64 => |bits| @constCast(&rec[0]).* = .{ .s64 = @bitCast(bits) },
+        else => {},
+    }
+}
+
+/// Lower a fully-lifted `InterfaceValue` into a heap-owned byte buffer
+/// using the canonical ABI layout for `kind`'s `ValType`. The returned
+/// slice is owned by `allocator` and is suitable for installation on
+/// `async_mod.Future.payload`; the executor's `future_read` arm will
+/// memcpy it into the guest's destination pointer at rendezvous time.
+///
+/// For `result<_, error-code>` (`.unit_err`), the 0.2 sync bodies
+/// conventionally fabricate an empty-tuple `ok` payload — that payload
+/// is irrelevant on the 0.3 wire (the ok arm is unit) and is stripped
+/// before lowering so `storeValReg` doesn't try to lower a non-existent
+/// ok type.
+fn fsP3LowerAsyncPayload(
+    allocator: Allocator,
+    kind: FsP3AsyncReturn,
+    val: InterfaceValue,
+) ![]u8 {
+    const reg = fsP3TypeRegistry();
+    const vt = kind.valType();
+    const size = abi.sizeOfType(reg, vt);
+    if (size == 0) return error.LowerError;
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    @memset(buf, 0);
+
+    // Strip a stray ok-payload from `result<_, error-code>` (the 0.2
+    // sync body emits `.tuple_val = &.{}` which is non-null but the
+    // 0.3 result type's ok arm is null — `storeValReg` would otherwise
+    // unwrap `td.result.ok.?`).
+    var effective = val;
+    if (kind == .unit_err and val == .result_val and val.result_val.is_ok) {
+        effective = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    try abi.storeValReg(buf, 0, vt, effective, reg);
+    return buf;
+}
+
 /// Lower a host slice-of-byte-slices into a canonical
 /// `list<list<u8>>` PtrLen in guest memory. Each inner slice is
 /// `hostAllocAndWrite`'d; the outer buffer holds `n × (u32 ptr, u32 len)`
@@ -6167,19 +6428,22 @@ pub const WasiCliAdapter = struct {
         results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
     }
 
-    // ── wasi:filesystem@0.3.0-* P3 surface (#484) ────────────────────────
+    // ── wasi:filesystem@0.3.0-* P3 surface (#484, #522) ──────────────────
     //
     // The 0.3 WIT replaces the 0.2 sync `descriptor.*` methods with
     // `async func` returning `future<result<...>>`, and replaces the P2
     // `input-stream`/`output-stream` resources with canonical
     // `stream<u8>` handles. The host implementations below consume those
     // surfaces inline and complete each call synchronously — every
-    // returned future is allocated `.ready` so a guest `future.read`
-    // succeeds without parking. The future's `payload` byte slice is
-    // intentionally `null`: the executor-side guest-lifting of the
-    // `result<_, error-code>` payload from the future slot is a wave-D
-    // concern (#489); the wave-C scope is to bind the surface so
-    // components that import the 0.3 interface link successfully.
+    // returned future is allocated `.ready` with its canonical-ABI
+    // payload bytes pre-populated, so a guest `future.read` succeeds
+    // without parking and memcpys the lowered result into its dst.
+    //
+    // The canonical lowering uses the synthetic `fs_p3_local_types`
+    // registry declared at module scope; the executor's `future_read`
+    // arm (`src/component/executor.zig`) already memcpys
+    // `Future.payload.len` bytes into the guest's dst when the future
+    // is `.ready` — no executor changes are required.
     //
     // The same simplification applies to `stream<u8>`: read-via-stream
     // pre-buffers up to a chunk of file data into the AsyncStream FIFO
@@ -6188,16 +6452,18 @@ pub const WasiCliAdapter = struct {
     // drains whatever bytes the guest already pushed into the stream
     // FIFO at call time.
 
-    /// Allocate an already-ready `future<result<_,error-code>>` slot in
-    /// `ci.futures` and return its handle. The `payload` slice is left
-    /// `null` so `Future.deinit` is a no-op for the slot. Callers are
-    /// responsible for releasing any 0.2 `result_val` they computed
-    /// before invoking this helper (see `fsCompleteAsyncSync`).
-    fn spawnReadyFsFuture(ci: *ComponentInstance) !u32 {
+    /// Allocate an already-ready `future<...>` slot in `ci.futures` and
+    /// return its handle. `payload_bytes` is the canonical-ABI lowered
+    /// payload (caller-owned via `ci.allocator`; ownership transfers to
+    /// the future slot — the executor's `future_read` arm frees it on
+    /// consumption). Pass `null` for unit-typed futures
+    /// (`future<()>`) where the executor's fast-path returns zero
+    /// bytes copied to the guest.
+    fn spawnReadyFsFuture(ci: *ComponentInstance, payload_bytes: ?[]u8) !u32 {
         const handle = ci.allocAsyncHandle();
         try ci.futures.put(ci.allocator, handle, .{
             .elem_type_idx = 0,
-            .payload = null,
+            .payload = payload_bytes,
             .state = .ready,
             .write_closed = true,
         });
@@ -6206,10 +6472,10 @@ pub const WasiCliAdapter = struct {
 
     /// Helper for the 21 Tier-A `async func` wrappers: invoke the
     /// existing 0.2 sync body (which writes a `result<X, error-code>`
-    /// `InterfaceValue` into a local results slot), free that value
-    /// (the host-side payload is not threaded through to the guest in
-    /// the wave-C scope — see the section comment above), allocate a
-    /// ready future and write its handle into `results[0]`.
+    /// `InterfaceValue` into a local results slot), lower the value
+    /// into canonical-ABI bytes for `kind`, install the byte buffer on
+    /// a ready future, and write the future handle into `results[0]`.
+    /// (#484, #522 — payload lift)
     fn fsCompleteAsyncSync(
         ci: *ComponentInstance,
         results: []InterfaceValue,
@@ -6217,80 +6483,88 @@ pub const WasiCliAdapter = struct {
         ctx_opaque: ?*anyopaque,
         args: []const InterfaceValue,
         allocator: Allocator,
+        kind: FsP3AsyncReturn,
     ) anyerror!void {
         if (results.len == 0) return error.InvalidArgs;
         var inner_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
         try sync_body(ctx_opaque, ci, args, &inner_results, allocator);
-        // The 0.2 body owns its result through `allocator`; release it.
-        inner_results[0].deinit(allocator);
-        const handle = try spawnReadyFsFuture(ci);
+        defer inner_results[0].deinit(allocator);
+
+        // 0.2 stat results carry `.u64` seconds; 0.3 spec uses signed
+        // `instant.seconds`. Patch the InterfaceValue tag before lowering.
+        if (kind == .desc_stat_err) fsP3FixupStatRecord(inner_results[0]);
+
+        // Lower into a canonical-ABI byte buffer allocated against
+        // `ci.allocator` so the `Future`/executor lifecycle frees it.
+        const payload = try fsP3LowerAsyncPayload(ci.allocator, kind, inner_results[0]);
+        const handle = try spawnReadyFsFuture(ci, payload);
         results[0] = .{ .handle = handle };
     }
 
     // ── Tier A: async-func wrappers over the 0.2 sync bodies ───────────
 
     fn fsDescriptorAdviseP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorAdvise, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorAdvise, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorCreateDirectoryAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorCreateDirectoryAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorCreateDirectoryAt, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorGetFlagsP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorGetFlags, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorGetFlags, ctx, args, allocator, .desc_flags_err);
     }
     fn fsDescriptorGetTypeP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorGetType, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorGetType, ctx, args, allocator, .desc_type_err);
     }
     fn fsDescriptorIsSameObjectP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorIsSameObject, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorIsSameObject, ctx, args, allocator, .just_bool);
     }
     fn fsDescriptorLinkAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorLinkAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorLinkAt, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorMetadataHashP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorMetadataHash, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorMetadataHash, ctx, args, allocator, .metadata_hash_err);
     }
     fn fsDescriptorMetadataHashAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorMetadataHashAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorMetadataHashAt, ctx, args, allocator, .metadata_hash_err);
     }
     fn fsDescriptorOpenAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorOpenAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorOpenAt, ctx, args, allocator, .desc_err);
     }
     fn fsDescriptorReadlinkAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorReadlinkAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorReadlinkAt, ctx, args, allocator, .string_err);
     }
     fn fsDescriptorRemoveDirectoryAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorRemoveDirectoryAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorRemoveDirectoryAt, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorRenameAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorRenameAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorRenameAt, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorSetSizeP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetSize, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetSize, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorSetTimesP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetTimes, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetTimes, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorSetTimesAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetTimesAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetTimesAt, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorStatP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorStat, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorStat, ctx, args, allocator, .desc_stat_err);
     }
     fn fsDescriptorStatAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorStatAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorStatAt, ctx, args, allocator, .desc_stat_err);
     }
     fn fsDescriptorSymlinkAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorSymlinkAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSymlinkAt, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorSyncP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorSync, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSync, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorSyncDataP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorSyncData, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSyncData, ctx, args, allocator, .unit_err);
     }
     fn fsDescriptorUnlinkFileAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
-        try fsCompleteAsyncSync(ci, results, &fsDescriptorUnlinkFileAt, ctx, args, allocator);
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorUnlinkFileAt, ctx, args, allocator, .unit_err);
     }
 
     // ── Tier B: canonical stream<u8> read/write/append ─────────────────
@@ -6318,14 +6592,50 @@ pub const WasiCliAdapter = struct {
         return handle;
     }
 
+    /// Build the canonical-ABI bytes for a `result<_, error-code>::ok`
+    /// payload. Owned by `ci.allocator`. The bytes are pre-zeroed past
+    /// the discriminant so the `_` arm has no observable state.
+    fn fsP3UnitOkPayload(ci: *ComponentInstance) ![]u8 {
+        const val = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = null } };
+        return fsP3LowerAsyncPayload(ci.allocator, .unit_err, val);
+    }
+
+    /// Build the canonical-ABI bytes for a `result<_, error-code>::err(code)`
+    /// payload. Owned by `ci.allocator`.
+    fn fsP3UnitErrPayload(ci: *ComponentInstance, code: FsErrorCode) ![]u8 {
+        var err_variant = InterfaceValue{ .variant_val = .{
+            .discriminant = @intFromEnum(code),
+            .payload = null,
+        } };
+        const val = InterfaceValue{ .result_val = .{ .is_ok = false, .payload = &err_variant } };
+        return fsP3LowerAsyncPayload(ci.allocator, .unit_err, val);
+    }
+
+    /// Spawn a ready `future<result<_, error-code>>` that resolves to ok.
+    fn spawnReadyOkFsFuture(ci: *ComponentInstance) !u32 {
+        const payload = try fsP3UnitOkPayload(ci);
+        errdefer ci.allocator.free(payload);
+        return try spawnReadyFsFuture(ci, payload);
+    }
+
+    /// Spawn a ready `future<result<_, error-code>>` that resolves to err.
+    fn spawnReadyErrFsFuture(ci: *ComponentInstance, code: FsErrorCode) !u32 {
+        const payload = try fsP3UnitErrPayload(ci, code);
+        errdefer ci.allocator.free(payload);
+        return try spawnReadyFsFuture(ci, payload);
+    }
+
     /// Build the `tuple<stream<u8>, future<...>>` returned by
     /// `read-via-stream` on an error path: a closed empty stream plus a
-    /// ready future. The future signals success-by-readiness; the
-    /// distinction "ok vs err" is encoded in the (currently elided)
-    /// future payload — see the wave-D follow-up note above.
-    fn fsReadStreamErrorTuple(ci: *ComponentInstance, allocator: Allocator) !InterfaceValue {
+    /// ready future that already carries the canonical `err(code)`
+    /// payload bytes the guest will observe via `future.read`.
+    fn fsReadStreamErrorTuple(
+        ci: *ComponentInstance,
+        allocator: Allocator,
+        code: FsErrorCode,
+    ) !InterfaceValue {
         const stream_handle = try spawnEmptyClosedStream(ci);
-        const future_handle = try spawnReadyFsFuture(ci);
+        const future_handle = try spawnReadyErrFsFuture(ci, code);
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_handle };
         fields[1] = .{ .handle = future_handle };
@@ -6333,12 +6643,15 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]descriptor.read-via-stream: func(offset: filesize)
-    ///   -> tuple<stream<u8>, future<result<_, error-code>>>` (#484).
+    ///   -> tuple<stream<u8>, future<result<_, error-code>>>` (#484, #522).
     ///
     /// The host pread()s up to `FS_STREAM_BUFFER_CAP` bytes from the
     /// file at `offset` into a freshly-allocated `AsyncStream`. The
     /// stream's `write_closed` flag is set so a subsequent guest
-    /// `stream.read` observes EOF once the FIFO is drained.
+    /// `stream.read` observes EOF once the FIFO is drained. The
+    /// returned future carries the canonical-ABI ok/err payload bytes
+    /// so `future.read` lifts the proper `result<_, error-code>` to the
+    /// guest at rendezvous time.
     fn fsDescriptorReadViaStreamP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -6358,18 +6671,18 @@ pub const WasiCliAdapter = struct {
         };
 
         const d = self.lookupFsDescriptor(handle) orelse {
-            results[0] = try fsReadStreamErrorTuple(ci, allocator);
+            results[0] = try fsReadStreamErrorTuple(ci, allocator, .bad_descriptor);
             return;
         };
         const fs_file: FsDescriptor.FsFile = switch (d.*) {
             .file => |f| f,
             .dir, .preopen => {
-                results[0] = try fsReadStreamErrorTuple(ci, allocator);
+                results[0] = try fsReadStreamErrorTuple(ci, allocator, .is_directory);
                 return;
             },
         };
         if (!fs_file.flags.read) {
-            results[0] = try fsReadStreamErrorTuple(ci, allocator);
+            results[0] = try fsReadStreamErrorTuple(ci, allocator, .access);
             return;
         }
 
@@ -6394,7 +6707,7 @@ pub const WasiCliAdapter = struct {
 
         try ci.streams.put(ci.allocator, stream_handle, slot);
 
-        const future_handle = try spawnReadyFsFuture(ci);
+        const future_handle = try spawnReadyOkFsFuture(ci);
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_handle };
         fields[1] = .{ .handle = future_handle };
@@ -6459,8 +6772,9 @@ pub const WasiCliAdapter = struct {
     }
 
     /// Common helper: drain the canonical stream FIFO and write its
-    /// contents to the file. On any error path, still returns a ready
-    /// future (the err-arm payload encoding is wave-D scope).
+    /// contents to the file. Returns a ready `future<result<_,
+    /// error-code>>` whose canonical payload reflects whether the
+    /// drain succeeded.
     fn fsWriteFromStream(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
@@ -6470,18 +6784,18 @@ pub const WasiCliAdapter = struct {
         append: bool,
         results: []InterfaceValue,
     ) !void {
-        const future_handle_on_err = blk: {
+        const future_handle: u32 = blk: {
             const d = self.lookupFsDescriptor(desc_handle) orelse {
-                break :blk try spawnReadyFsFuture(ci);
+                break :blk try spawnReadyErrFsFuture(ci, .bad_descriptor);
             };
             const fs_file: FsDescriptor.FsFile = switch (d.*) {
                 .file => |f| f,
-                .dir, .preopen => break :blk try spawnReadyFsFuture(ci),
+                .dir, .preopen => break :blk try spawnReadyErrFsFuture(ci, .is_directory),
             };
-            if (!fs_file.flags.write) break :blk try spawnReadyFsFuture(ci);
+            if (!fs_file.flags.write) break :blk try spawnReadyErrFsFuture(ci, .access);
 
             const slot = ci.streams.getPtr(stream_handle) orelse {
-                break :blk try spawnReadyFsFuture(ci);
+                break :blk try spawnReadyErrFsFuture(ci, .bad_descriptor);
             };
 
             // Drain the FIFO in-place.
@@ -6492,40 +6806,173 @@ pub const WasiCliAdapter = struct {
                 const stat = fs_file.file.stat(io) catch break :blk_off offset;
                 break :blk_off stat.size;
             } else offset;
-            fs_file.file.writePositionalAll(io, bytes, write_offset) catch {};
+            fs_file.file.writePositionalAll(io, bytes, write_offset) catch |err| {
+                slot.buffer.clearRetainingCapacity();
+                break :blk try spawnReadyErrFsFuture(ci, mapFsError(err));
+            };
             slot.buffer.clearRetainingCapacity();
 
-            break :blk try spawnReadyFsFuture(ci);
+            break :blk try spawnReadyOkFsFuture(ci);
         };
-        results[0] = .{ .handle = future_handle_on_err };
+        results[0] = .{ .handle = future_handle };
     }
 
     // ── Tier C: canonical stream<directory-entry> ──────────────────────
 
     /// `[method]descriptor.read-directory: func()
     ///   -> tuple<stream<directory-entry>, future<result<_, error-code>>>`
-    /// (#484).
+    /// (#484, #522).
     ///
-    /// The full canonical lift of `directory-entry` records into the
-    /// stream FIFO is wave-D scope (the `record` element-type lowering
-    /// path is gated on the executor's stream rendezvous). This wave-C
-    /// binding allocates an empty closed stream + a ready future so the
-    /// surface links and a guest `stream.read` immediately observes
-    /// stream-end.
+    /// Eagerly enumerates the directory via `std.Io.Dir.Iterator` (the
+    /// iterator embeds a ~2 KiB read buffer with a self-pointer that
+    /// `.next()` re-fixes each call — heap allocation is safe). Each
+    /// entry is lowered into the canonical `directory-entry` record
+    /// layout `{ type: descriptor-type, name: string }` and appended to
+    /// the AsyncStream FIFO so guests can `stream.read` one entry per
+    /// rendezvous. The writable end is closed up-front so a subsequent
+    /// drain observes stream-end naturally; the companion future
+    /// settles to `ok` (or `err(code)` on enumeration failure).
     fn fsDescriptorReadDirectoryP3(
-        _: ?*anyopaque,
+        ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
     ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
         if (args.len < 1 or results.len == 0) return error.InvalidArgs;
-        const stream_handle = try spawnEmptyClosedStream(ci);
-        const future_handle = try spawnReadyFsFuture(ci);
+        const desc_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(desc_handle) orelse {
+            results[0] = try fsReadDirectoryErrorTuple(ci, allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsReadDirectoryErrorTuple(ci, allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().read) {
+            results[0] = try fsReadDirectoryErrorTuple(ci, allocator, .access);
+            return;
+        }
+
+        // Allocate the canonical stream<directory-entry> slot. The
+        // element size is computed from `fs_p3_local_types[DIRECTORY_ENTRY_IDX]`
+        // — the executor's `stream.read t` op carries the guest's
+        // `directory-entry` type idx, which has the same canonical
+        // layout (string + variant<8>). Each guest read consumes one
+        // entry-worth of bytes from the FIFO.
+        const stream_handle = ci.allocAsyncHandle();
+        var slot: async_mod.AsyncStream = .{
+            .elem_type_idx = 0,
+            .state = .open,
+            .read_closed = false,
+            .write_closed = true, // host streams the whole listing upfront.
+        };
+        errdefer slot.deinit(ci.allocator);
+
+        // Heap-allocate the iterator: its struct embeds a ~2 KiB read
+        // buffer whose self-pointer is fixed up on every `.next()`
+        // call, so moving it into the heap is safe (memory note
+        // verified at lib/std/Io/Dir.zig:180-209).
+        const iter = try ci.allocator.create(std.Io.Dir.Iterator);
+        defer ci.allocator.destroy(iter);
+        iter.* = base_dir.iterate();
+
+        const reg = fsP3TypeRegistry();
+        const entry_t: ctypes.ValType = .{ .record = FS_P3_DIRECTORY_ENTRY_IDX };
+        const entry_size = abi.sizeOfType(reg, entry_t);
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var enum_err: ?FsErrorCode = null;
+        while (true) {
+            const maybe_entry = iter.next(io) catch |err| {
+                enum_err = mapFsError(err);
+                break;
+            };
+            const entry = maybe_entry orelse break;
+            // Skip names that aren't valid UTF-8 — WIT `string` is
+            // strict UTF-8 (mirrors the 0.2 `read-directory-entry`
+            // surfacing of `illegal-byte-sequence`).
+            if (!std.unicode.utf8ValidateSlice(entry.name)) {
+                enum_err = .illegal_byte_sequence;
+                break;
+            }
+
+            const dt: DescType = switch (entry.kind) {
+                .directory => .directory,
+                .file => .regular_file,
+                .block_device => .block_device,
+                .character_device => .character_device,
+                .named_pipe => .fifo,
+                .sym_link => .symbolic_link,
+                .unix_domain_socket => .socket,
+                else => .unknown,
+            };
+
+            // Copy the name into guest memory so the lowered string
+            // ptr survives past this iteration (the iterator buffer is
+            // overwritten on the next call).
+            const name_ptr: u32 = if (entry.name.len == 0)
+                0
+            else
+                (ci.hostAllocAndWrite(entry.name) orelse {
+                    enum_err = .insufficient_memory;
+                    break;
+                });
+
+            const type_variant = InterfaceValue{ .variant_val = .{
+                .discriminant = @intFromEnum(dt),
+                .payload = null,
+            } };
+            const record_fields = [_]InterfaceValue{
+                type_variant,
+                .{ .string = .{ .ptr = name_ptr, .len = @intCast(entry.name.len) } },
+            };
+            const record_val = InterfaceValue{ .record_val = &record_fields };
+
+            // Lower this entry into a per-entry buffer and append to
+            // the stream FIFO. We allocate inline rather than via the
+            // helper because the bytes immediately move into the
+            // long-lived FIFO.
+            const slot_buf = try allocator.alloc(u8, entry_size);
+            defer allocator.free(slot_buf);
+            @memset(slot_buf, 0);
+            abi.storeValReg(slot_buf, 0, entry_t, record_val, reg) catch {
+                enum_err = .io;
+                break;
+            };
+            try slot.buffer.appendSlice(ci.allocator, slot_buf);
+        }
+
+        try ci.streams.put(ci.allocator, stream_handle, slot);
+
+        const future_handle: u32 = if (enum_err) |code|
+            try spawnReadyErrFsFuture(ci, code)
+        else
+            try spawnReadyOkFsFuture(ci);
+
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_handle };
         fields[1] = .{ .handle = future_handle };
         results[0] = .{ .tuple_val = fields };
+    }
+
+    /// Mirror of `fsReadStreamErrorTuple` for the `read-directory` shape.
+    fn fsReadDirectoryErrorTuple(
+        ci: *ComponentInstance,
+        allocator: Allocator,
+        code: FsErrorCode,
+    ) !InterfaceValue {
+        const stream_handle = try spawnEmptyClosedStream(ci);
+        const future_handle = try spawnReadyErrFsFuture(ci, code);
+        const fields = try allocator.alloc(InterfaceValue, 2);
+        fields[0] = .{ .handle = stream_handle };
+        fields[1] = .{ .handle = future_handle };
+        return .{ .tuple_val = fields };
     }
 
     /// `wasi:filesystem/types.[resource-drop]descriptor: (own<descriptor>) -> ()`.
@@ -16329,6 +16776,311 @@ test "wasi:filesystem@0.3.0 set-size: file is resized + future settles (#484)" {
 
     const stat = try file.stat(io);
     try testing.expectEqual(@as(u64, 128), stat.size);
+}
+
+test "wasi:filesystem@0.3.0 open-at: future payload decodes to result<descriptor, error-code> (#522)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "openat.txt", .data = "hello" });
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    // tmp.dir is owned by `tmp`; nulling the slot before adapter.deinit
+    // avoids the use-after-free `closeFd: .BADF` on Linux.
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // open-at args: (borrow<descriptor>, path-flags, path, open-flags, descriptor-flags)
+    const path_ptr = ci.hostAllocAndWrite("openat.txt").?;
+    const path_flags = try testing.allocator.alloc(u32, 1);
+    defer testing.allocator.free(path_flags);
+    path_flags[0] = 1; // symlink-follow
+    const open_flags = try testing.allocator.alloc(u32, 1);
+    defer testing.allocator.free(open_flags);
+    open_flags[0] = 0;
+    const desc_flags = try testing.allocator.alloc(u32, 1);
+    defer testing.allocator.free(desc_flags);
+    desc_flags[0] = 1; // read
+
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .flags_val = path_flags },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("openat.txt".len) } },
+        .{ .flags_val = open_flags },
+        .{ .flags_val = desc_flags },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAtP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    // result<descriptor (own), error-code> canonical size = 1 + 3pad + max(4, 16) = 20 bytes.
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
+    // ok arm → discriminant byte = 0.
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[0]);
+    // ok payload at offset 4: u32 descriptor handle.
+    const opened_handle = std.mem.readInt(u32, fut.payload.?[4..8], .little);
+    try testing.expect(opened_handle < adapter.fs_descriptor_table.items.len);
+    try testing.expect(adapter.fs_descriptor_table.items[opened_handle] != null);
+}
+
+test "wasi:filesystem@0.3.0 open-at: missing path → future payload encodes err(no-entry) (#522)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const path_ptr = ci.hostAllocAndWrite("does-not-exist").?;
+    const empty_flags = try testing.allocator.alloc(u32, 1);
+    defer testing.allocator.free(empty_flags);
+    empty_flags[0] = 0;
+
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .flags_val = empty_flags },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("does-not-exist".len) } },
+        .{ .flags_val = empty_flags },
+        .{ .flags_val = empty_flags },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAtP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
+    // err arm → discriminant byte = 1.
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
+    // error-code variant disc at offset 4: no-entry = 20.
+    try testing.expectEqual(@as(u8, @intFromEnum(FsErrorCode.no_entry)), fut.payload.?[4]);
+}
+
+test "wasi:filesystem@0.3.0 read-directory: enumerates a 3-entry tmp dir (#522)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // `tmpDir(.{})` opens a non-iterable directory by default; pass
+    // `.iterate = true` so `Dir.Iterator.next` actually yields entries.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "alpha.txt", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beta.txt", .data = "b" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gamma.txt", .data = "c" });
+
+    const dir_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[dir_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    var args = [_]InterfaceValue{.{ .handle = dir_handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorReadDirectoryP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .tuple_val);
+    try testing.expectEqual(@as(usize, 2), results[0].tuple_val.len);
+
+    const stream_handle = results[0].tuple_val[0].handle;
+    const stream_slot = ci.streams.getPtr(stream_handle).?;
+    // Writable end closed up-front: stream-end naturally observed
+    // once the FIFO has been drained.
+    try testing.expect(stream_slot.write_closed);
+
+    // Each `directory-entry` is record { variant<8> type, string name };
+    // 3 entries → 3 × entry_size bytes.
+    const reg = fsP3TypeRegistry();
+    const entry_size = abi.sizeOfType(reg, .{ .record = FS_P3_DIRECTORY_ENTRY_IDX });
+    try testing.expectEqual(@as(usize, 3 * entry_size), stream_slot.buffer.items.len);
+
+    // Companion future settles ok (enumeration succeeded).
+    const fut_handle = results[0].tuple_val[1].handle;
+    const fut = ci.futures.getPtr(fut_handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok arm
+}
+
+test "wasi:filesystem@0.3.0 read-directory: not-a-directory → err(not-directory) (#522)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "f", .data = "x" });
+    const file = try tmp.dir.openFile(io, "f", .{ .mode = .read_only });
+    const file_handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    var args = [_]InterfaceValue{.{ .handle = file_handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorReadDirectoryP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .tuple_val);
+    const fut_handle = results[0].tuple_val[1].handle;
+    const fut = ci.futures.getPtr(fut_handle).?;
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]); // err arm
+    try testing.expectEqual(@as(u8, @intFromEnum(FsErrorCode.not_directory)), fut.payload.?[4]);
+}
+
+test "wasi:filesystem@0.3.0 stat-at: future payload decodes to result<descriptor-stat, error-code> (#522)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "statme.txt", .data = "hello-statme" });
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const path_ptr = ci.hostAllocAndWrite("statme.txt").?;
+    const empty_flags = try testing.allocator.alloc(u32, 1);
+    defer testing.allocator.free(empty_flags);
+    empty_flags[0] = 0;
+
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .flags_val = empty_flags },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("statme.txt".len) } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorStatAtP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+
+    // Canonical size of result<descriptor-stat, error-code>:
+    //   disc(1) + 7pad (align to 8) + payload_size(=descriptor-stat size).
+    const reg = fsP3TypeRegistry();
+    const stat_size = abi.sizeOfType(reg, .{ .result = FS_P3_RESULT_DESC_STAT_ERR_IDX });
+    try testing.expectEqual(@as(usize, stat_size), fut.payload.?.len);
+    // ok arm.
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[0]);
+
+    // descriptor-stat fields begin at offset 8 (after disc + 7 pad).
+    // `type` field is the descriptor-type variant; for a regular file
+    // the discriminant matches DescType.regular_file.
+    try testing.expectEqual(@as(u8, @intFromEnum(WasiCliAdapter.DescType.regular_file)), fut.payload.?[8]);
+
+    // `size` field — third record member at offset 8 + 16 (type variant) + 8 (link-count u64) = 32.
+    const size_val = std.mem.readInt(u64, fut.payload.?[8 + 16 + 8 ..][0..8], .little);
+    try testing.expectEqual(@as(u64, "hello-statme".len), size_val);
+}
+
+test "wasi:filesystem@0.3.0 link-at: future payload encodes result<_, error-code> ok (#522)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "src.txt", .data = "original" });
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const old_path_ptr = ci.hostAllocAndWrite("src.txt").?;
+    const new_path_ptr = ci.hostAllocAndWrite("dst.txt").?;
+    const flags = try testing.allocator.alloc(u32, 1);
+    defer testing.allocator.free(flags);
+    flags[0] = 0;
+
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .flags_val = flags },
+        .{ .string = .{ .ptr = old_path_ptr, .len = @intCast("src.txt".len) } },
+        .{ .handle = preopen_handle },
+        .{ .string = .{ .ptr = new_path_ptr, .len = @intCast("dst.txt".len) } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorLinkAtP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    // result<_, error-code> canonical size = 1 + 3pad + 16 = 20 bytes.
+    try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
+    // Disc byte 0 on a successful hard link; some hosts (notably
+    // Windows where hardlinks need elevation, or noexec fs mounts on
+    // CI runners) may reject the operation — accept either ok or a
+    // well-formed err arm.
+    try testing.expect(fut.payload.?[0] == 0 or fut.payload.?[0] == 1);
 }
 
 test "populateWasiProviders: wasi:filesystem@0.2 and @0.3 coexist independently (#484)" {
