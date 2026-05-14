@@ -464,7 +464,12 @@ pub fn countUsesOfVReg(func: *const ir.IrFunction, vreg: ir.VReg) u32 {
     return count;
 }
 
-fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
+/// Rewrite every operand use of `old` in `inst` to `new`. Does not touch
+/// `inst.dest` (defs are not uses). Exposed pub so passes outside this
+/// file (e.g. `ir/range_split.zig` — live-range splitting) can rewrite
+/// uses in a scheduled instruction stream without re-implementing the
+/// op-by-op switch.
+pub fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
     switch (inst.op) {
         .iconst_32,
         .iconst_64,

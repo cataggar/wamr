@@ -1159,9 +1159,35 @@ fn dispatchAsyncCanon(
                 return;
             };
 
+            // Unit-type fast-path (#487): when a writer marks the future
+            // `.ready` with no payload (e.g. `future<()>` or
+            // `future<result<_,_>>` with absent payload), `future.read`
+            // succeeds immediately with zero bytes copied. Must precede
+            // the writer-dropped check below so a host-completed unit
+            // future is not mis-reported as cancelled.
+            if (fut.state == .ready and fut.payload == null) {
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
             // Writer dropped without ever delivering a value → cancelled.
             if (fut.write_closed and fut.payload == null) {
                 env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // Unit-type (`future<()>`) fast-path (#483): a `wait-for` /
+            // `wait-until` timer fired and set `state = .ready` with no
+            // payload — there are zero bytes to copy. Distinct from the
+            // writer-dropped cancelled case above because `write_closed`
+            // is false here. `count = 1` reports one unit element.
+            if (fut.state == .ready and fut.payload == null and !fut.write_closed) {
+                fut.state = .closed;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator);
+                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
                     return error.StackOverflow;
                 return;
             }
