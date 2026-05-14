@@ -17,6 +17,7 @@ const range_split = @import("../../ir/range_split.zig");
 const range_split_debug = false;
 const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
+const local_init = @import("../../ir/local_init.zig");
 
 /// Simple VReg → physical register mapping.
 ///
@@ -1432,7 +1433,9 @@ pub fn compileFunctionImpl(
     try code.ldrImm(.x20, .x19, 0);
 
     // Spill VMContext (x0) and wasm params (x1..x7) to their frame slots.
-    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, hrp_save_off, frame_size, allocator);
+    const needs_init = try local_init.computeNeedsInit(allocator, func);
+    defer allocator.free(needs_init);
+    try emitEntrySpill(&code, func.*, local_layout.offsets, fctx.local_types, needs_init, hrp_save_off, frame_size, allocator);
 
     var block_offsets = try allocator.alloc(usize, func.blocks.items.len);
     defer allocator.free(block_offsets);
@@ -1966,11 +1969,19 @@ fn buildCallAbiPlan(
 /// Spill x0 (VMContext) and x1..x7 (wasm params) to their frame slots, and
 /// zero-initialize declared locals. Must be called right after emitPrologue
 /// and before any vreg allocation so we don't clobber these ABI regs.
+///
+/// `needs_init` (length == func.local_count) is a per-local bitmap. If
+/// `needs_init[i]` is false for `i ≥ param_count`, the wasm spec
+/// guarantee "non-param locals start at zero" is satisfied without
+/// emitting a prologue store because every reachable `local_get i` is
+/// dominated by a `local_set i`. Parameter indices are always treated
+/// as initialised by the caller's ABI spill regardless of the bitmap.
 fn emitEntrySpill(
     code: *emit.CodeBuffer,
     func: ir.IrFunction,
     local_offsets: []const u32,
     local_types: []const ir.IrType,
+    needs_init: []const bool,
     hrp_save_off: u32,
     frame_size: u32,
     allocator: std.mem.Allocator,
@@ -2023,25 +2034,62 @@ fn emitEntrySpill(
         }
     }
 
-    // Zero-init declared locals (wasm spec requires non-param locals to be 0).
-    // Scalar/reference slots are 8-byte host slots; v128 slots are zeroed with
-    // a full 128-bit Q store.
+    // Zero-init declared locals (wasm spec requires non-param locals to be 0)
+    // for those flagged by `needs_init`. Skipped locals are provably
+    // overwritten by a `local_set` before any `local_get` on every
+    // reachable path, so the store is dead.
+    //
+    // Pre-scan: see whether any scalar / any v128 slot needs init so we
+    // only materialise the zero value(s) when at least one store will
+    // be emitted.
+    var any_scalar = false;
+    var any_v128 = false;
     if (func.local_count > func.param_count) {
-        try code.movz(RegMap.tmp0, 0, 0);
-        var zeroed_v128 = false;
         var j: u32 = func.param_count;
         while (j < func.local_count) : (j += 1) {
+            if (!needs_init[@intCast(j)]) continue;
+            if (localTypeAt(local_types, j) == .v128) any_v128 = true else any_scalar = true;
+        }
+    }
+    if (any_scalar) try code.movz(RegMap.tmp0, 0, 0);
+    if (any_v128) try code.movi2dZero(v128_tmp0);
+
+    if (func.local_count > func.param_count) {
+        var j: u32 = func.param_count;
+        while (j < func.local_count) {
+            if (!needs_init[@intCast(j)]) {
+                j += 1;
+                continue;
+            }
             const offset = local_offsets[@intCast(j)];
             if (localTypeAt(local_types, j) == .v128) {
-                if (!zeroed_v128) {
-                    try code.movi2dZero(v128_tmp0);
-                    zeroed_v128 = true;
-                }
                 try frameAddr(code, RegMap.tmp1, offset);
                 try code.strQ(v128_tmp0, RegMap.tmp1);
-            } else {
-                try frameStore(code, RegMap.tmp0, offset);
+                j += 1;
+                continue;
             }
+
+            // Try to fuse with the next slot into a single STP. Two
+            // adjacent scalar slots whose offsets are 8 apart and whose
+            // base offset / 8 fits the STP signed-imm7 encoding can be
+            // written with a single 16-byte `stp tmp0, tmp0, [fp,#N]`.
+            if (j + 1 < func.local_count and
+                needs_init[@intCast(j + 1)] and
+                localTypeAt(local_types, j + 1) != .v128)
+            {
+                const next_off = local_offsets[@intCast(j + 1)];
+                if (next_off == offset + 8 and offset % 8 == 0) {
+                    const scaled = offset / 8;
+                    // STP signed imm7 is in [-64, 63] in 8-byte units.
+                    if (scaled <= 63) {
+                        try code.stpImm(RegMap.tmp0, RegMap.tmp0, .fp, @intCast(scaled));
+                        j += 2;
+                        continue;
+                    }
+                }
+            }
+            try frameStore(code, RegMap.tmp0, offset);
+            j += 1;
         }
     }
 }
@@ -11156,8 +11204,12 @@ test "compile: v128 local zero-init uses full-width store without clobbering sca
     defer func.deinit();
     func.local_types = try allocator.dupe(ir.IrType, &[_]ir.IrType{ .v128, .i32 });
     const bid = try func.newBlock();
+    // Read both locals before any set so the prologue zero-init must
+    // be preserved (see issue #468 — define-before-use skip).
+    const v_dummy = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v_dummy, .type = .v128 });
     const ret = func.newVReg();
-    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = ret, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 1 }, .dest = ret, .type = .i32 });
     try func.getBlock(bid).append(.{ .op = .{ .ret = ret } });
 
     const code = try compileFunction(&func, allocator);
@@ -11215,7 +11267,10 @@ test "compile: v128 local set/get uses Q stack traffic" {
 
     const counts = countQMemOps(code);
     try std.testing.expect(counts.loads >= 1);
-    try std.testing.expect(counts.stores >= 2);
+    // Q stores: the prologue zero-init can be skipped under issue #468
+    // because the local is set before any get; only the local_set Q
+    // store is required.
+    try std.testing.expect(counts.stores >= 1);
 }
 
 test "load: size 8 (i64) emits 64-bit LDR X" {
@@ -11971,37 +12026,86 @@ test "compile: param spill — STR x1 into first local slot" {
     try std.testing.expectEqual(@as(u32, 0xF9000FA1), str_param);
 }
 
-test "compile: zero-init of declared local (beyond params)" {
-    // 0 params, 2 locals. After pinning vmctx + memory_base, we MOVZ x16,#0
-    // then STR x16 to both local slots.
+test "compile: zero-init of declared local (beyond params) fuses into STP" {
+    // 0 params, 2 declared locals, both read before being set so the
+    // prologue zero-init is preserved (issue #468). The two adjacent
+    // 8-byte zero stores fuse into a single `stp xzr-via-tmp0, tmp0,
+    // [fp, #24]`.
     const allocator = std.testing.allocator;
     var func = ir.IrFunction.init(allocator, 0, 1, 2);
     defer func.deinit();
     const bid = try func.newBlock();
-    const v0 = func.newVReg();
-    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v0, .type = .i32 });
-    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    const r0 = func.newVReg();
+    const r1 = func.newVReg();
+    const sum = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = r0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 1 }, .dest = r1, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .add = .{ .lhs = r0, .rhs = r1 } }, .dest = sum, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = sum } });
     const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
     defer allocator.free(code);
-    // Layout (small-frame prologue, 2 words — spill region sized
-    // dynamically from vreg count so this function's frame fits in the
-    // STP pre-index scaled imm7 range):
+    // Layout (small-frame prologue):
     //   [0]   STP FP, LR, [SP, #-frame_size]!
     //   [4]   MOV FP, SP
     //   [8]..[44] 10× callee-save STR (40 bytes)
     //   [48]  MOV x19, x0 (#465 vmctx pin)
     //   [52]  LDR x20, [x19, #0] (#466 memory_base pin)
     //   [56]  MOVZ x16, #0
-    //   [60]/[64]  STR x16 → locals
+    //   [60]  STP x16, x16, [fp, #24] (fused 16-byte zero store, issue #468)
     const movz_word = std.mem.readInt(u32, code[56..][0..4], .little);
-    // MOVZ X16, #0, LSL #0 = 0xD2800000 | (0<<5) | 16 = 0xD2800010
     try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
+    // STP x16, x16, [fp, #24]: imm7=3 (#24/8), rt2=16, rn=29(fp), rt1=16
+    //   0xA9000000 | (3 << 15) | (16 << 10) | (29 << 5) | 16
+    const stp_word = std.mem.readInt(u32, code[60..][0..4], .little);
+    const expected_stp: u32 = 0xA9000000 |
+        (@as(u32, 3) << 15) |
+        (@as(u32, 16) << 10) |
+        (@as(u32, 29) << 5) |
+        16;
+    try std.testing.expectEqual(expected_stp, stp_word);
+}
+
+test "compile: prologue zero-init skipped when local is definitely set before any get (#468)" {
+    // 0 params, 1 declared local that is set before any read. The
+    // wasm spec zero-init store can be skipped because every reachable
+    // `local_get` is dominated by a `local_set`.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .local_set = .{ .idx = 0, .val = v0 } } });
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v1, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v1 } });
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
+    defer allocator.free(code);
+    // Word at offset 56 is the slot right after the vmctx + memory_base
+    // pins. With zero-init skipped this is NOT a MOVZ x16, #0
+    // (0xD2800010); the body proper begins here.
+    const word56 = std.mem.readInt(u32, code[56..][0..4], .little);
+    try std.testing.expect(word56 != 0xD2800010);
+}
+
+test "compile: prologue zero-init preserved when local is read before any set (#468)" {
+    // 0 params, 1 declared local that is read before being set on
+    // some path: the prologue zero store must be preserved for spec
+    // compliance.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 1);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .local_get = 0 }, .dest = v0, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = v0 } });
+    const code = try compileFunctionWithOptions(&func, allocator, .{ .enable_peephole = false });
+    defer allocator.free(code);
+    const movz_word = std.mem.readInt(u32, code[56..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 0xD2800010), movz_word);
+    // single 8-byte STR x16, [fp, #24]: imm12=3
     const str0 = std.mem.readInt(u32, code[60..][0..4], .little);
-    // STR x16, [fp, #24]: rt=16, rn=29, imm12=3 → 0xF9000000|(3<<10)|(29<<5)|16
     try std.testing.expectEqual(@as(u32, 0xF9000FB0), str0);
-    const str1 = std.mem.readInt(u32, code[64..][0..4], .little);
-    // STR x16, [fp, #32]: imm12=4 → 0xF9000000|(4<<10)|(29<<5)|16
-    try std.testing.expectEqual(@as(u32, 0xF90013B0), str1);
 }
 
 test "compile: local_get + local_set round trip" {

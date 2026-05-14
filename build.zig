@@ -358,6 +358,18 @@ pub fn build(b: *std.Build) void {
     const run_analysis_tests = b.addRunArtifact(analysis_tests);
     test_step.dependOn(&run_analysis_tests.step);
 
+    // Compiler local-init analysis tests
+    const local_init_test_module = b.createModule(.{
+        .root_source_file = b.path("src/compiler/ir/local_init.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const local_init_tests = b.addTest(.{
+        .root_module = local_init_test_module,
+    });
+    const run_local_init_tests = b.addRunArtifact(local_init_tests);
+    test_step.dependOn(&run_local_init_tests.step);
+
     // Compiler register allocator tests
     const regalloc_test_module = b.createModule(.{
         .root_source_file = b.path("src/compiler/ir/regalloc.zig"),
