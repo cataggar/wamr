@@ -1496,6 +1496,16 @@ pub fn callComponentFuncAsync(
     task_manager.current_task = handle;
     defer task_manager.current_task = saved_current_task;
 
+    // Publish the active TaskManager on the owning instance so the
+    // canon-builtin host trampolines (`canonBuiltinTrampoline`)
+    // installed during instantiation can dispatch into the right task
+    // state. Restored to its prior value on return to support nested
+    // async dispatches. (#520)
+    const owner_for_tm: *ComponentInstance = @constCast(owner_for_type);
+    const saved_tm = owner_for_tm.current_task_manager;
+    owner_for_tm.current_task_manager = task_manager;
+    defer owner_for_tm.current_task_manager = saved_tm;
+
     if (lift_opts.is_async) {
         // Async-lifted ABI: drive the core fn and let `task.return`
         // populate task.return_values on its own.
@@ -3681,7 +3691,97 @@ fn trampolineTrap(
     return error.Trap;
 }
 
+// ── Canon-builtin host trampoline (#520) ────────────────────────────────────
+//
+// `canon.lower` is one of several canons that contribute to the core-func
+// index space; the others are `context.{get,set}`, `task.{yield,return}`,
+// `resource.{new,drop,rep}`, and the async ABI builtins (stream/future
+// new/read/write/cancel/drop, subtask.{cancel,drop}, waitable-set ops,
+// error-context). When a core wasm module imports one of these via the
+// component's `(core instance (instantiate $main (with "x" (func $cidx))))`
+// wiring, the import must dispatch to the matching canon-builtin semantics
+// — not to a host function. `componentTrampoline` only handles canon.lower
+// (host-bound funcs); this trampoline routes everything else through
+// `dispatchCanonBuiltin`, which already implements the per-canon logic.
+
+/// Per-import-slot context for the canon-builtin trampoline. Stores the
+/// canon decl itself plus the owning component instance — enough to call
+/// `dispatchCanonBuiltin` with the right state on every invocation.
+pub const CanonBuiltinTrampolineCtx = struct {
+    comp_inst: *ComponentInstance,
+    canon: ctypes.Canon,
+};
+
+/// Trampoline entry-point installed on a core wasm import that was
+/// resolved to a canon builtin (context.{get,set}, task.{yield,return},
+/// resource.{new,drop,rep}, async ABI). Routes the call through
+/// `dispatchCanonBuiltin`, passing the instance's current TaskManager
+/// (set up by `callComponentFuncAsync` for the duration of an
+/// async-lifted dispatch; null on the sync-call path).
+pub fn canonBuiltinTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core_runtime_types.HostFnError!void {
+    const env: *ExecEnv = @ptrCast(@alignCast(env_opaque));
+    const ctx: *CanonBuiltinTrampolineCtx = @ptrCast(@alignCast(ctx_opaque.?));
+    dispatchCanonBuiltin(
+        ctx.comp_inst,
+        ctx.canon,
+        env,
+        ctx.comp_inst.current_task_manager,
+        ctx.comp_inst.allocator,
+    ) catch |err| {
+        env.host_trap = .{
+            .component_func_idx = 0,
+            .err_name = @errorName(err),
+            .stage = .host_call,
+        };
+        return error.Trap;
+    };
+}
+
 // ── Trampoline tests ────────────────────────────────────────────────────────
+
+test "canonBuiltinTrampoline: context.{set,get} round-trip through implicit fallback (#520)" {
+    // The CLI-side `wamr run` dispatch installs `canonBuiltinTrampoline`
+    // on every core import that resolves to a canon builtin (context.set,
+    // context.get, task.return, etc.). Confirm a context.set followed by
+    // context.get round-trips through `dispatchCanonBuiltin`, which falls
+    // back to `comp_inst.implicit_task_context` when no TaskManager is
+    // active (sync-call path).
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+    try std.testing.expect(inst.current_task_manager == null);
+
+    var set_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .context_set = .{ .val_type = .i32, .slot = 0 } },
+    };
+    var get_ctx = CanonBuiltinTrampolineCtx{
+        .comp_inst = inst,
+        .canon = .{ .context_get = .{ .val_type = .i32, .slot = 0 } },
+    };
+
+    try env.pushI32(@bitCast(@as(u32, 0xCAFE_F00D)));
+    try canonBuiltinTrampoline(@ptrCast(env), @ptrCast(&set_ctx));
+    try testing.expectEqual(@as(u32, 0xCAFE_F00D), inst.implicit_task_context[0]);
+
+    try canonBuiltinTrampoline(@ptrCast(env), @ptrCast(&get_ctx));
+    try testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xCAFE_F00D))), try env.popI32());
+}
 
 test "componentTrampoline: flat i32 host func with per-slot ctx" {
     const testing = std.testing;
