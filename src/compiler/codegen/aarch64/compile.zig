@@ -8,6 +8,13 @@ const std = @import("std");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
 const schedule = @import("schedule.zig");
+const range_split = @import("../../ir/range_split.zig");
+
+/// Compile-time debug flag: when true, print per-function range-split
+/// stats to stderr. Flip via `zig build -Drange-split-debug=true` after
+/// adding the option if needed; for routine bench triage just edit this
+/// line and rebuild — the harness handles isolated caches per worktree.
+const range_split_debug = false;
 const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
 const local_init = @import("../../ir/local_init.zig");
@@ -528,6 +535,11 @@ pub const CompileOptions = struct {
     /// conflict prevents it. The emit-time `if (src != dest) movRegReg`
     /// guard then elides the now-redundant mov entirely.
     enable_move_coalesce: bool = true,
+    /// Run loop-aware live-range splitting before linear scan (issue #383).
+    /// Splits vregs that cross a loop without being used inside it, freeing
+    /// their physical register for the hot loop body. Conservative: only
+    /// loops with a single entry-pred and single exit-edge are eligible.
+    enable_range_split: bool = true,
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -876,6 +888,31 @@ pub fn compileFunctionImpl(
         .enabled = ctx.options.enable_scheduler,
     });
     defer scheduled.deinit();
+
+    // Loop-aware live-range splitting (issue #383). Mutates `func` (adds
+    // synthetic locals + fresh vregs) and `scheduled` (splices in the
+    // `local_set`/`local_get` ops and rewrites post-loop uses) before live
+    // ranges are computed below. No-op for functions without eligible
+    // loops. Gated by a CompileOption to ease bisection of any regression.
+    if (ctx.options.enable_range_split) {
+        const rs_stats = try range_split.splitLiveRangesAtLoopBoundaries(
+            @constCast(func),
+            &scheduled,
+            allocator,
+        );
+        if (range_split_debug and rs_stats.loops_considered > 0) {
+            std.debug.print(
+                "[range_split] fn={s} loops={d} skip_shape={d} skip_pressure={d} splits={d}\n",
+                .{
+                    func.name orelse "<anon>",
+                    rs_stats.loops_considered,
+                    rs_stats.loops_skipped_shape,
+                    rs_stats.loops_skipped_pressure,
+                    rs_stats.splits_applied,
+                },
+            );
+        }
+    }
 
     var clobbers = try collectClobberPoints(func, block_order, &scheduled, allocator);
     defer clobbers.deinit(allocator);

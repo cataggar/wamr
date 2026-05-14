@@ -149,6 +149,10 @@ pub const wasi_p2_http = @import("wasi/preview2/http.zig");
 /// WASIp1 polyfill layer (maps p1 calls to p2 interfaces).
 pub const wasi_p1_polyfill = @import("wasi/preview2/polyfill.zig");
 
+/// WASIp2 → WASIp3 I/O polyfill (#481): virtualize 0.2 `input-stream` /
+/// `output-stream` resources over the 0.3 `stream<u8>` canonical type.
+pub const wasi_p2_to_p3_io_polyfill = @import("wasi/preview3/p2_to_p3_io_polyfill.zig");
+
 /// Component Model async canonical ABI extensions.
 pub const component_async_canon = @import("component/async_canon.zig");
 
