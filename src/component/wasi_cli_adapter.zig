@@ -38,6 +38,7 @@ const ImportBinding = instance_mod.ImportBinding;
 const InterfaceValue = instance_mod.InterfaceValue;
 const ctypes = @import("types.zig");
 const abi = @import("canonical_abi.zig");
+const async_mod = @import("async.zig");
 
 // ── Local TypeDef table for hand-lowered list<compound> shapes (#402) ───────
 //
@@ -142,7 +143,6 @@ fn lowerFieldEntriesList(ci: *ComponentInstance, entries: []const HttpFieldEntry
 
 const streams = @import("../wasi/preview2/streams.zig");
 const wasi_p2_core = @import("../wasi/preview2/core.zig");
-const async_mod = @import("async.zig");
 
 /// Captured stdout adapter. Owns its `OutputStream` and the `HostInstance`
 /// objects exposed to the runtime via `populateProviders`.
@@ -4197,6 +4197,85 @@ pub const WasiCliAdapter = struct {
         });
     }
 
+    /// Register `wasi:filesystem/preopens@0.3.0-*` (#484).
+    ///
+    /// `get-directories` carries over verbatim from 0.2.x — the wire
+    /// type (`list<tuple<own<descriptor>, string>>`) and host body
+    /// (`fsGetDirectories`) are unchanged.
+    pub fn populateWasiFilesystemPreopensP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.fs_preopens_p3_iface.members.put(self.allocator, "get-directories", .{
+            .func = .{ .context = self, .call = &fsGetDirectories },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.fs_preopens_p3_iface,
+        });
+    }
+
+    /// Register `wasi:filesystem/types@0.3.0-*` (#484).
+    ///
+    /// Changes from 0.2.x:
+    ///   - `read-via-stream` returns `tuple<stream<u8>, future<result<_,error-code>>>`
+    ///     (was `result<own<input-stream>, error-code>`).
+    ///   - `write-via-stream` / `append-via-stream` consume a guest
+    ///     `stream<u8>` and return `future<result<_,error-code>>`.
+    ///   - `read-directory` returns `tuple<stream<directory-entry>, future<...>>`.
+    ///   - All other `descriptor.*` methods become `async func`, returning
+    ///     a `future<result<...>>` handle. The host completes inline by
+    ///     allocating an already-resolved future.
+    ///   - `directory-entry-stream` resource and `filesystem-error-code`
+    ///     are removed (`error-context` replaces the 0.2 `error` resource).
+    pub fn populateWasiFilesystemTypesP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        const M = struct { name: []const u8, call: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void };
+        const members = [_]M{
+            // Tier B: canonical stream<u8> functions (changed shape).
+            .{ .name = "[method]descriptor.read-via-stream", .call = &fsDescriptorReadViaStreamP3 },
+            .{ .name = "[method]descriptor.write-via-stream", .call = &fsDescriptorWriteViaStreamP3 },
+            .{ .name = "[method]descriptor.append-via-stream", .call = &fsDescriptorAppendViaStreamP3 },
+            // Tier C: canonical stream<directory-entry>.
+            .{ .name = "[method]descriptor.read-directory", .call = &fsDescriptorReadDirectoryP3 },
+            // Tier A: async wrappers over the existing 0.2 sync bodies.
+            .{ .name = "[method]descriptor.advise", .call = &fsDescriptorAdviseP3 },
+            .{ .name = "[method]descriptor.create-directory-at", .call = &fsDescriptorCreateDirectoryAtP3 },
+            .{ .name = "[method]descriptor.get-flags", .call = &fsDescriptorGetFlagsP3 },
+            .{ .name = "[method]descriptor.get-type", .call = &fsDescriptorGetTypeP3 },
+            .{ .name = "[method]descriptor.is-same-object", .call = &fsDescriptorIsSameObjectP3 },
+            .{ .name = "[method]descriptor.link-at", .call = &fsDescriptorLinkAtP3 },
+            .{ .name = "[method]descriptor.metadata-hash", .call = &fsDescriptorMetadataHashP3 },
+            .{ .name = "[method]descriptor.metadata-hash-at", .call = &fsDescriptorMetadataHashAtP3 },
+            .{ .name = "[method]descriptor.open-at", .call = &fsDescriptorOpenAtP3 },
+            .{ .name = "[method]descriptor.readlink-at", .call = &fsDescriptorReadlinkAtP3 },
+            .{ .name = "[method]descriptor.remove-directory-at", .call = &fsDescriptorRemoveDirectoryAtP3 },
+            .{ .name = "[method]descriptor.rename-at", .call = &fsDescriptorRenameAtP3 },
+            .{ .name = "[method]descriptor.set-size", .call = &fsDescriptorSetSizeP3 },
+            .{ .name = "[method]descriptor.set-times", .call = &fsDescriptorSetTimesP3 },
+            .{ .name = "[method]descriptor.set-times-at", .call = &fsDescriptorSetTimesAtP3 },
+            .{ .name = "[method]descriptor.stat", .call = &fsDescriptorStatP3 },
+            .{ .name = "[method]descriptor.stat-at", .call = &fsDescriptorStatAtP3 },
+            .{ .name = "[method]descriptor.symlink-at", .call = &fsDescriptorSymlinkAtP3 },
+            .{ .name = "[method]descriptor.sync", .call = &fsDescriptorSyncP3 },
+            .{ .name = "[method]descriptor.sync-data", .call = &fsDescriptorSyncDataP3 },
+            .{ .name = "[method]descriptor.unlink-file-at", .call = &fsDescriptorUnlinkFileAtP3 },
+            // Tier D: verbatim carry-over.
+            .{ .name = "[resource-drop]descriptor", .call = &fsDescriptorDrop },
+        };
+        for (members) |m| {
+            try self.fs_types_p3_iface.members.put(self.allocator, m.name, .{
+                .func = .{ .context = self, .call = m.call },
+            });
+        }
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.fs_types_p3_iface,
+        });
+    }
+
     /// Reject paths that would escape the preopen sandbox: any `..` path
     /// component, any `\\` separator, any `:` (Windows drive prefix), or
     /// a leading `/` (absolute). Returns `.access` on rejection.
@@ -5985,6 +6064,367 @@ pub const WasiCliAdapter = struct {
     ) anyerror!void {
         if (results.len == 0) return error.InvalidArgs;
         results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+    }
+
+    // ── wasi:filesystem@0.3.0-* P3 surface (#484) ────────────────────────
+    //
+    // The 0.3 WIT replaces the 0.2 sync `descriptor.*` methods with
+    // `async func` returning `future<result<...>>`, and replaces the P2
+    // `input-stream`/`output-stream` resources with canonical
+    // `stream<u8>` handles. The host implementations below consume those
+    // surfaces inline and complete each call synchronously — every
+    // returned future is allocated `.ready` so a guest `future.read`
+    // succeeds without parking. The future's `payload` byte slice is
+    // intentionally `null`: the executor-side guest-lifting of the
+    // `result<_, error-code>` payload from the future slot is a wave-D
+    // concern (#489); the wave-C scope is to bind the surface so
+    // components that import the 0.3 interface link successfully.
+    //
+    // The same simplification applies to `stream<u8>`: read-via-stream
+    // pre-buffers up to a chunk of file data into the AsyncStream FIFO
+    // and marks the writable end closed (the stream is fully ready for
+    // the guest to drain via canon `stream.read`); write-via-stream
+    // drains whatever bytes the guest already pushed into the stream
+    // FIFO at call time.
+
+    /// Allocate an already-ready `future<result<_,error-code>>` slot in
+    /// `ci.futures` and return its handle. The `payload` slice is left
+    /// `null` so `Future.deinit` is a no-op for the slot. Callers are
+    /// responsible for releasing any 0.2 `result_val` they computed
+    /// before invoking this helper (see `fsCompleteAsyncSync`).
+    fn spawnReadyFsFuture(ci: *ComponentInstance) !u32 {
+        const handle = ci.allocAsyncHandle();
+        try ci.futures.put(ci.allocator, handle, .{
+            .elem_type_idx = 0,
+            .payload = null,
+            .state = .ready,
+            .write_closed = true,
+        });
+        return handle;
+    }
+
+    /// Helper for the 21 Tier-A `async func` wrappers: invoke the
+    /// existing 0.2 sync body (which writes a `result<X, error-code>`
+    /// `InterfaceValue` into a local results slot), free that value
+    /// (the host-side payload is not threaded through to the guest in
+    /// the wave-C scope — see the section comment above), allocate a
+    /// ready future and write its handle into `results[0]`.
+    fn fsCompleteAsyncSync(
+        ci: *ComponentInstance,
+        results: []InterfaceValue,
+        sync_body: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, Allocator) anyerror!void,
+        ctx_opaque: ?*anyopaque,
+        args: []const InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        var inner_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try sync_body(ctx_opaque, ci, args, &inner_results, allocator);
+        // The 0.2 body owns its result through `allocator`; release it.
+        inner_results[0].deinit(allocator);
+        const handle = try spawnReadyFsFuture(ci);
+        results[0] = .{ .handle = handle };
+    }
+
+    // ── Tier A: async-func wrappers over the 0.2 sync bodies ───────────
+
+    fn fsDescriptorAdviseP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorAdvise, ctx, args, allocator);
+    }
+    fn fsDescriptorCreateDirectoryAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorCreateDirectoryAt, ctx, args, allocator);
+    }
+    fn fsDescriptorGetFlagsP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorGetFlags, ctx, args, allocator);
+    }
+    fn fsDescriptorGetTypeP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorGetType, ctx, args, allocator);
+    }
+    fn fsDescriptorIsSameObjectP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorIsSameObject, ctx, args, allocator);
+    }
+    fn fsDescriptorLinkAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorLinkAt, ctx, args, allocator);
+    }
+    fn fsDescriptorMetadataHashP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorMetadataHash, ctx, args, allocator);
+    }
+    fn fsDescriptorMetadataHashAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorMetadataHashAt, ctx, args, allocator);
+    }
+    fn fsDescriptorOpenAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorOpenAt, ctx, args, allocator);
+    }
+    fn fsDescriptorReadlinkAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorReadlinkAt, ctx, args, allocator);
+    }
+    fn fsDescriptorRemoveDirectoryAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorRemoveDirectoryAt, ctx, args, allocator);
+    }
+    fn fsDescriptorRenameAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorRenameAt, ctx, args, allocator);
+    }
+    fn fsDescriptorSetSizeP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetSize, ctx, args, allocator);
+    }
+    fn fsDescriptorSetTimesP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetTimes, ctx, args, allocator);
+    }
+    fn fsDescriptorSetTimesAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSetTimesAt, ctx, args, allocator);
+    }
+    fn fsDescriptorStatP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorStat, ctx, args, allocator);
+    }
+    fn fsDescriptorStatAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorStatAt, ctx, args, allocator);
+    }
+    fn fsDescriptorSymlinkAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSymlinkAt, ctx, args, allocator);
+    }
+    fn fsDescriptorSyncP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSync, ctx, args, allocator);
+    }
+    fn fsDescriptorSyncDataP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorSyncData, ctx, args, allocator);
+    }
+    fn fsDescriptorUnlinkFileAtP3(ctx: ?*anyopaque, ci: *ComponentInstance, args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator) anyerror!void {
+        try fsCompleteAsyncSync(ci, results, &fsDescriptorUnlinkFileAt, ctx, args, allocator);
+    }
+
+    // ── Tier B: canonical stream<u8> read/write/append ─────────────────
+
+    /// Cap on the number of bytes pre-buffered into the canonical
+    /// `stream<u8>` returned by `read-via-stream`. Mirrors the 64 MiB
+    /// chunk used by the 0.2 positional `read` (see `fsDescriptorRead`).
+    /// Beyond this, guests must invoke the function again at a later
+    /// offset — exactly the semantics of the 0.2 P2 input-stream once
+    /// `BUFFER_FILL_MAX` is reached.
+    const FS_STREAM_BUFFER_CAP: usize = 64 * 1024 * 1024;
+
+    /// Allocate an empty closed `stream<u8>` slot. Used on the error
+    /// arm of `read-via-stream` so the returned tuple's stream handle
+    /// is well-typed (a `stream.read` against it yields the standard
+    /// "stream-end" outcome immediately).
+    fn spawnEmptyClosedStream(ci: *ComponentInstance) !u32 {
+        const handle = ci.allocAsyncHandle();
+        try ci.streams.put(ci.allocator, handle, .{
+            .elem_type_idx = 0,
+            .state = .closed,
+            .read_closed = false,
+            .write_closed = true,
+        });
+        return handle;
+    }
+
+    /// Build the `tuple<stream<u8>, future<...>>` returned by
+    /// `read-via-stream` on an error path: a closed empty stream plus a
+    /// ready future. The future signals success-by-readiness; the
+    /// distinction "ok vs err" is encoded in the (currently elided)
+    /// future payload — see the wave-D follow-up note above.
+    fn fsReadStreamErrorTuple(ci: *ComponentInstance, allocator: Allocator) !InterfaceValue {
+        const stream_handle = try spawnEmptyClosedStream(ci);
+        const future_handle = try spawnReadyFsFuture(ci);
+        const fields = try allocator.alloc(InterfaceValue, 2);
+        fields[0] = .{ .handle = stream_handle };
+        fields[1] = .{ .handle = future_handle };
+        return .{ .tuple_val = fields };
+    }
+
+    /// `[method]descriptor.read-via-stream: func(offset: filesize)
+    ///   -> tuple<stream<u8>, future<result<_, error-code>>>` (#484).
+    ///
+    /// The host pread()s up to `FS_STREAM_BUFFER_CAP` bytes from the
+    /// file at `offset` into a freshly-allocated `AsyncStream`. The
+    /// stream's `write_closed` flag is set so a subsequent guest
+    /// `stream.read` observes EOF once the FIFO is drained.
+    fn fsDescriptorReadViaStreamP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const offset: u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsReadStreamErrorTuple(ci, allocator);
+            return;
+        };
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => {
+                results[0] = try fsReadStreamErrorTuple(ci, allocator);
+                return;
+            },
+        };
+        if (!fs_file.flags.read) {
+            results[0] = try fsReadStreamErrorTuple(ci, allocator);
+            return;
+        }
+
+        // Allocate the canonical stream slot and pre-buffer file bytes.
+        const stream_handle = ci.allocAsyncHandle();
+        var slot: async_mod.AsyncStream = .{
+            .elem_type_idx = 0,
+            .state = .open,
+            .read_closed = false,
+            // Mark the writable end closed up-front: the host has
+            // already streamed everything it intends to into the FIFO.
+            .write_closed = true,
+        };
+        errdefer slot.deinit(ci.allocator);
+
+        const buf = try allocator.alloc(u8, FS_STREAM_BUFFER_CAP);
+        defer allocator.free(buf);
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const n: usize = fs_file.file.readPositional(io, &.{buf}, offset) catch 0;
+        if (n > 0) try slot.buffer.appendSlice(ci.allocator, buf[0..n]);
+
+        try ci.streams.put(ci.allocator, stream_handle, slot);
+
+        const future_handle = try spawnReadyFsFuture(ci);
+        const fields = try allocator.alloc(InterfaceValue, 2);
+        fields[0] = .{ .handle = stream_handle };
+        fields[1] = .{ .handle = future_handle };
+        results[0] = .{ .tuple_val = fields };
+    }
+
+    /// `[method]descriptor.write-via-stream: func(data: stream<u8>,
+    ///   offset: filesize) -> future<result<_, error-code>>` (#484).
+    ///
+    /// Drains whatever bytes the guest already pushed into the
+    /// canonical stream's FIFO and pwrites them at `offset`. The
+    /// returned future is ready immediately. Any bytes the guest
+    /// `stream.write`s after this call returns will accumulate in the
+    /// AsyncStream FIFO; flushing them is a wave-D concern.
+    fn fsDescriptorWriteViaStreamP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const desc_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const stream_handle = switch (args[1]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const offset: u64 = switch (args[2]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        try fsWriteFromStream(self, ci, desc_handle, stream_handle, offset, false, results);
+        _ = allocator;
+    }
+
+    /// `[method]descriptor.append-via-stream: func(data: stream<u8>)
+    ///   -> future<result<_, error-code>>` (#484). Same as
+    ///   `write-via-stream` with `append = true`.
+    fn fsDescriptorAppendViaStreamP3(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const desc_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const stream_handle = switch (args[1]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        try fsWriteFromStream(self, ci, desc_handle, stream_handle, 0, true, results);
+        _ = allocator;
+    }
+
+    /// Common helper: drain the canonical stream FIFO and write its
+    /// contents to the file. On any error path, still returns a ready
+    /// future (the err-arm payload encoding is wave-D scope).
+    fn fsWriteFromStream(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        desc_handle: u32,
+        stream_handle: u32,
+        offset: u64,
+        append: bool,
+        results: []InterfaceValue,
+    ) !void {
+        const future_handle_on_err = blk: {
+            const d = self.lookupFsDescriptor(desc_handle) orelse {
+                break :blk try spawnReadyFsFuture(ci);
+            };
+            const fs_file: FsDescriptor.FsFile = switch (d.*) {
+                .file => |f| f,
+                .dir, .preopen => break :blk try spawnReadyFsFuture(ci),
+            };
+            if (!fs_file.flags.write) break :blk try spawnReadyFsFuture(ci);
+
+            const slot = ci.streams.getPtr(stream_handle) orelse {
+                break :blk try spawnReadyFsFuture(ci);
+            };
+
+            // Drain the FIFO in-place.
+            const bytes = slot.buffer.items;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const write_offset: u64 = if (append) blk_off: {
+                // Best-effort append: position at current end-of-file.
+                const stat = fs_file.file.stat(io) catch break :blk_off offset;
+                break :blk_off stat.size;
+            } else offset;
+            fs_file.file.writePositionalAll(io, bytes, write_offset) catch {};
+            slot.buffer.clearRetainingCapacity();
+
+            break :blk try spawnReadyFsFuture(ci);
+        };
+        results[0] = .{ .handle = future_handle_on_err };
+    }
+
+    // ── Tier C: canonical stream<directory-entry> ──────────────────────
+
+    /// `[method]descriptor.read-directory: func()
+    ///   -> tuple<stream<directory-entry>, future<result<_, error-code>>>`
+    /// (#484).
+    ///
+    /// The full canonical lift of `directory-entry` records into the
+    /// stream FIFO is wave-D scope (the `record` element-type lowering
+    /// path is gated on the executor's stream rendezvous). This wave-C
+    /// binding allocates an empty closed stream + a ready future so the
+    /// surface links and a guest `stream.read` immediately observes
+    /// stream-end.
+    fn fsDescriptorReadDirectoryP3(
+        _: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const stream_handle = try spawnEmptyClosedStream(ci);
+        const future_handle = try spawnReadyFsFuture(ci);
+        const fields = try allocator.alloc(InterfaceValue, 2);
+        fields[0] = .{ .handle = stream_handle };
+        fields[1] = .{ .handle = future_handle };
+        results[0] = .{ .tuple_val = fields };
     }
 
     /// `wasi:filesystem/types.[resource-drop]descriptor: (own<descriptor>) -> ()`.
@@ -11884,6 +12324,8 @@ pub fn populateWasiProviders(
     var matched_random_insecure_seed_p3: ?[]const u8 = null;
     var matched_fs_types: ?[]const u8 = null;
     var matched_fs_preopens: ?[]const u8 = null;
+    var matched_fs_types_p3: ?[]const u8 = null;
+    var matched_fs_preopens_p3: ?[]const u8 = null;
     var matched_sockets_network: ?[]const u8 = null;
     var matched_sockets_instance_network: ?[]const u8 = null;
     var matched_sockets_tcp: ?[]const u8 = null;
@@ -12016,10 +12458,18 @@ pub fn populateWasiProviders(
                 else => matched_random = matched_random orelse imp.name,
             }
         }
-        if (matched_fs_types == null and matchesWasiPrefix(imp.name, "wasi:filesystem/types"))
-            matched_fs_types = imp.name;
-        if (matched_fs_preopens == null and matchesWasiPrefix(imp.name, "wasi:filesystem/preopens"))
-            matched_fs_preopens = imp.name;
+        if (matchesWasiPrefix(imp.name, "wasi:filesystem/types")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_fs_types_p3 = matched_fs_types_p3 orelse imp.name,
+                else => matched_fs_types = matched_fs_types orelse imp.name,
+            }
+        }
+        if (matchesWasiPrefix(imp.name, "wasi:filesystem/preopens")) {
+            switch (wasiVersion(imp.name)) {
+                .p3 => matched_fs_preopens_p3 = matched_fs_preopens_p3 orelse imp.name,
+                else => matched_fs_preopens = matched_fs_preopens orelse imp.name,
+            }
+        }
         // wasi:sockets/* (#148). `instance-network` shares the
         // `wasi:sockets/` prefix with `network`, so probe more-specific
         // names first to avoid an aliasing match.
@@ -12245,6 +12695,16 @@ pub fn populateWasiProviders(
         matched_fs_preopens orelse "wasi:filesystem/preopens",
     );
     if (matched_fs_preopens == null) _ = providers.remove("wasi:filesystem/preopens");
+
+    // wasi:filesystem@0.3.0 (#484). Conditionally bind only when the
+    // component imports the 0.3 surface — same pattern as wave-B
+    // wasi:random@0.3.0 (#485).
+    if (matched_fs_types_p3) |name| {
+        try adapter.populateWasiFilesystemTypesP3(providers, name);
+    }
+    if (matched_fs_preopens_p3) |name| {
+        try adapter.populateWasiFilesystemPreopensP3(providers, name);
+    }
 
     try adapter.populateWasiSocketsNetwork(
         providers,
@@ -13957,6 +14417,234 @@ test "populateWasiProviders: binds wasi:filesystem/types + preopens (#145)" {
     try testing.expect(adapter.fs_types_iface.members.contains("filesystem-error-code"));
     try testing.expect(adapter.fs_types_iface.members.contains("[resource-drop]descriptor"));
     try testing.expect(adapter.fs_preopens_iface.members.contains("get-directories"));
+}
+
+// ── wasi:filesystem@0.3.0 (#484) tests ──────────────────────────────────────
+
+/// Test-only: zero-init the async-handle tables in a `ComponentInstance`
+/// constructed with `var ci: ComponentInstance = undefined;`. The
+/// production constructor uses default field initialisers; tests that
+/// only call `enableTestMem` get those defaults skipped, so the P3
+/// stream/future tables would otherwise read garbage.
+fn p3TestInitAsyncTables(ci: *ComponentInstance) void {
+    ci.next_async_handle = 1;
+    ci.futures = .empty;
+    ci.streams = .empty;
+}
+
+fn p3TestDeinitAsyncTables(ci: *ComponentInstance, allocator: Allocator) void {
+    var fit = ci.futures.valueIterator();
+    while (fit.next()) |f| f.deinit(allocator);
+    ci.futures.deinit(allocator);
+    var sit = ci.streams.valueIterator();
+    while (sit.next()) |s| s.deinit(allocator);
+    ci.streams.deinit(allocator);
+}
+
+test "wasi:filesystem@0.3.0 read-via-stream: returns stream+future tuple and pre-buffers file bytes (#484)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-read.txt", .data = "p3-bytes" });
+    const file = try tmp.dir.openFile(io, "p3-read.txt", .{ .mode = .read_only });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 0 } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorReadViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    // Tuple<stream<u8>, future<...>>.
+    try testing.expect(results[0] == .tuple_val);
+    try testing.expectEqual(@as(usize, 2), results[0].tuple_val.len);
+    try testing.expect(results[0].tuple_val[0] == .handle);
+    try testing.expect(results[0].tuple_val[1] == .handle);
+
+    // Stream slot must hold the full file content; writable end already
+    // marked closed so a guest stream.read sees EOF after draining.
+    const stream_handle = results[0].tuple_val[0].handle;
+    const stream_slot = ci.streams.getPtr(stream_handle).?;
+    try testing.expectEqualStrings("p3-bytes", stream_slot.buffer.items);
+    try testing.expect(stream_slot.write_closed);
+
+    // Companion future is pre-resolved.
+    const fut_handle = results[0].tuple_val[1].handle;
+    const fut = ci.futures.getPtr(fut_handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+}
+
+test "wasi:filesystem@0.3.0 write-via-stream: drains stream FIFO into file at offset (#484)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-write.txt", .data = "" });
+    const file = try tmp.dir.openFile(io, "p3-write.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Pre-seed a canonical stream<u8> with "hello-p3".
+    const stream_handle = ci.allocAsyncHandle();
+    var seeded: async_mod.AsyncStream = .{};
+    try seeded.buffer.appendSlice(testing.allocator, "hello-p3");
+    seeded.write_closed = true;
+    try ci.streams.put(testing.allocator, stream_handle, seeded);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .handle = stream_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    // Returned future is a ready handle.
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+
+    // FIFO must have been drained.
+    const drained = ci.streams.getPtr(stream_handle).?;
+    try testing.expectEqual(@as(usize, 0), drained.buffer.items.len);
+
+    // File now contains the streamed bytes.
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositional(io, &.{&buf}, 0);
+    try testing.expectEqualStrings("hello-p3", buf[0..n]);
+}
+
+test "wasi:filesystem@0.3.0 sync: async-func wrapper returns a ready future (#484)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-sync.txt", .data = "x" });
+    const file = try tmp.dir.openFile(io, "p3-sync.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    var args = [_]InterfaceValue{.{ .handle = handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSyncP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+}
+
+test "wasi:filesystem@0.3.0 set-size: file is resized + future settles (#484)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-size.txt", .data = "" });
+    const file = try tmp.dir.openFile(io, "p3-size.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 128 } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSetSizeP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+
+    const stat = try file.stat(io);
+    try testing.expectEqual(@as(u64, 128), stat.size);
+}
+
+test "populateWasiProviders: wasi:filesystem@0.2 and @0.3 coexist independently (#484)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:filesystem/types@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:filesystem/preopens@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:filesystem/types@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:filesystem/preopens@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    // Both surfaces are bound, each to its own HostInstance.
+    try testing.expect(providers.contains("wasi:filesystem/types@0.2.6"));
+    try testing.expect(providers.contains("wasi:filesystem/preopens@0.2.6"));
+    try testing.expect(providers.contains("wasi:filesystem/types@0.3.0-rc-2026-03-15"));
+    try testing.expect(providers.contains("wasi:filesystem/preopens@0.3.0-rc-2026-03-15"));
+    try testing.expect(providers.get("wasi:filesystem/types@0.2.6").?.host_instance !=
+        providers.get("wasi:filesystem/types@0.3.0-rc-2026-03-15").?.host_instance);
+
+    // The 0.3 instance has the new stream/future surface.
+    try testing.expect(adapter.fs_types_p3_iface.members.contains("[method]descriptor.read-via-stream"));
+    try testing.expect(adapter.fs_types_p3_iface.members.contains("[method]descriptor.write-via-stream"));
+    try testing.expect(adapter.fs_types_p3_iface.members.contains("[method]descriptor.append-via-stream"));
+    try testing.expect(adapter.fs_types_p3_iface.members.contains("[method]descriptor.read-directory"));
+    try testing.expect(adapter.fs_types_p3_iface.members.contains("[method]descriptor.sync"));
+    try testing.expect(adapter.fs_types_p3_iface.members.contains("[method]descriptor.set-size"));
+    try testing.expect(adapter.fs_types_p3_iface.members.contains("[resource-drop]descriptor"));
+    // The 0.3 instance must NOT carry over the 0.2-only members.
+    try testing.expect(!adapter.fs_types_p3_iface.members.contains("[method]directory-entry-stream.read-directory-entry"));
+    try testing.expect(!adapter.fs_types_p3_iface.members.contains("[resource-drop]directory-entry-stream"));
+    try testing.expect(!adapter.fs_types_p3_iface.members.contains("filesystem-error-code"));
+    // The 0.2 instance still carries those members.
+    try testing.expect(adapter.fs_types_iface.members.contains("filesystem-error-code"));
+    // get-directories on the P3 preopens instance.
+    try testing.expect(adapter.fs_preopens_p3_iface.members.contains("get-directories"));
 }
 
 test "filesystem: get-directories returns empty list when no preopens configured (#145)" {
