@@ -247,6 +247,22 @@ pub const FsPreopen = struct {
     dir_handle: u32,
 };
 
+/// `wasi:filesystem/types.directory-entry-stream` resource (#476). A
+/// thin owner of a heap-allocated `std.Io.Dir.Iterator`. We heap-
+/// allocate because the iterator embeds a ~2 KiB read-buffer field
+/// whose self-referential pointer (`reader.buffer = &reader_buffer`)
+/// is re-fixed by each `.next(io)` call — that re-fix is what makes
+/// it valid for the struct to live in an `ArrayList` slot or to be
+/// moved across deinit boundaries.
+///
+/// Indices in `WasiCliAdapter.dir_entry_stream_table` are guest
+/// handles. The stream is independent of the descriptor that
+/// produced it; dropping that descriptor must **not** invalidate the
+/// stream.
+pub const DirEntryStream = struct {
+    iter: *std.Io.Dir.Iterator,
+};
+
 /// Close a descriptor's underlying handle. Used by both
 /// `[resource-drop]descriptor` (for `.file` / `.dir`) and adapter
 /// `deinit` (which also closes preopens).
@@ -1080,11 +1096,19 @@ fn mapFsError(err: anyerror) FsErrorCode {
         error.FileTooBig => .file_too_large,
         error.NoSpaceLeft => .insufficient_space,
         error.OutOfMemory => .insufficient_memory,
-        error.DeviceBusy => .busy,
+        error.DeviceBusy, error.FileBusy => .busy,
         error.WouldBlock => .would_block,
         error.BrokenPipe => .pipe,
         error.ReadOnlyFileSystem => .read_only,
         error.InvalidUtf8 => .illegal_byte_sequence,
+        // #476: directory-mutation surface needs cross-device, not-empty,
+        // unsupported-op, link-quota, disk-quota, and not-symlink mappings.
+        error.CrossDevice => .cross_device,
+        error.DirNotEmpty => .not_empty,
+        error.OperationUnsupported => .unsupported,
+        error.LinkQuotaExceeded => .too_many_links,
+        error.DiskQuota => .quota,
+        error.NotLink => .invalid,
         else => .io,
     };
 }
@@ -1466,6 +1490,12 @@ pub const WasiCliAdapter = struct {
     /// `dir_handle` indexes into `fs_descriptor_table`. The string is owned
     /// by the adapter and freed in `deinit`.
     fs_preopens: std.ArrayListUnmanaged(FsPreopen) = .empty,
+    /// `wasi:filesystem/types.directory-entry-stream` resource table (#476).
+    /// Slot index = guest handle. Each live slot owns a heap-allocated
+    /// `std.Io.Dir.Iterator`. Slots are nulled on
+    /// `[resource-drop]directory-entry-stream`; `deinit` mops up any
+    /// slots the guest leaked.
+    dir_entry_stream_table: std.ArrayListUnmanaged(?DirEntryStream) = .empty,
 
     /// `wasi:sockets/network` resource table. Slot index = guest handle.
     /// Slots are nulled on `[resource-drop]network`.
@@ -1639,6 +1669,15 @@ pub const WasiCliAdapter = struct {
         self.fs_descriptor_table.deinit(self.allocator);
         for (self.fs_preopens.items) |p| self.allocator.free(p.name);
         self.fs_preopens.deinit(self.allocator);
+
+        // #476: any directory-entry-stream slots the guest leaked own a
+        // heap-allocated Iterator. The iterator borrows the Dir handle
+        // (via its `reader.dir` field) but does not close it, so we
+        // only free the heap allocation here.
+        for (self.dir_entry_stream_table.items) |maybe| {
+            if (maybe) |s| self.allocator.destroy(s.iter);
+        }
+        self.dir_entry_stream_table.deinit(self.allocator);
 
         // wasi:sockets resource tables. Sockets are POD; networks own a
         // copy of the per-instance CIDR allow-list (#180) and free it on
@@ -3346,6 +3385,19 @@ pub const WasiCliAdapter = struct {
             .{ .name = "[method]descriptor.is-same-object", .call = &fsDescriptorIsSameObject },
             .{ .name = "[method]descriptor.metadata-hash", .call = &fsDescriptorMetadataHash },
             .{ .name = "[method]descriptor.metadata-hash-at", .call = &fsDescriptorMetadataHashAt },
+            // #476: directory-mutation surface (commit 2 of B).
+            .{ .name = "[method]descriptor.create-directory-at", .call = &fsDescriptorCreateDirectoryAt },
+            .{ .name = "[method]descriptor.unlink-file-at", .call = &fsDescriptorUnlinkFileAt },
+            .{ .name = "[method]descriptor.remove-directory-at", .call = &fsDescriptorRemoveDirectoryAt },
+            .{ .name = "[method]descriptor.rename-at", .call = &fsDescriptorRenameAt },
+            .{ .name = "[method]descriptor.link-at", .call = &fsDescriptorLinkAt },
+            .{ .name = "[method]descriptor.symlink-at", .call = &fsDescriptorSymlinkAt },
+            .{ .name = "[method]descriptor.readlink-at", .call = &fsDescriptorReadlinkAt },
+            // #476: directory listing + free fn (commit 3 of B).
+            .{ .name = "[method]descriptor.read-directory", .call = &fsDescriptorReadDirectory },
+            .{ .name = "[method]directory-entry-stream.read-directory-entry", .call = &fsDirectoryEntryStreamReadDirectoryEntry },
+            .{ .name = "[resource-drop]directory-entry-stream", .call = &fsDirectoryEntryStreamDrop },
+            .{ .name = "filesystem-error-code", .call = &fsFilesystemErrorCode },
             .{ .name = "[resource-drop]descriptor", .call = &fsDescriptorDrop },
         };
         for (members) |m| {
@@ -4470,6 +4522,682 @@ pub const WasiCliAdapter = struct {
         const hash = computeMetadataHash(st);
         const rec = try buildMetadataHashRecord(allocator, @truncate(hash), @truncate(hash >> 64));
         results[0] = try fsResultOk(allocator, rec);
+    }
+
+    // ── wasi:filesystem/types — directory ops batch B (#476) ────────────
+    //
+    // Path-mutating sibling methods of `stat-at` / `set-times-at`. Each
+    // one follows the same lift-validate-lookup-asDir-mutate_directory
+    // pipeline; `rename-at` and `link-at` resolve two descriptors. The
+    // host never honors `path-flags.symlink-follow` on a pure mutation
+    // (create/unlink/remove/rename/symlink) because the WIT spec doesn't
+    // hand that bit to those methods; `link-at` is the only one that
+    // takes it explicitly and forwards it as `HardLinkOptions`.
+
+    /// `[method]descriptor.create-directory-at: (borrow<descriptor>, string)
+    ///   -> result<_, error-code>`.
+    fn fsDescriptorCreateDirectoryAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.createDir(io, path_bytes, .default_dir) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.unlink-file-at: (borrow<descriptor>, string)
+    ///   -> result<_, error-code>`.
+    fn fsDescriptorUnlinkFileAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.deleteFile(io, path_bytes) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.remove-directory-at: (borrow<descriptor>, string)
+    ///   -> result<_, error-code>`.
+    ///
+    /// Maps `error.DirNotEmpty` → `error-code.not-empty`.
+    fn fsDescriptorRemoveDirectoryAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.deleteDir(io, path_bytes) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.rename-at: (borrow<descriptor>, string,
+    ///   borrow<descriptor>, string) -> result<_, error-code>`.
+    ///
+    /// Lifts two descriptor handles (source parent + destination parent) and
+    /// requires `mutate_directory` on **both**. Sandbox-validates both paths.
+    /// Cross-filesystem moves surface as `error-code.cross-device`.
+    fn fsDescriptorRenameAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 4 or results.len == 0) return error.InvalidArgs;
+
+        const old_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const old_path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const new_handle = switch (args[2]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const new_path_pl = switch (args[3]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const old_d = self.lookupFsDescriptor(old_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const old_dir: std.Io.Dir = old_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!old_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const new_d = self.lookupFsDescriptor(new_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const new_dir: std.Io.Dir = new_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!new_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const old_path_bytes = ci.readGuestBytes(old_path_pl.ptr, old_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const new_path_bytes = ci.readGuestBytes(new_path_pl.ptr, new_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(old_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (validateSandboxPath(new_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.rename(old_dir, old_path_bytes, new_dir, new_path_bytes, io) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.link-at: (borrow<descriptor>, path-flags, string,
+    ///   borrow<descriptor>, string) -> result<_, error-code>`.
+    ///
+    /// Hard-links `old-path` (relative to the first descriptor) at
+    /// `new-path` (relative to the second). `path-flags.symlink-follow`
+    /// is forwarded into `HardLinkOptions.follow_symlinks`. Requires
+    /// `mutate_directory` on **both** base descriptors.
+    fn fsDescriptorLinkAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 5 or results.len == 0) return error.InvalidArgs;
+
+        const old_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_flags: u32 = switch (args[1]) {
+            .flags_val => |w| if (w.len == 0) 0 else w[0],
+            .u32 => |v| v,
+            else => 0,
+        };
+        const follow_symlinks = (path_flags & 0b1) != 0;
+        const old_path_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const new_handle = switch (args[3]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const new_path_pl = switch (args[4]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const old_d = self.lookupFsDescriptor(old_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const old_dir: std.Io.Dir = old_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!old_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const new_d = self.lookupFsDescriptor(new_handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const new_dir: std.Io.Dir = new_d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!new_d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const old_path_bytes = ci.readGuestBytes(old_path_pl.ptr, old_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const new_path_bytes = ci.readGuestBytes(new_path_pl.ptr, new_path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(old_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (validateSandboxPath(new_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        std.Io.Dir.hardLink(old_dir, old_path_bytes, new_dir, new_path_bytes, io, .{
+            .follow_symlinks = follow_symlinks,
+        }) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.symlink-at: (borrow<descriptor>, string, string)
+    ///   -> result<_, error-code>`.
+    ///
+    /// WIT parameter order: `old-path` is the symlink **target** (the
+    /// string contents stored in the link), `new-path` is the **link
+    /// name** that gets created. The target is *not* sandbox-validated
+    /// because a symlink may legitimately point outside the preopen
+    /// (resolution-time validation in `open-at` re-checks the resolved
+    /// path); the link path is.
+    fn fsDescriptorSymlinkAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        // WIT `old-path` = symlink target (link contents). NOT a path on
+        // the host — just a string stored verbatim in the symlink inode.
+        const target_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        // WIT `new-path` = the link name to create, relative to `handle`.
+        const link_pl = switch (args[2]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().mutate_directory) {
+            results[0] = try fsResultErr(allocator, .read_only);
+            return;
+        }
+
+        const target_bytes = ci.readGuestBytes(target_pl.ptr, target_pl.len) orelse
+            return error.OutOfBoundsMemory;
+        const link_bytes = ci.readGuestBytes(link_pl.ptr, link_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        // Only the link path is constrained to the sandbox; the symlink
+        // target (link contents) is intentionally unconstrained — see
+        // doc-comment.
+        if (validateSandboxPath(link_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        base_dir.symLink(io, target_bytes, link_bytes, .{}) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        const ok_payload = try allocator.create(InterfaceValue);
+        ok_payload.* = .{ .tuple_val = &.{} };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+    }
+
+    /// `[method]descriptor.readlink-at: (borrow<descriptor>, string)
+    ///   -> result<string, error-code>`.
+    ///
+    /// Reads the contents of the symlink at `path` (relative to the base
+    /// descriptor) into a 4 KiB scratch buffer; copies the result into
+    /// guest memory via `hostAllocAndWrite`. Returns `.name_too_long` if
+    /// the link target exceeds the buffer (no incremental read API in
+    /// std.Io.Dir).
+    fn fsDescriptorReadlinkAt(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const path_pl = switch (args[1]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+
+        const path_bytes = ci.readGuestBytes(path_pl.ptr, path_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+
+        var buf: [4096]u8 = undefined;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const n = base_dir.readLink(io, path_bytes, &buf) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+        // If the kernel reports the full buffer is used, the actual link
+        // target may be longer — report .name_too_long rather than return
+        // a silently truncated path.
+        if (n == buf.len) {
+            results[0] = try fsResultErr(allocator, .name_too_long);
+            return;
+        }
+
+        const guest_ptr = ci.hostAllocAndWrite(buf[0..n]) orelse {
+            results[0] = try fsResultErr(allocator, .insufficient_memory);
+            return;
+        };
+        results[0] = try fsResultOk(allocator, .{
+            .string = .{ .ptr = guest_ptr, .len = @intCast(n) },
+        });
+    }
+
+    /// `[method]descriptor.read-directory: (borrow<descriptor>)
+    ///   -> result<own<directory-entry-stream>, error-code>` (#476).
+    ///
+    /// Heap-allocates a `std.Io.Dir.Iterator` (the struct embeds a 2 KiB
+    /// read buffer whose self-pointer is fixed up by each `.next()`) and
+    /// installs it in `dir_entry_stream_table`. Requires `flags.read` on
+    /// the base descriptor; the iterator is independent of that
+    /// descriptor's lifetime, mirroring the WIT spec.
+    fn fsDescriptorReadDirectory(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        const d = self.lookupFsDescriptor(handle) orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+        const base_dir: std.Io.Dir = d.asDir() orelse {
+            results[0] = try fsResultErr(allocator, .not_directory);
+            return;
+        };
+        if (!d.flags().read) {
+            results[0] = try fsResultErr(allocator, .access);
+            return;
+        }
+
+        const iter = self.allocator.create(std.Io.Dir.Iterator) catch {
+            results[0] = try fsResultErr(allocator, .insufficient_memory);
+            return;
+        };
+        iter.* = base_dir.iterate();
+
+        const new_handle: u32 = blk: {
+            // Reuse a null slot if any to keep handle ids stable.
+            for (self.dir_entry_stream_table.items, 0..) |slot, i| {
+                if (slot == null) {
+                    self.dir_entry_stream_table.items[i] = .{ .iter = iter };
+                    break :blk @intCast(i);
+                }
+            }
+            const idx: u32 = @intCast(self.dir_entry_stream_table.items.len);
+            self.dir_entry_stream_table.append(self.allocator, .{ .iter = iter }) catch {
+                self.allocator.destroy(iter);
+                results[0] = try fsResultErr(allocator, .insufficient_memory);
+                return;
+            };
+            break :blk idx;
+        };
+
+        results[0] = try fsResultOk(allocator, .{ .handle = new_handle });
+    }
+
+    /// `[method]directory-entry-stream.read-directory-entry: (borrow<...>)
+    ///   -> result<option<directory-entry>, error-code>` (#476).
+    ///
+    /// Returns `option::none` on end-of-iteration. Each entry is a
+    /// record `{ type: descriptor-type, name: string }`. The `name` is
+    /// copied into guest memory via `hostAllocAndWrite` before yielding
+    /// back to the guest — the iterator's read buffer may be overwritten
+    /// by the next `.next()` call.
+    ///
+    /// On Windows, directory entry names are WTF-8 (not strict UTF-8).
+    /// Names that aren't valid UTF-8 are surfaced as
+    /// `error-code.illegal-byte-sequence` rather than handed to the guest
+    /// as a malformed WIT `string`.
+    fn fsDirectoryEntryStreamReadDirectoryEntry(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+
+        if (handle >= self.dir_entry_stream_table.items.len) {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        }
+        const stream = self.dir_entry_stream_table.items[handle] orelse {
+            results[0] = try fsResultErr(allocator, .bad_descriptor);
+            return;
+        };
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const maybe_entry = stream.iter.next(io) catch |err| {
+            results[0] = try fsResultErr(allocator, mapFsError(err));
+            return;
+        };
+
+        if (maybe_entry) |entry| {
+            if (!std.unicode.utf8ValidateSlice(entry.name)) {
+                results[0] = try fsResultErr(allocator, .illegal_byte_sequence);
+                return;
+            }
+
+            const dt: DescType = switch (entry.kind) {
+                .directory => .directory,
+                .file => .regular_file,
+                .block_device => .block_device,
+                .character_device => .character_device,
+                .named_pipe => .fifo,
+                .sym_link => .symbolic_link,
+                .unix_domain_socket => .socket,
+                else => .unknown,
+            };
+
+            const name_ptr: u32 = if (entry.name.len == 0) 0 else (ci.hostAllocAndWrite(entry.name) orelse {
+                results[0] = try fsResultErr(allocator, .insufficient_memory);
+                return;
+            });
+
+            const fields = try allocator.alloc(InterfaceValue, 2);
+            fields[0] = .{ .variant_val = .{
+                .discriminant = @intFromEnum(dt),
+                .payload = null,
+            } };
+            fields[1] = .{ .string = .{ .ptr = name_ptr, .len = @intCast(entry.name.len) } };
+
+            const some_payload = try allocator.create(InterfaceValue);
+            some_payload.* = .{ .record_val = fields };
+            results[0] = try fsResultOk(allocator, .{ .option_val = .{
+                .is_some = true,
+                .payload = some_payload,
+            } });
+            return;
+        }
+
+        // End of iteration → option::none inside Ok arm.
+        results[0] = try fsResultOk(allocator, .{ .option_val = .{
+            .is_some = false,
+            .payload = null,
+        } });
+    }
+
+    /// `[resource-drop]directory-entry-stream: (own<...>) -> ()` (#476).
+    fn fsDirectoryEntryStreamDrop(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        _: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        if (handle >= self.dir_entry_stream_table.items.len) return;
+        if (self.dir_entry_stream_table.items[handle]) |s| {
+            self.allocator.destroy(s.iter);
+            self.dir_entry_stream_table.items[handle] = null;
+        }
+    }
+
+    /// `filesystem-error-code: (borrow<error>) -> option<error-code>` (#476).
+    ///
+    /// Free function (not a descriptor method). Today the host never lifts
+    /// a real `io.error` resource into a guest `borrow<error>`, so the
+    /// only thing this can legitimately answer is `option::none`. The
+    /// shape is registered for completeness and to satisfy guests that
+    /// blindly imports this name.
+    fn fsFilesystemErrorCode(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (results.len == 0) return error.InvalidArgs;
+        results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
     }
 
     /// `wasi:filesystem/types.[resource-drop]descriptor: (own<descriptor>) -> ()`.
@@ -11497,6 +12225,18 @@ test "populateWasiProviders: binds wasi:filesystem/types + preopens (#145)" {
     try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.is-same-object"));
     try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.metadata-hash"));
     try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.metadata-hash-at"));
+    // #476: directory ops batch B — path-mutation + entry-stream + free fn.
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.create-directory-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.unlink-file-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.remove-directory-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.rename-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.link-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.symlink-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.readlink-at"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]descriptor.read-directory"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[method]directory-entry-stream.read-directory-entry"));
+    try testing.expect(adapter.fs_types_iface.members.contains("[resource-drop]directory-entry-stream"));
+    try testing.expect(adapter.fs_types_iface.members.contains("filesystem-error-code"));
     try testing.expect(adapter.fs_types_iface.members.contains("[resource-drop]descriptor"));
     try testing.expect(adapter.fs_preopens_iface.members.contains("get-directories"));
 }
@@ -12201,6 +12941,616 @@ test "filesystem #475: metadata-hash-at on preopen sandbox-validates path" {
     // Avoid double-close of tmp.dir: adapter.deinit would close the
     // preopen slot's owned dir, but tmp.cleanup also closes tmp.dir.
     adapter.fs_descriptor_table.items[preopen_handle] = null;
+}
+
+// ── #476: wasi:filesystem/types directory ops batch B tests ─────────────
+//
+// Each helper pushes a `.preopen` slot for tmp.dir so the descriptor's
+// `flags.mutate_directory` (and `flags.read`) bits match the production
+// `addPreopen` defaults. Where a "no mutate" descriptor is required, a
+// `.dir` slot with `.flags = .{}` is used so the gate fires.
+
+test "filesystem #476: create-directory-at then stat-at confirms directory" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path = try testMakeListVal(&ci, testing.allocator, "newdir");
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = path.list } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorCreateDirectoryAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0].result_val.is_ok);
+
+    // Confirm via stat-at that the new path is a directory.
+    const stat_path = try testMakeListVal(&ci, testing.allocator, "newdir");
+    var stat_args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .flags_val = &[_]u32{0} },
+        .{ .string = stat_path.list },
+    };
+    var stat_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorStatAt(&adapter, &ci, &stat_args, &stat_results, testing.allocator);
+    defer stat_results[0].deinit(testing.allocator);
+    try testing.expect(stat_results[0].result_val.is_ok);
+    const rec = stat_results[0].result_val.payload.?.*.record_val;
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(WasiCliAdapter.DescType.directory)),
+        rec[0].variant_val.discriminant,
+    );
+}
+
+test "filesystem #476: unlink-file-at removes a file" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "doomed", .data = "data" });
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path = try testMakeListVal(&ci, testing.allocator, "doomed");
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = path.list } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorUnlinkFileAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0].result_val.is_ok);
+
+    // Subsequent stat-at must report no_entry.
+    const re_path = try testMakeListVal(&ci, testing.allocator, "doomed");
+    var stat_args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .flags_val = &[_]u32{0} },
+        .{ .string = re_path.list },
+    };
+    var stat_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorStatAt(&adapter, &ci, &stat_args, &stat_results, testing.allocator);
+    defer stat_results[0].deinit(testing.allocator);
+    try testing.expect(!stat_results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.no_entry)),
+        stat_results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #476: remove-directory-at on non-empty dir returns not_empty" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.createDir(io, "occupied", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "occupied/x", .data = "x" });
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path = try testMakeListVal(&ci, testing.allocator, "occupied");
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = path.list } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorRemoveDirectoryAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.not_empty)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #476: rename-at within a single preopen" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "old.txt", .data = "data" });
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const old_path = try testMakeListVal(&ci, testing.allocator, "old.txt");
+    const new_path = try testMakeListVal(&ci, testing.allocator, "new.txt");
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .string = old_path.list },
+        .{ .handle = handle },
+        .{ .string = new_path.list },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorRenameAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0].result_val.is_ok);
+
+    // Old path is gone; new path resolves.
+    const check_old = try testMakeListVal(&ci, testing.allocator, "old.txt");
+    var stat_old = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .flags_val = &[_]u32{0} },
+        .{ .string = check_old.list },
+    };
+    var stat_old_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorStatAt(&adapter, &ci, &stat_old, &stat_old_r, testing.allocator);
+    defer stat_old_r[0].deinit(testing.allocator);
+    try testing.expect(!stat_old_r[0].result_val.is_ok);
+
+    const check_new = try testMakeListVal(&ci, testing.allocator, "new.txt");
+    var stat_new = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .flags_val = &[_]u32{0} },
+        .{ .string = check_new.list },
+    };
+    var stat_new_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorStatAt(&adapter, &ci, &stat_new, &stat_new_r, testing.allocator);
+    defer stat_new_r[0].deinit(testing.allocator);
+    try testing.expect(stat_new_r[0].result_val.is_ok);
+}
+
+test "filesystem #476: rename-at across two distinct descriptor handles" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp_a = testing.tmpDir(.{});
+    defer tmp_a.cleanup();
+    var tmp_b = testing.tmpDir(.{});
+    defer tmp_b.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp_a.dir.writeFile(io, .{ .sub_path = "moveme.txt", .data = "data" });
+
+    const handle_a = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp_a.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle_a] = null;
+    const handle_b = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp_b.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle_b] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const old_path = try testMakeListVal(&ci, testing.allocator, "moveme.txt");
+    const new_path = try testMakeListVal(&ci, testing.allocator, "arrived.txt");
+    var args = [_]InterfaceValue{
+        .{ .handle = handle_a },
+        .{ .string = old_path.list },
+        .{ .handle = handle_b },
+        .{ .string = new_path.list },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorRenameAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    // Rename across two tmpDirs may legitimately yield .cross_device on
+    // hosts that put per-test tmpdirs on a different filesystem from the
+    // parent dir; tolerate both shapes here (the gate-evaluation path is
+    // what we're regressing, not the kernel's same-fs invariant).
+    if (results[0].result_val.is_ok) {
+        // Verify the file is now visible under tmp_b.
+        const check = try testMakeListVal(&ci, testing.allocator, "arrived.txt");
+        var stat_args = [_]InterfaceValue{
+            .{ .handle = handle_b },
+            .{ .flags_val = &[_]u32{0} },
+            .{ .string = check.list },
+        };
+        var stat_r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorStatAt(&adapter, &ci, &stat_args, &stat_r, testing.allocator);
+        defer stat_r[0].deinit(testing.allocator);
+        try testing.expect(stat_r[0].result_val.is_ok);
+    } else {
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.cross_device)),
+            results[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+}
+
+test "filesystem #476: symlink-at + readlink-at round-trip" {
+    if (builtin.os.tag == .windows) return; // Symlinks need admin elevation on Windows.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // WIT param order: (target = old_path, link = new_path).
+    const target = try testMakeListVal(&ci, testing.allocator, "the/actual/target");
+    const link = try testMakeListVal(&ci, testing.allocator, "mylink");
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .string = target.list },
+        .{ .string = link.list },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSymlinkAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0].result_val.is_ok);
+
+    // readlink-at returns the original target string.
+    const link_again = try testMakeListVal(&ci, testing.allocator, "mylink");
+    var rl_args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = link_again.list } };
+    var rl_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorReadlinkAt(&adapter, &ci, &rl_args, &rl_results, testing.allocator);
+    defer rl_results[0].deinit(testing.allocator);
+    try testing.expect(rl_results[0].result_val.is_ok);
+    const got_pl = rl_results[0].result_val.payload.?.*.string;
+    const got = ci.test_mem.?.buffer[got_pl.ptr..][0..got_pl.len];
+    try testing.expectEqualStrings("the/actual/target", got);
+}
+
+test "filesystem #476: read-directory enumerates entries then yields option::none" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // `iterate = true` is required for `Dir.iterate()` on Linux/macOS.
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "b" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c.txt", .data = "c" });
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // Open the stream.
+    var rd_args = [_]InterfaceValue{.{ .handle = handle }};
+    var rd_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorReadDirectory(&adapter, &ci, &rd_args, &rd_results, testing.allocator);
+    defer rd_results[0].deinit(testing.allocator);
+    try testing.expect(rd_results[0].result_val.is_ok);
+    const stream_handle = rd_results[0].result_val.payload.?.*.handle;
+
+    // Pull entries until exhausted. We expect at least the 3 we created;
+    // some hosts may also surface "." / ".." on Linux but std.Io.Dir
+    // filters those, so the count should be exactly 3.
+    var seen_names: [3]bool = .{ false, false, false };
+    var got_none = false;
+    var iterations: u32 = 0;
+    while (iterations < 16) : (iterations += 1) {
+        var rdes_args = [_]InterfaceValue{.{ .handle = stream_handle }};
+        var rdes_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDirectoryEntryStreamReadDirectoryEntry(
+            &adapter,
+            &ci,
+            &rdes_args,
+            &rdes_results,
+            testing.allocator,
+        );
+        defer rdes_results[0].deinit(testing.allocator);
+        try testing.expect(rdes_results[0].result_val.is_ok);
+        const opt = rdes_results[0].result_val.payload.?.*.option_val;
+        if (!opt.is_some) {
+            got_none = true;
+            break;
+        }
+        const rec = opt.payload.?.*.record_val;
+        // type = regular_file for all three entries.
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(WasiCliAdapter.DescType.regular_file)),
+            rec[0].variant_val.discriminant,
+        );
+        const name_pl = rec[1].string;
+        const name = ci.test_mem.?.buffer[name_pl.ptr..][0..name_pl.len];
+        if (std.mem.eql(u8, name, "a.txt")) seen_names[0] = true;
+        if (std.mem.eql(u8, name, "b.txt")) seen_names[1] = true;
+        if (std.mem.eql(u8, name, "c.txt")) seen_names[2] = true;
+    }
+    try testing.expect(got_none);
+    try testing.expect(seen_names[0] and seen_names[1] and seen_names[2]);
+
+    // Resource-drop the stream.
+    var drop_args = [_]InterfaceValue{.{ .handle = stream_handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.fsDirectoryEntryStreamDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+    try testing.expect(adapter.dir_entry_stream_table.items[stream_handle] == null);
+}
+
+test "filesystem #476: filesystem-error-code returns option::none" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsFilesystemErrorCode(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0] == .option_val);
+    try testing.expect(!results[0].option_val.is_some);
+}
+
+test "filesystem #476: sandbox rejection on each path-taking method" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // create-directory-at: leading slash → .access.
+    {
+        const p = try testMakeListVal(&ci, testing.allocator, "/etc/x");
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorCreateDirectoryAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+    // unlink-file-at: "..".
+    {
+        const p = try testMakeListVal(&ci, testing.allocator, "../escape");
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorUnlinkFileAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+    // remove-directory-at: drive prefix.
+    {
+        const p = try testMakeListVal(&ci, testing.allocator, "C:bad");
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorRemoveDirectoryAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+    // rename-at: bad old_path.
+    {
+        const old_p = try testMakeListVal(&ci, testing.allocator, "/abs");
+        const new_p = try testMakeListVal(&ci, testing.allocator, "ok");
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .string = old_p.list },
+            .{ .handle = handle },
+            .{ .string = new_p.list },
+        };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorRenameAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+    // link-at: bad new_path.
+    {
+        const old_p = try testMakeListVal(&ci, testing.allocator, "ok_old");
+        const new_p = try testMakeListVal(&ci, testing.allocator, "../up");
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .flags_val = &[_]u32{0} },
+            .{ .string = old_p.list },
+            .{ .handle = handle },
+            .{ .string = new_p.list },
+        };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorLinkAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+    // symlink-at: bad link path (only link path is sandbox-checked).
+    {
+        const target = try testMakeListVal(&ci, testing.allocator, "anywhere");
+        const link = try testMakeListVal(&ci, testing.allocator, "/abs");
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .string = target.list },
+            .{ .string = link.list },
+        };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorSymlinkAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+    // readlink-at: ".." path.
+    {
+        const p = try testMakeListVal(&ci, testing.allocator, "..");
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorReadlinkAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.access)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+}
+
+test "filesystem #476: mutate_directory enforcement on each mutating method" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // .dir slot with empty flags so mutate_directory is false. Using
+    // .dir (not .preopen) so resource-drop semantics close the handle —
+    // but we null the slot in defer to avoid double-close with tmp.cleanup.
+    const handle = try adapter.pushFsDescriptor(.{ .dir = .{
+        .dir = tmp.dir,
+        .flags = .{},
+    } });
+    defer adapter.fs_descriptor_table.items[handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const Case = struct { name: []const u8 };
+    inline for ([_]Case{
+        .{ .name = "create-directory-at" },
+        .{ .name = "unlink-file-at" },
+        .{ .name = "remove-directory-at" },
+        .{ .name = "symlink-at" },
+    }) |case| {
+        const p = try testMakeListVal(&ci, testing.allocator, "subject");
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        if (comptime std.mem.eql(u8, case.name, "create-directory-at")) {
+            var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
+            try WasiCliAdapter.fsDescriptorCreateDirectoryAt(&adapter, &ci, &args, &r, testing.allocator);
+        } else if (comptime std.mem.eql(u8, case.name, "unlink-file-at")) {
+            var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
+            try WasiCliAdapter.fsDescriptorUnlinkFileAt(&adapter, &ci, &args, &r, testing.allocator);
+        } else if (comptime std.mem.eql(u8, case.name, "remove-directory-at")) {
+            var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
+            try WasiCliAdapter.fsDescriptorRemoveDirectoryAt(&adapter, &ci, &args, &r, testing.allocator);
+        } else if (comptime std.mem.eql(u8, case.name, "symlink-at")) {
+            const target = try testMakeListVal(&ci, testing.allocator, "wherever");
+            var args = [_]InterfaceValue{
+                .{ .handle = handle },
+                .{ .string = target.list },
+                .{ .string = p.list },
+            };
+            try WasiCliAdapter.fsDescriptorSymlinkAt(&adapter, &ci, &args, &r, testing.allocator);
+        }
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.read_only)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+
+    // rename-at and link-at both gate on mutate_directory of either side.
+    {
+        const old_p = try testMakeListVal(&ci, testing.allocator, "a");
+        const new_p = try testMakeListVal(&ci, testing.allocator, "b");
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .string = old_p.list },
+            .{ .handle = handle },
+            .{ .string = new_p.list },
+        };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorRenameAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.read_only)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
+    {
+        const old_p = try testMakeListVal(&ci, testing.allocator, "a");
+        const new_p = try testMakeListVal(&ci, testing.allocator, "b");
+        var args = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .flags_val = &[_]u32{0} },
+            .{ .string = old_p.list },
+            .{ .handle = handle },
+            .{ .string = new_p.list },
+        };
+        var r: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorLinkAt(&adapter, &ci, &args, &r, testing.allocator);
+        defer r[0].deinit(testing.allocator);
+        try testing.expect(!r[0].result_val.is_ok);
+        try testing.expectEqual(
+            @as(u32, @intFromEnum(FsErrorCode.read_only)),
+            r[0].result_val.payload.?.*.variant_val.discriminant,
+        );
+    }
 }
 
 test "populateWasiProviders: binds wasi:sockets/* (#148)" {
