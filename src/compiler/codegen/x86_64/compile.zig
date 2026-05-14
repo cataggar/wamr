@@ -1485,6 +1485,7 @@ const GlobalCallPatch = struct {
 
 const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
+const local_init = @import("../../ir/local_init.zig");
 
 /// x86-64 allocatable GPR set: rdx(2), rsi(6), rdi(7), r8(8), r9(9),
 /// r12(12), r13(13), r14(14). `rbx`(3) is permanently pinned to
@@ -1949,12 +1950,26 @@ fn compileFunctionRAWithGlobalOffsets(
         }
     }
 
-    // Zero-initialize declared locals (wasm spec requires locals to be zero).
-    // Locals start after parameters in the frame layout.
+    // Zero-initialize declared locals (wasm spec requires locals to be zero)
+    // for those flagged by `needs_init`. A local whose every reachable
+    // `local_get` is dominated by a `local_set` does not need a prologue
+    // store (issue #468 part 1).
+    const needs_init = try local_init.computeNeedsInit(allocator, func);
+    defer allocator.free(needs_init);
     if (func.local_count > func.param_count) {
-        try code.xorReg32(.rax);
+        var any_init = false;
         for (func.param_count..func.local_count) |i| {
-            try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), .rax);
+            if (needs_init[i]) {
+                any_init = true;
+                break;
+            }
+        }
+        if (any_init) {
+            try code.xorReg32(.rax);
+            for (func.param_count..func.local_count) |i| {
+                if (!needs_init[i]) continue;
+                try code.movMemReg(.rbp, -@as(i32, @intCast((i + 2) * 8)), .rax);
+            }
         }
     }
 
