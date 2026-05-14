@@ -106,11 +106,18 @@ pub const Hint = struct {
 /// register. Reported to `coalesceMoves` so it can retarget one
 /// endpoint at the other's physreg post-allocation.
 ///
-/// Currently produced for `.reinterpret` (i64↔f64, i32↔f32 bit-
-/// identical copies). The aarch64 emit site at `emitReinterpret`
-/// already guards with `if (src != dest) movRegReg(...)`, so after
-/// successful coalescing the move literally disappears from the code
-/// stream without any codegen changes.
+/// Currently produced for:
+///   * `.reinterpret` (i64↔f64, i32↔f32 bit-identical copies) — emitted
+///     as a guarded `MOV Xd, Xn`.
+///   * `.wrap_i64`     (i64 → i32 low-32 truncation) — emitted as
+///     `UXTW Xd, Wn`. When `src == dest` we can skip the UXTW entirely
+///     because the i32 result is only ever read in W-form, which
+///     naturally truncates (see `local_get` for the contract).
+///
+/// The aarch64 emit sites at `emitReinterpret` and `emitWrap` already
+/// guard with `if (src != dest) <op>`, so after successful coalescing
+/// the instruction literally disappears from the code stream without
+/// any further codegen changes.
 pub const CopyHint = struct {
     dest: ir.VReg,
     src: ir.VReg,

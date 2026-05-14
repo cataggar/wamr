@@ -4858,7 +4858,12 @@ fn emitWrap(
     const src = try useInto(code, reg_map, vreg, RegMap.tmp0);
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     // wasm i32.wrap_i64: take low 32 bits of i64. UXTW zero-extends.
-    try code.uxtw(info.reg, src);
+    // When the move-coalescer has placed src and dest on the same physreg
+    // we can skip the UXTW entirely: every downstream consumer of an i32
+    // result reads W-form (see `local_get` comment about the contract that
+    // upper bits are ignored), so leaving the upper bits stale is safe.
+    // See `collectCopyHints` for the matching copy-hint registration.
+    if (src != info.reg) try code.uxtw(info.reg, src);
     try destCommit(code, reg_map, info);
 }
 
@@ -7946,12 +7951,18 @@ fn collectHintPoints(
 /// emit-site guard `if (src != info.reg) movRegReg(...)` swallows the
 /// move entirely.
 ///
-/// Currently produced for `.reinterpret` — the only IR op whose
-/// codegen is exactly a guarded reg-to-reg mov (`emitReinterpret`).
-/// Other potential candidates (`wrap_i64`, `extend_i32_u`) emit
-/// `UXTW`, which differs from MOV when src==dest (no-op for upper
-/// bits) but is not architecturally elidable when src!=dest — so they
-/// are out of scope here.
+/// Currently produced for:
+///   * `.reinterpret` — codegen is exactly a guarded `MOV Xd, Xn`
+///     (`emitReinterpret`).
+///   * `.wrap_i64`    — codegen is `UXTW Xd, Wn`. The W-form result
+///     contract (downstream i32 consumers always read W-form) makes
+///     the UXTW a no-op when src and dest share a physreg, so
+///     `emitWrap`'s guard `if (src != dest) uxtw(...)` elides it.
+///
+/// Sign / zero extends (`extend_i32_s`, `extend_i32_u`) and the
+/// sub-word extends (`extend8/16/32_s`) are NOT in scope: their
+/// upper-bit-write semantics are part of the IR contract for the i64
+/// dest and cannot be skipped just because src and dest co-located.
 fn collectCopyHints(
     func: *const ir.IrFunction,
     block_order_opt: ?[]const ir.BlockId,
@@ -7977,7 +7988,7 @@ fn collectCopyHints(
             func.blocks.items[bo_bid].instructions.items;
         for (insts) |ci| {
             switch (ci.op) {
-                .reinterpret => |src_vreg| {
+                .reinterpret, .wrap_i64 => |src_vreg| {
                     const dest = ci.dest orelse continue;
                     try hints.append(allocator, .{ .dest = dest, .src = src_vreg });
                 },
@@ -12875,6 +12886,40 @@ test "compileFunction: enable_move_coalesce elides reinterpret mov" {
     const code_on = try compileFunctionWithOptions(&func, allocator, .{ .enable_move_coalesce = true });
     defer allocator.free(code_on);
     try std.testing.expect(!testCodeContainsMasked(code_on, mov_mask, mov_value));
+}
+
+test "compileFunction: enable_move_coalesce elides wrap_i64 uxtw" {
+    // Issue #386 follow-up: wrap_i64 (i64 → i32) emits `UXTW Xd, Wn`,
+    // which is `MOV Wd, Wn` (ORR Wd, WZR, Wn) under the hood and
+    // zero-extends into Xd. When the move-coalescer places src and dest
+    // on the same physreg, the upper bits of the X register are stale
+    // but irrelevant — every downstream consumer of the i32 dest reads
+    // W-form (see `local_get`'s "subsequent W-form op will ignore the
+    // upper bits" contract), so `emitWrap`'s `if (src != dest) uxtw(...)`
+    // guard skips the now-redundant instruction.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+    const bid = try func.newBlock();
+    const a = func.newVReg();
+    const r = func.newVReg();
+    try func.getBlock(bid).append(.{ .op = .{ .iconst_64 = 0x1_0000_0001 }, .dest = a, .type = .i64 });
+    try func.getBlock(bid).append(.{ .op = .{ .wrap_i64 = a }, .dest = r, .type = .i32 });
+    try func.getBlock(bid).append(.{ .op = .{ .ret = r } });
+
+    // ORR Wd, WZR, Wn (the 32-bit MOV alias `movRegReg32` emits, which
+    // `uxtw` is implemented as): mask `0x7FE0_FC1F` keeps sf+opc+shift+
+    // N+imm6+Rn; masked value `0x2A00_03E0` has Rn=11111 (WZR). Rm and
+    // Rd are wildcarded.
+    const mov32_mask: u32 = 0x7FE0_FC1F;
+    const mov32_value: u32 = 0x2A00_03E0;
+
+    const code_on = try compileFunctionWithOptions(&func, allocator, .{ .enable_move_coalesce = true });
+    defer allocator.free(code_on);
+    try std.testing.expect(!testCodeContainsMasked(code_on, mov32_mask, mov32_value));
+    // The off-case asymmetry is allocator-ordering-dependent — see the
+    // matching note on the reinterpret test above; covered at the
+    // regalloc layer instead.
 }
 
 test "compileFunction: FMA fusion does not skip mul with non-arith uses" {
