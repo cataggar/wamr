@@ -10472,6 +10472,81 @@ test "stdio-echo: end-to-end real wasi-p2 component (#156)" {
     try testing.expectEqualStrings("echo: hello\n", adapter.getStdoutBytes());
 }
 
+test "stdio-echo: live host stdio via pipe-redirected fds (#474)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const data = @embedFile("fixtures/stdio-echo.wasm");
+    const linux = std.os.linux;
+
+    // Two pipe pairs: one for stdin (test writes, adapter reads), one
+    // for stdout (adapter writes, test reads). Stderr is wired to the
+    // test's own stderr fd — not redirected here, but separate from
+    // stdout so a noisy fixture doesn't pollute the assertion.
+    var stdin_fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&stdin_fds, .{})) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(stdin_fds[0]);
+    // stdin_fds[1] is closed below after writing "hello\n".
+
+    var stdout_fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&stdout_fds, .{})) != .SUCCESS) {
+        _ = linux.close(stdin_fds[1]);
+        return error.SkipZigTest;
+    }
+    defer _ = linux.close(stdout_fds[0]);
+    // stdout_fds[1] is closed by the adapter's `deinit` path indirectly
+    // — but `OutputStream.toFd` doesn't take ownership of the fd, so
+    // we close it explicitly after the run.
+
+    // Preload the "hello\n" line into the stdin pipe and close the
+    // write-end so the guest's read sees EOF after the line.
+    _ = linux.write(stdin_fds[1], "hello\n", 6);
+    _ = linux.close(stdin_fds[1]);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Use the host-stdio constructor with the pipe fds redirected in
+    // place of STDIN/STDOUT. Stderr gets the test process's own
+    // stderr fd (the adapter doesn't take ownership of it).
+    var adapter = WasiCliAdapter.initWithHostStdioFds(
+        testing.allocator,
+        stdin_fds[0],
+        stdout_fds[1],
+        std.posix.STDERR_FILENO,
+    );
+    defer adapter.deinit();
+
+    const outcome = runComponentBytes(data, arena_alloc, &adapter) catch |err| {
+        _ = linux.close(stdout_fds[1]);
+        std.debug.print("stdio-echo (live) run failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    // Close the adapter's stdout-write fd so the drain below hits EOF.
+    _ = linux.close(stdout_fds[1]);
+
+    // Drain everything the component wrote to the pipe. If the
+    // OutputStream `.fd` write branch were still a no-op stub
+    // (pre-#474), this drain would return 0 bytes and the assertion
+    // would fail.
+    var buf: [256]u8 = undefined;
+    var captured: std.ArrayList(u8) = .empty;
+    defer captured.deinit(testing.allocator);
+    while (true) {
+        const rc = linux.read(stdout_fds[0], &buf, buf.len);
+        const err = linux.errno(rc);
+        if (err == .INTR) continue;
+        if (err != .SUCCESS) break;
+        const n: usize = @intCast(rc);
+        if (n == 0) break;
+        try captured.appendSlice(testing.allocator, buf[0..n]);
+    }
+
+    try testing.expect(outcome.is_ok);
+    try testing.expectEqualStrings("echo: hello\n", captured.items);
+}
+
 test "populateWasiProviders: binds wasi:clocks/wall-clock + monotonic-clock (#146)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
