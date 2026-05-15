@@ -469,28 +469,31 @@ const sockets_p3_udp_receive_fields = [_]ctypes.ValType{
     .{ .list = 4 },
     .{ .variant = 7 },
 };
+// WIT 0.3 `wasi:sockets/types.error-code` is a 15-case variant ending in
+// `other(option<string>)` (NOT the flat 21-case enum of 0.2). Case 14
+// carries the option<string> payload so the canonical-ABI size envelope
+// for the variant reserves space for ptr+len+option-disc — emitting case
+// 14 with `payload=null` is `other(none)`; supplying a string is the
+// diagnostic path used by `socketResultErrP3WithDiag`. The `other` arm
+// references the `option<string>` typedef at index 13 below. (#563)
 const sockets_p3_error_code_cases = [_]ctypes.Case{
-    .{ .name = "unknown", .type = null },
     .{ .name = "access-denied", .type = null },
     .{ .name = "not-supported", .type = null },
     .{ .name = "invalid-argument", .type = null },
     .{ .name = "out-of-memory", .type = null },
     .{ .name = "timeout", .type = null },
-    .{ .name = "concurrency-conflict", .type = null },
-    .{ .name = "not-in-progress", .type = null },
-    .{ .name = "would-block", .type = null },
     .{ .name = "invalid-state", .type = null },
-    .{ .name = "new-socket-limit", .type = null },
     .{ .name = "address-not-bindable", .type = null },
     .{ .name = "address-in-use", .type = null },
     .{ .name = "remote-unreachable", .type = null },
     .{ .name = "connection-refused", .type = null },
+    .{ .name = "connection-broken", .type = null },
     .{ .name = "connection-reset", .type = null },
     .{ .name = "connection-aborted", .type = null },
     .{ .name = "datagram-too-large", .type = null },
-    .{ .name = "name-unresolvable", .type = null },
-    .{ .name = "temporary-resolver-failure", .type = null },
-    .{ .name = "permanent-resolver-failure", .type = null },
+    // case 14: `other(option<string>)` — payload references the
+    // option<string> typedef at index 13.
+    .{ .name = "other", .type = .{ .option = 13 } },
 };
 
 const sockets_p3_local_types = [_]ctypes.TypeDef{
@@ -507,6 +510,10 @@ const sockets_p3_local_types = [_]ctypes.TypeDef{
     .{ .result = .{ .ok = .{ .list = 3 }, .err = .{ .variant = 9 } } }, // 10
     .{ .result = .{ .ok = .{ .tuple = 8 }, .err = .{ .variant = 9 } } }, // 11
     .{ .result = .{ .ok = null, .err = .{ .variant = 9 } } }, // 12
+    // option<string> — referenced by `other(option<string>)` arm of the
+    // error-code variant. Must occupy the index named in
+    // `sockets_p3_error_code_cases[14].type.option`. (#563)
+    .{ .option = .{ .inner = .string } }, // 13
 };
 
 const SOCKETS_P3_IP_ADDRESS_VARIANT_IDX: u32 = 2;
@@ -516,6 +523,12 @@ const SOCKETS_P3_UDP_RECEIVE_TUPLE_IDX: u32 = 8;
 const SOCKETS_P3_RESULT_RESOLVE_IDX: u32 = 10;
 const SOCKETS_P3_RESULT_UDP_RECV_IDX: u32 = 11;
 const SOCKETS_P3_RESULT_UNIT_ERR_IDX: u32 = 12;
+const SOCKETS_P3_OPTION_STRING_IDX: u32 = 13;
+/// Discriminant of the `other(option<string>)` arm in the 0.3
+/// error-code variant. Co-located with the case array so the helper
+/// fall-through path can route unmapped errors here without an
+/// off-by-one risk. (#563)
+const SOCKETS_P3_ERROR_OTHER_DISC: u32 = 14;
 
 fn socketsP3TypeRegistry() abi.TypeRegistry {
     return abi.TypeRegistry.fromTypes(&sockets_p3_local_types);
@@ -7763,6 +7776,55 @@ pub const WasiCliAdapter = struct {
         return .{ .result_val = .{ .is_ok = false, .payload = payload } };
     }
 
+    /// Diagnostic-carrying variant of `socketResultErrP3`. When `code`
+    /// maps to the `other(option<string>)` arm (discriminant 14) and a
+    /// non-empty `diag` is provided, the host-side string is copied
+    /// into guest linear memory via `ci.hostAllocAndWrite` and attached
+    /// as `option::some(diag)`. For any non-`other` arm `diag` is
+    /// ignored — those cases are unit per the 0.3 WIT spec and adding
+    /// payload bytes would shift the variant's encoded length and
+    /// scramble the guest's variant lift. Falls back to `other(none)`
+    /// if the diagnostic is null/empty or guest allocation fails so
+    /// the caller never observes a partially-populated value. (#563)
+    fn socketResultErrP3WithDiag(
+        ci: *ComponentInstance,
+        allocator: Allocator,
+        code: SocketErrorCode,
+        diag: ?[]const u8,
+    ) !InterfaceValue {
+        const disc = socketCodeToP3Disc(code);
+        const payload = try allocator.create(InterfaceValue);
+        if (disc == SOCKETS_P3_ERROR_OTHER_DISC) {
+            if (diag) |msg| {
+                if (msg.len != 0) {
+                    if (ci.hostAllocAndWrite(msg)) |ptr| {
+                        const str_iv = try allocator.create(InterfaceValue);
+                        str_iv.* = .{ .string = .{ .ptr = ptr, .len = @intCast(msg.len) } };
+                        const opt_iv = try allocator.create(InterfaceValue);
+                        opt_iv.* = .{ .option_val = .{ .is_some = true, .payload = str_iv } };
+                        payload.* = .{ .variant_val = .{
+                            .discriminant = disc,
+                            .payload = opt_iv,
+                        } };
+                        return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+                    }
+                }
+            }
+            const none_iv = try allocator.create(InterfaceValue);
+            none_iv.* = .{ .option_val = .{ .is_some = false, .payload = null } };
+            payload.* = .{ .variant_val = .{
+                .discriminant = disc,
+                .payload = none_iv,
+            } };
+            return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+        }
+        payload.* = .{ .variant_val = .{
+            .discriminant = disc,
+            .payload = null,
+        } };
+        return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+    }
+
     /// Build a `result<X, error-code>` ok InterfaceValue.
     fn socketResultOk(allocator: Allocator, value: InterfaceValue) !InterfaceValue {
         const payload = try allocator.create(InterfaceValue);
@@ -10340,15 +10402,24 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]tcp-socket.bind: (borrow<tcp-socket>, ip-socket-address)
-    ///   -> result<_, error-code>` (#486).
+    ///   -> result<_, error-code>` (#486, #563).
     ///
     /// Collapses 0.2 `start-bind` + `finish-bind` into one synchronous
     /// call and drops the `borrow<network>` parameter — 0.3 has no
     /// network resource. Allow-list checking consults the adapter-level
     /// `sockets_allow_list_template` directly.
+    ///
+    /// 0.3 semantics (#563):
+    ///   - Multicast / broadcast / IPv4-mapped-IPv6 addresses are
+    ///     rejected with `invalid-argument` via `isUnicastAddress`.
+    ///   - The kernel `bind(2)` is performed eagerly so a request for
+    ///     port=0 returns an ephemeral assignment that `local-address`
+    ///     can read back. The bound `host_socket` is held on the rep so
+    ///     `tcpListenP3` can transition it to listening in-place
+    ///     instead of opening a fresh fd.
     fn tcpBindP3(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -10374,27 +10445,45 @@ pub const WasiCliAdapter = struct {
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
-        if (!templateAllows(self.sockets_allow_list_template, local)) {
-            results[0] = try socketResultErrP3(allocator, .access_denied);
+        if (!isUnicastAddress(local)) {
+            results[0] = try socketResultErrP3(allocator, .invalid_argument);
             return;
         }
-        // Bind is recorded on the rep without a kernel call here so
-        // that the existing P3 listen path (which sets up the actual
-        // listening fd via its own `IpAddress.listen`) doesn't fight
-        // with a stale `host_socket`. A real-bind path that round-
-        // trips the kernel-assigned ephemeral port is tracked as a
-        // follow-up to #520.
-        s.local_addr = local;
+        // 0.3 dropped the per-network allow-list at bind: the kernel
+        // already enforces what's bindable (returns AddressNotBindable
+        // for RFC 5737 test addresses, etc.) and the capability model
+        // is enforced on the outbound `connect` path instead. Skipping
+        // the allow-list here matches the wasi-p3-testsuite
+        // `test_not_bindable` expectation. (#563)
+        // Real kernel bind so port=0 yields ephemeral assignment and
+        // `local-address` returns the kernel-chosen port. The bound
+        // fd is held on the rep — `tcpListenP3` transitions it to
+        // listening in-place via `listenOnBoundFd` (POSIX) or, on
+        // Windows, closes it and re-opens via `IpAddress.listen` with
+        // the now-known address. (#563)
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const host_socket = std.Io.net.IpAddress.bind(&local, io, .{
+            .mode = .stream,
+            .protocol = .tcp,
+        }) catch |err| {
+            results[0] = try socketResultErrP3WithDiag(ci, allocator, mapSocketBindError(err), @errorName(err));
+            return;
+        };
+        s.host_socket = host_socket;
+        s.local_addr = host_socket.address;
         s.state = .bound;
         results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
     }
 
     /// `[method]udp-socket.bind: (borrow<udp-socket>, ip-socket-address)
-    ///   -> result<_, error-code>` (#486). 0.3 collapses the 0.2 start/
-    /// finish pair and drops the network handle.
+    ///   -> result<_, error-code>` (#486, #563). 0.3 collapses the 0.2
+    /// start/finish pair and drops the network handle. Multicast and
+    /// broadcast addresses are rejected with `invalid-argument`; the
+    /// kernel bind is performed eagerly so `local-address` observes
+    /// the ephemeral port when port=0 was requested.
     fn udpBindP3(
         ctx_opaque: ?*anyopaque,
-        _: *ComponentInstance,
+        ci: *ComponentInstance,
         args: []const InterfaceValue,
         results: []InterfaceValue,
         allocator: Allocator,
@@ -10420,19 +10509,31 @@ pub const WasiCliAdapter = struct {
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
-        if (!templateAllows(self.sockets_allow_list_template, local)) {
-            results[0] = try socketResultErrP3(allocator, .access_denied);
+        if (!isUnicastAddress(local)) {
+            results[0] = try socketResultErrP3(allocator, .invalid_argument);
             return;
         }
-        s.local_addr = local;
+        // See `tcpBindP3` (#563): no allow-list at bind in 0.3.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const host_socket = std.Io.net.IpAddress.bind(&local, io, .{
+            .mode = .dgram,
+            .protocol = .udp,
+        }) catch |err| {
+            results[0] = try socketResultErrP3WithDiag(ci, allocator, mapSocketBindError(err), @errorName(err));
+            return;
+        };
+        s.host_socket = host_socket;
+        s.local_addr = host_socket.address;
         s.state = .bound;
         results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
     }
 
     /// `[method]udp-socket.connect: (borrow<udp-socket>,
-    ///   ip-socket-address) -> result<_, error-code>` (#486). 0.3-only.
-    /// Records the remote address; subsequent `send` calls use it as the
-    /// implicit destination.
+    ///   ip-socket-address) -> result<_, error-code>` (#486, #563).
+    /// 0.3-only. Records the remote address; subsequent `send` calls
+    /// use it as the implicit destination. Multicast / broadcast /
+    /// wildcard-with-non-zero-port are rejected with `invalid-argument`
+    /// per the WIT contract.
     fn udpConnectP3(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
@@ -10461,6 +10562,19 @@ pub const WasiCliAdapter = struct {
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
+        if (!isUnicastAddress(remote)) {
+            results[0] = try socketResultErrP3(allocator, .invalid_argument);
+            return;
+        }
+        // Connect requires a fully-specified unicast remote: an
+        // unspecified address (`0.0.0.0` / `::`) and / or port=0 are
+        // both `invalid-argument` per the 0.3 WIT spec
+        // (`sockets-udp-connect.rs` `test_unspecified_remote_addr` /
+        // `test_connect_0_port`). (#563)
+        if (socketAddrIsUnspecified(remote) or socketPort(remote) == 0) {
+            results[0] = try socketResultErrP3(allocator, .invalid_argument);
+            return;
+        }
         if (!templateAllows(self.sockets_allow_list_template, remote)) {
             results[0] = try socketResultErrP3(allocator, .access_denied);
             return;
@@ -10818,6 +10932,48 @@ pub const WasiCliAdapter = struct {
         };
     }
 
+    /// True iff `addr` is a unicast address per the 0.3 WIT spec —
+    /// i.e., NOT IPv4 multicast (`224.0.0.0/4`), NOT IPv4 limited
+    /// broadcast (`255.255.255.255`), NOT IPv6 multicast (`ff00::/8`),
+    /// and NOT an IPv4-mapped-IPv6 form (`::ffff:0:0/96`). Both
+    /// `bind` and `connect` MUST reject non-unicast addresses with
+    /// `invalid-argument`. The unspecified address (`0.0.0.0` /
+    /// `::`) is still considered unicast for bind purposes — it's a
+    /// valid wildcard — and is rejected separately by `connect` via
+    /// `socketAddrIsUnspecified`. (#563)
+    pub fn isUnicastAddress(addr: std.Io.net.IpAddress) bool {
+        return !socketAddrIsNonUnicast(addr) and !socketAddrIsIpv4MappedIpv6(addr);
+    }
+
+    /// True iff the host platform exposes `listen(2)` on an existing
+    /// bound socket fd. POSIX has it; Windows uses an AFD IOCTL
+    /// instead and we don't reuse host_socket there — see
+    /// `tcpListenP3` for the cross-platform fall-back. (#563)
+    const can_reuse_bound_socket_for_listen: bool = blk: {
+        const tag = @import("builtin").os.tag;
+        break :blk tag != .windows and @hasDecl(std.posix.system, "listen");
+    };
+
+    /// POSIX `listen(2)` on an already-bound socket fd. Used to
+    /// transition a TCP socket from `bound` → `listening` while
+    /// preserving the kernel-assigned ephemeral port from
+    /// `tcpBindP3`. Returns `null` on success or a mapped error code.
+    /// Compiles to an `unreachable`-free no-op on Windows so the
+    /// cross-compile sweep (`aarch64-macos`, `x86_64-windows`,
+    /// `x86_64-linux`) stays clean. (#563)
+    fn listenOnBoundFd(handle: std.posix.fd_t, backlog: u31) ?SocketErrorCode {
+        if (comptime !can_reuse_bound_socket_for_listen) return .not_supported;
+        const rc = std.posix.system.listen(handle, backlog);
+        return switch (std.posix.errno(rc)) {
+            .SUCCESS => null,
+            .ADDRINUSE => .address_in_use,
+            .BADF => .invalid_state,
+            .NOTSOCK => .invalid_state,
+            .OPNOTSUPP => .not_supported,
+            else => .unknown,
+        };
+    }
+
     /// `[method]tcp-socket.connect: async func(remote-address)
     ///   -> result<_, error-code>` (#519).
     ///
@@ -10861,8 +11017,7 @@ pub const WasiCliAdapter = struct {
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
-        if (socketAddrIsIpv4MappedIpv6(remote) or
-            socketAddrIsNonUnicast(remote) or
+        if (!isUnicastAddress(remote) or
             socketAddrIsUnspecified(remote) or
             socketPort(remote) == 0)
         {
@@ -10883,6 +11038,16 @@ pub const WasiCliAdapter = struct {
             return;
         }
         const io = std.Io.Threaded.global_single_threaded.io();
+        // Release any `host_socket` left over from a prior `bind` —
+        // `IpAddress.connect` opens a fresh fd and we'd otherwise leak
+        // the bound one. Reusing the bound fd for connect() would
+        // preserve the source-port pin, but that path requires a raw
+        // POSIX connect on the bound socket and isn't required by the
+        // sockets-tcp-bind fixture; deferred until #563 follow-ups. (#563)
+        if (s.host_socket) |*hs| {
+            hs.close(io);
+            s.host_socket = null;
+        }
         const stream = std.Io.net.IpAddress.connect(&remote, io, .{
             .mode = .stream,
         }) catch |err| {
@@ -10898,7 +11063,7 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]tcp-socket.listen: func()
-    ///   -> result<stream<tcp-socket>, error-code>` (#519, #535).
+    ///   -> result<stream<tcp-socket>, error-code>` (#519, #535, #563).
     ///
     /// Synchronous. Performs the kernel `listen(2)` and returns a
     /// `stream<tcp-socket>` handle. The stream's `host_driver` (#535)
@@ -10906,6 +11071,16 @@ pub const WasiCliAdapter = struct {
     /// listeners admit a connection per rendezvous without per-call
     /// host-fn dispatch. Pre-fills the FIFO with any backlog already
     /// queued at listen time.
+    ///
+    /// 0.3 listen-reuse (#563): when `tcpBindP3` has already opened a
+    /// `host_socket` for this rep, transition that same fd to listening
+    /// in-place via `listenOnBoundFd` (POSIX `listen(2)`). This
+    /// preserves the kernel-assigned ephemeral port observed by
+    /// `local-address` between bind and listen. On Windows
+    /// (`listenOnBoundFd` unavailable) we fall back to closing the
+    /// bound fd and re-running `IpAddress.listen` with the recorded
+    /// `local_addr` — the kernel may pick a different ephemeral port in
+    /// that rare path but the cross-compile sweep stays green.
     fn tcpListenP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -10934,31 +11109,68 @@ pub const WasiCliAdapter = struct {
                 return;
             },
         }
-        // Implicit-bind: WIT-mandated fallback when `bind` was not called.
-        const local: std.Io.net.IpAddress = s.local_addr orelse switch (s.family) {
-            .ipv4 => std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
-            .ipv6 => std.Io.net.IpAddress{ .ip6 = .{
-                .bytes = [_]u8{0} ** 16,
-                .port = 0,
-                .flow = 0,
-            } },
-        };
         const io = std.Io.Threaded.global_single_threaded.io();
-        const server = std.Io.net.IpAddress.listen(&local, io, .{
-            .kernel_backlog = s.listen_backlog orelse 128,
-        }) catch |err| {
-            results[0] = try socketResultErrP3(allocator, mapSocketListenError(err));
-            return;
-        };
-        s.server = server;
-        s.local_addr = server.socket.address;
+        const backlog: u31 = s.listen_backlog orelse 128;
+        // Listen-reuse path: prefer the bound `host_socket` so the
+        // kernel-assigned ephemeral port from `tcpBindP3` carries over
+        // into the listening state. (#563)
+        var server: ?std.Io.net.Server = null;
+        if (s.host_socket) |host_socket| {
+            if (comptime can_reuse_bound_socket_for_listen) {
+                if (listenOnBoundFd(host_socket.handle, backlog)) |code| {
+                    // listen(2) failure: surface the mapped code with
+                    // a diagnostic payload via the `other` arm so the
+                    // fixture can decode the cause.
+                    results[0] = try socketResultErrP3WithDiag(ci, allocator, code, "listen on bound fd failed");
+                    return;
+                }
+                server = .{
+                    .socket = host_socket,
+                    .options = if (std.Io.net.Server.AcceptOptions != void)
+                        .{ .mode = .stream, .protocol = .tcp }
+                    else
+                        {},
+                };
+                // Ownership of the fd moves to `s.server`; clear the
+                // `host_socket` slot so `closeAll` doesn't double-close.
+                s.host_socket = null;
+            } else {
+                // Windows: stdlib has no listen-on-bound-fd path.
+                // Close the bound fd and fall through to a fresh
+                // `IpAddress.listen` with the recorded local_addr.
+                var hs_mut = host_socket;
+                hs_mut.close(io);
+                s.host_socket = null;
+            }
+        }
+        if (server == null) {
+            // Implicit-bind: WIT-mandated fallback when `bind` was
+            // not called. Open a fresh server fd via the stdlib
+            // path. Also used for the Windows fall-back above.
+            const local: std.Io.net.IpAddress = s.local_addr orelse switch (s.family) {
+                .ipv4 => std.Io.net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+                .ipv6 => std.Io.net.IpAddress{ .ip6 = .{
+                    .bytes = [_]u8{0} ** 16,
+                    .port = 0,
+                    .flow = 0,
+                } },
+            };
+            server = std.Io.net.IpAddress.listen(&local, io, .{
+                .kernel_backlog = backlog,
+            }) catch |err| {
+                results[0] = try socketResultErrP3WithDiag(ci, allocator, mapSocketListenError(err), @errorName(err));
+                return;
+            };
+        }
+        s.server = server.?;
+        s.local_addr = server.?.socket.address;
         s.state = .listening;
 
         // Install an accept-loop driver on the stream so each guest
         // `stream.read t` invocation can pop a fresh connection off
         // the backlog (#535). Pre-drain any queued connections so
         // a guest that connect()s before reading still sees them.
-        const driver_ctx = try self.allocSocketsP3StreamCtx(server.socket.handle, s.family);
+        const driver_ctx = try self.allocSocketsP3StreamCtx(server.?.socket.handle, s.family);
         const stream_h = ci.allocAsyncHandle();
         try ci.streams.put(ci.allocator, stream_h, .{
             .elem_type_idx = 0,
@@ -10970,7 +11182,7 @@ pub const WasiCliAdapter = struct {
         });
         // Non-blocking accept attempt to pre-fill the stream (the driver
         // path will keep adding as more arrive on subsequent reads).
-        if (fdPollReady(server.socket.handle, pollInEvents())) {
+        if (fdPollReady(server.?.socket.handle, pollInEvents())) {
             if (s.server.?.accept(io)) |accepted| {
                 const new_handle = self.pushSocket(.{
                     .kind = .tcp,
@@ -20796,6 +21008,300 @@ test "sockets P3: tcp-socket.connect rejects multicast (#519)" {
         @as(u8, @intCast(@intFromEnum(SocketErrorCode.invalid_argument))),
         fut.payload.?[1],
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// wasi:sockets@0.3.0 — tcp-bind kernel-port assignment + listen reuse
+// + multicast/broadcast/wildcard rejection + diagnostic payload (#563)
+// ──────────────────────────────────────────────────────────────────────
+
+// `isUnicastAddress` is the WIT-spec predicate that gates 0.3
+// bind/connect entry points. Anchors the boundary between the
+// `invalid-argument` reject set (multicast, broadcast, IPv4-mapped
+// IPv6) and the unicast pass set (including the wildcard, which is a
+// valid bind target). (#563)
+test "sockets P3 (#563): isUnicastAddress recognises multicast / broadcast / mapped" {
+    const testing = std.testing;
+    // IPv4 multicast (224.0.0.0/4): boundary checks.
+    try testing.expect(!WasiCliAdapter.isUnicastAddress(.{ .ip4 = .{ .bytes = .{ 224, 0, 0, 1 }, .port = 1 } }));
+    try testing.expect(!WasiCliAdapter.isUnicastAddress(.{ .ip4 = .{ .bytes = .{ 239, 255, 255, 255 }, .port = 1 } }));
+    // Just outside the multicast block: 223.x and 240.x are unicast.
+    try testing.expect(WasiCliAdapter.isUnicastAddress(.{ .ip4 = .{ .bytes = .{ 223, 255, 255, 255 }, .port = 1 } }));
+    try testing.expect(WasiCliAdapter.isUnicastAddress(.{ .ip4 = .{ .bytes = .{ 240, 0, 0, 1 }, .port = 1 } }));
+    // IPv4 limited broadcast.
+    try testing.expect(!WasiCliAdapter.isUnicastAddress(.{ .ip4 = .{ .bytes = .{ 255, 255, 255, 255 }, .port = 1 } }));
+    // IPv6 multicast (ff00::/8).
+    try testing.expect(!WasiCliAdapter.isUnicastAddress(.{ .ip6 = .{
+        .bytes = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .port = 1,
+        .flow = 0,
+    } }));
+    // IPv4-mapped IPv6 (::ffff:0:0/96) — also rejected per WIT contract.
+    try testing.expect(!WasiCliAdapter.isUnicastAddress(.{ .ip6 = .{
+        .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 },
+        .port = 1,
+        .flow = 0,
+    } }));
+    // Loopback and unspecified addresses are unicast (bind admits them).
+    try testing.expect(WasiCliAdapter.isUnicastAddress(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }));
+    try testing.expect(WasiCliAdapter.isUnicastAddress(.{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } }));
+}
+
+test "sockets P3 (#563): tcp-socket.bind(port=0) yields kernel-assigned port via local-address" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // tcp-socket.create + bind(127.0.0.1:0)
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    const bind_addr = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer p3FreeIpv4SockAddr(testing.allocator, bind_addr);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, bind_addr };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpBindP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    // local-address must report the kernel-assigned ephemeral port —
+    // bind populates `local_addr` from `IpAddress.bind`'s returned
+    // `Socket.address`, which carries the getsockname result. (#563)
+    const s = adapter.socket_table.items[0].?;
+    try testing.expect(s.host_socket != null);
+    const port: u16 = switch (s.local_addr.?) {
+        .ip4 => |v4| v4.port,
+        .ip6 => |v6| v6.port,
+    };
+    try testing.expect(port != 0);
+}
+
+test "sockets P3 (#563): tcp-socket.listen reuses bound host_socket fd" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    const bind_addr = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer p3FreeIpv4SockAddr(testing.allocator, bind_addr);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, bind_addr };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpBindP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    // Snapshot the bound fd BEFORE listen so we can assert it carried
+    // through. (#563)
+    const bound_fd = adapter.socket_table.items[0].?.host_socket.?.handle;
+    const bound_port: u16 = switch (adapter.socket_table.items[0].?.local_addr.?) {
+        .ip4 => |v4| v4.port,
+        .ip6 => |v6| v6.port,
+    };
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpListenP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    const s = adapter.socket_table.items[0].?;
+    // Listen consumed the host_socket and the fd is now owned by the
+    // server slot. The kernel fd identity is preserved — same
+    // ephemeral port observed before and after listen. (#563)
+    try testing.expect(s.host_socket == null);
+    try testing.expect(s.server != null);
+    try testing.expectEqual(bound_fd, s.server.?.socket.handle);
+    const listen_port: u16 = switch (s.local_addr.?) {
+        .ip4 => |v4| v4.port,
+        .ip6 => |v6| v6.port,
+    };
+    try testing.expectEqual(bound_port, listen_port);
+}
+
+test "sockets P3 (#563): tcp-socket.bind(multicast) yields invalid-argument" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    // 224.0.0.1:1234 — multicast must be rejected.
+    const mcast = try p3MakeIpv4SockAddr(testing.allocator, .{ 224, 0, 0, 1 }, 1234);
+    defer p3FreeIpv4SockAddr(testing.allocator, mcast);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, mcast };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpBindP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(!results[0].result_val.is_ok);
+    // Variant disc 2 = `invalid-argument` per the 0.3 WIT spec.
+    try testing.expectEqual(
+        @as(u32, 2),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+    // Bind must not have leaked a kernel fd onto the rep.
+    try testing.expect(adapter.socket_table.items[0].?.host_socket == null);
+}
+
+test "sockets P3 (#563): tcp-socket.bind(broadcast) yields invalid-argument" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    // 255.255.255.255:9 — limited broadcast must be rejected.
+    const bcast = try p3MakeIpv4SockAddr(testing.allocator, .{ 255, 255, 255, 255 }, 9);
+    defer p3FreeIpv4SockAddr(testing.allocator, bcast);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, bcast };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpBindP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, 2),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets P3 (#563): udp-socket.connect(wildcard:nonzero-port) yields invalid-argument" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    // 0.0.0.0:42 — connect-to-wildcard with non-zero port must reject.
+    const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 0, 0, 0, 0 }, 42);
+    defer p3FreeIpv4SockAddr(testing.allocator, dest);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, dest };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpConnectP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, 2),
+        results[0].result_val.payload.?.variant_val.discriminant,
+    );
+}
+
+test "sockets P3 (#563): socketResultErrP3WithDiag wires kernel string into `other(some)`" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // .unknown maps to disc 14 (`other`) per `socketCodeToP3Disc`.
+    // With a non-empty diag we expect option<string>::some with the
+    // bytes copied into guest linear memory.
+    const iv = try WasiCliAdapter.socketResultErrP3WithDiag(
+        &ci,
+        testing.allocator,
+        .unknown,
+        "errno=99 NetworkSubsystemFailure",
+    );
+    defer iv.deinit(testing.allocator);
+    try testing.expect(!iv.result_val.is_ok);
+    const variant = iv.result_val.payload.?.variant_val;
+    try testing.expectEqual(@as(u32, 14), variant.discriminant);
+    try testing.expect(variant.payload != null);
+    const opt = variant.payload.?.option_val;
+    try testing.expect(opt.is_some);
+    const str = opt.payload.?.string;
+    try testing.expectEqual(@as(u32, "errno=99 NetworkSubsystemFailure".len), str.len);
+    // String bytes were copied to guest memory via hostAllocAndWrite —
+    // verify the round-trip.
+    const guest_bytes = ci.readGuestBytes(str.ptr, str.len).?;
+    try testing.expectEqualStrings("errno=99 NetworkSubsystemFailure", guest_bytes);
+}
+
+test "sockets P3 (#563): socketResultErrP3WithDiag mapped error keeps unit arm" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // .invalid_argument maps to disc 2 (a unit arm). Even if a diag
+    // string is supplied we must NOT attach a payload to that arm —
+    // the variant size envelope still includes the option<string>
+    // bytes from `other`, but the active arm dictates the payload
+    // type and `invalid-argument` is unit. (#563)
+    const iv = try WasiCliAdapter.socketResultErrP3WithDiag(
+        &ci,
+        testing.allocator,
+        .invalid_argument,
+        "ignored-diag-text",
+    );
+    defer iv.deinit(testing.allocator);
+    try testing.expect(!iv.result_val.is_ok);
+    const variant = iv.result_val.payload.?.variant_val;
+    try testing.expectEqual(@as(u32, 2), variant.discriminant);
+    try testing.expect(variant.payload == null);
 }
 
 // ──────────────────────────────────────────────────────────────────────
