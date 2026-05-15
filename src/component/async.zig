@@ -264,6 +264,23 @@ pub const Future = struct {
     /// correct end (see `dispatchAsyncCanon.future_read`/`future_write`).
     read_closed: bool = false,
     write_closed: bool = false,
+    /// True iff the future was minted by a canon-lower-of-async-func
+    /// path (#551) — i.e. by a host adapter that wants the WaitableSet
+    /// wakeup to be surfaced through the `(handle << 4) | STATUS`
+    /// subtask shape rather than the `future.read` return-code
+    /// convention. Read by `executor.joinWaitable` /
+    /// `executor.popReadyEvent` to route the right wakeup channel.
+    ///
+    /// Distinct from the existing `future.read` / `future.write`
+    /// rendezvous flow — that path doesn't go through
+    /// `waitable-set.wait` event delivery (it uses `BLOCKED_STATUS`
+    /// status-word parking instead), and emitting an EVENT_SUBTASK
+    /// event for a `future.read` waiter would mis-decode the
+    /// `STATUS_RETURNED=2` payload as `ReturnCode::Cancelled` per
+    /// `wit-bindgen ≥ 0.53`'s `crates/guest-rust/src/rt/async_support`
+    /// constants — see the cli-stdio-roundtrip regression note in
+    /// `executor.popReadyEvent`.
+    subtask_managed: bool = false,
 
     pub const State = enum { pending, ready, closed };
 

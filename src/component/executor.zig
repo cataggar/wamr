@@ -1010,6 +1010,14 @@ fn dispatchAsyncCanon(
             const tm = task_manager orelse return error.FunctionNotFound;
             const handle = tm.current_task orelse return error.FunctionNotFound;
             tm.cancelTask(handle);
+            // Propagate the cancellation to host-side waitables owned by
+            // the cancelled task. Specifically, this aborts any pending
+            // `wasi:clocks` `wait-for`/`wait-until` timer future so the
+            // wait settles with the cancel disposition the next time the
+            // guest issues `waitable-set.{wait,poll}`. (#551 / multi-clock-wait.)
+            if (comp_inst.async_cancel_driver) |drv| {
+                drv(comp_inst.async_event_driver_ctx, comp_inst, handle, allocator);
+            }
         },
 
         // ── Stream handles ──────────────────────────────────────────────
@@ -1621,16 +1629,14 @@ fn dispatchAsyncCanon(
             // `canon_waitable_set_{wait,poll}` semantics so wit-bindgen's
             // wakeup loop can decode the result via `EventCode + ReturnCode`.
             //
-            // Single-threaded runtime semantics:
-            //
-            //   * `poll` returns `none` (event-code 0) when the queue is
-            //     empty.
-            //   * `wait` returns `none` here as well — true blocking
-            //     would deadlock the single-fiber runtime. wit-bindgen
-            //     treats `none` as "no progress" and re-polls all
-            //     branches, which is what we want for fixtures like
-            //     `cli-stdio-roundtrip` where peer settlement happens
-            //     synchronously inside the same `futures::join!` arm.
+            // For the `wait` variant we additionally drive the host
+            // async-event driver (typically
+            // `WasiCliAdapter.driveAsyncEvents`, #551) so the host can
+            // advance its monotonic clock and settle any pending
+            // `wasi:clocks` timer-futures before we consult the queue —
+            // otherwise a guest that wakes only on host-produced
+            // subtask events (`wait-for` / `wait-until`) would spin on
+            // EVENT_NONE forever.
             const out_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             const ws_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
@@ -1639,14 +1645,34 @@ fn dispatchAsyncCanon(
                 return;
             };
 
-            if (ws.popReadyEvent()) |item| {
-                const bytes = comp_inst.writableGuestBytes(out_ptr, 8) orelse
-                    return error.MemoryNotAvailable;
-                std.mem.writeInt(u32, bytes[0..4], item.handle, .little);
-                std.mem.writeInt(u32, bytes[4..8], item.code, .little);
-                env.pushI32(@bitCast(async_canon.eventCodeForKind(item.kind))) catch
-                    return error.StackOverflow;
-                return;
+            const is_wait = op == .waitable_set_wait;
+            // Bounded drive loop. Each iteration first asks the host
+            // async-event driver to advance time / drain host I/O,
+            // then re-checks `popReadyEvent`. Caps total iterations
+            // to keep the runtime responsive when the guest has
+            // non-host work (e.g. `futures::join!` peer rendezvous
+            // — the cli-stdio-roundtrip path).
+            const max_iters: usize = if (is_wait) 256 else 1;
+            var iter: usize = 0;
+            while (iter < max_iters) : (iter += 1) {
+                if (ws.popReadyEvent()) |item| {
+                    if (out_ptr != 0) {
+                        if (comp_inst.writableGuestBytes(out_ptr, 8)) |bytes| {
+                            std.mem.writeInt(u32, bytes[0..4], item.handle, .little);
+                            std.mem.writeInt(u32, bytes[4..8], item.code, .little);
+                        }
+                    }
+                    env.pushI32(@bitCast(async_canon.eventCodeForKind(item.kind))) catch
+                        return error.StackOverflow;
+                    return;
+                }
+                if (!is_wait) break;
+                const driver = comp_inst.async_event_driver orelse break;
+                // ~10ms-per-iteration budget: short enough to stay
+                // responsive, long enough to coalesce many timers.
+                // The driver is allowed to ignore the hint when it
+                // has due work to deliver immediately.
+                _ = driver(comp_inst.async_event_driver_ctx, comp_inst, 10 * std.time.ns_per_ms, allocator);
             }
 
             // No ready waitable — `none` event-code. Caller (wit-bindgen
@@ -1684,6 +1710,32 @@ fn dispatchAsyncCanon(
             // `write-via-stream` / `read-via-stream`).
             if (comp_inst.futures.getPtr(waitable_handle)) |fut| {
                 if (fut.waitable_set != null) return; // already joined
+                // #551: a future minted by a canon-lower-of-async-func
+                // host adapter (`wasi:clocks` `wait-for` / `wait-until`)
+                // carries a `subtask_managed` flag — wire it as a
+                // `.subtask` waitable so `waitable-set.wait` surfaces
+                // EVENT_SUBTASK with a STATUS_* code (matching the
+                // wit-bindgen `Subtask` runtime decoder), not as
+                // `.future_read` (which uses the future/stream
+                // `ReturnCode` decoder and would mis-interpret
+                // `STATUS_RETURNED=2` as `Cancelled(0)`).
+                if (fut.subtask_managed) {
+                    const idx = ws.register(.{ .kind = .subtask, .handle = waitable_handle }, allocator) catch
+                        return error.OutOfMemory;
+                    fut.waitable_set = ws;
+                    fut.read_waitable_idx = idx;
+                    // If the timer already fired before the guest
+                    // could join, surface the settled state at join
+                    // time so the next `waitable-set.wait` delivers
+                    // EVENT_SUBTASK rather than spinning on NONE.
+                    if (fut.state == .closed and fut.write_closed) {
+                        ws.setReady(idx, allocator, STATUS_STARTED_CANCELLED);
+                    } else if (fut.state == .ready or fut.state == .closed) {
+                        ws.setReady(idx, allocator, STATUS_RETURNED);
+                    }
+                    return;
+                }
+
                 // Futures default to `future_read` because their only
                 // blocking arm is the reader (`future.read` parks via
                 // `pending_read`). A `pending_write` slot doesn't exist
@@ -1753,6 +1805,11 @@ fn dispatchAsyncCanon(
         },
     }
 }
+
+/// On the canon-lower-of-async-func path (#551) `componentTrampoline` packs
+/// the host's future handle as `(handle << 4) | STATUS` and pushes a single
+/// i32 status word — the lifted result is delivered later when the timer
+/// fires (`WasiCliAdapter.completeDueTimerFutures`).
 
 // ── Async execution ─────────────────────────────────────────────────────────
 
@@ -1922,6 +1979,253 @@ test "LiftOptions: async + callback (#478 sub-PR 2)" {
     try std.testing.expectEqual(@as(?u32, 0), lo.memory_idx);
     try std.testing.expectEqual(true, lo.is_async);
     try std.testing.expectEqual(@as(?u32, 7), lo.callback_idx);
+}
+
+test "LowerOptions: async opt flips is_async (#551 canon-lower-of-async-func)" {
+    const opts_async = [_]ctypes.CanonOpt{ .{ .memory = 0 }, .async_lift };
+    const lo_async = LowerOptions.fromOpts(&opts_async);
+    try std.testing.expectEqual(true, lo_async.is_async);
+
+    const opts_sync = [_]ctypes.CanonOpt{ .{ .memory = 0 } };
+    const lo_sync = LowerOptions.fromOpts(&opts_sync);
+    try std.testing.expectEqual(false, lo_sync.is_async);
+
+    // `callback` opt on the lower side is accepted as a no-op (Binary.md
+    // canon opt vec is shared with canon.lift); it must NOT flip is_async.
+    const opts_cb = [_]ctypes.CanonOpt{ .{ .callback = 3 } };
+    const lo_cb = LowerOptions.fromOpts(&opts_cb);
+    try std.testing.expectEqual(false, lo_cb.is_async);
+}
+
+test "packAsyncLowerStatus: pending future → (handle << 4) | STATUS_STARTED (#551)" {
+    const testing = std.testing;
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    // Allocate a pending future and verify the packed status carries the
+    // handle in the high bits + STATUS_STARTED (=1) in the low nibble.
+    const fh = inst.allocAsyncHandle();
+    try inst.futures.put(testing.allocator, fh, .{ .elem_type_idx = 0, .state = .pending });
+    const packed_status = packAsyncLowerStatus(inst, fh);
+    try testing.expectEqual(STATUS_STARTED, packed_status & 0xf);
+    try testing.expectEqual(fh, packed_status >> 4);
+
+    // A ready future collapses to STATUS_RETURNED with no waitable
+    // handle in the high bits — the guest reads zero results and exits
+    // the WaitableOperation immediately.
+    inst.futures.getPtr(fh).?.state = .ready;
+    try testing.expectEqual(STATUS_RETURNED, packAsyncLowerStatus(inst, fh));
+
+    // Unknown handles degrade to STATUS_RETURNED rather than trap, so a
+    // host fn that forgot to populate the phantom slot doesn't poison
+    // the call.
+    try testing.expectEqual(STATUS_RETURNED, packAsyncLowerStatus(inst, 0));
+    try testing.expectEqual(STATUS_RETURNED, packAsyncLowerStatus(inst, 99));
+}
+
+test "dispatchCanonBuiltin: waitable.join wires a subtask_managed future as .subtask (#551)" {
+    // Canon-lower-of-async-func returns `(handle << 4) | STATUS_STARTED`;
+    // the guest follows up with `[waitable-join]`. Verify the join
+    // hooks the timer-future into the WaitableSet as a `.subtask`
+    // waitable (not `.future_read`) so the wait/poll arm surfaces
+    // EVENT_SUBTASK with a `STATUS_*` payload2 the wit-bindgen
+    // `Subtask` decoder expects.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const fh = inst.allocAsyncHandle();
+    try inst.futures.put(testing.allocator, fh, .{ .elem_type_idx = 0, .state = .pending, .subtask_managed = true });
+    const ws_handle = inst.allocAsyncHandle();
+    try inst.waitable_sets.put(testing.allocator, ws_handle, .{});
+
+    // Stack: (waitable, set) per canonical-abi.py order.
+    try env.pushI32(@bitCast(fh));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const ws = inst.waitable_sets.getPtr(ws_handle).?;
+    try testing.expectEqual(@as(usize, 1), ws.items.items.len);
+    try testing.expectEqual(fh, ws.items.items[0].handle);
+    try testing.expectEqual(
+        @import("async.zig").WaitableSet.WaitableItem.Kind.subtask,
+        ws.items.items[0].kind,
+    );
+}
+
+test "dispatchCanonBuiltin: waitable.join on a non-subtask future keeps the future_read shape (#551)" {
+    // Cli-stdio-roundtrip regression guard: a `future.read`-driven
+    // (non-subtask_managed) future must continue to be registered as
+    // `.future_read` so `waitable-set.wait` surfaces a
+    // future/stream `ReturnCode`-shaped payload2. Wiring it as
+    // `.subtask` would mis-decode `STATUS_RETURNED=2` as
+    // `ReturnCode::Cancelled(0)` per the wit-bindgen ≥ 0.53
+    // future_support runtime, panicking the guest.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const fh = inst.allocAsyncHandle();
+    // subtask_managed left at default `false` — plain future.read shape.
+    try inst.futures.put(testing.allocator, fh, .{ .elem_type_idx = 0, .state = .pending });
+    const ws_handle = inst.allocAsyncHandle();
+    try inst.waitable_sets.put(testing.allocator, ws_handle, .{});
+
+    try env.pushI32(@bitCast(fh));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const ws = inst.waitable_sets.getPtr(ws_handle).?;
+    try testing.expectEqual(@as(usize, 1), ws.items.items.len);
+    try testing.expectEqual(
+        @import("async.zig").WaitableSet.WaitableItem.Kind.future_read,
+        ws.items.items[0].kind,
+    );
+}
+
+test "dispatchCanonBuiltin: waitable.join late-arrival on an already-fired subtask surfaces immediately (#551)" {
+    // Regression guard: if the host completed the timer between
+    // `canon.lower (async)` returning STATUS_STARTED and the guest
+    // calling `[waitable-join]`, the join must observe the readiness
+    // synchronously so the very next `waitable-set.wait` delivers
+    // EVENT_SUBTASK rather than spinning on NONE.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const fh = inst.allocAsyncHandle();
+    try inst.futures.put(testing.allocator, fh, .{ .elem_type_idx = 0, .state = .ready, .subtask_managed = true });
+    const ws_handle = inst.allocAsyncHandle();
+    try inst.waitable_sets.put(testing.allocator, ws_handle, .{});
+
+    try env.pushI32(@bitCast(fh));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const ws = inst.waitable_sets.getPtr(ws_handle).?;
+    try testing.expectEqual(@as(usize, 1), ws.items.items.len);
+    try testing.expect(ws.items.items[0].ready);
+    try testing.expectEqual(STATUS_RETURNED, ws.items.items[0].code);
+}
+
+test "dispatchCanonBuiltin: waitable.join late-arrival on a cancelled subtask carries STATUS_STARTED_CANCELLED (#551)" {
+    // task.cancel during a clock wait flips the timer-future to
+    // `.closed` + `write_closed=true`. A subsequent `[waitable-join]`
+    // by the not-yet-aware guest still needs to surface the cancel
+    // disposition so the wit-bindgen `Subtask` decoder transitions to
+    // `STARTED_CANCELLED`.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    var comp = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    const inst = try instance_mod.instantiate(&comp, testing.allocator);
+    defer inst.deinit();
+
+    const fh = inst.allocAsyncHandle();
+    try inst.futures.put(testing.allocator, fh, .{
+        .elem_type_idx = 0,
+        .state = .closed,
+        .write_closed = true,
+        .subtask_managed = true,
+    });
+    const ws_handle = inst.allocAsyncHandle();
+    try inst.waitable_sets.put(testing.allocator, ws_handle, .{});
+
+    try env.pushI32(@bitCast(fh));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .waitable_join },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    const ws = inst.waitable_sets.getPtr(ws_handle).?;
+    try testing.expectEqual(@as(usize, 1), ws.items.items.len);
+    try testing.expect(ws.items.items[0].ready);
+    try testing.expectEqual(STATUS_STARTED_CANCELLED, ws.items.items[0].code);
 }
 
 test "countFlatTypes: primitives" {
@@ -4032,6 +4336,15 @@ pub const LowerOptions = struct {
     memory_idx: ?u32 = null,
     realloc_idx: ?u32 = null,
     string_encoding: ctypes.StringEncoding = .utf8,
+    /// `canon.lower (async) (func)` — Binary.md `canonopt 0x06` shared with
+    /// the lift side. When set, the canon-lower trampoline returns a packed
+    /// status word `(handle << 4) | STATUS` per the component-model spec
+    /// instead of the lifted result values. The host function is allowed
+    /// to populate a phantom return slot with the async waitable handle
+    /// (currently a `future<()>` handle for `wasi:clocks@0.3.x`
+    /// `wait-for` / `wait-until`); the trampoline inspects that future's
+    /// state and packs `STATUS_STARTED`/`STATUS_RETURNED` accordingly. (#551.)
+    is_async: bool = false,
 
     pub fn fromOpts(opts: []const ctypes.CanonOpt) LowerOptions {
         var lo = LowerOptions{};
@@ -4041,10 +4354,13 @@ pub const LowerOptions = struct {
                 .realloc => |idx| lo.realloc_idx = idx,
                 .post_return => {},
                 .string_encoding => |enc| lo.string_encoding = enc,
-                // `async` and `callback` only meaningful on the lift side
-                // (Binary.md grammar reuses one `opts` vec for both, so
-                // we must accept them here without effect).
-                .async_lift, .callback => {},
+                // `async` flips into the async-lower path (#551). The
+                // canonopt is shared between lift and lower; the binary
+                // grammar reuses one `opts` vec across both kinds.
+                .async_lift => lo.is_async = true,
+                // `callback` is only meaningful on the lift side; accept
+                // here as a no-op.
+                .callback => {},
             }
         }
         return lo;
@@ -4186,13 +4502,40 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     // Invoke host. Host owns allocation of any compound result values via
     // `allocator`; we deinit each result after lowering so payloads
     // (e.g. `.result_val.payload` for input-stream.blocking-read) don't leak.
+    //
+    // Async-lower (#551): when `canon.lower (async)` of a func WITH NO
+    // RESULTS is invoked (the `wasi:clocks@0.3.x` `wait-for` /
+    // `wait-until` shape), we allocate a single phantom result slot so
+    // the host fn can deposit a `future<()>` handle; the trampoline
+    // then packs `(handle << 4) | STATUS` and pushes it as the i32
+    // result word per the spec.
+    //
+    // For `(async)` lowers of funcs WITH non-empty results — e.g.
+    // `[async-lower]wasi:cli/stdout@0.3.x.write-via-stream: async func()
+    // -> tuple<…>` — the existing sync-lower path still applies: the
+    // host already delivered a fully-lifted result synchronously, so
+    // there's no separate subtask handle to encode. Wiring the
+    // STATUS_RETURNED-with-result-ptr shape of those calls is its own
+    // follow-up (the conformance gate's `cli-stdio-roundtrip` fixture
+    // hits that path; tracked under #550). Falling through to the
+    // sync-lower path keeps every adapter that worked before #551
+    // working — we only rewire the no-result clocks shape here.
+    const is_async_no_result_lower = ctx.lower_opts.is_async and ctx.result_types.len == 0;
+    const host_result_len: usize = if (is_async_no_result_lower) 1 else ctx.result_types.len;
     var results_stack_buf: [4]InterfaceValue = undefined;
-    const results_heap: ?[]InterfaceValue = if (ctx.result_types.len <= results_stack_buf.len) null else (allocator.alloc(InterfaceValue, ctx.result_types.len) catch |err|
+    const results_heap: ?[]InterfaceValue = if (host_result_len <= results_stack_buf.len) null else (allocator.alloc(InterfaceValue, host_result_len) catch |err|
         return trampolineTrap(env, ctx, err, .lift_args));
-    const results: []InterfaceValue = results_heap orelse results_stack_buf[0..ctx.result_types.len];
+    const results: []InterfaceValue = results_heap orelse results_stack_buf[0..host_result_len];
     defer {
         for (results) |r| r.deinit(allocator);
         if (results_heap) |h| allocator.free(h);
+    }
+    if (is_async_no_result_lower) {
+        // Phantom slot for the host's future/subtask handle. Initialise
+        // to a sentinel so a host fn that forgets to write triggers a
+        // clean STATUS_RETURNED with handle=0 (rather than reading
+        // uninitialised memory).
+        results[0] = .{ .u32 = 0 };
     }
     const call = ctx.host_func.call orelse {
         return trampolineTrap(env, ctx, error.HostFuncNotBound, .host_call);
@@ -4200,6 +4543,21 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     call(ctx.host_func.context, ctx.comp_inst, args, results, allocator) catch |err| {
         return trampolineTrap(env, ctx, err, .host_call);
     };
+
+    // Async-lower of a no-result func: pack `(handle << 4) | STATUS` and
+    // push as the i32 result. (#551.)
+    if (is_async_no_result_lower) {
+        const handle: u32 = switch (results[0]) {
+            .handle => |h| h,
+            .u32 => |v| v,
+            else => 0,
+        };
+        const packed_status = packAsyncLowerStatus(ctx.comp_inst, handle);
+        env.pushI32(@bitCast(packed_status)) catch |err| {
+            return trampolineTrap(env, ctx, err, .lower_results);
+        };
+        return;
+    }
 
     // Lower results.
     if (results_spill) {
@@ -4221,6 +4579,42 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
             };
         }
     }
+}
+
+/// Async-lower (`canon.lower (async)`) status-word encoding (#551). Given
+/// the host-returned waitable handle (currently a `future<()>` handle for
+/// `wasi:clocks@0.3.x` `wait-for` / `wait-until`), look up the future's
+/// state and return the spec-shaped packed i32:
+///
+///   * `(0 << 4) | STATUS_RETURNED` — `future.state == .ready` already;
+///     the call resolved synchronously (e.g. a `wait-for(0)` /
+///     `wait-until(now)` past-deadline shortcut).
+///   * `(handle << 4) | STATUS_STARTED` — pending; the guest must wait
+///     for completion via `waitable-set.{wait,poll}` after a
+///     `waitable.join(handle, ws_handle)`.
+///
+/// Status-bit encoding mirrors `wit-bindgen ≥ 0.53`'s
+/// `crates/guest-rust/src/rt/async_support.rs` constants:
+///   `STATUS_STARTING=0`, `STATUS_STARTED=1`, `STATUS_RETURNED=2`,
+///   `STATUS_STARTED_CANCELLED=3`, `STATUS_RETURNED_CANCELLED=4`.
+pub const STATUS_STARTING: u32 = 0;
+pub const STATUS_STARTED: u32 = 1;
+pub const STATUS_RETURNED: u32 = 2;
+pub const STATUS_STARTED_CANCELLED: u32 = 3;
+pub const STATUS_RETURNED_CANCELLED: u32 = 4;
+
+pub fn packAsyncLowerStatus(comp_inst: *const ComponentInstance, handle: u32) u32 {
+    if (handle == 0) return STATUS_RETURNED;
+    const fut = comp_inst.futures.getPtr(handle) orelse {
+        // No future entry — degenerate "already done" (e.g. host returned
+        // an unallocated handle); treat as STATUS_RETURNED with no
+        // waitable so the guest skips waitable.join.
+        return STATUS_RETURNED;
+    };
+    if (fut.state == .ready or fut.state == .closed) {
+        return STATUS_RETURNED;
+    }
+    return (handle << 4) | STATUS_STARTED;
 }
 
 /// Record `HostTrapInfo` on the env and return `error.Trap` so the canon-lower
