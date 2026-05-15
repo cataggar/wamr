@@ -8,6 +8,7 @@ const std = @import("std");
 const ir = @import("../../ir/ir.zig");
 const emit = @import("emit.zig");
 const schedule = @import("schedule.zig");
+const coalesce_post = @import("coalesce_post.zig");
 const range_split = @import("../../ir/range_split.zig");
 
 /// Compile-time debug flag: when true, print per-function range-split
@@ -540,6 +541,15 @@ pub const CompileOptions = struct {
     /// their physical register for the hot loop body. Conservative: only
     /// loops with a single entry-pred and single exit-edge are eligible.
     enable_range_split: bool = true,
+    /// Run the post-emission MOV coalescer scan (issue #539). After the
+    /// main emit loop, scan each basic block of the finalised byte
+    /// stream for `MOV xD, xS` (and `MOV wD, wS`) instructions that
+    /// regalloc could not eliminate via copy-hints, rewrite downstream
+    /// uses of `xD` to read `xS`, and replace the MOV with a NOP. The
+    /// pass is block-local in v1; cross-block coalescing is filed as a
+    /// follow-up. Disabling this option also disables the scan on the
+    /// `coalesce_post.zig` unit tests via build.zig's test step.
+    enable_post_emit_coalesce: bool = true,
 };
 
 /// Context threaded through per-function compilation for cross-function
@@ -1591,6 +1601,22 @@ pub fn compileFunctionImpl(
 
     // Elide saves/restores for callee-saved regs never assigned by RegMap.
     patchUnusedCalleeSaveSlots(&code, callee_save_sites.items, reg_map.used_callee_mask);
+
+    // Post-allocation MOV coalescer scan (issue #539). Operates on the
+    // finalised byte stream after every other emit-time fixup that
+    // writes individual instruction words, and BEFORE branch-patch
+    // resolution (which only edits embedded offset fields inside the
+    // already-emitted branch words, untouched by the coalescer). The
+    // pass replaces eliminated MOVs with NOP — byte offsets are
+    // preserved, so `block_offsets`, `patches`, `call_patches`, and
+    // `callee_save_sites` all remain valid afterwards.
+    if (ctx.options.enable_post_emit_coalesce) {
+        _ = coalesce_post.coalesceMovesPostEmit(
+            code.bytes.items,
+            block_offsets,
+            code.bytes.items.len,
+        );
+    }
 
     // Resolve branch patches.
     for (patches.items) |p| {
