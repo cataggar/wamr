@@ -612,6 +612,18 @@ pub const Component = struct {
     /// `wasm-tools compose` output where instance and alias sections
     /// interleave (issue #355).
     comp_instance_indexspace: []const CompInstanceContributor = &.{},
+    /// For each `Alias` in `aliases`, the parent `type_indexspace`
+    /// slot it contributed (or null if the alias contributes to a
+    /// different index space — e.g. core-func, comp-func, instance).
+    /// Indexed by `alias` position. Used by the load-time top-level
+    /// type-alias resolution pass (#534) to back-fill `type_indexspace`
+    /// slots produced by `(alias <instance> "<name>" (type …))` decls
+    /// that target an exported type of an imported instance. Without
+    /// resolution, `canon.lower` lift/lower of values whose declared
+    /// type goes through one of those slots trips
+    /// `CompoundNeedsRegistry`. Empty when the component was
+    /// constructed without a loader (hand-authored fixtures).
+    alias_type_slot: []const ?u32 = &.{},
 };
 
 /// A single contributor to the core-func index space.

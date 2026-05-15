@@ -36,8 +36,7 @@
         "cli-stdio":              "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
         "cli-stdio-roundtrip":    "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
         "run-with-err":           "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
-        "monotonic-clock":        "wasi:clocks@0.3.0 adapter not yet merged — tracking #483",
-        "multi-clock-wait":       "wasi:clocks@0.3.0 adapter not yet merged — tracking #483",
-        "wall-clock":             "wasi:clocks@0.3.0 adapter not yet merged — tracking #483"
+        "monotonic-clock":        "wasi:clocks@0.3.0 routing fixed in #534; `wait-for`/`wait-until` need canon-lower-of-async-func runtime support — tracking follow-up",
+        "multi-clock-wait":       "wasi:clocks@0.3.0 routing fixed in #534; needs canon-lower-of-async-func + task.cancel-aware sleep cancellation — tracking follow-up"
     }
 }

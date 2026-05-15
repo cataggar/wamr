@@ -151,6 +151,11 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
     // `indexspace.resolveCompInstance` only handles non-interleaved
     // layouts (issue #355).
     var comp_instance_indexspace: std.ArrayListUnmanaged(ctypes.CompInstanceContributor) = .empty;
+    // Parent type_indexspace slot contributed by each alias (or null
+    // for aliases that don't add a type slot). Indexed by alias
+    // position. Used by `resolveTopLevelTypeAliases` to back-fill
+    // null slots produced by `(alias <inst> "<name>" (type …))` (#534).
+    var alias_type_slot: std.ArrayListUnmanaged(?u32) = .empty;
 
     while (reader.remaining() > 0) {
         const section_id_byte = try reader.readByte();
@@ -217,7 +222,12 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                         .instance_export => |ie| ie.sort,
                         .outer => |o| o.sort,
                     };
-                    if (sort == .type) try type_indexspace.append(allocator, null);
+                    if (sort == .type) {
+                        try alias_type_slot.append(allocator, @intCast(type_indexspace.items.len));
+                        try type_indexspace.append(allocator, null);
+                    } else {
+                        try alias_type_slot.append(allocator, null);
+                    }
                     // Aliases of sort .core(.func) contribute to the
                     // core-func indexspace.
                     const is_core_func = switch (sort) {
@@ -320,6 +330,23 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
     }
 
+    // Post-parse: resolve top-level type-aliases against imported instance
+    // type bodies. Required for components that import a separate
+    // `wasi:clocks/types@0.3.x` instance to expose `duration` (and
+    // similar) shared types — without this, `canon.lower` lift/lower
+    // of values whose declared type goes through such an alias trips
+    // `CompoundNeedsRegistry`. See `resolveTopLevelTypeAliases` for the
+    // full algorithm and limitations. (#534)
+    try resolveTopLevelTypeAliases(
+        allocator,
+        aliases.items,
+        alias_type_slot.items,
+        imports.items,
+        comp_instance_indexspace.items,
+        &type_defs,
+        type_indexspace.items,
+    );
+
     return .{
         .core_modules = try core_modules.toOwnedSlice(allocator),
         .core_instances = try core_instances.toOwnedSlice(allocator),
@@ -335,7 +362,189 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         .exports = try exports.toOwnedSlice(allocator),
         .core_func_indexspace = try core_func_indexspace.toOwnedSlice(allocator),
         .comp_instance_indexspace = try comp_instance_indexspace.toOwnedSlice(allocator),
+        .alias_type_slot = try alias_type_slot.toOwnedSlice(allocator),
     };
+}
+
+// ── Top-level type-alias resolution (#534) ─────────────────────────────────
+//
+// `(alias instance_export <inst> "<name>" (type …))` produces a parent
+// `type_indexspace` slot whose target is the type exported by the
+// imported instance under `<name>`. The on-wire encoding doesn't include
+// the resolved type — we have to walk the imported instance's type body
+// at load time to recover it.
+//
+// Scope: handles the case where `<inst>` resolves to a *direct* instance
+// import whose type body's exported declarator has bound `eq <inner_idx>`,
+// and `<inner_idx>` points at a `TypeDef.val` (primitive aliases like
+// `type duration = u64`). Compound exported types — records, variants,
+// resources — fall through unresolved (slot stays null); the affected
+// `canon.lower` trampolines will continue to surface `CompoundNeedsRegistry`
+// until a future slice extends this resolver to deep-copy compound
+// payloads through the parent type space. The clock fixtures targeted
+// by #534 only expose `type duration = u64` at the top level, so the
+// primitive case is sufficient.
+//
+// Multi-hop alias chains (`alias-of-alias-of-import-export`) are
+// supported via the fixed-point loop. The pass bails after a defensive
+// bound on the number of iterations.
+fn resolveTopLevelTypeAliases(
+    allocator: std.mem.Allocator,
+    aliases: []const ctypes.Alias,
+    alias_type_slot: []const ?u32,
+    imports: []const ctypes.ImportDecl,
+    comp_instance_indexspace: []const ctypes.CompInstanceContributor,
+    type_defs: *std.ArrayListUnmanaged(ctypes.TypeDef),
+    type_indexspace: []?u32,
+) LoadError!void {
+    if (aliases.len == 0) return;
+    var iteration: u32 = 0;
+    while (iteration < 8) : (iteration += 1) {
+        var any_change = false;
+        for (aliases, 0..) |a, ai| {
+            if (a != .instance_export) continue;
+            const ie = a.instance_export;
+            if (ie.sort != .type) continue;
+            if (ai >= alias_type_slot.len) continue;
+            const slot = alias_type_slot[ai] orelse continue;
+            if (slot >= type_indexspace.len) continue;
+            if (type_indexspace[slot] != null) continue;
+
+            const resolved = resolveAliasInstanceExportType(
+                ie.instance_idx,
+                ie.name,
+                imports,
+                comp_instance_indexspace,
+                type_defs.items,
+                type_indexspace,
+            ) orelse continue;
+
+            // Materialize the resolved TypeDef in the parent's type
+            // pool. For primitive `TypeDef.val` we can copy directly;
+            // any compound shape would require deep-copy + type_idx
+            // rewriting, which this pass leaves for a future slice.
+            switch (resolved) {
+                .val => {
+                    const new_idx: u32 = @intCast(type_defs.items.len);
+                    try type_defs.append(allocator, resolved);
+                    type_indexspace[slot] = new_idx;
+                    any_change = true;
+                },
+                else => {},
+            }
+        }
+        if (!any_change) return;
+    }
+}
+
+/// Resolve `(alias <inst_ci_idx> "<name>" (type …))` to the exported
+/// `TypeDef` of the imported instance, or `null` if the chain can't be
+/// followed yet. See `resolveTopLevelTypeAliases` for scope.
+fn resolveAliasInstanceExportType(
+    inst_ci_idx: u32,
+    name: []const u8,
+    imports: []const ctypes.ImportDecl,
+    comp_instance_indexspace: []const ctypes.CompInstanceContributor,
+    type_defs: []const ctypes.TypeDef,
+    type_indexspace: []const ?u32,
+) ?ctypes.TypeDef {
+    // 1. Resolve the instance reference to a direct import declarator.
+    if (inst_ci_idx >= comp_instance_indexspace.len) return null;
+    const contributor = comp_instance_indexspace[inst_ci_idx];
+    const imp_idx: u32 = switch (contributor) {
+        .import => |i| i,
+        // Local instances / alias-of-instance / exported_alias chains
+        // are unsupported here; the type bodies they reference are
+        // resolved elsewhere (or not at all). Skip.
+        else => return null,
+    };
+    if (imp_idx >= imports.len) return null;
+    const imp = imports[imp_idx];
+    const imp_type_idx: u32 = switch (imp.desc) {
+        .instance => |ti| ti,
+        else => return null,
+    };
+
+    // 2. Look up the import's instance-type body in `type_defs`,
+    // honouring `type_indexspace` indirection when present.
+    const local_idx: u32 = blk: {
+        if (type_indexspace.len > 0) {
+            if (imp_type_idx >= type_indexspace.len) return null;
+            break :blk type_indexspace[imp_type_idx] orelse return null;
+        }
+        break :blk imp_type_idx;
+    };
+    if (local_idx >= type_defs.len) return null;
+    const inst_td = type_defs[local_idx];
+    const inst_decls = switch (inst_td) {
+        .instance => |inst| inst.decls,
+        else => return null,
+    };
+
+    // 3. Walk the instance type body, building the inner type-indexspace
+    // map and locating the named export.
+    return resolveInstanceTypeExportByName(inst_decls, name);
+}
+
+/// Walk an instance-type body's declarator list, build an inner
+/// type-indexspace ↔ inner `TypeDef` table, find the export named
+/// `name`, resolve its bound, and return the corresponding `TypeDef`.
+fn resolveInstanceTypeExportByName(
+    decls: []const ctypes.Decl,
+    name: []const u8,
+) ?ctypes.TypeDef {
+    // Inner type-indexspace, populated in declaration order. Each
+    // entry is either an embedded TypeDef (`.type`), or a `.eq <slot>`
+    // back-reference (introduced by an export-of-type declarator).
+    // The actual storage uses a small fixed-size buffer to avoid an
+    // allocation; instance type bodies in real fixtures rarely exceed
+    // a few dozen entries.
+    const max_inner_slots = 256;
+    var inner_slots: [max_inner_slots]?ctypes.TypeDef = [_]?ctypes.TypeDef{null} ** max_inner_slots;
+    var inner_eq: [max_inner_slots]?u32 = [_]?u32{null} ** max_inner_slots;
+    var slot_count: u32 = 0;
+    for (decls) |d| switch (d) {
+        .type => |td| {
+            if (slot_count >= max_inner_slots) return null;
+            inner_slots[slot_count] = td;
+            slot_count += 1;
+        },
+        .alias => {
+            // Outer / instance-export inner aliases — not resolved
+            // here. The clock fixtures the #534 pass targets don't
+            // use these for top-level `type` exports.
+            if (slot_count >= max_inner_slots) return null;
+            slot_count += 1;
+        },
+        .@"export" => |e| {
+            if (e.desc == .type) {
+                if (slot_count >= max_inner_slots) return null;
+                switch (e.desc.type) {
+                    .eq => |target| {
+                        if (target < slot_count) inner_eq[slot_count] = target;
+                    },
+                    .sub_resource => {},
+                }
+                if (std.mem.eql(u8, e.name, name)) {
+                    // Found the requested export. Follow `eq` chain.
+                    var cur: u32 = slot_count;
+                    var hops: u32 = 0;
+                    while (hops < max_inner_slots) : (hops += 1) {
+                        if (inner_eq[cur]) |t| {
+                            cur = t;
+                            continue;
+                        }
+                        if (inner_slots[cur]) |td| return td;
+                        return null;
+                    }
+                    return null;
+                }
+                slot_count += 1;
+            }
+        },
+        else => {},
+    };
+    return null;
 }
 
 // ── Section parsers ─────────────────────────────────────────────────────────

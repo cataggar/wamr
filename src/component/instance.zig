@@ -1501,7 +1501,7 @@ pub fn instantiate(
                                 else
                                     @intCast(component.types.len);
                                 const ext: InstanceTypeExtension = if (rft.decls) |decls|
-                                    buildInstanceTypeExtension(allocator, decls, ext_base) catch {
+                                    buildInstanceTypeExtension(allocator, decls, ext_base, component) catch {
                                         allocator.destroy(ctx_ptr);
                                         continue;
                                     }
@@ -2337,21 +2337,64 @@ const InstanceTypeExtension = struct {
     }
 };
 
+/// True iff `a` is a single-hop outer alias of sort `.type` whose
+/// parent target slot has been resolved (i.e. `type_indexspace[idx]`
+/// is non-null). Used to size the extension's type buffer for #534.
+fn canResolveOuterTypeAlias(a: ctypes.Alias, component: *const ctypes.Component) bool {
+    return resolveOuterTypeAliasToParent(a, component) != null;
+}
+
+/// Resolve a single-hop `.alias outer 1 M (type)` against the parent
+/// component's `type_indexspace`. Returns the parent's `TypeDef` or
+/// `null` when the alias shape is unsupported (multi-level outer,
+/// non-type sort, target slot still unresolved). The returned TypeDef
+/// is structurally shared with the parent — callers MUST NOT deep-free
+/// it when tearing the extension down. Limited to `TypeDef.val` for
+/// now (#534 scope; primitives like `type duration = u64` cover the
+/// clock fixtures). A future slice may extend this to record / variant
+/// payloads with proper deep-copy + type_idx rewriting.
+fn resolveOuterTypeAliasToParent(
+    a: ctypes.Alias,
+    component: *const ctypes.Component,
+) ?ctypes.TypeDef {
+    const outer = switch (a) {
+        .outer => |o| o,
+        else => return null,
+    };
+    if (outer.sort != .type) return null;
+    // Only single-hop outers — i.e. the immediate enclosing component.
+    if (outer.outer_count != 1) return null;
+    if (component.type_indexspace.len == 0) return null;
+    if (outer.idx >= component.type_indexspace.len) return null;
+    const local = component.type_indexspace[outer.idx] orelse return null;
+    if (local >= component.types.len) return null;
+    const td = component.types[local];
+    return switch (td) {
+        .val => td,
+        else => null,
+    };
+}
+
 /// Materialize the per-trampoline TypeRegistry extension covering an
 /// instance-type body's local type space. Walks `decls` in declaration
 /// order, mirroring `resolveInstanceTypeLocal`'s slot-counting rules:
 /// `.type`, `.alias`, and `.@"export"`-with-type each contribute one
-/// indexspace slot. Only `.type` slots materialize a structural typedef;
-/// `.alias` and exported-type slots map to `null` (the trampoline path
-/// for them was already null-fallback under the prior local-only walker).
+/// indexspace slot. `.type` slots materialize a structural typedef;
+/// `.alias outer 1 M (type)` slots resolve through the parent
+/// component's `type_indexspace` (#534); other alias shapes map to
+/// `null` (the trampoline path for them was already null-fallback
+/// under the prior local-only walker).
 ///
 /// The caller is responsible for `deinit`'ing the returned extension.
 fn buildInstanceTypeExtension(
     allocator: std.mem.Allocator,
     decls: []const ctypes.Decl,
     base: u32,
+    component: *const ctypes.Component,
 ) !InstanceTypeExtension {
-    // First pass: count slots and type entries.
+    // First pass: count slots and type entries. Reserve a type slot for
+    // `(alias outer 1 M (type))` decls too — we materialize the parent
+    // type into the extension when possible (#534).
     var slot_count: u32 = 0;
     var type_count: u32 = 0;
     for (decls) |d| switch (d) {
@@ -2359,7 +2402,14 @@ fn buildInstanceTypeExtension(
             slot_count += 1;
             type_count += 1;
         },
-        .alias => slot_count += 1,
+        .alias => |a| {
+            slot_count += 1;
+            // `.alias outer count=1 idx=M (type)` may resolve to a
+            // parent type — reserve a type slot for the copy. Other
+            // alias shapes (inner instance_export aliases, deeper outer
+            // hops) stay unresolved.
+            if (canResolveOuterTypeAlias(a, component)) type_count += 1;
+        },
         .@"export" => |e| if (e.desc == .type) {
             slot_count += 1;
         },
@@ -2387,13 +2437,23 @@ fn buildInstanceTypeExtension(
             type_i += 1;
             slot_i += 1;
         },
-        .alias => {
-            // `.alias outer N M (type)` introduces a slot that aliases an
-            // outer type indexspace. We don't currently plumb the parent's
-            // indexspace into this builder, so the slot remains unresolved.
-            // Type-uses that resolve through this slot will correctly fall
-            // through to the registry's null path. Tracked separately.
-            idxspace_buf[slot_i] = null;
+        .alias => |a| {
+            // `.alias outer count=1 idx=M (type)` — when M points at a
+            // parent type-indexspace slot that has been resolved (e.g.
+            // by the loader's #534 top-level type-alias resolution),
+            // copy that TypeDef into the extension so canon-ABI
+            // lift/lower of values whose declared type goes through this
+            // slot can look up the concrete shape. Deep-copy is not
+            // needed for the `TypeDef.val` case currently handled by
+            // the loader resolver; nested type_idx refs would require
+            // rewriting and are out of scope here.
+            if (resolveOuterTypeAliasToParent(a, component)) |parent_td| {
+                types_buf[type_i] = parent_td;
+                idxspace_buf[slot_i] = type_i;
+                type_i += 1;
+            } else {
+                idxspace_buf[slot_i] = null;
+            }
             slot_i += 1;
         },
         .@"export" => |e| if (e.desc == .type) {
