@@ -49,7 +49,13 @@ def get_wasi_versions() -> List[str]:
 
 
 def get_wasi_worlds() -> List[str]:
-    return ["wasi:cli/command"]
+    # Declares both `wasi:cli/command` (every cli/filesystem/sockets
+    # fixture) and `wasi:http/service` (the `http-service` fixture,
+    # which exports `wasi:http/incoming-handler@0.3.0.handle`). Without
+    # the http world declaration the upstream
+    # `UnsupportedWasiTestExcludeFilter` auto-skips http-service
+    # before any of our dispatch glue gets a chance to run. (#570)
+    return ["wasi:cli/command", "wasi:http/service"]
 
 
 def _isolate_preopens(dirs: List[Tuple[Path, str]]) -> List[Tuple[Path, str]]:
@@ -99,6 +105,17 @@ def compute_argv(
     if "sockets" in proposals:
         argv += ["--allow-net", "127.0.0.0/8"]
         argv += ["--allow-net", "::1/128"]
+
+    # `wasi:http/service` fixtures (`http-service.wasm`) export
+    # `wasi:http/incoming-handler@0.3.0.handle` and expect the host
+    # to bind a TCP listener, accept on it, and route incoming HTTP
+    # over the guest export. Bare `--listen` selects an ephemeral
+    # 127.0.0.1:0 bind and triggers `announce_listening` — the wamr
+    # CLI prints `http://<host>:<port>` to stderr so the
+    # wasi-testsuite `TestCaseRunner.get_http_server` URL-scrape
+    # succeeds. (#570)
+    if wasi_world == "wasi:http/service":
+        argv += ["--listen"]
 
     argv += [test_path]
     argv += args
