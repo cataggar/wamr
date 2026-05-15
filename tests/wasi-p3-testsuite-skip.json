@@ -28,7 +28,6 @@
         "filesystem-set-size": "wasi:filesystem@0.3.0 host bindings wired in #484/#522; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "filesystem-stat": "wasi:filesystem@0.3.0 host bindings wired in #484/#522; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "filesystem-unlink-errors": "wasi:filesystem@0.3.0 host bindings wired in #484/#522; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
-        "cli-stdio-roundtrip": "P3 stdio works but `futures::join!` rendezvous needs waitable-set.{wait,poll} event delivery for stream-write futures — tracking #550",
         "monotonic-clock": "wasi:clocks@0.3.0 routing fixed in #534 / PR #546; `wait-for` / `wait-until` need canon-lower-of-async-func wiring — tracking #551",
         "multi-clock-wait": "wasi:clocks@0.3.0 routing fixed in #534 / PR #546; needs canon-lower-of-async-func + task.cancel-aware sleep cancellation — tracking #551"
     }

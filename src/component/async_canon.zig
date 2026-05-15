@@ -110,6 +110,42 @@ pub fn packStatus(status: FutureStatus, count: u32) u32 {
     return @intFromEnum(status) | (count << 4);
 }
 
+/// Event-code discriminants returned by `canon waitable-set.{wait,poll}`
+/// (Binary.md tags `0x20` / `0x21`). The numeric values match the
+/// canonical-abi.py `EventCode` enum so the guest's wit-bindgen
+/// reactor can branch on the result.
+///
+///   * `none` — no ready waitable (only legal as a `poll` outcome).
+///   * `subtask` — an async-lifted subtask transitioned to `.returned`
+///     / `.cancelled`; payload2 carries the new task state.
+///   * `stream_read` / `stream_write` — the corresponding stream end
+///     became drainable / acceptable. Payload2 carries the
+///     `packStatus(...)` the next `stream.{read,write}` would return.
+///   * `future_read` / `future_write` — the corresponding future end
+///     settled. Payload2 carries the `packStatus(...)` the next
+///     `future.{read,write}` would return.
+pub const EventCode = enum(u32) {
+    none = 0,
+    subtask = 1,
+    stream_read = 2,
+    stream_write = 3,
+    future_read = 4,
+    future_write = 5,
+};
+
+/// Map a `WaitableSet.WaitableItem.Kind` to its on-the-wire `EventCode`
+/// numeric value. Centralised so the executor's wait/poll arm and
+/// future tests stay in lockstep with the spec encoding.
+pub fn eventCodeForKind(kind: async_mod.WaitableSet.WaitableItem.Kind) u32 {
+    return @intFromEnum(@as(EventCode, switch (kind) {
+        .subtask => .subtask,
+        .stream_read => .stream_read,
+        .stream_write => .stream_write,
+        .future_read => .future_read,
+        .future_write => .future_write,
+    }));
+}
+
 /// Execute `canon thread.yield cancel?` for the currently executing task.
 ///
 /// Single-threaded runtime semantics: a "yield" is the smallest possible
