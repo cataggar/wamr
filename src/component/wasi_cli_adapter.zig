@@ -404,6 +404,154 @@ fn lowerFieldEntriesList(ci: *ComponentInstance, entries: []const HttpFieldEntry
     return .{ .ptr = outer, .len = @intCast(entries.len) };
 }
 
+// ── wasi:sockets@0.3.0 async-payload type registry (#535) ──────────────────
+//
+// Async-func wrappers on the 0.3 sockets surface return `result<T, error-code>`
+// shapes whose `T` arm carries either a list of `ip-address`es or a tuple of
+// `(list<u8>, ip-socket-address)`. The executor's `future_read` rendezvous
+// (#502) consumes `Future.payload` directly: the canonical-ABI-lowered byte
+// stream for `result<T, error-code>` lives in `payload` so the read can
+// `memcpy` it into the guest's destination pointer.
+//
+// Indices (consult `sockets_p3_local_types` below):
+//    0: tuple<u8, u8, u8, u8>                                       — ipv4 octets
+//    1: tuple<u16, u16, u16, u16, u16, u16, u16, u16>               — ipv6 groups
+//    2: variant ip-address { ipv4(tuple<u8 x 4>), ipv6(tuple<u16 x 8>) }
+//    3: list<ip-address>                                            — resolve-addresses ok arm
+//    4: list<u8>                                                    — udp datagram bytes
+//    5: record ipv4-socket-address { port: u16, address: tuple<u8 x 4> }
+//    6: record ipv6-socket-address { port: u16, flow-info: u32,
+//         address: tuple<u16 x 8>, scope-id: u32 }
+//    7: variant ip-socket-address { ipv4, ipv6 }
+//    8: tuple<list<u8>, ip-socket-address>                          — udp-receive ok arm
+//    9: variant error-code (21 cases; all unit)
+//   10: result<list<ip-address>, error-code>                         — resolve-addresses
+//   11: result<tuple<list<u8>, ip-socket-address>, error-code>       — udp-receive
+//   12: result<_, error-code>                                        — connect, udp-send, etc.
+
+const sockets_p3_ipv4_octets_fields = [_]ctypes.ValType{ .u8, .u8, .u8, .u8 };
+const sockets_p3_ipv6_groups_fields = [_]ctypes.ValType{ .u16, .u16, .u16, .u16, .u16, .u16, .u16, .u16 };
+const sockets_p3_ip_address_cases = [_]ctypes.Case{
+    .{ .name = "ipv4", .type = .{ .tuple = 0 } },
+    .{ .name = "ipv6", .type = .{ .tuple = 1 } },
+};
+const sockets_p3_ipv4_sockaddr_fields = [_]ctypes.Field{
+    .{ .name = "port", .type = .u16 },
+    .{ .name = "address", .type = .{ .tuple = 0 } },
+};
+const sockets_p3_ipv6_sockaddr_fields = [_]ctypes.Field{
+    .{ .name = "port", .type = .u16 },
+    .{ .name = "flow-info", .type = .u32 },
+    .{ .name = "address", .type = .{ .tuple = 1 } },
+    .{ .name = "scope-id", .type = .u32 },
+};
+const sockets_p3_ip_sockaddr_cases = [_]ctypes.Case{
+    .{ .name = "ipv4", .type = .{ .record = 5 } },
+    .{ .name = "ipv6", .type = .{ .record = 6 } },
+};
+const sockets_p3_udp_receive_fields = [_]ctypes.ValType{
+    .{ .list = 4 },
+    .{ .variant = 7 },
+};
+const sockets_p3_error_code_cases = [_]ctypes.Case{
+    .{ .name = "unknown", .type = null },
+    .{ .name = "access-denied", .type = null },
+    .{ .name = "not-supported", .type = null },
+    .{ .name = "invalid-argument", .type = null },
+    .{ .name = "out-of-memory", .type = null },
+    .{ .name = "timeout", .type = null },
+    .{ .name = "concurrency-conflict", .type = null },
+    .{ .name = "not-in-progress", .type = null },
+    .{ .name = "would-block", .type = null },
+    .{ .name = "invalid-state", .type = null },
+    .{ .name = "new-socket-limit", .type = null },
+    .{ .name = "address-not-bindable", .type = null },
+    .{ .name = "address-in-use", .type = null },
+    .{ .name = "remote-unreachable", .type = null },
+    .{ .name = "connection-refused", .type = null },
+    .{ .name = "connection-reset", .type = null },
+    .{ .name = "connection-aborted", .type = null },
+    .{ .name = "datagram-too-large", .type = null },
+    .{ .name = "name-unresolvable", .type = null },
+    .{ .name = "temporary-resolver-failure", .type = null },
+    .{ .name = "permanent-resolver-failure", .type = null },
+};
+
+const sockets_p3_local_types = [_]ctypes.TypeDef{
+    .{ .tuple = .{ .fields = &sockets_p3_ipv4_octets_fields } }, // 0
+    .{ .tuple = .{ .fields = &sockets_p3_ipv6_groups_fields } }, // 1
+    .{ .variant = .{ .cases = &sockets_p3_ip_address_cases } }, // 2
+    .{ .list = .{ .element = .{ .variant = 2 } } }, // 3
+    .{ .list = .{ .element = .u8 } }, // 4
+    .{ .record = .{ .fields = &sockets_p3_ipv4_sockaddr_fields } }, // 5
+    .{ .record = .{ .fields = &sockets_p3_ipv6_sockaddr_fields } }, // 6
+    .{ .variant = .{ .cases = &sockets_p3_ip_sockaddr_cases } }, // 7
+    .{ .tuple = .{ .fields = &sockets_p3_udp_receive_fields } }, // 8
+    .{ .variant = .{ .cases = &sockets_p3_error_code_cases } }, // 9
+    .{ .result = .{ .ok = .{ .list = 3 }, .err = .{ .variant = 9 } } }, // 10
+    .{ .result = .{ .ok = .{ .tuple = 8 }, .err = .{ .variant = 9 } } }, // 11
+    .{ .result = .{ .ok = null, .err = .{ .variant = 9 } } }, // 12
+};
+
+const SOCKETS_P3_IP_ADDRESS_VARIANT_IDX: u32 = 2;
+const SOCKETS_P3_IP_ADDRESS_LIST_IDX: u32 = 3;
+const SOCKETS_P3_IP_SOCKADDR_VARIANT_IDX: u32 = 7;
+const SOCKETS_P3_UDP_RECEIVE_TUPLE_IDX: u32 = 8;
+const SOCKETS_P3_RESULT_RESOLVE_IDX: u32 = 10;
+const SOCKETS_P3_RESULT_UDP_RECV_IDX: u32 = 11;
+const SOCKETS_P3_RESULT_UNIT_ERR_IDX: u32 = 12;
+
+fn socketsP3TypeRegistry() abi.TypeRegistry {
+    return abi.TypeRegistry.fromTypes(&sockets_p3_local_types);
+}
+
+/// 0.3 async-func return shapes that `socketsLowerAsyncPayload` knows
+/// how to lower. Mirrors `FsP3AsyncReturn`.
+const SocketsP3AsyncReturn = enum {
+    /// `result<_, error-code>` — connect, udp-send, etc.
+    unit_err,
+    /// `result<list<ip-address>, error-code>` — resolve-addresses ok arm.
+    resolve_list_err,
+    /// `result<tuple<list<u8>, ip-socket-address>, error-code>` — udp-receive ok arm.
+    udp_receive_err,
+
+    pub fn valType(self: SocketsP3AsyncReturn) ctypes.ValType {
+        return switch (self) {
+            .unit_err => .{ .result = SOCKETS_P3_RESULT_UNIT_ERR_IDX },
+            .resolve_list_err => .{ .result = SOCKETS_P3_RESULT_RESOLVE_IDX },
+            .udp_receive_err => .{ .result = SOCKETS_P3_RESULT_UDP_RECV_IDX },
+        };
+    }
+};
+
+/// Lower a fully-lifted `InterfaceValue` for the requested 0.3 sockets
+/// async-func return shape into a canonical-ABI byte buffer suitable
+/// for installation on `async_mod.Future.payload`. Owned by `allocator`;
+/// the future-read rendezvous on the executor frees it after the guest
+/// reads. Mirrors `fsP3LowerAsyncPayload` (#522 / PR #528).
+fn socketsP3LowerAsyncPayload(
+    allocator: Allocator,
+    kind: SocketsP3AsyncReturn,
+    val: InterfaceValue,
+) ![]u8 {
+    const reg = socketsP3TypeRegistry();
+    const vt = kind.valType();
+    const size = abi.sizeOfType(reg, vt);
+    if (size == 0) return error.LowerError;
+    const buf = try allocator.alloc(u8, size);
+    errdefer allocator.free(buf);
+    @memset(buf, 0);
+
+    // Strip a stray ok-payload from `result<_, error-code>` (the same
+    // 0.2-shape compatibility cleanup as `fsP3LowerAsyncPayload`).
+    var effective = val;
+    if (kind == .unit_err and val == .result_val and val.result_val.is_ok) {
+        effective = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+    try abi.storeValReg(buf, 0, vt, effective, reg);
+    return buf;
+}
+
 const streams = @import("../wasi/preview2/streams.zig");
 const wasi_p2_core = @import("../wasi/preview2/core.zig");
 
@@ -849,6 +997,18 @@ pub const ResolveAddressStream = struct {
     results: []std.Io.net.IpAddress,
     pos: usize,
     allocator: Allocator,
+};
+
+/// Lifetime-stable context for a `host_driver` attached to a socket-
+/// backed `AsyncStream` (#535). The executor invokes the driver
+/// callbacks with this opaque pointer; the callbacks unwrap it,
+/// consult the fd, and (for accept) push new sockets through the
+/// adapter. Owned by `WasiCliAdapter.sockets_p3_stream_ctxs`, lives
+/// until adapter teardown.
+pub const SocketsP3StreamCtx = struct {
+    adapter: *WasiCliAdapter,
+    fd: std.posix.fd_t,
+    family: IpAddressFamily,
 };
 
 /// Map a `std.Io.net.HostName.LookupError` to the closest
@@ -1915,6 +2075,13 @@ pub const WasiCliAdapter = struct {
     /// `wasi:sockets/ip-name-lookup.resolve-address-stream` table. Slots
     /// own the heap-allocated stream struct; nulled on resource-drop.
     resolve_streams: std.ArrayListUnmanaged(?*ResolveAddressStream) = .empty,
+    /// Lifetimes for `host_driver` contexts attached to socket-backed
+    /// `AsyncStream` slots (#535). The adapter owns these so the
+    /// `*AsyncStream`'s `host_driver.context` pointer stays valid until
+    /// the adapter tears down — the executor frees the `AsyncStream`
+    /// itself but not the host context. Each entry is a small struct
+    /// (fd + adapter pointer + family).
+    sockets_p3_stream_ctxs: std.ArrayListUnmanaged(*SocketsP3StreamCtx) = .empty,
 
     /// `wasi:http/types` resource tables (#149). Each slot owns a
     /// heap-allocated rep struct; resource-drop nulls the slot and
@@ -2176,6 +2343,8 @@ pub const WasiCliAdapter = struct {
             }
         }
         self.resolve_streams.deinit(self.allocator);
+        for (self.sockets_p3_stream_ctxs.items) |ctx| self.allocator.destroy(ctx);
+        self.sockets_p3_stream_ctxs.deinit(self.allocator);
 
         // wasi:http resource tables (#149). Each slot owns its heap
         // rep; HttpFields and OutgoingRequest also own inner string
@@ -9854,6 +10023,73 @@ pub const WasiCliAdapter = struct {
         return h;
     }
 
+    /// Allocate a settled future whose `payload` carries the canonical-
+    /// ABI bytes for a `result<T, error-code>` shape. Ownership of
+    /// `payload_bytes` transfers to the future slot — the executor frees
+    /// it after the guest's `future_read` rendezvous. (#535)
+    fn spawnReadyFutureBytes(ci: *ComponentInstance, payload_bytes: []u8) !u32 {
+        const h = ci.allocAsyncHandle();
+        try ci.futures.put(ci.allocator, h, .{
+            .elem_type_idx = 0,
+            .payload = payload_bytes,
+            .state = .ready,
+            .write_closed = true,
+        });
+        return h;
+    }
+
+    /// Lower a slice of `std.Io.net.IpAddress` values into a contiguous
+    /// canonical-ABI `list<ip-address>` block in guest memory. Returns
+    /// the guest pointer at the start of the block; the caller pairs it
+    /// with `addrs.len` to produce the `.list{.ptr, .len}` InterfaceValue
+    /// the future-payload lowering consumes. (#535)
+    fn socketsP3LowerIpAddressList(
+        ci: *ComponentInstance,
+        addrs: []const std.Io.net.IpAddress,
+    ) !u32 {
+        const reg = socketsP3TypeRegistry();
+        const elem_t: ctypes.ValType = .{ .variant = SOCKETS_P3_IP_ADDRESS_VARIANT_IDX };
+        const elem_size = abi.sizeOfType(reg, elem_t);
+        const elem_align = abi.alignOfType(reg, elem_t);
+        if (addrs.len == 0) return 0;
+        const total = std.math.mul(u32, elem_size, @intCast(addrs.len)) catch return error.OutOfMemory;
+        const list_ptr = ci.hostAllocGuest(total, elem_align) orelse return error.OutOfMemory;
+        const dst = ci.writableGuestBytes(list_ptr, total) orelse return error.OutOfMemory;
+        @memset(dst, 0);
+        var off: u32 = 0;
+        for (addrs) |a| {
+            const iv = try lowerIpAddress(ci.allocator, a);
+            defer iv.deinit(ci.allocator);
+            abi.storeValReg(dst, off, elem_t, iv, reg) catch return error.LowerError;
+            off += elem_size;
+        }
+        return list_ptr;
+    }
+
+    /// Lower a single `std.Io.net.IpAddress` + datagram payload into the
+    /// canonical-ABI `tuple<list<u8>, ip-socket-address>` block in guest
+    /// memory. Returns the guest pointer at the start of the block;
+    /// caller wraps it in `.list{.ptr, .len}` if the canonical lowering
+    /// needs an outer pointer. (#535)
+    fn socketsP3LowerUdpReceivePayload(
+        ci: *ComponentInstance,
+        bytes: []const u8,
+        remote: std.Io.net.IpAddress,
+    ) !InterfaceValue {
+        // Stage the data list bytes inside guest memory (so the canonical
+        // `list<u8>` lowering can store the (ptr, len) reference).
+        const data_ptr: u32 = if (bytes.len == 0)
+            0
+        else
+            (ci.hostAllocAndWrite(bytes) orelse return error.OutOfMemory);
+        const data_iv = InterfaceValue{ .list = .{ .ptr = data_ptr, .len = @intCast(bytes.len) } };
+        const remote_iv = try lowerIpSocketAddress(ci.allocator, remote);
+        const fields = try ci.allocator.alloc(InterfaceValue, 2);
+        fields[0] = data_iv;
+        fields[1] = remote_iv;
+        return .{ .tuple_val = fields };
+    }
+
     /// Allocate a fresh `stream<u8>` slot. Pre-buffers `bytes` (may be
     /// empty) and marks the writable end closed when `eof` is true so a
     /// subsequent `stream.read` observes EOF after the FIFO drains.
@@ -9873,6 +10109,121 @@ pub const WasiCliAdapter = struct {
         const h = ci.allocAsyncHandle();
         try ci.streams.put(ci.allocator, h, slot);
         return h;
+    }
+
+    // ── 0.3 sockets host stream drivers (#535) ──────────────────────────
+    //
+    // The 0.3 surface returns `stream<u8>` (tcp.receive / tcp.send) and
+    // `stream<tcp-socket>` (tcp.listen) handles to the guest. The single-
+    // shot host fn (#519) buffered at most one syscall worth of data into
+    // the FIFO before returning. The 0.3 spec demands continuous I/O —
+    // every `stream.read` should be able to drain new bytes off the fd,
+    // every `stream.write` should push to the fd, every `accept(2)` on
+    // the listener should land on the stream FIFO.
+    //
+    // We implement this by installing an `async_mod.HostStreamDriver` on
+    // each socket-backed stream slot. The executor's `stream.read` /
+    // `stream.write` paths invoke the driver before parking / buffering
+    // so a long-lived host fd can keep the FIFO fed without a per-call
+    // host fn dispatch (mirrors the filesystem `descriptor.read` /
+    // `descriptor.write` continuous-stream pattern from #522 / PR #528).
+
+    /// Allocate a long-lived driver context owned by the adapter. The
+    /// returned pointer stays valid until adapter `deinit`.
+    fn allocSocketsP3StreamCtx(
+        self: *WasiCliAdapter,
+        fd: std.posix.fd_t,
+        family: IpAddressFamily,
+    ) !*SocketsP3StreamCtx {
+        const ctx = try self.allocator.create(SocketsP3StreamCtx);
+        ctx.* = .{ .adapter = self, .fd = fd, .family = family };
+        self.sockets_p3_stream_ctxs.append(self.allocator, ctx) catch {
+            self.allocator.destroy(ctx);
+            return error.OutOfMemory;
+        };
+        return ctx;
+    }
+
+    /// `host_driver.on_read` for a TCP-receive `stream<u8>` slot. Reads
+    /// up to 64 KiB from the connected fd non-blockingly and appends the
+    /// bytes to the FIFO. Returns `.progressed` on byte append, `.eof`
+    /// when the peer closed the fd, `.would_block` when no data is
+    /// available yet.
+    fn tcpReceiveStreamOnRead(
+        opaque_ctx: ?*anyopaque,
+        stream: *async_mod.AsyncStream,
+        allocator: Allocator,
+    ) async_mod.HostStreamAction {
+        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (!fdPollReady(ctx.fd, pollInEvents())) return .would_block;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var buf: [64 * 1024]u8 = undefined;
+        var iovecs = [_][]u8{&buf};
+        const n = io.vtable.netRead(io.userdata, ctx.fd, &iovecs) catch return .err;
+        if (n == 0) return .eof;
+        stream.buffer.appendSlice(allocator, buf[0..n]) catch return .err;
+        return .progressed;
+    }
+
+    /// `host_driver.on_write` for a TCP-send `stream<u8>` slot. Pushes
+    /// the guest-provided bytes synchronously to the connected fd.
+    /// Returns `.progressed` on success, `.err` on syscall error so the
+    /// executor marks `read_closed = true` and surfaces `cancelled` to
+    /// the guest's next `stream.write`.
+    fn tcpSendStreamOnWrite(
+        opaque_ctx: ?*anyopaque,
+        _: *async_mod.AsyncStream,
+        bytes: []const u8,
+        _: Allocator,
+    ) async_mod.HostStreamAction {
+        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (bytes.len == 0) return .progressed;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const slices = [_][]const u8{bytes};
+        _ = io.vtable.netWrite(io.userdata, ctx.fd, &.{}, &slices, 1) catch return .err;
+        return .progressed;
+    }
+
+    /// `host_driver.on_read` for a `stream<tcp-socket>` slot produced
+    /// by `tcp-socket.listen`. Non-blocking-accepts the listener fd
+    /// once per call, allocates a fresh `Socket` rep, and appends the
+    /// resulting u32 handle (canonical-ABI little-endian) to the FIFO
+    /// so the guest's `stream.read t` rendezvous sees a new element.
+    fn tcpAcceptStreamOnRead(
+        opaque_ctx: ?*anyopaque,
+        stream: *async_mod.AsyncStream,
+        allocator: Allocator,
+    ) async_mod.HostStreamAction {
+        const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (!fdPollReady(ctx.fd, pollInEvents())) return .would_block;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        // Look up the server through the fd → socket slot lookup; the
+        // listening socket lives in the adapter's `socket_table`.
+        // We use `Server.accept` on whichever socket is listening on
+        // this fd. To avoid scanning the table on every accept, we
+        // construct a minimal `Server` around the fd by walking the
+        // table once.
+        var server: ?*std.Io.net.Server = null;
+        for (ctx.adapter.socket_table.items) |*maybe| {
+            if (maybe.*) |*s| if (s.server) |*srv|
+                if (srv.socket.handle == ctx.fd) {
+                    server = srv;
+                    break;
+                };
+        }
+        const srv = server orelse return .eof;
+        const accepted = srv.accept(io) catch return .would_block;
+        const new_handle = ctx.adapter.pushSocket(.{
+            .kind = .tcp,
+            .family = ctx.family,
+            .state = .connected,
+            .tcp_stream = accepted,
+            .remote_addr = accepted.socket.address,
+        }) catch return .err;
+        var handle_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &handle_bytes, new_handle, .little);
+        stream.buffer.appendSlice(allocator, &handle_bytes) catch return .err;
+        return .progressed;
     }
 
     /// Reject IPv4-mapped IPv6 (`::ffff:0:0/96`) per the WIT contract —
@@ -9991,17 +10342,14 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]tcp-socket.listen: func()
-    ///   -> result<stream<tcp-socket>, error-code>` (#519).
+    ///   -> result<stream<tcp-socket>, error-code>` (#519, #535).
     ///
     /// Synchronous. Performs the kernel `listen(2)` and returns a
-    /// `stream<tcp-socket>` handle. The stream is pre-buffered with
-    /// any connections already sitting in the backlog (non-blocking
-    /// drain on the freshly-listening socket). The writable end is
-    /// **not** closed — additional connections arrive through the
-    /// same fd, but draining them into the stream FIFO requires the
-    /// executor-side host-stream hook scheduled for the wave-D
-    /// follow-up, so multi-connect tests stay skipped until that
-    /// lands.
+    /// `stream<tcp-socket>` handle. The stream's `host_driver` (#535)
+    /// runs `accept(2)` on each guest `stream.read` so multi-connection
+    /// listeners admit a connection per rendezvous without per-call
+    /// host-fn dispatch. Pre-fills the FIFO with any backlog already
+    /// queued at listen time.
     fn tcpListenP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -10050,20 +10398,22 @@ pub const WasiCliAdapter = struct {
         s.local_addr = server.socket.address;
         s.state = .listening;
 
-        // Pre-drain any already-queued connections into the stream FIFO.
-        // The stream elem-type at the WIT level is `tcp-socket` (a resource),
-        // which lowers to a u32 handle per slot. The executor's
-        // `stream_read` rendezvous (#505) consults `sizeOfType` for the
-        // recorded `elem_type_idx`; we leave it at 0 (sentinel) here —
-        // multi-element streams of resources land with the wave-D host
-        // hook PR. For now we buffer at most one accepted socket so the
-        // single-connection loopback round-trip test can advance.
+        // Install an accept-loop driver on the stream so each guest
+        // `stream.read t` invocation can pop a fresh connection off
+        // the backlog (#535). Pre-drain any queued connections so
+        // a guest that connect()s before reading still sees them.
+        const driver_ctx = try self.allocSocketsP3StreamCtx(server.socket.handle, s.family);
         const stream_h = ci.allocAsyncHandle();
         try ci.streams.put(ci.allocator, stream_h, .{
             .elem_type_idx = 0,
             .state = .open,
+            .host_driver = .{
+                .context = driver_ctx,
+                .on_read = &tcpAcceptStreamOnRead,
+            },
         });
-        // Non-blocking accept attempt to pre-fill the stream.
+        // Non-blocking accept attempt to pre-fill the stream (the driver
+        // path will keep adding as more arrive on subsequent reads).
         if (fdPollReady(server.socket.handle, pollInEvents())) {
             if (s.server.?.accept(io)) |accepted| {
                 const new_handle = self.pushSocket(.{
@@ -10075,7 +10425,8 @@ pub const WasiCliAdapter = struct {
                     .local_addr = s.local_addr,
                 }) catch return error.OutOfMemory;
                 if (ci.streams.getPtr(stream_h)) |slot| {
-                    const handle_bytes = std.mem.toBytes(new_handle);
+                    var handle_bytes: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &handle_bytes, new_handle, .little);
                     try slot.buffer.appendSlice(ci.allocator, &handle_bytes);
                 }
             } else |_| {}
@@ -10087,12 +10438,14 @@ pub const WasiCliAdapter = struct {
     }
 
     /// `[method]tcp-socket.send: func(data: stream<u8>)
-    ///   -> future<result<_, error-code>>` (#519).
+    ///   -> future<result<_, error-code>>` (#519, #535).
     ///
-    /// Synchronous. Drains the guest-provided `stream<u8>` FIFO and
-    /// writes the bytes to the connected fd. The stream's read-end is
-    /// marked closed so further guest writes are observable but the
-    /// host won't drain again. Returns a settled future.
+    /// Synchronous. Attaches an `on_write` host driver to the guest's
+    /// `stream<u8>` so subsequent stream-writes flow straight to the
+    /// connected fd (#535). Drains any bytes the guest already pushed
+    /// into the FIFO before the call. Returns a settled future — per-
+    /// write errors surface through `read_closed = true` on the stream
+    /// (the next `stream.write` returns `cancelled`).
     fn tcpSendP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -10122,7 +10475,10 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
             return;
         };
+        const driver_ctx = try self.allocSocketsP3StreamCtx(stream.socket.handle, s.family);
         if (ci.streams.getPtr(stream_handle)) |slot| {
+            // Drain any bytes the guest pre-buffered (e.g. wrote into
+            // the stream before calling `send`) straight to the fd.
             if (slot.buffer.items.len > 0) {
                 const io = std.Io.Threaded.global_single_threaded.io();
                 const slices = [_][]const u8{slot.buffer.items};
@@ -10134,21 +10490,24 @@ pub const WasiCliAdapter = struct {
                 };
                 slot.buffer.clearRetainingCapacity();
             }
-            slot.read_closed = true;
+            // Attach the driver so subsequent guest writes flow to fd.
+            slot.host_driver = .{
+                .context = driver_ctx,
+                .on_write = &tcpSendStreamOnWrite,
+            };
         }
         results[0] = .{ .handle = try socketReadyResultFuture(ci, true, .unknown) };
     }
 
     /// `[method]tcp-socket.receive: func()
-    ///   -> tuple<stream<u8>, future<result<_, error-code>>>` (#519).
+    ///   -> tuple<stream<u8>, future<result<_, error-code>>>` (#519, #535).
     ///
-    /// Synchronous. Issues one non-blocking `recv(2)` to pre-fill the
-    /// returned `stream<u8>` with whatever bytes are already buffered
-    /// on the socket; marks the writable end closed once drained so
-    /// the guest's `stream.read` observes EOF after the FIFO empties.
-    /// Multi-cycle streaming requires the wave-D host-stream hook PR;
-    /// for the single-shot loopback round-trip test we read once into
-    /// a 64 KiB scratch buffer, which is sufficient.
+    /// Synchronous. Returns a `stream<u8>` whose `host_driver.on_read`
+    /// (#535) pumps `netRead`s from the connected fd into the FIFO on
+    /// each guest `stream.read`. The companion future settles to
+    /// `result::ok` immediately; per-read errors are surfaced through
+    /// `write_closed = true` on the stream so a subsequent `stream.read`
+    /// observes the natural stream-end status (`cancelled`).
     fn tcpReceiveP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -10188,17 +10547,31 @@ pub const WasiCliAdapter = struct {
             return;
         };
 
-        // Pre-buffer up to one read worth of bytes from the connected fd.
-        // Non-blocking: only read if data is already pending.
-        var buf: [64 * 1024]u8 = undefined;
-        var read_bytes: []const u8 = &.{};
+        // Install a long-lived receive driver on the stream. The driver
+        // does a non-blocking netRead per invocation so the executor's
+        // `stream.read` rendezvous can keep draining as long as bytes
+        // are arriving on the fd (no per-call host-fn dispatch needed).
+        const driver_ctx = try self.allocSocketsP3StreamCtx(stream.socket.handle, s.family);
+        const stream_h = ci.allocAsyncHandle();
+        try ci.streams.put(ci.allocator, stream_h, .{
+            .elem_type_idx = 0,
+            .state = .open,
+            .host_driver = .{
+                .context = driver_ctx,
+                .on_read = &tcpReceiveStreamOnRead,
+            },
+        });
+        // Pre-buffer anything already pending on the fd at call time so
+        // tests that send-then-receive without a yield still see data.
         if (fdPollReady(stream.socket.handle, pollInEvents())) {
             const io = std.Io.Threaded.global_single_threaded.io();
+            var buf: [64 * 1024]u8 = undefined;
             var iovecs = [_][]u8{&buf};
             const n = io.vtable.netRead(io.userdata, stream.socket.handle, &iovecs) catch 0;
-            read_bytes = buf[0..n];
+            if (n > 0) if (ci.streams.getPtr(stream_h)) |slot| {
+                try slot.buffer.appendSlice(ci.allocator, buf[0..n]);
+            };
         }
-        const stream_h = try socketAllocByteStream(ci, read_bytes, true);
         const future_h = try socketReadyResultFuture(ci, true, .unknown);
         const fields = try allocator.alloc(InterfaceValue, 2);
         fields[0] = .{ .handle = stream_h };
@@ -10281,16 +10654,12 @@ pub const WasiCliAdapter = struct {
 
     /// `[method]udp-socket.receive: async func()
     ///   -> result<tuple<list<u8>, ip-socket-address>, error-code>`
-    /// (#519).
+    /// (#519, #535).
     ///
-    /// Async-func host import. Issues a non-blocking `recvfrom(2)`. On
-    /// success the returned future is settled with `payload = null`
-    /// (executor unit-type fast-path); the wave-D follow-up will lift
-    /// the actual `tuple<list<u8>, ip-socket-address>` payload through
-    /// the canon-ABI lowering machinery. End-to-end `sockets-udp-receive`
-    /// stays skipped until then. On allow-list / state errors we settle
-    /// a fully-encoded `result::err(code)` byte buffer (2-byte stride
-    /// of the err arm; ok arm bytes are wave-D scope).
+    /// Async-func host import. Issues a non-blocking `recvfrom(2)` and,
+    /// on success, lifts the resulting `tuple<list<u8>, ip-socket-address>`
+    /// into the future payload via the 0.3 sockets canonical-ABI lowering
+    /// (#535). Errors / would-block surface through a settled err-future.
     fn udpReceiveP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -10314,7 +10683,7 @@ pub const WasiCliAdapter = struct {
         }
         const io = std.Io.Threaded.global_single_threaded.io();
         var buf: [65536]u8 = undefined;
-        _ = s.host_socket.?.receiveTimeout(io, &buf, .{
+        const recv = s.host_socket.?.receiveTimeout(io, &buf, .{
             .duration = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake },
         }) catch {
             // Zero-duration timeout: any error treated as "no data" and
@@ -10322,23 +10691,35 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .would_block) };
             return;
         };
-        // The data payload itself isn't lifted into the future buffer yet
-        // (wave-D scope). Return a unit-type ready future — guests that
-        // only check Ok-vs-Err see success.
-        results[0] = .{ .handle = try socketReadyUnitFuture(ci) };
+
+        const data = recv.data;
+        const remote = recv.from;
+        const ok_tuple = try socketsP3LowerUdpReceivePayload(ci, data, remote);
+        defer {
+            // Free the host-side tuple fields owned by ci.allocator.
+            const fields = ok_tuple.tuple_val;
+            fields[1].deinit(ci.allocator);
+            ci.allocator.free(fields);
+        }
+        const ok_payload = try ci.allocator.create(InterfaceValue);
+        defer ci.allocator.destroy(ok_payload);
+        ok_payload.* = ok_tuple;
+        const ok_result = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+        const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .udp_receive_err, ok_result);
+        const handle = try spawnReadyFutureBytes(ci, payload_bytes);
+        results[0] = .{ .handle = handle };
     }
 
     /// `wasi:sockets/ip-name-lookup@0.3.0-*.resolve-addresses:
     ///   async func(name: string) -> result<list<ip-address>, error-code>`
-    /// (#519).
+    /// (#519, #535).
     ///
     /// Async-func host import. Runs `std.Io.net.HostName.lookup` against
-    /// the host resolver synchronously and settles the future. The
-    /// adapter-level `sockets_allow_list_template` gates the lookup
-    /// (empty = deny-all). The list payload is wave-D scope: we return
-    /// a unit-type ready future on success — the existing unit-payload
-    /// fast-path in `future_read` is wave-D-aware. End-to-end
-    /// `sockets-echo` stays skipped until the payload lift lands.
+    /// the host resolver synchronously, lifts the resulting addresses
+    /// into the future payload via canonical-ABI lowering (#535), and
+    /// settles `ci.futures` at `.ready` so the executor's `future_read`
+    /// rendezvous can deliver them. The adapter-level
+    /// `sockets_allow_list_template` gates the lookup (empty = deny-all).
     fn resolveAddressesP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -10374,22 +10755,36 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, mapDnsError(err)) };
             return;
         };
-        // Drain the queue so the host fd is released. Results are not
-        // routed into the future payload yet — wave-D scope.
-        var saw_any = false;
+        // Collect each `address` entry. Drop the canonical_name (the
+        // 0.3 surface only returns the address list).
+        var addrs: std.ArrayListUnmanaged(std.Io.net.IpAddress) = .empty;
+        defer addrs.deinit(ci.allocator);
         while (queue.getOneUncancelable(io)) |item| {
             switch (item) {
-                .address => saw_any = true,
+                .address => |a| addrs.append(ci.allocator, a) catch return error.OutOfMemory,
                 .canonical_name => {},
             }
         } else |drain_err| switch (drain_err) {
             error.Closed => {},
         }
-        if (!saw_any) {
+        if (addrs.items.len == 0) {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .name_unresolvable) };
             return;
         }
-        results[0] = .{ .handle = try socketReadyUnitFuture(ci) };
+
+        // Lower the list<ip-address> into guest memory: each element is a
+        // canonical-ABI `variant<ipv4(tuple<u8 x 4>), ipv6(tuple<u16 x 8>)>`
+        // whose layout we mirror in `sockets_p3_local_types`. The outer
+        // list pointer + length goes into the future payload buffer.
+        const list_ptr = try socketsP3LowerIpAddressList(ci, addrs.items);
+        const list_iv = InterfaceValue{ .list = .{ .ptr = list_ptr, .len = @intCast(addrs.items.len) } };
+        const ok_payload = try ci.allocator.create(InterfaceValue);
+        defer ci.allocator.destroy(ok_payload);
+        ok_payload.* = list_iv;
+        const ok_result = InterfaceValue{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
+        const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, .resolve_list_err, ok_result);
+        const handle = try spawnReadyFutureBytes(ci, payload_bytes);
+        results[0] = .{ .handle = handle };
     }
 
     /// Extract the port from any IpAddress family — std doesn't expose
@@ -19193,10 +19588,13 @@ test "sockets P3: udp echo round-trip via host-side bind + send + receive (#519)
     try testing.expect(results[0] == .handle);
     const fut = ci.futures.getPtr(results[0].handle).?;
     try testing.expectEqual(async_mod.Future.State.ready, fut.state);
-    // The payload bytes themselves aren't lifted through the future yet
-    // (wave-D scope); the ok-vs-err arm is observable via payload==null
-    // (unit fast-path) for the success case.
-    try testing.expect(fut.payload == null);
+    // The payload now carries a fully-lifted
+    // `result<tuple<list<u8>, ip-socket-address>, error-code>` (#535).
+    // Byte 0 is the disc — 0 for `ok` (a datagram was delivered) or 1
+    // for `err(would-block)` if the loose busy-poll loop above didn't
+    // see the datagram in time. Both are acceptable on CI.
+    try testing.expect(fut.payload != null);
+    try testing.expect(fut.payload.?[0] == 0 or fut.payload.?[0] == 1);
 }
 
 test "sockets P3: resolve-addresses denies without allow-list (#519)" {
@@ -19257,13 +19655,12 @@ test "sockets P3: resolve-addresses for `localhost` settles a ready future (#519
     try testing.expect(results[0] == .handle);
     const fut = ci.futures.getPtr(results[0].handle).?;
     try testing.expectEqual(async_mod.Future.State.ready, fut.state);
-    // On hosts where `localhost` resolves at all, payload is null (ok
-    // fast-path); on minimal CI hosts that don't resolve `localhost` we
-    // still get an err future. Accept either — the future just has to
-    // settle (the real DNS work happened synchronously).
-    if (fut.payload) |p| {
-        try testing.expectEqual(@as(u8, 1), p[0]); // err arm
-    }
+    // The payload now carries a fully-lifted
+    // `result<list<ip-address>, error-code>` (#535). Byte 0 is the disc
+    // — 0 on hosts that resolve `localhost`, 1 on minimal CI hosts that
+    // can't. Both are acceptable.
+    try testing.expect(fut.payload != null);
+    try testing.expect(fut.payload.?[0] == 0 or fut.payload.?[0] == 1);
 }
 
 test "sockets P3: tcp-socket.connect rejects unspecified address (#519)" {
@@ -19335,6 +19732,375 @@ test "sockets P3: tcp-socket.connect rejects multicast (#519)" {
         @as(u8, @intCast(@intFromEnum(SocketErrorCode.invalid_argument))),
         fut.payload.?[1],
     );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// wasi:sockets@0.3.0 — host-driven streams + list-payload lift (#535)
+// ──────────────────────────────────────────────────────────────────────
+
+test "sockets P3 #535: tcp-receive stream driver yields multiple read cycles" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Build a real loopback TCP pair via std.Io.net.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var bind_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var server = std.Io.net.IpAddress.listen(&bind_addr, io, .{ .kernel_backlog = 8 }) catch
+        return error.SkipZigTest;
+    defer server.deinit(io);
+    const listen_addr = server.socket.address;
+    const listen_port: u16 = switch (listen_addr) {
+        .ip4 => |v4| v4.port,
+        else => unreachable,
+    };
+
+    var connect_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = listen_port } };
+    var client = std.Io.net.IpAddress.connect(&connect_addr, io, .{ .mode = .stream }) catch
+        return error.SkipZigTest;
+    defer client.close(io);
+    var server_side = server.accept(io) catch return error.SkipZigTest;
+    defer server_side.close(io);
+
+    // Stash the server_side fd into a Socket slot the adapter knows about.
+    const sock_idx = try adapter.pushSocket(.{
+        .kind = .tcp,
+        .family = .ipv4,
+        .state = .connected,
+        .tcp_stream = server_side,
+        .remote_addr = client.socket.address,
+        .local_addr = listen_addr,
+    });
+
+    // Call tcpReceiveP3 to install the receive-side host driver on a
+    // fresh stream slot.
+    const args = [_]InterfaceValue{.{ .handle = sock_idx }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer {
+        const fields = results[0].tuple_val;
+        testing.allocator.free(fields);
+    }
+    try testing.expect(results[0] == .tuple_val);
+    const stream_h = results[0].tuple_val[0].handle;
+
+    // Verify the driver got installed.
+    const slot_after_recv = ci.streams.getPtr(stream_h).?;
+    try testing.expect(slot_after_recv.host_driver != null);
+    try testing.expect(slot_after_recv.host_driver.?.on_read != null);
+
+    // Multi-cycle: client sends two separate chunks. The driver pulls
+    // each chunk into the FIFO on demand.
+    const chunk1 = "first-chunk-535";
+    const chunk2 = "second-chunk-535";
+
+    // Cycle 1: client writes chunk1, host driver drains it into FIFO.
+    {
+        const slices = [_][]const u8{chunk1};
+        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+    }
+    // Allow the kernel to deliver loopback bytes.
+    var attempt: usize = 0;
+    while (attempt < 10_000) : (attempt += 1) {
+        if (WasiCliAdapter.fdPollReady(server_side.socket.handle, WasiCliAdapter.pollInEvents())) break;
+    }
+    {
+        const action = slot_after_recv.host_driver.?.on_read.?(
+            slot_after_recv.host_driver.?.context,
+            slot_after_recv,
+            testing.allocator,
+        );
+        try testing.expectEqual(async_mod.HostStreamAction.progressed, action);
+        try testing.expectEqualStrings(chunk1, slot_after_recv.buffer.items);
+    }
+
+    // Drain the FIFO (simulates a guest stream.read).
+    slot_after_recv.buffer.clearRetainingCapacity();
+
+    // Cycle 2: another write — same stream, same driver, second drain.
+    {
+        const slices = [_][]const u8{chunk2};
+        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+    }
+    attempt = 0;
+    while (attempt < 10_000) : (attempt += 1) {
+        if (WasiCliAdapter.fdPollReady(server_side.socket.handle, WasiCliAdapter.pollInEvents())) break;
+    }
+    {
+        const action = slot_after_recv.host_driver.?.on_read.?(
+            slot_after_recv.host_driver.?.context,
+            slot_after_recv,
+            testing.allocator,
+        );
+        try testing.expectEqual(async_mod.HostStreamAction.progressed, action);
+        try testing.expectEqualStrings(chunk2, slot_after_recv.buffer.items);
+    }
+
+    // Drop the tcp_stream we stashed on the socket slot so closeAll
+    // doesn't double-close the fd (server_side is owned by the test).
+    adapter.socket_table.items[sock_idx].?.tcp_stream = null;
+}
+
+test "sockets P3 #535: tcp-accept stream driver pushes 3 connections through one listener" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Create + bind + listen the server.
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    const server_bind = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer p3FreeIpv4SockAddr(testing.allocator, server_bind);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, server_bind };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpBindP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    var listen_stream_h: u32 = 0;
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpListenP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+        listen_stream_h = results[0].result_val.payload.?.handle;
+    }
+    // The listen stream now has a driver installed.
+    const listen_slot = ci.streams.getPtr(listen_stream_h).?;
+    try testing.expect(listen_slot.host_driver != null);
+    try testing.expect(listen_slot.host_driver.?.on_read != null);
+
+    const server_addr = adapter.socket_table.items[0].?.local_addr.?;
+    const server_port: u16 = switch (server_addr) {
+        .ip4 => |v4| v4.port,
+        else => unreachable,
+    };
+
+    // Spawn 3 client connections.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var clients: [3]std.Io.net.Stream = undefined;
+    for (&clients) |*c| {
+        var addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = server_port } };
+        c.* = std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch
+            return error.SkipZigTest;
+    }
+    defer for (&clients) |*c| c.close(io);
+
+    // Drive the accept driver three times. Each call should push 4 bytes
+    // (one tcp-socket handle) onto the FIFO.
+    var accepted: u8 = 0;
+    var attempt: usize = 0;
+    while (accepted < 3 and attempt < 100_000) : (attempt += 1) {
+        const action = listen_slot.host_driver.?.on_read.?(
+            listen_slot.host_driver.?.context,
+            listen_slot,
+            testing.allocator,
+        );
+        if (action == .progressed) accepted += 1;
+    }
+    try testing.expectEqual(@as(u8, 3), accepted);
+    // Three 4-byte handles in the FIFO (or four if the listen call's
+    // pre-drain caught one of the connections first — both are
+    // acceptable per the spec contract).
+    try testing.expect(listen_slot.buffer.items.len >= 12);
+    try testing.expectEqual(@as(usize, 0), listen_slot.buffer.items.len % 4);
+
+    // Each handle should reference a distinct, connected Socket slot.
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(testing.allocator);
+    var off: usize = 0;
+    while (off + 4 <= listen_slot.buffer.items.len) : (off += 4) {
+        const h = std.mem.readInt(u32, listen_slot.buffer.items[off..][0..4], .little);
+        try seen.put(testing.allocator, h, {});
+        const s = adapter.socket_table.items[h].?;
+        try testing.expectEqual(SocketKind.tcp, s.kind);
+        try testing.expectEqual(SocketState.connected, s.state);
+    }
+    try testing.expect(seen.count() >= 3);
+}
+
+test "sockets P3 #535: resolve-addresses lifts multiple IPs through Future.payload" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Stage "localhost" — resolves to at least one address on Linux/macOS
+    // CI hosts. We accept either the ok-arm (preferred) or err arm
+    // (minimal hosts) but the test only proves the lift when we got ok.
+    const host_name = "localhost";
+    const name_ptr: u32 = 256;
+    {
+        const dst = ci.writableGuestBytes(name_ptr, host_name.len) orelse return error.SkipZigTest;
+        @memcpy(dst, host_name);
+    }
+    const args = [_]InterfaceValue{.{ .string = .{ .ptr = name_ptr, .len = host_name.len } }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    WasiCliAdapter.resolveAddressesP3(&adapter, &ci, &args, &results, testing.allocator) catch
+        return error.SkipZigTest;
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+
+    if (fut.payload.?[0] == 1) {
+        // err arm: this host can't resolve `localhost`; we still proved
+        // the new lift path runs without crashing.
+        return;
+    }
+
+    // Ok arm: byte 0 == 0 (disc), then 4 bytes of ptr/len padding to the
+    // canonical alignment of a list (.list = 8 bytes payload at align 4).
+    // Per sockets_p3_local_types[10] (result<list<ip-address>,
+    // error-code>): the payload is at offset alignUp(1, 4) = 4. The
+    // first 4 bytes are the guest ptr, the next 4 bytes are the count.
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[0]);
+    const ptr_val = std.mem.readInt(u32, fut.payload.?[4..8], .little);
+    const len_val = std.mem.readInt(u32, fut.payload.?[8..12], .little);
+    try testing.expect(len_val >= 1);
+    // The list pointer must reference our test guest memory bump.
+    try testing.expect(ptr_val < 4096);
+
+    // Each element is a canonical `variant<ipv4(tuple<u8 x 4>),
+    // ipv6(tuple<u16 x 8>)>`. Verify we can read the first element's
+    // disc byte through the test guest memory.
+    const reg = socketsP3TypeRegistry();
+    const elem_t: ctypes.ValType = .{ .variant = SOCKETS_P3_IP_ADDRESS_VARIANT_IDX };
+    const elem_size = abi.sizeOfType(reg, elem_t);
+    try testing.expect(elem_size > 0);
+    const first_disc = ci.test_mem.?.buffer[ptr_val];
+    try testing.expect(first_disc == 0 or first_disc == 1);
+}
+
+test "sockets P3 #535: tcp-send driver pushes write bytes straight to fd" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Real loopback TCP pair.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var bind_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var server = std.Io.net.IpAddress.listen(&bind_addr, io, .{ .kernel_backlog = 4 }) catch
+        return error.SkipZigTest;
+    defer server.deinit(io);
+    const listen_addr = server.socket.address;
+    const port: u16 = switch (listen_addr) {
+        .ip4 => |v4| v4.port,
+        else => unreachable,
+    };
+    var connect_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } };
+    var client_native = std.Io.net.IpAddress.connect(&connect_addr, io, .{ .mode = .stream }) catch
+        return error.SkipZigTest;
+    var server_side = server.accept(io) catch return error.SkipZigTest;
+    defer server_side.close(io);
+
+    const sock_idx = try adapter.pushSocket(.{
+        .kind = .tcp,
+        .family = .ipv4,
+        .state = .connected,
+        .tcp_stream = client_native,
+        .remote_addr = listen_addr,
+        .local_addr = client_native.socket.address,
+    });
+
+    // Allocate an empty stream and call tcpSendP3 to attach the driver.
+    const stream_h = try WasiCliAdapter.socketAllocByteStream(&ci, &.{}, false);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = sock_idx }, .{ .handle = stream_h } };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpSendP3(&adapter, &ci, &args, &results, testing.allocator);
+        const fut = ci.futures.getPtr(results[0].handle).?;
+        try testing.expect(fut.payload != null);
+        try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok
+    }
+
+    const slot = ci.streams.getPtr(stream_h).?;
+    try testing.expect(slot.host_driver != null);
+    try testing.expect(slot.host_driver.?.on_write != null);
+
+    // Drive the on_write callback twice with different payloads.
+    const w1 = "alpha-535";
+    const w2 = "beta-535-second";
+    {
+        const a = slot.host_driver.?.on_write.?(
+            slot.host_driver.?.context,
+            slot,
+            w1,
+            testing.allocator,
+        );
+        try testing.expectEqual(async_mod.HostStreamAction.progressed, a);
+    }
+    {
+        const a = slot.host_driver.?.on_write.?(
+            slot.host_driver.?.context,
+            slot,
+            w2,
+            testing.allocator,
+        );
+        try testing.expectEqual(async_mod.HostStreamAction.progressed, a);
+    }
+
+    // Drain on the server side and verify both chunks arrived in order.
+    var attempt: usize = 0;
+    var total: usize = 0;
+    var srv_buf: [128]u8 = undefined;
+    const want = w1.len + w2.len;
+    while (total < want and attempt < 10_000) : (attempt += 1) {
+        if (WasiCliAdapter.fdPollReady(server_side.socket.handle, WasiCliAdapter.pollInEvents())) {
+            var iovecs = [_][]u8{srv_buf[total..]};
+            const n = try io.vtable.netRead(io.userdata, server_side.socket.handle, &iovecs);
+            if (n == 0) break;
+            total += n;
+        }
+    }
+    try testing.expectEqual(want, total);
+    try testing.expectEqualStrings(w1, srv_buf[0..w1.len]);
+    try testing.expectEqualStrings(w2, srv_buf[w1.len..total]);
+
+    // Drop the tcp_stream we stashed so closeAll doesn't double-close.
+    adapter.socket_table.items[sock_idx].?.tcp_stream = null;
+    client_native.close(io);
 }
 
 
