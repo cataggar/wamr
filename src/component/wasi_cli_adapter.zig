@@ -1831,6 +1831,16 @@ pub const WasiCliAdapter = struct {
     cli_terminal_output_p3_iface: HostInstance = .{},
     clocks_wall_p3_iface: HostInstance = .{},
     clocks_monotonic_p3_iface: HostInstance = .{},
+    // #534: wasi:clocks@0.3.0 hoists `duration` (and, in newer revisions,
+    // `instant`) into a top-level `wasi:clocks/types` interface that the
+    // `monotonic-clock` / `system-clock` ifaces alias from. The instance
+    // carries no functions — just type definitions — so the provider is
+    // an empty `HostInstance` whose sole purpose is to satisfy guest
+    // import resolution. Without it, components emitted by recent rustc
+    // toolchains (e.g. the `wall-clock` / `monotonic-clock` /
+    // `multi-clock-wait` wasi-p3 fixtures) fail to link even when every
+    // other 0.2 / 0.3 clock import has a provider.
+    clocks_types_p3_iface: HostInstance = .{},
     fs_types_p3_iface: HostInstance = .{},
     fs_preopens_p3_iface: HostInstance = .{},
     http_types_p3_iface: HostInstance = .{},
@@ -2077,6 +2087,7 @@ pub const WasiCliAdapter = struct {
         self.cli_terminal_output_p3_iface.deinit(self.allocator);
         self.clocks_wall_p3_iface.deinit(self.allocator);
         self.clocks_monotonic_p3_iface.deinit(self.allocator);
+        self.clocks_types_p3_iface.deinit(self.allocator);
         self.fs_types_p3_iface.deinit(self.allocator);
         self.fs_preopens_p3_iface.deinit(self.allocator);
         self.http_types_p3_iface.deinit(self.allocator);
@@ -3410,6 +3421,32 @@ pub const WasiCliAdapter = struct {
         });
         try providers.put(self.allocator, iface_name, .{
             .host_instance = &self.clocks_wall_p3_iface,
+        });
+    }
+
+    /// Register `wasi:clocks/types@0.3.x` (#534).
+    ///
+    /// The 0.3 clocks WIT hoists shared type aliases (`duration`, and in
+    /// newer revisions `instant`) into a separate top-level instance:
+    ///
+    /// ```wit
+    /// interface types {
+    ///   type duration = u64;
+    ///   record instant { seconds: s64, nanoseconds: u32 }
+    /// }
+    /// ```
+    ///
+    /// Components emitted by recent rustc toolchains import this instance
+    /// at the top level even when the `monotonic-clock` / `system-clock`
+    /// ifaces alias the types from there. There are no functions to wire
+    /// — registration is purely so `linkImports` accepts the import.
+    pub fn populateWasiClocksTypesP3(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        iface_name: []const u8,
+    ) !void {
+        try providers.put(self.allocator, iface_name, .{
+            .host_instance = &self.clocks_types_p3_iface,
         });
     }
 
@@ -14452,6 +14489,7 @@ pub fn populateWasiProviders(
     var matched_monotonic_clock: ?[]const u8 = null;
     var matched_monotonic_clock_p3: ?[]const u8 = null;
     var matched_system_clock_p3: ?[]const u8 = null;
+    var matched_clocks_types_p3: ?[]const u8 = null;
     var matched_random: ?[]const u8 = null;
     var matched_random_insecure: ?[]const u8 = null;
     var matched_random_insecure_seed: ?[]const u8 = null;
@@ -14577,6 +14615,15 @@ pub fn populateWasiProviders(
         if (matched_system_clock_p3 == null and
             matchesWasiPrefix(imp.name, "wasi:clocks/system-clock"))
             matched_system_clock_p3 = imp.name;
+        // #534: wasi:clocks/types@0.3 — a type-only instance holding
+        // `duration` (and, in newer revisions, `instant`). Components
+        // emitted by recent rustc toolchains import this top-level
+        // even when the monotonic/system clock interfaces alias the
+        // types from it. P3-only; no 0.2 counterpart.
+        if (matched_clocks_types_p3 == null and
+            matchesWasiPrefix(imp.name, "wasi:clocks/types") and
+            wasiVersion(imp.name) == .p3)
+            matched_clocks_types_p3 = imp.name;
         // `wasi:random/insecure-seed` shares the `wasi:random/insecure`
         // prefix, so test the more-specific name first. #485 splits each
         // interface by version so 0.2 and 0.3 imports route to different
@@ -14802,6 +14849,12 @@ pub fn populateWasiProviders(
     }
     if (matched_system_clock_p3) |name| {
         try adapter.populateWasiClocksSystemClockP3(providers, name);
+    }
+    // #534: P3 clocks/types — type-only instance, no functions. Wire
+    // only when imported so `linkImports`'s strict-checking still
+    // catches accidental unmatched imports elsewhere.
+    if (matched_clocks_types_p3) |name| {
+        try adapter.populateWasiClocksTypesP3(providers, name);
     }
 
     try adapter.populateWasiRandomRandom(
@@ -22917,6 +22970,196 @@ test "populateWasiProviders: binds wasi:clocks@0.3 monotonic + system (#483)" {
     try testing.expect(sys_p3.host_instance == &adapter.clocks_wall_p3_iface);
     try testing.expect(adapter.clocks_wall_p3_iface.members.contains("now"));
     try testing.expect(adapter.clocks_wall_p3_iface.members.contains("get-resolution"));
+}
+
+// ── #534 hybrid 0.2/0.3 routing unit tests ───────────────────────────────
+//
+// Recent rustc toolchains emit wasm32-wasip3 components whose `wasi:cli/run`
+// export is the legacy 0.2 sync entrypoint but whose `wasi:clocks/*` imports
+// resolve through a separate `wasi:clocks/types@0.3.x` instance carrying
+// the `duration` type alias. Before #534, `populateWasiProviders` never
+// registered a provider for `wasi:clocks/types@0.3` — so `linkImports`
+// rejected the component with `MissingImport`. The clock fixtures
+// targeted by #534 (`wall-clock`, `monotonic-clock`, `multi-clock-wait`)
+// all exhibit this pattern; the first of those is the simplest sync
+// regression.
+
+test "populateWasiProviders: binds wasi:clocks/types@0.3 alongside 0.2 cli/run (#534)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Mirrors the real wasi-p3 `wall-clock` fixture's top-level imports:
+    // a 0.3 clocks types instance, a 0.3 system-clock that aliases from
+    // it, plus the legacy 0.2 wasi:cli surface. The component would
+    // dispatch through the legacy `runComponentBytes` 0.2 path, so
+    // `populateWasiProviders` must still install P3 clock + types
+    // bindings alongside the 0.2 cli ones.
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:clocks/types@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:clocks/system-clock@0.3.0-rc-2026-03-15", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/exit@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/stdout@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    // The previously-missing types iface MUST be wired (the regression
+    // surface for #534).
+    try testing.expect(providers.contains("wasi:clocks/types@0.3.0-rc-2026-03-15"));
+    const types_p3 = providers.get("wasi:clocks/types@0.3.0-rc-2026-03-15").?;
+    try testing.expect(types_p3.host_instance == &adapter.clocks_types_p3_iface);
+
+    // 0.3 system-clock still wires (`@0.3.x` import → P3 host instance).
+    try testing.expect(providers.contains("wasi:clocks/system-clock@0.3.0-rc-2026-03-15"));
+
+    // 0.2 cli imports retain their existing P2 routing — the hybrid
+    // case must not regress that side of the multiplex.
+    try testing.expect(providers.contains("wasi:cli/stdout@0.2.6"));
+    try testing.expect(providers.contains("wasi:cli/exit@0.2.6"));
+    try testing.expect(providers.contains("wasi:io/streams@0.2.6"));
+}
+
+test "populateWasiClocksTypesP3: empty host instance suffices for type-only import (#534)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try adapter.populateWasiClocksTypesP3(
+        &providers,
+        "wasi:clocks/types@0.3.0-rc-2026-03-15",
+    );
+
+    const binding = providers.get("wasi:clocks/types@0.3.0-rc-2026-03-15").?;
+    try testing.expect(binding == .host_instance);
+    try testing.expect(binding.host_instance == &adapter.clocks_types_p3_iface);
+    // `wasi:clocks/types@0.3.x` is type-only — no callable members.
+    try testing.expectEqual(@as(usize, 0), adapter.clocks_types_p3_iface.members.count());
+}
+
+test "populateWasiProviders: skips clocks/types@0.3 when not imported (#534)" {
+    // Strict-checking via `linkImports.MissingImport` must still flag
+    // accidental unmatched imports elsewhere, so `populateWasiProviders`
+    // only registers a clocks/types provider on demand. A 0.2-only
+    // component with no clocks/types import should leave that name
+    // unbound in the providers map.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:clocks/wall-clock@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:cli/stdout@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(!providers.contains("wasi:clocks/types@0.3.0-rc-2026-03-15"));
+    try testing.expect(!providers.contains("wasi:clocks/types@0.3.0"));
+    try testing.expect(providers.contains("wasi:clocks/wall-clock@0.2.6"));
+}
+
+test "loader.resolveTopLevelTypeAliases: alias-of-instance-export resolves type duration=u64 (#534)" {
+    // Mirrors the parent-level `(alias export $clocks-types-instance
+    // "duration" (type 1))` shape used by every wasi-p3 clock fixture.
+    // The imported instance's type body declares `type duration = u64`
+    // and exports it under that name; the loader's post-pass must
+    // back-fill the parent `type_indexspace` slot with `TypeDef.val .u64`
+    // so canon.lower lift/lower of values whose declared type points
+    // there don't trip `CompoundNeedsRegistry`.
+    const testing = std.testing;
+    const loader = @import("loader.zig");
+
+    // Construct the binary by hand. Top-level decls:
+    //   type 0 = (instance (type 0 u64) (export "duration" (type (eq 0))))
+    //   import "wasi:clocks/types@0.3" (instance 0)  ← contributes inst 0
+    //   alias export instance=0 "duration" (type)    ← parent type idx 1
+    const bytes = [_]u8{
+        // magic + component preamble
+        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00,
+        // section 0x07 (component type), size 0x13 (computed below):
+        // count=1
+        //   tag=0x42 (instance type) count=2
+        //     decl 0x01 (type) tag=0x77 (u64)
+        //     decl 0x04 (export) name="duration" desc=0x05 type bound=eq(0)
+        0x07, 0x13,
+        0x01,
+        0x42, 0x02,
+        0x01, 0x77, // type (val u64)
+        0x04, 0x00, 0x08, 'd', 'u', 'r', 'a', 't', 'i', 'o', 'n', 0x03, 0x00, 0x00,
+        // section 0x0a (component import), size 0x2a
+        // count=1
+        //   importname (with no-prefix marker 0x00) "wasi:clocks/types@0.3.0-rc-2026-03-15"
+        //   desc 0x05 (instance) type_idx=0
+        0x0a, 0x2a,
+        0x01,
+        0x00, 0x25, 'w', 'a', 's', 'i', ':', 'c', 'l', 'o', 'c', 'k', 's', '/', 't', 'y', 'p', 'e',
+        's', '@', '0', '.', '3', '.', '0', '-', 'r', 'c', '-', '2', '0', '2', '6', '-', '0', '3',
+        '-', '1', '5', 0x05, 0x00,
+        // section 0x06 (component alias), size 0x0d
+        // count=1
+        //   sort=0x03 (type) form=0x00 (instance_export) inst_idx=0 name="duration"
+        0x06, 0x0d,
+        0x01,
+        0x03, 0x00, 0x00, 0x08, 'd', 'u', 'r', 'a', 't', 'i', 'o', 'n',
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const component = try loader.load(&bytes, arena.allocator());
+
+    // Parent type indexspace must have 2 slots:
+    //   0 — the instance type def (materialized)
+    //   1 — the type alias to the instance's "duration" export (back-filled by #534)
+    try testing.expectEqual(@as(usize, 2), component.type_indexspace.len);
+    const slot0 = component.type_indexspace[0] orelse return error.MissingSlot0;
+    const slot1 = component.type_indexspace[1] orelse return error.MissingSlot1Resolution;
+    try testing.expect(slot0 < component.types.len);
+    try testing.expect(slot1 < component.types.len);
+    // Slot 1 must resolve to `TypeDef.val u64`.
+    const td1 = component.types[slot1];
+    try testing.expect(td1 == .val);
+    try testing.expect(td1.val == .u64);
+
+    // `alias_type_slot` side-table must record that alias 0 contributed
+    // parent type slot 1 (and is the only alias in the binary).
+    try testing.expectEqual(@as(usize, 1), component.alias_type_slot.len);
+    try testing.expectEqual(@as(?u32, 1), component.alias_type_slot[0]);
 }
 
 // ── #482 wasi:cli@0.3.0 unit tests ──────────────────────────────────────
