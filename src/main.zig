@@ -310,7 +310,11 @@ fn runComponent(
         const io = std.Io.Threaded.global_single_threaded.io();
         const cwd_dir = std.Io.Dir.cwd();
         for (map_dirs) |md| {
-            const opened = cwd_dir.openDir(io, md.host_path, .{}) catch |err| {
+            // Open with `.iterate = true` so the guest can enumerate
+            // the preopen (and any sub-dir opened via `open-at`) via
+            // `descriptor.read-directory`. Without it, `getdents64`
+            // returns BADF on Linux. (#571 — fixes filesystem-read-directory.)
+            const opened = cwd_dir.openDir(io, md.host_path, .{ .iterate = true }) catch |err| {
                 std.debug.print(
                     "Error: cannot pre-open '{s}' as '{s}': {}\n",
                     .{ md.host_path, md.guest_name, err },

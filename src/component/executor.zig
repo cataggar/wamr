@@ -1521,7 +1521,17 @@ fn dispatchAsyncCanon(
             };
 
             const registry = TypeRegistry.init(comp_inst.component);
-            const elem_size = streamFutureElemSize(registry, info.type_idx);
+            // Host eager-lowering producers (e.g.
+            // `fsDescriptorReadDirectoryP3`) stash the byte stride
+            // they actually appended on `elem_size_hint` so we can
+            // drain in the correct stride even if `info.type_idx`
+            // doesn't resolve to a sized type in this component's
+            // registry (cross-instance element types lose their
+            // resolution path). (#571.)
+            const elem_size: u32 = if (s.elem_size_hint) |hint|
+                hint
+            else
+                streamFutureElemSize(registry, info.type_idx);
             if (elem_size == 0) return error.LowerError;
 
             // Zero-length read: synchronous no-op completion.

@@ -5484,21 +5484,98 @@ pub const WasiCliAdapter = struct {
 
     /// Reject paths that would escape the preopen sandbox: any `..` path
     /// component, any `\\` separator, any `:` (Windows drive prefix), or
-    /// a leading `/` (absolute). Returns `.access` on rejection.
+    /// a leading `/` (absolute). Returns the appropriate `error-code`
+    /// per the 0.3 fixture expectations on rejection.
+    ///
+    /// The 0.3 fixtures (`filesystem-{open-errors, stat, mkdir-rmdir,
+    /// unlink-errors, rename, hard-links, metadata-hash}`) uniformly
+    /// expect `not-permitted` for any sandbox-escaping path:
+    /// absolute (`/...`), `..` components, etc. Windows-only escapes
+    /// (`\` separator, drive prefix `:`) remain `.access` since no
+    /// fixture targets them. (#571.)
     pub fn validateSandboxPath(path: []const u8) ?FsErrorCode {
         if (path.len == 0) return null;
-        if (path[0] == '/') return .access;
+        if (path[0] == '/') return .not_permitted;
         for (path) |c| {
             if (c == '\\' or c == ':') return .access;
         }
         var it = std.mem.splitScalar(u8, path, '/');
         while (it.next()) |comp| {
-            // `..` is rejected with `not-permitted` per the 0.3
-            // conformance fixture's expectation — distinct from an
-            // absolute path escape (`/...`) which is `access`. (#564.)
             if (std.mem.eql(u8, comp, "..")) return .not_permitted;
         }
         return null;
+    }
+
+    /// Walk each `/`-separated prefix of `path` and check whether any
+    /// component is a symlink in the host filesystem under `base_dir`.
+    ///
+    /// Per WASI sandbox semantics (#571): a symlink anywhere in a path
+    /// component creates a potential escape, so we reject the request
+    /// with `not-permitted` rather than letting the kernel follow the
+    /// link.
+    ///   - **Intermediate** symlinks are always rejected, regardless of
+    ///     the operation's `path-flags.symlink-follow` setting. Even an
+    ///     op that wouldn't normally follow the last component still
+    ///     traverses intermediates (e.g. `unlink-file-at("p/x")` walks
+    ///     `p` before unlinking `x`).
+    ///   - The **final** component is rejected only if the operation
+    ///     follows symlinks (e.g. `stat-at` with `SYMLINK_FOLLOW`,
+    ///     `open-at` with that flag, `link-at` with `follow_old=true`).
+    ///     If the op targets the link entry itself (e.g. `unlink-file-at`,
+    ///     `stat-at` without follow), the final symlink is permitted.
+    ///
+    /// Returns `null` if the path is clean; `.not_permitted` if a
+    /// disallowed symlink component is detected. Non-existent prefixes
+    /// pass through (the underlying op will surface the kernel error).
+    pub fn checkPathSymlinks(
+        base_dir: std.Io.Dir,
+        path: []const u8,
+        follow_final: bool,
+    ) ?FsErrorCode {
+        if (path.len == 0) return null;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var end: usize = 0;
+        while (end < path.len) {
+            while (end < path.len and path[end] == '/') end += 1;
+            if (end >= path.len) break;
+            while (end < path.len and path[end] != '/') end += 1;
+            const prefix = path[0..end];
+            const is_last = blk: {
+                var j = end;
+                while (j < path.len and path[j] == '/') j += 1;
+                break :blk (j >= path.len);
+            };
+            const st = base_dir.statFile(io, prefix, .{ .follow_symlinks = false }) catch {
+                // Component doesn't exist — can't be a symlink we'd follow.
+                return null;
+            };
+            if (st.kind == .sym_link) {
+                if (!is_last) return .not_permitted;
+                if (follow_final) return .not_permitted;
+            }
+        }
+        return null;
+    }
+
+    /// Whether `path` would make Linux `unlinkat(AT_REMOVEDIR)` (or
+    /// the Zig stdlib's `dirDeleteDirPosix`) return `EINVAL` — i.e.
+    /// the path's last component is `.` or `..`. Both the kernel and
+    /// Zig stdlib treat this as a "programmer bug" and panic in debug
+    /// builds; the 0.3 filesystem-mkdir-rmdir fixture explicitly tests
+    /// `rmdir(".")` and expects `Err(ErrorCode::Invalid | Access)`.
+    /// Detect early so the guest gets a clean `.invalid` rather than a
+    /// host trap. Empty path is left to the kernel (NoEntry).
+    fn rmdirPathIsInvalid(path: []const u8) bool {
+        if (path.len == 0) return false;
+        // Drop trailing slashes — `rmdir("foo/")` should behave like
+        // `rmdir("foo")` for the trailing-`.` check below.
+        var end = path.len;
+        while (end > 0 and path[end - 1] == '/') end -= 1;
+        if (end == 0) return true; // path was all `/` — kernel EINVAL.
+        var start = end;
+        while (start > 0 and path[start - 1] != '/') start -= 1;
+        const last = path[start..end];
+        return std.mem.eql(u8, last, ".") or std.mem.eql(u8, last, "..");
     }
 
     fn lookupFsDescriptor(self: *WasiCliAdapter, handle: u32) ?*FsDescriptor {
@@ -5738,6 +5815,10 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
+        if (checkPathSymlinks(base_dir, path_bytes, follow_symlinks)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
 
         const io = std.Io.Threaded.global_single_threaded.io();
         const st = base_dir.statFile(io, path_bytes, .{
@@ -5846,6 +5927,10 @@ pub const WasiCliAdapter = struct {
 
         // path-flags bit 0 = symlink-follow (per WIT); 0 means "don't follow".
         const follow_symlinks = (path_flags & 0b1) != 0;
+        if (checkPathSymlinks(base_dir, path_bytes, follow_symlinks)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
 
         const io = std.Io.Threaded.global_single_threaded.io();
         base_dir.setTimestamps(io, path_bytes, .{
@@ -5877,6 +5962,15 @@ pub const WasiCliAdapter = struct {
     /// `path-flags.symlink-follow` is plumbed into both `openDir` and
     /// `openFile`. `createFile` ignores it because Zig 0.16's
     /// `CreateFileOptions` has no `follow_symlinks` field.
+    ///
+    /// Flag propagation per `filesystem-flags-and-type` fixture (#571):
+    /// - `OpenFlags::CREATE` implies `descriptor-flags::WRITE`.
+    /// - If neither `READ` nor `WRITE` is requested in the child flags
+    ///   (and `CREATE` isn't adding `WRITE`), default to `READ` so
+    ///   `get-flags` round-trips a useful value.
+    /// - Opening a sub-directory always implies iteration capability.
+    /// Truncation per `filesystem-set-size` (#571): if `TRUNCATE` and
+    /// `WRITE`, the file is zero-sized after open via `setLength(0)`.
     fn fsDescriptorOpenAt(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -5910,7 +6004,7 @@ pub const WasiCliAdapter = struct {
             .u32 => |v| v,
             else => 0,
         };
-        const child_flags = FsDescriptorFlags.fromBits(desc_flags_bits);
+        var child_flags = FsDescriptorFlags.fromBits(desc_flags_bits);
 
         const d = self.lookupFsDescriptor(handle) orelse {
             results[0] = try fsResultErr(allocator, .bad_descriptor);
@@ -5927,9 +6021,22 @@ pub const WasiCliAdapter = struct {
         const want_directory = (open_flags & 0b0010) != 0;
         const want_exclusive = (open_flags & 0b0100) != 0;
         const want_truncate = (open_flags & 0b1000) != 0;
+        const follow_symlinks = (path_flags & 0b1) != 0;
+
+        // Default-and-imply rules per `filesystem-flags-and-type` fixture:
+        //   - If neither READ nor WRITE was explicitly requested by the
+        //     guest, default to READ (so `get-flags` round-trips a
+        //     useful value on a "I just want a handle" open). Apply
+        //     this BEFORE CREATE→WRITE so e.g. `open(CREATE|EXCL, empty)`
+        //     yields READ|WRITE, not just WRITE.
+        //   - `OpenFlags::CREATE` always implies WRITE on the resulting
+        //     descriptor; `WRITE alone (without CREATE) does not imply
+        //     READ`.
+        if (!child_flags.read and !child_flags.write) child_flags.read = true;
+        if (want_create) child_flags.write = true;
+
         const want_read = child_flags.read;
         const want_write = child_flags.write;
-        const follow_symlinks = (path_flags & 0b1) != 0;
 
         // Spec (#181): if the base directory was opened without
         // `mutate-directory`, any child open that would mutate (create,
@@ -5949,6 +6056,10 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
+        if (checkPathSymlinks(base_dir, path_bytes, follow_symlinks)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
 
         // `mutate-directory` is only meaningful on directory descriptors;
         // strip it from the file-shaped child to keep `get-flags` honest.
@@ -5957,9 +6068,37 @@ pub const WasiCliAdapter = struct {
 
         const io = std.Io.Threaded.global_single_threaded.io();
 
-        if (want_directory) {
+        // Probe the target's kind so an `open-at` without `OpenFlags::DIRECTORY`
+        // on a directory path still produces a directory descriptor
+        // (per `filesystem-flags-and-type` fixture) — and so a WRITE
+        // open against a directory surfaces `IsDirectory` rather than
+        // succeeding via `openFile`. The probe is skipped when CREATE
+        // is requested (the path may not exist yet). (#571.)
+        var open_as_directory = want_directory;
+        if (!want_create) {
+            const probe = base_dir.statFile(io, path_bytes, .{
+                .follow_symlinks = follow_symlinks,
+            }) catch null;
+            if (probe) |st| {
+                if (st.kind == .directory) {
+                    if (want_write) {
+                        results[0] = try fsResultErr(allocator, .is_directory);
+                        return;
+                    }
+                    open_as_directory = true;
+                    // Dir descriptors don't reflect the file-shaped
+                    // `mutate_directory` strip we did above.
+                    stored_flags.mutate_directory = child_flags.mutate_directory;
+                }
+            }
+        }
+
+        if (open_as_directory) {
+            // Directories are always iterable so `read-directory` works
+            // on any guest-opened sub-dir (#571 follow-up to #476).
             const new_dir = base_dir.openDir(io, path_bytes, .{
                 .follow_symlinks = follow_symlinks,
+                .iterate = true,
             }) catch |err| {
                 results[0] = try fsResultErr(allocator, mapFsError(err));
                 return;
@@ -5995,6 +6134,19 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, mapFsError(err));
             return;
         };
+
+        // Honor `OpenFlags::TRUNCATE` on the already-existing path —
+        // `createFile.truncate` covers the CREATE case; an open without
+        // CREATE still needs an explicit `setLength(0)` to truncate.
+        // Skip if WRITE wasn't requested (truncate without write is
+        // meaningless and `setLength` will EBADF a read-only fd). (#571)
+        if (want_truncate and !want_create and want_write) {
+            new_file.setLength(io, 0) catch |err| {
+                new_file.close(io);
+                results[0] = try fsResultErr(allocator, mapFsError(err));
+                return;
+            };
+        }
 
         const new_handle = self.pushFsDescriptor(.{ .file = .{
             .file = new_file,
@@ -6308,8 +6460,15 @@ pub const WasiCliAdapter = struct {
                 return;
             },
         };
+        // Per `filesystem-io` fixture: `sync` / `sync-data` on a
+        // read-only fd is a successful no-op rather than `access`.
+        // The kernel-level `fsync(2)` on a read-only fd is valid but
+        // typically pointless — for portability, just succeed without
+        // calling it so guest semantics are deterministic. (#571.)
         if (!fs_file.flags.write) {
-            results[0] = try fsResultErr(allocator, .access);
+            const ok_payload = try allocator.create(InterfaceValue);
+            ok_payload.* = .{ .tuple_val = &.{} };
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = ok_payload } };
             return;
         }
 
@@ -6593,6 +6752,10 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
+        if (checkPathSymlinks(base_dir, path_bytes, follow_symlinks)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
 
         const io = std.Io.Threaded.global_single_threaded.io();
         const st = base_dir.statFile(io, path_bytes, .{
@@ -6658,6 +6821,10 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
+        if (checkPathSymlinks(base_dir, path_bytes, false)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
 
         const io = std.Io.Threaded.global_single_threaded.io();
         base_dir.createDir(io, path_bytes, .default_dir) catch |err| {
@@ -6708,6 +6875,10 @@ pub const WasiCliAdapter = struct {
             return error.OutOfBoundsMemory;
 
         if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (checkPathSymlinks(base_dir, path_bytes, false)) |code| {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
@@ -6763,6 +6934,19 @@ pub const WasiCliAdapter = struct {
             return error.OutOfBoundsMemory;
 
         if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        // Linux `unlinkat(.., AT_REMOVEDIR)` returns `EINVAL` for path
+        // `.` or any path ending in `.` / `..`, which the Zig stdlib
+        // panics on as a "programmer bug". Guard explicitly so the
+        // guest sees `Err(ErrorCode::Invalid)` per `filesystem-mkdir-rmdir`
+        // (line 73-75 `Err(Invalid | Access)`). (#571.)
+        if (rmdirPathIsInvalid(path_bytes)) {
+            results[0] = try fsResultErr(allocator, .invalid);
+            return;
+        }
+        if (checkPathSymlinks(base_dir, path_bytes, false)) |code| {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
@@ -6847,6 +7031,14 @@ pub const WasiCliAdapter = struct {
             return;
         }
         if (validateSandboxPath(new_path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (checkPathSymlinks(old_dir, old_path_bytes, false)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (checkPathSymlinks(new_dir, new_path_bytes, false)) |code| {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
@@ -6941,6 +7133,14 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
+        if (checkPathSymlinks(old_dir, old_path_bytes, follow_symlinks)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (checkPathSymlinks(new_dir, new_path_bytes, false)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
 
         const io = std.Io.Threaded.global_single_threaded.io();
         std.Io.Dir.hardLink(old_dir, old_path_bytes, new_dir, new_path_bytes, io, .{
@@ -7015,6 +7215,10 @@ pub const WasiCliAdapter = struct {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
+        if (checkPathSymlinks(base_dir, link_bytes, false)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
 
         const io = std.Io.Threaded.global_single_threaded.io();
         base_dir.symLink(io, target_bytes, link_bytes, .{}) catch |err| {
@@ -7067,6 +7271,10 @@ pub const WasiCliAdapter = struct {
             return error.OutOfBoundsMemory;
 
         if (validateSandboxPath(path_bytes)) |code| {
+            results[0] = try fsResultErr(allocator, code);
+            return;
+        }
+        if (checkPathSymlinks(base_dir, path_bytes, false)) |code| {
             results[0] = try fsResultErr(allocator, code);
             return;
         }
@@ -7556,6 +7764,22 @@ pub const WasiCliAdapter = struct {
         const buf = try allocator.alloc(u8, FS_STREAM_BUFFER_CAP);
         defer allocator.free(buf);
 
+        // Pre-validate offset: Zig's `readPositional` panics on EINVAL
+        // (Linux pread with a negative offset). Cap at i64::MAX —
+        // `pread(2)` takes a signed `off_t`, so anything past that wraps
+        // negative and is meaningless. Per `filesystem-io` fixture, the
+        // guest expects `Err(ErrorCode::Invalid)` for `pread(_, _, u64::MAX)`.
+        // We surface this by closing the stream + spawning an err future.
+        if (offset > @as(u64, @bitCast(@as(i64, std.math.maxInt(i64))))) {
+            try ci.streams.put(ci.allocator, stream_handle, slot);
+            const err_future = try spawnReadyErrFsFuture(ci, .invalid);
+            const fields_e = try allocator.alloc(InterfaceValue, 2);
+            fields_e[0] = .{ .handle = stream_handle };
+            fields_e[1] = .{ .handle = err_future };
+            results[0] = .{ .tuple_val = fields_e };
+            return;
+        }
+
         const io = std.Io.Threaded.global_single_threaded.io();
         const n: usize = fs_file.file.readPositional(io, &.{buf}, offset) catch 0;
         if (n > 0) try slot.buffer.appendSlice(ci.allocator, buf[0..n]);
@@ -7721,8 +7945,19 @@ pub const WasiCliAdapter = struct {
         // layout (string + variant<8>). Each guest read consumes one
         // entry-worth of bytes from the FIFO.
         const stream_handle = ci.allocAsyncHandle();
+        const reg = fsP3TypeRegistry();
+        const entry_t: ctypes.ValType = .{ .record = FS_P3_DIRECTORY_ENTRY_IDX };
+        const entry_size = abi.sizeOfType(reg, entry_t);
         var slot: async_mod.AsyncStream = .{
             .elem_type_idx = 0,
+            // `directory-entry` lives in the wasi:filesystem typespace
+            // and is reached through the host's `fs_p3_local_types`
+            // registry. The component-local `TypeRegistry` for the
+            // guest doesn't always carry a resolvable size for it (the
+            // stream's `t` is a cross-instance type-idx) — pin the
+            // stride here so `stream.read t` drains in the same units
+            // we lowered. (#571.)
+            .elem_size_hint = entry_size,
             .state = .open,
             .read_closed = false,
             .write_closed = true, // host streams the whole listing upfront.
@@ -7736,10 +7971,6 @@ pub const WasiCliAdapter = struct {
         const iter = try ci.allocator.create(std.Io.Dir.Iterator);
         defer ci.allocator.destroy(iter);
         iter.* = base_dir.iterate();
-
-        const reg = fsP3TypeRegistry();
-        const entry_t: ctypes.ValType = .{ .record = FS_P3_DIRECTORY_ENTRY_IDX };
-        const entry_size = abi.sizeOfType(reg, entry_t);
 
         const io = std.Io.Threaded.global_single_threaded.io();
         var enum_err: ?FsErrorCode = null;
@@ -7780,7 +8011,16 @@ pub const WasiCliAdapter = struct {
                 });
 
             const type_variant = InterfaceValue{ .variant_val = .{
-                .discriminant = @intFromEnum(dt),
+                // Transcode the 0.2-shape `DescType` discriminant to
+                // the 0.3 wire ordering (#571 follow-up to #564). The
+                // 0.3 `descriptor-type` variant drops 0.2's leading
+                // `unknown` and shifts each remaining case down by one
+                // — see `descTypeToP3Disc`. Without this, the guest
+                // mis-interprets the kind tag and wit-bindgen's variant
+                // reader can synthesize a `NonNull::new_unchecked` UB
+                // on a string-payload variant that should have had a
+                // different disc.
+                .discriminant = descTypeToP3Disc(@intFromEnum(dt)),
                 .payload = null,
             } };
             const record_fields = [_]InterfaceValue{
@@ -19212,10 +19452,15 @@ test "filesystem: addPreopen registers descriptor + name (#145)" {
 test "filesystem: open-at sandbox rejects .. and absolute paths (#145)" {
     const testing = std.testing;
 
-    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("/etc/passwd"));
+    // Absolute paths map to `not-permitted` per the 0.3 conformance
+    // fixtures (filesystem-open-errors, filesystem-stat,
+    // filesystem-mkdir-rmdir): leading `/` is a sandbox escape, not a
+    // POSIX-EACCES situation. (#571 follow-up to #564.)
+    try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("/etc/passwd"));
+    try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("/"));
     // `..` components map to `not-permitted` per the 0.3 conformance
-    // fixture's expectation (filesystem-dotdot). Absolute paths and
-    // Windows-style escapes still map to `access`. (#564.)
+    // fixture's expectation (filesystem-dotdot). Windows-style escapes
+    // still map to `access`. (#564.)
     try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("../escape"));
     try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("a/../b"));
     try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("a\\b"));
@@ -19844,7 +20089,7 @@ test "filesystem #475: metadata-hash-at on preopen sandbox-validates path" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    // Rejected: leading slash.
+    // Rejected: leading slash (now `not-permitted` per 0.3 fixtures; #571).
     {
         const bad_path = try testMakeListVal(&ci, testing.allocator, "/etc/passwd");
         var args = [_]InterfaceValue{
@@ -19857,7 +20102,7 @@ test "filesystem #475: metadata-hash-at on preopen sandbox-validates path" {
         defer results[0].deinit(testing.allocator);
         try testing.expect(!results[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
             results[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -20284,7 +20529,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
     try ci.enableTestMem(testing.allocator, 4096);
     defer ci.disableTestMem();
 
-    // create-directory-at: leading slash → .access.
+    // create-directory-at: leading slash → .not_permitted (#571 — absolute path is a sandbox escape).
     {
         const p = try testMakeListVal(&ci, testing.allocator, "/etc/x");
         var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .string = p.list } };
@@ -20293,7 +20538,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -20326,7 +20571,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
-    // rename-at: bad old_path.
+    // rename-at: bad old_path (absolute → .not_permitted #571).
     {
         const old_p = try testMakeListVal(&ci, testing.allocator, "/abs");
         const new_p = try testMakeListVal(&ci, testing.allocator, "ok");
@@ -20341,7 +20586,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -20366,7 +20611,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
-    // symlink-at: bad link path (only link path is sandbox-checked).
+    // symlink-at: bad link path — absolute → .not_permitted #571.
     {
         const target = try testMakeListVal(&ci, testing.allocator, "anywhere");
         const link = try testMakeListVal(&ci, testing.allocator, "/abs");
@@ -20380,7 +20625,7 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -23288,6 +23533,435 @@ test "filesystem: open-at strips mutate-directory from non-directory child (#181
         break :blk f;
     };
     try testing.expectEqual(@as(u32, 0b000011), stripped.toBits());
+}
+
+// ── #571: filesystem fixture-completeness ──────────────────────────────────
+
+test "filesystem #571: open-at defaults to READ when no R/W requested" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "x.txt", .data = "hi" });
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("x.txt").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .u32 = 0 }, // path-flags
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("x.txt".len) } },
+        .{ .u32 = 0 }, // open-flags empty
+        .{ .u32 = 0 }, // descriptor-flags empty (neither R nor W)
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    const child_handle = results[0].result_val.payload.?.*.handle;
+    const child = adapter.fs_descriptor_table.items[child_handle].?;
+    // Per `filesystem-flags-and-type` fixture: open with neither READ
+    // nor WRITE → default READ. CREATE is not set so WRITE stays off.
+    try testing.expect(child.flags().read);
+    try testing.expect(!child.flags().write);
+}
+
+test "filesystem #571: open-at(CREATE) implies WRITE and defaults READ" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("new.cleanup").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .u32 = 0 }, // path-flags
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("new.cleanup".len) } },
+        .{ .u32 = 0b0101 }, // open-flags = CREATE | EXCLUSIVE
+        .{ .u32 = 0 }, // descriptor-flags empty
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    const child_handle = results[0].result_val.payload.?.*.handle;
+    const child = adapter.fs_descriptor_table.items[child_handle].?;
+    // Per `filesystem-flags-and-type` fixture: CREATE adds WRITE; the
+    // empty-flag default also adds READ, so the result is READ|WRITE.
+    try testing.expect(child.flags().read);
+    try testing.expect(child.flags().write);
+}
+
+test "filesystem #571: open-at(CREATE, WRITE) keeps WRITE without adding READ" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("write-only.cleanup").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .u32 = 0 },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("write-only.cleanup".len) } },
+        .{ .u32 = 0b0101 }, // CREATE | EXCLUSIVE
+        .{ .u32 = 0b000010 }, // WRITE only
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    const child_handle = results[0].result_val.payload.?.*.handle;
+    const child = adapter.fs_descriptor_table.items[child_handle].?;
+    // Per `filesystem-flags-and-type` fixture line 142-145: WRITE alone
+    // does not imply READ; CREATE is a no-op for WRITE since WRITE is
+    // already set.
+    try testing.expect(!child.flags().read);
+    try testing.expect(child.flags().write);
+}
+
+test "filesystem #571: open-at(TRUNCATE, WRITE) truncates existing file to 0 bytes" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "trunc.cleanup", .data = "0123456789ABCDEF" });
+
+    // Sanity: pre-truncate the file is 16 bytes.
+    {
+        const st_before = try tmp.dir.statFile(io, "trunc.cleanup", .{});
+        try testing.expectEqual(@as(u64, 16), st_before.size);
+    }
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("trunc.cleanup").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .u32 = 0 },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("trunc.cleanup".len) } },
+        .{ .u32 = 0b1000 }, // OpenFlags::TRUNCATE
+        .{ .u32 = 0b000011 }, // READ | WRITE
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    const st_after = try tmp.dir.statFile(io, "trunc.cleanup", .{});
+    try testing.expectEqual(@as(u64, 0), st_after.size);
+}
+
+test "filesystem #571: open-at on a directory without DIRECTORY flag returns dir descriptor" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.createDir(io, "sub", .default_dir);
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("sub").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .u32 = 0 },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("sub".len) } },
+        .{ .u32 = 0 }, // no DIRECTORY flag
+        .{ .u32 = 0 }, // empty descriptor-flags
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    const child_handle = results[0].result_val.payload.?.*.handle;
+    // Per `filesystem-flags-and-type` line 45-50: opening a dir without
+    // the DIRECTORY open-flag still yields a directory descriptor.
+    try testing.expect(adapter.fs_descriptor_table.items[child_handle].? == .dir);
+}
+
+test "filesystem #571: open-at(WRITE) on directory returns is-directory error" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.createDir(io, "sub2", .default_dir);
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("sub2").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .u32 = 0 },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("sub2".len) } },
+        .{ .u32 = 0 },
+        .{ .u32 = 0b000010 }, // WRITE
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.is_directory)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #571: open-at rejects symlink-follow that escapes sandbox" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Create a symlink that points outside the sandbox.
+    try tmp.dir.symLink(io, "..", "parent", .{});
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("parent").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .u32 = 0b1 }, // path-flags = SYMLINK_FOLLOW
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("parent".len) } },
+        .{ .u32 = 0 },
+        .{ .u32 = 0b000001 }, // READ
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorOpenAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #571: intermediate symlink rejected by create-directory-at" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.symLink(io, "..", "parent", .{});
+
+    const preopen_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .write = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[preopen_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    const path_ptr = ci.hostAllocAndWrite("parent/q.cleanup").?;
+    var args = [_]InterfaceValue{
+        .{ .handle = preopen_handle },
+        .{ .string = .{ .ptr = path_ptr, .len = @intCast("parent/q.cleanup".len) } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorCreateDirectoryAt(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    // The "parent" symlink in the intermediate position of the path
+    // would let `mkdirat(2)` create `../q.cleanup` *outside* the
+    // preopen — `checkPathSymlinks` short-circuits with `not-permitted`
+    // before the kernel runs the op.
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
+        results[0].result_val.payload.?.*.variant_val.discriminant,
+    );
+}
+
+test "filesystem #571: kernel-errno → 0.3 variant — absolute path is not-permitted" {
+    const testing = std.testing;
+
+    // Per the 0.3 `filesystem-{open-errors, mkdir-rmdir, ...}` fixtures,
+    // a leading `/` is a sandbox escape that maps to `not-permitted`
+    // rather than the POSIX-EACCES `access`. (#571)
+    try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("/"));
+    try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("/etc/passwd"));
+}
+
+test "filesystem #571: kernel-errno → 0.3 variant — DirNotEmpty maps to not-empty" {
+    const testing = std.testing;
+
+    try testing.expectEqual(FsErrorCode.not_empty, mapFsError(error.DirNotEmpty));
+    try testing.expectEqual(FsErrorCode.cross_device, mapFsError(error.CrossDevice));
+    try testing.expectEqual(FsErrorCode.exist, mapFsError(error.PathAlreadyExists));
+    try testing.expectEqual(FsErrorCode.no_entry, mapFsError(error.FileNotFound));
+    try testing.expectEqual(FsErrorCode.access, mapFsError(error.AccessDenied));
+}
+
+test "filesystem #571: read-directory iterates twice from a re-opened stream" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "a" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "b" });
+
+    const dir_handle = try adapter.pushFsDescriptor(.{ .preopen = .{
+        .dir = tmp.dir,
+        .flags = .{ .read = true, .mutate_directory = true },
+    } });
+    defer adapter.fs_descriptor_table.items[dir_handle] = null;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const reg = fsP3TypeRegistry();
+    const entry_size = abi.sizeOfType(reg, .{ .record = FS_P3_DIRECTORY_ENTRY_IDX });
+
+    // First enumeration: a fresh `read-directory` call returns a fresh
+    // stream handle whose FIFO has all 2 entries pre-lowered.
+    {
+        var args = [_]InterfaceValue{.{ .handle = dir_handle }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorReadDirectoryP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        const stream_handle = results[0].tuple_val[0].handle;
+        const stream_slot = ci.streams.getPtr(stream_handle).?;
+        try testing.expectEqual(@as(usize, 2 * entry_size), stream_slot.buffer.items.len);
+        // The per-stream size hint covers the host's `directory-entry`
+        // record so `stream.read t` drains in the same byte stride we
+        // lowered (#571 follow-up to #564).
+        try testing.expectEqual(@as(?u32, @intCast(entry_size)), stream_slot.elem_size_hint);
+    }
+
+    // Second enumeration: a second `read-directory` call must succeed
+    // and again return a stream with all 2 entries. The Linux
+    // `getdents64` BADF panic from #571 was rooted in the preopen dir
+    // being opened without `.iterate = true`; the issue is now
+    // structural, so a fresh iterator on the same dir is fine.
+    {
+        var args = [_]InterfaceValue{.{ .handle = dir_handle }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorReadDirectoryP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        const stream_handle = results[0].tuple_val[0].handle;
+        const stream_slot = ci.streams.getPtr(stream_handle).?;
+        try testing.expectEqual(@as(usize, 2 * entry_size), stream_slot.buffer.items.len);
+    }
+}
+
+test "filesystem #571: sync_data is a no-op on a read-only descriptor" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ro.txt", .data = "data" });
+    const file = try tmp.dir.openFile(io, "ro.txt", .{ .mode = .read_only });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{
+        .file = file,
+        .flags = .{ .read = true },
+    } });
+
+    var ci: ComponentInstance = undefined;
+    var args = [_]InterfaceValue{.{ .handle = handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorSyncData(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    // Per `filesystem-io` fixture line 184: `sync_data` on a read-only
+    // fd is a successful no-op rather than `access`. (#571.)
+    try testing.expect(results[0].result_val.is_ok);
 }
 
 // ---------------------------------------------------------------------------
