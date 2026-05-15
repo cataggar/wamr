@@ -307,6 +307,18 @@ pub const ComponentInstance = struct {
     /// `implicit_task_context` (Wasmtime parity, sync-call path). (#520)
     current_task_manager: ?*async_mod.TaskManager = null,
 
+    /// Cached `ExecEnv` for `cabi_realloc` (#538). The wasi:http@0.3.0
+    /// fixtures allocate guest-side scratch buffers many thousand
+    /// times per `wamr run`; recreating a 96 KiB `ExecEnv` on every
+    /// `hostAllocGuest` pushed Debug-build `http-fields` past the
+    /// wasi-p3-testsuite runner's 5-second wait timeout. Lazy-created
+    /// on first use and freed in `deinit`. `realloc_env_owner` keeps
+    /// the cache aligned with the core module that exposes the
+    /// `cabi_realloc` export — re-creating if the realloc owner ever
+    /// shifts (e.g. when sub-instances become the realloc target).
+    realloc_env: ?*@import("../runtime/common/exec_env.zig").ExecEnv = null,
+    realloc_env_owner: ?*core_types.ModuleInstance = null,
+
     /// Allocate a fresh async-handle (#478 sub-PR 3). Used by every
     /// `.new`-flavoured canon-builtin to mint a unique key into the
     /// per-instance future / stream / error-context / waitable-set
@@ -512,8 +524,17 @@ pub const ComponentInstance = struct {
         const realloc_local = realloc_owner.getExportFunc("cabi_realloc") orelse return null;
         const ExecEnv = @import("../runtime/common/exec_env.zig").ExecEnv;
         const executor = @import("executor.zig");
-        const env = ExecEnv.create(realloc_owner, 4096, self.allocator) catch return null;
-        defer env.destroy();
+        // Reuse a cached `ExecEnv` keyed on the realloc owner — the
+        // wasi:http@0.3.0 testsuite fixtures hit `hostAllocGuest`
+        // thousands of times per run and a fresh `ExecEnv.create` is
+        // ~96 KiB of allocator churn each (#538). `realloc_env` is
+        // discarded + re-created if the owner ever shifts.
+        if (self.realloc_env_owner != realloc_owner) {
+            if (self.realloc_env) |old| old.destroy();
+            self.realloc_env = ExecEnv.create(realloc_owner, 1024, self.allocator) catch null;
+            self.realloc_env_owner = if (self.realloc_env != null) realloc_owner else null;
+        }
+        const env = self.realloc_env orelse return null;
         const a: u32 = if (align_ == 0) 1 else align_;
         return executor.callRealloc(env, realloc_local, 0, 0, a, size) catch null;
     }
@@ -1111,6 +1132,13 @@ pub const ComponentInstance = struct {
     }
 
     pub fn deinit(self: *ComponentInstance) void {
+        // The cached `cabi_realloc` ExecEnv must be freed before the
+        // core instances it points at (#538).
+        if (self.realloc_env) |env| {
+            env.destroy();
+            self.realloc_env = null;
+            self.realloc_env_owner = null;
+        }
         // Children are allocated independently of `module_arena` so we
         // can give each a deterministic deinit before the parent tears
         // down core instances / imports / arena. Walk in declaration

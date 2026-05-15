@@ -248,11 +248,17 @@ jobs:
         run: |
           pip install --user -r tests/wasi-testsuite/test-runner/requirements.txt
 
-      - name: Build wamr (Debug)
-        run: zig build
+      - name: Build wamr (ReleaseSafe)
+        # ReleaseSafe instead of Debug: the wasi:http@0.3.0 fixtures
+        # (`http-fields` in particular) sweep ≥1024 codepoints through
+        # the host adapter on every run, which the Debug interpreter
+        # cannot complete inside the testsuite-runner's 5-second
+        # per-`wait` timeout (#538). Safety checks still fire on this
+        # build so a regression in adapter state still trips the gate.
+        run: zig build -Doptimize=ReleaseSafe
 
       - name: Run WASI Preview 3 conformance gate
-        run: zig build wasi-p3-testsuite
+        run: zig build wasi-p3-testsuite -Doptimize=ReleaseSafe
 
   component-examples-wasmtime:
     name: Build & Test (component-examples-wasmtime)
