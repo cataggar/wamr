@@ -316,6 +316,44 @@ pub const ComponentInstance = struct {
     /// `implicit_task_context` (Wasmtime parity, sync-call path). (#520)
     current_task_manager: ?*async_mod.TaskManager = null,
 
+    /// Host-driven async-event driver hook (#551). Installed by
+    /// `wasi:cli`-style host adapters that own background timers or other
+    /// futures whose completion is not produced by guest code. Invoked
+    /// from `waitable-set.{wait,poll}` to advance time / drain host I/O
+    /// before consulting `WaitableSet.ready_queue`. Returns `true` if any
+    /// host-side event fired (i.e. some waitable in `futures`/`streams`
+    /// transitioned to `.ready`).
+    ///
+    /// `wait_for_ns_hint` is the number of nanoseconds the executor is
+    /// willing to block waiting for a host event before returning. The
+    /// adapter may sleep up to that amount or, when servicing a short
+    /// queue of due timers, return immediately. A `null` hint means the
+    /// caller is polling (non-blocking): the driver MUST NOT sleep.
+    /// (See `wasi_cli_adapter.WasiCliAdapter.driveAsyncEvents`.)
+    async_event_driver: ?*const fn (
+        ctx: ?*anyopaque,
+        ci: *ComponentInstance,
+        wait_for_ns_hint: ?u64,
+        allocator: std.mem.Allocator,
+    ) bool = null,
+    async_event_driver_ctx: ?*anyopaque = null,
+    /// Companion hook to `async_event_driver` invoked from the
+    /// `task.cancel` canon-builtin path (#551). Lets the host abort any
+    /// timer futures owned by the currently-cancelled task — the wait
+    /// must settle with the cancel disposition so the guest sees
+    /// `STATUS_STARTED_CANCELLED` on its next `waitable-set.wait`. The
+    /// driver iterates its pending-timer table and, for every entry that
+    /// belongs to `task_handle` (or all entries when `task_handle` is
+    /// null), removes the timer and transitions the backing future to
+    /// `.closed` with `write_closed = true` so the executor lowers
+    /// `STATUS_STARTED_CANCELLED` for the corresponding subtask.
+    async_cancel_driver: ?*const fn (
+        ctx: ?*anyopaque,
+        ci: *ComponentInstance,
+        task_handle: ?u32,
+        allocator: std.mem.Allocator,
+    ) void = null,
+
     /// Cached `ExecEnv` for `cabi_realloc` (#538). The wasi:http@0.3.0
     /// fixtures allocate guest-side scratch buffers many thousand
     /// times per `wamr run`; recreating a 96 KiB `ExecEnv` on every

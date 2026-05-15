@@ -4380,6 +4380,11 @@ pub const WasiCliAdapter = struct {
         try ci.futures.put(ci.allocator, handle, .{
             .elem_type_idx = 0, // unit type
             .state = .pending,
+            // Flagged so `executor.joinWaitable` knows to register this
+            // handle as a `.subtask` waitable and `popReadyEvent` knows
+            // to emit `EVENT_SUBTASK` with `STATUS_RETURNED` rather than
+            // a `future.read` return-code (#551).
+            .subtask_managed = true,
         });
         errdefer _ = ci.futures.remove(handle);
         try self.timer_futures.append(self.allocator, .{
@@ -4478,10 +4483,19 @@ pub const WasiCliAdapter = struct {
         results[0] = .{ .handle = ph };
     }
 
-    /// Drain any P3 timer-futures whose deadline has elapsed (#483).
+    /// Drain any P3 timer-futures whose deadline has elapsed (#483, #551).
     /// Sets `Future.state = .ready`, wakes a registered read-waitable, and
     /// flips the `.future_timer` polyfill ready flag. Returns whether any
     /// timer fired. Safe to call from any polling site; idempotent.
+    ///
+    /// The `code` published on the WaitableSet payload depends on the
+    /// future's `subtask_managed` flag: timer-futures minted by
+    /// `wasi:clocks` `wait-for` / `wait-until` (subtask_managed=true)
+    /// carry a wit-bindgen async-ABI `STATUS_RETURNED` discriminant so
+    /// the guest's `Subtask` decoder finishes the await; legacy
+    /// 0.2-on-0.3 polyfill timer-futures (subtask_managed=false) keep
+    /// the `packStatus(.completed, 0)` shape consumed by the
+    /// future/stream `ReturnCode` decoder. (#551.)
     pub fn completeDueTimerFutures(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
@@ -4499,14 +4513,120 @@ pub const WasiCliAdapter = struct {
             if (ci.futures.getPtr(tf.handle)) |fut| {
                 fut.pending_read = null;
                 fut.state = .ready;
-                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx| {
+                    const code: u32 = if (fut.subtask_managed)
+                        executor_root.STATUS_RETURNED
+                    else
+                        async_canon.packStatus(.completed, 0);
+                    ws.setReady(idx, allocator, code);
+                };
             }
             if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
             _ = self.timer_futures.swapRemove(i);
             fired = true;
         }
         return fired;
+    }
+
+    /// `ComponentInstance.async_event_driver` hook (#551). Advances the
+    /// host monotonic clock (honoring `monotonic_clock_override` so unit
+    /// tests stay deterministic) and drains any due timer-futures into
+    /// the WaitableSet they were joined to via `waitable.join`. When the
+    /// caller is blocking on `waitable-set.wait` and `wait_for_ns_hint`
+    /// is non-null, this routine sleeps the host thread until the
+    /// earliest pending deadline or the hint, whichever comes first.
+    ///
+    /// The sleep is bounded by the hint so tests with mocked clocks
+    /// (override set) don't actually block on host time. Returns whether
+    /// any host event was delivered.
+    pub fn driveAsyncEvents(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        wait_for_ns_hint: ?u64,
+        allocator: Allocator,
+    ) bool {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+
+        // Drain anything already due first — the common case for
+        // `wait-for(0)` / `wait-until(past)` and for tests that
+        // pre-advance `monotonic_clock_override`.
+        const fired = self.completeDueTimerFutures(ci, allocator);
+
+        // Caller asked us not to block (poll variant); return immediately.
+        const hint_ns = wait_for_ns_hint orelse return fired;
+        if (fired) return fired;
+
+        // Determine the soonest pending deadline so we can sleep just
+        // long enough to fire it. If `monotonic_clock_override` is set
+        // (tests), don't sleep — the test mutates the override manually
+        // and re-enters `driveAsyncEvents` to deliver.
+        if (self.monotonic_clock_override != null) return false;
+        if (self.timer_futures.items.len == 0) return false;
+
+        const now = self.monotonicNs();
+        var soonest: u64 = std.math.maxInt(u64);
+        for (self.timer_futures.items) |tf| {
+            if (tf.deadline_ns < soonest) soonest = tf.deadline_ns;
+        }
+        if (soonest == std.math.maxInt(u64)) return false;
+
+        const delta_ns: u64 = if (soonest > now) soonest - now else 0;
+        const sleep_ns = @min(delta_ns, hint_ns);
+        if (sleep_ns > 0) {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const duration: std.Io.Clock.Duration = .{
+                .raw = .{ .nanoseconds = sleep_ns },
+                .clock = .awake,
+            };
+            duration.sleep(io) catch {};
+        }
+        return self.completeDueTimerFutures(ci, allocator);
+    }
+
+    /// `ComponentInstance.async_cancel_driver` hook (#551). Invoked from
+    /// the `task.cancel` canon-builtin path when the guest cancels the
+    /// currently-executing task. Aborts every pending timer future and
+    /// settles the backing future with `state = .closed`,
+    /// `write_closed = true` so the next `waitable-set.{wait,poll}`
+    /// surfaces `STATUS_STARTED_CANCELLED` for the corresponding
+    /// subtask. Mirrors the cancellation semantics described by the
+    /// component-model spec's `canon.lower (async)` table.
+    ///
+    /// The `task_handle` argument is reserved for a future per-task
+    /// owner-tracking refactor; today we cancel every pending timer the
+    /// adapter owns. Single-task guests (which is what every fixture
+    /// driven by `wasi:cli@0.3.x.run` is) hit the same behaviour either
+    /// way.
+    pub fn cancelAllPendingTimers(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        task_handle: ?u32,
+        allocator: Allocator,
+    ) void {
+        _ = task_handle;
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        var i: usize = 0;
+        while (i < self.timer_futures.items.len) : (i += 1) {
+            const tf = self.timer_futures.items[i];
+            if (ci.futures.getPtr(tf.handle)) |fut| {
+                fut.pending_read = null;
+                // Settle the future with the cancel disposition. The
+                // future is `subtask_managed` (timer-future invariant)
+                // so the executor's `waitable_set_wait` arm pops a
+                // `kind == .subtask` event whose `code` carries the
+                // wit-bindgen async-ABI `STATUS_STARTED_CANCELLED`
+                // discriminant (=3) — matching the
+                // `crates/guest-rust/src/rt/async_support/subtask.rs`
+                // decoder in wit-bindgen ≥ 0.53.
+                fut.state = .closed;
+                fut.write_closed = true;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+            }
+            if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
+        }
+        // Now clear the pending list — we settled every entry above.
+        self.timer_futures.clearRetainingCapacity();
     }
 
     fn allocStreamHandle(self: *WasiCliAdapter, stream: *streams.OutputStream) !u32 {
@@ -16394,6 +16514,14 @@ pub fn runLoadedComponentP3(
         else => return error.LinkFailed,
     };
 
+    // Install the adapter's async-event driver so `waitable-set.wait`
+    // can advance time / drain `wasi:clocks` timers (#551). Same for the
+    // task.cancel propagation hook used by `multi-clock-wait`. Cleared
+    // implicitly when `inst.deinit()` runs at function exit.
+    inst.async_event_driver = &WasiCliAdapter.driveAsyncEvents;
+    inst.async_event_driver_ctx = adapter;
+    inst.async_cancel_driver = &WasiCliAdapter.cancelAllPendingTimers;
+
     const run_name = (findRunP3ExportName(component, inst, allocator) catch return error.OutOfMemory) orelse
         return error.NoRunExport;
     defer allocator.free(run_name);
@@ -24491,6 +24619,75 @@ test "wasi:clocks/monotonic-clock@0.3 wait-until past deadline fires immediately
         ci.futures.getPtr(fh).?.state,
     );
     try testing.expectEqual(@as(usize, 0), adapter.timer_futures.items.len);
+}
+
+test "WasiCliAdapter.driveAsyncEvents: drains due timer-futures non-blocking (#551)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = makeBareCiForClocksTest();
+    defer freeBareCiForClocksTest(&ci);
+
+    adapter.monotonic_clock_override = 0;
+    const args = [_]InterfaceValue{.{ .u64 = 100 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.monotonicWaitFor(&adapter, &ci, &args, &results, testing.allocator);
+    const fh = results[0].handle;
+    try testing.expectEqual(@as(usize, 1), adapter.timer_futures.items.len);
+
+    // Not yet due: a poll-shaped drive (null hint) reports no progress.
+    try testing.expect(!WasiCliAdapter.driveAsyncEvents(&adapter, &ci, null, testing.allocator));
+
+    // Advance the mocked clock past the deadline; drive picks it up.
+    adapter.monotonic_clock_override = 200;
+    try testing.expect(WasiCliAdapter.driveAsyncEvents(&adapter, &ci, null, testing.allocator));
+    try testing.expectEqual(
+        @import("async.zig").Future.State.ready,
+        ci.futures.getPtr(fh).?.state,
+    );
+    try testing.expectEqual(@as(usize, 0), adapter.timer_futures.items.len);
+}
+
+test "WasiCliAdapter.cancelAllPendingTimers: aborts in-flight waits with cancel disposition (#551)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = makeBareCiForClocksTest();
+    defer freeBareCiForClocksTest(&ci);
+
+    adapter.monotonic_clock_override = 0;
+
+    // Two pending `wait-for` timers — the classic `multi-clock-wait`
+    // shape where a task.cancel must reap every outstanding waitable.
+    const args1 = [_]InterfaceValue{.{ .u64 = 1_000 }};
+    var res1: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.monotonicWaitFor(&adapter, &ci, &args1, &res1, testing.allocator);
+    const fh1 = res1[0].handle;
+    const args2 = [_]InterfaceValue{.{ .u64 = 2_000 }};
+    var res2: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.monotonicWaitFor(&adapter, &ci, &args2, &res2, testing.allocator);
+    const fh2 = res2[0].handle;
+    try testing.expectEqual(@as(usize, 2), adapter.timer_futures.items.len);
+
+    WasiCliAdapter.cancelAllPendingTimers(&adapter, &ci, null, testing.allocator);
+
+    // Both futures are now in the cancel-disposition state, which the
+    // executor's `popReadyEvent` translates into
+    // `STATUS_STARTED_CANCELLED` for the EVENT_SUBTASK payload.
+    try testing.expectEqual(
+        @import("async.zig").Future.State.closed,
+        ci.futures.getPtr(fh1).?.state,
+    );
+    try testing.expectEqual(true, ci.futures.getPtr(fh1).?.write_closed);
+    try testing.expectEqual(
+        @import("async.zig").Future.State.closed,
+        ci.futures.getPtr(fh2).?.state,
+    );
+    try testing.expectEqual(true, ci.futures.getPtr(fh2).?.write_closed);
+
+    // Pending list is drained; subsequent timer-wheel drives are no-ops.
+    try testing.expectEqual(@as(usize, 0), adapter.timer_futures.items.len);
+    try testing.expect(!adapter.completeDueTimerFutures(&ci, testing.allocator));
 }
 
 test "wasi:clocks/monotonic-clock@0.3 polyfill: subscribe-duration pollable fires via P3 timer (#483)" {
