@@ -103,6 +103,13 @@ pub fn build(b: *std.Build) void {
     const component_model = b.option(bool, "component_model", "Enable Component Model") orelse false;
     options.addOption(bool, "component_model", component_model);
 
+    const network_tests = b.option(
+        bool,
+        "network_tests",
+        "Enable opt-in unit tests that perform real outbound HTTPS requests (#521)",
+    ) orelse false;
+    options.addOption(bool, "network_tests", network_tests);
+
     const skip_coldstart = b.option(bool, "skip-coldstart", "Skip cold-start budget tests (issue #395)") orelse false;
 
     const config_module = options.createModule();
