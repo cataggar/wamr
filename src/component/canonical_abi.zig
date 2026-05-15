@@ -1023,6 +1023,88 @@ pub fn liftFlat(core_vals: []const u32, t: ctypes.ValType) !InterfaceValue {
     };
 }
 
+/// Registry-aware flat lift. Handles compound `variant` / `option` /
+/// `enum` / `result` / `type_idx` inner types by recursing through the
+/// type registry; falls back to `liftFlat` for primitives. Used by the
+/// async-canon flat-arg path (executor.popInterfaceValue) when the
+/// outer compound's inner type is itself compound — e.g.
+/// `option<scheme>` where `scheme = variant { http, https, other(string) }`
+/// (#552). Allocates payload nodes through `alloc`.
+pub fn liftFlatReg(
+    core_vals: []const u32,
+    t: ctypes.ValType,
+    reg: TypeRegistry,
+    alloc: Allocator,
+) !InterfaceValue {
+    return switch (t) {
+        .enum_ => |idx| blk: {
+            const td = reg.get(idx) orelse break :blk error.InvalidTypeIndex;
+            if (core_vals.len == 0) break :blk error.EmptyCoreVals;
+            const disc = core_vals[0];
+            if (disc >= td.enum_.names.len) break :blk error.InvalidDiscriminant;
+            break :blk .{ .enum_val = disc };
+        },
+        .variant => |idx| blk: {
+            const td = reg.get(idx) orelse break :blk error.InvalidTypeIndex;
+            if (core_vals.len == 0) break :blk error.EmptyCoreVals;
+            const disc = core_vals[0];
+            if (disc >= td.variant.cases.len) break :blk error.InvalidDiscriminant;
+            const case_type = td.variant.cases[disc].type;
+            const payload_ptr: ?*const InterfaceValue = if (case_type) |ct| p: {
+                const arm_slots = flattenCount(reg, ct);
+                if (1 + arm_slots > core_vals.len) break :blk error.EmptyCoreVals;
+                const lifted = try liftFlatReg(core_vals[1 .. 1 + arm_slots], ct, reg, alloc);
+                const node = try alloc.create(InterfaceValue);
+                node.* = lifted;
+                break :p node;
+            } else null;
+            break :blk .{ .variant_val = .{ .discriminant = disc, .payload = payload_ptr } };
+        },
+        .option => |idx| blk: {
+            const td = reg.get(idx) orelse break :blk error.InvalidTypeIndex;
+            if (core_vals.len == 0) break :blk error.EmptyCoreVals;
+            const is_some = core_vals[0] != 0;
+            if (!is_some) break :blk .{ .option_val = .{ .is_some = false, .payload = null } };
+            const inner = td.option.inner;
+            const inner_slots = flattenCount(reg, inner);
+            if (1 + inner_slots > core_vals.len) break :blk error.EmptyCoreVals;
+            const lifted = try liftFlatReg(core_vals[1 .. 1 + inner_slots], inner, reg, alloc);
+            const node = try alloc.create(InterfaceValue);
+            node.* = lifted;
+            break :blk .{ .option_val = .{ .is_some = true, .payload = node } };
+        },
+        .result => |idx| blk: {
+            const td = reg.get(idx) orelse break :blk error.InvalidTypeIndex;
+            if (core_vals.len == 0) break :blk error.EmptyCoreVals;
+            const is_ok = core_vals[0] == 0;
+            const arm_type = if (is_ok) td.result.ok else td.result.err;
+            const payload_ptr: ?*const InterfaceValue = if (arm_type) |at| p: {
+                const arm_slots = flattenCount(reg, at);
+                if (1 + arm_slots > core_vals.len) break :blk error.EmptyCoreVals;
+                const lifted = try liftFlatReg(core_vals[1 .. 1 + arm_slots], at, reg, alloc);
+                const node = try alloc.create(InterfaceValue);
+                node.* = lifted;
+                break :p node;
+            } else null;
+            break :blk .{ .result_val = .{ .is_ok = is_ok, .payload = payload_ptr } };
+        },
+        .type_idx => |idx| blk: {
+            const td = reg.get(idx) orelse break :blk error.InvalidTypeIndex;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |v| v,
+                .variant => .{ .variant = idx },
+                .option => .{ .option = idx },
+                .result => .{ .result = idx },
+                .enum_ => .{ .enum_ = idx },
+                .resource => .{ .own = idx },
+                else => break :blk error.CompoundNeedsRegistry,
+            };
+            break :blk try liftFlatReg(core_vals, reified, reg, alloc);
+        },
+        else => try liftFlat(core_vals, t),
+    };
+}
+
 /// Lower a primitive interface value to flat core values. Writes into `out`.
 /// Returns the number of core values written, or error for compound types.
 pub fn lowerFlat(val: InterfaceValue, t: ctypes.ValType, out: []u32) !u32 {

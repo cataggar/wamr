@@ -1,8 +1,6 @@
 {
     "_comment": "Skip-list for `zig build wasi-p3-testsuite` (issue #489). Mirrors the format of `tests/wasi-testsuite-skip.json` consumed by `wasi-testsuite/test-runner/wasi_test_runner.py`. Each entry MUST carry a rationale + tracking issue. Remove entries as the corresponding P3 adapter PRs land. Suite key matches `tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3/manifest.json` `name`.",
     "WASI Rust tests [wasm32-wasip3]": {
-        "http-fields": "wasi:http@0.3.0 host adapter complete (#538 / PR #549) but CI's 5s wasi-testsuite/test_suite_runner timeout is too tight for the 1024-codepoint validation sweep on the Debug/ReleaseSafe interpreter — tracking #552",
-        "http-request": "wasi:http@0.3.0 request — scheme/method/path/authority byte-validation per RFC 7230/3986 not yet enforced — tracking #552",
         "http-service": "wasi:http@0.3.0 service requires host-driven TCP listener (sockets host-stream wiring landed via #535 / PR #544) plus end-to-end CLI dispatch — tracking #520",
         "sockets-echo": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-bind": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",

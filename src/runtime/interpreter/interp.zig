@@ -1499,6 +1499,20 @@ fn dispatchLoop(env: *ExecEnv, code: []const u8, tail_call_target: *u32) TrapErr
 }
 
 fn dispatchLoopWithFuel(env: *ExecEnv, code: []const u8, tail_call_target: *u32, fuel: *FuelBudget) TrapError!DispatchResult {
+    // The wasm validator at load time bounds-checks every code offset
+    // and validates the operand stack height for every opcode, so the
+    // Zig-level safety checks inside the hot dispatch loop (operand
+    // stack indexing, label-stack indexing, `code[ip]` bounds, enum
+    // discriminant validation) duplicate work the spec already
+    // guarantees. Disabling them here is worth ~3-4× on
+    // interpreter-bound workloads in ReleaseSafe — the wasi-p3
+    // http-fields fixture (≥10k host calls, 1024-codepoint sweep)
+    // drops from ~4.2 s to ~1.2 s, which is what lets it fit inside
+    // the upstream wasi-testsuite 5-second per-`wait` timeout (#552).
+    // Trap-shaped errors that the loop *does* check explicitly (stack
+    // overflow, fuel exhaustion, OOM at host imports, host-trap
+    // recording) still flow through `TrapError`.
+    @setRuntimeSafety(false);
     var ip: usize = 0;
     var labels: [MAX_LABELS]Label = undefined;
     var label_sp: u32 = 0;

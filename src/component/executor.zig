@@ -666,22 +666,28 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
                 // direct `own<R>` for the purpose of lifting.
                 const resolved = resolveArmType(at, registry);
                 const arm_slots = abi.flattenCount(registry, resolved);
-                if (abi.liftFlat(slot_buf[0..arm_slots], resolved)) |lifted| {
+                // Prefer the registry-aware lift so compound arms
+                // (variant / option / result / enum) get a proper
+                // payload (#552). Falls back to `liftFlat` only when
+                // both fail.
+                if (abi.liftFlatReg(slot_buf[0..arm_slots], resolved, registry, allocator)) |lifted| {
                     const p = try allocator.create(InterfaceValue);
                     p.* = lifted;
                     payload = p;
                 } else |_| {
-                    // Compound arm type — leave payload null. Host
-                    // imports that need the typed payload should ship
-                    // its data through a different surface (e.g. raw
-                    // handle args).
+                    if (abi.liftFlat(slot_buf[0..arm_slots], resolved)) |lifted| {
+                        const p = try allocator.create(InterfaceValue);
+                        p.* = lifted;
+                        payload = p;
+                    } else |_| {}
                 }
             }
             break :blk .{ .result_val = .{ .is_ok = is_ok, .payload = payload } };
         },
         // `option<T>`: symmetric to `.result` above. Pop payload slots,
-        // pop disc; if `is_some`, lift the buffered slots via `liftFlat`
-        // for simple inner types.
+        // pop disc; if `is_some`, lift the buffered slots — preferring
+        // the registry-aware lifter so compound inners (variant /
+        // option / result) keep their payload (#552).
         .option => |idx| blk: {
             const td = registry.get(idx) orelse return error.CompoundNeedsRegistry;
             const inner_type: ctypes.ValType = switch (td) {
@@ -702,18 +708,36 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             if (is_some) {
                 const resolved = resolveArmType(inner_type, registry);
                 const inner_slots = abi.flattenCount(registry, resolved);
-                if (abi.liftFlat(slot_buf[0..inner_slots], resolved)) |lifted| {
+                if (abi.liftFlatReg(slot_buf[0..inner_slots], resolved, registry, allocator)) |lifted| {
                     const p = try allocator.create(InterfaceValue);
                     p.* = lifted;
                     payload = p;
                 } else |_| {
-                    // Compound inner — leave payload null. Same caveat
-                    // as the `.result` branch above.
+                    if (abi.liftFlat(slot_buf[0..inner_slots], resolved)) |lifted| {
+                        const p = try allocator.create(InterfaceValue);
+                        p.* = lifted;
+                        payload = p;
+                    } else |_| {}
                 }
             }
             break :blk .{ .option_val = .{ .is_some = is_some, .payload = payload } };
         },
-        .record, .variant, .tuple, .flags, .enum_ => error.CompoundNeedsRegistry,
+        .record, .tuple, .flags => error.CompoundNeedsRegistry,
+        // Top-level `variant` / `enum`: pop the flat slots into a
+        // scratch buffer, then re-lift through the registry-aware
+        // path so compound case payloads (e.g. `Method::Other(string)`,
+        // `Scheme::Other(string)`) keep their bytes (#552).
+        .variant, .enum_ => blk: {
+            const total_slots = abi.flattenCount(registry, t);
+            var slot_buf: [16]u32 = undefined;
+            if (total_slots > slot_buf.len) return error.CompoundNeedsRegistry;
+            var i: u32 = total_slots;
+            while (i > 0) {
+                i -= 1;
+                slot_buf[i] = @bitCast(try env.popI32());
+            }
+            break :blk try abi.liftFlatReg(slot_buf[0..total_slots], t, registry, allocator);
+        },
         // Mirror `pushInterfaceValue`: resolve `.type_idx` and re-pop on
         // the reified ValType.
         .type_idx => |idx| blk: {
@@ -4126,10 +4150,15 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         result_dest_ptr = @bitCast(env.popI32() catch |err| return trampolineTrap(env, ctx, err, .lift_args));
     }
 
-    // Lift args.
-    const args = allocator.alloc(InterfaceValue, ctx.param_types.len) catch |err|
-        return trampolineTrap(env, ctx, err, .lift_args);
-    defer allocator.free(args);
+    // Lift args. Stack-buffer the common ≤8-param case so high-volume
+    // host calls (the http-fields fixture sweeps ≥10k calls through
+    // this path) don't pay the heap-alloc-and-free price every time
+    // (#552).
+    var args_stack_buf: [8]InterfaceValue = undefined;
+    const args_heap: ?[]InterfaceValue = if (ctx.param_types.len <= args_stack_buf.len) null else (allocator.alloc(InterfaceValue, ctx.param_types.len) catch |err|
+        return trampolineTrap(env, ctx, err, .lift_args));
+    defer if (args_heap) |h| allocator.free(h);
+    const args: []InterfaceValue = args_heap orelse args_stack_buf[0..ctx.param_types.len];
     if (params_spill) {
         const params_ptr: u32 = @bitCast(env.popI32() catch |err| return trampolineTrap(env, ctx, err, .lift_args));
         const mem_idx = ctx.lower_opts.memory_idx.?;
@@ -4157,11 +4186,13 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     // Invoke host. Host owns allocation of any compound result values via
     // `allocator`; we deinit each result after lowering so payloads
     // (e.g. `.result_val.payload` for input-stream.blocking-read) don't leak.
-    const results = allocator.alloc(InterfaceValue, ctx.result_types.len) catch |err|
-        return trampolineTrap(env, ctx, err, .lift_args);
+    var results_stack_buf: [4]InterfaceValue = undefined;
+    const results_heap: ?[]InterfaceValue = if (ctx.result_types.len <= results_stack_buf.len) null else (allocator.alloc(InterfaceValue, ctx.result_types.len) catch |err|
+        return trampolineTrap(env, ctx, err, .lift_args));
+    const results: []InterfaceValue = results_heap orelse results_stack_buf[0..ctx.result_types.len];
     defer {
         for (results) |r| r.deinit(allocator);
-        allocator.free(results);
+        if (results_heap) |h| allocator.free(h);
     }
     const call = ctx.host_func.call orelse {
         return trampolineTrap(env, ctx, error.HostFuncNotBound, .host_call);
