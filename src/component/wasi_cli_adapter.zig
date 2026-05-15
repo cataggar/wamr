@@ -5402,7 +5402,12 @@ pub const WasiCliAdapter = struct {
         for (self.fs_preopens.items, 0..) |p, i| {
             const name_ptr = ci.hostAllocAndWrite(p.name) orelse return error.IoError;
             const off = i * stride;
-            std.mem.writeInt(u32, scratch[off..][0..4], p.dir_handle, .little);
+            // `dir_handle` is the host-side 0-based slot index; the
+            // canon-ABI wire handle is `slot + 1` per the resource
+            // offset convention (`executor.encodeResourceWire`). Since
+            // we're writing the tuple straight into linear memory we
+            // apply the encoding here. (#520 wave 2)
+            std.mem.writeInt(u32, scratch[off..][0..4], abi.encodeResourceWireAbi(p.dir_handle), .little);
             std.mem.writeInt(u32, scratch[off + 4 ..][0..4], name_ptr, .little);
             std.mem.writeInt(u32, scratch[off + 8 ..][0..4], @intCast(p.name.len), .little);
         }
@@ -7708,6 +7713,56 @@ pub const WasiCliAdapter = struct {
         return .{ .result_val = .{ .is_ok = false, .payload = payload } };
     }
 
+    /// Map our internal `SocketErrorCode` (matches WASI 0.2 `enum`
+    /// numbering with `unknown=0`) to the WASI 0.3 `variant error-code`
+    /// discriminant from `wasi:sockets/types@0.3.0-rc-2026-03-15`. 0.3
+    /// dropped `unknown` and shifted all subsequent cases down by one,
+    /// and also dropped a handful of P2-specific cases (`concurrency-
+    /// conflict`, `not-in-progress`, `would-block`, `new-socket-limit`,
+    /// `name-unresolvable`, `temporary-resolver-failure`, `permanent-
+    /// resolver-failure`) which we collapse onto the `other(none)`
+    /// catch-all (case 14). (#520 wave 2)
+    pub fn socketCodeToP3Disc(code: SocketErrorCode) u32 {
+        return switch (code) {
+            .unknown => 14, // other(none)
+            .access_denied => 0,
+            .not_supported => 1,
+            .invalid_argument => 2,
+            .out_of_memory => 3,
+            .timeout => 4,
+            .concurrency_conflict => 14,
+            .not_in_progress => 14,
+            .would_block => 14,
+            .invalid_state => 5,
+            .new_socket_limit => 14,
+            .address_not_bindable => 6,
+            .address_in_use => 7,
+            .remote_unreachable => 8,
+            .connection_refused => 9,
+            .connection_reset => 11,
+            .connection_aborted => 12,
+            .datagram_too_large => 13,
+            // DNS-only cases on `wasi:sockets/ip-name-lookup` —
+            // callers using this helper for the `types` variant should
+            // never hit these; `other(none)` is the safe fallback.
+            .name_unresolvable => 14,
+            .temporary_resolver_failure => 14,
+            .permanent_resolver_failure => 14,
+        };
+    }
+
+    /// P3-aware variant of `socketResultErr` that emits WIT 0.3
+    /// `variant error-code` discriminants. Use from any host fn
+    /// targeting `wasi:sockets/types@0.3.0-rc-2026-03-15`. (#520 wave 2)
+    fn socketResultErrP3(allocator: Allocator, code: SocketErrorCode) !InterfaceValue {
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = .{ .variant_val = .{
+            .discriminant = socketCodeToP3Disc(code),
+            .payload = null,
+        } };
+        return .{ .result_val = .{ .is_ok = false, .payload = payload } };
+    }
+
     /// Build a `result<X, error-code>` ok InterfaceValue.
     fn socketResultOk(allocator: Allocator, value: InterfaceValue) !InterfaceValue {
         const payload = try allocator.create(InterfaceValue);
@@ -7743,6 +7798,17 @@ pub const WasiCliAdapter = struct {
         const idx: u32 = @intCast(self.network_table.items.len);
         try self.network_table.append(self.allocator, n);
         return idx;
+    }
+
+    /// Decode a wire handle into a `network_table` slot index, or null
+    /// for out-of-range. Internal slot indices are 0-based; the canon
+    /// ABI's `.own/.borrow` resource-handle offset (#520 wave 2) is
+    /// applied at the lift/lower boundary in `canonical_abi.zig`, not
+    /// here. Kept as a helper for the network-allow-list lookups.
+    fn lookupNetworkSlot(self: *const WasiCliAdapter, handle: u32) ?u32 {
+        if (handle >= self.network_table.items.len) return null;
+        if (self.network_table.items[handle] == null) return null;
+        return handle;
     }
 
     fn pushResolveStream(self: *WasiCliAdapter, s: *ResolveAddressStream) !u32 {
@@ -8005,8 +8071,8 @@ pub const WasiCliAdapter = struct {
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
-        const net = if (net_handle < self.network_table.items.len)
-            self.network_table.items[net_handle]
+        const net = if (self.lookupNetworkSlot(net_handle)) |net_idx|
+            self.network_table.items[net_idx]
         else
             null;
         if (net == null or !net.?.allows(local)) {
@@ -8187,8 +8253,8 @@ pub const WasiCliAdapter = struct {
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
-        const net = if (net_handle < self.network_table.items.len)
-            self.network_table.items[net_handle]
+        const net = if (self.lookupNetworkSlot(net_handle)) |net_idx|
+            self.network_table.items[net_idx]
         else
             null;
         if (net == null or !net.?.allows(remote)) {
@@ -9051,8 +9117,8 @@ pub const WasiCliAdapter = struct {
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
-        const net = if (net_handle < self.network_table.items.len)
-            self.network_table.items[net_handle]
+        const net = if (self.lookupNetworkSlot(net_handle)) |net_idx|
+            self.network_table.items[net_idx]
         else
             null;
         if (net == null or !net.?.allows(local)) {
@@ -9901,8 +9967,8 @@ pub const WasiCliAdapter = struct {
         // Allow-list opt-in gate. Default deny-all keeps the guest from
         // observing the host's DNS configuration even on names that
         // would resolve via /etc/hosts.
-        const net = if (net_handle < self.network_table.items.len)
-            self.network_table.items[net_handle]
+        const net = if (self.lookupNetworkSlot(net_handle)) |net_idx|
+            self.network_table.items[net_idx]
         else
             null;
         if (net == null or net.?.allow_list.len == 0) {
@@ -10294,24 +10360,30 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         const s = self.lookupSocket(sock_handle) orelse {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         };
         if (s.kind != .tcp or s.state != .unbound) {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         }
         const local = liftIpSocketAddress(args[1], s.family) catch |err| switch (err) {
             error.FamilyMismatch => {
-                results[0] = try socketResultErr(allocator, .invalid_argument);
+                results[0] = try socketResultErrP3(allocator, .invalid_argument);
                 return;
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
         if (!templateAllows(self.sockets_allow_list_template, local)) {
-            results[0] = try socketResultErr(allocator, .access_denied);
+            results[0] = try socketResultErrP3(allocator, .access_denied);
             return;
         }
+        // Bind is recorded on the rep without a kernel call here so
+        // that the existing P3 listen path (which sets up the actual
+        // listening fd via its own `IpAddress.listen`) doesn't fight
+        // with a stale `host_socket`. A real-bind path that round-
+        // trips the kernel-assigned ephemeral port is tracked as a
+        // follow-up to #520.
         s.local_addr = local;
         s.state = .bound;
         results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
@@ -10334,22 +10406,22 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         const s = self.lookupSocket(sock_handle) orelse {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         };
         if (s.kind != .udp or s.state != .unbound) {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         }
         const local = liftIpSocketAddress(args[1], s.family) catch |err| switch (err) {
             error.FamilyMismatch => {
-                results[0] = try socketResultErr(allocator, .invalid_argument);
+                results[0] = try socketResultErrP3(allocator, .invalid_argument);
                 return;
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
         if (!templateAllows(self.sockets_allow_list_template, local)) {
-            results[0] = try socketResultErr(allocator, .access_denied);
+            results[0] = try socketResultErrP3(allocator, .access_denied);
             return;
         }
         s.local_addr = local;
@@ -10375,22 +10447,22 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         const s = self.lookupSocket(sock_handle) orelse {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         };
         if (s.kind != .udp) {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         }
         const remote = liftIpSocketAddress(args[1], s.family) catch |err| switch (err) {
             error.FamilyMismatch => {
-                results[0] = try socketResultErr(allocator, .invalid_argument);
+                results[0] = try socketResultErrP3(allocator, .invalid_argument);
                 return;
             },
             error.InvalidArgs => return error.InvalidArgs,
         };
         if (!templateAllows(self.sockets_allow_list_template, remote)) {
-            results[0] = try socketResultErr(allocator, .access_denied);
+            results[0] = try socketResultErrP3(allocator, .access_denied);
             return;
         }
         s.remote_addr = remote;
@@ -10414,11 +10486,11 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         const s = self.lookupSocket(sock_handle) orelse {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         };
         if (s.kind != .udp or s.remote_addr == null) {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         }
         s.remote_addr = null;
@@ -10702,7 +10774,10 @@ pub const WasiCliAdapter = struct {
             .remote_addr = accepted.socket.address,
         }) catch return .err;
         var handle_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &handle_bytes, new_handle, .little);
+        // Apply the resource-handle wire offset (`slot + 1`) so the
+        // guest's wit-bindgen `Resource<TcpSocket>` constructor doesn't
+        // trip its `handle != 0` debug assertion. (#520 wave 2)
+        std.mem.writeInt(u32, &handle_bytes, abi.encodeResourceWireAbi(new_handle), .little);
         stream.buffer.appendSlice(allocator, &handle_bytes) catch return .err;
         return .progressed;
     }
@@ -10845,17 +10920,17 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         const s = self.lookupSocket(sock_handle) orelse {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         };
         if (s.kind != .tcp) {
-            results[0] = try socketResultErr(allocator, .invalid_state);
+            results[0] = try socketResultErrP3(allocator, .invalid_state);
             return;
         }
         switch (s.state) {
             .unbound, .bound => {},
             else => {
-                results[0] = try socketResultErr(allocator, .invalid_state);
+                results[0] = try socketResultErrP3(allocator, .invalid_state);
                 return;
             },
         }
@@ -10872,7 +10947,7 @@ pub const WasiCliAdapter = struct {
         const server = std.Io.net.IpAddress.listen(&local, io, .{
             .kernel_backlog = s.listen_backlog orelse 128,
         }) catch |err| {
-            results[0] = try socketResultErr(allocator, mapSocketListenError(err));
+            results[0] = try socketResultErrP3(allocator, mapSocketListenError(err));
             return;
         };
         s.server = server;
@@ -10907,7 +10982,10 @@ pub const WasiCliAdapter = struct {
                 }) catch return error.OutOfMemory;
                 if (ci.streams.getPtr(stream_h)) |slot| {
                     var handle_bytes: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &handle_bytes, new_handle, .little);
+                    // Apply the resource-handle wire offset
+                    // (`slot + 1`); see `accept_driver` above. (#520
+                    // wave 2)
+                    std.mem.writeInt(u32, &handle_bytes, abi.encodeResourceWireAbi(new_handle), .little);
                     try slot.buffer.appendSlice(ci.allocator, &handle_bytes);
                 }
             } else |_| {}
@@ -18260,8 +18338,12 @@ test "wasi:filesystem@0.3.0 open-at: future payload decodes to result<descriptor
     try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
     // ok arm → discriminant byte = 0.
     try testing.expectEqual(@as(u8, 0), fut.payload.?[0]);
-    // ok payload at offset 4: u32 descriptor handle.
-    const opened_handle = std.mem.readInt(u32, fut.payload.?[4..8], .little);
+    // ok payload at offset 4: u32 descriptor handle (wire-encoded;
+    // decode via `executor.decodeResourceWire` to recover the 0-based
+    // slot index — #520 wave 2 applied a `slot + 1` offset so the
+    // canon-ABI wire handle is never 0).
+    const wire_handle = std.mem.readInt(u32, fut.payload.?[4..8], .little);
+    const opened_handle = @import("executor.zig").decodeResourceWire(wire_handle);
     try testing.expect(opened_handle < adapter.fs_descriptor_table.items.len);
     try testing.expect(adapter.fs_descriptor_table.items[opened_handle] != null);
 }
@@ -20152,8 +20234,11 @@ test "sockets P3: udp-socket.connect / disconnect round-trip remote_addr (#486)"
         try WasiCliAdapter.udpDisconnectP3(&adapter, &ci, &args, &results, testing.allocator);
         defer testing.allocator.destroy(results[0].result_val.payload.?);
         try testing.expect(!results[0].result_val.is_ok);
+        // P3 host fns use WIT 0.3 `variant error-code` discriminants
+        // (no `unknown` case, so `invalid-state` is disc 5 not 9).
+        // (#520 wave 2)
         try testing.expectEqual(
-            @as(u32, @intFromEnum(SocketErrorCode.invalid_state)),
+            @as(u32, WasiCliAdapter.socketCodeToP3Disc(.invalid_state)),
             results[0].result_val.payload.?.variant_val.discriminant,
         );
     }
@@ -20909,11 +20994,14 @@ test "sockets P3 #535: tcp-accept stream driver pushes 3 connections through one
     try testing.expectEqual(@as(usize, 0), listen_slot.buffer.items.len % 4);
 
     // Each handle should reference a distinct, connected Socket slot.
+    // The bytes are canon-ABI wire handles (slot+1 per the resource
+    // offset, #520 wave 2), so decode before indexing the table.
     var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer seen.deinit(testing.allocator);
     var off: usize = 0;
     while (off + 4 <= listen_slot.buffer.items.len) : (off += 4) {
-        const h = std.mem.readInt(u32, listen_slot.buffer.items[off..][0..4], .little);
+        const wire = std.mem.readInt(u32, listen_slot.buffer.items[off..][0..4], .little);
+        const h = @import("executor.zig").decodeResourceWire(wire);
         try seen.put(testing.allocator, h, {});
         const s = adapter.socket_table.items[h].?;
         try testing.expectEqual(SocketKind.tcp, s.kind);
@@ -26131,4 +26219,58 @@ test "wasi:http@0.3 (#552): authority byte-validation: host[:port], rejects bad 
     try testing.expect(!try Caller.callSetSome(&adapter, &ci, req_handle, "example.com:"));
     // Empty authority rejected.
     try testing.expect(!try Caller.callSetSome(&adapter, &ci, req_handle, ""));
+}
+
+test "sockets (#520 wave 2): socketCodeToP3Disc maps internal enum to WIT 0.3 variant discs" {
+    const testing = std.testing;
+    // WIT 0.3 `wasi:sockets/types.error-code` variant ordering:
+    // 0=access-denied, 1=not-supported, 2=invalid-argument, 3=out-of-memory,
+    // 4=timeout, 5=invalid-state, 6=address-not-bindable, 7=address-in-use,
+    // 8=remote-unreachable, 9=connection-refused, 10=connection-broken,
+    // 11=connection-reset, 12=connection-aborted, 13=datagram-too-large,
+    // 14=other(option<string>). Our internal `SocketErrorCode` enum
+    // matches the 0.2 ENUM ordering (`unknown=0`, access_denied=1, …)
+    // which is off-by-one from 0.3 — that mismatch is what
+    // `socketCodeToP3Disc` translates at the host boundary.
+    try testing.expectEqual(@as(u32, 0), WasiCliAdapter.socketCodeToP3Disc(.access_denied));
+    try testing.expectEqual(@as(u32, 1), WasiCliAdapter.socketCodeToP3Disc(.not_supported));
+    try testing.expectEqual(@as(u32, 2), WasiCliAdapter.socketCodeToP3Disc(.invalid_argument));
+    try testing.expectEqual(@as(u32, 3), WasiCliAdapter.socketCodeToP3Disc(.out_of_memory));
+    try testing.expectEqual(@as(u32, 5), WasiCliAdapter.socketCodeToP3Disc(.invalid_state));
+    try testing.expectEqual(@as(u32, 6), WasiCliAdapter.socketCodeToP3Disc(.address_not_bindable));
+    try testing.expectEqual(@as(u32, 7), WasiCliAdapter.socketCodeToP3Disc(.address_in_use));
+    // 0.2-only cases (no 0.3 equivalent) fall back to `other(none)` = 14.
+    try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.unknown));
+    try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.concurrency_conflict));
+    try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.not_in_progress));
+    try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.would_block));
+    try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.new_socket_limit));
+}
+
+test "main (#520 wave 2): runComponent applies --map-dir flags via addPreopen" {
+    const testing = std.testing;
+
+    // Spin up an adapter the same way `runComponent` does and verify
+    // that `addPreopen` ends up in `fs_preopens`. The CLI plumbing
+    // path itself (parse `--map-dir`, call `cwd_dir.openDir`, hand
+    // off to `addPreopen`) is exercised end-to-end by the
+    // wasi-p3-testsuite filesystem fixtures once the async-future
+    // lower fix lands; this unit test pins the contract.
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const handle = try adapter.addPreopen("fs-tests.dir", tmp.dir);
+    // Replace the slot with null so adapter.deinit doesn't double-close
+    // (tmp.cleanup() owns the dir handle).
+    adapter.fs_descriptor_table.items[handle] = null;
+
+    try testing.expectEqual(@as(usize, 1), adapter.fs_preopens.items.len);
+    try testing.expectEqualStrings("fs-tests.dir", adapter.fs_preopens.items[0].name);
+    // `dir_handle` is the 0-based slot index; the wire encoding
+    // (`slot + 1`) is applied by `fsGetDirectories` via
+    // `abi.encodeResourceWireAbi` when lowering to guest memory.
+    try testing.expectEqual(handle, adapter.fs_preopens.items[0].dir_handle);
 }

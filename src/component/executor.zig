@@ -27,6 +27,27 @@ const TypeRegistry = abi.TypeRegistry;
 pub const MAX_FLAT_PARAMS: u32 = 16;
 pub const MAX_FLAT_RESULTS: u32 = 1;
 
+/// Encode a host-side resource representation (slot index from
+/// `pushSocket` / `pushFsDescriptor` / `pushNetwork` / 0-based) into a
+/// canon-ABI wire handle. Wit-bindgen Rust's `Resource<T>` constructor
+/// asserts `handle != 0 && handle != u32::MAX`, so the wire value
+/// must be non-zero. We adopt the convention `wire = rep + 1`. Reps
+/// of `u32::MAX` are guarded (they would overflow); upper-layer code
+/// should never produce that. (#520 wave 2)
+pub fn encodeResourceWire(rep: u32) u32 {
+    if (rep == std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return rep +% 1;
+}
+
+/// Decode a canon-ABI wire handle back into a host-side representation
+/// (0-based slot index). Wire `0` decodes to `0` (the host's
+/// `lookupSocket(0)` etc. would return null for an out-of-range
+/// slot anyway, so the round-trip is safe). (#520 wave 2)
+pub fn decodeResourceWire(wire: u32) u32 {
+    if (wire == 0) return 0;
+    return wire -% 1;
+}
+
 // ── Error types ─────────────────────────────────────────────────────────────
 
 pub const ExecutionError = error{
@@ -413,7 +434,31 @@ pub fn callComponentFuncByLocalAsyncLifted(
     // Drive the core body. It is the callee's responsibility to invoke
     // `canon task.return` before returning — which deposits the lifted
     // results onto the task via `dispatchCanonBuiltin`.
+    //
+    // On trap, surface diagnostic info from `env.host_trap` so the
+    // failure mode is visible to the operator. Mirrors the sync-call
+    // path in `callComponentFunc` (added in #520 wave 1 / PR #532).
+    // The `WasiExit` case is normal control flow (the exit code is
+    // already stashed on `WasiCliAdapter.exit_code`) and is suppressed
+    // to avoid spurious diagnostics on a successful `wasi:cli/exit`.
     interp.executeFunction(env, exported.core_func_idx) catch {
+        if (env.host_trap) |ht| {
+            const is_wasi_exit = std.mem.eql(u8, ht.err_name, "WasiExit");
+            if (!is_wasi_exit) {
+                std.debug.print("[async-lifted trap] core_func_idx={d}", .{ht.core_func_idx});
+                if (ht.component_func_idx != std.math.maxInt(u32))
+                    std.debug.print(" component_func_idx={d}", .{ht.component_func_idx});
+                if (ht.import_module_name.len > 0 or ht.import_field_name.len > 0)
+                    std.debug.print(
+                        " import='{s}.{s}'",
+                        .{ ht.import_module_name, ht.import_field_name },
+                    );
+                std.debug.print(
+                    " stage={s} error={s}\n",
+                    .{ @tagName(ht.stage), ht.err_name },
+                );
+            }
+        }
         return error.TrapInCoreFunction;
     };
 
@@ -512,7 +557,8 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
         .u64 => try env.pushI64(@bitCast(val.u64)),
         .f32 => try env.push(.{ .f32 = @bitCast(val.f32) }),
         .f64 => try env.push(.{ .f64 = @bitCast(val.f64) }),
-        .own, .borrow, .future, .stream, .error_context => try env.pushI32(@bitCast(val.handle)),
+        .own, .borrow => try env.pushI32(@bitCast(encodeResourceWire(val.handle))),
+        .future, .stream, .error_context => try env.pushI32(@bitCast(val.handle)),
         .string => {
             try env.pushI32(@bitCast(val.string.ptr));
             try env.pushI32(@bitCast(val.string.len));
@@ -549,8 +595,22 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
                 try env.pushI32(0);
             }
         },
+        // Compound types — lower into a scratch buffer via
+        // `lowerFlatReg`, then push the flat i32 slots onto the stack
+        // in canonical order. The variant / record / tuple / flags /
+        // enum_ / option shapes show up in sockets/filesystem fixture
+        // results (e.g. a host that returns `result<_, error-code>`
+        // with an `error-code` variant payload). (#520 wave 2)
         .record, .variant, .tuple, .flags, .enum_, .option => {
-            return error.CompoundNeedsRegistry;
+            const total_slots = abi.flattenCount(registry, t);
+            var slot_buf: [32]u32 = undefined;
+            if (total_slots > slot_buf.len) return error.CompoundNeedsRegistry;
+            const written = try lowerFlatReg(slot_buf[0..total_slots], val, t, registry);
+            // Pad any unused tail with zero (variant / option / result
+            // join behaviour: shorter arms zero-fill the remaining
+            // slots so the join's flat width is constant).
+            for (written..total_slots) |k| slot_buf[k] = 0;
+            for (slot_buf[0..total_slots]) |s| try env.pushI32(@bitCast(s));
         },
         // Resolve `.type_idx` through the registry and re-dispatch on
         // the reified ValType. The registry may have been extended with
@@ -573,6 +633,198 @@ fn pushInterfaceValue(env: *ExecEnv, val: InterfaceValue, t: ctypes.ValType, reg
                 else => return error.CompoundNeedsRegistry,
             };
             try pushInterfaceValue(env, val, reified, registry);
+        },
+    }
+}
+
+/// Lower a single value into a flat slot buffer (canonical order),
+/// returning the number of slots written. The buffer must be at least
+/// `flattenCount(registry, t)` slots long; the caller zero-pads any
+/// remaining tail (variant/option/result join behaviour). (#520 wave 2)
+fn lowerFlatReg(
+    out: []u32,
+    val: InterfaceValue,
+    t: ctypes.ValType,
+    registry: TypeRegistry,
+) error{ CompoundNeedsRegistry, InvalidTypeIndex, InvalidValue, BufferTooSmall }!u32 {
+    if (out.len == 0) return error.BufferTooSmall;
+    switch (t) {
+        .bool => {
+            out[0] = if (val.bool) 1 else 0;
+            return 1;
+        },
+        .s8 => {
+            out[0] = @as(u32, @intCast(@as(u8, @bitCast(val.s8))));
+            return 1;
+        },
+        .u8 => {
+            out[0] = val.u8;
+            return 1;
+        },
+        .s16 => {
+            out[0] = @as(u32, @intCast(@as(u16, @bitCast(val.s16))));
+            return 1;
+        },
+        .u16 => {
+            out[0] = val.u16;
+            return 1;
+        },
+        .s32 => {
+            out[0] = @bitCast(val.s32);
+            return 1;
+        },
+        .u32, .char => {
+            out[0] = val.u32;
+            return 1;
+        },
+        .s64 => {
+            if (out.len < 2) return error.BufferTooSmall;
+            const bits: u64 = @bitCast(val.s64);
+            out[0] = @truncate(bits);
+            out[1] = @truncate(bits >> 32);
+            return 2;
+        },
+        .u64 => {
+            if (out.len < 2) return error.BufferTooSmall;
+            out[0] = @truncate(val.u64);
+            out[1] = @truncate(val.u64 >> 32);
+            return 2;
+        },
+        .f32 => {
+            out[0] = val.f32;
+            return 1;
+        },
+        .f64 => {
+            if (out.len < 2) return error.BufferTooSmall;
+            out[0] = @truncate(val.f64);
+            out[1] = @truncate(val.f64 >> 32);
+            return 2;
+        },
+        .own, .borrow => {
+            out[0] = encodeResourceWire(val.handle);
+            return 1;
+        },
+        .future, .stream, .error_context => {
+            out[0] = val.handle;
+            return 1;
+        },
+        .string => {
+            if (out.len < 2) return error.BufferTooSmall;
+            out[0] = val.string.ptr;
+            out[1] = val.string.len;
+            return 2;
+        },
+        .list => {
+            if (out.len < 2) return error.BufferTooSmall;
+            out[0] = val.list.ptr;
+            out[1] = val.list.len;
+            return 2;
+        },
+        .enum_ => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .enum_) return error.InvalidTypeIndex;
+            out[0] = val.enum_val;
+            return 1;
+        },
+        .flags => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .flags) return error.InvalidTypeIndex;
+            const n_words: u32 = @intCast(@max(@as(usize, 1), (td.flags.names.len + 31) / 32));
+            if (out.len < n_words) return error.BufferTooSmall;
+            const words = val.flags_val;
+            for (0..n_words) |k| out[k] = if (k < words.len) words[k] else 0;
+            return n_words;
+        },
+        .record => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .record) return error.InvalidTypeIndex;
+            const fields_meta = td.record.fields;
+            const fields_val = val.record_val;
+            if (fields_val.len != fields_meta.len) return error.InvalidValue;
+            var off: u32 = 0;
+            for (fields_meta, 0..) |f, i| {
+                const ft = resolveArmType(f.type, registry);
+                const w = try lowerFlatReg(out[off..], fields_val[i], ft, registry);
+                off += w;
+            }
+            return off;
+        },
+        .tuple => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .tuple) return error.InvalidTypeIndex;
+            const fields_meta = td.tuple.fields;
+            const fields_val = val.tuple_val;
+            if (fields_val.len != fields_meta.len) return error.InvalidValue;
+            var off: u32 = 0;
+            for (fields_meta, 0..) |f, i| {
+                const ft = resolveArmType(f, registry);
+                const w = try lowerFlatReg(out[off..], fields_val[i], ft, registry);
+                off += w;
+            }
+            return off;
+        },
+        .variant => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .variant) return error.InvalidTypeIndex;
+            const cases = td.variant.cases;
+            const v = val.variant_val;
+            if (v.discriminant >= cases.len) return error.InvalidValue;
+            out[0] = v.discriminant;
+            var off: u32 = 1;
+            if (cases[v.discriminant].type) |ct| {
+                if (v.payload) |p| {
+                    const resolved = resolveArmType(ct, registry);
+                    off += try lowerFlatReg(out[off..], p.*, resolved, registry);
+                }
+            }
+            // Caller zero-pads tail to total flat width.
+            return off;
+        },
+        .option => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .option) return error.InvalidTypeIndex;
+            const o = val.option_val;
+            out[0] = if (o.is_some) 1 else 0;
+            var off: u32 = 1;
+            if (o.is_some) {
+                if (o.payload) |p| {
+                    const inner = resolveArmType(td.option.inner, registry);
+                    off += try lowerFlatReg(out[off..], p.*, inner, registry);
+                }
+            }
+            return off;
+        },
+        .result => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .result) return error.InvalidTypeIndex;
+            const r = val.result_val;
+            out[0] = if (r.is_ok) 0 else 1;
+            var off: u32 = 1;
+            const arm_type: ?ctypes.ValType = if (r.is_ok) td.result.ok else td.result.err;
+            if (arm_type) |at| {
+                if (r.payload) |p| {
+                    const resolved = resolveArmType(at, registry);
+                    off += try lowerFlatReg(out[off..], p.*, resolved, registry);
+                }
+            }
+            return off;
+        },
+        .type_idx => |idx| {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |inner| inner,
+                .list => .{ .list = idx },
+                .record => .{ .record = idx },
+                .tuple => .{ .tuple = idx },
+                .variant => .{ .variant = idx },
+                .flags => .{ .flags = idx },
+                .enum_ => .{ .enum_ = idx },
+                .option => .{ .option = idx },
+                .result => .{ .result = idx },
+                .resource => .{ .own = idx },
+                else => return error.InvalidTypeIndex,
+            };
+            return try lowerFlatReg(out, val, reified, registry);
         },
     }
 }
@@ -621,7 +873,8 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
                 else => 0,
             } };
         },
-        .own, .borrow, .future, .stream, .error_context => .{ .handle = @bitCast(try env.popI32()) },
+        .own, .borrow => .{ .handle = decodeResourceWire(@bitCast(try env.popI32())) },
+        .future, .stream, .error_context => .{ .handle = @bitCast(try env.popI32()) },
         .string => .{ .string = .{
             .len = @bitCast(try env.popI32()),
             .ptr = @bitCast(try env.popI32()),
@@ -722,21 +975,17 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
             }
             break :blk .{ .option_val = .{ .is_some = is_some, .payload = payload } };
         },
-        .record, .tuple, .flags => error.CompoundNeedsRegistry,
-        // Top-level `variant` / `enum`: pop the flat slots into a
-        // scratch buffer, then re-lift through the registry-aware
-        // path so compound case payloads (e.g. `Method::Other(string)`,
-        // `Scheme::Other(string)`) keep their bytes (#552).
-        .variant, .enum_ => blk: {
+        // Compound types — pop all flat slots into a scratch buffer
+        // (canonical order: slot[0]..slot[N-1]) and recursively lift
+        // through the registry. The variant / record / tuple / flags /
+        // enum_ shapes all show up in sockets and filesystem fixture
+        // arguments (e.g. `ip-socket-address` is a variant of records
+        // of u16+tuple). Supersedes the variant-only path landed in
+        // PR #559 (#552). (#520 wave 2)
+        .record, .variant, .tuple, .flags, .enum_ => |idx| blk: {
+            _ = idx;
             const total_slots = abi.flattenCount(registry, t);
-            var slot_buf: [16]u32 = undefined;
-            if (total_slots > slot_buf.len) return error.CompoundNeedsRegistry;
-            var i: u32 = total_slots;
-            while (i > 0) {
-                i -= 1;
-                slot_buf[i] = @bitCast(try env.popI32());
-            }
-            break :blk try abi.liftFlatReg(slot_buf[0..total_slots], t, registry, allocator);
+            break :blk try popFlatCompound(env, t, total_slots, registry, allocator);
         },
         // Mirror `pushInterfaceValue`: resolve `.type_idx` and re-pop on
         // the reified ValType.
@@ -756,6 +1005,218 @@ fn popInterfaceValue(env: *ExecEnv, t: ctypes.ValType, registry: TypeRegistry, a
                 else => return error.CompoundNeedsRegistry,
             };
             break :blk try popInterfaceValue(env, reified, registry, allocator);
+        },
+    };
+}
+
+/// Pop `total_slots` flat i32 core values off the stack (top-of-stack is
+/// the last-pushed = highest-index slot) into a scratch buffer in
+/// canonical order (`slot[0]..slot[N-1]`), then lift the compound value
+/// from the buffer via `liftFlatReg`. Used by `popInterfaceValue` for
+/// `record` / `variant` / `tuple` / `flags` / `enum_` types whose flat
+/// layout is determined by walking the type registry.
+///
+/// The `total_slots <= 32` cap matches the canon ABI's MAX_FLAT_PARAMS
+/// (16) doubled to accommodate a return-result tuple of equal size; any
+/// compound exceeding this would have spilled to memory anyway, in
+/// which case the `loadInterfaceValue` (memory-spill) path is used
+/// instead. (#520 wave 2)
+fn popFlatCompound(
+    env: *ExecEnv,
+    t: ctypes.ValType,
+    total_slots: u32,
+    registry: TypeRegistry,
+    allocator: Allocator,
+) !InterfaceValue {
+    var slot_buf: [32]u32 = undefined;
+    if (total_slots > slot_buf.len) return error.CompoundNeedsRegistry;
+    var i: u32 = total_slots;
+    while (i > 0) {
+        i -= 1;
+        slot_buf[i] = @bitCast(try env.popI32());
+    }
+    const lifted = try liftFlatReg(slot_buf[0..total_slots], t, registry, allocator);
+    return lifted.val;
+}
+
+/// Lift a single value from a flat slot buffer (canonical order). Returns
+/// the lifted `InterfaceValue` and the number of slots consumed. Handles
+/// every shape the canon-lower trampoline can encounter at the import
+/// boundary: primitives, handles, string/list ptr+len pairs, and the
+/// registry-bound compounds (record/variant/tuple/flags/enum_/option/
+/// result/type_idx). Slots are treated as i32 (canon ABI flat repr for
+/// the i32-only-join case used by sockets / filesystem fixtures); i64
+/// joins read consecutive low+high u32 slots. (#520 wave 2)
+fn liftFlatReg(
+    slots: []const u32,
+    t: ctypes.ValType,
+    registry: TypeRegistry,
+    allocator: Allocator,
+) error{ OutOfMemory, InvalidDiscriminant, InvalidTypeIndex, EmptySlots, CompoundNeedsRegistry }!struct { val: InterfaceValue, used: u32 } {
+    if (slots.len == 0) return error.EmptySlots;
+    return switch (t) {
+        .bool => .{ .val = .{ .bool = slots[0] != 0 }, .used = 1 },
+        .s8 => .{ .val = .{ .s8 = @bitCast(@as(u8, @truncate(slots[0]))) }, .used = 1 },
+        .u8 => .{ .val = .{ .u8 = @truncate(slots[0]) }, .used = 1 },
+        .s16 => .{ .val = .{ .s16 = @bitCast(@as(u16, @truncate(slots[0]))) }, .used = 1 },
+        .u16 => .{ .val = .{ .u16 = @truncate(slots[0]) }, .used = 1 },
+        .s32 => .{ .val = .{ .s32 = @bitCast(slots[0]) }, .used = 1 },
+        .u32, .char => .{ .val = .{ .u32 = slots[0] }, .used = 1 },
+        .s64 => blk: {
+            const lo: u64 = slots[0];
+            const hi: u64 = if (slots.len > 1) slots[1] else 0;
+            break :blk .{ .val = .{ .s64 = @bitCast(hi << 32 | lo) }, .used = 2 };
+        },
+        .u64 => blk: {
+            const lo: u64 = slots[0];
+            const hi: u64 = if (slots.len > 1) slots[1] else 0;
+            break :blk .{ .val = .{ .u64 = hi << 32 | lo }, .used = 2 };
+        },
+        .f32 => .{ .val = .{ .f32 = slots[0] }, .used = 1 },
+        .f64 => blk: {
+            const lo: u64 = slots[0];
+            const hi: u64 = if (slots.len > 1) slots[1] else 0;
+            break :blk .{ .val = .{ .f64 = hi << 32 | lo }, .used = 2 };
+        },
+        .own, .borrow => .{ .val = .{ .handle = decodeResourceWire(slots[0]) }, .used = 1 },
+        .future, .stream, .error_context => .{ .val = .{ .handle = slots[0] }, .used = 1 },
+        .string => .{ .val = .{ .string = .{ .ptr = slots[0], .len = if (slots.len > 1) slots[1] else 0 } }, .used = 2 },
+        .list => .{ .val = .{ .list = .{ .ptr = slots[0], .len = if (slots.len > 1) slots[1] else 0 } }, .used = 2 },
+        .enum_ => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .enum_) return error.InvalidTypeIndex;
+            const disc = slots[0];
+            if (disc >= td.enum_.names.len) return error.InvalidDiscriminant;
+            break :blk .{ .val = .{ .enum_val = disc }, .used = 1 };
+        },
+        .flags => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .flags) return error.InvalidTypeIndex;
+            const n_words: u32 = @intCast(@max(@as(usize, 1), (td.flags.names.len + 31) / 32));
+            if (slots.len < n_words) return error.EmptySlots;
+            const words = try allocator.alloc(u32, n_words);
+            for (0..n_words) |k| words[k] = slots[k];
+            break :blk .{ .val = .{ .flags_val = words }, .used = n_words };
+        },
+        .record => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .record) return error.InvalidTypeIndex;
+            const fields = td.record.fields;
+            const vals = try allocator.alloc(InterfaceValue, fields.len);
+            errdefer {
+                for (vals) |v| v.deinit(allocator);
+                allocator.free(vals);
+            }
+            var used: u32 = 0;
+            for (fields, 0..) |f, i| {
+                const ft = resolveArmType(f.type, registry);
+                const r = try liftFlatReg(slots[used..], ft, registry, allocator);
+                vals[i] = r.val;
+                used += r.used;
+            }
+            break :blk .{ .val = .{ .record_val = vals }, .used = used };
+        },
+        .tuple => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .tuple) return error.InvalidTypeIndex;
+            const fields = td.tuple.fields;
+            const vals = try allocator.alloc(InterfaceValue, fields.len);
+            errdefer {
+                for (vals) |v| v.deinit(allocator);
+                allocator.free(vals);
+            }
+            var used: u32 = 0;
+            for (fields, 0..) |f, i| {
+                const ft = resolveArmType(f, registry);
+                const r = try liftFlatReg(slots[used..], ft, registry, allocator);
+                vals[i] = r.val;
+                used += r.used;
+            }
+            break :blk .{ .val = .{ .tuple_val = vals }, .used = used };
+        },
+        .variant => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .variant) return error.InvalidTypeIndex;
+            const cases = td.variant.cases;
+            const disc = slots[0];
+            if (disc >= cases.len) return error.InvalidDiscriminant;
+            // Discriminant + max-of-payload-flatten-counts (i32-only join).
+            const total_payload = abi.flattenCount(registry, t) - 1;
+            var payload: ?*InterfaceValue = null;
+            if (cases[disc].type) |ct| {
+                const resolved = resolveArmType(ct, registry);
+                const arm_slots = abi.flattenCount(registry, resolved);
+                if (1 + arm_slots > slots.len) return error.EmptySlots;
+                const r = try liftFlatReg(slots[1 .. 1 + arm_slots], resolved, registry, allocator);
+                const p = try allocator.create(InterfaceValue);
+                p.* = r.val;
+                payload = p;
+            }
+            break :blk .{
+                .val = .{ .variant_val = .{ .discriminant = disc, .payload = payload } },
+                .used = 1 + total_payload,
+            };
+        },
+        .option => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .option) return error.InvalidTypeIndex;
+            const disc = slots[0];
+            if (disc > 1) return error.InvalidDiscriminant;
+            const total_payload = abi.flattenCount(registry, t) - 1;
+            if (disc == 0) {
+                break :blk .{
+                    .val = .{ .option_val = .{ .is_some = false, .payload = null } },
+                    .used = 1 + total_payload,
+                };
+            }
+            const inner = resolveArmType(td.option.inner, registry);
+            const r = try liftFlatReg(slots[1..], inner, registry, allocator);
+            const p = try allocator.create(InterfaceValue);
+            p.* = r.val;
+            break :blk .{
+                .val = .{ .option_val = .{ .is_some = true, .payload = p } },
+                .used = 1 + total_payload,
+            };
+        },
+        .result => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            if (td != .result) return error.InvalidTypeIndex;
+            const disc = slots[0];
+            if (disc > 1) return error.InvalidDiscriminant;
+            const is_ok = disc == 0;
+            const arm_type: ?ctypes.ValType = if (is_ok) td.result.ok else td.result.err;
+            const total_payload = abi.flattenCount(registry, t) - 1;
+            var payload: ?*InterfaceValue = null;
+            if (arm_type) |at| {
+                const resolved = resolveArmType(at, registry);
+                const arm_slots = abi.flattenCount(registry, resolved);
+                if (1 + arm_slots > slots.len) return error.EmptySlots;
+                const r = try liftFlatReg(slots[1 .. 1 + arm_slots], resolved, registry, allocator);
+                const p = try allocator.create(InterfaceValue);
+                p.* = r.val;
+                payload = p;
+            }
+            break :blk .{
+                .val = .{ .result_val = .{ .is_ok = is_ok, .payload = payload } },
+                .used = 1 + total_payload,
+            };
+        },
+        .type_idx => |idx| blk: {
+            const td = registry.get(idx) orelse return error.InvalidTypeIndex;
+            const reified: ctypes.ValType = switch (td) {
+                .val => |inner| inner,
+                .list => .{ .list = idx },
+                .record => .{ .record = idx },
+                .tuple => .{ .tuple = idx },
+                .variant => .{ .variant = idx },
+                .flags => .{ .flags = idx },
+                .enum_ => .{ .enum_ = idx },
+                .option => .{ .option = idx },
+                .result => .{ .result = idx },
+                .resource => .{ .own = idx },
+                else => return error.InvalidTypeIndex,
+            };
+            break :blk try liftFlatReg(slots, reified, registry, allocator);
         },
     };
 }
@@ -5093,4 +5554,80 @@ test "pushInterfaceValue/popInterfaceValue: result<_, primitive> roundtrip (#155
     const disc_slot = try env.popI32();
     try testing.expectEqual(@as(u32, 0xCAFE), payload_slot);
     try testing.expectEqual(@as(i32, 1), disc_slot);
+}
+
+test "popInterfaceValue: lift variant<record<u16, tuple<u8x4>>> from flat stack (#520 wave 2)" {
+    // Mirrors the wasi:sockets@0.3.0 `ip-socket-address` ipv4 arm shape
+    // sent by wit-bindgen when the guest calls `tcp-socket.bind`.
+    // Before wave-2 #520, `popInterfaceValue` returned
+    // `error.CompoundNeedsRegistry` for `.variant` / `.record` /
+    // `.tuple`, blocking the entire sockets fixture bucket at the
+    // canon-lower trampoline boundary.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    const tup_fields = [_]ctypes.ValType{ .u8, .u8, .u8, .u8 };
+    const rec_fields = [_]ctypes.Field{
+        .{ .name = "port", .type = .u16 },
+        .{ .name = "address", .type = .{ .tuple = 0 } },
+    };
+    const cases = [_]ctypes.Case{
+        .{ .name = "ipv4", .type = .{ .record = 1 }, .refines = null },
+    };
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .tuple = .{ .fields = &tup_fields } }, // 0
+        .{ .record = .{ .fields = &rec_fields } }, // 1
+        .{ .variant = .{ .cases = &cases } }, // 2
+    };
+    var component = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},   .instances = &.{},      .aliases = &.{},
+        .types = &type_defs,  .canons = &.{},
+        .imports = &.{},      .exports = &.{},
+    };
+    const registry = TypeRegistry.init(&component);
+    const t: ctypes.ValType = .{ .variant = 2 };
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    // Flat repr: [disc=0, port=0xBEEF, oct[0]=127, oct[1]=0, oct[2]=0, oct[3]=1].
+    try env.pushI32(0);
+    try env.pushI32(0xBEEF);
+    try env.pushI32(127);
+    try env.pushI32(0);
+    try env.pushI32(0);
+    try env.pushI32(1);
+
+    const lifted = try popInterfaceValue(env, t, registry, testing.allocator);
+    defer lifted.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), lifted.variant_val.discriminant);
+    const rec = lifted.variant_val.payload.?;
+    try testing.expectEqual(@as(u16, 0xBEEF), rec.record_val[0].u16);
+    const oct = rec.record_val[1].tuple_val;
+    try testing.expectEqual(@as(u8, 127), oct[0].u8);
+    try testing.expectEqual(@as(u8, 0), oct[1].u8);
+    try testing.expectEqual(@as(u8, 0), oct[2].u8);
+    try testing.expectEqual(@as(u8, 1), oct[3].u8);
+}
+
+test "encode/decodeResourceWire round-trip (#520 wave 2)" {
+    // Re-export of the canon-ABI helper for use by host code that
+    // bypasses the lift/lower layer (e.g. `fsGetDirectories` writing
+    // descriptor handles straight into linear memory).
+    const testing = std.testing;
+    try testing.expectEqual(@as(u32, 1), encodeResourceWire(0));
+    try testing.expectEqual(@as(u32, 2), encodeResourceWire(1));
+    try testing.expectEqual(@as(u32, 0), decodeResourceWire(1));
+    try testing.expectEqual(@as(u32, 0), decodeResourceWire(0));
+    try testing.expectEqual(@as(u32, 1), decodeResourceWire(2));
+    // Round-trip stability for arbitrary slot indices.
+    for (0..100) |i| {
+        const slot: u32 = @intCast(i);
+        try testing.expectEqual(slot, decodeResourceWire(encodeResourceWire(slot)));
+    }
 }

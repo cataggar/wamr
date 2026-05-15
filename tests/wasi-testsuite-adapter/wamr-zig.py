@@ -68,6 +68,14 @@ def compute_argv(
     for host, guest in dirs:
         argv += ["--map-dir", f"{host}::{guest}"]
 
+    # wasi:sockets fixtures need an explicit allow-list to escape the
+    # adapter's default deny-all posture. Localhost is sufficient for
+    # every wasi-testsuite sockets fixture (they all bind/connect to
+    # 127.0.0.1 / ::1). (#520 wave 2)
+    if "sockets" in proposals:
+        argv += ["--allow-net", "127.0.0.0/8"]
+        argv += ["--allow-net", "::1/128"]
+
     argv += [test_path]
     argv += args
     return argv
