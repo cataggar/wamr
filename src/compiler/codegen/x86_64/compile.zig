@@ -2193,6 +2193,25 @@ fn useVReg(
     vreg: ir.VReg,
     scratch: emit.Reg,
 ) !emit.Reg {
+    // #542: rematerialisable defs are not in `assignments`. Re-emit
+    // the original const into `scratch` instead of loading from a
+    // spill slot. This is the whole reason we DIDN'T spill: if the
+    // value is needed after a call clobbers `scratch`, the next
+    // `useVReg` call after the clobber re-emits again — no reload.
+    if (alloc_result.getRemat(vreg)) |rd| {
+        switch (rd) {
+            .iconst_32 => |v| {
+                if (v == 0) {
+                    try code.xorReg32(scratch);
+                } else {
+                    try code.movRegImm32(scratch, v);
+                    try code.zeroExtend32(scratch);
+                }
+            },
+            .iconst_64 => |v| try code.movRegImm64(scratch, @bitCast(v)),
+        }
+        return scratch;
+    }
     const alloc = alloc_result.get(vreg) orelse return scratch;
     switch (alloc) {
         .reg => |preg| return @as(emit.Reg, @enumFromInt(preg)),
@@ -2347,12 +2366,24 @@ fn emitCallRegArgMoves(
         is_stack: bool,
         stack_offset: i32,
         target: emit.Reg,
+        // #542: when set, the arg has no register/spill home; emit
+        // the constant directly into `target` in Phase 3 (after both
+        // the reg→reg parallel move and the spill-slot loads).
+        remat: ?regalloc.RematDef = null,
     };
     var infos: [6]ArgInfo = undefined;
     var i: u32 = 0;
     while (i < max_reg_args) : (i += 1) {
         const target = param_regs[i + 1];
-        if (alloc_result.get(args[i])) |a| switch (a) {
+        if (alloc_result.getRemat(args[i])) |rd| {
+            infos[i] = .{
+                .source = target,
+                .is_stack = false,
+                .stack_offset = 0,
+                .target = target,
+                .remat = rd,
+            };
+        } else if (alloc_result.get(args[i])) |a| switch (a) {
             .reg => |preg| infos[i] = .{
                 .source = @enumFromInt(preg),
                 .is_stack = false,
@@ -2374,6 +2405,7 @@ fn emitCallRegArgMoves(
     var pending: [6]bool = .{ false, false, false, false, false, false };
     i = 0;
     while (i < max_reg_args) : (i += 1) {
+        if (infos[i].remat != null) continue;
         if (!infos[i].is_stack and infos[i].source != infos[i].target) pending[i] = true;
     }
     while (true) {
@@ -2422,6 +2454,24 @@ fn emitCallRegArgMoves(
         if (infos[i].is_stack) {
             try code.movRegMem(infos[i].target, .rbp, infos[i].stack_offset);
         }
+    }
+
+    // Phase 3 (#542): materialise rematerialisable args. Done last so
+    // the const write doesn't clobber a register that Phase 1 might
+    // still read as a source.
+    i = 0;
+    while (i < max_reg_args) : (i += 1) {
+        if (infos[i].remat) |rd| switch (rd) {
+            .iconst_32 => |v| {
+                if (v == 0) {
+                    try code.xorReg32(infos[i].target);
+                } else {
+                    try code.movRegImm32(infos[i].target, v);
+                    try code.zeroExtend32(infos[i].target);
+                }
+            },
+            .iconst_64 => |v| try code.movRegImm64(infos[i].target, @bitCast(v)),
+        };
     }
 }
 
@@ -2509,6 +2559,9 @@ fn compileInstRA(
             const dest = inst.dest orelse return;
             // #523: skip the mov entirely if every use folds.
             if (suppress_iconst.contains(dest)) return;
+            // #542: rematerialisable — the def emits nothing. Each
+            // use re-emits via `useVReg`.
+            if (alloc_result.isRemat(dest)) return;
             const dr = destReg(alloc_result, dest);
             if (val == 0) {
                 try code.xorReg32(dr);
@@ -2522,6 +2575,8 @@ fn compileInstRA(
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
             if (suppress_iconst.contains(dest)) return;
+            // #542: rematerialisable — see above.
+            if (alloc_result.isRemat(dest)) return;
             const dr = destReg(alloc_result, dest);
             try code.movRegImm64(dr, @bitCast(val));
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
@@ -6207,7 +6262,11 @@ test "compileFunctionRA: caller passes >3 args via stack on Win64" {
 fn makeAllocResult(allocator: std.mem.Allocator, mapping: []const struct { vreg: ir.VReg, reg: regalloc.PhysReg }) !regalloc.AllocResult {
     var map = std.AutoHashMap(ir.VReg, regalloc.Allocation).init(allocator);
     for (mapping) |m| try map.put(m.vreg, .{ .reg = m.reg });
-    return .{ .assignments = map, .spill_count = 0 };
+    return .{
+        .assignments = map,
+        .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, regalloc.RematDef).init(allocator),
+    };
 }
 
 /// Encode `mov dst, src` through the same emitter the production code uses,
