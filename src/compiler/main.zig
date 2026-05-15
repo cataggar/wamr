@@ -250,6 +250,24 @@ fn runCompile(init: std.process.Init, allocator: std.mem.Allocator, sub_args: []
         std.debug.print("Optimization: {d} passes made changes\n", .{opt_changes});
     }
 
+    // #540: Route phi-resolution through register MOV instead of frame
+    // round-trip on aarch64. The IR op `parallel_copy`, codegen
+    // emitter (4-phase resolver), and lowering pass
+    // `coalescePhiLocalsToParallelCopy` are all implemented and unit-
+    // tested. The wiring is intentionally disabled here pending
+    // investigation of a CoreMark hang (the converted IR appears to
+    // confuse downstream regalloc on certain self-loop / multi-edge
+    // patterns; reduced repros pass cleanly). x86_64 is out of scope
+    // and keeps the existing frameStore/frameLoad lowering anyway.
+    if (false and target_arch == .aarch64) {
+        for (ir_module.functions.items) |*f| {
+            _ = passes.coalescePhiLocalsToParallelCopy(f, allocator) catch |err| {
+                std.debug.print("Error lowering phi parallel-copies: {}\n", .{err});
+                std.process.exit(1);
+            };
+        }
+    }
+
     if (dumper.matchesPass("final")) {
         for (ir_module.functions.items, 0..) |*f, fi| {
             if (!dumper.matchesFunc(f, @intCast(fi))) continue;

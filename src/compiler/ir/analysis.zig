@@ -111,6 +111,9 @@ pub fn computeLiveness(
                 const inst = block.instructions.items[inst_idx];
                 // Remove def
                 if (inst.dest) |dest| _ = live.remove(dest);
+                if (inst.op == .parallel_copy) {
+                    for (inst.op.parallel_copy) |p| _ = live.remove(p.dst);
+                }
                 // Add uses
                 addInstUses(&live, inst);
             }
@@ -462,6 +465,9 @@ fn addInstUses(live: *std.AutoHashMap(ir.VReg, void), inst: ir.Inst) void {
         .phi => |edges| {
             for (edges) |edge| live.put(edge.val, {}) catch {};
         },
+        .parallel_copy => |pairs| {
+            for (pairs) |p| live.put(p.src, {}) catch {};
+        },
     }
 }
 
@@ -562,6 +568,14 @@ pub fn computeLiveRangesWithOrder(
                 if (!def_pos.contains(dest)) {
                     try def_pos.put(dest, global_idx);
                     try def_type.put(dest, inst.type);
+                }
+            }
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| {
+                    if (!def_pos.contains(p.dst)) {
+                        try def_pos.put(p.dst, global_idx);
+                        try def_type.put(p.dst, p.ty);
+                    }
                 }
             }
             // Record last use position
@@ -1016,6 +1030,9 @@ fn updateLastUse(last_use: *std.AutoHashMap(ir.VReg, u32), inst: ir.Inst, pos: u
         .elem_drop => {},
         .phi => |edges| {
             for (edges) |edge| last_use.put(edge.val, pos) catch {};
+        },
+        .parallel_copy => |pairs| {
+            for (pairs) |p| last_use.put(p.src, pos) catch {};
         },
     }
 }
