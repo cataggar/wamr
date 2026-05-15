@@ -590,6 +590,13 @@ const FuncCompileCtx = struct {
     /// ADD/SUB imm). The iconst itself is still materialized into its home
     /// register, so downstream uses that don't fold still work.
     const_vals: ?*const std.AutoHashMap(ir.VReg, i64) = null,
+    /// Set of `iconst_*` dest vregs whose every use folds as an immediate
+    /// operand (currently: ADD/SUB imm12). For these vregs the codegen-side
+    /// `mov xN, #K` materialization is suppressed — the physreg is allocated
+    /// (so regalloc bookkeeping stays consistent) but never written. See
+    /// issue #523. The IR-level def stays in place; only the asm emit is
+    /// elided.
+    suppress_iconst_emit: ?*const std.AutoHashMap(ir.VReg, void) = null,
     /// Set of mul dest vregs whose computation should be skipped because
     /// the single consumer is an add/sub that will be emitted as a fused
     /// MADD/MSUB (Phase 4 FMA fusion). When the mul handler sees a dest
@@ -1153,6 +1160,118 @@ pub fn compileFunctionImpl(
     fctx.fma_info = &fma_info;
     fctx.simd_mul_fused = &simd_mul_fused;
     fctx.simd_fma_info = &simd_fma_info;
+
+    // Build iconst-mov suppression set. An `iconst_*` def whose every use
+    // folds as an immediate operand (currently: the imm12 path of ADD/SUB
+    // in `emitBinOp`) doesn't need its `mov xN, #K` materialization at
+    // all — the consuming op encodes the value directly. The IR-level def
+    // stays so regalloc/liveness book-keeping is unchanged; only the asm
+    // emit is suppressed.
+    //
+    // Conservative conjunctive rule (issue #523): if ANY use of an iconst
+    // vreg needs a real register (binop reg/reg fallback, store address
+    // base, call argument, phi, spill, divisor, comparison, …), the mov
+    // stays — otherwise we'd have to re-emit it per use. Mirrors the pick
+    // logic in `emitBinOp` exactly so the suppression decision can never
+    // disagree with the consumer.
+    var iconst_total: std.AutoHashMap(ir.VReg, u32) = .init(allocator);
+    defer iconst_total.deinit();
+    var iconst_foldable: std.AutoHashMap(ir.VReg, u32) = .init(allocator);
+    defer iconst_foldable.deinit();
+    {
+        const Ctx = struct {
+            cv: *const std.AutoHashMap(ir.VReg, i64),
+            tot: *std.AutoHashMap(ir.VReg, u32),
+            fol: *std.AutoHashMap(ir.VReg, u32),
+            fma: *const std.AutoHashMap(ir.VReg, FmaInfo),
+            mul_fused_set: *const std.AutoHashMap(ir.VReg, void),
+
+            fn bumpTotal(self: *@This(), v: ir.VReg) !void {
+                if (!self.cv.contains(v)) return;
+                const e = try self.tot.getOrPut(v);
+                if (!e.found_existing) e.value_ptr.* = 0;
+                e.value_ptr.* += 1;
+            }
+            fn bumpFold(self: *@This(), v: ir.VReg) !void {
+                if (!self.cv.contains(v)) return;
+                const e = try self.fol.getOrPut(v);
+                if (!e.found_existing) e.value_ptr.* = 0;
+                e.value_ptr.* += 1;
+            }
+            fn visitDefault(self: *@This(), v: ir.VReg) !void {
+                try self.bumpTotal(v);
+            }
+        };
+        var cls_ctx: Ctx = .{
+            .cv = &const_vals,
+            .tot = &iconst_total,
+            .fol = &iconst_foldable,
+            .fma = &fma_info,
+            .mul_fused_set = &mul_fused,
+        };
+
+        for (block_order) |bo_bid| {
+            for (scheduled.instructions(bo_bid)) |inst| {
+                // The mul itself is skipped if fused; its operand reads
+                // happen at the MADD site via `useInto`. Either way, the
+                // operands are read into real registers — non-foldable.
+                // For ADD/SUB, mirror emitBinOp's pick: if the FMA path
+                // is taken, neither lhs nor rhs of the add/sub is folded
+                // as an immediate (they take the FMA branch instead).
+                switch (inst.op) {
+                    .add, .sub => |b| {
+                        const dest = inst.dest;
+                        const fma_taken = if (dest) |d| cls_ctx.fma.contains(d) else false;
+                        if (fma_taken or (inst.type != .i32 and inst.type != .i64)) {
+                            try cls_ctx.bumpTotal(b.lhs);
+                            try cls_ctx.bumpTotal(b.rhs);
+                            continue;
+                        }
+                        const is_add = inst.op == .add;
+                        const rhs_const = cls_ctx.cv.get(b.rhs);
+                        const lhs_const = if (is_add) cls_ctx.cv.get(b.lhs) else null;
+                        var pick_rhs = false;
+                        var pick_lhs = false;
+                        if (rhs_const) |v| {
+                            if (encodeAddSubImm(v) != null) pick_rhs = true;
+                        }
+                        if (!pick_rhs) {
+                            if (lhs_const) |v| {
+                                if (encodeAddSubImm(v) != null) pick_lhs = true;
+                            }
+                        }
+                        // Always count totals; only count foldables on
+                        // the picked side.
+                        try cls_ctx.bumpTotal(b.lhs);
+                        try cls_ctx.bumpTotal(b.rhs);
+                        if (pick_lhs) try cls_ctx.bumpFold(b.lhs);
+                        if (pick_rhs) try cls_ctx.bumpFold(b.rhs);
+                    },
+                    else => {
+                        try schedule.forEachUse(inst, &cls_ctx, Ctx.visitDefault);
+                    },
+                }
+            }
+        }
+    }
+
+    var suppress_iconst: std.AutoHashMap(ir.VReg, void) = .init(allocator);
+    defer suppress_iconst.deinit();
+    {
+        var it = const_vals.iterator();
+        while (it.next()) |entry| {
+            const v = entry.key_ptr.*;
+            const total = iconst_total.get(v) orelse 0;
+            const fold = iconst_foldable.get(v) orelse 0;
+            // total > 0 guards against vregs with zero uses (those should
+            // already have been DCE'd by PR #508; if any survive, leaving
+            // the mov is harmless).
+            if (total > 0 and total == fold) {
+                try suppress_iconst.put(v, {});
+            }
+        }
+    }
+    fctx.suppress_iconst_emit = &suppress_iconst;
 
     // Compute live ranges using the SAME block order as code emission.
     const live_ranges = try computeLiveRangesScheduled(func, block_order, &scheduled, allocator);
@@ -2414,12 +2533,29 @@ fn compileInst(
         // ── Constants ────────────────────────────────────────────────
         .iconst_32 => |val| {
             const dest = inst.dest orelse return;
+            if (fctx.suppress_iconst_emit) |s| {
+                if (s.contains(dest)) {
+                    // All uses fold as immediates (#523). Skip the
+                    // `mov xN, #K` materialization but still call
+                    // `assign` so callee-save mask / spill bookkeeping
+                    // stays consistent. The allocated physreg is never
+                    // written; consumers encode the value directly.
+                    _ = try reg_map.assign(dest);
+                    return;
+                }
+            }
             const info = try destBegin(reg_map, dest, RegMap.tmp0);
             try code.movImm32(info.reg, val);
             try destCommit(code, reg_map, info);
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
+            if (fctx.suppress_iconst_emit) |s| {
+                if (s.contains(dest)) {
+                    _ = try reg_map.assign(dest);
+                    return;
+                }
+            }
             const info = try destBegin(reg_map, dest, RegMap.tmp0);
             try code.movImm64(info.reg, @bitCast(val));
             try destCommit(code, reg_map, info);
@@ -8099,6 +8235,132 @@ test "compileFunction: add two constants" {
 
     try std.testing.expect(code.len > 0);
     try std.testing.expect(code.len % 4 == 0);
+}
+
+// Count MOVZ instructions in `code`. MOVZ encoding: 1|10|100101|hw|imm16|Rd
+// → top 9 bits == 110100101 (mask 0xFF800000 against base 0xD2800000).
+fn countMovzImm(code: []const u8) u32 {
+    var i: usize = 0;
+    var n: u32 = 0;
+    while (i + 4 <= code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, code[i..][0..4], .little);
+        if ((w & 0xFF800000) == 0xD2800000) n += 1;
+    }
+    return n;
+}
+
+test "iconst suppress (#523): iconst feeding add-imm12 emits no MOVZ" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 2, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+    const param = func.newVReg();
+    const k = func.newVReg();
+    const sum = func.newVReg();
+    // sum = param + 5 ; ret sum   — `5` fits imm12, all uses fold.
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = param, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 5 }, .dest = k, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = param, .rhs = k } }, .dest = sum, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = sum } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // No MOVZ should appear: prologue+epilogue use STP/LDP/ADD/SUB only,
+    // and the iconst's mov is suppressed (#523).
+    try std.testing.expectEqual(@as(u32, 0), countMovzImm(code));
+}
+
+test "iconst suppress (#523): out-of-imm12 constant keeps its MOVZ" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 2, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+    const param = func.newVReg();
+    const k = func.newVReg();
+    const sum = func.newVReg();
+    // 0x1_0001 doesn't fit imm12 nor imm12<<12 — encodeAddSubImm returns
+    // null, the consumer falls through to reg/reg ADD which reads `k`
+    // as a real register, so the iconst must materialize.
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = param, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0x1_0001 }, .dest = k, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = param, .rhs = k } }, .dest = sum, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = sum } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(countMovzImm(code) >= 1);
+}
+
+test "iconst suppress (#523): one foldable + one non-foldable use keeps MOVZ" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 2, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+    const param = func.newVReg();
+    const k = func.newVReg();
+    const sum = func.newVReg();
+    const eq = func.newVReg();
+    const out = func.newVReg();
+    // `k=7` is folded into ADD-imm12 (foldable use), but also feeds an
+    // EQ comparison which has no immediate-fold path on aarch64 — the
+    // cmp reads `k` as a register. Conjunctive rule keeps the mov.
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = param, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = k, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = param, .rhs = k } }, .dest = sum, .type = .i32 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = sum, .rhs = k } }, .dest = eq, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = sum, .rhs = eq } }, .dest = out, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = out } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    try std.testing.expect(countMovzImm(code) >= 1);
+}
+
+test "iconst suppress (#523): iconst as store base keeps MOVZ" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 1, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+    const val = func.newVReg();
+    const base = func.newVReg();
+    // store i32 value at constant base address. Address goes through
+    // foldLoadStoreOffset but uses the IR `.offset` field (literal),
+    // not a vreg — `base` is read as a register. Not foldable.
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = val, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0 }, .dest = base, .type = .i32 });
+    try block.append(.{ .op = .{ .store = .{ .base = base, .offset = 0, .val = val, .size = 4 } } });
+    try block.append(.{ .op = .{ .ret = null } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+
+    // base=0 is materialized via MOVZ #0; can't be folded into the store
+    // address (the IR `.offset` field handles literal displacements, not
+    // vreg-based ones).
+    try std.testing.expect(countMovzImm(code) >= 1);
 }
 
 test "compileFunction: global_get then global_set round-trips" {

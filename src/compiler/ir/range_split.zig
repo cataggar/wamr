@@ -551,7 +551,7 @@ fn collectUses(inst: ir.Inst, into: *VRegSet, allocator: std.mem.Allocator) !voi
 /// breaches the `src/compiler/ir/` module path under Zig 0.16's strict
 /// per-module file-tree boundary. Stays in sync with that source — any
 /// new op variant must be added in both places.
-fn forEachUseInst(
+pub fn forEachUseInst(
     inst: ir.Inst,
     context: anytype,
     comptime visit: fn (@TypeOf(context), ir.VReg) anyerror!void,

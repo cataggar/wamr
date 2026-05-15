@@ -1486,6 +1486,7 @@ const GlobalCallPatch = struct {
 const regalloc = @import("../../ir/regalloc.zig");
 const analysis = @import("../../ir/analysis.zig");
 const local_init = @import("../../ir/local_init.zig");
+const range_split = @import("../../ir/range_split.zig");
 
 /// x86-64 allocatable GPR set: rdx(2), rsi(6), rdi(7), r8(8), r9(9),
 /// r12(12), r13(13), r14(14). `rbx`(3) is permanently pinned to
@@ -1585,7 +1586,7 @@ fn x86_64_reg_set(local_count: u32) regalloc.RegSet {
     };
 }
 
-fn buildConstVals(func: *const ir.IrFunction, allocator: std.mem.Allocator) !std.AutoHashMap(ir.VReg, i64) {
+pub fn buildConstVals(func: *const ir.IrFunction, allocator: std.mem.Allocator) !std.AutoHashMap(ir.VReg, i64) {
     var const_vals = std.AutoHashMap(ir.VReg, i64).init(allocator);
     errdefer const_vals.deinit();
     for (func.blocks.items) |block| {
@@ -1606,6 +1607,101 @@ fn smallFixedBulkMemLen(const_vals: *const std.AutoHashMap(ir.VReg, i64), len: i
     const val = const_vals.get(len) orelse return null;
     if (val < 0 or val > small_bulk_mem_max_len) return null;
     return @intCast(val);
+}
+
+/// Build the per-function suppression set for `iconst_*` mov elision
+/// (#523). A vreg is in the result iff it is an `iconst_32` / `iconst_64`
+/// def AND every IR use folds as an immediate operand on x86_64.
+///
+/// Foldable uses on x86_64 (mirrors the `const_vals.get(...)` checks in
+/// `compileInstRA`):
+///   - integer `add/sub/mul/and/or/xor` RHS, value in i32 range.
+///   - shift count of `shl/shr_s/shr_u/rotl/rotr` RHS (always fits, the
+///     emitter masks to the wasm-semantic 5/6 bits).
+///   - `len` of `memory_copy` / `memory_fill`, when
+///     `smallFixedBulkMemLen` returns non-null.
+///
+/// Every other read of an iconst vreg (cmp, store address, load base,
+/// call arg, local_set, ret, phi, float arithmetic, etc.) is
+/// non-foldable; under the conjunctive rule a single non-foldable use
+/// suppresses suppression. Spilled vregs aren't a concern here: if all
+/// uses fold, no consumer reads the spill slot either.
+pub fn buildIconstSuppress(
+    func: *const ir.IrFunction,
+    const_vals: *const std.AutoHashMap(ir.VReg, i64),
+    allocator: std.mem.Allocator,
+) !std.AutoHashMap(ir.VReg, void) {
+    var totals = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer totals.deinit();
+    var folds = std.AutoHashMap(ir.VReg, u32).init(allocator);
+    defer folds.deinit();
+
+    const TotalCtx = struct {
+        cv: *const std.AutoHashMap(ir.VReg, i64),
+        tot: *std.AutoHashMap(ir.VReg, u32),
+        fn visit(self: *@This(), v: ir.VReg) !void {
+            if (!self.cv.contains(v)) return;
+            const e = try self.tot.getOrPut(v);
+            if (!e.found_existing) e.value_ptr.* = 0;
+            e.value_ptr.* += 1;
+        }
+    };
+    var tctx: TotalCtx = .{ .cv = const_vals, .tot = &totals };
+
+    const bumpFold = struct {
+        fn f(m: *std.AutoHashMap(ir.VReg, u32), v: ir.VReg) !void {
+            const e = try m.getOrPut(v);
+            if (!e.found_existing) e.value_ptr.* = 0;
+            e.value_ptr.* += 1;
+        }
+    }.f;
+
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            // Total uses: visit every operand. Authoritative single
+            // source of truth — kept in sync with codegen by piggy-
+            // backing on `range_split.forEachUseInst`.
+            try range_split.forEachUseInst(inst, &tctx, TotalCtx.visit);
+
+            // Foldable uses: per-op classifier matching the const_vals
+            // checks in compileInstRA.
+            switch (inst.op) {
+                .add, .sub, .mul, .@"and", .@"or", .xor => |b| {
+                    if (inst.type != .i32 and inst.type != .i64) continue;
+                    if (const_vals.get(b.rhs)) |imm| {
+                        if (imm >= std.math.minInt(i32) and imm <= std.math.maxInt(i32)) {
+                            try bumpFold(&folds, b.rhs);
+                        }
+                    }
+                },
+                .shl, .shr_s, .shr_u, .rotl, .rotr => |b| {
+                    if (const_vals.contains(b.rhs)) try bumpFold(&folds, b.rhs);
+                },
+                .memory_copy => |mc| {
+                    if (smallFixedBulkMemLen(const_vals, mc.len) != null) {
+                        try bumpFold(&folds, mc.len);
+                    }
+                },
+                .memory_fill => |mf| {
+                    if (smallFixedBulkMemLen(const_vals, mf.len) != null) {
+                        try bumpFold(&folds, mf.len);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    var suppress = std.AutoHashMap(ir.VReg, void).init(allocator);
+    errdefer suppress.deinit();
+    var it = const_vals.iterator();
+    while (it.next()) |entry| {
+        const v = entry.key_ptr.*;
+        const total = totals.get(v) orelse 0;
+        const fold = folds.get(v) orelse 0;
+        if (total > 0 and total == fold) try suppress.put(v, {});
+    }
+    return suppress;
 }
 
 fn functionUsesV128(func: *const ir.IrFunction) bool {
@@ -2024,6 +2120,16 @@ fn compileFunctionRAWithGlobalOffsets(
     var table_patches: std.ArrayList(TablePatch) = .empty;
     defer table_patches.deinit(allocator);
 
+    // Build iconst-mov suppression set (#523). An iconst dest vreg whose
+    // every IR use folds as an immediate operand on x86_64 (add/sub/mul/
+    // and/or/xor RHS with sign_extends_to_i32, shift count, or
+    // memory.copy/fill length via smallFixedBulkMemLen) doesn't need its
+    // mov: the consuming op encodes the value directly. Conjunctive: any
+    // non-foldable use (cmp, store, call arg, local_set, base address,
+    // float op, …) keeps the mov.
+    var suppress_iconst = try buildIconstSuppress(func, &const_vals, allocator);
+    defer suppress_iconst.deinit();
+
     // block_order already computed above — reuse for emission.
 
     var last_was_ret = false;
@@ -2033,7 +2139,7 @@ fn compileFunctionRAWithGlobalOffsets(
         const next_block_id: ?ir.BlockId = if (order_idx + 1 < block_order.len) block_order[order_idx + 1] else null;
         for (block.instructions.items) |inst| {
             last_was_ret = isRet(inst.op);
-            try compileInstRA(&code, inst, &alloc_result, &const_vals, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets);
+            try compileInstRA(&code, inst, &alloc_result, &const_vals, &suppress_iconst, &branch_patches, &call_patches, &table_patches, import_count, &used_caller_saved, &used_callee_saved, func.local_count, global_offsets);
         }
         // C3 fall-through peephole: if the block's terminator emitted a
         // trailing `E9 disp32` (br, or br_if's unconditional else) whose
@@ -2387,6 +2493,7 @@ fn compileInstRA(
     inst: ir.Inst,
     alloc_result: *const regalloc.AllocResult,
     const_vals: *const std.AutoHashMap(ir.VReg, i64),
+    suppress_iconst: *const std.AutoHashMap(ir.VReg, void),
     patches: *std.ArrayList(BranchPatch),
     call_patches: *std.ArrayList(CallPatch),
     table_patches: *std.ArrayList(TablePatch),
@@ -2400,6 +2507,8 @@ fn compileInstRA(
         // ── Constants ─────────────────────────────────────────────────
         .iconst_32 => |val| {
             const dest = inst.dest orelse return;
+            // #523: skip the mov entirely if every use folds.
+            if (suppress_iconst.contains(dest)) return;
             const dr = destReg(alloc_result, dest);
             if (val == 0) {
                 try code.xorReg32(dr);
@@ -2412,6 +2521,7 @@ fn compileInstRA(
         },
         .iconst_64 => |val| {
             const dest = inst.dest orelse return;
+            if (suppress_iconst.contains(dest)) return;
             const dr = destReg(alloc_result, dest);
             try code.movRegImm64(dr, @bitCast(val));
             try writeDefTyped(code, alloc_result, dest, dr, inst.type);
@@ -5130,6 +5240,62 @@ test "compileFunctionRA: memory.grow refreshes pinned r15 (issue #466)" {
     // assert it exists in the post-call region — codegen places it
     // immediately after the stack adjust, before writeDefTyped.
     _ = reload_off;
+}
+
+test "iconst suppress (#523, x86_64): foldable add-imm32 use is in suppress set" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    // v1=42 fits i32 and is the rhs of an integer add — fully foldable.
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 42 }, .dest = v1, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = v2 } });
+
+    var const_vals = try buildConstVals(&func, allocator);
+    defer const_vals.deinit();
+    var suppress = try buildIconstSuppress(&func, &const_vals, allocator);
+    defer suppress.deinit();
+
+    // v1 is rhs of an integer add → foldable. v0 is lhs (the i32 imm
+    // form folds rhs only) → not foldable. Conjunctive rule keeps v0.
+    try std.testing.expect(suppress.contains(v1));
+    try std.testing.expect(!suppress.contains(v0));
+}
+
+test "iconst suppress (#523, x86_64): mixed foldable/non-foldable use stays materialised" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const block_id = try func.newBlock();
+    const block = func.getBlock(block_id);
+    const a = func.newVReg();
+    const k = func.newVReg();
+    const sum = func.newVReg();
+    const eq = func.newVReg();
+    const out = func.newVReg();
+    // k=7 used as ADD-imm32 rhs (foldable) AND as cmp rhs (non-foldable
+    // — cmp has no const_vals fold path). Conjunctive rule keeps it.
+    try block.append(.{ .op = .{ .iconst_32 = 100 }, .dest = a, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 7 }, .dest = k, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = a, .rhs = k } }, .dest = sum, .type = .i32 });
+    try block.append(.{ .op = .{ .eq = .{ .lhs = sum, .rhs = k } }, .dest = eq, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = sum, .rhs = eq } }, .dest = out, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = out } });
+
+    var const_vals = try buildConstVals(&func, allocator);
+    defer const_vals.deinit();
+    var suppress = try buildIconstSuppress(&func, &const_vals, allocator);
+    defer suppress.deinit();
+
+    try std.testing.expect(!suppress.contains(k));
 }
 
 test "compileFunctionRA: add two constants" {
