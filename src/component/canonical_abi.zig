@@ -669,16 +669,18 @@ pub fn loadValReg(memory: []const u8, ptr: u32, t: ctypes.ValType, reg: TypeRegi
             const disc = loadU8(memory, ptr);
             if (disc > 1) break :blk error.InvalidDiscriminant;
             const is_ok = disc == 0;
-            const payload_type = if (is_ok) td.result.ok else td.result.err;
-            // Per canon ABI: result payload alignment is `max` across
-            // ok+err arms. Using just the active arm's alignment is wrong
-            // when one arm has a larger payload than the other (#561).
+            // Mirror `storeValReg.result`: payload offset uses the max
+            // alignment across both arms (canon-ABI variant semantics).
+            // (#564.)
             var payload_align: u32 = 1;
-            if (td.result.ok) |ok| payload_align = @max(payload_align, alignOfType(reg, ok));
-            if (td.result.err) |er| payload_align = @max(payload_align, alignOfType(reg, er));
-            const payload_ptr = if (payload_type) |pt| p: {
-                break :p try allocPayload(alloc, try loadValReg(memory, alignUp(ptr + 1, payload_align), pt, reg, alloc));
-            } else null;
+            if (td.result.ok) |ok_t| payload_align = @max(payload_align, alignOfType(reg, ok_t));
+            if (td.result.err) |err_t| payload_align = @max(payload_align, alignOfType(reg, err_t));
+            const payload_off = alignUp(ptr + 1, payload_align);
+            const payload_type = if (is_ok) td.result.ok else td.result.err;
+            const payload_ptr = if (payload_type) |pt|
+                try allocPayload(alloc, try loadValReg(memory, payload_off, pt, reg, alloc))
+            else
+                null;
             break :blk .{ .result_val = .{ .is_ok = is_ok, .payload = payload_ptr } };
         },
         .type_idx => |idx| blk: {
@@ -777,15 +779,19 @@ fn loadValFromDef(memory: []const u8, ptr: u32, td: ctypes.TypeDef, reg: TypeReg
             const disc = loadU8(memory, ptr);
             if (disc > 1) break :blk error.InvalidDiscriminant;
             const is_ok = disc == 0;
-            const pt = if (is_ok) res.ok else res.err;
-            // Same `max(ok_align, err_align)` rule as the other
-            // result paths (#561).
+            // Mirror the `storeValReg.result` convention: the payload
+            // offset is computed from the **max** alignment across the
+            // ok and err arms (matching canon-ABI variant semantics).
+            // (#564.)
             var payload_align: u32 = 1;
-            if (res.ok) |ok| payload_align = @max(payload_align, alignOfType(reg, ok));
-            if (res.err) |er| payload_align = @max(payload_align, alignOfType(reg, er));
-            const payload_ptr = if (pt) |payload_type| p: {
-                break :p try allocPayload(alloc, try loadValReg(memory, alignUp(ptr + 1, payload_align), payload_type, reg, alloc));
-            } else null;
+            if (res.ok) |ok_t| payload_align = @max(payload_align, alignOfType(reg, ok_t));
+            if (res.err) |err_t| payload_align = @max(payload_align, alignOfType(reg, err_t));
+            const payload_off = alignUp(ptr + 1, payload_align);
+            const pt = if (is_ok) res.ok else res.err;
+            const payload_ptr = if (pt) |payload_type|
+                try allocPayload(alloc, try loadValReg(memory, payload_off, payload_type, reg, alloc))
+            else
+                null;
             break :blk .{ .result_val = .{ .is_ok = is_ok, .payload = payload_ptr } };
         },
         .resource => .{ .handle = decodeResourceWireAbi(loadU32(memory, ptr)) },
@@ -929,28 +935,32 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
         .result => {
             const idx = t.result;
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
-            // Per canon ABI: result payload alignment is `max` across
-            // ok+err arms. Using just the active arm's alignment is
-            // wrong when one arm has a larger payload than the other
-            // (e.g. result<bool, error-code> where error-code carries
-            // `other(option<string>)`) and shifts the payload offset
-            // so the guest reads garbage (#561). Mirrors the variant
-            // fix from #520 wave 2.
+            // Per canon ABI: a `result<T, E>`'s payload alignment is the
+            // **max** alignment across the ok and err arms (matching the
+            // `variant` semantics fixed in PR #560 wave 2). Using the
+            // active arm's alignment alone shifts the payload offset
+            // when arms differ in alignment (e.g.
+            // `result<descriptor-flags (align=1), error-code (align=4)>`
+            // — the ok arm's flags byte must land at offset 4, not 1)
+            // and causes the guest to read garbage. Same shape applies
+            // to `result<bool, error-code>` where `error-code` carries
+            // `other(option<string>)`. (#561 / #564.)
             var payload_align: u32 = 1;
-            if (td.result.ok) |ok| payload_align = @max(payload_align, alignOfType(reg, ok));
-            if (td.result.err) |er| payload_align = @max(payload_align, alignOfType(reg, er));
+            if (td.result.ok) |ok_t| payload_align = @max(payload_align, alignOfType(reg, ok_t));
+            if (td.result.err) |err_t| payload_align = @max(payload_align, alignOfType(reg, err_t));
+            const payload_off = alignUp(ptr + 1, payload_align);
             if (val.result_val.is_ok) {
                 storeU8(memory, ptr, 0);
                 if (td.result.ok) |ok_type| {
                     if (val.result_val.payload) |payload| {
-                        try storeValReg(memory, alignUp(ptr + 1, payload_align), ok_type, payload.*, reg);
+                        try storeValReg(memory, payload_off, ok_type, payload.*, reg);
                     }
                 }
             } else {
                 storeU8(memory, ptr, 1);
                 if (td.result.err) |err_type| {
                     if (val.result_val.payload) |payload| {
-                        try storeValReg(memory, alignUp(ptr + 1, payload_align), err_type, payload.*, reg);
+                        try storeValReg(memory, payload_off, err_type, payload.*, reg);
                     }
                 }
             }
@@ -1040,11 +1050,20 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
             }
         },
         .result => |res| {
-            // Same `max(ok_align, err_align)` rule as `storeValReg`
-            // (#561). Mirrors the variant fix from #520 wave 2.
+            // Per canon ABI: a `result<T, E>`'s payload alignment is the
+            // **max** alignment across the ok and err arms (matching the
+            // `variant` semantics fixed in PR #560 wave 2). Using the
+            // active arm's alignment alone shifts the payload offset
+            // when arms differ in alignment (e.g.
+            // `result<descriptor-flags (align=1), error-code (align=4)>`
+            // — the ok arm's flags byte must land at offset 4, not 1)
+            // and causes the guest to read garbage. Same shape applies
+            // to `result<bool, error-code>` where `error-code` carries
+            // `other(option<string>)`. (#561 / #564.)
             var payload_align: u32 = 1;
-            if (res.ok) |ok| payload_align = @max(payload_align, alignOfType(reg, ok));
-            if (res.err) |er| payload_align = @max(payload_align, alignOfType(reg, er));
+            if (res.ok) |ok_t| payload_align = @max(payload_align, alignOfType(reg, ok_t));
+            if (res.err) |err_t| payload_align = @max(payload_align, alignOfType(reg, err_t));
+            const payload_off = alignUp(ptr + 1, payload_align);
             if (val.result_val.is_ok) {
                 storeU8(memory, ptr, 0);
                 // The WIT type may be `result<_, E>` (no ok payload).
@@ -1053,14 +1072,14 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
                 // the payload write when the ok arm has no type.
                 if (res.ok) |ok_type| {
                     if (val.result_val.payload) |payload| {
-                        try storeValReg(memory, alignUp(ptr + 1, payload_align), ok_type, payload.*, reg);
+                        try storeValReg(memory, payload_off, ok_type, payload.*, reg);
                     }
                 }
             } else {
                 storeU8(memory, ptr, 1);
                 if (res.err) |err_type| {
                     if (val.result_val.payload) |payload| {
-                        try storeValReg(memory, alignUp(ptr + 1, payload_align), err_type, payload.*, reg);
+                        try storeValReg(memory, payload_off, err_type, payload.*, reg);
                     }
                 }
             }

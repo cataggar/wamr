@@ -12,9 +12,11 @@ The wamr CLI uses a Wasmtime-shaped subcommand layout
 `version` after the binary path.
 """
 
-import subprocess
 import os
 import shlex
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -50,6 +52,28 @@ def get_wasi_worlds() -> List[str]:
     return ["wasi:cli/command"]
 
 
+def _isolate_preopens(dirs: List[Tuple[Path, str]]) -> List[Tuple[Path, str]]:
+    """Snapshot each preopen host directory into a fresh tempdir so a
+    filesystem test that mutates the mapped directory doesn't pollute
+    state for subsequent tests in the run (the upstream runner reuses
+    the same host paths across invocations). The tempdirs are leaked
+    intentionally — they're tiny and the per-suite TMPDIR is cleared
+    between CI invocations. (#564.)
+    """
+    isolated: List[Tuple[Path, str]] = []
+    for host, guest in dirs:
+        host_path = Path(host)
+        if not host_path.is_dir():
+            isolated.append((host, guest))
+            continue
+        snapshot = Path(tempfile.mkdtemp(prefix="wamr-zig-fs-"))
+        # `copytree(..., dirs_exist_ok=True)` lets us land into the
+        # just-created mkdtemp root rather than under a child dir.
+        shutil.copytree(host_path, snapshot, dirs_exist_ok=True, symlinks=True)
+        isolated.append((snapshot, guest))
+    return isolated
+
+
 def compute_argv(
     test_path: str,
     args_env_dirs: Tuple[List[str], Dict[str, str], List[Tuple[Path, str]]],
@@ -65,7 +89,7 @@ def compute_argv(
     for k, v in env.items():
         argv += ["--env", f"{k}={v}"]
 
-    for host, guest in dirs:
+    for host, guest in _isolate_preopens(dirs):
         argv += ["--map-dir", f"{host}::{guest}"]
 
     # wasi:sockets fixtures need an explicit allow-list to escape the

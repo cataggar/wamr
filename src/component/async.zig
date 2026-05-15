@@ -282,6 +282,24 @@ pub const Future = struct {
     /// `executor.popReadyEvent`.
     subtask_managed: bool = false,
 
+    /// Set by `componentTrampoline` on the canon-lower-of-async-func
+    /// path (#564) when the host returns a `.pending` future for a
+    /// non-empty-result async func. The host settle path (whoever
+    /// eventually transitions `state` to `.ready`/`.closed`) must copy
+    /// `payload` bytes into `guest_mem[async_lower_retptr..]` so the
+    /// guest observes the canonical-ABI lifted result at the address
+    /// it passed in to the lower trampoline.
+    ///
+    /// `null` for futures minted outside the canon-lower-async path
+    /// (e.g. `future.new` / `wasi:clocks` timer-futures whose lifted
+    /// result is unit and so have no payload). Today every P3 host
+    /// adapter completes synchronously and writes `mem[retptr..]`
+    /// directly from inside the trampoline; this field exists so any
+    /// genuinely-async host body (HTTP request inflight, DNS resolve,
+    /// long-blocking connect) can wire deferred completion later
+    /// without changing the trampoline contract.
+    async_lower_retptr: ?u32 = null,
+
     pub const State = enum { pending, ready, closed };
 
     pub const PendingRead = struct { guest_ptr: u32 };
