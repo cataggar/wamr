@@ -224,6 +224,11 @@ pub const ComponentInstance = struct {
     /// module instance; we keep the slice here so lifetimes are tied to the
     /// `ComponentInstance` and freed together on `deinit`.
     trampoline_ctxs: std.ArrayListUnmanaged(*executor_mod.ComponentTrampolineCtx) = .empty,
+    /// Canon-builtin trampoline contexts (context.{get,set}, task.{yield,
+    /// return}, resource.{new,drop,rep}, async ABI). Same ownership model
+    /// as `trampoline_ctxs` — each is referenced from an installed
+    /// `HostFnEntry` and freed when the instance tears down. (#520)
+    canon_builtin_ctxs: std.ArrayListUnmanaged(*executor_mod.CanonBuiltinTrampolineCtx) = .empty,
     /// Pending core-module start functions whose execution was deferred
     /// during `instantiate` so canon-lower trampoline `host_funcs` can be
     /// bound by `linkImports` first. Drained by `linkImports` in core-instance
@@ -289,6 +294,18 @@ pub const ComponentInstance = struct {
     error_contexts: std.AutoHashMapUnmanaged(u32, []u8) = .empty,
     waitable_sets: std.AutoHashMapUnmanaged(u32, async_mod.WaitableSet) = .empty,
     next_async_handle: u32 = 1,
+
+    /// TaskManager driving the currently-active async-lifted call into
+    /// this instance, or null when no async call is on the stack. Set
+    /// by `callComponentFuncAsync` for the duration of an async-lifted
+    /// dispatch, and restored to its prior value on return so nested
+    /// dispatches work. Used by the canon-builtin host trampoline (see
+    /// `executor.canonBuiltinTrampoline`) to route `context.{get,set}`,
+    /// `task.{yield,return}`, and the async ABI canons through
+    /// `dispatchCanonBuiltin` with the right task state. When null,
+    /// canon builtins fall back to the instance-scoped
+    /// `implicit_task_context` (Wasmtime parity, sync-call path). (#520)
+    current_task_manager: ?*async_mod.TaskManager = null,
 
     /// Allocate a fresh async-handle (#478 sub-PR 3). Used by every
     /// `.new`-flavoured canon-builtin to mint a unique key into the
@@ -1141,6 +1158,10 @@ pub const ComponentInstance = struct {
             self.allocator.destroy(ctx);
         }
         self.trampoline_ctxs.deinit(self.allocator);
+        for (self.canon_builtin_ctxs.items) |ctx| {
+            self.allocator.destroy(ctx);
+        }
+        self.canon_builtin_ctxs.deinit(self.allocator);
         self.pending_core_starts.deinit(self.allocator);
         if (self.core_instances.len > 0) {
             const inst_mod = @import("../runtime/interpreter/instance.zig");
@@ -1398,7 +1419,52 @@ pub fn instantiate(
                                         continue;
                                     },
                                     .lowered => {},
-                                    else => continue,
+                                    // ── Canon-builtin imports (#520) ───────
+                                    // The wit-bindgen-emitted P3 core modules
+                                    // import context.{get,set}, task.{yield,
+                                    // return}, resource.{new,drop,rep}, and
+                                    // async ABI canons via `(core instance
+                                    // (instantiate $main (with "x" (func
+                                    // $canon))))`. Install
+                                    // `canonBuiltinTrampoline` for each so
+                                    // dispatch routes into
+                                    // `dispatchCanonBuiltin` at call time.
+                                    .context_get,
+                                    .context_set,
+                                    .task_yield,
+                                    .task_return,
+                                    .resource_drop,
+                                    .resource_new,
+                                    .resource_rep,
+                                    .async_canon,
+                                    => {
+                                        const canon_idx_b: u32 = switch (cfref) {
+                                            .context_get => |i| i,
+                                            .context_set => |i| i,
+                                            .task_yield => |i| i,
+                                            .task_return => |i| i,
+                                            .resource_drop => |i| i,
+                                            .resource_new => |i| i,
+                                            .resource_rep => |i| i,
+                                            .async_canon => |i| i,
+                                            .aliased, .lowered => unreachable,
+                                        };
+                                        if (canon_idx_b >= component.canons.len) continue;
+                                        const ctx_b = allocator.create(executor_mod.CanonBuiltinTrampolineCtx) catch continue;
+                                        ctx_b.* = .{
+                                            .comp_inst = inst,
+                                            .canon = component.canons[canon_idx_b],
+                                        };
+                                        inst.canon_builtin_ctxs.append(allocator, ctx_b) catch {
+                                            allocator.destroy(ctx_b);
+                                            continue;
+                                        };
+                                        entries[imp_func_idx] = .{
+                                            .func = &executor_mod.canonBuiltinTrampoline,
+                                            .ctx = @ptrCast(ctx_b),
+                                        };
+                                        continue;
+                                    },
                                 }
                                 const canon_idx = cfref.lowered;
                                 const canon = component.canons[canon_idx];

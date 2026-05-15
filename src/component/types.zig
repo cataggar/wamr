@@ -124,6 +124,13 @@ pub const NamedValType = struct {
 pub const FuncType = struct {
     params: []const NamedValType,
     results: ResultList,
+    /// True iff this functype was encoded as `0x43` (async functype) rather
+    /// than `0x40`. Recorded at parse time so the executor's async-lifted
+    /// dispatch path can match on the binary form regardless of whether
+    /// the call site supplies the `async-lift` canon option. The legacy
+    /// `0x40` form leaves this `false`; the `async-lift` canon opt is the
+    /// orthogonal axis recorded on `LiftOptions.is_async`.
+    is_async: bool = false,
 
     pub const ResultList = union(enum) {
         /// No result (spec: `0x01 0x00`).
@@ -623,6 +630,15 @@ pub const CoreFuncContributor = union(enum) {
 /// `.instance`) section entries — so the index space cannot be derived
 /// by walking imports, then instances, then aliases as separate phases.
 /// (Issue #355.)
+///
+/// `.exported_alias` covers top-level `export … (instance …)` decls,
+/// which contribute a new compinstance index that aliases the export's
+/// `sort_idx`. The reference is by export-index; resolving it chains
+/// back through `resolveCompInstance(component.exports[i].sort_idx.idx)`.
+/// Required to load WASI Preview 3 components emitted by recent
+/// wit-component versions, which intersperse two `wasi:cli/run@…`
+/// instance exports with a second local `instance` section between them
+/// (#520).
 pub const CompInstanceContributor = union(enum) {
     /// Index into `component.imports` (must be `.instance` desc).
     import: u32,
@@ -631,6 +647,10 @@ pub const CompInstanceContributor = union(enum) {
     /// Index into `component.aliases` (must be `instance_export` of
     /// sort `.instance`).
     alias: u32,
+    /// Index into `component.exports` (must be of sort `.instance`).
+    /// The exported instance contributes a new compinstance index
+    /// that aliases the export's `sort_idx`.
+    exported_alias: u32,
 };
 
 /// A core module embedded within a component (stored as raw bytes

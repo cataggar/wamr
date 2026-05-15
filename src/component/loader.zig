@@ -288,7 +288,25 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
-                    try exports.append(allocator, try parseTopLevelExport(&reader));
+                    const local_idx: u32 = @intCast(exports.items.len);
+                    const exp = try parseTopLevelExport(&reader);
+                    try exports.append(allocator, exp);
+                    // An `(export <name> (instance N))` decl contributes a
+                    // new compinstance-indexspace slot that aliases the
+                    // referenced instance (per Binary.md: every top-level
+                    // export adds a fresh slot in its sort's indexspace).
+                    // Required for binaries like wit-component 0.245's
+                    // P3 components that intersperse two `wasi:cli/run`
+                    // instance exports with an inner instance section
+                    // between them — without this, downstream index
+                    // lookups for the second export miss the slot
+                    // contributed by the first export and either return
+                    // null or land on the wrong instance. (#520)
+                    if (exp.sort_idx) |si| {
+                        if (si.sort == .instance) {
+                            try comp_instance_indexspace.append(allocator, .{ .exported_alias = local_idx });
+                        }
+                    }
                 }
             },
             .value => {
@@ -488,9 +506,18 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
     // the remaining space (primvaltypes 0x64..0x7F, own 0x69, borrow 0x68,
     // and any non-negative typeidx encoded as signed-LEB) is a bare valtype.
     // Peek the first byte and dispatch without consuming if not recognized.
+    //
+    // The component-model spec gained the `0x43` async-functype tag
+    // alongside the existing synchronous `0x40` functype encoding;
+    // both share the same body grammar (paramlist + resultlist) and
+    // differ only in whether the lifted function is invoked through
+    // the async-lifted dispatch path. We dispatch both into the same
+    // body parser and record the async-ness on the returned `FuncType`.
+    // (#520 — required to load wasm32-wasip3 fixtures emitted by
+    // wit-bindgen 0.45 / wit-component 0.245.)
     const tag = try reader.peekByte();
     return switch (tag) {
-        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x3F, 0x40, 0x41, 0x42 => parseCompoundTypeDef(reader, allocator),
+        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x3F, 0x40, 0x41, 0x42, 0x43 => parseCompoundTypeDef(reader, allocator),
         else => .{ .val = try readValType(reader) },
     };
 }
@@ -570,11 +597,13 @@ fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
             const dtor = if (has_dtor != 0) try reader.readU32() else null;
             break :blk .{ .resource = .{ .destructor = dtor } };
         },
-        0x40 => blk: {
-            // func type
-            // Current spec (2024): paramlist is a bare vec<labelvaltype>,
+        0x40, 0x43 => blk: {
+            // func type. Synchronous (`0x40`) and asynchronous (`0x43`)
+            // share the body grammar; only the leading tag byte differs.
+            // Current spec (2024-2025): paramlist is a bare vec<labelvaltype>,
             // resultlist is `0x00 valtype` (one result) | `0x01 0x00` (none).
             // See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
+            const is_async = (tag == 0x43);
             const param_count = try reader.readU32();
             const params = try allocator.alloc(ctypes.NamedValType, param_count);
             for (params) |*p| {
@@ -591,7 +620,7 @@ fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
                 },
                 else => return error.InvalidEncoding,
             };
-            break :blk .{ .func = .{ .params = params, .results = results } };
+            break :blk .{ .func = .{ .params = params, .results = results, .is_async = is_async } };
         },
         0x41 => blk: {
             // component type
@@ -1323,6 +1352,45 @@ test "parseTypeDef: instance type rejects import decl" {
     const data = [_]u8{ 0x42, 0x01, 0x03 };
     var reader = BinaryReader{ .data = &data };
     try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
+}
+
+test "parseTypeDef: async functype 0x43 (#520)" {
+    // The component-model spec gained an `0x43` deftype tag for
+    // asynchronous functypes alongside the existing synchronous `0x40`.
+    // Body shape (paramlist + resultlist) matches `0x40`; only the
+    // `FuncType.is_async` flag distinguishes them. Required to load
+    // wasm32-wasip3 components emitted by recent wit-bindgen versions.
+    //
+    // Encoding: `0x43` tag, paramcount=0, resultlist `0x00 valtype`
+    // (one unnamed result), valtype = primitive `u32` (signed-LEB 0x79).
+    const data = [_]u8{ 0x43, 0x00, 0x00, 0x79 };
+    var reader = BinaryReader{ .data = &data };
+    const td = try parseTypeDef(&reader, std.testing.allocator);
+    defer switch (td) {
+        .func => |ft| std.testing.allocator.free(ft.params),
+        else => {},
+    };
+    try std.testing.expect(td == .func);
+    try std.testing.expectEqual(true, td.func.is_async);
+    try std.testing.expectEqual(@as(usize, 0), td.func.params.len);
+    try std.testing.expect(td.func.results == .unnamed);
+    try std.testing.expect(td.func.results.unnamed == .u32);
+    try std.testing.expectEqual(data.len, reader.pos);
+}
+
+test "parseTypeDef: sync functype 0x40 has is_async=false (#520)" {
+    // Same body as the 0x43 test above but with the synchronous tag;
+    // confirms the new is_async flag defaults to false for legacy
+    // encodings.
+    const data = [_]u8{ 0x40, 0x00, 0x00, 0x79 };
+    var reader = BinaryReader{ .data = &data };
+    const td = try parseTypeDef(&reader, std.testing.allocator);
+    defer switch (td) {
+        .func => |ft| std.testing.allocator.free(ft.params),
+        else => {},
+    };
+    try std.testing.expect(td == .func);
+    try std.testing.expectEqual(false, td.func.is_async);
 }
 
 test "parseInstance: inline-export form expects exportname' (0x00 prefix) on each name" {
