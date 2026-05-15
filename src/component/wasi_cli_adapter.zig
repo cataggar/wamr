@@ -12011,10 +12011,30 @@ pub const WasiCliAdapter = struct {
     // "null handle" — wit-bindgen 0.45 asserts `handle != 0` on every
     // host-returned resource handle (#538), so we always allocate
     // from index 1.
+    //
+    // Combined with the canon-ABI lift/lower `encodeResourceWire` /
+    // `decodeResourceWire` offset (#520 wave 2 / PR #560), this gives
+    // a defence-in-depth wire convention for every http host table
+    // (#562):
+    //
+    //   wire = host_slot + 1 (applied by executor.zig / canonical_abi.zig)
+    //
+    //  Reserving slot 0 here means that if a guest does pass `wire = 0`
+    //  (e.g. via wit-bindgen's `Option<Resource<T>>::None` round-trip
+    //  bug, or a hand-written wasm passing a sentinel), the canon-ABI
+    //  lift maps `wire 0 → slot 0`, and `lookup*` finds a null slot
+    //  and returns null. Without the slot-0 reservation, a 0-based
+    //  table would silently return the first allocated entry for a
+    //  null wire — the precise bug PR #560 fixed for sockets +
+    //  filesystem and that this PR extends to the http tables listed
+    //  in #562 (`http_outgoing_responses`, `http_outgoing_requests`,
+    //  `http_outgoing_bodies`, `http_incoming_responses`,
+    //  `http_incoming_requests`, `http_incoming_bodies`, `http_fields`,
+    //  `http_future_trailers` — and, for symmetry,
+    //  `http_future_responses`, `http_response_outparams`, and
+    //  `http_request_options`).
     fn pushHttpFields(self: *WasiCliAdapter, f: *HttpFields) !u32 {
-        if (self.http_fields_table.items.len == 0) {
-            try self.http_fields_table.append(self.allocator, null);
-        }
+        try self.reserveZeroSlot(*HttpFields, &self.http_fields_table);
         for (self.http_fields_table.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_fields_table.items[i] = f;
@@ -12030,7 +12050,8 @@ pub const WasiCliAdapter = struct {
         return self.http_fields_table.items[h];
     }
     fn pushOutgoingRequest(self: *WasiCliAdapter, r: *OutgoingRequest) !u32 {
-        for (self.http_outgoing_requests.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*OutgoingRequest, &self.http_outgoing_requests);
+        for (self.http_outgoing_requests.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_outgoing_requests.items[i] = r;
                 return @intCast(i);
@@ -12045,7 +12066,8 @@ pub const WasiCliAdapter = struct {
         return self.http_outgoing_requests.items[h];
     }
     fn pushIncomingRequest(self: *WasiCliAdapter, r: *IncomingRequest) !u32 {
-        for (self.http_incoming_requests.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*IncomingRequest, &self.http_incoming_requests);
+        for (self.http_incoming_requests.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_incoming_requests.items[i] = r;
                 return @intCast(i);
@@ -12060,7 +12082,8 @@ pub const WasiCliAdapter = struct {
         return self.http_incoming_requests.items[h];
     }
     fn pushOutgoingResponse(self: *WasiCliAdapter, r: *OutgoingResponse) !u32 {
-        for (self.http_outgoing_responses.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*OutgoingResponse, &self.http_outgoing_responses);
+        for (self.http_outgoing_responses.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_outgoing_responses.items[i] = r;
                 return @intCast(i);
@@ -12075,7 +12098,8 @@ pub const WasiCliAdapter = struct {
         return self.http_outgoing_responses.items[h];
     }
     fn pushOutgoingBody(self: *WasiCliAdapter, b: *OutgoingBody) !u32 {
-        for (self.http_outgoing_bodies.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*OutgoingBody, &self.http_outgoing_bodies);
+        for (self.http_outgoing_bodies.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_outgoing_bodies.items[i] = b;
                 return @intCast(i);
@@ -12086,7 +12110,8 @@ pub const WasiCliAdapter = struct {
         return idx;
     }
     fn pushFutureResponse(self: *WasiCliAdapter, f: *FutureIncomingResponse) !u32 {
-        for (self.http_future_responses.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*FutureIncomingResponse, &self.http_future_responses);
+        for (self.http_future_responses.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_future_responses.items[i] = f;
                 return @intCast(i);
@@ -12101,7 +12126,8 @@ pub const WasiCliAdapter = struct {
         return self.http_future_responses.items[h];
     }
     fn pushFutureTrailers(self: *WasiCliAdapter, f: *FutureTrailers) !u32 {
-        for (self.http_future_trailers.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*FutureTrailers, &self.http_future_trailers);
+        for (self.http_future_trailers.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_future_trailers.items[i] = f;
                 return @intCast(i);
@@ -12112,7 +12138,8 @@ pub const WasiCliAdapter = struct {
         return idx;
     }
     fn pushRequestOptions(self: *WasiCliAdapter, r: *RequestOptions) !u32 {
-        for (self.http_request_options.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*RequestOptions, &self.http_request_options);
+        for (self.http_request_options.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_request_options.items[i] = r;
                 return @intCast(i);
@@ -12123,7 +12150,8 @@ pub const WasiCliAdapter = struct {
         return idx;
     }
     fn pushResponseOutparam(self: *WasiCliAdapter, r: *ResponseOutparam) !u32 {
-        for (self.http_response_outparams.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*ResponseOutparam, &self.http_response_outparams);
+        for (self.http_response_outparams.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_response_outparams.items[i] = r;
                 return @intCast(i);
@@ -12138,7 +12166,8 @@ pub const WasiCliAdapter = struct {
         return self.http_response_outparams.items[h];
     }
     fn pushIncomingResponse(self: *WasiCliAdapter, r: *IncomingResponse) !u32 {
-        for (self.http_incoming_responses.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*IncomingResponse, &self.http_incoming_responses);
+        for (self.http_incoming_responses.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_incoming_responses.items[i] = r;
                 return @intCast(i);
@@ -12153,7 +12182,8 @@ pub const WasiCliAdapter = struct {
         return self.http_incoming_responses.items[h];
     }
     fn pushIncomingBody(self: *WasiCliAdapter, b: *IncomingBody) !u32 {
-        for (self.http_incoming_bodies.items, 0..) |slot, i| {
+        try self.reserveZeroSlot(*IncomingBody, &self.http_incoming_bodies);
+        for (self.http_incoming_bodies.items[1..], 1..) |slot, i| {
             if (slot == null) {
                 self.http_incoming_bodies.items[i] = b;
                 return @intCast(i);
@@ -23032,8 +23062,10 @@ test "http: outgoing-request constructor allocates slot (#149)" {
     try WasiCliAdapter.httpOutgoingRequestConstructor(&adapter, &ci, &args, &results, testing.allocator);
 
     try testing.expect(results[0] == .handle);
-    try testing.expectEqual(@as(usize, 1), adapter.http_outgoing_requests.items.len);
-    const slot = adapter.http_outgoing_requests.items[0].?;
+    // Slot 0 reserved as null sentinel (#538 / #562) — table length is
+    // 2 after one allocation, with the request landing at index 1.
+    try testing.expectEqual(@as(usize, 2), adapter.http_outgoing_requests.items.len);
+    const slot = adapter.http_outgoing_requests.items[results[0].handle].?;
     try testing.expectEqual(fh, slot.headers_handle);
 
     // headers() should round-trip the same handle.
@@ -27326,4 +27358,177 @@ test "main (#520 wave 2): runComponent applies --map-dir flags via addPreopen" {
     // (`slot + 1`) is applied by `fsGetDirectories` via
     // `abi.encodeResourceWireAbi` when lowering to guest memory.
     try testing.expectEqual(handle, adapter.fs_preopens.items[0].dir_handle);
+}
+
+// ── #562: wasi:http@0.3 host-handle wire offset for `outgoing-response`
+// and friends. Verifies that every http host-instance table reserves
+// slot 0 as a null sentinel, so the canon-ABI `decodeResourceWire(wire)`
+// mapping of wire `0` → host slot `0` lands on a null entry (rather
+// than silently returning the first allocated resource). PR #560
+// applied the same pattern to sockets + filesystem; this PR extends
+// the convention to http (`http_outgoing_responses`,
+// `http_outgoing_requests`, `http_outgoing_bodies`,
+// `http_incoming_responses`, `http_incoming_requests`,
+// `http_incoming_bodies`, `http_fields`, `http_future_trailers`).
+
+test "http (#562): outgoing-response push reserves slot 0 + wire round-trips through encodeResourceWire" {
+    const testing = std.testing;
+    const executor = @import("executor.zig");
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Push a fresh `OutgoingResponse`. The headers_handle field is
+    // populated from a real `pushHttpFields` slot to keep the
+    // adapter's deinit clean.
+    const fields = try adapter.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+    try testing.expect(fh >= 1); // slot 0 reserved
+
+    const resp = try adapter.allocator.create(OutgoingResponse);
+    resp.* = .{ .status = 200, .headers_handle = fh };
+    const slot = try adapter.pushOutgoingResponse(resp);
+
+    // Slot must be 1+ (slot 0 is the null sentinel).
+    try testing.expect(slot >= 1);
+    try testing.expectEqual(@as(?*OutgoingResponse, null), adapter.http_outgoing_responses.items[0]);
+    try testing.expectEqual(resp, adapter.http_outgoing_responses.items[slot].?);
+
+    // wire = slot + 1 (`encodeResourceWire`). Non-zero, so wit-bindgen
+    // Rust's `Resource<OutgoingResponse>::from_handle(wire)` will not
+    // trip the `handle != 0` debug assertion.
+    const wire = executor.encodeResourceWire(slot);
+    try testing.expect(wire >= 2);
+    try testing.expectEqual(slot + 1, wire);
+
+    // Round-trip back to slot via `decodeResourceWire`.
+    const decoded = executor.decodeResourceWire(wire);
+    try testing.expectEqual(slot, decoded);
+    try testing.expectEqual(resp, adapter.lookupOutgoingResponse(decoded).?);
+}
+
+test "http (#562): http_fields_table push reserves slot 0 + wire round-trips through encodeResourceWire" {
+    const testing = std.testing;
+    const executor = @import("executor.zig");
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const fields = try adapter.allocator.create(HttpFields);
+    fields.* = .{};
+    const slot = try adapter.pushHttpFields(fields);
+
+    // Slot 0 stays null; first allocation lands at slot 1.
+    try testing.expect(slot >= 1);
+    try testing.expectEqual(@as(?*HttpFields, null), adapter.http_fields_table.items[0]);
+    try testing.expectEqual(fields, adapter.http_fields_table.items[slot].?);
+
+    // Encode → decode → lookup must round-trip to the same resource.
+    const wire = executor.encodeResourceWire(slot);
+    try testing.expect(wire >= 2);
+    const decoded = executor.decodeResourceWire(wire);
+    try testing.expectEqual(slot, decoded);
+    try testing.expectEqual(fields, adapter.lookupHttpFields(decoded).?);
+}
+
+test "http (#562): every http host table reserves slot 0 — wire=0 lookup returns null, not the first allocation" {
+    const testing = std.testing;
+    const executor = @import("executor.zig");
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Allocate one resource into every http host table so that slot 1
+    // is real. `decodeResourceWire(0) == 0` (the canon-ABI lifts a
+    // wire-zero handle to host slot 0); slot 0 of every http table
+    // must be null so the corresponding `lookup*` returns null
+    // instead of silently surfacing the first allocation.
+    const fields = try adapter.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+    try testing.expect(fh >= 1);
+
+    const out_req = try adapter.allocator.create(OutgoingRequest);
+    out_req.* = .{ .headers_handle = fh };
+    const out_req_slot = try adapter.pushOutgoingRequest(out_req);
+    try testing.expect(out_req_slot >= 1);
+
+    const in_req = try adapter.allocator.create(IncomingRequest);
+    in_req.* = .{};
+    const in_req_slot = try adapter.pushIncomingRequest(in_req);
+    try testing.expect(in_req_slot >= 1);
+
+    const out_resp = try adapter.allocator.create(OutgoingResponse);
+    out_resp.* = .{ .status = 200, .headers_handle = fh };
+    const out_resp_slot = try adapter.pushOutgoingResponse(out_resp);
+    try testing.expect(out_resp_slot >= 1);
+
+    const in_resp = try adapter.allocator.create(IncomingResponse);
+    in_resp.* = .{};
+    const in_resp_slot = try adapter.pushIncomingResponse(in_resp);
+    try testing.expect(in_resp_slot >= 1);
+
+    const out_body = try adapter.allocator.create(OutgoingBody);
+    out_body.* = .{};
+    const out_body_slot = try adapter.pushOutgoingBody(out_body);
+    try testing.expect(out_body_slot >= 1);
+
+    const in_body = try adapter.allocator.create(IncomingBody);
+    in_body.* = .{};
+    const in_body_slot = try adapter.pushIncomingBody(in_body);
+    try testing.expect(in_body_slot >= 1);
+
+    const ft = try adapter.allocator.create(FutureTrailers);
+    ft.* = .{};
+    const ft_slot = try adapter.pushFutureTrailers(ft);
+    try testing.expect(ft_slot >= 1);
+
+    // For each of the 8 tables listed in #562, `decodeResourceWire(0)`
+    // returns host slot `0`, and `lookup*(0)` must return null so the
+    // host doesn't silently target the first real allocation.
+    const wire_zero_slot = executor.decodeResourceWire(0);
+    try testing.expectEqual(@as(u32, 0), wire_zero_slot);
+    try testing.expectEqual(@as(?*HttpFields, null), adapter.lookupHttpFields(wire_zero_slot));
+    try testing.expectEqual(@as(?*OutgoingRequest, null), adapter.lookupOutgoingRequest(wire_zero_slot));
+    try testing.expectEqual(@as(?*IncomingRequest, null), adapter.lookupIncomingRequest(wire_zero_slot));
+    try testing.expectEqual(@as(?*OutgoingResponse, null), adapter.lookupOutgoingResponse(wire_zero_slot));
+    try testing.expectEqual(@as(?*IncomingResponse, null), adapter.lookupIncomingResponse(wire_zero_slot));
+    try testing.expectEqual(@as(?*OutgoingBody, null), adapter.lookupOutgoingBody(wire_zero_slot));
+    try testing.expectEqual(@as(?*IncomingBody, null), adapter.lookupIncomingBody(wire_zero_slot));
+    // `lookupFutureTrailers` doesn't exist as a helper (`http_future_trailers`
+    // is accessed inline via `items[handle]`), but the table itself must
+    // still reserve slot 0:
+    try testing.expectEqual(@as(?*FutureTrailers, null), adapter.http_future_trailers.items[0]);
+}
+
+test "http (#562): slot-reuse stays within the 1-based range after a drop" {
+    const testing = std.testing;
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Three pushes land at slots 1, 2, 3 (slot 0 reserved).
+    const o1 = try adapter.allocator.create(OutgoingResponse);
+    o1.* = .{ .status = 200, .headers_handle = 0 };
+    const s1 = try adapter.pushOutgoingResponse(o1);
+    const o2 = try adapter.allocator.create(OutgoingResponse);
+    o2.* = .{ .status = 200, .headers_handle = 0 };
+    const s2 = try adapter.pushOutgoingResponse(o2);
+    const o3 = try adapter.allocator.create(OutgoingResponse);
+    o3.* = .{ .status = 200, .headers_handle = 0 };
+    const s3 = try adapter.pushOutgoingResponse(o3);
+    try testing.expectEqual(@as(u32, 1), s1);
+    try testing.expectEqual(@as(u32, 2), s2);
+    try testing.expectEqual(@as(u32, 3), s3);
+
+    // Free slot 2; a subsequent push must reuse slot 2 (not slot 0).
+    adapter.allocator.destroy(o2);
+    adapter.http_outgoing_responses.items[s2] = null;
+
+    const o4 = try adapter.allocator.create(OutgoingResponse);
+    o4.* = .{ .status = 201, .headers_handle = 0 };
+    const s4 = try adapter.pushOutgoingResponse(o4);
+    try testing.expectEqual(@as(u32, 2), s4);
+    try testing.expectEqual(@as(?*OutgoingResponse, null), adapter.http_outgoing_responses.items[0]);
 }
