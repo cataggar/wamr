@@ -72,21 +72,40 @@ pub const YieldOutcome = enum(u32) {
     cancelled = 1,
 };
 
-/// Discriminant for `future.read` / `future.write` / `future.cancel-*`
-/// status words (Binary.md "Async Calls"). The on-the-wire status word
-/// is `packStatus(status, count)` — bits 0..3 carry the discriminant,
-/// bits 4..31 carry the number of elements transferred (for `future<T>`
-/// always 0 or 1 since the channel is one-shot).
+/// Discriminant for `future.read` / `future.write` / `stream.read` /
+/// `stream.write` / `{future,stream}.cancel-*` status words. The
+/// on-the-wire encoding (post-`WebAssembly/component-model#541`) is:
+///
+///   * `BLOCKED = 0xFFFFFFFF` — operation has not completed; caller must
+///     wait for a `waitable` event before re-checking. Pushed as a raw
+///     sentinel via `BLOCKED_STATUS` (not via `packStatus`).
+///   * `packStatus(.completed, count)` — operation finished successfully
+///     transferring `count` elements. Low 4 bits = 0.
+///   * `packStatus(.dropped, count)` — other end of the channel dropped
+///     before/during the operation. `count` elements were transferred
+///     before the drop. Low 4 bits = 1.
+///   * `packStatus(.cancelled, count)` — operation was explicitly
+///     cancelled via `cancel-read`/`cancel-write`. `count` elements
+///     were transferred before the cancellation took effect. Low 4
+///     bits = 2.
+///
+/// Matches the encoding wit-bindgen ≥ 0.53 decodes in
+/// `crates/guest-rust/src/rt/async_support.rs::ReturnCode::decode`.
 pub const FutureStatus = enum(u32) {
-    starting = 0,
-    started = 1,
-    returned = 2,
-    cancelled = 3,
+    completed = 0,
+    dropped = 1,
+    cancelled = 2,
 };
 
-/// Pack a future read/write status discriminant + element count into the
-/// single i32 status word the spec returns from `future.{read,write}` and
-/// `future.cancel-{read,write}`.
+/// Sentinel pushed onto the wasm operand stack when an async operation
+/// (`stream.{read,write}` / `future.{read,write}`) is parked pending a
+/// waitable event. Distinct from any `packStatus(...)` value because
+/// the spec assigns `0xFFFFFFFF` to BLOCKED — see `FutureStatus`.
+pub const BLOCKED_STATUS: u32 = 0xFFFF_FFFF;
+
+/// Pack a future/stream read/write status discriminant + element count
+/// into the single i32 status word the spec returns from
+/// `{future,stream}.{read,write,cancel-read,cancel-write}`.
 pub fn packStatus(status: FutureStatus, count: u32) u32 {
     return @intFromEnum(status) | (count << 4);
 }
@@ -246,12 +265,15 @@ test "taskYield: unknown handle is a no-op" {
     try std.testing.expectEqual(YieldOutcome.resumed, taskYield(&tm, 999, true, allocator));
 }
 
-test "packStatus: encodes discriminant + element count" {
-    try std.testing.expectEqual(@as(u32, 0), packStatus(.starting, 0));
-    try std.testing.expectEqual(@as(u32, 1), packStatus(.started, 0));
-    try std.testing.expectEqual(@as(u32, 2), packStatus(.returned, 0));
+test "packStatus: encodes discriminant + element count (post-#541 spec)" {
+    try std.testing.expectEqual(@as(u32, 0), packStatus(.completed, 0));
+    try std.testing.expectEqual(@as(u32, 1), packStatus(.dropped, 0));
+    try std.testing.expectEqual(@as(u32, 2), packStatus(.cancelled, 0));
     // `future<T>` only ever transfers 0 or 1 elements; verify the count
     // lands in bits 4..31.
-    try std.testing.expectEqual(@as(u32, 2 | (1 << 4)), packStatus(.returned, 1));
-    try std.testing.expectEqual(@as(u32, 3), packStatus(.cancelled, 0));
+    try std.testing.expectEqual(@as(u32, 0 | (1 << 4)), packStatus(.completed, 1));
+    try std.testing.expectEqual(@as(u32, 1 | (3 << 4)), packStatus(.dropped, 3));
+    // BLOCKED is a raw sentinel (not packed) — verify it's distinct from
+    // any `packStatus(...)` value.
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), BLOCKED_STATUS);
 }

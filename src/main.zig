@@ -260,11 +260,13 @@ fn runComponent(
     var adapter = adapter_mod.WasiCliAdapter.initWithHostStdio(allocator);
     defer adapter.deinit();
 
-    // argv[0] = wasm path, rest = user args (matches wasmtime convention).
+    // argv[0] = basename of the wasm path, rest = user args. Matches
+    // the wasmtime convention (and wasi-testsuite fixtures' assumption,
+    // see wasm32-wasip3 `cli-env.rs` asserting on `"cli-env.wasm"`).
     var argv_buf = allocator.alloc([]const u8, 1 + wasm_args.len) catch
         return 1;
     defer allocator.free(argv_buf);
-    argv_buf[0] = wasm_path;
+    argv_buf[0] = std.fs.path.basename(wasm_path);
     for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);

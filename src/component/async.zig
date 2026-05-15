@@ -306,11 +306,26 @@ pub const AsyncStream = struct {
     /// kept for the future high-water-mark backpressure PR.
     pending_write: ?PendingWrite = null,
 
-    /// Optional host-side I/O hook (#535). When set, the executor's
-    /// stream ops invoke the driver before parking / buffering so a
-    /// long-lived TCP fd, accept queue, or UDP socket can keep the FIFO
-    /// fed without a per-call host fn dispatch.
+    /// Optional host-side I/O hook for long-lived sockets (#535). When
+    /// set, the executor's stream ops invoke the driver before parking
+    /// / buffering so a long-lived TCP fd, accept queue, or UDP socket
+    /// can keep the FIFO fed without a per-call host fn dispatch.
     host_driver: ?HostStreamDriver = null,
+    /// Optional host-attached sink/source for `wasi:cli` stdio (#537).
+    /// When set, `stream.write` / `stream.read` from the guest is
+    /// forwarded directly to the host (via `on_write` / `on_read`)
+    /// instead of being buffered. This is how
+    /// `wasi:cli/{stdout,stderr,stdin}@0.3.x.{write,read}-via-stream`
+    /// keep WAMR's single-threaded synchronous model in sync with the
+    /// guest's `futures::join!` style concurrent writers — the host
+    /// effectively stays "parked" on its end indefinitely, draining /
+    /// producing synchronously at every guest op.
+    ///
+    /// Distinct from `host_driver` (#535): `host_driver` integrates a
+    /// long-lived socket fd into the rendezvous loop with optional
+    /// would-block fallback to buffering, whereas `host_handler`
+    /// targets synchronous-once stdio with future-coupled completion.
+    host_handler: ?HostStreamHandler = null,
 
     /// Waitable plumbing for `waitable.join` integration.
     waitable_set: ?*WaitableSet = null,
@@ -333,6 +348,46 @@ pub const AsyncStream = struct {
     pub fn deinit(self: *AsyncStream, allocator: std.mem.Allocator) void {
         self.buffer.deinit(allocator);
     }
+};
+
+/// Host-side callbacks attached to an `AsyncStream` so the host can
+/// participate in guest stream I/O without an asynchronous scheduler.
+/// A stream has two ends; the host always attaches to the end opposite
+/// the guest:
+///
+///   * `wasi:cli/stdout@0.3.x.write-via-stream` — host is on the READ
+///     end. `on_write` fires from `stream.write` to drain guest data
+///     directly into a host sink; `on_drop_writable` fires when the
+///     guest closes its writer.
+///   * `wasi:cli/stdin@0.3.x.read-via-stream` — host is on the WRITE
+///     end. `on_read` fires from `stream.read` (when the buffer is
+///     empty) so the host can produce bytes from a real fd.
+///
+/// Installed by the corresponding adapter functions in
+/// `wasi_cli_adapter.zig` (#537).
+pub const HostStreamHandler = struct {
+    /// Host-on-read-end: drain guest write directly to a host sink.
+    /// Returns `true` on success, `false` if the sink rejected
+    /// (closed / errored).
+    on_write: ?*const fn (ctx: ?*anyopaque, bytes: []const u8) bool = null,
+    /// Host-on-read-end: notification fired from `stream.drop-writable`
+    /// when the guest closes its writer end. Used to settle the
+    /// companion `future<result<_,error-code>>`.
+    on_drop_writable: ?*const fn (ctx: ?*anyopaque) void = null,
+
+    /// Host-on-write-end: produce bytes for a guest read. Returns:
+    ///   * `> 0` — number of bytes written into `dst`.
+    ///   * `0`   — EOF; caller should mark the stream `write_closed`.
+    ///   * `< 0` — error; caller should surface as DROPPED to the guest.
+    on_read: ?*const fn (ctx: ?*anyopaque, dst: []u8) i32 = null,
+
+    /// Optional destructor — fired when the stream is fully closed
+    /// (both ends dropped) and removed from the table. Lets the host
+    /// release its `ctx` allocation without leaking on Debug builds.
+    on_destroy: ?*const fn (ctx: ?*anyopaque) void = null,
+
+    /// Opaque user context passed back to the callbacks.
+    ctx: ?*anyopaque = null,
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────────

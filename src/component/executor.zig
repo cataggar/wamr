@@ -809,6 +809,43 @@ pub fn canonResourceRep(
 /// `task.yield` is a no-op resume and `context.{get,set}` operate on
 /// `comp_inst.implicit_task_context`, matching Wasmtime's per-instance
 /// fallback for sync calls. (#478 sub-PR 1.)
+/// Resolve the per-element byte size for `stream.{read,write}` /
+/// `future.{read,write}` from the canon's `type_idx` immediate.
+///
+/// The component-model canon `stream.read t` / `future.read t` carries
+/// the typeidx of the *stream/future type def* — the element type sits
+/// one level inside, encoded by the loader as
+/// `TypeDef.val(.stream{inner})` / `TypeDef.val(.future{inner})` where
+/// `inner` is either a typeidx or a sentinel-encoded primitive (see
+/// `types.zig::decodeStreamFutureInner`).
+///
+/// To preserve compatibility with the hand-crafted test fixtures from
+/// #478 sub-PR 3 — which pass an *element* typeidx directly — this helper
+/// falls back to `abi.sizeOfType(.type_idx = type_idx)` when the typeidx
+/// does NOT resolve to a wrapping stream/future deftype.
+fn streamFutureElemSize(reg: TypeRegistry, type_idx: u32) u32 {
+    if (reg.resolve(ctypes.ValType{ .type_idx = type_idx })) |td| {
+        switch (td) {
+            .val => |v| switch (v) {
+                .stream => |inner| return decodeAndSize(reg, inner),
+                .future => |inner| return decodeAndSize(reg, inner),
+                else => {},
+            },
+            else => {},
+        }
+    }
+    // Test-fixture / element-typeidx fallback path.
+    return abi.sizeOfType(reg, ctypes.ValType{ .type_idx = type_idx });
+}
+
+fn decodeAndSize(reg: TypeRegistry, inner: u32) u32 {
+    switch (ctypes.decodeStreamFutureInner(inner)) {
+        .empty => return 0,
+        .primitive => |prim| return abi.sizeOfType(reg, prim),
+        .typeidx => |idx| return abi.sizeOfType(reg, ctypes.ValType{ .type_idx = idx }),
+    }
+}
+
 pub fn dispatchCanonBuiltin(
     comp_inst: *ComponentInstance,
     canon: ctypes.Canon,
@@ -971,18 +1008,21 @@ fn dispatchAsyncCanon(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
             const s = comp_inst.streams.getPtr(handle) orelse {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                // Unknown handle ⇒ treat as "other end gone" so wit-bindgen
+                // surfaces `ReturnCode::Dropped(0)` rather than an unknown
+                // sentinel that would trap.
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             };
 
             const registry = TypeRegistry.init(comp_inst.component);
-            const elem_size = abi.sizeOfType(registry, ctypes.ValType{ .type_idx = info.type_idx });
+            const elem_size = streamFutureElemSize(registry, info.type_idx);
             if (elem_size == 0) return error.LowerError;
 
             // Zero-length read: synchronous no-op completion.
             if (max_count == 0) {
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1033,21 +1073,52 @@ fn dispatchAsyncCanon(
                     s.buffer.items[take_bytes..],
                 );
                 s.buffer.items.len -= take_bytes;
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, take))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, take))) catch
                     return error.StackOverflow;
                 return;
             }
 
-            // Writer dropped and buffer drained → cancelled (EOF).
+            // Writer dropped and buffer drained → reader observes the
+            // drop with zero additional elements transferred.
             if (s.write_closed) {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             }
 
-            // No data yet — park.
+            // Host-attached source (#537): the host installed a
+            // synchronous producer callback (e.g.
+            // `wasi:cli/stdin.read-via-stream`). Read directly into the
+            // guest's destination buffer instead of parking.
+            if (s.host_handler) |h| if (h.on_read) |reader| {
+                const max_bytes = max_count * elem_size;
+                const dst = comp_inst.writableGuestBytes(guest_ptr, max_bytes) orelse
+                    return error.MemoryNotAvailable;
+                const got = reader(h.ctx, dst);
+                if (got < 0) {
+                    env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
+                        return error.StackOverflow;
+                    return;
+                }
+                if (got == 0) {
+                    // EOF — flag write_closed so subsequent reads
+                    // observe the drop without re-invoking the host.
+                    s.write_closed = true;
+                    env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
+                        return error.StackOverflow;
+                    return;
+                }
+                const got_count: u32 = @as(u32, @intCast(got)) / elem_size;
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, got_count))) catch
+                    return error.StackOverflow;
+                return;
+            };
+
+            // No data yet — park; signal BLOCKED (post-#541) so the
+            // guest's `WaitableOperation` waits for the completion
+            // callback rather than treating us as cancelled.
             s.pending_read = .{ .guest_ptr = guest_ptr, .max_count = max_count };
-            env.pushI32(@bitCast(async_canon.packStatus(.starting, 0))) catch
+            env.pushI32(@bitCast(async_canon.BLOCKED_STATUS)) catch
                 return error.StackOverflow;
         },
         .stream_write => |info| {
@@ -1058,25 +1129,25 @@ fn dispatchAsyncCanon(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
             const s = comp_inst.streams.getPtr(handle) orelse {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             };
 
-            // Reader end already dropped → writer is cancelled.
+            // Reader end already dropped → writer observes the drop.
             if (s.read_closed) {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             }
 
             const registry = TypeRegistry.init(comp_inst.component);
-            const elem_size = abi.sizeOfType(registry, ctypes.ValType{ .type_idx = info.type_idx });
+            const elem_size = streamFutureElemSize(registry, info.type_idx);
             if (elem_size == 0) return error.LowerError;
 
             // Zero-length write: synchronous no-op completion.
             if (count == 0) {
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1084,6 +1155,23 @@ fn dispatchAsyncCanon(
             const byte_len: u32 = elem_size * count;
             const src = comp_inst.readGuestBytes(guest_ptr, byte_len) orelse
                 return error.MemoryNotAvailable;
+
+            // Host-attached sink (#537): the host installed a synchronous
+            // drain callback (e.g. `wasi:cli/stdout.write-via-stream`).
+            // Forward directly to the sink instead of buffering — this is
+            // what keeps WAMR's single-threaded model in sync with guests
+            // that use `futures::join!` to interleave a host I/O await
+            // with a writer task.
+            if (s.host_handler) |h| if (h.on_write) |writer| {
+                if (!writer(h.ctx, src)) {
+                    env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
+                        return error.StackOverflow;
+                    return;
+                }
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
+                    return error.StackOverflow;
+                return;
+            };
 
             // Reader parked first: fulfil it directly (no buffering).
             if (s.pending_read) |pr| {
@@ -1103,7 +1191,7 @@ fn dispatchAsyncCanon(
                 s.pending_read = null;
                 if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
                     ws.setReady(idx, allocator);
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, transfer_count))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, transfer_count))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1118,13 +1206,13 @@ fn dispatchAsyncCanon(
                     const action = cb(drv.context, s, src, comp_inst.allocator);
                     switch (action) {
                         .progressed => {
-                            env.pushI32(@bitCast(async_canon.packStatus(.returned, count))) catch
+                            env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
                                 return error.StackOverflow;
                             return;
                         },
                         .eof, .err => {
                             s.read_closed = true;
-                            env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                            env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                                 return error.StackOverflow;
                             return;
                         },
@@ -1142,7 +1230,7 @@ fn dispatchAsyncCanon(
                 return error.OutOfMemory;
             if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
                 ws.setReady(idx, allocator);
-            env.pushI32(@bitCast(async_canon.packStatus(.returned, count))) catch
+            env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
                 return error.StackOverflow;
         },
         .stream_cancel_read => |info| {
@@ -1178,6 +1266,8 @@ fn dispatchAsyncCanon(
                 if (s.waitable_set) |ws| if (s.write_waitable_idx) |idx|
                     ws.setReady(idx, allocator);
                 if (s.read_closed and s.write_closed) {
+                    if (s.host_handler) |h| if (h.on_destroy) |cb|
+                        cb(h.ctx);
                     s.deinit(comp_inst.allocator);
                     _ = comp_inst.streams.remove(handle);
                 }
@@ -1188,10 +1278,24 @@ fn dispatchAsyncCanon(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
             if (comp_inst.streams.getPtr(handle)) |s| {
                 s.write_closed = true;
+                // Notify any host-attached sink that the guest has
+                // closed its writer end (#537). The host handler is
+                // responsible for settling its companion future.
+                if (s.host_handler) |h| if (h.on_drop_writable) |cb| {
+                    cb(h.ctx);
+                    // A host-attached sink only needs the read end open
+                    // long enough to receive synchronous `stream.write`
+                    // forwards. After the writer drops, the host is
+                    // done — close the read end so the stream entry is
+                    // freed (and `on_destroy` reclaims `ctx`).
+                    s.read_closed = true;
+                };
                 // Wake a parked reader so it can observe CANCELLED.
                 if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
                     ws.setReady(idx, allocator);
                 if (s.read_closed and s.write_closed) {
+                    if (s.host_handler) |h| if (h.on_destroy) |cb|
+                        cb(h.ctx);
                     s.deinit(comp_inst.allocator);
                     _ = comp_inst.streams.remove(handle);
                 }
@@ -1214,7 +1318,7 @@ fn dispatchAsyncCanon(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
             const fut = comp_inst.futures.getPtr(handle) orelse {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             };
@@ -1226,14 +1330,15 @@ fn dispatchAsyncCanon(
             // the writer-dropped check below so a host-completed unit
             // future is not mis-reported as cancelled.
             if (fut.state == .ready and fut.payload == null) {
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
 
-            // Writer dropped without ever delivering a value → cancelled.
+            // Writer dropped without ever delivering a value → DROPPED
+            // (post-#541 spec).
             if (fut.write_closed and fut.payload == null) {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1241,13 +1346,13 @@ fn dispatchAsyncCanon(
             // Unit-type (`future<()>`) fast-path (#483): a `wait-for` /
             // `wait-until` timer fired and set `state = .ready` with no
             // payload — there are zero bytes to copy. Distinct from the
-            // writer-dropped cancelled case above because `write_closed`
+            // writer-dropped case above because `write_closed`
             // is false here. `count = 1` reports one unit element.
             if (fut.state == .ready and fut.payload == null and !fut.write_closed) {
                 fut.state = .closed;
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
                     ws.setReady(idx, allocator);
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1262,7 +1367,7 @@ fn dispatchAsyncCanon(
                 fut.state = .ready;
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
                     ws.setReady(idx, allocator);
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1272,7 +1377,7 @@ fn dispatchAsyncCanon(
             // ptr here.
             _ = info;
             fut.pending_read = .{ .guest_ptr = guest_ptr };
-            env.pushI32(@bitCast(async_canon.packStatus(.starting, 0))) catch
+            env.pushI32(@bitCast(async_canon.BLOCKED_STATUS)) catch
                 return error.StackOverflow;
         },
         .future_write => |info| {
@@ -1281,28 +1386,29 @@ fn dispatchAsyncCanon(
             const handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
 
             const fut = comp_inst.futures.getPtr(handle) orelse {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             };
 
-            // Reader already dropped → writer is cancelled.
+            // Reader already dropped → writer observes the drop.
             if (fut.read_closed) {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             }
 
-            // Already buffered (double-write); reject with cancelled. Spec
-            // forbids two writes on a one-shot future.
+            // Already buffered (double-write); reject. Spec forbids two
+            // writes on a one-shot future — surface as DROPPED so the
+            // guest's WaitableOperation observes the rejection.
             if (fut.payload != null) {
-                env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
                     return error.StackOverflow;
                 return;
             }
 
             const registry = TypeRegistry.init(comp_inst.component);
-            const elem_size = abi.sizeOfType(registry, ctypes.ValType{ .type_idx = info.type_idx });
+            const elem_size = streamFutureElemSize(registry, info.type_idx);
             if (elem_size == 0) return error.LowerError;
 
             const src = comp_inst.readGuestBytes(guest_ptr, elem_size) orelse
@@ -1318,7 +1424,7 @@ fn dispatchAsyncCanon(
                 fut.state = .ready;
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
                     ws.setReady(idx, allocator);
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1332,7 +1438,7 @@ fn dispatchAsyncCanon(
             fut.state = .ready;
             if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
                 ws.setReady(idx, allocator);
-            env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+            env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                 return error.StackOverflow;
         },
         .future_cancel_read => |info| {
@@ -1344,9 +1450,9 @@ fn dispatchAsyncCanon(
                 return;
             };
             // If a value was already delivered before cancel arrived,
-            // surface RETURNED so the caller still observes the transfer.
+            // surface COMPLETED so the caller still observes the transfer.
             if (fut.state == .ready and fut.payload == null) {
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1363,9 +1469,9 @@ fn dispatchAsyncCanon(
                 return;
             };
             // If the reader already consumed the buffered payload, the
-            // write completed before cancel; report RETURNED.
+            // write completed before cancel; report COMPLETED.
             if (fut.state == .ready and fut.payload == null and fut.pending_read == null) {
-                env.pushI32(@bitCast(async_canon.packStatus(.returned, 1))) catch
+                env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
             }
@@ -1488,8 +1594,8 @@ fn dispatchAsyncCanon(
             // guest-memory bridging we can't honour that contract — pop
             // arguments and push a zero status to keep the core stack
             // balanced for the conformance "load + don't crash" target.
-            _ = env.popI32() catch return error.StackUnderflow; // ws handle
             _ = env.popI32() catch return error.StackUnderflow; // out ptr
+            _ = env.popI32() catch return error.StackUnderflow; // ws handle
             env.pushI32(0) catch return error.StackOverflow;
         },
 
@@ -2622,7 +2728,7 @@ test "future.write then future.read: round-trips a u32" {
         testing.allocator,
     );
     const write_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 1), write_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 0), write_status);
     try testing.expect(inst.futures.getPtr(handle).?.payload != null);
 
     // Issue future.read — should copy buffered bytes into dst.
@@ -2636,7 +2742,7 @@ test "future.write then future.read: round-trips a u32" {
         testing.allocator,
     );
     const read_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 1), read_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 0), read_status);
 
     const dst_bytes = inst.writableGuestBytes(dst_ptr, 4).?;
     try testing.expectEqual(@as(u32, 0xDEAD_BEEF), std.mem.readInt(u32, dst_bytes[0..4], .little));
@@ -2695,7 +2801,7 @@ test "future.read parks then future.write wakes a waitable" {
         testing.allocator,
     );
     const read_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.starting, 0), read_status);
+    try testing.expectEqual(async_canon.BLOCKED_STATUS, read_status);
     try testing.expectEqual(@as(u32, dst_ptr), inst.futures.getPtr(handle).?.pending_read.?.guest_ptr);
 
     // Writer arrives — copies straight into the parked dst, returns RETURNED.
@@ -2709,7 +2815,7 @@ test "future.read parks then future.write wakes a waitable" {
         testing.allocator,
     );
     const write_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 1), write_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 0), write_status);
 
     // Destination memory updated, payload not buffered, waitable woken.
     const dst_bytes = inst.writableGuestBytes(dst_ptr, 4).?;
@@ -2770,7 +2876,7 @@ test "future.cancel-read on empty future returns CANCELLED" {
     try testing.expect(inst.futures.getPtr(handle).?.pending_read == null);
 }
 
-test "future.drop-writable while reader parked: subsequent read is CANCELLED" {
+test "future.drop-writable while reader parked: subsequent read is DROPPED" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
     const inst_mod_core = @import("../runtime/interpreter/instance.zig");
@@ -2833,7 +2939,7 @@ test "future.drop-writable while reader parked: subsequent read is CANCELLED" {
         testing.allocator,
     );
     const status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.cancelled, 0), status);
+    try testing.expectEqual(async_canon.packStatus(.dropped, 0), status);
 }
 
 test "future.drop both ends: table entry is freed" {
@@ -3012,7 +3118,7 @@ test "stream.write then stream.read: round-trips 3×u32" {
         testing.allocator,
     );
     const write_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 3), write_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 3), write_status);
     try testing.expectEqual(@as(usize, 12), inst.streams.getPtr(handle).?.buffer.items.len);
 
     // stream.read with max_count=3 — drains the FIFO.
@@ -3027,7 +3133,7 @@ test "stream.write then stream.read: round-trips 3×u32" {
         testing.allocator,
     );
     const read_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 3), read_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 3), read_status);
 
     const dst_bytes = inst.writableGuestBytes(dst_ptr, 12).?;
     try testing.expectEqual(@as(u32, 0x1111_1111), std.mem.readInt(u32, dst_bytes[0..4], .little));
@@ -3088,7 +3194,7 @@ test "stream.read parks; stream.write delivers and wakes waitable" {
         testing.allocator,
     );
     const read_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.starting, 0), read_status);
+    try testing.expectEqual(async_canon.BLOCKED_STATUS, read_status);
     try testing.expectEqual(@as(u32, dst_ptr), inst.streams.getPtr(handle).?.pending_read.?.guest_ptr);
     try testing.expectEqual(@as(u32, 2), inst.streams.getPtr(handle).?.pending_read.?.max_count);
 
@@ -3104,7 +3210,7 @@ test "stream.read parks; stream.write delivers and wakes waitable" {
         testing.allocator,
     );
     const write_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 2), write_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 2), write_status);
 
     const dst_bytes = inst.writableGuestBytes(dst_ptr, 8).?;
     try testing.expectEqual(@as(u32, 0xAAAA_AAAA), std.mem.readInt(u32, dst_bytes[0..4], .little));
@@ -3171,7 +3277,7 @@ test "stream.write count > pending reader max: extra bytes buffer for next read"
         testing.allocator,
     );
     const write_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 1), write_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 1), write_status);
 
     // Reader got the first element; remaining 2 elements (8 bytes)
     // sit in the FIFO awaiting the next reader.
@@ -3193,7 +3299,7 @@ test "stream.write count > pending reader max: extra bytes buffer for next read"
         testing.allocator,
     );
     const read2_status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.returned, 2), read2_status);
+    try testing.expectEqual(async_canon.packStatus(.completed, 2), read2_status);
 
     const dst2_bytes = inst.writableGuestBytes(dst2_ptr, 8).?;
     try testing.expectEqual(@as(u32, 0xAAAA_0002), std.mem.readInt(u32, dst2_bytes[0..4], .little));
@@ -3252,7 +3358,7 @@ test "stream.cancel-read on parked reader returns CANCELLED and clears slot" {
     try testing.expect(inst.streams.getPtr(handle).?.pending_read == null);
 }
 
-test "stream.drop-writable while buffer drained: subsequent read returns CANCELLED (EOF)" {
+test "stream.drop-writable while buffer drained: subsequent read returns DROPPED (EOF)" {
     const testing = std.testing;
     const core_types_mod = @import("../runtime/common/types.zig");
     const inst_mod_core = @import("../runtime/interpreter/instance.zig");
@@ -3320,7 +3426,7 @@ test "stream.drop-writable while buffer drained: subsequent read returns CANCELL
     try testing.expectEqual(@as(u32, 1), inst.streams.count());
     try testing.expect(inst.streams.getPtr(r_idx).?.write_closed);
 
-    // A subsequent read observes EOF as CANCELLED.
+    // A subsequent read observes EOF as DROPPED.
     try env.pushI32(@bitCast(r_idx));
     try env.pushI32(@bitCast(dst_ptr));
     try env.pushI32(@bitCast(@as(u32, 1)));
@@ -3332,7 +3438,7 @@ test "stream.drop-writable while buffer drained: subsequent read returns CANCELL
         testing.allocator,
     );
     const status: u32 = @bitCast(try env.popI32());
-    try testing.expectEqual(async_canon.packStatus(.cancelled, 0), status);
+    try testing.expectEqual(async_canon.packStatus(.dropped, 0), status);
 }
 
 test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
