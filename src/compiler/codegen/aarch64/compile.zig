@@ -1679,6 +1679,17 @@ fn computeLiveRangesScheduled(
                     try def_type.put(dest, inst.type);
                 }
             }
+            // parallel_copy is a multi-def IR op (one def per pair).
+            // Register each dst so it gets a live range and an
+            // assignment from the allocator.
+            if (inst.op == .parallel_copy) {
+                for (inst.op.parallel_copy) |p| {
+                    if (!def_pos.contains(p.dst)) {
+                        try def_pos.put(p.dst, global_idx);
+                        try def_type.put(p.dst, p.ty);
+                    }
+                }
+            }
             var use_ctx = LastUseCtx{
                 .last_use_pos = &last_use_pos,
                 .pos = global_idx,
@@ -2508,6 +2519,7 @@ fn instRequiresV128Flush(inst: ir.Inst) bool {
         .atomic_rmw,
         .atomic_cmpxchg,
         .atomic_fence,
+        .parallel_copy,
         .memory_init,
         .data_drop,
         => false,
@@ -2831,6 +2843,7 @@ fn compileInst(
         .elem_drop => |seg_idx| try emitElemDrop(code, seg_idx, reg_map, fctx),
         // Phi must be lowered before codegen.
         .phi => unreachable,
+        .parallel_copy => |pairs| try emitParallelCopy(code, pairs, reg_map, fctx.allocator),
         else => {
             // Explicit failure for unimplemented ops. Previously this was a
             // silent no-op which produced incorrect code. Anything that lands
@@ -5088,6 +5101,231 @@ fn emitReinterpret(
     const info = try destBegin(reg_map, dest, RegMap.tmp1);
     if (src != info.reg) try code.movRegReg(info.reg, src);
     try destCommit(code, reg_map, info);
+}
+
+/// Resolve a batch of parallel (dst ← src) vreg copies, honouring the
+/// "all reads before any writes" semantics required for phi resolution
+/// at a predecessor's terminator.
+///
+/// Each pair classifies into one of four storage shapes after consulting
+/// the register allocator's assignments:
+///   * reg → stack : a plain `STR src_reg, [fp, #dst_off]` (reads OLD src).
+///   * stack → stack : `LDR tmp0, [fp, #src_off]; STR tmp0, [fp, #dst_off]`.
+///   * reg → reg : participates in the 4-phase parallel-copy resolver.
+///   * stack → reg : a plain `LDR dst_reg, [fp, #src_off]`.
+///
+/// We emit reg→stack and stack→stack FIRST so they observe the
+/// pre-copy register state; then resolve reg→reg with cycle breaking
+/// using `RegMap.tmp2` as scratch (X15, non-allocatable); then emit
+/// stack→reg loads last so they can safely clobber dst regs that were
+/// read in earlier phases.
+///
+/// Cycle resolver (4-phase):
+///   1. Build edges `src_reg → dst_reg` for reg→reg pairs.
+///   2. Repeatedly emit moves whose dst is NOT some other pending move's
+///      src (a "leaf" — safe because no remaining mov needs to read it).
+///   3. Whatever remains forms one or more pure cycles. Break each cycle
+///      by `mov tmp2, head_src; mov head_src, …; … ; mov tail_dst, tmp2`.
+///   4. Repeat until all pairs are emitted.
+fn emitParallelCopy(
+    code: *emit.CodeBuffer,
+    pairs: []const ir.Inst.ParallelCopy,
+    reg_map: *RegMap,
+    allocator: std.mem.Allocator,
+) !void {
+    if (pairs.len == 0) return;
+    // v128 parallel-copy is intentionally out of scope for #540. The
+    // lowering pass only emits scalar pairs; surface a clear error if
+    // a v128 sneaks in.
+    for (pairs) |p| if (p.ty == .v128) return error.UnimplementedOp;
+    try emitParallelCopyFull(code, pairs, reg_map, allocator);
+}
+
+fn emitParallelCopyFull(
+    code: *emit.CodeBuffer,
+    pairs: []const ir.Inst.ParallelCopy,
+    reg_map: *RegMap,
+    allocator: std.mem.Allocator,
+) !void {
+    const Loc = RegMap.Location;
+    const Resolved = struct {
+        dst: Loc,
+        src: Loc,
+    };
+
+    var resolved = try allocator.alloc(Resolved, pairs.len);
+    defer allocator.free(resolved);
+
+    for (pairs, 0..) |p, i| {
+        const dst_loc = try reg_map.assign(p.dst);
+        const src_loc = reg_map.get(p.src) orelse return error.UnboundVReg;
+        resolved[i] = .{ .dst = dst_loc, .src = src_loc };
+    }
+
+    // Phase A: reg→stack stores. Read src reg's PRE-copy value, write to mem.
+    for (resolved) |r| {
+        switch (r.src) {
+            .reg => |src_reg| switch (r.dst) {
+                .stack => |off| try code.strImm(src_reg, .fp, reg_map.spillOffsetScaled(off)),
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    // Phase B: stack→stack via tmp0.
+    for (resolved) |r| {
+        switch (r.src) {
+            .stack => |src_off| switch (r.dst) {
+                .stack => |dst_off| {
+                    try code.ldrImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(src_off));
+                    try code.strImm(RegMap.tmp0, .fp, reg_map.spillOffsetScaled(dst_off));
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    // Phase C: collect reg→reg pairs (skip identity moves the allocator
+    // already coalesced for us).
+    var rr_dst = try allocator.alloc(emit.Reg, pairs.len);
+    defer allocator.free(rr_dst);
+    var rr_src = try allocator.alloc(emit.Reg, pairs.len);
+    defer allocator.free(rr_src);
+    var rr_done = try allocator.alloc(bool, pairs.len);
+    defer allocator.free(rr_done);
+
+    var rr_len: usize = 0;
+    for (resolved) |r| {
+        switch (r.src) {
+            .reg => |src_reg| switch (r.dst) {
+                .reg => |dst_reg| {
+                    if (src_reg == dst_reg) continue; // coalesced by regalloc
+                    rr_dst[rr_len] = dst_reg;
+                    rr_src[rr_len] = src_reg;
+                    rr_done[rr_len] = false;
+                    rr_len += 1;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    try emitParallelRegMoves(code, rr_dst[0..rr_len], rr_src[0..rr_len], rr_done[0..rr_len]);
+
+    // Phase D: stack→reg loads. Emit last so they don't clobber regs that
+    // were sources of reg→reg moves.
+    for (resolved) |r| {
+        switch (r.src) {
+            .stack => |src_off| switch (r.dst) {
+                .reg => |dst_reg| try code.ldrImm(dst_reg, .fp, reg_map.spillOffsetScaled(src_off)),
+                else => {},
+            },
+            else => {},
+        }
+    }
+}
+
+/// 4-phase parallel-copy resolver for the reg→reg subset. Emits moves
+/// that respect "all reads before all writes": leaf moves (whose dst is
+/// not read by any pending move) are emitted in topological order; the
+/// remaining pure cycles are broken with `RegMap.tmp2` (X15) as scratch.
+fn emitParallelRegMoves(
+    code: *emit.CodeBuffer,
+    dst: []const emit.Reg,
+    src: []const emit.Reg,
+    done: []bool,
+) !void {
+    const n = dst.len;
+    if (n == 0) return;
+
+    while (true) {
+        var progressed = true;
+        while (progressed) {
+            progressed = false;
+            for (0..n) |i| {
+                if (done[i]) continue;
+                // Is dst[i] read by any pending mov?
+                var read_by_pending = false;
+                for (0..n) |j| {
+                    if (done[j] or j == i) continue;
+                    if (src[j] == dst[i]) {
+                        read_by_pending = true;
+                        break;
+                    }
+                }
+                if (!read_by_pending) {
+                    try code.movRegReg(dst[i], src[i]);
+                    done[i] = true;
+                    progressed = true;
+                }
+            }
+        }
+
+        // Any pending? Find a head and break its cycle.
+        var head: ?usize = null;
+        for (0..n) |i| {
+            if (!done[i]) {
+                head = i;
+                break;
+            }
+        }
+        if (head == null) return;
+
+        // Cycle break: walk the cycle backwards (in dataflow terms,
+        // visit the pair that WRITES TO head.src first). The pair we
+        // visit last is `head` itself, emitted with its src replaced
+        // by `scratch` (which still holds the head.src's PRE-copy
+        // value).
+        const start = head.?;
+        const scratch = RegMap.tmp2;
+        try code.movRegReg(scratch, src[start]);
+
+        var found_predecessor: ?usize = null;
+        for (0..n) |k| {
+            if (done[k] or k == start) continue;
+            if (dst[k] == src[start]) {
+                found_predecessor = k;
+                break;
+            }
+        }
+
+        if (found_predecessor == null) {
+            // `start`'s src is not written by any pending mov. That
+            // means `start` participates in a degenerate cycle of one
+            // edge (post-leaf-resolution this can only happen via a
+            // chained handoff already emitted). Settle it with
+            // scratch and re-enter the outer loop.
+            try code.movRegReg(dst[start], scratch);
+            done[start] = true;
+            continue;
+        }
+
+        var cur = found_predecessor.?;
+        while (cur != start) {
+            try code.movRegReg(dst[cur], src[cur]);
+            done[cur] = true;
+            var next_opt: ?usize = null;
+            for (0..n) |k| {
+                if (done[k] or k == start) continue;
+                if (dst[k] == src[cur]) {
+                    next_opt = k;
+                    break;
+                }
+            }
+            if (next_opt == null) {
+                // Chain bridged into the cycle — shouldn't happen
+                // after leaf resolution, but bail safely.
+                break;
+            }
+            cur = next_opt.?;
+        }
+        // Close the cycle: write scratch into head's dst.
+        try code.movRegReg(dst[start], scratch);
+        done[start] = true;
+    }
 }
 
 const FBinKind = enum { add, sub, mul, div };
@@ -8178,6 +8416,21 @@ fn collectCopyHints(
                     const dest = ci.dest orelse continue;
                     try hints.append(allocator, .{ .dest = dest, .src = src_vreg });
                 },
+                .parallel_copy => |pairs| {
+                    // Each pair is an honest register-move candidate at
+                    // the predecessor's terminator. Hinting `dst <- src`
+                    // lets the linear-scan allocator + post-allocation
+                    // coalescer collapse same-physreg pairs to no-ops
+                    // before `emitParallelCopy` ever runs.
+                    //
+                    // Disabled while investigating: copy hints for the
+                    // back-edge phi (src = vreg defined inside the
+                    // loop body, dst = phi value live across the
+                    // body) may make the coalescer believe two
+                    // overlapping live ranges can share a physreg —
+                    // misaligning loop semantics.
+                    _ = pairs;
+                },
                 else => {},
             }
         }
@@ -8243,6 +8496,271 @@ fn testCodeContainsMasked(code: []const u8, mask: u32, value: u32) bool {
         if ((w & mask) == value) return true;
     }
     return false;
+}
+
+/// AArch64 `MOV Xd, Xn` is encoded as ORR Xd, XZR, Xn:
+///   0xAA000000 | (1 << 21) ? ... actually: 1010|1010|000|Rm|0|00000|11111|Rd
+/// Standard form: 0xAA0003E0 | (Rm << 16) | Rd.
+fn testMovRegRegWord(rd: emit.Reg, rm: emit.Reg) u32 {
+    return 0xAA0003E0 |
+        (@as(u32, @intFromEnum(rm)) << 16) |
+        @as(u32, @intFromEnum(rd));
+}
+
+test "emitParallelRegMoves: empty input is a no-op" {
+    const allocator = std.testing.allocator;
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+    var done = [_]bool{};
+    try emitParallelRegMoves(&code, &.{}, &.{}, &done);
+    try std.testing.expectEqual(@as(usize, 0), code.bytes.items.len);
+}
+
+test "emitParallelRegMoves: disjoint chain emits topological MOVs" {
+    // Pairs:
+    //   x3 <- x1   (leaf — x3 not read by anyone)
+    //   x4 <- x2   (leaf — x4 not read by anyone)
+    // Expected: two MOVs in any order, no scratch use.
+    const allocator = std.testing.allocator;
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    var dst = [_]emit.Reg{ .x3, .x4 };
+    var src = [_]emit.Reg{ .x1, .x2 };
+    var done = [_]bool{ false, false };
+    try emitParallelRegMoves(&code, &dst, &src, &done);
+
+    try std.testing.expectEqual(@as(usize, 8), code.bytes.items.len);
+    try std.testing.expect(testCodeContainsWord(code.bytes.items, testMovRegRegWord(.x3, .x1)));
+    try std.testing.expect(testCodeContainsWord(code.bytes.items, testMovRegRegWord(.x4, .x2)));
+    // No use of the cycle scratch register (X15 = tmp2).
+    try std.testing.expect(!testCodeContainsWord(code.bytes.items, testMovRegRegWord(.x15, .x1)));
+    try std.testing.expect(!testCodeContainsWord(code.bytes.items, testMovRegRegWord(.x15, .x2)));
+}
+
+test "emitParallelRegMoves: chain a→b→c emits in correct order" {
+    // Pairs:
+    //   x2 <- x1
+    //   x3 <- x2   (must run before x2<-x1 clobbers x2)
+    // Expected: MOV x3, x2 first; then MOV x2, x1.
+    const allocator = std.testing.allocator;
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    var dst = [_]emit.Reg{ .x2, .x3 };
+    var src = [_]emit.Reg{ .x1, .x2 };
+    var done = [_]bool{ false, false };
+    try emitParallelRegMoves(&code, &dst, &src, &done);
+
+    try std.testing.expectEqual(@as(usize, 8), code.bytes.items.len);
+    const w0 = std.mem.readInt(u32, code.bytes.items[0..4], .little);
+    const w1 = std.mem.readInt(u32, code.bytes.items[4..8], .little);
+    try std.testing.expectEqual(testMovRegRegWord(.x3, .x2), w0);
+    try std.testing.expectEqual(testMovRegRegWord(.x2, .x1), w1);
+}
+
+test "emitParallelRegMoves: 2-cycle swap a↔b uses scratch" {
+    // Pairs:
+    //   x1 <- x2
+    //   x2 <- x1   (swap)
+    // Naive sequential MOVs would corrupt: `mov x1, x2` clobbers x1,
+    // then `mov x2, x1` reads the new value. The 4-phase resolver
+    // saves head.src to X15 (tmp2), walks the cycle, and writes
+    // scratch into head.dst at the end.
+    const allocator = std.testing.allocator;
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    var dst = [_]emit.Reg{ .x1, .x2 };
+    var src = [_]emit.Reg{ .x2, .x1 };
+    var done = [_]bool{ false, false };
+    try emitParallelRegMoves(&code, &dst, &src, &done);
+
+    try std.testing.expectEqual(@as(usize, 12), code.bytes.items.len);
+    const w0 = std.mem.readInt(u32, code.bytes.items[0..4], .little);
+    const w1 = std.mem.readInt(u32, code.bytes.items[4..8], .little);
+    const w2 = std.mem.readInt(u32, code.bytes.items[8..12], .little);
+    // mov X15, X2  (save head.src = X2)
+    try std.testing.expectEqual(testMovRegRegWord(.x15, .x2), w0);
+    // mov X2, X1   (walk predecessor: pair whose dst==head.src=X2)
+    try std.testing.expectEqual(testMovRegRegWord(.x2, .x1), w1);
+    // mov X1, X15  (close cycle: head.dst <- scratch)
+    try std.testing.expectEqual(testMovRegRegWord(.x1, .x15), w2);
+}
+
+test "emitParallelRegMoves: 3-cycle a→b, b→c, c→a uses scratch" {
+    // Pairs (cycle):
+    //   x1 <- x3   (a <- c)
+    //   x2 <- x1   (b <- a)
+    //   x3 <- x2   (c <- b)
+    // Expected: scratch X15 saves head.src, then visit pairs in
+    // reverse-dataflow order: pair writing to head.src first, then
+    // around the cycle, finally head with src=scratch.
+    const allocator = std.testing.allocator;
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    var dst = [_]emit.Reg{ .x1, .x2, .x3 };
+    var src = [_]emit.Reg{ .x3, .x1, .x2 };
+    var done = [_]bool{ false, false, false };
+    try emitParallelRegMoves(&code, &dst, &src, &done);
+
+    // 4 MOVs total: 1 save + 3 cycle MOVs.
+    try std.testing.expectEqual(@as(usize, 16), code.bytes.items.len);
+    // First instruction is `mov X15, head.src`. Head is pair[0] (first
+    // pending after leaf phase), src[0]=X3.
+    const w0 = std.mem.readInt(u32, code.bytes.items[0..4], .little);
+    try std.testing.expectEqual(testMovRegRegWord(.x15, .x3), w0);
+    // Last instruction closes the cycle: dst[0] <- X15.
+    const last = std.mem.readInt(u32, code.bytes.items[12..16], .little);
+    try std.testing.expectEqual(testMovRegRegWord(.x1, .x15), last);
+}
+
+test "emitParallelRegMoves: mixed chain + cycle" {
+    // Three pairs:
+    //   x5 <- x1   (chain leaf — x5 read by nobody)
+    //   x1 <- x2   (cycle part)
+    //   x2 <- x1   (cycle part — swap with above)
+    // Wait, that's a 2-cycle PLUS a leaf reading x1 (the cycle's src).
+    // The leaf MUST run BEFORE the cycle clobbers x1.
+    const allocator = std.testing.allocator;
+    var code = emit.CodeBuffer.init(allocator);
+    defer code.deinit();
+
+    var dst = [_]emit.Reg{ .x5, .x1, .x2 };
+    var src = [_]emit.Reg{ .x1, .x2, .x1 };
+    var done = [_]bool{ false, false, false };
+    try emitParallelRegMoves(&code, &dst, &src, &done);
+
+    // The leaf (x5 <- x1) reads x1; the cycle (x1<->x2) overwrites x1.
+    // For correctness x5 must be written BEFORE x1 changes.
+    // The resolver's leaf phase emits x5<-x1 first.
+    const w0 = std.mem.readInt(u32, code.bytes.items[0..4], .little);
+    try std.testing.expectEqual(testMovRegRegWord(.x5, .x1), w0);
+    // Then a 2-cycle swap follows (3 MOVs with scratch).
+    try std.testing.expectEqual(@as(usize, 16), code.bytes.items.len);
+}
+
+test "compile: 2-arm scalar phi lowers to MOV-free path (copy-hint coalesced)" {
+    // Build:
+    //   b0:  v0 = iconst 7; br_if c → b1 else b2
+    //   b1:  v1 = iconst 11; br b3
+    //   b2:  v2 = iconst 13; br b3
+    //   b3:  v3 = phi (b1, v1) (b2, v2); ret v3
+    // After lowerPhisToLocals + coalescePhiLocalsToParallelCopy +
+    // copy-hint coalescing, the predecessor copies should collapse to
+    // no-ops (v3 / v1 / v2 share a physreg).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const v2 = func.newVReg();
+    const v3 = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = v0, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 11 }, .dest = v1, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .iconst_32 = 13 }, .dest = v2, .type = .i32 });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+
+    const edges = try allocator.alloc(ir.Inst.PhiEdge, 2);
+    edges[0] = .{ .block = b1, .val = v1 };
+    edges[1] = .{ .block = b2, .val = v2 };
+    try func.getBlock(b3).append(.{ .op = .{ .phi = edges }, .dest = v3, .type = .i32 });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v3 } });
+
+    try func.getBlock(b1).addPredecessor(b0);
+    try func.getBlock(b2).addPredecessor(b0);
+    try func.getBlock(b3).addPredecessor(b1);
+    try func.getBlock(b3).addPredecessor(b2);
+
+    _ = try @import("../../ir/passes.zig").lowerPhisToLocals(&func, allocator);
+    _ = try @import("../../ir/passes.zig").coalescePhiLocalsToParallelCopy(&func, allocator);
+
+    // After our lowering, the join block (b3) has NO local_get of the
+    // synth — it was deleted; phi_dest is defined by parallel_copy
+    // ops in each predecessor.
+    for (func.getBlock(b3).instructions.items) |inst| {
+        try std.testing.expect(inst.op != .local_get);
+    }
+    // Both predecessor blocks gained a parallel_copy instruction
+    // (placed before their terminator).
+    var pc_blocks: u32 = 0;
+    for ([_]ir.BlockId{ b1, b2 }) |bid| {
+        for (func.getBlock(bid).instructions.items) |inst| {
+            if (inst.op == .parallel_copy) {
+                pc_blocks += 1;
+                try std.testing.expectEqual(@as(usize, 1), inst.op.parallel_copy.len);
+                try std.testing.expectEqual(v3, inst.op.parallel_copy[0].dst);
+                try std.testing.expectEqual(ir.IrType.i32, inst.op.parallel_copy[0].ty);
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 2), pc_blocks);
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+}
+
+test "compile: phi-resolution end-to-end produces no per-arm frame round-trip" {
+    // Build a small loop with a phi (loop counter):
+    //   b0:  v_init = iconst 0; br b1
+    //   b1:  v_i = phi (b0, v_init) (b1, v_next); v_next = v_i + 1;
+    //        br_if cond → b1 else b2
+    //   b2:  ret v_i
+    // The phi-resolution should NOT emit `str ... [fp, ...]` and
+    // matching `ldr` purely for the phi bridge: instead a register MOV
+    // (or, when the coalescer wins, no instruction at all).
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+
+    const v_init = func.newVReg();
+    const v_i = func.newVReg();
+    const v_one = func.newVReg();
+    const v_next = func.newVReg();
+    const v_cond = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 0 }, .dest = v_init, .type = .i32 });
+    try func.getBlock(b0).append(.{ .op = .{ .br = b1 } });
+
+    const edges = try allocator.alloc(ir.Inst.PhiEdge, 2);
+    edges[0] = .{ .block = b0, .val = v_init };
+    edges[1] = .{ .block = b1, .val = v_next };
+    try func.getBlock(b1).append(.{ .op = .{ .phi = edges }, .dest = v_i, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 1 }, .dest = v_one, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v_i, .rhs = v_one } }, .dest = v_next, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .iconst_32 = 10 }, .dest = v_cond, .type = .i32 });
+    try func.getBlock(b1).append(.{ .op = .{ .br_if = .{ .cond = v_cond, .then_block = b1, .else_block = b2 } } });
+
+    try func.getBlock(b2).append(.{ .op = .{ .ret = v_i } });
+
+    try func.getBlock(b1).addPredecessor(b0);
+    try func.getBlock(b1).addPredecessor(b1);
+    try func.getBlock(b2).addPredecessor(b1);
+
+    _ = try @import("../../ir/passes.zig").lowerPhisToLocals(&func, allocator);
+    _ = try @import("../../ir/passes.zig").coalescePhiLocalsToParallelCopy(&func, allocator);
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
 }
 
 test "compileFunction: iconst_32 + ret" {

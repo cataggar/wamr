@@ -198,6 +198,13 @@ pub fn buildUseDef(func: *const ir.IrFunction, allocator: std.mem.Allocator) !st
                         entry.value_ptr.use_count += 1;
                     }
                 },
+                .parallel_copy => |pairs| {
+                    for (pairs) |p| {
+                        const entry = try info.getOrPut(p.src);
+                        if (!entry.found_existing) entry.value_ptr.* = .{};
+                        entry.value_ptr.use_count += 1;
+                    }
+                },
                 else => {},
             }
         }
@@ -529,6 +536,8 @@ fn getUsedVRegs(inst: ir.Inst) BoundedVRegList {
         .elem_drop => {},
         // Phi operands handled separately (unbounded, like call args).
         .phi => {},
+        // Parallel-copy operands handled separately (unbounded slice).
+        .parallel_copy => {},
     }
     return list;
 }
@@ -999,6 +1008,11 @@ pub fn replaceInInst(inst: *ir.Inst, old: ir.VReg, new: ir.VReg) void {
         .phi => |edges| {
             for (@constCast(edges)) |*edge| {
                 if (edge.val == old) edge.val = new;
+            }
+        },
+        .parallel_copy => |pairs| {
+            for (@constCast(pairs)) |*p| {
+                if (p.src == old) p.src = new;
             }
         },
     }
@@ -5049,6 +5063,12 @@ fn shiftVRegsInInst(inst: *ir.Inst, offset: ir.VReg) void {
         .phi => |edges| {
             for (@constCast(edges)) |*edge| edge.val += offset;
         },
+        .parallel_copy => |pairs| {
+            for (@constCast(pairs)) |*p| {
+                p.src += offset;
+                p.dst += offset;
+            }
+        },
     }
 }
 
@@ -5844,6 +5864,7 @@ pub fn promoteLocalsToSSA(func: *ir.IrFunction, allocator: std.mem.Allocator) !b
 /// writes to one don't clobber reads of another.
 pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
     var changed = false;
+    const original_local_count = func.local_count;
     var next_synth_local = func.local_count;
 
     for (func.blocks.items) |*block| {
@@ -5892,6 +5913,14 @@ pub fn lowerPhisToLocals(func: *ir.IrFunction, allocator: std.mem.Allocator) !bo
     // Update local_count to include synthetic locals.
     if (next_synth_local > func.local_count) {
         func.local_count = next_synth_local;
+        // Record the synthetic-local range so the aarch64
+        // `coalescePhiLocalsToParallelCopy` pass can identify them
+        // even if a downstream pass (e.g. `inductionVariableSimplification`)
+        // bumps `local_count` further afterwards.
+        if (func.phi_synth_local_start == null) {
+            func.phi_synth_local_start = original_local_count;
+        }
+        func.phi_synth_local_end = next_synth_local;
     }
 
     return changed;
@@ -5907,6 +5936,150 @@ fn findTerminatorIndex(block: *const ir.BasicBlock) usize {
         }
     }
     return block.instructions.items.len;
+}
+
+/// Phi-resolution: route through register MOV instead of frame round-trip
+/// (#540 / #386 follow-up). Coalesces the (`local_set` in each predecessor
+/// + `local_get` at the join) pair that `lowerPhisToLocals` emits per
+/// synthetic phi local into a single `parallel_copy` IR op at each
+/// predecessor's terminator. Every contributing `local_get` is removed
+/// and the join's phi-destination vreg is defined directly by the
+/// predecessors' parallel_copy, eliminating the per-arm `frameStore`/
+/// `frameLoad` round-trip on the aarch64 emit path.
+///
+/// Cycle correctness (e.g. swap `a→b, b→a`) is the aarch64 emitter's
+/// responsibility — this pass produces an unordered batch and the
+/// codegen runs a 4-phase parallel-copy resolver over the physreg-assigned
+/// pairs.
+///
+/// Scope: only scalar phis (i32/i64/f32/f64). v128 synth locals are left
+/// on the existing memory path — out of scope for #540's first cut.
+///
+/// Idempotent: a second call observes no `local_get` for synth locals and
+/// returns false.
+pub fn coalescePhiLocalsToParallelCopy(func: *ir.IrFunction, allocator: std.mem.Allocator) !bool {
+    const synth_start = func.phi_synth_local_start orelse return false;
+    const synth_end = func.phi_synth_local_end orelse return false;
+    if (synth_start >= synth_end) return false;
+
+    const synth_count = synth_end - synth_start;
+
+    // For each synth idx, find the single `local_get` (at the join) and
+    // record its dest vreg + type + home block. After
+    // `lowerPhisToLocals` these are unique per synth; we conservatively
+    // bail on synths that no longer match the canonical fingerprint
+    // (e.g. a downstream pass duplicated or eliminated the local_get).
+    const Info = struct {
+        join_block: ir.BlockId,
+        get_inst_idx: usize,
+        dest: ir.VReg,
+        ty: ir.IrType,
+        seen_count: u8,
+        eligible: bool,
+    };
+    var info = try allocator.alloc(Info, synth_count);
+    defer allocator.free(info);
+    for (info) |*it| it.* = .{
+        .join_block = 0,
+        .get_inst_idx = 0,
+        .dest = 0,
+        .ty = .void,
+        .seen_count = 0,
+        .eligible = false,
+    };
+
+    for (func.blocks.items, 0..) |*block, bid_us| {
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.op != .local_get) continue;
+            const idx = inst.op.local_get;
+            if (idx < synth_start or idx >= synth_end) continue;
+            const slot = &info[idx - synth_start];
+            slot.seen_count +|= 1;
+            if (slot.seen_count > 1) {
+                slot.eligible = false;
+                continue;
+            }
+            const dest = inst.dest orelse continue;
+            // Scope restriction: scalar only. v128 keeps the memory path.
+            switch (inst.type) {
+                .i32, .i64, .f32, .f64 => {},
+                else => continue,
+            }
+            slot.join_block = @intCast(bid_us);
+            slot.get_inst_idx = ii;
+            slot.dest = dest;
+            slot.ty = inst.type;
+            slot.eligible = true;
+        }
+    }
+
+    // Walk every block; for each, gather (dst, src, ty) tuples from
+    // `local_set <synth>, val` instructions whose synth is eligible.
+    // Remove those local_sets and insert one `parallel_copy` before the
+    // terminator. Also clear the join-side local_get for eligible synths.
+
+    var changed = false;
+    var pair_buf: std.ArrayListUnmanaged(ir.Inst.ParallelCopy) = .empty;
+    defer pair_buf.deinit(allocator);
+
+    for (func.blocks.items) |*block| {
+        pair_buf.clearRetainingCapacity();
+
+        // First pass: collect pairs from this block's local_set's of
+        // eligible synth locals.
+        var k: usize = 0;
+        while (k < block.instructions.items.len) {
+            const inst = block.instructions.items[k];
+            if (inst.op == .local_set) {
+                const ls = inst.op.local_set;
+                if (ls.idx >= synth_start and ls.idx < synth_end) {
+                    const slot = &info[ls.idx - synth_start];
+                    if (slot.eligible) {
+                        try pair_buf.append(allocator, .{
+                            .dst = slot.dest,
+                            .src = ls.val,
+                            .ty = slot.ty,
+                        });
+                        _ = block.instructions.orderedRemove(k);
+                        continue;
+                    }
+                }
+            }
+            k += 1;
+        }
+
+        if (pair_buf.items.len > 0) {
+            const term_idx = findTerminatorIndex(block);
+            const owned = try allocator.dupe(ir.Inst.ParallelCopy, pair_buf.items);
+            try block.instructions.insert(func.allocator, term_idx, .{
+                .op = .{ .parallel_copy = owned },
+            });
+            changed = true;
+        }
+    }
+
+    // Second sweep: remove join-side local_get's for eligible synths.
+    // Done after pair collection so we don't accidentally edit indices
+    // before knowing all per-block insertions.
+    for (info) |it| {
+        if (!it.eligible) continue;
+        const block = &func.blocks.items[it.join_block];
+        var found: ?usize = null;
+        for (block.instructions.items, 0..) |inst, ii| {
+            if (inst.op != .local_get) continue;
+            const dest = inst.dest orelse continue;
+            if (dest == it.dest) {
+                found = ii;
+                break;
+            }
+        }
+        if (found) |gi| {
+            _ = block.instructions.orderedRemove(gi);
+            changed = true;
+        }
+    }
+
+    return changed;
 }
 
 // ── Tail Duplication of Small Joins ────────────────────────────────────────
@@ -6071,6 +6244,9 @@ fn vregHasExternalUse(
                 },
                 .phi => |edges| for (edges) |e| {
                     if (e.val == vreg) return true;
+                },
+                .parallel_copy => |pairs| for (pairs) |pp| {
+                    if (pp.src == vreg) return true;
                 },
                 else => {},
             }

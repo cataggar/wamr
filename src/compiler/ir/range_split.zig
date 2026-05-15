@@ -709,6 +709,7 @@ pub fn forEachUseInst(
             try visit(context, tg.delta);
         },
         .phi => |edges| for (edges) |edge| try visit(context, edge.val),
+        .parallel_copy => |pairs| for (pairs) |p| try visit(context, p.src),
         .v128_not => |v| try visit(context, v),
         .v128_any_true => |v| try visit(context, v),
         .v128_load => |ld| try visit(context, ld.base),
