@@ -1181,6 +1181,36 @@ pub const SocketsP3StreamCtx = struct {
     family: IpAddressFamily,
 };
 
+/// Lifetime-stable context for a `host_driver` attached to an
+/// `AsyncStream` created by `descriptor.write-via-stream` /
+/// `descriptor.append-via-stream` (#571). The executor invokes
+/// `writeViaStreamOnWrite` with this opaque pointer; the callback
+/// looks up the underlying `FsDescriptor` (so a guest dropping the
+/// descriptor while the stream is still live surfaces gracefully as
+/// `.err`) and `pwrite(2)`s the guest's bytes at
+/// `offset + bytes_written`, tracking the running offset.
+///
+/// Owned by `WasiCliAdapter.fs_write_stream_ctxs`; freed in adapter
+/// `deinit` after the executor has released all `AsyncStream` slots.
+pub const FsWriteStreamCtx = struct {
+    adapter: *WasiCliAdapter,
+    /// Guest-visible `descriptor` handle for the target file. We
+    /// re-lookup on every callback instead of stashing a `std.Io.File`
+    /// by value so a `[resource-drop]descriptor` mid-stream surfaces
+    /// as an error instead of a UAF on the fd.
+    desc_handle: u32,
+    /// Base offset captured at `write-via-stream` call time. For
+    /// `append-via-stream` we ignore this and re-stat each call.
+    offset: u64,
+    /// Running byte counter — sum of all bytes pwrite'd so far. The
+    /// next `on_write` call writes at `offset + bytes_written`.
+    bytes_written: u64,
+    /// True if this driver was installed by `append-via-stream`. The
+    /// `on_write` callback stats the file each call and writes at
+    /// end-of-file instead of `offset + bytes_written`.
+    append: bool,
+};
+
 /// Map a `std.Io.net.HostName.LookupError` to the closest
 /// `wasi:sockets/network.error-code` variant. Most parse / nameserver
 /// failures funnel into `permanent-resolver-failure`; transient errors
@@ -2747,6 +2777,13 @@ pub const WasiCliAdapter = struct {
     /// itself but not the host context. Each entry is a small struct
     /// (fd + adapter pointer + family).
     sockets_p3_stream_ctxs: std.ArrayListUnmanaged(*SocketsP3StreamCtx) = .empty,
+    /// Lifetimes for `host_driver` contexts attached to `AsyncStream`
+    /// slots produced by `descriptor.write-via-stream` /
+    /// `descriptor.append-via-stream` (#571). The adapter owns these
+    /// so the `*AsyncStream`'s `host_driver.context` pointer stays
+    /// valid for the lifetime of the stream — the executor frees the
+    /// `AsyncStream` itself but not the host context.
+    fs_write_stream_ctxs: std.ArrayListUnmanaged(*FsWriteStreamCtx) = .empty,
 
     /// `wasi:http/types` resource tables (#149). Each slot owns a
     /// heap-allocated rep struct; resource-drop nulls the slot and
@@ -3010,6 +3047,8 @@ pub const WasiCliAdapter = struct {
         self.resolve_streams.deinit(self.allocator);
         for (self.sockets_p3_stream_ctxs.items) |ctx| self.allocator.destroy(ctx);
         self.sockets_p3_stream_ctxs.deinit(self.allocator);
+        for (self.fs_write_stream_ctxs.items) |ctx| self.allocator.destroy(ctx);
+        self.fs_write_stream_ctxs.deinit(self.allocator);
 
         // wasi:http resource tables (#149). Each slot owns its heap
         // rep; HttpFields and OutgoingRequest also own inner string
@@ -8028,6 +8067,12 @@ pub const WasiCliAdapter = struct {
         const stream_handle = ci.allocAsyncHandle();
         var slot: async_mod.AsyncStream = .{
             .elem_type_idx = 0,
+            // Pin byte stride (#571 / PR #573 pattern). `stream<u8>`
+            // resolves to size 1 in the guest's component-local
+            // registry, but cross-instance type-idx resolution can
+            // silently regress; the hint keeps `stream.read t`
+            // draining in the right units.
+            .elem_size_hint = 1,
             .state = .open,
             .read_closed = false,
             // Mark the writable end closed up-front: the host has
@@ -8125,10 +8170,20 @@ pub const WasiCliAdapter = struct {
         _ = allocator;
     }
 
-    /// Common helper: drain the canonical stream FIFO and write its
-    /// contents to the file. Returns a ready `future<result<_,
-    /// error-code>>` whose canonical payload reflects whether the
-    /// drain succeeded.
+    /// Common helper: install a `host_driver.on_write` on the guest's
+    /// `stream<u8>` so subsequent `stream.write`s pwrite into `fs_file`
+    /// at `offset + bytes_written` (or end-of-file when `append` is
+    /// set). Any bytes the guest pre-buffered into the stream FIFO
+    /// before calling `write-via-stream` / `append-via-stream` are
+    /// drained eagerly through the same path so the running offset
+    /// stays consistent with the install-time invariants.
+    ///
+    /// The companion `future<result<_,error-code>>` settles to ok
+    /// immediately — per-write failures surface to the guest through
+    /// `read_closed = true` on the stream, which causes the next
+    /// `stream.write` to return DROPPED (the guest's `StreamResult`
+    /// loop in `pwrite` then breaks out and reports the partial
+    /// `written` count).
     fn fsWriteFromStream(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
@@ -8152,23 +8207,114 @@ pub const WasiCliAdapter = struct {
                 break :blk try spawnReadyErrFsFuture(ci, .bad_descriptor);
             };
 
-            // Drain the FIFO in-place.
-            const bytes = slot.buffer.items;
-            const io = std.Io.Threaded.global_single_threaded.io();
-            const write_offset: u64 = if (append) blk_off: {
-                // Best-effort append: position at current end-of-file.
-                const stat = fs_file.file.stat(io) catch break :blk_off offset;
-                break :blk_off stat.size;
-            } else offset;
-            fs_file.file.writePositionalAll(io, bytes, write_offset) catch |err| {
+            const ctx = try self.allocFsWriteStreamCtx(desc_handle, offset, append);
+
+            // Pin byte stride (#571 / PR #573 pattern). `stream<u8>`
+            // resolves to size 1 in the guest's component-local
+            // registry, but cross-instance type-idx resolution can
+            // silently regress; the hint keeps `stream.read t` /
+            // `stream.write t` draining in the right units.
+            slot.elem_size_hint = 1;
+
+            // Drain any bytes the guest pre-buffered (eagerly written
+            // into the stream before invoking `write-via-stream`)
+            // straight through the pwrite path so the install-time
+            // running offset is accurate.
+            if (slot.buffer.items.len > 0) {
+                const action = fsWriteViaStreamOnWrite(
+                    ctx,
+                    slot,
+                    slot.buffer.items,
+                    ci.allocator,
+                );
                 slot.buffer.clearRetainingCapacity();
-                break :blk try spawnReadyErrFsFuture(ci, mapFsError(err));
+                switch (action) {
+                    .progressed => {},
+                    .would_block => {},
+                    .eof, .err => {
+                        slot.read_closed = true;
+                        break :blk try spawnReadyErrFsFuture(ci, .io);
+                    },
+                }
+            }
+
+            // Install the driver so subsequent guest `stream.write`s
+            // flow through `fsWriteViaStreamOnWrite` → pwrite(2).
+            slot.host_driver = .{
+                .context = ctx,
+                .on_write = &fsWriteViaStreamOnWrite,
             };
-            slot.buffer.clearRetainingCapacity();
 
             break :blk try spawnReadyOkFsFuture(ci);
         };
         results[0] = .{ .handle = future_handle };
+    }
+
+    /// Allocate a heap-stable `FsWriteStreamCtx` and stash it on
+    /// `fs_write_stream_ctxs` so the executor's `*AsyncStream` can
+    /// hold a stable `host_driver.context` pointer for the lifetime
+    /// of the stream.
+    fn allocFsWriteStreamCtx(
+        self: *WasiCliAdapter,
+        desc_handle: u32,
+        offset: u64,
+        append: bool,
+    ) !*FsWriteStreamCtx {
+        const ctx = try self.allocator.create(FsWriteStreamCtx);
+        ctx.* = .{
+            .adapter = self,
+            .desc_handle = desc_handle,
+            .offset = offset,
+            .bytes_written = 0,
+            .append = append,
+        };
+        self.fs_write_stream_ctxs.append(self.allocator, ctx) catch {
+            self.allocator.destroy(ctx);
+            return error.OutOfMemory;
+        };
+        return ctx;
+    }
+
+    /// `host_driver.on_write` for a `descriptor.write-via-stream` /
+    /// `descriptor.append-via-stream` `stream<u8>` slot (#571).
+    ///
+    /// Pulls the guest's chunk and `pwrite(2)`s it at
+    /// `offset + bytes_written` (or end-of-file in append mode),
+    /// advancing the running counter so the next chunk lands
+    /// contiguously. Returns `.progressed` on success, `.err` on
+    /// syscall error so the executor flips `read_closed = true` and
+    /// the guest's next `stream.write` returns DROPPED.
+    ///
+    /// Re-looks up the underlying `FsDescriptor` each call: if the
+    /// guest dropped the descriptor while the stream is still live,
+    /// the lookup fails and we surface `.err` rather than UAF the fd.
+    fn fsWriteViaStreamOnWrite(
+        opaque_ctx: ?*anyopaque,
+        _: *async_mod.AsyncStream,
+        bytes: []const u8,
+        _: Allocator,
+    ) async_mod.HostStreamAction {
+        const ctx: *FsWriteStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (bytes.len == 0) return .progressed;
+        const d = ctx.adapter.lookupFsDescriptor(ctx.desc_handle) orelse return .err;
+        const fs_file: FsDescriptor.FsFile = switch (d.*) {
+            .file => |f| f,
+            .dir, .preopen => return .err,
+        };
+        if (!fs_file.flags.write) return .err;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const write_offset: u64 = if (ctx.append) blk: {
+            // Append mode: position at the current end-of-file. We
+            // re-stat each chunk so concurrent extenders (other
+            // descriptors pointing at the same inode) don't clobber
+            // bytes we just wrote. Best-effort: a stat failure
+            // surfaces as `.err`.
+            const stat = fs_file.file.stat(io) catch return .err;
+            break :blk stat.size;
+        } else ctx.offset +% ctx.bytes_written;
+        fs_file.file.writePositionalAll(io, bytes, write_offset) catch return .err;
+        ctx.bytes_written += @as(u64, bytes.len);
+        return .progressed;
     }
 
     // ── Tier C: canonical stream<directory-entry> ──────────────────────
@@ -19412,6 +19558,250 @@ test "wasi:filesystem@0.3.0 write-via-stream: drains stream FIFO into file at of
     var buf: [16]u8 = undefined;
     const n = try file.readPositional(io, &.{&buf}, 0);
     try testing.expectEqualStrings("hello-p3", buf[0..n]);
+}
+
+test "wasi:filesystem@0.3.0 write-via-stream: host_driver pwrites guest chunks at offset 0 (#571)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-pwrite-0.txt", .data = "" });
+    const file = try tmp.dir.openFile(io, "p3-pwrite-0.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Allocate an empty open stream — the guest hasn't pushed bytes yet.
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, stream_handle, .{});
+
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .handle = stream_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+
+    // The driver must be installed and the stride pinned to 1 byte.
+    const slot = ci.streams.getPtr(stream_handle).?;
+    try testing.expect(slot.host_driver != null);
+    try testing.expect(slot.host_driver.?.on_write != null);
+    try testing.expectEqual(@as(?u32, 1), slot.elem_size_hint);
+
+    // Simulate two guest stream.write chunks through the installed
+    // `on_write` callback. Each chunk lands at offset + bytes_written.
+    const cb = slot.host_driver.?.on_write.?;
+    try testing.expectEqual(
+        async_mod.HostStreamAction.progressed,
+        cb(slot.host_driver.?.context, slot, "hello", testing.allocator),
+    );
+    try testing.expectEqual(
+        async_mod.HostStreamAction.progressed,
+        cb(slot.host_driver.?.context, slot, "!", testing.allocator),
+    );
+
+    // The file content reflects the two chunks contiguously at offset 0.
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositional(io, &.{&buf}, 0);
+    try testing.expectEqualStrings("hello!", buf[0..n]);
+}
+
+test "wasi:filesystem@0.3.0 write-via-stream: pwrite at non-zero offset is in-place (no truncate / no cursor advance) (#571)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Pre-seed an 8-byte file. A non-zero-offset pwrite must overlay
+    // bytes mid-stream and leave the surrounding bytes intact.
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-pwrite-3.txt", .data = "ABCDEFGH" });
+    const file = try tmp.dir.openFile(io, "p3-pwrite-3.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, stream_handle, .{});
+
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .handle = stream_handle },
+        .{ .u64 = 3 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    const slot = ci.streams.getPtr(stream_handle).?;
+    const cb = slot.host_driver.?.on_write.?;
+
+    // Simulate two guest stream.write chunks "XY" + "Z". They land at
+    // offsets 3 and 5 (3 + 2 bytes_written), not at the file's end.
+    try testing.expectEqual(
+        async_mod.HostStreamAction.progressed,
+        cb(slot.host_driver.?.context, slot, "XY", testing.allocator),
+    );
+    try testing.expectEqual(
+        async_mod.HostStreamAction.progressed,
+        cb(slot.host_driver.?.context, slot, "Z", testing.allocator),
+    );
+
+    // File: 'ABC' + 'XYZ' + 'GH' = 'ABCXYZGH' — 8 bytes still, no
+    // truncation, surrounding bytes preserved, and the descriptor's
+    // own cursor is untouched (pwrite uses an explicit offset).
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositional(io, &.{&buf}, 0);
+    try testing.expectEqualStrings("ABCXYZGH", buf[0..n]);
+    try testing.expectEqual(@as(usize, 8), n);
+
+    // A subsequent readPositional at offset 0 still observes byte 0 —
+    // confirming pwrite did not move a kernel-level cursor. (The
+    // descriptor's logical pwrite/pread offset is per-call, not
+    // stateful, so a fresh read at 0 sees the full file.)
+    var head: [1]u8 = undefined;
+    _ = try file.readPositional(io, &.{&head}, 0);
+    try testing.expectEqual(@as(u8, 'A'), head[0]);
+}
+
+test "wasi:filesystem@0.3.0 read-via-stream + write-via-stream: independent offsets on the same descriptor (#571)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-iopair.txt", .data = "0123456789" });
+    const file = try tmp.dir.openFile(io, "p3-iopair.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // 1. read-via-stream at offset 5 pre-buffers "56789" eagerly.
+    {
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 5 } };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorReadViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+
+        try testing.expect(results[0] == .tuple_val);
+        const read_stream_handle = results[0].tuple_val[0].handle;
+        const read_slot = ci.streams.getPtr(read_stream_handle).?;
+        try testing.expectEqualStrings("56789", read_slot.buffer.items);
+        try testing.expectEqual(@as(?u32, 1), read_slot.elem_size_hint);
+
+        // 2. write-via-stream at offset 2 installs the on_write driver
+        // on a SEPARATE stream handle. Both streams coexist on the
+        // same descriptor without sharing state.
+        const write_stream_handle = ci.allocAsyncHandle();
+        try ci.streams.put(testing.allocator, write_stream_handle, .{});
+        var wargs = [_]InterfaceValue{
+            .{ .handle = handle },
+            .{ .handle = write_stream_handle },
+            .{ .u64 = 2 },
+        };
+        var wresults: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.fsDescriptorWriteViaStreamP3(&adapter, &ci, &wargs, &wresults, testing.allocator);
+
+        const write_slot = ci.streams.getPtr(write_stream_handle).?;
+        try testing.expect(write_slot.host_driver != null);
+        try testing.expectEqual(@as(?u32, 1), write_slot.elem_size_hint);
+        try testing.expect(write_stream_handle != read_stream_handle);
+
+        // 3. Drive two writes through the write stream's on_write.
+        //    "AB" lands at offset 2; "C" lands at offset 4. The read
+        //    stream's FIFO must be unaffected — its bytes were
+        //    pre-buffered at the install time of read-via-stream and
+        //    operate on an independent logical cursor.
+        const cb = write_slot.host_driver.?.on_write.?;
+        try testing.expectEqual(
+            async_mod.HostStreamAction.progressed,
+            cb(write_slot.host_driver.?.context, write_slot, "AB", testing.allocator),
+        );
+        try testing.expectEqual(
+            async_mod.HostStreamAction.progressed,
+            cb(write_slot.host_driver.?.context, write_slot, "C", testing.allocator),
+        );
+
+        // Read stream's buffer is still "56789" — the writes at
+        // offsets 2..5 didn't touch it. (Read stream's cursor is
+        // logically frozen at the install-time snapshot.)
+        try testing.expectEqualStrings("56789", read_slot.buffer.items);
+    }
+
+    // 4. File on disk: original "0123456789" with bytes 2..5 replaced
+    //    by "ABC" → "01ABC56789".
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositional(io, &.{&buf}, 0);
+    try testing.expectEqualStrings("01ABC56789", buf[0..n]);
+}
+
+test "wasi:filesystem@0.3.0 append-via-stream: host_driver pwrites guest chunks at end-of-file (#571)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-append.txt", .data = "head" });
+    const file = try tmp.dir.openFile(io, "p3-append.txt", .{ .mode = .read_write });
+    const handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, stream_handle, .{});
+
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .handle = stream_handle } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorAppendViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    const slot = ci.streams.getPtr(stream_handle).?;
+    const cb = slot.host_driver.?.on_write.?;
+    try testing.expectEqualSlices(u8, &.{}, slot.buffer.items);
+
+    // Each append chunk lands at the current end-of-file (re-stat per call).
+    try testing.expectEqual(
+        async_mod.HostStreamAction.progressed,
+        cb(slot.host_driver.?.context, slot, "-tail", testing.allocator),
+    );
+    try testing.expectEqual(
+        async_mod.HostStreamAction.progressed,
+        cb(slot.host_driver.?.context, slot, "-more", testing.allocator),
+    );
+
+    var buf: [32]u8 = undefined;
+    const n = try file.readPositional(io, &.{&buf}, 0);
+    try testing.expectEqualStrings("head-tail-more", buf[0..n]);
 }
 
 test "wasi:filesystem@0.3.0 sync: async-func wrapper returns a ready future (#484)" {
