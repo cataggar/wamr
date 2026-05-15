@@ -1437,7 +1437,16 @@ fn bindAndGetsockname(
         .udp => std.posix.IPPROTO.UDP,
         else => 0,
     } else 0;
-    const flags = sock_type | std.posix.SOCK.CLOEXEC;
+    // On Darwin (and Haiku) `SOCK.CLOEXEC` is a Zig-supplied shim — not a real
+    // BSD kernel flag — so it must NOT be OR'd into the raw `socket(2)` type
+    // argument or the kernel rejects it with EINVAL. Instead, do a bare
+    // `socket(2)` and apply FD_CLOEXEC via `fcntl(F_SETFD, …)` afterwards.
+    // This mirrors `std.Io.Threaded.openSocketPosix` (Threaded.zig:12243).
+    const socket_flags_unsupported = switch (native_os) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst, .haiku => true,
+        else => false,
+    };
+    const flags: u32 = sock_type | if (socket_flags_unsupported) 0 else std.posix.SOCK.CLOEXEC;
     const sock_rc = std.posix.system.socket(fam, flags, proto);
     switch (std.posix.errno(sock_rc)) {
         .SUCCESS => {},
@@ -1452,6 +1461,18 @@ fn bindAndGetsockname(
     }
     const fd: std.posix.fd_t = @intCast(sock_rc);
     errdefer _ = std.posix.system.close(fd);
+
+    if (socket_flags_unsupported) {
+        while (true) switch (std.posix.errno(std.posix.system.fcntl(
+            fd,
+            std.posix.F.SETFD,
+            @as(usize, std.posix.FD_CLOEXEC),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.SystemResources,
+        };
+    }
 
     // SO_REUSEADDR semantics differ between BSD and Linux. The WIT 0.3
     // sockets spec doesn't actually mandate SO_REUSEADDR be set by
