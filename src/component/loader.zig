@@ -918,19 +918,45 @@ fn readValType(reader: *BinaryReader) LoadError!ctypes.ValType {
     };
 }
 
-/// Read `(stream|future) t?` per defvaltype 0x66/0x65. Sub-PR 3 of #478
-/// accepts only the `t?` = present form (`0x01 valtype`); the empty
-/// form is rejected with `InvalidEncoding` until a follow-up wires
-/// payload-less streams/futures. The inner valtype must be a typeidx —
-/// the host-side `async_mod.{Future,AsyncStream}` only carries `u32`
-/// values today, so primitive-only payloads suffice but aren't yet
-/// modelled in the IR.
+/// Read `(stream|future) t?` per defvaltype 0x66/0x65.
+///
+/// Three legal encodings:
+///   - `0x00`             → empty form: `(stream)` / `(future)`. Stored
+///     with payload `STREAM_FUTURE_EMPTY`.
+///   - `0x01 <typeidx>`   → `(stream T)` / `(future T)` where T is a
+///     component type-indexspace entry. Stored as the raw typeidx.
+///   - `0x01 <primvaltype>` → `(stream p)` / `(future p)` where p is a
+///     primitive value type (e.g. `u8`). Stored with payload
+///     `encodeStreamFuturePrimitiveByte(...)`. Required to load real
+///     wasm32-wasip3 components emitted by wit-bindgen — `wasi:cli` 0.3
+///     declares `stream<u8>` directly in the type section.
 fn readPayloadedValType(reader: *BinaryReader, comptime kind: enum { future, stream }) LoadError!ctypes.ValType {
     const present = try reader.readByte();
+    if (present == 0x00) {
+        return switch (kind) {
+            .future => .{ .future = ctypes.STREAM_FUTURE_EMPTY },
+            .stream => .{ .stream = ctypes.STREAM_FUTURE_EMPTY },
+        };
+    }
     if (present != 0x01) return error.InvalidEncoding;
     const inner = try readValType(reader);
-    const idx = switch (inner) {
+    const idx: u32 = switch (inner) {
         .type_idx => |i| i,
+        // Primitive payloads — encode as a sentinel so downstream code
+        // can recover the original primitive via `decodeStreamFutureInner`.
+        .bool => ctypes.encodeStreamFuturePrimitiveByte(0x7F),
+        .s8 => ctypes.encodeStreamFuturePrimitiveByte(0x7E),
+        .u8 => ctypes.encodeStreamFuturePrimitiveByte(0x7D),
+        .s16 => ctypes.encodeStreamFuturePrimitiveByte(0x7C),
+        .u16 => ctypes.encodeStreamFuturePrimitiveByte(0x7B),
+        .s32 => ctypes.encodeStreamFuturePrimitiveByte(0x7A),
+        .u32 => ctypes.encodeStreamFuturePrimitiveByte(0x79),
+        .s64 => ctypes.encodeStreamFuturePrimitiveByte(0x78),
+        .u64 => ctypes.encodeStreamFuturePrimitiveByte(0x77),
+        .f32 => ctypes.encodeStreamFuturePrimitiveByte(0x76),
+        .f64 => ctypes.encodeStreamFuturePrimitiveByte(0x75),
+        .char => ctypes.encodeStreamFuturePrimitiveByte(0x74),
+        .string => ctypes.encodeStreamFuturePrimitiveByte(0x73),
         else => return error.InvalidEncoding,
     };
     return switch (kind) {
@@ -1384,12 +1410,17 @@ test "readValType: error-context (0x64)" {
     try std.testing.expect(v == .error_context);
 }
 
-test "readValType: future<u32>" {
+test "readValType: future<u32> primitive payload" {
     // 0x65 0x01 0x79 (future + present + u32 primvaltype). Inner u32 is
-    // a primvaltype, so it lands as `.u32` not `.type_idx`; sub-PR 3
-    // only accepts the typeidx form so this is `error.InvalidEncoding`.
+    // a primvaltype; we encode it via the sentinel scheme so downstream
+    // code can recover the primitive ValType. See loader.zig
+    // `readPayloadedValType` for the encoding.
     var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x01, 0x79 } };
-    try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .future);
+    const decoded = ctypes.decodeStreamFutureInner(v.future);
+    try std.testing.expect(decoded == .primitive);
+    try std.testing.expect(decoded.primitive == .u32);
 }
 
 test "readValType: stream with typeidx payload" {
@@ -1398,6 +1429,9 @@ test "readValType: stream with typeidx payload" {
     const v = try readValType(&reader);
     try std.testing.expect(v == .stream);
     try std.testing.expectEqual(@as(u32, 3), v.stream);
+    const decoded = ctypes.decodeStreamFutureInner(v.stream);
+    try std.testing.expect(decoded == .typeidx);
+    try std.testing.expectEqual(@as(u32, 3), decoded.typeidx);
 }
 
 test "readValType: future with typeidx payload" {
@@ -1407,9 +1441,34 @@ test "readValType: future with typeidx payload" {
     try std.testing.expectEqual(@as(u32, 5), v.future);
 }
 
-test "readValType: stream rejects empty payload (sub-PR 3 scope)" {
+test "readValType: stream<u8> primitive payload (#537)" {
+    // wit-bindgen emits `stream<u8>` directly in the type section for
+    // wasi:cli@0.3 — see cli-stdio.wasm fixture. The primvaltype byte
+    // tag for u8 is 0x7D; we encode via the sentinel scheme.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x7D } };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .stream);
+    const decoded = ctypes.decodeStreamFutureInner(v.stream);
+    try std.testing.expect(decoded == .primitive);
+    try std.testing.expect(decoded.primitive == .u8);
+}
+
+test "readValType: stream empty form (#537)" {
+    // `(stream)` with no element — encoded as `0x66 0x00`. Required by
+    // some pure-signaling stream uses.
     var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x00 } };
-    try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .stream);
+    const decoded = ctypes.decodeStreamFutureInner(v.stream);
+    try std.testing.expect(decoded == .empty);
+}
+
+test "readValType: future empty form (#537)" {
+    var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x00 } };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .future);
+    const decoded = ctypes.decodeStreamFutureInner(v.future);
+    try std.testing.expect(decoded == .empty);
 }
 
 test "parseCanon: subtask.cancel async?=0x01" {

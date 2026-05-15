@@ -31,11 +31,7 @@
         "filesystem-set-size":         "wasi:filesystem@0.3.0 host bindings wired in #484/#522; end-to-end run blocked on wamr P3 CLI loader — tracking #520",
         "filesystem-stat":             "wasi:filesystem@0.3.0 host bindings wired in #484/#522; end-to-end run blocked on wamr P3 CLI loader — tracking #520",
         "filesystem-unlink-errors":    "wasi:filesystem@0.3.0 host bindings wired in #484/#522; end-to-end run blocked on wamr P3 CLI loader — tracking #520",
-        "cli-env":                "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
-        "cli-exit":               "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
-        "cli-stdio":              "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
-        "cli-stdio-roundtrip":    "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
-        "run-with-err":           "wasi:cli@0.3.0 adapter not yet merged — tracking #482",
+        "cli-stdio-roundtrip":    "P3 stdio works but `futures::join!` rendezvous needs `waitable-set.{wait,poll}` event delivery + callback re-entry loop — tracking #537 follow-up",
         "monotonic-clock":        "wasi:clocks@0.3.0 routing fixed in #534; `wait-for`/`wait-until` need canon-lower-of-async-func runtime support — tracking follow-up",
         "multi-clock-wait":       "wasi:clocks@0.3.0 routing fixed in #534; needs canon-lower-of-async-func + task.cancel-aware sleep cancellation — tracking follow-up"
     }

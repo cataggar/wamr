@@ -45,17 +45,80 @@ pub const ValType = union(enum) {
     //   0x64                       => error-context
     //   0x65 t?:<valtype>?         => (future t?)
     //   0x66 t?:<valtype>?         => (stream t?)
-    // Sub-PR 3 of #478 only accepts the typeidx-carrying form; the
-    // payload-less spelling (`0x65 0x00` / `0x66 0x00`) is rejected at
-    // load with `error.InvalidEncoding` — Wasmtime's tests don't emit it
-    // either, and supporting it cleanly requires a payload variant.
+    // The `u32` field encodes the inner element as either:
+    //   - a real typeidx (when bit 31 is clear), or
+    //   - a sentinel of the form `STREAM_FUTURE_PRIM_FLAG | <primvaltype byte tag>`
+    //     for primitive inner payloads (bit 31 set; low byte is the spec's
+    //     primvaltype byte tag, e.g. 0x7D for `u8`). The bare
+    //     `STREAM_FUTURE_PRIM_FLAG` (low byte 0) represents the empty
+    //     form `0x66 0x00` / `0x65 0x00`.
+    //
+    // Decode via `decodeStreamFutureInner` to recover a `ValType`.
     error_context,
-    future: u32, // typeidx of payload element
-    stream: u32, // typeidx of payload element
+    future: u32,
+    stream: u32,
 
     /// Type index reference (for recursive/named types).
     type_idx: u32,
 };
+
+/// Top-bit sentinel that marks `ValType.stream` / `ValType.future` as
+/// carrying a primitive (or empty) payload rather than a real component
+/// type-indexspace typeidx. The low byte (when set) is the spec's
+/// primvaltype byte tag from the component-model Binary.md valtype
+/// encoding. See `decodeStreamFutureInner` for the inverse mapping.
+pub const STREAM_FUTURE_PRIM_FLAG: u32 = 0x8000_0000;
+
+/// Sentinel marking the empty `(stream)` / `(future)` form — no inner
+/// element type.
+pub const STREAM_FUTURE_EMPTY: u32 = STREAM_FUTURE_PRIM_FLAG;
+
+/// Encode a primvaltype byte tag (e.g. 0x7D for `u8`) into the
+/// `ValType.stream` / `ValType.future` `u32` payload.
+pub fn encodeStreamFuturePrimitiveByte(byte_tag: u8) u32 {
+    return STREAM_FUTURE_PRIM_FLAG | @as(u32, byte_tag);
+}
+
+/// Result of decoding a `ValType.stream` / `ValType.future` payload:
+/// either the empty form (no element), a primitive ValType, or a real
+/// typeidx. `from_typeidx` is `true` iff `value` is a `.type_idx` —
+/// callers that need to follow type-indexspace resolution can branch
+/// on this without re-deconstructing.
+pub const StreamFutureInner = union(enum) {
+    empty,
+    /// Primitive element type — already lifted to a `ValType` variant
+    /// (e.g. `.u8`, `.string`).
+    primitive: ValType,
+    /// Typeidx in the component type indexspace.
+    typeidx: u32,
+};
+
+/// Decode a `ValType.stream` / `ValType.future` `u32` payload back to
+/// its semantic form.
+pub fn decodeStreamFutureInner(payload: u32) StreamFutureInner {
+    if ((payload & STREAM_FUTURE_PRIM_FLAG) == 0) {
+        return .{ .typeidx = payload };
+    }
+    const byte_tag: u8 = @intCast(payload & 0xFF);
+    if (byte_tag == 0) return .empty;
+    return .{ .primitive = switch (byte_tag) {
+        0x7F => ValType.bool,
+        0x7E => ValType.s8,
+        0x7D => ValType.u8,
+        0x7C => ValType.s16,
+        0x7B => ValType.u16,
+        0x7A => ValType.s32,
+        0x79 => ValType.u32,
+        0x78 => ValType.s64,
+        0x77 => ValType.u64,
+        0x76 => ValType.f32,
+        0x75 => ValType.f64,
+        0x74 => ValType.char,
+        0x73 => ValType.string,
+        // Unknown byte tag — fall back to typeidx (best-effort).
+        else => return .{ .typeidx = payload },
+    } };
+}
 
 // ── Compound type definitions ───────────────────────────────────────────────
 

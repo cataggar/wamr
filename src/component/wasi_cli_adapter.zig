@@ -2946,28 +2946,26 @@ pub const WasiCliAdapter = struct {
         if (results.len == 0) return error.InvalidArgs;
 
         // 1. Allocate a stream<u8> handle in the per-instance table.
+        //    Crucially, we do NOT eagerly drain stdin here (#537) —
+        //    the test harness writes to stdin AFTER `run` starts, and
+        //    eager `posix.read` on a still-open pipe would deadlock.
+        //    Instead we install a host-attached `on_read` handler on
+        //    the stream: bytes are pulled from `self.stdin` lazily,
+        //    once per guest `stream.read`.
         const stream_handle = ci.allocAsyncHandle();
+
+        const ctx = self.allocator.create(ReadViaStreamCtx) catch
+            return error.OutOfMemory;
+        ctx.* = .{ .adapter = self };
+
         var stream_entry = async_mod.AsyncStream{};
-        // Drain stdin eagerly into the stream FIFO using the
-        // cross-platform `InputStream.read` (which dispatches by
-        // source variant — buffer/fd/host_file/tcp_stream/closed —
-        // and works on Windows where `std.posix.read` doesn't compile
-        // for raw fd_t values).
-        var tmp: [4096]u8 = undefined;
-        drain: while (true) {
-            switch (self.stdin.read(&tmp)) {
-                .ok => |n| {
-                    if (n == 0) break :drain;
-                    stream_entry.buffer.appendSlice(self.allocator, tmp[0..n]) catch {
-                        stream_entry.deinit(self.allocator);
-                        return error.OutOfMemory;
-                    };
-                },
-                .closed, .err => break :drain,
-            }
-        }
-        stream_entry.write_closed = true;
+        stream_entry.host_handler = async_mod.HostStreamHandler{
+            .on_read = &readViaStreamOnRead,
+            .on_destroy = &readViaStreamOnDestroy,
+            .ctx = ctx,
+        };
         ci.streams.put(self.allocator, stream_handle, stream_entry) catch {
+            self.allocator.destroy(ctx);
             stream_entry.deinit(self.allocator);
             return error.OutOfMemory;
         };
@@ -2990,6 +2988,28 @@ pub const WasiCliAdapter = struct {
         tuple[0] = .{ .handle = stream_handle };
         tuple[1] = .{ .handle = future_handle };
         results[0] = .{ .tuple_val = tuple };
+    }
+
+    const ReadViaStreamCtx = struct {
+        adapter: *WasiCliAdapter,
+    };
+
+    /// `on_read` callback for `wasi:cli/stdin.read-via-stream` (#537).
+    /// Synchronously reads from the host's stdin into the guest's
+    /// destination buffer. Blocks on pipes; returns 0 on EOF; -1 on
+    /// error.
+    fn readViaStreamOnRead(ctx_opaque: ?*anyopaque, dst: []u8) i32 {
+        const c: *ReadViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
+        switch (c.adapter.stdin.read(dst)) {
+            .ok => |n| return @intCast(n),
+            .closed => return 0,
+            .err => return -1,
+        }
+    }
+
+    fn readViaStreamOnDestroy(ctx_opaque: ?*anyopaque) void {
+        const c: *ReadViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
+        c.adapter.allocator.destroy(c);
     }
 
     /// `wasi:cli/stdout@0.3.x.write-via-stream:
@@ -3019,9 +3039,16 @@ pub const WasiCliAdapter = struct {
     }
 
     /// Common body for `stdout.write-via-stream` / `stderr.write-via-stream`.
-    /// Drains any bytes currently buffered in the guest's `stream<u8>`
-    /// into the captured/host sink, marks the stream's read end closed
-    /// (we've consumed it), and returns a settled-ok future handle.
+    /// Installs a host-attached sink on the guest's `stream<u8>` so every
+    /// subsequent `stream.write` is forwarded synchronously to `target`.
+    /// Returns an open `future<result<_,error-code>>` that settles to
+    /// Ok when the guest finally calls `stream.drop-writable` (#537).
+    ///
+    /// WAMR has no async scheduler, so we can't asynchronously "pump"
+    /// the stream — we instead rely on the executor's `stream.write`
+    /// arm forwarding directly via `AsyncStream.host_handler`. This
+    /// mirrors what a real async runtime would do with a long-lived
+    /// `stream.read` parked on the host side.
     fn writeViaStreamImplP3(
         self: *WasiCliAdapter,
         target: *streams.OutputStream,
@@ -3036,26 +3063,103 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
 
+        // Allocate the companion future first so we can capture its
+        // handle inside the host-handler context.
+        const future_handle = ci.allocAsyncHandle();
+        const fut_entry = async_mod.Future{ .state = .pending, .payload = null };
+        ci.futures.put(self.allocator, future_handle, fut_entry) catch
+            return error.OutOfMemory;
+
+        const ctx = self.allocator.create(WriteViaStreamCtx) catch
+            return error.OutOfMemory;
+        ctx.* = .{
+            .adapter = self,
+            .target = target,
+            .ci = ci,
+            .future_handle = future_handle,
+        };
+
         if (ci.streams.getPtr(stream_handle)) |s| {
+            // Drain any bytes already buffered (e.g. eagerly written
+            // before the host became attached).
             if (s.buffer.items.len > 0) {
                 switch (target.write(s.buffer.items, self.allocator)) {
                     .ok => {},
-                    .err, .closed => return error.IoError,
+                    .err, .closed => {
+                        self.allocator.destroy(ctx);
+                        return error.IoError;
+                    },
                 }
                 s.buffer.clearRetainingCapacity();
             }
-            s.read_closed = true;
+            // Install host handler — every future `stream.write` from
+            // the guest goes synchronously to `target`.
+            s.host_handler = async_mod.HostStreamHandler{
+                .on_write = &writeViaStreamOnWrite,
+                .on_drop_writable = &writeViaStreamOnDropWritable,
+                .on_destroy = &writeViaStreamOnDestroy,
+                .ctx = ctx,
+            };
+            // If the writer was already dropped (the synchronous "no
+            // concurrent writer" case), settle the future immediately.
+            if (s.write_closed) writeViaStreamOnDropWritable(ctx);
+        } else {
+            // Unknown stream handle — settle the future to ok so the
+            // guest's await completes without panicking.
+            writeViaStreamOnDropWritable(ctx);
         }
 
-        const future_handle = ci.allocAsyncHandle();
-        const ok_payload = self.allocator.alloc(u8, 1) catch return error.OutOfMemory;
-        ok_payload[0] = 0;
-        const fut_entry = async_mod.Future{ .state = .ready, .payload = ok_payload };
-        ci.futures.put(self.allocator, future_handle, fut_entry) catch {
-            self.allocator.free(ok_payload);
-            return error.OutOfMemory;
-        };
         results[0] = .{ .handle = future_handle };
+    }
+
+    const WriteViaStreamCtx = struct {
+        adapter: *WasiCliAdapter,
+        target: *streams.OutputStream,
+        ci: *ComponentInstance,
+        future_handle: u32,
+    };
+
+    fn writeViaStreamOnWrite(ctx_opaque: ?*anyopaque, bytes: []const u8) bool {
+        const c: *WriteViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
+        return switch (c.target.write(bytes, c.adapter.allocator)) {
+            .ok => true,
+            .err, .closed => false,
+        };
+    }
+
+    fn writeViaStreamOnDropWritable(ctx_opaque: ?*anyopaque) void {
+        const c: *WriteViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
+        if (c.ci.futures.getPtr(c.future_handle)) |fut| {
+            // Settle as `Ok(())` (discriminant 0). Allocate a 1-byte
+            // payload — `future_read` copies `buf.len` bytes into the
+            // guest's destination, and `result<_, error-code>` only
+            // requires the leading discriminant byte to lift Ok.
+            if (fut.payload == null and !fut.write_closed) {
+                if (c.adapter.allocator.alloc(u8, 1)) |buf| {
+                    buf[0] = 0;
+                    fut.payload = buf;
+                } else |_| {
+                    // Out-of-memory fallback: mark ready with no payload.
+                    // The unit-type fast-path in `future_read` handles
+                    // this by returning COMPLETED(0) — a behaviourally
+                    // equivalent ok-result lift.
+                }
+                fut.state = .ready;
+                fut.write_closed = true;
+            }
+            if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                ws.setReady(idx, c.adapter.allocator);
+        }
+        // NB: the ctx is NOT freed here — `stream.drop-readable` /
+        // `stream.drop-writable` fire `on_destroy` once the stream
+        // table entry is removed (both ends dropped). Freeing here
+        // would race that destructor and break the executor's drop
+        // sequence when the writer drops before the reader.
+    }
+
+    fn writeViaStreamOnDestroy(ctx_opaque: ?*anyopaque) void {
+        const c: *WriteViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
+        c.adapter.allocator.destroy(c);
     }
 
     fn pushPollable(self: *WasiCliAdapter, pollable: Pollable) !u32 {
@@ -24013,7 +24117,7 @@ test "populateWasiCliP3: cliExitWithCode(7) routes through P3 exit iface (#482)"
     try testing.expectEqual(@as(?u32, 7), adapter.exit_code);
 }
 
-test "populateWasiCliP3: stdinReadViaStreamP3 pre-seeds stream with stdin bytes (#482)" {
+test "populateWasiCliP3: stdinReadViaStreamP3 attaches lazy host source (#482, #537)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
@@ -24027,10 +24131,17 @@ test "populateWasiCliP3: stdinReadViaStreamP3 pre-seeds stream with stdin bytes 
     ci.next_async_handle = 1;
     defer {
         var sit = ci.streams.iterator();
-        while (sit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        while (sit.next()) |e| {
+            // Mimic the on_destroy hook the executor fires on a fully
+            // closed stream — frees the heap-allocated host context.
+            if (e.value_ptr.host_handler) |h| if (h.on_destroy) |cb| cb(h.ctx);
+            e.value_ptr.deinit(testing.allocator);
+        }
         ci.streams.deinit(testing.allocator);
         var fit = ci.futures.iterator();
-        while (fit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        while (fit.next()) |e| {
+            if (e.value_ptr.payload) |p| testing.allocator.free(p);
+        }
         ci.futures.deinit(testing.allocator);
     }
 
@@ -24044,9 +24155,19 @@ test "populateWasiCliP3: stdinReadViaStreamP3 pre-seeds stream with stdin bytes 
     const stream_h = results[0].tuple_val[0].handle;
     const future_h = results[0].tuple_val[1].handle;
 
+    // No eager drain — the buffer is empty; the host source is
+    // attached as a callback that `stream.read` invokes on demand.
     const s = ci.streams.getPtr(stream_h) orelse return error.MissingStream;
-    try testing.expectEqualStrings("hello\n", s.buffer.items);
-    try testing.expect(s.write_closed);
+    try testing.expectEqual(@as(usize, 0), s.buffer.items.len);
+    try testing.expect(s.host_handler != null);
+    try testing.expect(s.host_handler.?.on_read != null);
+
+    // Exercise the on_read callback directly — it must drain the
+    // configured host stdin into the dst buffer.
+    var dst: [16]u8 = undefined;
+    const n = s.host_handler.?.on_read.?(s.host_handler.?.ctx, &dst);
+    try testing.expectEqual(@as(i32, 6), n);
+    try testing.expectEqualStrings("hello\n", dst[0..6]);
 
     const f = ci.futures.getPtr(future_h) orelse return error.MissingFuture;
     try testing.expectEqual(async_mod.Future.State.ready, f.state);
@@ -24054,7 +24175,7 @@ test "populateWasiCliP3: stdinReadViaStreamP3 pre-seeds stream with stdin bytes 
     try testing.expectEqual(@as(u8, 0), f.payload.?[0]); // result<_,_> ok discriminant
 }
 
-test "populateWasiCliP3: writeViaStreamImplP3 drains stream into adapter.stdout (#482)" {
+test "populateWasiCliP3: writeViaStreamImplP3 drains+attaches stream sink (#482, #537)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
@@ -24065,14 +24186,23 @@ test "populateWasiCliP3: writeViaStreamImplP3 drains stream into adapter.stdout 
     ci.next_async_handle = 1;
     defer {
         var sit = ci.streams.iterator();
-        while (sit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        while (sit.next()) |e| {
+            // Free the heap-allocated host-handler context (mirrors what
+            // `stream.drop-readable`/`drop-writable` does in the executor).
+            if (e.value_ptr.host_handler) |h| if (h.on_destroy) |cb| cb(h.ctx);
+            e.value_ptr.deinit(testing.allocator);
+        }
         ci.streams.deinit(testing.allocator);
         var fit = ci.futures.iterator();
-        while (fit.next()) |e| e.value_ptr.deinit(testing.allocator);
+        while (fit.next()) |e| {
+            if (e.value_ptr.payload) |p| testing.allocator.free(p);
+        }
         ci.futures.deinit(testing.allocator);
     }
 
-    // Pre-populate a stream with bytes the guest wrote into.
+    // Pre-populate a stream with bytes the guest already wrote into,
+    // simulating an eager write that landed before `write-via-stream`
+    // attached. Those bytes must be drained synchronously.
     const stream_h = ci.allocAsyncHandle();
     var s = async_mod.AsyncStream{};
     try s.buffer.appendSlice(testing.allocator, "world");
@@ -24082,15 +24212,106 @@ test "populateWasiCliP3: writeViaStreamImplP3 drains stream into adapter.stdout 
     var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
     try WasiCliAdapter.stdoutWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
 
+    // Pre-buffered bytes drained synchronously.
     try testing.expectEqualStrings("world", adapter.getStdoutBytes());
-    const drained = ci.streams.getPtr(stream_h) orelse return error.MissingStream;
-    try testing.expectEqual(@as(usize, 0), drained.buffer.items.len);
-    try testing.expect(drained.read_closed);
+    const attached = ci.streams.getPtr(stream_h) orelse return error.MissingStream;
+    try testing.expectEqual(@as(usize, 0), attached.buffer.items.len);
+    // Host handler installed — subsequent guest `stream.write` will
+    // forward synchronously (verified separately via #537 executor tests).
+    try testing.expect(attached.host_handler != null);
 
-    // Returned future is settled-ok.
+    // Returned future is open (will settle when the guest drops the
+    // writer end, not synchronously here).
     try testing.expect(results[0] == .handle);
     const f = ci.futures.getPtr(results[0].handle) orelse return error.MissingFuture;
-    try testing.expectEqual(async_mod.Future.State.ready, f.state);
+    try testing.expectEqual(async_mod.Future.State.pending, f.state);
+}
+
+test "populateWasiCliP3: host-attached sink forwards stream.write to stdout (#537)" {
+    const testing = std.testing;
+    const dispatch = @import("executor.zig").dispatchCanonBuiltin;
+    const async_canon_mod = @import("async_canon.zig");
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+    const exec_env_mod = @import("../runtime/common/exec_env.zig");
+
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Bootstrap a ComponentInstance with usable guest memory + async tables.
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try exec_env_mod.ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    // Minimal component carrying one `TypeDef.val(.u8)` so the canon's
+    // `type_idx=0` resolves to a 1-byte element (matches `stream<u8>`).
+    const StreamFixture = struct {
+        var types_array = [_]ctypes_root.TypeDef{.{ .val = .u8 }};
+        var comp: ctypes_root.Component = .{
+            .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+            .components = &.{},       .instances = &.{},      .aliases = &.{},
+            .types = &.{},            .canons = &.{},         .imports = &.{},
+            .exports = &.{},
+        };
+    };
+    StreamFixture.comp.types = &StreamFixture.types_array;
+    const inst_mod = @import("instance.zig");
+    const ci = try inst_mod.instantiate(&StreamFixture.comp, testing.allocator);
+    defer ci.deinit();
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // Guest allocates a stream<u8> via `stream.new`.
+    try dispatch(
+        ci,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Host installs the write-via-stream sink.
+    const args: [1]InterfaceValue = .{.{ .handle = handle }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.stdoutWriteViaStreamP3(&adapter, ci, &args, &results, testing.allocator);
+    const future_handle = results[0].handle;
+    try testing.expect(ci.streams.getPtr(handle).?.host_handler != null);
+
+    // Guest writes 5 bytes via `stream.write` — should forward
+    // synchronously to adapter.stdout and complete with count=5.
+    const src_ptr: u32 = 0;
+    const src_bytes = ci.writableGuestBytes(src_ptr, 5).?;
+    @memcpy(src_bytes, "hello");
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, 5)));
+    try dispatch(
+        ci,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const write_status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon_mod.packStatus(.completed, 5), write_status);
+    try testing.expectEqualStrings("hello", adapter.getStdoutBytes());
+
+    // Guest drops the writer end → companion future settles to ok.
+    try env.pushI32(@bitCast(handle));
+    try dispatch(
+        ci,
+        .{ .async_canon = .{ .stream_drop_writable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const fut = ci.futures.getPtr(future_handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[0]); // ok discriminant
 }
 
 test "populateWasiProviders: routes wasi:cli/*@0.3.x to P3 host instances (#482)" {
