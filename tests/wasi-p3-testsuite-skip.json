@@ -3,12 +3,11 @@
     "WASI Rust tests [wasm32-wasip3]": {
         "http-service": "wasi:http@0.3.0 service requires host-driven TCP listener (sockets host-stream wiring landed via #535 / PR #544) plus end-to-end CLI dispatch — tracking #520",
         "sockets-echo": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
-        "sockets-tcp-bind": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
+        "sockets-tcp-bind": "wasi:sockets@0.3.0 kernel-port assignment + listen reuse + multicast/broadcast/non-bindable rejection wired in #563; sync sub-tests now pass but the `test_reuseaddr` async case still trips canon-async lift_args with InvalidDiscriminant — tracking #564",
         "sockets-tcp-connect": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-listen": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-receive": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-send": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
-        "sockets-udp-bind": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-udp-connect": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-udp-properties": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-udp-receive": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",

@@ -295,6 +295,17 @@ pub const Inst = struct {
         // SSA phi: merges values from predecessor edges at join points.
         // Inserted by mem2reg and lowered before codegen.
         phi: []const PhiEdge,
+
+        // Parallel register-to-register copy. Resolves phi-incoming values
+        // at a predecessor's terminator without going through a frame
+        // round-trip. All `src` reads happen "in parallel" before any
+        // `dst` is written — the aarch64 emitter applies a 4-phase
+        // parallel-copy algorithm to honor that semantics even when the
+        // assigned physical registers form cycles.
+        //
+        // Owned: the backing slice is freed by `BasicBlock.deinit` and
+        // tracked alongside `phi` in `owned_phi_edges` / similar.
+        parallel_copy: []const ParallelCopy,
     };
 
     pub const BinOp = struct {
@@ -850,6 +861,15 @@ pub const Inst = struct {
         block: BlockId,
         val: VReg,
     };
+
+    /// One (dst ← src) pair inside a `parallel_copy` instruction. The
+    /// per-pair `ty` lets the codegen pick the right MOV width without
+    /// looking up the destination vreg's type from a side table.
+    pub const ParallelCopy = struct {
+        dst: VReg,
+        src: VReg,
+        ty: IrType,
+    };
 };
 
 /// A basic block — a sequence of instructions with a single entry point.
@@ -869,7 +889,11 @@ pub const BasicBlock = struct {
 
     pub fn deinit(self: *BasicBlock) void {
         for (self.instructions.items) |inst| {
-            if (inst.op == .phi) self.allocator.free(inst.op.phi);
+            switch (inst.op) {
+                .phi => |edges| self.allocator.free(edges),
+                .parallel_copy => |pairs| self.allocator.free(pairs),
+                else => {},
+            }
         }
         self.instructions.deinit(self.allocator);
         self.predecessors.deinit(self.allocator);
@@ -890,6 +914,15 @@ pub const IrFunction = struct {
     param_count: u32,
     result_count: u32,
     local_count: u32,
+    /// First synthetic-local index produced by `lowerPhisToLocals`, and
+    /// the EXCLUSIVE end of the synthetic-local range at the time of that
+    /// pass. Used by `coalescePhiLocalsToParallelCopy` (#540) to identify
+    /// the bridge slots without conflating them with locals later
+    /// inserted by passes like `inductionVariableSimplification` (which
+    /// also bumps `local_count`). `null` means no phi lowering has run,
+    /// or it ran but produced no synthetic locals.
+    phi_synth_local_start: ?u32 = null,
+    phi_synth_local_end: ?u32 = null,
     /// Per-local IR type (params first, then declared locals, then synthetic).
     /// Populated by the frontend; used by mem2reg for typed-zero seeding.
     local_types: ?[]const IrType = null,
