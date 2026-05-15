@@ -7,7 +7,117 @@
 const std = @import("std");
 const ir = @import("ir.zig");
 const analysis = @import("analysis.zig");
+const alias_class = @import("alias_class.zig");
 const deadStoreElimination = @import("dead_store_elimination.zig").deadStoreElimination;
+
+const LoadKey = alias_class.LoadKey;
+
+/// Stack of per-dominator-level load value tables, shared by
+/// `commonSubexprElimination` and `globalValueNumbering` when handling
+/// `load` / `local_get` / `local_set` (issue #541).
+///
+/// Each frame maps a `LoadKey` to the VReg that holds its current
+/// value at this point on the dominator path. Lookup walks top→bottom
+/// (innermost scope wins). Stores, `local_set`, and barriers (calls,
+/// atomics, bulk-memory) invalidate matching entries across every
+/// active frame — sibling dominator branches are NOT on the stack so
+/// they are intrinsically protected (see #525 sibling-invariance).
+const LoadFrameStack = struct {
+    frames: std.ArrayList(std.AutoHashMap(LoadKey, ir.VReg)),
+    alloc: std.mem.Allocator,
+    /// Scratch buffer for `invalidateMem` to avoid allocating one map's
+    /// worth of keys per store.
+    scratch: std.ArrayList(LoadKey),
+
+    fn init(alloc: std.mem.Allocator) LoadFrameStack {
+        return .{
+            .frames = .empty,
+            .alloc = alloc,
+            .scratch = .empty,
+        };
+    }
+
+    fn deinit(self: *LoadFrameStack) void {
+        for (self.frames.items) |*f| f.deinit();
+        self.frames.deinit(self.alloc);
+        self.scratch.deinit(self.alloc);
+    }
+
+    fn push(self: *LoadFrameStack) !void {
+        try self.frames.append(self.alloc, std.AutoHashMap(LoadKey, ir.VReg).init(self.alloc));
+    }
+
+    fn pop(self: *LoadFrameStack) void {
+        var f = self.frames.pop().?;
+        f.deinit();
+    }
+
+    /// Search top→bottom for a current binding of `key`.
+    fn lookup(self: *LoadFrameStack, key: LoadKey) ?ir.VReg {
+        var i = self.frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.frames.items[i].get(key)) |v| return v;
+        }
+        return null;
+    }
+
+    /// Add `(key -> vreg)` to the current (top) frame.
+    fn record(self: *LoadFrameStack, key: LoadKey, vreg: ir.VReg) !void {
+        try self.frames.items[self.frames.items.len - 1].put(key, vreg);
+    }
+
+    /// Drop entries in every active frame whose `.mem` keys overlap the
+    /// store. `.local` entries are never affected.
+    fn invalidateMem(self: *LoadFrameStack, st: anytype) !void {
+        for (self.frames.items) |*frame| {
+            self.scratch.clearRetainingCapacity();
+            var it = frame.iterator();
+            while (it.next()) |entry| {
+                if (alias_class.storeAliasesLoad(entry.key_ptr.*, st)) {
+                    try self.scratch.append(self.alloc, entry.key_ptr.*);
+                }
+            }
+            for (self.scratch.items) |k| _ = frame.remove(k);
+        }
+    }
+
+    /// Drop `.local = idx` from every active frame.
+    fn invalidateLocal(self: *LoadFrameStack, idx: u32) void {
+        for (self.frames.items) |*frame| {
+            _ = frame.remove(.{ .local = idx });
+        }
+    }
+
+    /// Coarse barrier (call, atomic, bulk-memory): clear all frames.
+    fn clearAll(self: *LoadFrameStack) void {
+        for (self.frames.items) |*frame| frame.clearRetainingCapacity();
+    }
+};
+
+/// Returns true iff `op` is a coarse barrier that invalidates every
+/// load (memory + local) tracked by the dominator-scoped CSE/GVN.
+/// Mirrors the barrier set in `forward_redundant_loads.zig`.
+fn opIsLoadBarrier(op: ir.Inst.Op) bool {
+    return switch (op) {
+        .call,
+        .call_indirect,
+        .call_ref,
+        .atomic_load,
+        .atomic_store,
+        .atomic_rmw,
+        .atomic_cmpxchg,
+        .atomic_fence,
+        .atomic_notify,
+        .atomic_wait,
+        .memory_copy,
+        .memory_fill,
+        .memory_init,
+        .memory_grow,
+        => true,
+        else => false,
+    };
+}
 
 pub const TargetArch = enum { x86_64, aarch64 };
 
@@ -1847,22 +1957,67 @@ pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocat
     if (dom.idom[0] == null) return false;
     try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0 });
 
+    // Parallel stack of per-dominator-level load tables. Handles `load`,
+    // `local_get`, and their invalidation by stores/`local_set`/barriers.
+    // See `LoadFrameStack` doc. Distinct from the pure-expr `table`
+    // above because per-instruction alias invalidation cannot be
+    // expressed via the snapshot/restore append-only protocol used for
+    // strictly pure ops.
+    var load_frames = LoadFrameStack.init(allocator);
+    defer load_frames.deinit();
+
     var changed = false;
     while (stack.items.len > 0) {
         const top = &stack.items[stack.items.len - 1];
         if (top.phase == 1) {
             // Backtrack: restore expression table.
             table.shrinkRetainingCapacity(top.snap_len);
+            load_frames.pop();
             _ = stack.pop();
             continue;
         }
         const bid = top.bid;
         top.phase = 1;
         top.snap_len = table.items.len;
+        try load_frames.push();
 
         const block = &func.blocks.items[bid];
-        for (block.instructions.items) |*inst| {
-            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) continue;
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            const inst = &block.instructions.items[i];
+            switch (inst.op) {
+                .load => |ld| {
+                    if (inst.dest) |dest| {
+                        const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(ld) };
+                        if (load_frames.lookup(key)) |held| {
+                            replaceVReg(func, dest, held);
+                            _ = block.instructions.orderedRemove(i);
+                            changed = true;
+                            continue;
+                        }
+                        try load_frames.record(key, dest);
+                    }
+                    i += 1;
+                    continue;
+                },
+                .store => |st| {
+                    try load_frames.invalidateMem(st);
+                    i += 1;
+                    continue;
+                },
+                else => {
+                    if (opIsLoadBarrier(inst.op)) {
+                        load_frames.clearAll();
+                        i += 1;
+                        continue;
+                    }
+                },
+            }
+
+            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) {
+                i += 1;
+                continue;
+            }
 
             // Scan table backwards for nearest dominating match.
             // Later entries are from closer ancestors, so backwards
@@ -1883,6 +2038,7 @@ pub fn commonSubexprElimination(func: *ir.IrFunction, allocator: std.mem.Allocat
             if (!found) {
                 try table.append(allocator, .{ .inst = inst.*, .dest = inst.dest.? });
             }
+            i += 1;
         }
 
         // Push dom-tree children for DFS traversal.
@@ -2223,21 +2379,78 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
     defer stack.deinit(allocator);
     try stack.append(allocator, .{ .bid = 0, .phase = 0, .snap_len = 0 });
 
+    // Per-dominator-level load tables (see `LoadFrameStack`). Tracks
+    // `load` and `local_get` value numbers with proper alias
+    // invalidation on stores / `local_set` / barriers.
+    var load_frames = LoadFrameStack.init(allocator);
+    defer load_frames.deinit();
+
     var changed = false;
     while (stack.items.len > 0) {
         const top = &stack.items[stack.items.len - 1];
         if (top.phase == 1) {
             table.shrinkRetainingCapacity(top.snap_len);
+            load_frames.pop();
             _ = stack.pop();
             continue;
         }
         const bid = top.bid;
         top.phase = 1;
         top.snap_len = table.items.len;
+        try load_frames.push();
 
         const block = &func.blocks.items[bid];
-        for (block.instructions.items) |*inst| {
-            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) continue;
+        var i: usize = 0;
+        while (i < block.instructions.items.len) {
+            const inst = &block.instructions.items[i];
+            switch (inst.op) {
+                .load => |ld| {
+                    if (inst.dest) |dest| {
+                        const key: LoadKey = .{ .mem = alias_class.memKeyFromLoad(ld) };
+                        if (load_frames.lookup(key)) |held| {
+                            replaceVReg(func, dest, held);
+                            _ = block.instructions.orderedRemove(i);
+                            changed = true;
+                            continue;
+                        }
+                        try load_frames.record(key, dest);
+                    }
+                    i += 1;
+                    continue;
+                },
+                .store => |st| {
+                    try load_frames.invalidateMem(st);
+                    i += 1;
+                    continue;
+                },
+                .local_get, .local_set => {
+                    // Cross-block local_get / local_set value-numbering
+                    // is unsound after `lowerPhisToLocals`: SSA phis are
+                    // lowered into `local_set` at every predecessor and
+                    // `local_get` at the merge point, so forwarding a
+                    // `.local(idx)` value across a loop back-edge would
+                    // erase the iteration update. Single-block local
+                    // forwarding is handled by `forwardLocalGet` and
+                    // `forwardRedundantLoads`. We deliberately fall
+                    // through to the generic skip below; no .local
+                    // entries are ever recorded in `load_frames`, so
+                    // invalidation is moot.
+                    i += 1;
+                    continue;
+                },
+                else => {
+                    if (opIsLoadBarrier(inst.op)) {
+                        load_frames.clearAll();
+                        i += 1;
+                        continue;
+                    }
+                },
+            }
+
+            if (inst.dest == null or hasSideEffect(inst.*) or !isPure(inst.*)) {
+                i += 1;
+                continue;
+            }
 
             var found: ?ir.VReg = null;
             for (table.items) |entry| {
@@ -2253,6 +2466,7 @@ pub fn globalValueNumbering(func: *ir.IrFunction, allocator: std.mem.Allocator) 
             } else {
                 try table.append(allocator, .{ .inst = inst.*, .vreg = inst.dest.? });
             }
+            i += 1;
         }
 
         for (children[bid].items) |child| {
@@ -11971,5 +12185,186 @@ test "tailDuplicateSmallJoins: join def with external use is NOT duplicated" {
     try func.getBlock(b4).append(.{ .op = .{ .ret = v_join } });
 
     const changed = try tailDuplicateSmallJoins(&func, allocator);
+    try std.testing.expect(!changed);
+}
+
+// ── #541: Load-aware dominator GVN / CSE tests ──────────────────────────────
+
+test "GVN: cross-block load forwarded from dominator (#541)" {
+    // entry: load v_base[0] -> v_dom; br tail
+    // tail:  load v_base[0] -> v_tail; ret v_tail
+    // GVN must rewrite uses of v_tail to v_dom.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = tail } });
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    const changed = try globalValueNumbering(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_dom }, func.getBlock(tail).instructions.items[0].op);
+}
+
+test "CSE: diamond — add v0,v1 in both arms hoisted to dominator (#541)" {
+    // b0: iconst, iconst, add v0,v1 -> v_dom; br_if cond, b1, b2
+    // b1: add v0,v1 -> v_l; br b3
+    // b2: add v0,v1 -> v_r; br b3
+    // b3: ret v_l  (use of b1's def — should rewrite to v_dom)
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const b0 = try func.newBlock();
+    const b1 = try func.newBlock();
+    const b2 = try func.newBlock();
+    const b3 = try func.newBlock();
+    const v0 = func.newVReg();
+    const v1 = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_l = func.newVReg();
+    const v_r = func.newVReg();
+
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 11 }, .dest = v1 });
+    try func.getBlock(b0).append(.{ .op = .{ .iconst_32 = 1 }, .dest = cond });
+    try func.getBlock(b0).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_dom });
+    try func.getBlock(b0).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = b1, .else_block = b2 } } });
+    try func.getBlock(b1).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_l });
+    try func.getBlock(b1).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b2).append(.{ .op = .{ .add = .{ .lhs = v0, .rhs = v1 } }, .dest = v_r });
+    try func.getBlock(b2).append(.{ .op = .{ .br = b3 } });
+    try func.getBlock(b3).append(.{ .op = .{ .ret = v_l } });
+
+    const changed = try commonSubexprElimination(&func, allocator);
+    try std.testing.expect(changed);
+    // b3's ret must reference v_dom (the dominator's def), NOT v_l/v_r.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_dom }, func.getBlock(b3).instructions.items[0].op);
+}
+
+test "GVN load: sibling-block store does NOT poison dominator-cached load (#541)" {
+    // entry: load v_base[0] -> v_dom; br_if cond, left, right
+    // left:  store v_base[0]                       (aliasing store in sibling)
+    //        ret
+    // right: load v_base[0] -> v_right             (must be rewritten to v_dom)
+    //        ret v_right
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const left = try func.newBlock();
+    const right = try func.newBlock();
+    const v_base = func.newVReg();
+    const cond = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_store_val = func.newVReg();
+    const v_right = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br_if = .{ .cond = cond, .then_block = left, .else_block = right } } });
+
+    try func.getBlock(left).append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_store_val } }, .type = .i32 });
+    try func.getBlock(left).append(.{ .op = .{ .ret = null } });
+
+    try func.getBlock(right).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_right, .type = .i32 });
+    try func.getBlock(right).append(.{ .op = .{ .ret = v_right } });
+
+    const changed = try globalValueNumbering(&func, allocator);
+    try std.testing.expect(changed);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_dom }, func.getBlock(right).instructions.items[0].op);
+}
+
+test "GVN load: aliasing store on dominator path DOES invalidate (#541)" {
+    // entry: load v_base[0] -> v_dom; store v_base[0]; br tail
+    // tail:  load v_base[0] -> v_tail; ret v_tail
+    // After the dominator-path store, the tail load must NOT be rewritten
+    // to v_dom — the store invalidated the cached value.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_store_val = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .store = .{ .base = v_base, .offset = 0, .size = 4, .val = v_store_val } }, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = tail } });
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    const changed = try globalValueNumbering(&func, allocator);
+    try std.testing.expect(!changed);
+    // tail's ret still references its own load result, unchanged.
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
+}
+
+test "GVN load: local_set/local_get cross-block forwarding is deliberately suppressed (#541)" {
+    // After `lowerPhisToLocals` an SSA phi is encoded as `local_set` at
+    // each predecessor and `local_get` at the merge. Forwarding the
+    // dominator's slot value across a loop back-edge would erase the
+    // iteration update — see GVN's `.local_get, .local_set` branch.
+    // This test pins that conservative behaviour: even on a strictly
+    // linear chain (no loop), we do NOT rewrite the tail's `local_get`,
+    // because the pass cannot cheaply distinguish loop vs non-loop
+    // contexts at this point and prefers correctness over cleverness.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_dom = func.newVReg();
+    const v_new = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .local_get = 3 }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .iconst_32 = 99 }, .dest = v_new, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .local_set = .{ .idx = 3, .val = v_new } } });
+    try func.getBlock(entry).append(.{ .op = .{ .br = tail } });
+    try func.getBlock(tail).append(.{ .op = .{ .local_get = 3 }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    _ = try globalValueNumbering(&func, allocator);
+    // tail's local_get must remain — no rewrite, no removal.
+    try std.testing.expect(func.getBlock(tail).instructions.items[0].op == .local_get);
+    try std.testing.expectEqual(ir.Inst.Op{ .ret = v_tail }, func.getBlock(tail).instructions.items[1].op);
+}
+
+test "GVN load: call between dominator-load and dominated-load invalidates (#541)" {
+    // entry: load v_base[0] -> v_dom; call f -> v_c; br tail
+    // tail:  load v_base[0] -> v_tail; ret v_tail
+    // The call is a coarse barrier — tail's load must not be rewritten.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+
+    const entry = try func.newBlock();
+    const tail = try func.newBlock();
+    const v_base = func.newVReg();
+    const v_dom = func.newVReg();
+    const v_c = func.newVReg();
+    const v_tail = func.newVReg();
+
+    try func.getBlock(entry).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_dom, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .call = .{ .func_idx = 0 } }, .dest = v_c, .type = .i32 });
+    try func.getBlock(entry).append(.{ .op = .{ .br = tail } });
+    try func.getBlock(tail).append(.{ .op = .{ .load = .{ .base = v_base, .offset = 0, .size = 4 } }, .dest = v_tail, .type = .i32 });
+    try func.getBlock(tail).append(.{ .op = .{ .ret = v_tail } });
+
+    const changed = try globalValueNumbering(&func, allocator);
     try std.testing.expect(!changed);
 }
