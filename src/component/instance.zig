@@ -229,6 +229,15 @@ pub const ComponentInstance = struct {
     /// as `trampoline_ctxs` — each is referenced from an installed
     /// `HostFnEntry` and freed when the instance tears down. (#520)
     canon_builtin_ctxs: std.ArrayListUnmanaged(*executor_mod.CanonBuiltinTrampolineCtx) = .empty,
+    /// Memoisation map for canon-builtin trampoline contexts, keyed by the
+    /// component canon-def index that produced the context. Lets multiple
+    /// core import slots that resolve to the *same* canon-def-id (e.g. two
+    /// imports of `context.get` from different interfaces) share a single
+    /// `*CanonBuiltinTrampolineCtx` rather than allocating one per slot.
+    /// The pointers in this map are non-owning aliases of entries already
+    /// in `canon_builtin_ctxs`; that list remains the sole owner and is
+    /// what `deinit` walks to free the contexts exactly once. (#533)
+    canon_builtin_ctx_by_canon_idx: std.AutoHashMapUnmanaged(u32, *executor_mod.CanonBuiltinTrampolineCtx) = .empty,
     /// Pending core-module start functions whose execution was deferred
     /// during `instantiate` so canon-lower trampoline `host_funcs` can be
     /// bound by `linkImports` first. Drained by `linkImports` in core-instance
@@ -1190,6 +1199,7 @@ pub const ComponentInstance = struct {
             self.allocator.destroy(ctx);
         }
         self.canon_builtin_ctxs.deinit(self.allocator);
+        self.canon_builtin_ctx_by_canon_idx.deinit(self.allocator);
         self.pending_core_starts.deinit(self.allocator);
         if (self.core_instances.len > 0) {
             const inst_mod = @import("../runtime/interpreter/instance.zig");
@@ -1478,14 +1488,35 @@ pub fn instantiate(
                                             .aliased, .lowered => unreachable,
                                         };
                                         if (canon_idx_b >= component.canons.len) continue;
-                                        const ctx_b = allocator.create(executor_mod.CanonBuiltinTrampolineCtx) catch continue;
-                                        ctx_b.* = .{
-                                            .comp_inst = inst,
-                                            .canon = component.canons[canon_idx_b],
-                                        };
-                                        inst.canon_builtin_ctxs.append(allocator, ctx_b) catch {
-                                            allocator.destroy(ctx_b);
-                                            continue;
+                                        // Share one `*CanonBuiltinTrampolineCtx` across every
+                                        // import slot that resolves to the same canon-def-id
+                                        // (e.g. two imports of `context.get` from different
+                                        // interfaces in a wit-bindgen P3 module). The Canon
+                                        // payload — including any memory/realloc opts —
+                                        // is fully determined by the canon-def-id within
+                                        // a given component, and the trampoline only needs
+                                        // `{comp_inst, canon}` to dispatch correctly, so the
+                                        // ctx is safe to alias. (#533)
+                                        const ctx_b = ctx_blk: {
+                                            if (inst.canon_builtin_ctx_by_canon_idx.get(canon_idx_b)) |existing| {
+                                                break :ctx_blk existing;
+                                            }
+                                            const new_ctx = allocator.create(executor_mod.CanonBuiltinTrampolineCtx) catch continue;
+                                            new_ctx.* = .{
+                                                .comp_inst = inst,
+                                                .canon = component.canons[canon_idx_b],
+                                            };
+                                            inst.canon_builtin_ctxs.append(allocator, new_ctx) catch {
+                                                allocator.destroy(new_ctx);
+                                                continue;
+                                            };
+                                            // Failing to record the memoisation entry is
+                                            // non-fatal: `canon_builtin_ctxs` still owns the
+                                            // allocation, so it will be freed on `deinit`.
+                                            // Subsequent duplicate slots will allocate their
+                                            // own ctx (graceful degradation under OOM).
+                                            inst.canon_builtin_ctx_by_canon_idx.put(allocator, canon_idx_b, new_ctx) catch {};
+                                            break :ctx_blk new_ctx;
                                         };
                                         entries[imp_func_idx] = .{
                                             .func = &executor_mod.canonBuiltinTrampoline,
@@ -3877,5 +3908,167 @@ test "instantiate: two-deep alias chain to sub-component instance export (#355)"
     // Two-hop (alias[1] of alias[0]) must surface MultiHopAliasUnsupported.
     const r2 = indexspace.resolveInstanceExpr(&component, 2);
     try std.testing.expectError(error.MultiHopAliasUnsupported, r2);
+}
+
+// ── #533: canon-builtin trampoline ctx sharing ──────────────────────────────
+//
+// The next three tests cover the memoisation contract added for #533:
+// duplicate import slots that resolve to the SAME canon-def-id share one
+// `*CanonBuiltinTrampolineCtx`, while slots resolving to DIFFERENT canon
+// definitions still get distinct contexts. All three exercise the
+// canon-builtin registration path in `instantiate` via a section-aware
+// core_instances composition (no loader; section-order fallback in
+// `indexspace.resolveCoreFunc` is what wires canons → core-func indices).
+
+// Minimal core module used by the #533 tests:
+//   (module
+//     (type (func (result i32)))            ;; type 0 — context.get shape
+//     (type (func (param i32)))             ;; type 1 — context.set shape
+//     (import "x" "f0" (func (type 0)))     ;; context.get
+//     (import "x" "f1" (func (type 0)))     ;; context.get (duplicate)
+//     (import "x" "f2" (func (type 1))))    ;; context.set
+//
+// No function/code/export sections — we only need the import slots to be
+// resolved against the canon-builtin trampoline path.
+const ctx_share_core_wasm_533 = [_]u8{
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    // type section (id=1, body=9): 2 types.
+    0x01, 0x09, 0x02,
+    0x60, 0x00, 0x01, 0x7f, // () -> i32
+    0x60, 0x01, 0x7f, 0x00, // (i32) -> ()
+    // import section (id=2, body=22): 3 imports.
+    0x02, 0x16, 0x03,
+    // host.f0 : func (type 0)
+    0x01, 'x', 0x02, 'f', '0', 0x00, 0x00,
+    // host.f1 : func (type 0)
+    0x01, 'x', 0x02, 'f', '1', 0x00, 0x00,
+    // host.f2 : func (type 1)
+    0x01, 'x', 0x02, 'f', '2', 0x00, 0x01,
+};
+
+// Shared fixture builder for the #533 tests. Returns a Component descriptor
+// whose `core_instances[0]` is an inline-exports bundle mapping "f0", "f1"
+// to canon-def-id 0 (`context.get`) and "f2" to canon-def-id 1
+// (`context.set`), and whose `core_instances[1]` instantiates the core
+// module above with `with "x" (instance 0)`.
+fn build533CtxShareComponent() ctypes.Component {
+    const S = struct {
+        const core_modules = [_]ctypes.CoreModule{.{ .data = &ctx_share_core_wasm_533 }};
+        const canons = [_]ctypes.Canon{
+            .{ .context_get = .{ .val_type = .i32, .slot = 0 } }, // canon-def-id 0 -> core-func-idx 0
+            .{ .context_set = .{ .val_type = .i32, .slot = 0 } }, // canon-def-id 1 -> core-func-idx 1
+        };
+        const inline_exports = [_]ctypes.CoreInlineExport{
+            .{ .name = "f0", .sort_idx = .{ .sort = .func, .idx = 0 } }, // → canon 0 (context.get)
+            .{ .name = "f1", .sort_idx = .{ .sort = .func, .idx = 0 } }, // → canon 0 (duplicate)
+            .{ .name = "f2", .sort_idx = .{ .sort = .func, .idx = 1 } }, // → canon 1 (context.set)
+        };
+        const inst_args = [_]ctypes.CoreInstantiateArg{
+            .{ .name = "x", .instance_idx = 0 },
+        };
+        const core_insts = [_]ctypes.CoreInstanceExpr{
+            .{ .exports = &inline_exports },
+            .{ .instantiate = .{ .module_idx = 0, .args = &inst_args } },
+        };
+    };
+    return ctypes.Component{
+        .core_modules = &S.core_modules,
+        .core_instances = &S.core_insts,
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &S.canons,
+        .imports = &.{},
+        .exports = &.{},
+    };
+}
+
+test "instantiate: duplicate canon-builtin imports share one trampoline ctx (#533)" {
+    // Allocation-count regression: a component with two imports of
+    // `context.get` (same canon-def-id) must allocate exactly ONE
+    // `*CanonBuiltinTrampolineCtx`, not one per import slot.
+    const component = build533CtxShareComponent();
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    const mi = inst.core_instances[1].module_inst orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 3), mi.host_func_entries.len);
+
+    // Three slots: f0, f1 (both → canon-def 0), f2 (→ canon-def 1).
+    // Two distinct canon-def-ids ⇒ two distinct trampoline ctxs total
+    // (NOT three — that would mean the duplicate slot allocated its own).
+    try std.testing.expectEqual(@as(usize, 2), inst.canon_builtin_ctxs.items.len);
+    try std.testing.expectEqual(@as(u32, 2), inst.canon_builtin_ctx_by_canon_idx.count());
+}
+
+test "instantiate: same canon-def-id yields identical trampoline ctx pointer (#533)" {
+    // Identity test: two import slots that both resolve to canon-def-id 0
+    // must be wired with the *same* `*CanonBuiltinTrampolineCtx`, so the
+    // dispatch-time `ctx_opaque` is pointer-equal between them.
+    const component = build533CtxShareComponent();
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    const mi = inst.core_instances[1].module_inst orelse return error.TestFailed;
+    try std.testing.expect(mi.host_func_entries[0] != null);
+    try std.testing.expect(mi.host_func_entries[1] != null);
+
+    const ctx0 = mi.host_func_entries[0].?.ctx.?;
+    const ctx1 = mi.host_func_entries[1].?.ctx.?;
+    try std.testing.expectEqual(ctx0, ctx1);
+
+    // Both must alias the single ctx recorded in the memoisation map for
+    // canon-def-id 0.
+    const memoised = inst.canon_builtin_ctx_by_canon_idx.get(0) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(memoised)), ctx0);
+}
+
+test "instantiate: distinct canon-def-ids yield distinct trampoline ctx pointers (#533)" {
+    // Negative: two import slots resolving to DIFFERENT canon-def-ids
+    // (`context.get` vs `context.set`) must NOT share a trampoline ctx.
+    // Memoisation is keyed by canon-def-id; different keys ⇒ different
+    // contexts, otherwise the dispatched `canon` payload would be wrong.
+    const component = build533CtxShareComponent();
+    const inst = try instantiate(&component, std.testing.allocator);
+    defer inst.deinit();
+
+    const mi = inst.core_instances[1].module_inst orelse return error.TestFailed;
+    try std.testing.expect(mi.host_func_entries[0] != null);
+    try std.testing.expect(mi.host_func_entries[2] != null);
+
+    const ctx0 = mi.host_func_entries[0].?.ctx.?;
+    const ctx2 = mi.host_func_entries[2].?.ctx.?;
+    try std.testing.expect(ctx0 != ctx2);
+
+    // And the underlying Canon payloads must differ — sanity-check the
+    // memoisation didn't accidentally alias across distinct tags.
+    const ctx2_typed: *executor_mod.CanonBuiltinTrampolineCtx = @ptrCast(@alignCast(ctx2));
+    try std.testing.expect(ctx2_typed.canon == .context_set);
+    const ctx0_typed: *executor_mod.CanonBuiltinTrampolineCtx = @ptrCast(@alignCast(ctx0));
+    try std.testing.expect(ctx0_typed.canon == .context_get);
+}
+
+test "instantiate: dropping component frees shared canon-builtin ctx exactly once (#533)" {
+    // Memory cleanup: with N>1 import slots sharing one ctx via
+    // memoisation, `deinit` must free that ctx exactly once — not N times
+    // (use-after-free) and not zero times (leak). `std.testing.allocator`
+    // is leak-detecting and panics on double-free; passing this test with
+    // `defer inst.deinit()` exercises both failure modes.
+    const component = build533CtxShareComponent();
+    const inst = try instantiate(&component, std.testing.allocator);
+
+    // Sanity: 3 import slots, 2 unique canon-def-ids ⇒ 2 owned ctxs.
+    try std.testing.expectEqual(@as(usize, 2), inst.canon_builtin_ctxs.items.len);
+    const mi = inst.core_instances[1].module_inst orelse return error.TestFailed;
+    try std.testing.expectEqual(mi.host_func_entries[0].?.ctx, mi.host_func_entries[1].?.ctx);
+
+    // Drop the instance — the testing allocator panics on leak or
+    // double-free. If memoisation had handed out the same `*Context`
+    // pointer to multiple `canon_builtin_ctxs.append` calls, the
+    // `destroy()` loop in `deinit` would free it twice and trip the
+    // safety check here.
+    inst.deinit();
 }
 
