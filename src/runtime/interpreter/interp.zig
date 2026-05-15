@@ -628,7 +628,7 @@ fn gcArrayCopy(env: *ExecEnv) TrapError!void {
     }
 }
 
-fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labels: *[256]Label, label_sp: *u32) TrapError!void {
+fn handleBrOnCast(env: *ExecEnv, sub_op: u32, code: []const u8, ip: *usize, labels: *[MAX_LABELS]Label, label_sp: *u32) TrapError!void {
     // Wabt encoding: labelidx(U32 LEB128) castflags(1 byte) target_heaptype(S32 LEB128)
     const depth = readU32(code, ip);
     const castflags = readU32(code, ip); // bit 0 = source nullable, bit 1 = target nullable
@@ -1464,7 +1464,12 @@ const Label = struct {
     const Kind = enum { block, loop, @"if", try_table };
 };
 
-const MAX_LABELS = 256;
+/// Maximum number of `block`/`loop`/`if`/`try` labels active in a
+/// single function call. wit-bindgen 0.45 emits async-lift code that
+/// nests labels per `task.yield` point; the wasi:http@0.3.0 fixtures
+/// peak at ~280 labels in a single function (#538). 1024 leaves
+/// generous headroom without burning much stack.
+const MAX_LABELS = 1024;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
