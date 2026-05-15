@@ -386,6 +386,18 @@ pub const AsyncStream = struct {
     /// by `stream.read` / `stream.write` to compute the per-element byte
     /// size via `canonical_abi.sizeOfType`.
     elem_type_idx: u32 = 0,
+    /// Optional per-stream override of the per-element byte size used
+    /// when the executor's `stream.read t` instruction carries a
+    /// `type_idx` that doesn't resolve in the host-side
+    /// `TypeRegistry` (typically because the element type lives in
+    /// another instance / wraps an unsupported recursive form).
+    ///
+    /// Host-side eager-lowering producers (`fsDescriptorReadDirectoryP3`,
+    /// etc.) set this to the byte stride they actually appended to
+    /// `buffer`, so the executor drains in the correct stride even
+    /// when guest-side resolution would have returned a stale fallback
+    /// size. (#571 — read-directory + cross-instance element types.)
+    elem_size_hint: ?u32 = null,
     /// FIFO of raw lowered bytes. Element boundaries are recomputed at
     /// op time from `elem_size = sizeOfType(...)`.
     buffer: std.ArrayListUnmanaged(u8) = .empty,
