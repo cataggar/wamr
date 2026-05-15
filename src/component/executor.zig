@@ -1656,7 +1656,16 @@ fn dispatchAsyncCanon(
             }
 
             const registry = TypeRegistry.init(comp_inst.component);
-            const elem_size = streamFutureElemSize(registry, info.type_idx);
+            // Mirror the `stream.read t` arm (#571): honour the
+            // per-stream `elem_size_hint` so a host-installed driver
+            // can pin the byte stride even when the executor's
+            // `info.type_idx` doesn't resolve cleanly in this
+            // component's `TypeRegistry` (cross-instance element
+            // types lose their resolution path).
+            const elem_size: u32 = if (s.elem_size_hint) |hint|
+                hint
+            else
+                streamFutureElemSize(registry, info.type_idx);
             if (elem_size == 0) return error.LowerError;
 
             // Zero-length write: synchronous no-op completion.
