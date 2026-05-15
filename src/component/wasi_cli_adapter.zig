@@ -1381,6 +1381,281 @@ fn mapSocketBindError(err: anyerror) SocketErrorCode {
     };
 }
 
+/// Open a kernel socket, bind to `address`, and getsockname for the
+/// kernel-resolved local address. Wraps the result in the same
+/// `std.Io.net.Socket` shape that `IpAddress.bind` returns so existing
+/// `close`/`send`/`receive` paths work transparently. POSIX-only:
+/// Windows falls back to `IpAddress.bind` because the WIT cases the
+/// custom path serves (port-0 readback already works via stdlib on
+/// Windows; no SO_REUSEADDR needed since SO_REUSEADDR's BSD-style
+/// semantics align with the WIT spec there). (#569)
+///
+/// The reason for not just calling `std.Io.net.IpAddress.bind` on POSIX
+/// is twofold:
+///   1. Future-proofing for a per-socket setsockopt phase between
+///      socket(2) and bind(2) — e.g. SO_LINGER tuning, IPV6_V6ONLY
+///      defaults, or any host-policy hooks. The current body does no
+///      extra setsockopt (SO_REUSEADDR is left at the kernel default
+///      so `sockets-tcp-connect::test_explicit_bind_addrinuse` and
+///      friends behave correctly on Linux), but the structure is in
+///      place for a follow-up that needs it.
+///   2. Centralising the `getsockname` step ensures the returned
+///      `Socket.address` always carries the kernel-resolved ephemeral
+///      port — defensive against stdlib drift where some
+///      `netBindIp` variants might skip the getsockname refresh.
+///
+/// Returns a `BindWithReuseError` superset of the stdlib `BindError` —
+/// `mapBindWithReuseError` collapses it back to a `SocketErrorCode`
+/// without losing the host-specific access-denied / family-mismatch
+/// classifications.
+fn bindAndGetsockname(
+    address: std.Io.net.IpAddress,
+    mode: std.Io.net.Socket.Mode,
+    protocol: ?std.Io.net.Protocol,
+) BindWithReuseError!std.Io.net.Socket {
+    const native_os = @import("builtin").os.tag;
+    if (native_os == .windows) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return std.Io.net.IpAddress.bind(&address, io, .{
+            .mode = mode,
+            .protocol = protocol,
+        });
+    }
+    // POSIX path — raw syscalls so we can interleave setsockopt
+    // between socket(2) and bind(2).
+    const fam: std.posix.sa_family_t = switch (address) {
+        .ip4 => std.posix.AF.INET,
+        .ip6 => std.posix.AF.INET6,
+    };
+    const sock_type: u32 = switch (mode) {
+        .stream => std.posix.SOCK.STREAM,
+        .dgram => std.posix.SOCK.DGRAM,
+        else => return error.SocketModeUnsupported,
+    };
+    const proto: u32 = if (protocol) |p| switch (p) {
+        .tcp => std.posix.IPPROTO.TCP,
+        .udp => std.posix.IPPROTO.UDP,
+        else => 0,
+    } else 0;
+    // On Darwin (and Haiku) `SOCK.CLOEXEC` is a Zig-supplied shim — not a real
+    // BSD kernel flag — so it must NOT be OR'd into the raw `socket(2)` type
+    // argument or the kernel rejects it with EINVAL. Instead, do a bare
+    // `socket(2)` and apply FD_CLOEXEC via `fcntl(F_SETFD, …)` afterwards.
+    // This mirrors `std.Io.Threaded.openSocketPosix` (Threaded.zig:12243).
+    const socket_flags_unsupported = switch (native_os) {
+        .macos, .ios, .tvos, .watchos, .visionos, .driverkit, .maccatalyst, .haiku => true,
+        else => false,
+    };
+    const flags: u32 = sock_type | if (socket_flags_unsupported) 0 else std.posix.SOCK.CLOEXEC;
+    const sock_rc = std.posix.system.socket(fam, flags, proto);
+    switch (std.posix.errno(sock_rc)) {
+        .SUCCESS => {},
+        .ACCES => return error.AccessDenied,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .MFILE => return error.ProcessFdQuotaExceeded,
+        .NFILE => return error.SystemFdQuotaExceeded,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        .PROTONOSUPPORT => return error.ProtocolUnsupportedBySystem,
+        .INVAL => return error.ProtocolUnsupportedBySystem,
+        else => return error.SystemResources,
+    }
+    const fd: std.posix.fd_t = @intCast(sock_rc);
+    errdefer _ = std.posix.system.close(fd);
+
+    if (socket_flags_unsupported) {
+        while (true) switch (std.posix.errno(std.posix.system.fcntl(
+            fd,
+            std.posix.F.SETFD,
+            @as(usize, std.posix.FD_CLOEXEC),
+        ))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.SystemResources,
+        };
+    }
+
+    // SO_REUSEADDR semantics differ between BSD and Linux. The WIT 0.3
+    // sockets spec doesn't actually mandate SO_REUSEADDR be set by
+    // default for either TCP or UDP. Setting it on Linux would cause
+    // `sockets-tcp-connect::test_explicit_bind_addrinuse` and
+    // `sockets-udp-connect::test_explicit_bind_addrinuse` to fail —
+    // those expect a second `bind` to an actively-bound port to surface
+    // AddressInUse, but on Linux SO_REUSEADDR=1 on both sockets allows
+    // the concurrent bind. The narrower `sockets-tcp-bind::test_reuseaddr`
+    // case (rebind to a port whose accepted-child sockets are still in
+    // TIME_WAIT) is left as a known wave-6 follow-up. We still wrap the
+    // socket() + bind() + getsockname() sequence here because the
+    // sequence is essential for the kernel-port readback on port=0
+    // bind even without REUSEADDR. (#569)
+    // Intentionally no setsockopt(SO_REUSEADDR) — see comment above.
+
+    // Build the sockaddr storage and call bind(2).
+    var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    var addr_len: std.posix.socklen_t = 0;
+    switch (address) {
+        .ip4 => |v4| {
+            const sa_in: *std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+            sa_in.* = .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, v4.port),
+                .addr = @bitCast(v4.bytes),
+                .zero = [_]u8{0} ** 8,
+            };
+            addr_len = @sizeOf(std.posix.sockaddr.in);
+        },
+        .ip6 => |v6| {
+            const sa_in6: *std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            sa_in6.* = .{
+                .family = std.posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, v6.port),
+                .flowinfo = v6.flow,
+                .addr = v6.bytes,
+                .scope_id = 0,
+            };
+            addr_len = @sizeOf(std.posix.sockaddr.in6);
+        },
+    }
+    const bind_rc = std.posix.system.bind(fd, @ptrCast(&storage), addr_len);
+    switch (std.posix.errno(bind_rc)) {
+        .SUCCESS => {},
+        .ACCES => return error.AccessDenied,
+        .ADDRINUSE => return error.AddressInUse,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        else => return error.SystemResources,
+    }
+
+    // getsockname → resolve ephemeral port.
+    var got_storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    var got_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    const gs_rc = std.posix.system.getsockname(fd, @ptrCast(&got_storage), &got_len);
+    if (std.posix.errno(gs_rc) != .SUCCESS) return error.SystemResources;
+
+    const local: std.Io.net.IpAddress = switch (address) {
+        .ip4 => blk: {
+            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&got_storage));
+            break :blk .{ .ip4 = .{
+                .bytes = @bitCast(sa.addr),
+                .port = std.mem.bigToNative(u16, sa.port),
+            } };
+        },
+        .ip6 => blk: {
+            const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&got_storage));
+            break :blk .{ .ip6 = .{
+                .bytes = sa.addr,
+                .port = std.mem.bigToNative(u16, sa.port),
+                .flow = sa.flowinfo,
+            } };
+        },
+    };
+    return .{ .handle = fd, .address = local };
+}
+
+/// Superset of `std.Io.net.IpAddress.BindError` carried through
+/// `bindAndGetsockname` — adds `AccessDenied` (returned by socket(2)
+/// EACCES on some POSIX systems) which the stdlib bind path lifts to
+/// `error.Unexpected`. `mapSocketBindError` knows how to route
+/// either.
+const BindWithReuseError = std.Io.net.IpAddress.BindError || error{AccessDenied};
+
+/// Build a raw POSIX `sockaddr_storage` from a Zig
+/// `std.Io.net.IpAddress`. Returns the storage by value plus the
+/// effective length (`sa_family_t` + family-specific tail) so the
+/// caller can pass either to `bind(2)`, `connect(2)`, or
+/// `getsockname(2)`. (#569)
+fn ipAddressToPosixStorage(
+    address: std.Io.net.IpAddress,
+) struct { storage: std.posix.sockaddr.storage, len: std.posix.socklen_t } {
+    var storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    var addr_len: std.posix.socklen_t = 0;
+    switch (address) {
+        .ip4 => |v4| {
+            const sa_in: *std.posix.sockaddr.in = @ptrCast(@alignCast(&storage));
+            sa_in.* = .{
+                .family = std.posix.AF.INET,
+                .port = std.mem.nativeToBig(u16, v4.port),
+                .addr = @bitCast(v4.bytes),
+                .zero = [_]u8{0} ** 8,
+            };
+            addr_len = @sizeOf(std.posix.sockaddr.in);
+        },
+        .ip6 => |v6| {
+            const sa_in6: *std.posix.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            sa_in6.* = .{
+                .family = std.posix.AF.INET6,
+                .port = std.mem.nativeToBig(u16, v6.port),
+                .flowinfo = v6.flow,
+                .addr = v6.bytes,
+                .scope_id = 0,
+            };
+            addr_len = @sizeOf(std.posix.sockaddr.in6);
+        },
+    }
+    return .{ .storage = storage, .len = addr_len };
+}
+
+/// Call `connect(2)` on a kernel UDP fd so the kernel records the
+/// remote address and (for wildcard-bound sockets) refines the
+/// outbound interface IP. Returns the same error set as
+/// `std.Io.net.IpAddress.ConnectError` so callers can pipe straight
+/// into `mapConnectError`. POSIX-only; Windows callers should skip
+/// this path. (#569)
+fn connectUdpKernel(
+    fd: std.posix.fd_t,
+    remote: std.Io.net.IpAddress,
+) std.Io.net.IpAddress.ConnectError!void {
+    const built = ipAddressToPosixStorage(remote);
+    const rc = std.posix.system.connect(fd, @ptrCast(&built.storage), built.len);
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return,
+        .ACCES, .PERM => return error.AccessDenied,
+        .ADDRINUSE => return error.AddressUnavailable,
+        .ADDRNOTAVAIL => return error.AddressUnavailable,
+        .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .NETUNREACH, .NETDOWN => return error.NetworkUnreachable,
+        .HOSTUNREACH => return error.HostUnreachable,
+        .TIMEDOUT => return error.Timeout,
+        .NOBUFS, .NOMEM => return error.SystemResources,
+        else => return error.Unexpected,
+    }
+}
+
+/// Call `getsockname(2)` on a kernel socket fd and return the
+/// resolved `std.Io.net.IpAddress`. Returns `null` if the syscall
+/// fails or the returned family doesn't match `expected_family` (a
+/// belt-and-braces guard against a kernel returning AF_UNSPEC after
+/// connect-then-disconnect). POSIX-only. (#569)
+fn getsocknameKernel(
+    fd: std.posix.fd_t,
+    expected_family: IpAddressFamily,
+) ?std.Io.net.IpAddress {
+    var got_storage: std.posix.sockaddr.storage = std.mem.zeroes(std.posix.sockaddr.storage);
+    var got_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    const rc = std.posix.system.getsockname(fd, @ptrCast(&got_storage), &got_len);
+    if (std.posix.errno(rc) != .SUCCESS) return null;
+    return switch (expected_family) {
+        .ipv4 => blk: {
+            const sa: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&got_storage));
+            if (sa.family != std.posix.AF.INET) break :blk null;
+            break :blk .{ .ip4 = .{
+                .bytes = @bitCast(sa.addr),
+                .port = std.mem.bigToNative(u16, sa.port),
+            } };
+        },
+        .ipv6 => blk: {
+            const sa: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(&got_storage));
+            if (sa.family != std.posix.AF.INET6) break :blk null;
+            break :blk .{ .ip6 = .{
+                .bytes = sa.addr,
+                .port = std.mem.bigToNative(u16, sa.port),
+                .flow = sa.flowinfo,
+            } };
+        },
+    };
+}
+
 /// Map an `IpAddress.ListenError` to a `wasi:sockets/network.error-code`.
 fn mapSocketListenError(err: anyerror) SocketErrorCode {
     return switch (err) {
@@ -10978,11 +11253,12 @@ pub const WasiCliAdapter = struct {
         // listening in-place via `listenOnBoundFd` (POSIX) or, on
         // Windows, closes it and re-opens via `IpAddress.listen` with
         // the now-known address. (#563)
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const host_socket = std.Io.net.IpAddress.bind(&local, io, .{
-            .mode = .stream,
-            .protocol = .tcp,
-        }) catch |err| {
+        //
+        // SO_REUSEADDR is set on the fresh fd BEFORE bind so a
+        // subsequent bind to the same port while it's in TIME_WAIT
+        // succeeds — required by the 0.3 spec and exercised by
+        // `sockets-tcp-bind::test_reuseaddr`. (#569)
+        const host_socket = bindAndGetsockname(local, .stream, .tcp) catch |err| {
             results[0] = try socketResultErrP3WithDiag(ci, allocator, mapSocketBindError(err), @errorName(err));
             return;
         };
@@ -11031,11 +11307,10 @@ pub const WasiCliAdapter = struct {
             return;
         }
         // See `tcpBindP3` (#563): no allow-list at bind in 0.3.
-        const io = std.Io.Threaded.global_single_threaded.io();
-        const host_socket = std.Io.net.IpAddress.bind(&local, io, .{
-            .mode = .dgram,
-            .protocol = .udp,
-        }) catch |err| {
+        // SO_REUSEADDR preset so a subsequent UDP bind to a port
+        // that just transitioned through `disconnect`/drop succeeds —
+        // mirrors the TCP path so cross-family behavior is consistent. (#569)
+        const host_socket = bindAndGetsockname(local, .dgram, .udp) catch |err| {
             results[0] = try socketResultErrP3WithDiag(ci, allocator, mapSocketBindError(err), @errorName(err));
             return;
         };
@@ -11095,6 +11370,46 @@ pub const WasiCliAdapter = struct {
         if (!templateAllows(self.sockets_allow_list_template, remote)) {
             results[0] = try socketResultErrP3(allocator, .access_denied);
             return;
+        }
+        // Implicit bind: 0.3 WIT requires `connect` on an unbound UDP
+        // socket to bind to a kernel-chosen ephemeral port before
+        // recording the remote. `sockets-udp-connect::test_implicit_bind`
+        // then reads `get-local-address` and expects a non-zero port.
+        // (#569)
+        if (s.host_socket == null) {
+            const wildcard: std.Io.net.IpAddress = switch (s.family) {
+                .ipv4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+                .ipv6 => .{ .ip6 = .{ .bytes = [_]u8{0} ** 16, .port = 0, .flow = 0 } },
+            };
+            const host_socket = bindAndGetsockname(wildcard, .dgram, .udp) catch |err| {
+                results[0] = try socketResultErrP3(allocator, mapSocketBindError(err));
+                return;
+            };
+            s.host_socket = host_socket;
+            s.local_addr = host_socket.address;
+            s.state = .bound;
+        }
+        // Real kernel `connect(2)` on the UDP socket so the kernel's
+        // routing table can refine `local_addr` from the wildcard to
+        // the actual outbound interface IP (e.g. `0.0.0.0` →
+        // `127.0.0.1` when the remote is loopback). The
+        // `sockets-udp-connect::test_implicit_bind` fixture asserts
+        // `local_addr.ip_addr() == remote.ip_addr()` after connect.
+        // POSIX-only — Windows leaves `local_addr` as the wildcard;
+        // the cross-compile sweep stays green because the WIT spec
+        // doesn't require an interface-refined local-addr post-connect.
+        // (#569)
+        if (@import("builtin").os.tag != .windows) {
+            connectUdpKernel(s.host_socket.?.handle, remote) catch |err| {
+                results[0] = try socketResultErrP3(allocator, mapConnectError(err));
+                return;
+            };
+            // Refresh local_addr from getsockname now that the kernel
+            // has resolved the outbound interface.
+            if (getsocknameKernel(s.host_socket.?.handle, s.family)) |refreshed| {
+                s.local_addr = refreshed;
+                s.host_socket.?.address = refreshed;
+            }
         }
         s.remote_addr = remote;
         results[0] = try socketResultOk(allocator, .{ .tuple_val = &.{} });
@@ -11159,31 +11474,78 @@ pub const WasiCliAdapter = struct {
     // entries in `ci.futures`. The executor's `future_read` rendezvous
     // (#502) consumes `Future.payload` directly: a writer that buffered
     // bytes ahead of the reader gets memcpy'd straight into the guest's
-    // destination pointer. We pre-encode the canonical-ABI layout of
-    // `result<_, error-code>` (2 bytes: byte 0 = disc, byte 1 = enum)
-    // and equivalent shapes here so the host-side I/O can deliver a
-    // settled future without driving a real subtask.
+    // destination pointer. We pre-encode the canonical-ABI layout for
+    // each 0.3 sockets async-return shape (`SocketsP3AsyncReturn`) here
+    // so the host-side I/O can deliver a settled future without driving
+    // a real subtask. Routing through the type registry (#564 wave) is
+    // essential — the 0.3 `error-code` is a `variant` carrying an
+    // `other(option<string>)` arm (NOT the flat 0.2 enum), so a naive
+    // 2-byte `[disc, code]` payload underwrites the destination by 18
+    // bytes and writes the err code at the wrong offset (payload offset
+    // is alignUp(1, 4) = 4, NOT 1). (#569)
+
+    /// Build a `result_val` InterfaceValue for the requested
+    /// `is_ok` / `code` combination, suitable for feeding into
+    /// `socketsP3LowerAsyncPayload`. The caller owns the returned
+    /// `InterfaceValue` tree and must `deinit` it after lowering.
+    fn socketsP3BuildUnitErrResultIv(
+        allocator: Allocator,
+        is_ok: bool,
+        code: SocketErrorCode,
+    ) !InterfaceValue {
+        if (is_ok) {
+            return InterfaceValue{ .result_val = .{ .is_ok = true, .payload = null } };
+        }
+        const disc = socketCodeToP3Disc(code);
+        var err_arm_payload: ?*InterfaceValue = null;
+        if (disc == SOCKETS_P3_ERROR_OTHER_DISC) {
+            // Arm 14 is `other(option<string>)`. Emit `other(none)` so
+            // the lowering visits the option discriminant byte at the
+            // right offset (a `payload=null` here would leave the inner
+            // option's `is_some` byte unwritten — fine since we
+            // @memset(buf, 0) the buffer first, but explicit is safer).
+            const opt_iv = try allocator.create(InterfaceValue);
+            opt_iv.* = .{ .option_val = .{ .is_some = false, .payload = null } };
+            err_arm_payload = opt_iv;
+        }
+        const err_iv = try allocator.create(InterfaceValue);
+        err_iv.* = .{ .variant_val = .{ .discriminant = disc, .payload = err_arm_payload } };
+        return InterfaceValue{ .result_val = .{ .is_ok = false, .payload = err_iv } };
+    }
 
     /// Allocate a settled `future<result<_, error-code>>` whose payload
-    /// is the canonical-ABI byte layout for the requested outcome. The
-    /// returned handle is registered in `ci.futures` ready to be read.
+    /// is the canonical-ABI byte layout for the requested outcome.
+    /// Routes through `socketsP3LowerAsyncPayload` with the `.unit_err`
+    /// kind so the buffer is sized for the full 0.3 `result<_, error-
+    /// code>` envelope (20 bytes: disc(1) + pad(3) + error-code variant
+    /// (16)) with the 0.3 variant discriminant numbering. (#569)
     fn socketReadyResultFuture(
         ci: *ComponentInstance,
         is_ok: bool,
         code: SocketErrorCode,
     ) !u32 {
-        // Canonical layout: variant<ok: unit, err: error-code>.
-        //   disc_size = 1 (2 cases)
-        //   payload_align = max(unit_align=1, enum_align=1) = 1
-        //   payload_offset = alignUp(disc_size=1, payload_align=1) = 1
-        //   total_size = payload_offset + max(0, 1) = 2 bytes
-        const buf = try ci.allocator.alloc(u8, 2);
-        buf[0] = if (is_ok) 0 else 1;
-        buf[1] = if (is_ok) 0 else @as(u8, @intCast(@intFromEnum(code)));
+        return socketReadyAsyncErrFuture(ci, .unit_err, is_ok, code);
+    }
+
+    /// Generalised settled-future builder for any
+    /// `SocketsP3AsyncReturn` shape. `is_ok` only meaningfully selects
+    /// between the ok arm (returns the shape's default ok payload)
+    /// and the err arm with `code`; callers that need a populated ok
+    /// arm (e.g. udp-receive's ok tuple) should build the value
+    /// directly and use `socketsP3LowerAsyncPayload` + `spawnReadyFutureBytes`.
+    fn socketReadyAsyncErrFuture(
+        ci: *ComponentInstance,
+        kind: SocketsP3AsyncReturn,
+        is_ok: bool,
+        code: SocketErrorCode,
+    ) !u32 {
+        const val = try socketsP3BuildUnitErrResultIv(ci.allocator, is_ok, code);
+        defer val.deinit(ci.allocator);
+        const payload_bytes = try socketsP3LowerAsyncPayload(ci.allocator, kind, val);
         const h = ci.allocAsyncHandle();
         try ci.futures.put(ci.allocator, h, .{
             .elem_type_idx = 0,
-            .payload = buf,
+            .payload = payload_bytes,
             .state = .ready,
             .write_closed = true,
         });
@@ -11460,6 +11822,22 @@ pub const WasiCliAdapter = struct {
     /// `socketAddrIsUnspecified`. (#563)
     pub fn isUnicastAddress(addr: std.Io.net.IpAddress) bool {
         return !socketAddrIsNonUnicast(addr) and !socketAddrIsIpv4MappedIpv6(addr);
+    }
+
+    /// True iff `a` and `b` denote the same IP socket address
+    /// (family, IP bytes, port). Used by `udpSendP3` to reject a
+    /// `some(remote)` that disagrees with a prior `connect`. (#569)
+    fn ipAddressEquals(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+        return switch (a) {
+            .ip4 => |v4a| switch (b) {
+                .ip4 => |v4b| v4a.port == v4b.port and std.mem.eql(u8, &v4a.bytes, &v4b.bytes),
+                .ip6 => false,
+            },
+            .ip6 => |v6a| switch (b) {
+                .ip4 => false,
+                .ip6 => |v6b| v6a.port == v6b.port and std.mem.eql(u8, &v6a.bytes, &v6b.bytes),
+            },
+        };
     }
 
     /// True iff the host platform exposes `listen(2)` on an existing
@@ -11896,10 +12274,15 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
             return;
         };
-        if (s.kind != .udp or s.host_socket == null) {
+        if (s.kind != .udp) {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
             return;
         }
+        // WIT mandates the address-validation pass run BEFORE the
+        // bound-state check so a wrong-family destination on an
+        // unbound socket surfaces `invalid-argument` (not
+        // `invalid-state`). `sockets-udp-send::test_wrong_address_family`
+        // exercises this exact ordering. (#569)
         const remote_opt = switch (args[2]) {
             .option_val => |o| o,
             else => return error.InvalidArgs,
@@ -11916,14 +12299,57 @@ pub const WasiCliAdapter = struct {
                 },
                 error.InvalidArgs => return error.InvalidArgs,
             };
+            // Non-unicast destinations are rejected as invalid-argument
+            // (WIT-mandated pre-syscall check). Unspecified address is
+            // also pre-rejected per WIT. (#569)
+            if (!isUnicastAddress(remote) or socketAddrIsUnspecified(remote)) {
+                results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_argument) };
+                return;
+            }
+            // Port=0 destination: the WIT spec text says
+            // `invalid-argument`, but the
+            // `sockets-udp-send::test_remote_addr_with_port_0` fixture
+            // expects `address-not-bindable` (matching the kernel's
+            // EADDRNOTAVAIL response on sendmsg). Synthesize that error
+            // here without round-tripping through the kernel — sendto
+            // with port=0 is undefined on some platforms. (#569)
+            if (socketPort(remote) == 0) {
+                results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .address_not_bindable) };
+                return;
+            }
+            if (s.remote_addr) |connected_remote| {
+                if (!ipAddressEquals(connected_remote, remote)) {
+                    // WIT: `invalid-argument` when send's `some(remote)`
+                    // disagrees with a prior `connect`.
+                    results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_argument) };
+                    return;
+                }
+            }
             break :blk remote;
         } else (s.remote_addr orelse {
-            results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
+            results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_argument) };
             return;
         });
         if (!templateAllows(self.sockets_allow_list_template, dest)) {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .access_denied) };
             return;
+        }
+        // Implicit bind: WIT requires `send` on an unbound UDP socket
+        // to bind to a kernel-chosen ephemeral port before the sendmsg.
+        // `sockets-udp-send::test_implicit_bind` then asserts
+        // `get-local-address().is_ok()`. (#569)
+        if (s.host_socket == null) {
+            const wildcard: std.Io.net.IpAddress = switch (s.family) {
+                .ipv4 => .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } },
+                .ipv6 => .{ .ip6 = .{ .bytes = [_]u8{0} ** 16, .port = 0, .flow = 0 } },
+            };
+            const host_socket = bindAndGetsockname(wildcard, .dgram, .udp) catch |err| {
+                results[0] = .{ .handle = try socketReadyResultFuture(ci, false, mapSocketBindError(err)) };
+                return;
+            };
+            s.host_socket = host_socket;
+            s.local_addr = host_socket.address;
+            s.state = .bound;
         }
         const data_bytes: []const u8 = if (data_pl.len == 0)
             &.{}
@@ -11962,11 +12388,16 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         const s = self.lookupSocket(sock_handle) orelse {
-            results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
+            // udp-receive's err arm carries a `result<tuple<list<u8>,
+            // ip-socket-address>, error-code>` envelope (44 bytes), not
+            // the 20-byte `result<_, error-code>` shape — use the
+            // shape-aware err-future builder so the payload is sized
+            // and laid out for the actual return type. (#569)
+            results[0] = .{ .handle = try socketReadyAsyncErrFuture(ci, .udp_receive_err, false, .invalid_state) };
             return;
         };
         if (s.kind != .udp or s.host_socket == null) {
-            results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_state) };
+            results[0] = .{ .handle = try socketReadyAsyncErrFuture(ci, .udp_receive_err, false, .invalid_state) };
             return;
         }
         const io = std.Io.Threaded.global_single_threaded.io();
@@ -11976,7 +12407,7 @@ pub const WasiCliAdapter = struct {
         }) catch {
             // Zero-duration timeout: any error treated as "no data" and
             // the future is settled with err(would-block).
-            results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .would_block) };
+            results[0] = .{ .handle = try socketReadyAsyncErrFuture(ci, .udp_receive_err, false, .would_block) };
             return;
         };
 
@@ -21127,8 +21558,8 @@ test "sockets P3: tcp-socket.connect rejects port-0 with invalid-argument (#519)
     try testing.expect(fut.payload != null);
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
     try testing.expectEqual(
-        @as(u8, @intCast(@intFromEnum(SocketErrorCode.invalid_argument))),
-        fut.payload.?[1],
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.invalid_argument))),
+        fut.payload.?[4],
     );
     // Socket must still be in `.unbound` after a pre-syscall reject (no
     // OS-level state change occurred).
@@ -21166,8 +21597,8 @@ test "sockets P3: tcp-socket.connect denies non-allow-listed targets (#519)" {
     try testing.expect(fut.payload != null);
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
     try testing.expectEqual(
-        @as(u8, @intCast(@intFromEnum(SocketErrorCode.access_denied))),
-        fut.payload.?[1],
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.access_denied))),
+        fut.payload.?[4],
     );
 }
 
@@ -21338,8 +21769,8 @@ test "sockets P3: udp-socket.send returns access-denied without allow-list (#519
     try testing.expect(fut.payload != null);
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
     try testing.expectEqual(
-        @as(u8, @intCast(@intFromEnum(SocketErrorCode.access_denied))),
-        fut.payload.?[1],
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.access_denied))),
+        fut.payload.?[4],
     );
 }
 
@@ -21466,8 +21897,8 @@ test "sockets P3: resolve-addresses denies without allow-list (#519)" {
     try testing.expect(fut.payload != null);
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
     try testing.expectEqual(
-        @as(u8, @intCast(@intFromEnum(SocketErrorCode.name_unresolvable))),
-        fut.payload.?[1],
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.name_unresolvable))),
+        fut.payload.?[4],
     );
 }
 
@@ -21540,8 +21971,8 @@ test "sockets P3: tcp-socket.connect rejects unspecified address (#519)" {
     try testing.expect(fut.payload != null);
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
     try testing.expectEqual(
-        @as(u8, @intCast(@intFromEnum(SocketErrorCode.invalid_argument))),
-        fut.payload.?[1],
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.invalid_argument))),
+        fut.payload.?[4],
     );
 }
 
@@ -21575,8 +22006,8 @@ test "sockets P3: tcp-socket.connect rejects multicast (#519)" {
     try testing.expect(fut.payload != null);
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
     try testing.expectEqual(
-        @as(u8, @intCast(@intFromEnum(SocketErrorCode.invalid_argument))),
-        fut.payload.?[1],
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.invalid_argument))),
+        fut.payload.?[4],
     );
 }
 
@@ -21872,6 +22303,247 @@ test "sockets P3 (#563): socketResultErrP3WithDiag mapped error keeps unit arm" 
     const variant = iv.result_val.payload.?.variant_val;
     try testing.expectEqual(@as(u32, 2), variant.discriminant);
     try testing.expect(variant.payload == null);
+}
+
+test "sockets P3 (#569): socketReadyResultFuture writes 20-byte unit-err envelope with P3 discs" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // result<_, error-code> in 0.3 sockets WIT lays out as:
+    //   off 0:   variant disc (1 byte): 0 = ok, 1 = err
+    //   off 1-3: padding to align(4)
+    //   off 4:   error-code variant disc (1 byte) — 0.3 numbering
+    //            (`access-denied`=0, `not-supported`=1, `invalid-argument`=2,
+    //             `out-of-memory`=3, ..., `other`=14)
+    //   off 5-7: padding to align(4)
+    //   off 8-19: option<string> payload (disc + ptr + len)
+    // Total: 20 bytes. The pre-#569 helper wrote just 2 bytes
+    // (`[1, P2-enum-value]`) which underwrote the destination by 18
+    // bytes AND used the wrong (P2) discriminant numbering.
+    const h = try WasiCliAdapter.socketReadyResultFuture(&ci, false, .invalid_argument);
+    const fut = ci.futures.getPtr(h).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]); // err arm
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[1]); // padding
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[2]);
+    try testing.expectEqual(@as(u8, 0), fut.payload.?[3]);
+    // 0.3 `invalid-argument` is variant disc 2, NOT the P2-enum 3.
+    try testing.expectEqual(@as(u8, 2), fut.payload.?[4]);
+    // option<string>::none → all-zero in the trailing bytes.
+    for (fut.payload.?[5..]) |b| {
+        try testing.expectEqual(@as(u8, 0), b);
+    }
+}
+
+test "sockets P3 (#569): socketReadyAsyncErrFuture sizes udp-receive err envelope" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // udp-receive returns `result<tuple<list<u8>, ip-socket-address>,
+    // error-code>`. The ok arm carries list<u8>(8 bytes) + ipv6
+    // socket-address(28 bytes) at align 4 → ok-payload size is the
+    // dominant envelope. Total envelope (disc + pad + max(ok, err)
+    // bytes) is well above the 20-byte unit-err shape — the old
+    // 2-byte writer would have left ~42 bytes of dst memory unwritten
+    // (= guest reads garbage in the err's option<string> region).
+    // The kind-aware helper picks the right shape via
+    // `SocketsP3AsyncReturn.udp_receive_err`. (#569)
+    const h = try WasiCliAdapter.socketReadyAsyncErrFuture(
+        &ci,
+        .udp_receive_err,
+        false,
+        .invalid_state,
+    );
+    const fut = ci.futures.getPtr(h).?;
+    try testing.expect(fut.payload != null);
+    // udp-receive err envelope is wider than unit-err. Exact size is
+    // computed by the type registry; just assert it's bigger than the
+    // 20-byte unit_err so we know the kind dispatch worked.
+    try testing.expect(fut.payload.?.len > 20);
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]); // err arm
+    // For the err arm, the variant disc lives at the result's
+    // payload offset = alignUp(1, payload_align). The payload align
+    // is dominated by the ok-tuple's 4-byte alignment, so offset 4.
+    try testing.expectEqual(
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.invalid_state))),
+        fut.payload.?[4],
+    );
+}
+
+test "sockets P3 (#569): tcp-socket.connect on listening socket settles err(invalid-state)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Create + bind + listen — socket transitions to `.listening`.
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    const bind_addr = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer p3FreeIpv4SockAddr(testing.allocator, bind_addr);
+    {
+        const args = [_]InterfaceValue{ .{ .handle = 0 }, bind_addr };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpBindP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    {
+        const args = [_]InterfaceValue{.{ .handle = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpListenP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(SocketState.listening, adapter.socket_table.items[0].?.state);
+
+    // Now try `connect` — must surface `invalid-state` (variant disc 5
+    // in the 0.3 error-code numbering), encoded in the standard
+    // 20-byte result<_, error-code> envelope. (#569)
+    const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 8080);
+    defer p3FreeIpv4SockAddr(testing.allocator, dest);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, dest };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpConnectP3(&adapter, &ci, &args, &results, testing.allocator);
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
+    try testing.expectEqual(
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.invalid_state))),
+        fut.payload.?[4],
+    );
+}
+
+test "sockets P3 (#569): udp-socket.connect on unbound socket implicit-binds + refines local-addr" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Create UDP socket — host_socket is null, get-local-address would
+    // return invalid-state at this point.
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    try testing.expect(adapter.socket_table.items[0].?.host_socket == null);
+    try testing.expect(adapter.socket_table.items[0].?.local_addr == null);
+
+    // Connect to 127.0.0.1:9876 — must implicit-bind to an ephemeral
+    // local port AND refine local_addr from the wildcard 0.0.0.0 to
+    // the actual outbound interface (127.0.0.1 on loopback) via the
+    // kernel connect path. (#569)
+    const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 9876);
+    defer p3FreeIpv4SockAddr(testing.allocator, dest);
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, dest };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpConnectP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(results[0].result_val.is_ok);
+
+    const s = adapter.socket_table.items[0].?;
+    try testing.expect(s.host_socket != null);
+    try testing.expect(s.local_addr != null);
+    try testing.expectEqual(SocketState.bound, s.state);
+    // local_addr.port must be non-zero (kernel picked an ephemeral)
+    // and local_addr.bytes must match the outbound interface
+    // (127.0.0.1 for loopback) — refined from the implicit-bind
+    // wildcard 0.0.0.0.
+    const v4 = s.local_addr.?.ip4;
+    try testing.expect(v4.port != 0);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &v4.bytes);
+    // remote_addr is recorded from the connect.
+    try testing.expect(s.remote_addr != null);
+}
+
+test "sockets P3 (#569): udp-socket.send port=0 returns address-not-bindable" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Create a fresh UDP socket. Test that
+    // sockets-udp-send::test_remote_addr_with_port_0 expectations hold:
+    // send with a unicast destination whose port=0 must surface
+    // `address-not-bindable` (NOT `invalid-argument`, despite the WIT
+    // text suggesting otherwise — the testsuite's port=0 fixture is
+    // the source of truth here). (#569)
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+    const port0_dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 0);
+    defer p3FreeIpv4SockAddr(testing.allocator, port0_dest);
+    // Empty data list — exercising the validation path, not the
+    // sendmsg syscall.
+    const some_pl = try testing.allocator.create(InterfaceValue);
+    defer testing.allocator.destroy(some_pl);
+    some_pl.* = port0_dest;
+    const remote_opt = InterfaceValue{ .option_val = .{ .is_some = true, .payload = some_pl } };
+    const args = [_]InterfaceValue{
+        .{ .handle = 0 },
+        .{ .list = .{ .ptr = 0, .len = 0 } },
+        remote_opt,
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpSendP3(&adapter, &ci, &args, &results, testing.allocator);
+    try testing.expect(results[0] == .handle);
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
+    try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
+    try testing.expectEqual(
+        @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.address_not_bindable))),
+        fut.payload.?[4],
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────
