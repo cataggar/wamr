@@ -76,6 +76,14 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     defer env_flags.deinit(allocator);
     var map_dirs: std.ArrayListUnmanaged(MapDir) = .empty;
     defer map_dirs.deinit(allocator);
+    // `--allow-net=CIDR` (repeatable): seed the component-side WASI
+    // sockets allow-list with the given CIDR blocks. Without at least
+    // one entry the default-deny policy rejects every bind/connect
+    // with `error-code::access-denied` — the wasi-testsuite sockets
+    // fixtures need 127.0.0.0/8 (and ::1/128) to exercise the
+    // loopback-bind paths. (#520 wave 2)
+    var allow_net: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer allow_net.deinit(allocator);
     var listen_address: ?std.Io.net.IpAddress = null;
     var stack_size: u32 = 64 * 1024;
     var past_options = false;
@@ -136,6 +144,16 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     return 2;
                 };
                 try map_dirs.append(allocator, md);
+            } else if (std.mem.eql(u8, arg, "--allow-net") or std.mem.startsWith(u8, arg, "--allow-net=")) {
+                const spec = if (std.mem.eql(u8, arg, "--allow-net")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --allow-net requires CIDR (e.g. 127.0.0.0/8)\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--allow-net=".len..];
+                try allow_net.append(allocator, spec);
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
@@ -195,7 +213,7 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
             if (listen_address) |addr| {
                 return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr);
             }
-            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items);
         }
     }
 
@@ -250,6 +268,8 @@ fn runComponent(
     wasm_path: []const u8,
     wasm_args: []const []const u8,
     env_vars: []const wamr.wasi_cli_adapter.EnvVar,
+    map_dirs: []const MapDir,
+    allow_net_cidrs: []const []const u8,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     // Wire the adapter's stdio directly to the host process's
@@ -270,6 +290,43 @@ fn runComponent(
     for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);
+
+    // Seed the WASI sockets allow-list from `--allow-net=CIDR` flags
+    // (default deny-all). (#520 wave 2)
+    if (allow_net_cidrs.len > 0) {
+        adapter.setSocketsAllowList(allow_net_cidrs) catch |err| {
+            std.debug.print("Error: invalid --allow-net CIDR: {}\n", .{err});
+            return 1;
+        };
+    }
+
+    // Register each `--map-dir HOST::GUEST` flag as a filesystem
+    // preopen. wasi-testsuite fixtures (e.g. wasm32-wasip3
+    // `filesystem-stat`) discover their fs-test directory via
+    // `wasi:filesystem/preopens.get-directories`; without these
+    // registrations the test asserts no preopens and exits early
+    // with a usage message. (#520 wave 2)
+    if (map_dirs.len > 0) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const cwd_dir = std.Io.Dir.cwd();
+        for (map_dirs) |md| {
+            const opened = cwd_dir.openDir(io, md.host_path, .{}) catch |err| {
+                std.debug.print(
+                    "Error: cannot pre-open '{s}' as '{s}': {}\n",
+                    .{ md.host_path, md.guest_name, err },
+                );
+                return 1;
+            };
+            _ = adapter.addPreopen(md.guest_name, opened) catch |err| {
+                std.debug.print(
+                    "Error: cannot register preopen '{s}': {}\n",
+                    .{ md.guest_name, err },
+                );
+                opened.close(io);
+                return 1;
+            };
+        }
+    }
 
     // The component loader has no `Component.deinit` yet (#142 Phase 1B);
     // its allocations (and the matching `ComponentInstance` machinery, whose
@@ -688,6 +745,10 @@ const run_usage =
     \\  --env KEY=VALUE          Set a WASI environment variable (repeatable)
     \\  --map-dir HOST::GUEST    Pre-open `HOST` host directory as `GUEST`
     \\                           inside the guest WASI sandbox (repeatable)
+    \\  --allow-net CIDR         For components: allow wasi:sockets bind /
+    \\                           connect / DNS to addresses inside CIDR
+    \\                           (e.g. `127.0.0.0/8`). Default deny-all.
+    \\                           Repeatable.
     \\
 ;
 

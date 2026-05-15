@@ -113,6 +113,21 @@ pub const TypeRegistry = struct {
 
 // ── Interface value representation ──────────────────────────────────────────
 
+/// Encode a host-side resource representation (0-based slot index) into
+/// a canon-ABI wire handle. Mirrors `executor.encodeResourceWire` but
+/// lives here to avoid a cyclic import. (#520 wave 2)
+pub fn encodeResourceWireAbi(rep: u32) u32 {
+    if (rep == std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return rep +% 1;
+}
+
+/// Decode a canon-ABI wire handle into a host-side representation.
+/// (#520 wave 2)
+pub fn decodeResourceWireAbi(wire: u32) u32 {
+    if (wire == 0) return 0;
+    return wire -% 1;
+}
+
 /// Runtime representation of a component interface value.
 /// Primitives are stored inline; compound types use allocator-owned slices.
 pub const InterfaceValue = union(enum) {
@@ -533,7 +548,8 @@ pub fn loadVal(memory: []const u8, ptr: u32, t: ctypes.ValType) !InterfaceValue 
         .f32 => .{ .f32 = @bitCast(loadU32(memory, ptr)) },
         .f64 => .{ .f64 = @bitCast(loadU64(memory, ptr)) },
         .char => .{ .char = loadU32(memory, ptr) },
-        .own, .borrow, .future, .stream, .error_context => .{ .handle = loadU32(memory, ptr) },
+        .own, .borrow => .{ .handle = decodeResourceWireAbi(loadU32(memory, ptr)) },
+        .future, .stream, .error_context => .{ .handle = loadU32(memory, ptr) },
         .string => .{ .string = .{
             .ptr = loadU32(memory, ptr),
             .len = loadU32At(memory, ptr, 4),
@@ -622,9 +638,17 @@ pub fn loadValReg(memory: []const u8, ptr: u32, t: ctypes.ValType, reg: TypeRegi
                 else => loadU32(memory, ptr),
             };
             if (disc >= cases.len) break :blk error.InvalidDiscriminant;
+            // Per canon ABI: variant payload alignment is `max` across
+            // all case payload types (mirrors `alignOfTypeDef.variant`
+            // and the matching `storeValReg.variant` fix). (#520 wave 2)
+            var payload_align: u32 = 1;
+            for (cases) |c2| {
+                if (c2.type) |ct3| {
+                    payload_align = @max(payload_align, alignOfType(reg, ct3));
+                }
+            }
             const payload_ptr = if (cases[disc].type) |ct| p: {
-                const pa = alignOfType(reg, ct);
-                break :p try allocPayload(alloc, try loadValReg(memory, alignUp(ptr + disc_sz, pa), ct, reg, alloc));
+                break :p try allocPayload(alloc, try loadValReg(memory, alignUp(ptr + disc_sz, payload_align), ct, reg, alloc));
             } else null;
             break :blk .{ .variant_val = .{ .discriminant = disc, .payload = payload_ptr } };
         },
@@ -699,9 +723,16 @@ fn loadValFromDef(memory: []const u8, ptr: u32, td: ctypes.TypeDef, reg: TypeReg
                 else => loadU32(memory, ptr),
             };
             if (disc >= v.cases.len) break :blk error.InvalidDiscriminant;
+            // Per canon ABI: variant payload alignment is `max` across
+            // all case payload types. (#520 wave 2)
+            var payload_align: u32 = 1;
+            for (v.cases) |c2| {
+                if (c2.type) |ct3| {
+                    payload_align = @max(payload_align, alignOfType(reg, ct3));
+                }
+            }
             const payload_ptr = if (v.cases[disc].type) |ct| p: {
-                const pa = alignOfType(reg, ct);
-                break :p try allocPayload(alloc, try loadValReg(memory, alignUp(ptr + disc_sz, pa), ct, reg, alloc));
+                break :p try allocPayload(alloc, try loadValReg(memory, alignUp(ptr + disc_sz, payload_align), ct, reg, alloc));
             } else null;
             break :blk .{ .variant_val = .{ .discriminant = disc, .payload = payload_ptr } };
         },
@@ -748,7 +779,7 @@ fn loadValFromDef(memory: []const u8, ptr: u32, td: ctypes.TypeDef, reg: TypeReg
             } else null;
             break :blk .{ .result_val = .{ .is_ok = is_ok, .payload = payload_ptr } };
         },
-        .resource => .{ .handle = loadU32(memory, ptr) },
+        .resource => .{ .handle = decodeResourceWireAbi(loadU32(memory, ptr)) },
         else => .{ .handle = 0 },
     };
 }
@@ -775,7 +806,8 @@ pub fn storeVal(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValue) 
         .f32 => storeU32(memory, ptr, @bitCast(val.f32)),
         .f64 => storeU64(memory, ptr, @bitCast(val.f64)),
         .char => storeU32(memory, ptr, val.char),
-        .own, .borrow, .future, .stream, .error_context => storeU32(memory, ptr, val.handle),
+        .own, .borrow => storeU32(memory, ptr, encodeResourceWireAbi(val.handle)),
+        .future, .stream, .error_context => storeU32(memory, ptr, val.handle),
         .string => {
             storeU32(memory, ptr, val.string.ptr);
             storeU32At(memory, ptr, 4, val.string.len);
@@ -857,10 +889,21 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
                 2 => storeU16(memory, ptr, @intCast(val.variant_val.discriminant)),
                 else => storeU32(memory, ptr, val.variant_val.discriminant),
             }
+            // Per canon ABI: variant payload alignment is the **max**
+            // alignment across all case payload types, not the current
+            // active arm's alignment. Using the active arm would shift
+            // the payload offset for arms with smaller alignment,
+            // causing the guest to read garbage (PR #520 wave 2). The
+            // memory layout below mirrors `alignOfTypeDef.variant`.
+            var payload_align: u32 = 1;
+            for (cases) |c| {
+                if (c.type) |ct2| {
+                    payload_align = @max(payload_align, alignOfType(reg, ct2));
+                }
+            }
             if (val.variant_val.payload) |payload| {
                 const ct = cases[val.variant_val.discriminant].type.?;
-                const pa = alignOfType(reg, ct);
-                try storeValReg(memory, alignUp(ptr + disc_sz, pa), ct, payload.*, reg);
+                try storeValReg(memory, alignUp(ptr + disc_sz, payload_align), ct, payload.*, reg);
             }
         },
         .option => {
@@ -879,17 +922,19 @@ pub fn storeValReg(memory: []u8, ptr: u32, t: ctypes.ValType, val: InterfaceValu
             const td = reg.get(idx) orelse return error.InvalidTypeIndex;
             if (val.result_val.is_ok) {
                 storeU8(memory, ptr, 0);
-                if (val.result_val.payload) |payload| {
-                    const ok_type = td.result.ok.?;
-                    const pa = alignOfType(reg, ok_type);
-                    try storeValReg(memory, alignUp(ptr + 1, pa), ok_type, payload.*, reg);
+                if (td.result.ok) |ok_type| {
+                    if (val.result_val.payload) |payload| {
+                        const pa = alignOfType(reg, ok_type);
+                        try storeValReg(memory, alignUp(ptr + 1, pa), ok_type, payload.*, reg);
+                    }
                 }
             } else {
                 storeU8(memory, ptr, 1);
-                if (val.result_val.payload) |payload| {
-                    const err_type = td.result.err.?;
-                    const pa = alignOfType(reg, err_type);
-                    try storeValReg(memory, alignUp(ptr + 1, pa), err_type, payload.*, reg);
+                if (td.result.err) |err_type| {
+                    if (val.result_val.payload) |payload| {
+                        const pa = alignOfType(reg, err_type);
+                        try storeValReg(memory, alignUp(ptr + 1, pa), err_type, payload.*, reg);
+                    }
                 }
             }
         },
@@ -935,10 +980,17 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
                 2 => storeU16(memory, ptr, @intCast(val.variant_val.discriminant)),
                 else => storeU32(memory, ptr, val.variant_val.discriminant),
             }
+            // Per canon ABI: variant payload alignment is `max` across
+            // all case payload types. (#520 wave 2)
+            var payload_align: u32 = 1;
+            for (v.cases) |c2| {
+                if (c2.type) |ct3| {
+                    payload_align = @max(payload_align, alignOfType(reg, ct3));
+                }
+            }
             if (val.variant_val.payload) |payload| {
                 const ct = v.cases[val.variant_val.discriminant].type.?;
-                const pa = alignOfType(reg, ct);
-                try storeValReg(memory, alignUp(ptr + disc_sz, pa), ct, payload.*, reg);
+                try storeValReg(memory, alignUp(ptr + disc_sz, payload_align), ct, payload.*, reg);
             }
         },
         .flags => |fl| {
@@ -973,21 +1025,27 @@ fn storeValFromDef(memory: []u8, ptr: u32, td: ctypes.TypeDef, val: InterfaceVal
         .result => |res| {
             if (val.result_val.is_ok) {
                 storeU8(memory, ptr, 0);
-                if (val.result_val.payload) |payload| {
-                    const ok_type = res.ok.?;
-                    const pa = alignOfType(reg, ok_type);
-                    try storeValReg(memory, alignUp(ptr + 1, pa), ok_type, payload.*, reg);
+                // The WIT type may be `result<_, E>` (no ok payload).
+                // Host adapters conventionally still pass a sentinel
+                // `tuple_val = &.{}` to signal "ok with nothing"; skip
+                // the payload write when the ok arm has no type.
+                if (res.ok) |ok_type| {
+                    if (val.result_val.payload) |payload| {
+                        const pa = alignOfType(reg, ok_type);
+                        try storeValReg(memory, alignUp(ptr + 1, pa), ok_type, payload.*, reg);
+                    }
                 }
             } else {
                 storeU8(memory, ptr, 1);
-                if (val.result_val.payload) |payload| {
-                    const err_type = res.err.?;
-                    const pa = alignOfType(reg, err_type);
-                    try storeValReg(memory, alignUp(ptr + 1, pa), err_type, payload.*, reg);
+                if (res.err) |err_type| {
+                    if (val.result_val.payload) |payload| {
+                        const pa = alignOfType(reg, err_type);
+                        try storeValReg(memory, alignUp(ptr + 1, pa), err_type, payload.*, reg);
+                    }
                 }
             }
         },
-        .resource => storeU32(memory, ptr, val.handle),
+        .resource => storeU32(memory, ptr, encodeResourceWireAbi(val.handle)),
         else => {},
     }
 }
@@ -1010,7 +1068,8 @@ pub fn liftFlat(core_vals: []const u32, t: ctypes.ValType) !InterfaceValue {
         .u64 => .{ .u64 = if (core_vals.len > 1) @as(u64, core_vals[1]) << 32 | core_vals[0] else core_vals[0] },
         .f32 => .{ .f32 = core_vals[0] },
         .f64 => .{ .f64 = if (core_vals.len > 1) @as(u64, core_vals[1]) << 32 | core_vals[0] else core_vals[0] },
-        .own, .borrow, .future, .stream, .error_context => .{ .handle = core_vals[0] },
+        .own, .borrow => .{ .handle = decodeResourceWireAbi(core_vals[0]) },
+        .future, .stream, .error_context => .{ .handle = core_vals[0] },
         .string => .{ .string = .{
             .ptr = core_vals[0],
             .len = if (core_vals.len > 1) core_vals[1] else 0,
@@ -1157,7 +1216,11 @@ pub fn lowerFlat(val: InterfaceValue, t: ctypes.ValType, out: []u32) !u32 {
             if (out.len > 1) out[1] = @truncate(val.f64 >> 32);
             return 2;
         },
-        .own, .borrow, .future, .stream, .error_context => {
+        .own, .borrow => {
+            out[0] = encodeResourceWireAbi(val.handle);
+            return 1;
+        },
+        .future, .stream, .error_context => {
             out[0] = val.handle;
             return 1;
         },
@@ -2040,4 +2103,112 @@ test "list types: alignment=4, elemSize=8" {
     try std.testing.expectEqual(@as(u32, 8), sizeOfType(reg, .{ .list = 0 }));
     try std.testing.expectEqual(@as(u32, 4), alignOfType(reg, .{ .list = 1 }));
     try std.testing.expectEqual(@as(u32, 8), sizeOfType(reg, .{ .list = 1 }));
+}
+
+test "variant: mixed-arm alignment uses the max across all cases (#520 wave 2)" {
+    // Per canon ABI, the variant payload offset is `alignUp(disc_sz, max-payload-align)`.
+    // Prior to wave-2 #520, `storeValReg.variant` and `loadValReg.variant`
+    // both used the *current arm's* alignment instead of the max, which
+    // shifted the payload offset for arms with smaller alignment (e.g.
+    // ipv4-sockaddr inside `ip-socket-address` whose ipv6 arm has
+    // align=4 vs ipv4 arm's align=2). The guest then read garbage at
+    // the shifted offsets — observed end-to-end as
+    // `IpAddress::Ipv4((0, 1, 0, 0))` instead of `(127, 0, 0, 1)` for
+    // the wasi-testsuite `sockets-tcp-bind` fixture.
+    //
+    // Mirrors that shape with two cases: case 0 carries u16 (align 2),
+    // case 1 carries u32 (align 4). Variant payload must land at
+    // offset 4 (alignUp(1, max(2, 4))), not 2 (case-0's alignment).
+    const fields_u16 = [_]ctypes.Field{.{ .name = "v", .type = .u16 }};
+    const fields_u32 = [_]ctypes.Field{.{ .name = "v", .type = .u32 }};
+    const cases = [_]ctypes.Case{
+        .{ .name = "a", .type = .{ .record = 0 }, .refines = null },
+        .{ .name = "b", .type = .{ .record = 1 }, .refines = null },
+    };
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .record = .{ .fields = &fields_u16 } }, // 0
+        .{ .record = .{ .fields = &fields_u32 } }, // 1
+        .{ .variant = .{ .cases = &cases } }, // 2
+    };
+    const comp_idxspace = [_]?u32{ 0, 1, 2 };
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+    const reg = TypeRegistry.init(&component);
+
+    // Construct case 0 (the smaller-aligned arm) with value 0xABCD.
+    const inner_val = std.testing.allocator.create(InterfaceValue) catch unreachable;
+    defer std.testing.allocator.destroy(inner_val);
+    const payload_field = std.testing.allocator.alloc(InterfaceValue, 1) catch unreachable;
+    defer std.testing.allocator.free(payload_field);
+    payload_field[0] = .{ .u16 = 0xABCD };
+    inner_val.* = .{ .record_val = payload_field };
+    const val: InterfaceValue = .{ .variant_val = .{ .discriminant = 0, .payload = inner_val } };
+
+    var mem: [16]u8 = .{0} ** 16;
+    try storeValReg(&mem, 0, .{ .variant = 2 }, val, reg);
+    // Payload must land at offset 4 (max align across arms = 4), not 2.
+    try std.testing.expectEqual(@as(u8, 0xCD), mem[4]);
+    try std.testing.expectEqual(@as(u8, 0xAB), mem[5]);
+    // Bytes at offsets 2..3 must remain zero (padding region).
+    try std.testing.expectEqual(@as(u8, 0), mem[2]);
+    try std.testing.expectEqual(@as(u8, 0), mem[3]);
+
+    // Round-trip: load back and check arm + payload value.
+    const loaded = try loadValReg(&mem, 0, .{ .variant = 2 }, reg, std.testing.allocator);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), loaded.variant_val.discriminant);
+    const loaded_payload = loaded.variant_val.payload.?;
+    try std.testing.expectEqual(@as(u16, 0xABCD), loaded_payload.record_val[0].u16);
+}
+
+test "result<_, E>: store with null ok type does not crash (#520 wave 2)" {
+    // `result<_, error-code>` has `ok = null` (no payload). Prior to
+    // wave-2 #520 the store path unconditionally unwrapped
+    // `res.ok.?`, panicking when the host adapter returned an `ok`
+    // variant with the conventional sentinel `tuple_val = &.{}`
+    // payload. Confirm the store skips the payload write when
+    // `res.ok` is null.
+    const err_cases = [_]ctypes.Case{
+        .{ .name = "bad", .type = null, .refines = null },
+    };
+    const comp_types = [_]ctypes.TypeDef{
+        .{ .variant = .{ .cases = &err_cases } }, // 0: error-code variant
+        .{ .result = .{ .ok = null, .err = .{ .variant = 0 } } }, // 1: result<_, error-code>
+    };
+    const comp_idxspace = [_]?u32{ 0, 1 };
+    var component = std.mem.zeroes(ctypes.Component);
+    component.types = &comp_types;
+    component.type_indexspace = &comp_idxspace;
+    const reg = TypeRegistry.init(&component);
+
+    var mem: [4]u8 = .{0} ** 4;
+    const empty_tuple: InterfaceValue = .{ .tuple_val = &.{} };
+    const payload = std.testing.allocator.create(InterfaceValue) catch unreachable;
+    defer std.testing.allocator.destroy(payload);
+    payload.* = empty_tuple;
+    const ok_val: InterfaceValue = .{ .result_val = .{ .is_ok = true, .payload = payload } };
+
+    // Must not crash even though `res.ok` is null.
+    try storeValReg(&mem, 0, .{ .result = 1 }, ok_val, reg);
+    // Discriminant byte 0 == 0 (ok).
+    try std.testing.expectEqual(@as(u8, 0), mem[0]);
+}
+
+test "encode/decodeResourceWireAbi round-trip (#520 wave 2)" {
+    // Wit-bindgen Rust's `Resource<T>::from_handle` asserts
+    // `handle != 0 && handle != u32::MAX`. The canon ABI lift/lower
+    // layer applies a `slot + 1` offset on `own/borrow` handles so
+    // that host-side 0-based slot indices round-trip safely to a
+    // non-zero wire value.
+    try std.testing.expectEqual(@as(u32, 1), encodeResourceWireAbi(0));
+    try std.testing.expectEqual(@as(u32, 2), encodeResourceWireAbi(1));
+    try std.testing.expectEqual(@as(u32, 0), decodeResourceWireAbi(1));
+    try std.testing.expectEqual(@as(u32, 1), decodeResourceWireAbi(2));
+    // The MAX sentinel passes through unchanged so the assertion-
+    // failure mode survives observability.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), encodeResourceWireAbi(std.math.maxInt(u32)));
+    // Wire 0 (the "uninitialised" sentinel) decodes to 0, which the
+    // adapter-side `lookupSocket(0)` etc. will reject as out-of-range.
+    try std.testing.expectEqual(@as(u32, 0), decodeResourceWireAbi(0));
 }
