@@ -41,6 +41,7 @@ const InterfaceValue = instance_mod.InterfaceValue;
 const ctypes = @import("types.zig");
 const abi = @import("canonical_abi.zig");
 const async_mod = @import("async.zig");
+const async_canon = @import("async_canon.zig");
 
 // ── Local TypeDef table for hand-lowered list<compound> shapes (#402) ───────
 //
@@ -3212,25 +3213,46 @@ pub const WasiCliAdapter = struct {
     fn writeViaStreamOnDropWritable(ctx_opaque: ?*anyopaque) void {
         const c: *WriteViaStreamCtx = @ptrCast(@alignCast(ctx_opaque.?));
         if (c.ci.futures.getPtr(c.future_handle)) |fut| {
-            // Settle as `Ok(())` (discriminant 0). Allocate a 1-byte
-            // payload — `future_read` copies `buf.len` bytes into the
-            // guest's destination, and `result<_, error-code>` only
-            // requires the leading discriminant byte to lift Ok.
-            if (fut.payload == null and !fut.write_closed) {
-                if (c.adapter.allocator.alloc(u8, 1)) |buf| {
-                    buf[0] = 0;
-                    fut.payload = buf;
-                } else |_| {
-                    // Out-of-memory fallback: mark ready with no payload.
-                    // The unit-type fast-path in `future_read` handles
-                    // this by returning COMPLETED(0) — a behaviourally
-                    // equivalent ok-result lift.
+            // Settle as `Ok(())` (discriminant 0). The companion
+            // `future<result<_,error-code>>` lift only inspects the
+            // leading 1-byte discriminant: 0 selects the Ok arm and
+            // the trailing payload bytes are unread.
+            if (!fut.write_closed) {
+                // If a reader already parked (the common case for
+                // `futures::join!` over a host-future-await + a
+                // stream writer), populate the parked destination
+                // **before** delivering the wakeup event. wit-bindgen's
+                // `WaitableOperation` lifts directly from the pointer
+                // it passed to `future.read` at `start_read` time —
+                // it does **not** re-call `future.read` after the
+                // event — so writing the payload into a side heap
+                // buffer would leave the guest's lift target
+                // uninitialised and trigger a Rust enum-discriminant
+                // panic (#550). Clear `pending_read` and skip the
+                // heap buffer in that case.
+                if (fut.pending_read) |pr| {
+                    if (c.ci.writableGuestBytes(pr.guest_ptr, 1)) |dst| {
+                        dst[0] = 0;
+                    }
+                    fut.pending_read = null;
+                } else if (fut.payload == null) {
+                    // No parked reader yet — buffer the discriminant so
+                    // a subsequent `future.read` can copy it out.
+                    if (c.adapter.allocator.alloc(u8, 1)) |buf| {
+                        buf[0] = 0;
+                        fut.payload = buf;
+                    } else |_| {
+                        // Out-of-memory fallback: leave payload null;
+                        // the unit-type fast-path in `future_read`
+                        // surfaces COMPLETED(0) which the guest's
+                        // `result<_, error-code>` lift treats as Ok.
+                    }
                 }
                 fut.state = .ready;
                 fut.write_closed = true;
             }
             if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                ws.setReady(idx, c.adapter.allocator);
+                ws.setReady(idx, c.adapter.allocator, async_canon.packStatus(.completed, 0));
         }
         // NB: the ctx is NOT freed here — `stream.drop-readable` /
         // `stream.drop-writable` fire `on_destroy` once the stream
@@ -4325,7 +4347,7 @@ pub const WasiCliAdapter = struct {
                 fut.pending_read = null;
                 fut.state = .ready;
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
             }
             if (self.timer_future_ready.getPtr(tf.handle)) |slot| slot.* = true;
             _ = self.timer_futures.swapRemove(i);

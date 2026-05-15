@@ -47,33 +47,87 @@ pub const Task = struct {
 pub const WaitableSet = struct {
     /// Registered items that can become ready.
     items: std.ArrayListUnmanaged(WaitableItem) = .empty,
-    /// Items that have become ready since the last wait/poll.
+    /// FIFO of indices that have become ready since the last
+    /// `popReadyEvent`. Used by `waitable-set.{wait,poll}` to surface
+    /// the oldest pending event to the guest. The matching `ready`
+    /// flag on the `WaitableItem` lets `register`/`setReady` avoid
+    /// double-enqueueing the same item.
     ready_queue: std.ArrayListUnmanaged(u32) = .empty, // indices into items
 
     pub const WaitableItem = struct {
         kind: Kind,
         handle: u32, // task/stream/future handle
         ready: bool = false,
+        /// Packed status word delivered as the event payload2 when this
+        /// item is surfaced by `waitable-set.{wait,poll}`. For
+        /// stream/future events this is the `packStatus(...)` value
+        /// the corresponding `{stream,future}.{read,write}` op would
+        /// return when re-issued at the time the event was fired.
+        /// For subtask events it carries the post-transition task
+        /// state. Populated by `setReady`; stale across multiple
+        /// readiness cycles only if the producer forgets to refresh.
+        code: u32 = 0,
 
         pub const Kind = enum { subtask, stream_read, stream_write, future_read, future_write };
     };
 
-    /// Register an item for waiting.
+    /// Register an item for waiting. Returns the per-set index of the
+    /// new entry, which the caller stashes on the underlying
+    /// stream/future entry so subsequent `setReady` calls can find
+    /// the right slot.
     pub fn register(self: *WaitableSet, item: WaitableItem, allocator: std.mem.Allocator) !u32 {
         const idx: u32 = @intCast(self.items.items.len);
         try self.items.append(allocator, item);
         return idx;
     }
 
-    /// Mark an item as ready (called by the runtime when a subtask completes, etc.).
-    pub fn setReady(self: *WaitableSet, idx: u32, allocator: std.mem.Allocator) void {
-        if (idx < self.items.items.len) {
-            self.items.items[idx].ready = true;
+    /// Mark an item as ready and enqueue it for the next
+    /// `popReadyEvent` / `pollReady` consumer. `code` is delivered as
+    /// the event payload2 (e.g. `packStatus(.completed, n)` for stream
+    /// / future events; task state for subtask events).
+    ///
+    /// Idempotent for already-queued items — the `ready` flag prevents
+    /// double-enqueueing — but always refreshes `code` to reflect the
+    /// most recent event payload.
+    pub fn setReady(
+        self: *WaitableSet,
+        idx: u32,
+        allocator: std.mem.Allocator,
+        code: u32,
+    ) void {
+        if (idx >= self.items.items.len) return;
+        const item = &self.items.items[idx];
+        item.code = code;
+        if (!item.ready) {
+            item.ready = true;
             self.ready_queue.append(allocator, idx) catch {};
         }
     }
 
-    /// Poll for ready items without blocking. Returns indices of ready items.
+    /// Pop the oldest ready item from the queue, clearing its `ready`
+    /// flag so a subsequent `setReady` re-enqueues it. Returns a copy
+    /// of the WaitableItem (kind/handle/code) so callers can lift the
+    /// event payload without re-indexing. `null` when no ready items
+    /// remain — the wait/poll arm signals NONE in that case.
+    pub fn popReadyEvent(self: *WaitableSet) ?WaitableItem {
+        while (self.ready_queue.items.len > 0) {
+            const idx = self.ready_queue.orderedRemove(0);
+            if (idx >= self.items.items.len) continue;
+            const item = &self.items.items[idx];
+            if (!item.ready) continue;
+            item.ready = false;
+            return item.*;
+        }
+        return null;
+    }
+
+    /// Poll for ready items without blocking. Returns the count of
+    /// ready entries, writing their `items[]` indices into `out` (up
+    /// to `out.len`). Drains the `ready_queue` of those indices.
+    ///
+    /// Kept for the smoke-tests that assert "some waitable woke" —
+    /// real event delivery goes through `popReadyEvent` so the
+    /// guest receives `(kind, handle, code)`.
     pub fn pollReady(self: *WaitableSet, out: []u32) u32 {
         var count: u32 = 0;
         for (self.items.items, 0..) |*item, i| {
@@ -85,6 +139,9 @@ pub const WaitableSet = struct {
                 item.ready = false; // consume readiness
             }
         }
+        // The ready_queue is now stale — clear it so subsequent
+        // `popReadyEvent` callers don't re-surface drained items.
+        self.ready_queue.clearRetainingCapacity();
         return count;
     }
 
@@ -131,7 +188,7 @@ pub const TaskManager = struct {
             task.return_values = values;
             // Notify waitable set
             if (task.waitable_set) |ws| {
-                ws.setReady(handle, std.heap.page_allocator);
+                ws.setReady(handle, std.heap.page_allocator, @intFromEnum(TaskState.returned));
             }
         }
     }
@@ -473,11 +530,41 @@ test "WaitableSet: register and poll" {
     const idx1 = try ws.register(.{ .kind = .subtask, .handle = 1 }, allocator);
     _ = idx0;
 
-    ws.setReady(idx1, allocator);
+    ws.setReady(idx1, allocator, 0);
     var out: [4]u32 = undefined;
     const count = ws.pollReady(&out);
     try std.testing.expectEqual(@as(u32, 1), count);
     try std.testing.expectEqual(idx1, out[0]);
+}
+
+test "WaitableSet: popReadyEvent surfaces kind/handle/code in FIFO order" {
+    const allocator = std.testing.allocator;
+    var ws = WaitableSet{};
+    defer ws.deinit(allocator);
+
+    const idx_w = try ws.register(.{ .kind = .stream_write, .handle = 7 }, allocator);
+    const idx_r = try ws.register(.{ .kind = .future_read, .handle = 9 }, allocator);
+
+    // No ready items yet.
+    try std.testing.expect(ws.popReadyEvent() == null);
+
+    // Refreshing `code` on the same item must not double-enqueue.
+    ws.setReady(idx_w, allocator, 0x40);
+    ws.setReady(idx_w, allocator, 0x42);
+    ws.setReady(idx_r, allocator, 0x10);
+
+    const first = ws.popReadyEvent().?;
+    try std.testing.expectEqual(WaitableSet.WaitableItem.Kind.stream_write, first.kind);
+    try std.testing.expectEqual(@as(u32, 7), first.handle);
+    try std.testing.expectEqual(@as(u32, 0x42), first.code);
+
+    const second = ws.popReadyEvent().?;
+    try std.testing.expectEqual(WaitableSet.WaitableItem.Kind.future_read, second.kind);
+    try std.testing.expectEqual(@as(u32, 9), second.handle);
+    try std.testing.expectEqual(@as(u32, 0x10), second.code);
+
+    // Queue drained.
+    try std.testing.expect(ws.popReadyEvent() == null);
 }
 
 test "Future: state transitions through pending/ready" {
