@@ -1318,6 +1318,9 @@ fn compileInst(
         => return error.UnsupportedV128,
         // Phi must be lowered before codegen.
         .phi => unreachable,
+        // parallel_copy is an aarch64-only post-pipeline op (#540).
+        // x86_64 keeps the synth-local frameStore/frameLoad path.
+        .parallel_copy => unreachable,
     }
 }
 

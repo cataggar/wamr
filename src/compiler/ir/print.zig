@@ -271,6 +271,14 @@ fn formatPayload(op: ir.Inst.Op, w: *std.Io.Writer) Error!void {
             }
             try w.writeByte(']');
         },
+        .parallel_copy => |pairs| {
+            try w.writeAll(" [");
+            for (pairs, 0..) |p, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.print("v{d}<-v{d}:{s}", .{ p.dst, p.src, @tagName(p.ty) });
+            }
+            try w.writeByte(']');
+        },
 
         // Atomic
         .atomic_load => |a| try w.print(" base=v{d}, offset={d}, size={d}", .{ a.base, a.offset, a.size }),
