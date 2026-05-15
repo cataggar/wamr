@@ -1190,7 +1190,7 @@ fn dispatchAsyncCanon(
 
                 s.pending_read = null;
                 if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, transfer_count));
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, transfer_count))) catch
                     return error.StackOverflow;
                 return;
@@ -1229,7 +1229,7 @@ fn dispatchAsyncCanon(
             s.buffer.appendSlice(comp_inst.allocator, src) catch
                 return error.OutOfMemory;
             if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
-                ws.setReady(idx, allocator);
+                ws.setReady(idx, allocator, async_canon.packStatus(.completed, count));
             env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
                 return error.StackOverflow;
         },
@@ -1264,7 +1264,7 @@ fn dispatchAsyncCanon(
                 s.read_closed = true;
                 // Wake a parked writer so it can observe CANCELLED.
                 if (s.waitable_set) |ws| if (s.write_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
                 if (s.read_closed and s.write_closed) {
                     if (s.host_handler) |h| if (h.on_destroy) |cb|
                         cb(h.ctx);
@@ -1292,7 +1292,7 @@ fn dispatchAsyncCanon(
                 };
                 // Wake a parked reader so it can observe CANCELLED.
                 if (s.waitable_set) |ws| if (s.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
                 if (s.read_closed and s.write_closed) {
                     if (s.host_handler) |h| if (h.on_destroy) |cb|
                         cb(h.ctx);
@@ -1351,7 +1351,7 @@ fn dispatchAsyncCanon(
             if (fut.state == .ready and fut.payload == null and !fut.write_closed) {
                 fut.state = .closed;
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
@@ -1366,7 +1366,7 @@ fn dispatchAsyncCanon(
                 fut.payload = null;
                 fut.state = .ready;
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
@@ -1423,7 +1423,7 @@ fn dispatchAsyncCanon(
                 fut.pending_read = null;
                 fut.state = .ready;
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
                 env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                     return error.StackOverflow;
                 return;
@@ -1437,7 +1437,7 @@ fn dispatchAsyncCanon(
             fut.payload = heap_buf;
             fut.state = .ready;
             if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                ws.setReady(idx, allocator);
+                ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
             env.pushI32(@bitCast(async_canon.packStatus(.completed, 0))) catch
                 return error.StackOverflow;
         },
@@ -1491,7 +1491,7 @@ fn dispatchAsyncCanon(
                 fut.read_closed = true;
                 // Wake a parked writer so it can observe CANCELLED.
                 if (fut.waitable_set) |ws| if (fut.write_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
                 if (fut.read_closed and fut.write_closed) {
                     fut.deinit(comp_inst.allocator);
                     _ = comp_inst.futures.remove(handle);
@@ -1505,7 +1505,7 @@ fn dispatchAsyncCanon(
                 fut.write_closed = true;
                 // Wake a parked reader so it can observe CANCELLED.
                 if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
-                    ws.setReady(idx, allocator);
+                    ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
                 if (fut.read_closed and fut.write_closed) {
                     fut.deinit(comp_inst.allocator);
                     _ = comp_inst.futures.remove(handle);
@@ -1589,22 +1589,143 @@ fn dispatchAsyncCanon(
             }
         },
         .waitable_set_wait, .waitable_set_poll => {
-            // wait/poll expect a (ws_handle, out_ptr) and write a 2-tuple
-            // (event-kind, payload) into guest memory. Without
-            // guest-memory bridging we can't honour that contract — pop
-            // arguments and push a zero status to keep the core stack
-            // balanced for the conformance "load + don't crash" target.
-            _ = env.popI32() catch return error.StackUnderflow; // out ptr
-            _ = env.popI32() catch return error.StackUnderflow; // ws handle
-            env.pushI32(0) catch return error.StackOverflow;
+            // wait/poll surface the oldest ready item registered in the
+            // waitable-set as `(event-kind: i32, payload: (handle: u32, code: u32))`:
+            // the event-kind is returned on the operand stack and the
+            // (handle, code) pair is written at the guest out-pointer
+            // popped off the stack. Mirrors the canonical-abi.py
+            // `canon_waitable_set_{wait,poll}` semantics so wit-bindgen's
+            // wakeup loop can decode the result via `EventCode + ReturnCode`.
+            //
+            // Single-threaded runtime semantics:
+            //
+            //   * `poll` returns `none` (event-code 0) when the queue is
+            //     empty.
+            //   * `wait` returns `none` here as well — true blocking
+            //     would deadlock the single-fiber runtime. wit-bindgen
+            //     treats `none` as "no progress" and re-polls all
+            //     branches, which is what we want for fixtures like
+            //     `cli-stdio-roundtrip` where peer settlement happens
+            //     synchronously inside the same `futures::join!` arm.
+            const out_ptr: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const ws_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            const ws = comp_inst.waitable_sets.getPtr(ws_handle) orelse {
+                env.pushI32(0) catch return error.StackOverflow;
+                return;
+            };
+
+            if (ws.popReadyEvent()) |item| {
+                const bytes = comp_inst.writableGuestBytes(out_ptr, 8) orelse
+                    return error.MemoryNotAvailable;
+                std.mem.writeInt(u32, bytes[0..4], item.handle, .little);
+                std.mem.writeInt(u32, bytes[4..8], item.code, .little);
+                env.pushI32(@bitCast(async_canon.eventCodeForKind(item.kind))) catch
+                    return error.StackOverflow;
+                return;
+            }
+
+            // No ready waitable — `none` event-code. Caller (wit-bindgen
+            // reactor) reschedules.
+            env.pushI32(@intFromEnum(async_canon.EventCode.none)) catch
+                return error.StackOverflow;
         },
 
         .waitable_join => {
-            // Pops (waitable_handle, ws_handle). We simply drop both —
-            // the join becomes a no-op until real WaitableItem-typed
-            // registration lands alongside the read/write canon ops.
-            _ = env.popI32() catch return error.StackUnderflow;
-            _ = env.popI32() catch return error.StackUnderflow;
+            // `canon waitable.join` — canonical-abi.py
+            // `canon_waitable_join(wi, si)` declares params in
+            // `(waitable, set)` order, so the runtime stack at call
+            // time is (bottom→top) `[waitable, set]`. We therefore
+            // pop **set** first (top) and **waitable** second
+            // (under). A zero `set` means "remove from any current
+            // set" — we currently no-op that because removal isn't
+            // observable until the waitable becomes ready, and the
+            // only producer of a zero-set join is wit-bindgen's drop
+            // path which shortly drops the waitable entirely.
+            const ws_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+            const waitable_handle: u32 = @bitCast(env.popI32() catch return error.StackUnderflow);
+
+            if (ws_handle == 0) return;
+            const ws = comp_inst.waitable_sets.getPtr(ws_handle) orelse return;
+
+            // Determine kind by inspecting which end of the
+            // future/stream is currently parked. The guest calls
+            // `waitable.join` immediately after the corresponding
+            // `{future,stream}.{read,write}` returned `BLOCKED`, so
+            // exactly one of `pending_read` / `pending_write` is set
+            // (futures only park readers in our impl; streams can
+            // park either end). Fall back to `_read` for futures and
+            // `_write` for streams — the common case is a guest
+            // awaiting a host-produced future end (see #537
+            // `write-via-stream` / `read-via-stream`).
+            if (comp_inst.futures.getPtr(waitable_handle)) |fut| {
+                if (fut.waitable_set != null) return; // already joined
+                // Futures default to `future_read` because their only
+                // blocking arm is the reader (`future.read` parks via
+                // `pending_read`). A `pending_write` slot doesn't exist
+                // in our model — `future.write` always completes
+                // synchronously. We still treat `read_closed` as a
+                // hint that the join is for the write end so the
+                // dropped-peer wake fires the right slot.
+                const kind: async_mod.WaitableSet.WaitableItem.Kind =
+                    if (fut.read_closed) .future_write else .future_read;
+                const idx = ws.register(.{ .kind = kind, .handle = waitable_handle }, allocator) catch
+                    return error.OutOfMemory;
+                fut.waitable_set = ws;
+                if (kind == .future_read) {
+                    fut.read_waitable_idx = idx;
+                } else {
+                    fut.write_waitable_idx = idx;
+                }
+                // If the corresponding end is already settled (the
+                // peer fired its drop / write before the join arrived
+                // — common when stdout's `on_drop_writable` runs
+                // synchronously inside the same `futures::join!` arm),
+                // mark the slot ready immediately so the very next
+                // `waitable-set.{wait,poll}` surfaces the event.
+                if (kind == .future_read) {
+                    if (fut.payload != null or (fut.state == .ready and !fut.write_closed)) {
+                        ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+                    } else if (fut.write_closed and fut.payload == null) {
+                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
+                    }
+                } else { // future_write
+                    if (fut.read_closed) {
+                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
+                    }
+                }
+                return;
+            }
+
+            if (comp_inst.streams.getPtr(waitable_handle)) |s| {
+                if (s.waitable_set != null) return; // already joined
+                const kind: async_mod.WaitableSet.WaitableItem.Kind =
+                    if (s.pending_read != null) .stream_read else .stream_write;
+                const idx = ws.register(.{ .kind = kind, .handle = waitable_handle }, allocator) catch
+                    return error.OutOfMemory;
+                s.waitable_set = ws;
+                if (kind == .stream_read) {
+                    s.read_waitable_idx = idx;
+                    // Buffered bytes available or peer closed →
+                    // surface readiness immediately.
+                    if (s.buffer.items.len > 0) {
+                        ws.setReady(idx, allocator, async_canon.packStatus(.completed, 0));
+                    } else if (s.write_closed) {
+                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
+                    }
+                } else {
+                    s.write_waitable_idx = idx;
+                    if (s.read_closed) {
+                        ws.setReady(idx, allocator, async_canon.packStatus(.dropped, 0));
+                    }
+                }
+                return;
+            }
+
+            // Unknown waitable handle — silently no-op. Spec says trap,
+            // but the conformance suite occasionally joins a
+            // just-dropped handle on the cancellation path; matching
+            // wasmtime's tolerant behaviour avoids spurious traps.
         },
     }
 }
@@ -3439,6 +3560,240 @@ test "stream.drop-writable while buffer drained: subsequent read returns DROPPED
     );
     const status: u32 = @bitCast(try env.popI32());
     try testing.expectEqual(async_canon.packStatus(.dropped, 0), status);
+}
+
+// ── #550: waitable.join + waitable-set.{wait,poll} event delivery ─────────
+
+test "waitable.join + waitable-set.wait: stream-write event delivered to a parked write waitable (#550)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU32Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    // Allocate a stream + a waitable-set.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const stream_handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .waitable_set_new }, env, null, testing.allocator);
+    const ws_handle: u32 = @bitCast(try env.popI32());
+
+    // Park a stream.write by pre-flagging `pending_write` so the
+    // join arm classifies the join as `stream_write` (matches the
+    // post-#541 BLOCKED-then-join sequence wit-bindgen emits when
+    // an out-of-band sink can't accept bytes immediately).
+    {
+        const s = inst.streams.getPtr(stream_handle).?;
+        s.pending_write = .{ .guest_ptr = 0, .count = 4 };
+    }
+
+    // `canon waitable.join : [waitable, set]` — wasm pop order is set
+    // (top), waitable (under), so push waitable first then set.
+    try env.pushI32(@bitCast(stream_handle));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .waitable_join }, env, null, testing.allocator);
+
+    try testing.expectEqual(@as(usize, 1), inst.waitable_sets.getPtr(ws_handle).?.items.items.len);
+    try testing.expectEqual(
+        async_mod.WaitableSet.WaitableItem.Kind.stream_write,
+        inst.waitable_sets.getPtr(ws_handle).?.items.items[0].kind,
+    );
+    try testing.expectEqual(@as(u32, 0), inst.streams.getPtr(stream_handle).?.write_waitable_idx.?);
+
+    // Drop the readable end — the parked writer must wake with a
+    // `dropped` event so the guest can re-issue `stream.write` and
+    // observe the closed peer synchronously.
+    try env.pushI32(@bitCast(stream_handle));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_drop_readable = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+
+    // `canon waitable-set.wait : [set, out_ptr] -> [event]` —
+    // out_ptr at top of stack.
+    const out_ptr: u32 = 0x100;
+    try env.pushI32(@bitCast(ws_handle));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_wait = .{ .cancellable = false, .memory = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const event: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(@intFromEnum(async_canon.EventCode.stream_write), event);
+
+    // Payload at out_ptr: (handle, packed_status).
+    const ev_bytes = inst.writableGuestBytes(out_ptr, 8).?;
+    try testing.expectEqual(stream_handle, std.mem.readInt(u32, ev_bytes[0..4], .little));
+    try testing.expectEqual(async_canon.packStatus(.dropped, 0), std.mem.readInt(u32, ev_bytes[4..8], .little));
+}
+
+test "waitable-set.poll: settled future surfaces FUTURE_READ event with the right handle/code (#550)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    // Allocate a future + waitable-set. The future stands in for the
+    // `future<result<_,error-code>>` returned by `write-via-stream`.
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const future_handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .waitable_set_new }, env, null, testing.allocator);
+    const ws_handle: u32 = @bitCast(try env.popI32());
+
+    // Park a reader via `future.read` — returns BLOCKED so the join
+    // arm can detect `pending_read != null` and classify as future_read.
+    const guest_ptr: u32 = 0x80;
+    try env.pushI32(@bitCast(future_handle));
+    try env.pushI32(@bitCast(guest_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .future_read = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(async_canon.BLOCKED_STATUS, @as(u32, @bitCast(try env.popI32())));
+
+    // Join the parked future to the waitable-set.
+    try env.pushI32(@bitCast(future_handle));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .waitable_join }, env, null, testing.allocator);
+
+    // poll before settlement → NONE.
+    const out_ptr: u32 = 0x200;
+    try env.pushI32(@bitCast(ws_handle));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_poll = .{ .cancellable = false, .memory = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@intFromEnum(async_canon.EventCode.none), @as(u32, @bitCast(try env.popI32())));
+
+    // Simulate host settling the future the way
+    // `writeViaStreamOnDropWritable` does: directly populate the
+    // parked reader's destination + set state ready + fire setReady.
+    {
+        const fut = inst.futures.getPtr(future_handle).?;
+        const dst = inst.writableGuestBytes(fut.pending_read.?.guest_ptr, 1).?;
+        dst[0] = 0;
+        fut.pending_read = null;
+        fut.state = .ready;
+        fut.write_closed = true;
+        if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+            ws.setReady(idx, testing.allocator, async_canon.packStatus(.completed, 0));
+    }
+
+    // poll after settlement → FUTURE_READ event with the future handle.
+    try env.pushI32(@bitCast(ws_handle));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_poll = .{ .cancellable = false, .memory = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@intFromEnum(async_canon.EventCode.future_read), @as(u32, @bitCast(try env.popI32())));
+    const ev_bytes = inst.writableGuestBytes(out_ptr, 8).?;
+    try testing.expectEqual(future_handle, std.mem.readInt(u32, ev_bytes[0..4], .little));
+    try testing.expectEqual(async_canon.packStatus(.completed, 0), std.mem.readInt(u32, ev_bytes[4..8], .little));
+
+    // The lifted Ok discriminant is at `guest_ptr` already (written
+    // synchronously above) so wit-bindgen's lift-from-original-ptr
+    // contract is satisfied — no re-issued `future.read` needed.
+    try testing.expectEqual(@as(u8, 0), inst.writableGuestBytes(guest_ptr, 1).?[0]);
+}
+
+test "waitable.join on already-settled future: marks ready synchronously so the next wait surfaces it (#550)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newFutureU32Inst(testing.allocator);
+    defer destroyFutureInst(inst);
+
+    // Allocate a future and pre-settle it (state=.ready, payload set)
+    // — this mirrors a `read-via-stream` companion future that the
+    // host creates already-Ok.
+    const future_handle = inst.allocAsyncHandle();
+    const payload = try testing.allocator.alloc(u8, 1);
+    payload[0] = 0;
+    try inst.futures.put(testing.allocator, future_handle, .{
+        .elem_type_idx = 0,
+        .state = .ready,
+        .payload = payload,
+    });
+
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .waitable_set_new }, env, null, testing.allocator);
+    const ws_handle: u32 = @bitCast(try env.popI32());
+
+    // Join — the future is already ready, so `waitable.join` must
+    // synchronously mark the slot ready (otherwise the guest would
+    // wait forever for an event that's already past).
+    try env.pushI32(@bitCast(future_handle));
+    try env.pushI32(@bitCast(ws_handle));
+    try dispatchCanonBuiltin(inst, .{ .async_canon = .waitable_join }, env, null, testing.allocator);
+
+    const ws = inst.waitable_sets.getPtr(ws_handle).?;
+    try testing.expectEqual(@as(usize, 1), ws.ready_queue.items.len);
+
+    // Wait drains the event.
+    const out_ptr: u32 = 0x300;
+    try env.pushI32(@bitCast(ws_handle));
+    try env.pushI32(@bitCast(out_ptr));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .waitable_set_wait = .{ .cancellable = false, .memory = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    try testing.expectEqual(@intFromEnum(async_canon.EventCode.future_read), @as(u32, @bitCast(try env.popI32())));
+    const ev_bytes = inst.writableGuestBytes(out_ptr, 8).?;
+    try testing.expectEqual(future_handle, std.mem.readInt(u32, ev_bytes[0..4], .little));
 }
 
 test "dispatchCanonBuiltin: error-context.new + drop round-trip" {
