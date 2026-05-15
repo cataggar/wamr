@@ -1658,6 +1658,7 @@ pub fn instantiate(
                                     .lower_opts = executor_mod.LowerOptions.fromOpts(lower.opts),
                                     .extended_types = ext.extension_types,
                                     .extended_indexspace = ext.extension_indexspace,
+                                    .is_async_func = ft.is_async,
                                 };
                                 inst.trampoline_ctxs.append(allocator, ctx_ptr) catch {
                                     ctx_ptr.deinit(allocator);

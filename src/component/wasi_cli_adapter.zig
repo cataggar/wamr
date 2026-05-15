@@ -327,6 +327,71 @@ fn fsP3FixupOptionalInstant(val_ptr: *InterfaceValue) void {
     }
 }
 
+/// Map a discriminant produced by the host's 0.2-shape `FsErrorCode`
+/// enum into the 0.3 `variant error-code` discriminant position. The
+/// 0.3 spec dropped the `would-block` case (which sat at position 1 in
+/// 0.2), shifting every subsequent case down by one. Sockets has the
+/// same shape via `socketCodeToP3Disc`. (#564.)
+///
+/// Internal `would_block` (`= 1`) maps to 0.3 `busy` (`= 3`) — the
+/// closest semantic equivalent for a "transient retry" error on a
+/// filesystem operation.
+fn fsCodeToP3Disc(p2_disc: u32) u32 {
+    if (p2_disc == 0) return 0; // access stays
+    if (p2_disc == 1) return 3; // would_block → busy (closest 0.3 equivalent)
+    return p2_disc - 1; // already (2)..cross_device (36) shift down by one
+}
+
+/// Walk the `result<_, error-code>` shape and transcode the err-arm
+/// discriminant from the host's 0.2 enum to the 0.3 variant via
+/// `fsCodeToP3Disc`. The ok arm and non-variant err payloads (none
+/// produced by the current host fns) are left untouched. (#564.)
+fn fsP3FixupErrCode(val: InterfaceValue) void {
+    if (val != .result_val) return;
+    if (val.result_val.is_ok) return;
+    const err_ptr = val.result_val.payload orelse return;
+    if (err_ptr.* != .variant_val) return;
+    const p2 = err_ptr.variant_val.discriminant;
+    @constCast(err_ptr).variant_val.discriminant = fsCodeToP3Disc(p2);
+}
+
+/// Map a discriminant produced by the host's 0.2-shape `DescType`
+/// enum into the 0.3 `variant descriptor-type` discriminant. The 0.2
+/// enum had `unknown=0` at the head; the 0.3 spec drops it and
+/// introduces an `other(option<string>)` case at the tail. Each
+/// 0.2 case 1..7 shifts down by one; `unknown` maps to `other` (with
+/// no payload — see `fsP3FixupDescType`). (#564.)
+fn descTypeToP3Disc(p2_disc: u32) u32 {
+    if (p2_disc == 0) return 7; // unknown → other(none)
+    return p2_disc - 1; // block_device..socket shift down by one
+}
+
+/// Walk a `result<descriptor-type, error-code>` shape and transcode
+/// the ok-arm `descriptor-type` variant discriminant from the host's
+/// 0.2 enum to the 0.3 variant. Also descends into a
+/// `descriptor-stat` record (field 0 is the descriptor-type) for the
+/// `.desc_stat_err` shape. (#564.)
+fn fsP3FixupDescType(val: InterfaceValue) void {
+    if (val != .result_val) return;
+    if (!val.result_val.is_ok) return;
+    const ok_ptr = val.result_val.payload orelse return;
+    if (ok_ptr.* != .variant_val) return;
+    const p2 = ok_ptr.variant_val.discriminant;
+    @constCast(ok_ptr).variant_val.discriminant = descTypeToP3Disc(p2);
+}
+
+fn fsP3FixupDescStatType(val: InterfaceValue) void {
+    if (val != .result_val) return;
+    if (!val.result_val.is_ok) return;
+    const ok_ptr = val.result_val.payload orelse return;
+    if (ok_ptr.* != .record_val) return;
+    const rec = ok_ptr.record_val;
+    if (rec.len < 1) return;
+    if (rec[0] != .variant_val) return;
+    const p2 = rec[0].variant_val.discriminant;
+    @constCast(&rec[0]).variant_val.discriminant = descTypeToP3Disc(p2);
+}
+
 /// Lower a fully-lifted `InterfaceValue` into a heap-owned byte buffer
 /// using the canonical ABI layout for `kind`'s `ValType`. The returned
 /// slice is owned by `allocator` and is suitable for installation on
@@ -358,6 +423,26 @@ fn fsP3LowerAsyncPayload(
     var effective = val;
     if (kind == .unit_err and val == .result_val and val.result_val.is_ok) {
         effective = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    // The 0.2 sync bodies write the err-arm discriminant via
+    // `@intFromEnum(FsErrorCode)`, but the 0.3 `variant error-code`
+    // dropped `would-block`. Transcode in-place for every
+    // `result<_, error-code>`-shaped return so the wire-level disc
+    // matches the guest's 0.3 enum positions. The 0.2 `DescType`
+    // similarly has a leading `unknown=0` case absent from 0.3's
+    // `descriptor-type` variant — transcode the ok-arm disc for
+    // `.desc_type_err` and the `descriptor-stat.type` field for
+    // `.desc_stat_err`. Tier-D / `.just_bool` doesn't carry an error
+    // variant; safe to skip. (#564.)
+    switch (kind) {
+        .unit_err, .desc_err, .desc_type_err, .desc_flags_err, .string_err, .desc_stat_err, .metadata_hash_err => fsP3FixupErrCode(effective),
+        .just_bool => {},
+    }
+    switch (kind) {
+        .desc_type_err => fsP3FixupDescType(effective),
+        .desc_stat_err => fsP3FixupDescStatType(effective),
+        else => {},
     }
 
     try abi.storeValReg(buf, 0, vt, effective, reg);
@@ -5230,10 +5315,13 @@ pub const WasiCliAdapter = struct {
         try self.fs_descriptor_table.append(self.allocator, .{
             .preopen = .{
                 .dir = dir,
-                // Preopens are full-capability roots: read+write+mutate so
-                // pre-#181 callers (e.g. `open-at` of a writable child) keep
-                // working without each embedder having to opt in.
-                .flags = .{ .read = true, .write = true, .mutate_directory = true },
+                // Per the 0.3 WIT, a preopen directory descriptor
+                // exposes `read | mutate-directory` capabilities — the
+                // `write` bit is reserved for file descriptors. Children
+                // opened from this preopen still receive whatever
+                // `open-at` flags the guest passes (subject to the
+                // post-#181 mutate-directory check). (#564.)
+                .flags = .{ .read = true, .mutate_directory = true },
             },
         });
         const dup_name = try self.allocator.dupe(u8, name);
@@ -5405,7 +5493,10 @@ pub const WasiCliAdapter = struct {
         }
         var it = std.mem.splitScalar(u8, path, '/');
         while (it.next()) |comp| {
-            if (std.mem.eql(u8, comp, "..")) return .access;
+            // `..` is rejected with `not-permitted` per the 0.3
+            // conformance fixture's expectation — distinct from an
+            // absolute path escape (`/...`) which is `access`. (#564.)
+            if (std.mem.eql(u8, comp, "..")) return .not_permitted;
         }
         return null;
     }
@@ -6326,8 +6417,11 @@ pub const WasiCliAdapter = struct {
         };
         const fs_file: FsDescriptor.FsFile = switch (d.*) {
             .file => |f| f,
+            // POSIX `posix_fadvise(2)` returns `EBADF` for directories; the
+            // 0.3 `filesystem-advise` conformance fixture follows the same
+            // convention. (#564.)
             .dir, .preopen => {
-                results[0] = try fsResultErr(allocator, .is_directory);
+                results[0] = try fsResultErr(allocator, .bad_descriptor);
                 return;
             },
         };
@@ -18815,8 +18909,13 @@ test "wasi:filesystem@0.3.0 open-at: missing path → future payload encodes err
     try testing.expectEqual(@as(usize, 20), fut.payload.?.len);
     // err arm → discriminant byte = 1.
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]);
-    // error-code variant disc at offset 4: no-entry = 20.
-    try testing.expectEqual(@as(u8, @intFromEnum(FsErrorCode.no_entry)), fut.payload.?[4]);
+    // error-code variant disc at offset 4: no-entry = 19 in the
+    // 0.3 wire (0.2 had `would-block` at position 1 — the 0.3 wire
+    // drops it, shifting `no-entry` down from 20 to 19). The host
+    // builds the lift with `FsErrorCode.no_entry` (= 20 internally);
+    // `fsP3LowerAsyncPayload` transcodes via `fsCodeToP3Disc` before
+    // writing the payload bytes. (#564.)
+    try testing.expectEqual(@as(u8, @intCast(fsCodeToP3Disc(@intFromEnum(FsErrorCode.no_entry)))), fut.payload.?[4]);
 }
 
 test "wasi:filesystem@0.3.0 read-directory: enumerates a 3-entry tmp dir (#522)" {
@@ -18903,7 +19002,10 @@ test "wasi:filesystem@0.3.0 read-directory: not-a-directory → err(not-director
     const fut = ci.futures.getPtr(fut_handle).?;
     try testing.expect(fut.payload != null);
     try testing.expectEqual(@as(u8, 1), fut.payload.?[0]); // err arm
-    try testing.expectEqual(@as(u8, @intFromEnum(FsErrorCode.not_directory)), fut.payload.?[4]);
+    // 0.3 wire disc for `not-directory` is 23 (host's `FsErrorCode.not_directory`
+    // = 24 internally; transcoded via `fsCodeToP3Disc` to skip the
+    // dropped 0.2 `would-block` slot). (#564.)
+    try testing.expectEqual(@as(u8, @intCast(fsCodeToP3Disc(@intFromEnum(FsErrorCode.not_directory)))), fut.payload.?[4]);
 }
 
 test "wasi:filesystem@0.3.0 stat-at: future payload decodes to result<descriptor-stat, error-code> (#522)" {
@@ -18957,8 +19059,10 @@ test "wasi:filesystem@0.3.0 stat-at: future payload decodes to result<descriptor
 
     // descriptor-stat fields begin at offset 8 (after disc + 7 pad).
     // `type` field is the descriptor-type variant; for a regular file
-    // the discriminant matches DescType.regular_file.
-    try testing.expectEqual(@as(u8, @intFromEnum(WasiCliAdapter.DescType.regular_file)), fut.payload.?[8]);
+    // the 0.3 wire discriminant is 5 (host's `DescType.regular_file`
+    // = 6 internally; transcoded via `descTypeToP3Disc` to skip the
+    // dropped 0.2 `unknown` head). (#564.)
+    try testing.expectEqual(@as(u8, @intCast(descTypeToP3Disc(@intFromEnum(WasiCliAdapter.DescType.regular_file)))), fut.payload.?[8]);
 
     // `size` field — third record member at offset 8 + 16 (type variant) + 8 (link-count u64) = 32.
     const size_val = std.mem.readInt(u64, fut.payload.?[8 + 16 + 8 ..][0..8], .little);
@@ -19109,8 +19213,11 @@ test "filesystem: open-at sandbox rejects .. and absolute paths (#145)" {
     const testing = std.testing;
 
     try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("/etc/passwd"));
-    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("../escape"));
-    try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("a/../b"));
+    // `..` components map to `not-permitted` per the 0.3 conformance
+    // fixture's expectation (filesystem-dotdot). Absolute paths and
+    // Windows-style escapes still map to `access`. (#564.)
+    try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("../escape"));
+    try testing.expectEqual(@as(?FsErrorCode, .not_permitted), WasiCliAdapter.validateSandboxPath("a/../b"));
     try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("a\\b"));
     try testing.expectEqual(@as(?FsErrorCode, .access), WasiCliAdapter.validateSandboxPath("C:foo"));
     try testing.expectEqual(@as(?FsErrorCode, null), WasiCliAdapter.validateSandboxPath("a/b/c.txt"));
@@ -20198,8 +20305,11 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         try WasiCliAdapter.fsDescriptorUnlinkFileAt(&adapter, &ci, &args, &r, testing.allocator);
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
+        // `..` rejection is now `not-permitted` (was `access`) — see
+        // `validateSandboxPath` + the 0.3 filesystem-dotdot fixture
+        // expectations. (#564.)
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -20250,8 +20360,9 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         try WasiCliAdapter.fsDescriptorLinkAt(&adapter, &ci, &args, &r, testing.allocator);
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
+        // `..` rejection is `not-permitted` per the 0.3 expectation. (#564.)
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }
@@ -20281,8 +20392,9 @@ test "filesystem #476: sandbox rejection on each path-taking method" {
         try WasiCliAdapter.fsDescriptorReadlinkAt(&adapter, &ci, &args, &r, testing.allocator);
         defer r[0].deinit(testing.allocator);
         try testing.expect(!r[0].result_val.is_ok);
+        // `..` rejection is `not-permitted` per the 0.3 expectation. (#564.)
         try testing.expectEqual(
-            @as(u32, @intFromEnum(FsErrorCode.access)),
+            @as(u32, @intFromEnum(FsErrorCode.not_permitted)),
             r[0].result_val.payload.?.*.variant_val.discriminant,
         );
     }

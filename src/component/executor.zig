@@ -27,6 +27,17 @@ const TypeRegistry = abi.TypeRegistry;
 pub const MAX_FLAT_PARAMS: u32 = 16;
 pub const MAX_FLAT_RESULTS: u32 = 1;
 
+/// Component-model `MAX_FLAT_PARAMS_ASYNC` per the spec's
+/// canonical-ABI rules for `canon.lower (async)`: when a lifted async
+/// func has more than 4 flat-params, the caller spills the entire
+/// param block to memory and passes a single `params_ptr` instead.
+/// wit-bindgen ≥ 0.45 emits shim trampolines that respect this
+/// threshold — `[async-lower][method]descriptor.open-at` (6 flat
+/// params) lowers to `(params_ptr, retptr) -> status` (2 i32 args),
+/// while `create-directory-at` (3 flat params) lowers to
+/// `(self, path_ptr, path_len, retptr) -> status` (4 i32 args). (#564.)
+pub const MAX_FLAT_PARAMS_ASYNC: u32 = 4;
+
 /// Encode a host-side resource representation (slot index from
 /// `pushSocket` / `pushFsDescriptor` / `pushNetwork` / 0-based) into a
 /// canon-ABI wire handle. Wit-bindgen Rust's `Resource<T>` constructor
@@ -4853,6 +4864,19 @@ pub const ComponentTrampolineCtx = struct {
     extended_types: []const ctypes.TypeDef = &.{},
     extended_indexspace: []const ?u32 = &.{},
 
+    /// `true` when the underlying lifted `FuncType` is declared with the
+    /// async-functype tag (`0x43`, loader records this on `FuncType.is_async`).
+    /// Mirrored here so `componentTrampoline` can route through the
+    /// canon-lower-of-async-func path even when the canon decl itself
+    /// did NOT carry the `async_lift` canon-opt (the common case for
+    /// wit-bindgen ≥ 0.45 `async func` lowers, which produce a plain
+    /// `canon.lower (func $f)` decl and rely on the FuncType-level
+    /// async-ness to drive the `(handle << 4) | STATUS_*` packed-status
+    /// return shape). The legacy `lower_opts.is_async` (from the
+    /// `async_lift` canon-opt) is still respected — either flag flips
+    /// the trampoline into the async path. (#564.)
+    is_async_func: bool = false,
+
     pub fn deinit(self: *ComponentTrampolineCtx, allocator: Allocator) void {
         allocator.free(self.param_types);
         allocator.free(self.result_types);
@@ -4909,13 +4933,43 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
 
     const flat_params = countFlatTypes(registry, ctx.param_types);
     const flat_results = countFlatTypes(registry, ctx.result_types);
-    const params_spill = flat_params > MAX_FLAT_PARAMS;
+
+    // `canon.lower (async)` uses a tighter param-spill threshold
+    // (MAX_FLAT_PARAMS_ASYNC = 4 vs sync's MAX_FLAT_PARAMS = 16) per
+    // the component-model spec — any flatten count exceeding 4 forces
+    // the caller to spill the param block to memory and pass a single
+    // `params_ptr` instead. wit-bindgen-emitted shims confirm this:
+    // `[async-lower][method]descriptor.open-at` with 6 flat-params
+    // lowers to `(params_ptr, retptr) -> status` (2 i32 args), while
+    // `create-directory-at` with 3 flat-params lowers to
+    // `(self, path_ptr, path_len, retptr) -> status` (4 i32 args).
+    // The result side is uniform: a single `retptr` if the lifted
+    // result type is non-empty. (#564.)
+    //
+    // The "async-lower" flag is the OR of the canon-opt-level
+    // `is_async` (`async_lift` opt explicitly set on the canon.lower
+    // decl) and the FuncType-level `is_async` (parsed from the `0x43`
+    // functype tag — wit-bindgen ≥ 0.45 emits `(canon lower ... async)`
+    // for async funcs; the FuncType-level flag also flips when the
+    // canon decl forgot the opt for any reason).
+    const is_async_lower = ctx.lower_opts.is_async or ctx.is_async_func;
+    const params_spill_threshold: u32 = if (is_async_lower) MAX_FLAT_PARAMS_ASYNC else MAX_FLAT_PARAMS;
+    const params_spill = flat_params > params_spill_threshold;
     const results_spill = flat_results > MAX_FLAT_RESULTS;
+
+    // `canon.lower (async)` of an async-func WITH at least one lifted
+    // result has the core signature `(P-flat..., retptr) -> i32 status`
+    // regardless of `flat_results`. The retptr is always the last param
+    // pushed by the caller — we pop it the same way `results_spill`
+    // does, but the trigger is the canon-async-with-result shape, not
+    // the flat-results overflow.
+    const async_with_result_retptr = is_async_lower and ctx.result_types.len > 0;
+    const has_retptr = (!is_async_lower and results_spill) or async_with_result_retptr;
 
     // Resolve linear memory for either spill path. The memory option is
     // mandatory whenever spilling occurs, and we need a non-empty
     // core_instances list to actually own a memory.
-    if (params_spill or results_spill) {
+    if (params_spill or has_retptr) {
         if (ctx.lower_opts.memory_idx == null) return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
         if (ctx.comp_inst.core_instances.len == 0) return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
     }
@@ -4923,7 +4977,7 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     // Pop result-destination pointer first if results spill (it was pushed
     // last by the caller).
     var result_dest_ptr: u32 = 0;
-    if (results_spill) {
+    if (has_retptr) {
         result_dest_ptr = @bitCast(env.popI32() catch |err| return trampolineTrap(env, ctx, err, .lift_args));
     }
 
@@ -4964,24 +5018,32 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
     // `allocator`; we deinit each result after lowering so payloads
     // (e.g. `.result_val.payload` for input-stream.blocking-read) don't leak.
     //
-    // Async-lower (#551): when `canon.lower (async)` of a func WITH NO
-    // RESULTS is invoked (the `wasi:clocks@0.3.x` `wait-for` /
-    // `wait-until` shape), we allocate a single phantom result slot so
-    // the host fn can deposit a `future<()>` handle; the trampoline
-    // then packs `(handle << 4) | STATUS` and pushes it as the i32
-    // result word per the spec.
+    // Async-lower (#551, #564): when `canon.lower (async)` of an async
+    // func is invoked, the host fn delivers a future/subtask handle in
+    // `results[0]` instead of a lifted value. We then pack
+    // `(handle << 4) | STATUS_*` and push it as the i32 status word per
+    // the component-model spec.
     //
-    // For `(async)` lowers of funcs WITH non-empty results — e.g.
-    // `[async-lower]wasi:cli/stdout@0.3.x.write-via-stream: async func()
-    // -> tuple<…>` — the existing sync-lower path still applies: the
-    // host already delivered a fully-lifted result synchronously, so
-    // there's no separate subtask handle to encode. Wiring the
-    // STATUS_RETURNED-with-result-ptr shape of those calls is its own
-    // follow-up (the conformance gate's `cli-stdio-roundtrip` fixture
-    // hits that path; tracked under #550). Falling through to the
-    // sync-lower path keeps every adapter that worked before #551
-    // working — we only rewire the no-result clocks shape here.
-    const is_async_no_result_lower = ctx.lower_opts.is_async and ctx.result_types.len == 0;
+    //   * Funcs with NO lifted result — the `wasi:clocks@0.3.x`
+    //     `wait-for` / `wait-until` shape — get a single phantom slot
+    //     for the host's `future<()>` handle. (#551.)
+    //   * Funcs WITH a lifted result — the `wasi:filesystem` /
+    //     `wasi:sockets@0.3.x` async-func shape — write the host's
+    //     `future<R>` handle into `results[0]`, and the trampoline
+    //     copies the future's pre-lowered canonical-ABI `payload` bytes
+    //     into the caller's `retptr` (settled-synchronously fast path
+    //     used by every current P3 adapter). If the future is `.pending`
+    //     the trampoline returns `STATUS_STARTED` with the handle in
+    //     the high bits so the guest can `waitable.join` + wait on it.
+    //     (#564.)
+    //
+    // The `(handle << 4) | STATUS` encoding is the same shape required
+    // by wit-bindgen ≥ 0.53's `wit_bindgen::Subtask` runtime; the
+    // bridging future on `ComponentInstance.futures` carries
+    // `subtask_managed = true` (set here on first observation) so the
+    // guest's subsequent `waitable.join` routes it through the
+    // `.subtask` waitable kind (see `executor.joinWaitable`).
+    const is_async_no_result_lower = is_async_lower and ctx.result_types.len == 0;
     const host_result_len: usize = if (is_async_no_result_lower) 1 else ctx.result_types.len;
     var results_stack_buf: [4]InterfaceValue = undefined;
     const results_heap: ?[]InterfaceValue = if (host_result_len <= results_stack_buf.len) null else (allocator.alloc(InterfaceValue, host_result_len) catch |err|
@@ -5005,14 +5067,63 @@ pub fn componentTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) core
         return trampolineTrap(env, ctx, err, .host_call);
     };
 
-    // Async-lower of a no-result func: pack `(handle << 4) | STATUS` and
-    // push as the i32 result. (#551.)
-    if (is_async_no_result_lower) {
-        const handle: u32 = switch (results[0]) {
+    // Async-lower trampoline result path (#551, #564). Pack
+    // `(handle << 4) | STATUS` and push it as the i32 status word. For
+    // the with-result shape we also copy the future's pre-lowered
+    // payload bytes into `mem[retptr..]` so the guest observes the
+    // canonical-ABI result synchronously (every current P3 host fn
+    // mints `.ready` futures with pre-populated payload bytes).
+    if (is_async_lower) {
+        const handle: u32 = if (results.len == 0) 0 else switch (results[0]) {
             .handle => |h| h,
             .u32 => |v| v,
             else => 0,
         };
+
+        // Flag the bridging future as subtask-managed so a subsequent
+        // `waitable.join` on the guest side routes the handle through
+        // the `.subtask` waitable kind (delivering EVENT_SUBTASK +
+        // STATUS_* per the wit-bindgen `Subtask` decoder). This is a
+        // no-op for `wasi:clocks` timer-futures (already true) and
+        // unconditional for the freshly-minted filesystem/sockets
+        // futures from the P3 adapter. (#564.)
+        if (handle != 0) {
+            if (ctx.comp_inst.futures.getPtr(handle)) |fut| {
+                if (!fut.subtask_managed) fut.subtask_managed = true;
+
+                // For the with-result async-lower shape, write the
+                // future's pre-lowered canonical-ABI bytes to the
+                // caller's retptr. This is the sync-completion fast
+                // path used by every current `wasi:filesystem` /
+                // `wasi:sockets` P3 adapter (each `[method]descriptor.*`
+                // and the sockets-P3 `connect` / `bind` / etc. mint
+                // already-`.ready` futures via `spawnReadyFsFuture` /
+                // `socketReadyResultFuture`). Pending futures leave
+                // retptr untouched here; the deferred-completion path
+                // is wired separately via `Future.async_lower_retptr`
+                // and the relevant settle hooks.
+                if (async_with_result_retptr) {
+                    if (fut.state == .ready or fut.state == .closed) {
+                        if (fut.payload) |bytes| {
+                            const mem_idx = ctx.lower_opts.memory_idx.?;
+                            const mem = ctx.comp_inst.resolveTopLevelMemory(mem_idx) orelse
+                                return trampolineTrap(env, ctx, error.MemoryNotAvailable, .memory_resolve);
+                            if (@as(u64, result_dest_ptr) + bytes.len > mem.data.len) {
+                                return trampolineTrap(env, ctx, error.MemoryNotAvailable, .lower_results);
+                            }
+                            @memcpy(mem.data[result_dest_ptr .. result_dest_ptr + bytes.len], bytes);
+                        }
+                    } else {
+                        // Pending: stash retptr so the host settle path
+                        // can complete the lower-results copy on
+                        // future-state transition. (#564 forward-compat
+                        // for genuinely-async host bodies.)
+                        fut.async_lower_retptr = result_dest_ptr;
+                    }
+                }
+            }
+        }
+
         const packed_status = packAsyncLowerStatus(ctx.comp_inst, handle);
         env.pushI32(@bitCast(packed_status)) catch |err| {
             return trampolineTrap(env, ctx, err, .lower_results);
@@ -5145,6 +5256,378 @@ pub fn canonBuiltinTrampoline(env_opaque: *anyopaque, ctx_opaque: ?*anyopaque) c
 }
 
 // ── Trampoline tests ────────────────────────────────────────────────────────
+
+test "componentTrampoline: async-lower no-result (clocks-style) packs (handle << 4) | STATUS_STARTED (#564)" {
+    // Regression test for the wasi:clocks `wait-for` / `wait-until`
+    // shape — async-lower of a func with zero lifted results. The
+    // trampoline allocates a phantom slot for the host's future
+    // handle, packs `(handle << 4) | STATUS_*`, and pushes the i32
+    // status word in place of the lifted results. Mirrors the
+    // pre-#564 wave-3 behaviour; included here as a guard against
+    // the generic path regressing the clocks special case.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "wait", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{}, .results = &.{.i32} },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    // Allocate a pending future and inject its handle through the
+    // host fn's phantom result slot.
+    const fh = comp_inst.allocAsyncHandle();
+    try comp_inst.futures.put(comp_inst.allocator, fh, .{ .elem_type_idx = 0, .state = .pending });
+
+    const Host = struct {
+        var captured_handle: u32 = 0;
+        fn wait(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            _: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            out[0] = .{ .handle = captured_handle };
+        }
+    };
+    Host.captured_handle = fh;
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 0);
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 0);
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.wait },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{},
+        .is_async_func = true,
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(STATUS_STARTED, status & 0xf);
+    try testing.expectEqual(fh, status >> 4);
+    // Pending future should now carry `subtask_managed = true` so the
+    // guest's subsequent `waitable.join` routes it as a `.subtask`
+    // waitable.
+    try testing.expect(comp_inst.futures.getPtr(fh).?.subtask_managed);
+}
+
+test "componentTrampoline: async-lower with-result spilled-params writes payload to retptr (#564)" {
+    // Generic async-lower path with N flat params > MAX_FLAT_PARAMS_ASYNC
+    // (so params spill to memory) and one lifted result — the
+    // wasi:filesystem `[method]descriptor.open-at`-style shape. The
+    // trampoline:
+    //   1. Pops retptr from the stack (last core arg pushed by caller).
+    //   2. Pops params_ptr (penultimate core arg).
+    //   3. Lifts each arg from `mem[params_ptr..]` via canon-ABI layout.
+    //   4. Calls host, which deposits a `.ready` future handle in
+    //      `results[0]`.
+    //   5. Copies `fut.payload` bytes to `mem[retptr..]`.
+    //   6. Pushes STATUS_RETURNED as the i32 status word.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    // 5 flat params (5 × u32) → 5 > 4 (async limit) → caller passes a
+    // single i32 params_ptr instead.
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "spilled", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{ .i32, .i32 }, .results = &.{.i32} },
+    };
+    const memories = [_]core_types_mod.MemoryType{
+        .{ .limits = .{ .min = 1, .max = 1 } },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+        .memories = &memories,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    // Pre-stage a ready future with a 4-byte payload (the canonical-ABI
+    // bytes the trampoline will copy into mem[retptr..]).
+    const fh = comp_inst.allocAsyncHandle();
+    const payload = try comp_inst.allocator.alloc(u8, 4);
+    payload[0] = 0xCA;
+    payload[1] = 0xFE;
+    payload[2] = 0xBA;
+    payload[3] = 0xBE;
+    try comp_inst.futures.put(comp_inst.allocator, fh, .{
+        .elem_type_idx = 0,
+        .payload = payload,
+        .state = .ready,
+        .write_closed = true,
+    });
+
+    const mem = core_inst.getMemory(0).?;
+    // Lay out the spilled params: 5 × u32 at offsets 0, 4, 8, 12, 16.
+    const params_ptr: u32 = 32;
+    std.mem.writeInt(u32, mem.data[params_ptr..][0..4], 0x11111111, .little);
+    std.mem.writeInt(u32, mem.data[params_ptr + 4 ..][0..4], 0x22222222, .little);
+    std.mem.writeInt(u32, mem.data[params_ptr + 8 ..][0..4], 0x33333333, .little);
+    std.mem.writeInt(u32, mem.data[params_ptr + 12 ..][0..4], 0x44444444, .little);
+    std.mem.writeInt(u32, mem.data[params_ptr + 16 ..][0..4], 0x55555555, .little);
+
+    const Host = struct {
+        var captured_handle: u32 = 0;
+        var captured_args: [5]u32 = .{ 0, 0, 0, 0, 0 };
+        fn body(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            args: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            for (args, 0..) |a, i| captured_args[i] = a.u32;
+            out[0] = .{ .handle = captured_handle };
+        }
+    };
+    Host.captured_handle = fh;
+    Host.captured_args = .{ 0, 0, 0, 0, 0 };
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 5);
+    for (param_types) |*p| p.* = .u32;
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 1);
+    result_types[0] = .u32;
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.body },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{ .memory_idx = 0, .is_async = true },
+        .is_async_func = true,
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const env = try ExecEnv.create(core_inst, 256, testing.allocator);
+    defer env.destroy();
+    // Caller pushed (params_ptr, retptr) in canonical order — flat=5 > 4
+    // so the params are spilled to memory.
+    const retptr: u32 = 96;
+    try env.pushI32(@bitCast(params_ptr));
+    try env.pushI32(@bitCast(retptr));
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    // Host saw all 5 args lifted from mem[params_ptr..].
+    try testing.expectEqual(@as(u32, 0x11111111), Host.captured_args[0]);
+    try testing.expectEqual(@as(u32, 0x22222222), Host.captured_args[1]);
+    try testing.expectEqual(@as(u32, 0x33333333), Host.captured_args[2]);
+    try testing.expectEqual(@as(u32, 0x44444444), Host.captured_args[3]);
+    try testing.expectEqual(@as(u32, 0x55555555), Host.captured_args[4]);
+
+    // Trampoline pushed STATUS_RETURNED (the future was already ready).
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(STATUS_RETURNED, status);
+
+    // And copied the future's payload to mem[retptr..].
+    try testing.expectEqual(@as(u8, 0xCA), mem.data[retptr]);
+    try testing.expectEqual(@as(u8, 0xFE), mem.data[retptr + 1]);
+    try testing.expectEqual(@as(u8, 0xBA), mem.data[retptr + 2]);
+    try testing.expectEqual(@as(u8, 0xBE), mem.data[retptr + 3]);
+}
+
+test "componentTrampoline: async-lower resource handle arg uses encodeResourceWire decode (#564)" {
+    // The canon-ABI wire format for `own<R>` / `borrow<R>` adds a
+    // `slot + 1` offset (PR #560 wave 2) so wit-bindgen's
+    // `Resource::from_handle` assertion (`handle != 0 && handle !=
+    // u32::MAX`) sees a non-zero wire value. The trampoline lifts the
+    // arg via `popInterfaceValue` → `decodeResourceWire`, which undoes
+    // the `+1`. Verify a guest pushing wire=1 reaches the host as slot=0.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "with_borrow", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        // (borrow<R>) → status
+        .{ .params = &.{.i32}, .results = &.{.i32} },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    const fh = comp_inst.allocAsyncHandle();
+    try comp_inst.futures.put(comp_inst.allocator, fh, .{ .elem_type_idx = 0, .state = .ready });
+
+    const Host = struct {
+        var captured_slot: u32 = 0xFFFF_FFFF;
+        var captured_handle: u32 = 0;
+        fn body(
+            _: ?*anyopaque,
+            _: *ComponentInstance,
+            args: []const InterfaceValue,
+            out: []InterfaceValue,
+            _: Allocator,
+        ) anyerror!void {
+            captured_slot = args[0].handle;
+            out[0] = .{ .handle = captured_handle };
+        }
+    };
+    Host.captured_handle = fh;
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 1);
+    param_types[0] = .{ .borrow = 0 };
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 0);
+
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.body },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{},
+        .is_async_func = true,
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+    // Guest pushes wire=1 (encoded form of slot=0).
+    try env.pushI32(@bitCast(@as(u32, 1)));
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    // Host received the decoded slot=0.
+    try testing.expectEqual(@as(u32, 0), Host.captured_slot);
+    // Trampoline pushed (fh << 4) | STATUS_RETURNED (the future is .ready).
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(STATUS_RETURNED, status);
+}
+
+test "componentTrampoline: async-lower routing fires for FuncType.is_async even without canon-opt (#564)" {
+    // wit-bindgen ≥ 0.45 emits `(canon lower ... async)` for async
+    // funcs (the `lower_opts.is_async` path), but the FuncType-level
+    // `is_async` flag set by the `0x43` functype tag must independently
+    // flip the trampoline into the async-lower routing even when the
+    // canon decl is missing the explicit `async_lift` opt. Confirm the
+    // `ctx.is_async_func` standalone trigger produces the packed
+    // status return shape.
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    const imports = [_]core_types_mod.ImportDesc{
+        .{ .module_name = "host", .field_name = "f", .kind = .function, .func_type_idx = 0 },
+    };
+    const func_types = [_]core_types_mod.FuncType{
+        .{ .params = &.{}, .results = &.{.i32} },
+    };
+    var module = core_types_mod.WasmModule{
+        .imports = &imports,
+        .import_function_count = 1,
+        .types = &func_types,
+    };
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+
+    var component = ctypes.Component{
+        .core_modules = &.{},     .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},       .instances = &.{},      .aliases = &.{},
+        .types = &.{},            .canons = &.{},
+        .imports = &.{},          .exports = &.{},
+    };
+    const comp_inst = try instance_mod.instantiate(&component, testing.allocator);
+    defer comp_inst.deinit();
+
+    const cis = try testing.allocator.alloc(ComponentInstance.CoreInstanceEntry, 1);
+    cis[0] = .{ .module_inst = core_inst };
+    comp_inst.core_instances = cis;
+
+    const fh = comp_inst.allocAsyncHandle();
+    try comp_inst.futures.put(comp_inst.allocator, fh, .{ .elem_type_idx = 0, .state = .pending });
+
+    const Host = struct {
+        var captured_handle: u32 = 0;
+        fn body(_: ?*anyopaque, _: *ComponentInstance, _: []const InterfaceValue, out: []InterfaceValue, _: Allocator) anyerror!void {
+            out[0] = .{ .handle = captured_handle };
+        }
+    };
+    Host.captured_handle = fh;
+
+    const param_types = try testing.allocator.alloc(ctypes.ValType, 0);
+    const result_types = try testing.allocator.alloc(ctypes.ValType, 0);
+
+    // Note: `lower_opts.is_async = false` (no `async_lift` canon-opt).
+    // The trampoline should still take the async-lower path because
+    // `is_async_func = true` mirrors the loader-level FuncType tag.
+    var tctx = ComponentTrampolineCtx{
+        .comp_inst = comp_inst,
+        .host_func = .{ .call = &Host.body },
+        .param_types = param_types,
+        .result_types = result_types,
+        .lower_opts = .{},
+        .is_async_func = true,
+    };
+    defer tctx.deinit(testing.allocator);
+
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+    try componentTrampoline(env, @ptrCast(&tctx));
+
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(STATUS_STARTED, status & 0xf);
+    try testing.expectEqual(fh, status >> 4);
+}
 
 test "canonBuiltinTrampoline: context.{set,get} round-trip through implicit fallback (#520)" {
     // The CLI-side `wamr run` dispatch installs `canonBuiltinTrampoline`
