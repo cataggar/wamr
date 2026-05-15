@@ -6,7 +6,6 @@
         "sockets-tcp-bind": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-connect": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-listen": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
-        "sockets-tcp-properties": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-receive": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-tcp-send": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
         "sockets-udp-bind": "wasi:sockets@0.3.0 host bindings + streaming I/O wired in #486/#519/#535; end-to-end run still blocked on wamr P3 CLI loader dispatch — tracking #520",
