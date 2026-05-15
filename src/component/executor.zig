@@ -987,6 +987,37 @@ fn dispatchAsyncCanon(
                 return;
             }
 
+            // Host-driven streams (#535) get a chance to top up the FIFO
+            // before we drain. Loop on `progressed` so a chunky reader can
+            // keep filling until `would_block` / `eof`. The loop is bounded
+            // by the driver itself — production drivers do a single
+            // non-blocking syscall per invocation and return `would_block`
+            // on the second pass.
+            if (s.buffer.items.len == 0 and !s.write_closed) {
+                if (s.host_driver) |drv| {
+                    if (drv.on_read) |cb| {
+                        var driver_iters: u8 = 0;
+                        while (driver_iters < 32) : (driver_iters += 1) {
+                            const action = cb(drv.context, s, comp_inst.allocator);
+                            switch (action) {
+                                .progressed => {
+                                    if (s.buffer.items.len > 0) break;
+                                    // Driver claimed progress but appended
+                                    // nothing — treat as would_block to
+                                    // avoid spinning.
+                                    break;
+                                },
+                                .would_block => break,
+                                .eof, .err => {
+                                    s.write_closed = true;
+                                    break;
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+
             // Drain buffered data first.
             const buffered_elems: u32 = @intCast(s.buffer.items.len / elem_size);
             if (buffered_elems > 0) {
@@ -1075,6 +1106,35 @@ fn dispatchAsyncCanon(
                 env.pushI32(@bitCast(async_canon.packStatus(.returned, transfer_count))) catch
                     return error.StackOverflow;
                 return;
+            }
+
+            // Host-driven sink (#535): the guest writes are forwarded
+            // straight to the host (e.g. a connected TCP fd) instead of
+            // accumulating in the FIFO. We only invoke the driver after
+            // confirming there's no parked reader, since the reader path
+            // is the canonical wakeup mechanism for in-component pairs.
+            if (s.host_driver) |drv| {
+                if (drv.on_write) |cb| {
+                    const action = cb(drv.context, s, src, comp_inst.allocator);
+                    switch (action) {
+                        .progressed => {
+                            env.pushI32(@bitCast(async_canon.packStatus(.returned, count))) catch
+                                return error.StackOverflow;
+                            return;
+                        },
+                        .eof, .err => {
+                            s.read_closed = true;
+                            env.pushI32(@bitCast(async_canon.packStatus(.cancelled, 0))) catch
+                                return error.StackOverflow;
+                            return;
+                        },
+                        .would_block => {
+                            // Fall through to FIFO buffering — a later
+                            // driver invocation (or `cancel_write`) can
+                            // drain it.
+                        },
+                    }
+                }
             }
 
             // No reader yet — append to FIFO.

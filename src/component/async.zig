@@ -224,6 +224,64 @@ pub const Future = struct {
 
 // ── Streams (async multi-value channel) ─────────────────────────────────────
 
+/// Outcome of a `HostStreamDriver` callback. Tells the executor what to
+/// do after invoking the driver.
+pub const HostStreamAction = enum {
+    /// Progress made — the driver appended bytes to the FIFO (for
+    /// `on_read`) or successfully consumed the caller's bytes (for
+    /// `on_write`). The executor's stream op will treat this as a
+    /// completed operation.
+    progressed,
+    /// No progress yet — no host-side data available (read) or the
+    /// host sink is temporarily not ready (write). The executor should
+    /// fall back to its default behaviour (park reader / buffer write).
+    would_block,
+    /// The host-side source / sink is exhausted (peer closed, fd
+    /// hit EOF). The executor should mark the corresponding stream end
+    /// closed so subsequent ops surface stream-end naturally.
+    eof,
+    /// The host-side driver encountered an unrecoverable error.
+    /// Equivalent to `eof` for the executor: close the appropriate end.
+    err,
+};
+
+/// Optional host-driven I/O attached to an `AsyncStream`. When set, the
+/// executor's `stream.read` / `stream.write` paths invoke the driver
+/// before parking / buffering so a long-lived host source / sink (a
+/// TCP fd, a `listen()` accept queue, a UDP socket) can continuously
+/// service the stream FIFO without per-call host fn dispatches.
+///
+/// Both callbacks are optional: a read-only stream sets `on_read`; a
+/// write-only stream sets `on_write`; bidirectional models would set
+/// both (none of the current sockets bindings do).
+///
+/// The executor holds the canonical FIFO in `AsyncStream.buffer` — the
+/// driver appends to / drains from it directly via the `*AsyncStream`
+/// pointer the executor passes in.
+pub const HostStreamDriver = struct {
+    /// Opaque context (typically `*WasiCliAdapter` plus a per-socket
+    /// fd captured inline). Passed back to each callback verbatim.
+    context: ?*anyopaque = null,
+    /// Called by `stream.read` when the FIFO is empty and the writable
+    /// end is not yet closed. The driver should attempt to append more
+    /// bytes to `stream.buffer` and return whether progress was made.
+    on_read: ?*const fn (
+        ctx: ?*anyopaque,
+        stream: *AsyncStream,
+        allocator: std.mem.Allocator,
+    ) HostStreamAction = null,
+    /// Called by `stream.write` when there's no parked reader and a
+    /// guest write has arrived. The driver should attempt to consume
+    /// the bytes (push them onto a host fd, etc.). On `would_block`
+    /// the executor falls back to buffering the bytes in the FIFO.
+    on_write: ?*const fn (
+        ctx: ?*anyopaque,
+        stream: *AsyncStream,
+        bytes: []const u8,
+        allocator: std.mem.Allocator,
+    ) HostStreamAction = null,
+};
+
 /// A component-level async stream — FIFO byte channel parameterised on
 /// element type `T`. Mirrors the rendezvous-driven model used by `Future`
 /// but with a multi-value buffer instead of a one-shot payload.
@@ -247,6 +305,12 @@ pub const AsyncStream = struct {
     /// cap. The initial implementation has no cap, so this stays `null`;
     /// kept for the future high-water-mark backpressure PR.
     pending_write: ?PendingWrite = null,
+
+    /// Optional host-side I/O hook (#535). When set, the executor's
+    /// stream ops invoke the driver before parking / buffering so a
+    /// long-lived TCP fd, accept queue, or UDP socket can keep the FIFO
+    /// fed without a per-call host fn dispatch.
+    host_driver: ?HostStreamDriver = null,
 
     /// Waitable plumbing for `waitable.join` integration.
     waitable_set: ?*WaitableSet = null,
@@ -396,4 +460,29 @@ test "AsyncStream: pending_read records guest_ptr and max_count" {
     s.pending_read = .{ .guest_ptr = 0x2000, .max_count = 7 };
     try std.testing.expectEqual(@as(u32, 0x2000), s.pending_read.?.guest_ptr);
     try std.testing.expectEqual(@as(u32, 7), s.pending_read.?.max_count);
+}
+
+test "AsyncStream: host_driver field defaults to null and can be installed (#535)" {
+    var s = AsyncStream{};
+    try std.testing.expect(s.host_driver == null);
+
+    const Cb = struct {
+        fn onRead(
+            _: ?*anyopaque,
+            stream: *AsyncStream,
+            allocator: std.mem.Allocator,
+        ) HostStreamAction {
+            stream.buffer.appendSlice(allocator, &[_]u8{ 0xAA, 0xBB }) catch return .err;
+            return .progressed;
+        }
+    };
+    s.host_driver = .{ .context = null, .on_read = &Cb.onRead };
+    try std.testing.expect(s.host_driver != null);
+    try std.testing.expect(s.host_driver.?.on_read != null);
+
+    // Drive the callback manually (mirrors what the executor will do).
+    const action = s.host_driver.?.on_read.?(null, &s, std.testing.allocator);
+    try std.testing.expectEqual(HostStreamAction.progressed, action);
+    try std.testing.expectEqual(@as(usize, 2), s.buffer.items.len);
+    s.deinit(std.testing.allocator);
 }
