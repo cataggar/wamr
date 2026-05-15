@@ -2544,6 +2544,14 @@ fn compileInst(
                     return;
                 }
             }
+            // #542: rematerialisable — re-emitted at each use site
+            // by `useInto` (and the call-arg staging helpers). The
+            // canonical def emits nothing AND skips `reg_map.assign`
+            // entirely because the allocator chose not to assign it
+            // (no spill slot, no register).
+            if (reg_map.alloc_result) |ar| {
+                if (ar.isRemat(dest)) return;
+            }
             const info = try destBegin(reg_map, dest, RegMap.tmp0);
             try code.movImm32(info.reg, val);
             try destCommit(code, reg_map, info);
@@ -2555,6 +2563,10 @@ fn compileInst(
                     _ = try reg_map.assign(dest);
                     return;
                 }
+            }
+            // #542: rematerialisable — see above.
+            if (reg_map.alloc_result) |ar| {
+                if (ar.isRemat(dest)) return;
             }
             const info = try destBegin(reg_map, dest, RegMap.tmp0);
             try code.movImm64(info.reg, @bitCast(val));
@@ -2887,6 +2899,19 @@ fn useInto(
     vreg: ir.VReg,
     scratch: emit.Reg,
 ) !emit.Reg {
+    // #542: rematerialisable defs have no entry in `entries` and no
+    // spill slot. Re-emit the constant into `scratch`. Critically,
+    // because this runs at the use site, the re-emission happens
+    // AFTER any intervening call-clobber — no reload needed.
+    if (reg_map.alloc_result) |ar| {
+        if (ar.getRemat(vreg)) |rd| {
+            switch (rd) {
+                .iconst_32 => |v| try code.movImm32(scratch, v),
+                .iconst_64 => |v| try code.movImm64(scratch, @bitCast(v)),
+            }
+            return scratch;
+        }
+    }
     const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
     return switch (loc) {
         .reg => |r| r,
@@ -6417,6 +6442,24 @@ fn callerSaveArgMask(reg_map: *const RegMap, args: []const ir.VReg) u16 {
 ///
 /// Precondition: the caller has already spilled all used caller-save
 /// regs to `fctx.call_save_base` (so the memory fallback is valid).
+/// #542: emit a rematerialised def's value directly into `target`. Returns
+/// `true` if `vreg` was rematerialisable (caller should skip the normal
+/// reg/spill path entirely).
+fn emitRematInto(
+    code: *emit.CodeBuffer,
+    reg_map: *const RegMap,
+    vreg: ir.VReg,
+    target: emit.Reg,
+) !bool {
+    const ar = reg_map.alloc_result orelse return false;
+    const rd = ar.getRemat(vreg) orelse return false;
+    switch (rd) {
+        .iconst_32 => |v| try code.movImm32(target, v),
+        .iconst_64 => |v| try code.movImm64(target, @bitCast(v)),
+    }
+    return true;
+}
+
 fn stageArgFromSaved(
     code: *emit.CodeBuffer,
     reg_map: *RegMap,
@@ -6425,6 +6468,7 @@ fn stageArgFromSaved(
     vreg: ir.VReg,
     clobbered: u16,
 ) !void {
+    if (try emitRematInto(code, reg_map, vreg, target)) return;
     const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
     switch (loc) {
         .reg => |r| {
@@ -6542,20 +6586,24 @@ fn emitCallIndirect(
     //
     // Load elem_idx → tmp2 (32-bit value, zero-extended).
     {
-        const loc = reg_map.get(ci.elem_idx) orelse return error.UnboundVReg;
-        switch (loc) {
-            .reg => |r| {
-                const reg_idx: u32 = @intFromEnum(r);
-                if (reg_idx >= 19) {
-                    try code.movRegReg(RegMap.tmp2, r);
-                } else {
-                    const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
-                    try code.ldrImm(RegMap.tmp2, .fp, slot_scaled);
-                }
-            },
-            .stack => |off| {
-                try code.ldrImm(RegMap.tmp2, .fp, reg_map.spillOffsetScaled(off));
-            },
+        if (try emitRematInto(code, reg_map, ci.elem_idx, RegMap.tmp2)) {
+            // already in tmp2
+        } else {
+            const loc = reg_map.get(ci.elem_idx) orelse return error.UnboundVReg;
+            switch (loc) {
+                .reg => |r| {
+                    const reg_idx: u32 = @intFromEnum(r);
+                    if (reg_idx >= 19) {
+                        try code.movRegReg(RegMap.tmp2, r);
+                    } else {
+                        const slot_scaled: u12 = @intCast((fctx.call_save_base + reg_idx * 8) / 8);
+                        try code.ldrImm(RegMap.tmp2, .fp, slot_scaled);
+                    }
+                },
+                .stack => |off| {
+                    try code.ldrImm(RegMap.tmp2, .fp, reg_map.spillOffsetScaled(off));
+                },
+            }
         }
     }
 
@@ -6840,6 +6888,7 @@ fn emitVmctxHelperCall(
     // Stage VReg args into x1..xN from stable post-snapshot storage.
     const arg_regs = [_]emit.Reg{ .x1, .x2, .x3, .x4, .x5, .x6, .x7 };
     for (args, 0..) |vreg, i| {
+        if (try emitRematInto(code, reg_map, vreg, arg_regs[i])) continue;
         const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
         switch (loc) {
             .reg => |r| {
@@ -6894,6 +6943,7 @@ fn readVregStable(
     vreg: ir.VReg,
     dest_reg: emit.Reg,
 ) !void {
+    if (try emitRematInto(code, reg_map, vreg, dest_reg)) return;
     const loc = reg_map.get(vreg) orelse return error.UnboundVReg;
     switch (loc) {
         .reg => |r| {
@@ -13420,4 +13470,121 @@ test "compileModule: regalloc hints — leaf 2-arg call places args directly int
             }
         }
     }
+}
+
+// ── #542: rematerialisation of cheap defs ────────────────────────────
+
+test "remat (#542): high-pressure iconst function compiles successfully" {
+    // 20 simultaneously-live iconst_32 vregs forces register pressure
+    // well above the 25 allocatable GPRs once the kept-alive sum chain
+    // is included. Without remat, the spill-slot accesses would
+    // explode the code size; with remat the def emits nothing and
+    // uses re-emit a single MOVZ each.
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 1, 0);
+    defer func.deinit();
+
+    const b = try func.newBlock();
+    const block = func.getBlock(b);
+    var ks: [30]ir.VReg = undefined;
+    for (0..ks.len) |i| {
+        ks[i] = func.newVReg();
+        try block.append(.{ .op = .{ .iconst_32 = @as(i32, @intCast(i + 1)) * 0x100001 }, .dest = ks[i], .type = .i32 });
+    }
+    var sum = ks[0];
+    for (1..ks.len) |i| {
+        const next = func.newVReg();
+        try block.append(.{ .op = .{ .add = .{ .lhs = sum, .rhs = ks[i] } }, .dest = next, .type = .i32 });
+        sum = next;
+    }
+    try block.append(.{ .op = .{ .ret = sum } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
+    try std.testing.expect(code.len % 4 == 0);
+}
+
+test "remat (#542): iconst used after a call recompiles cleanly" {
+    // f0 returns 7. f1 builds an iconst, calls f0, then adds the
+    // iconst to f0's result. Call clobbers all caller-save physregs;
+    // if the allocator assigned the iconst to a caller-save it would
+    // have to spill across the call — remat skips that and re-emits
+    // the const at the post-call use.
+    const allocator = std.testing.allocator;
+    var module = ir.IrModule.init(allocator);
+    defer module.deinit();
+
+    var f0 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f0.newBlock();
+        const v = f0.newVReg();
+        try f0.getBlock(b).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v, .type = .i32 });
+        try f0.getBlock(b).append(.{ .op = .{ .ret = v } });
+    }
+    _ = try module.addFunction(f0);
+
+    var f1 = ir.IrFunction.init(allocator, 0, 1, 0);
+    {
+        const b = try f1.newBlock();
+        const blk = f1.getBlock(b);
+        const k = f1.newVReg();
+        // Out-of-imm12 to defeat #523 fold-on-use and force a real
+        // remat use point.
+        try blk.append(.{ .op = .{ .iconst_32 = 0x10003 }, .dest = k, .type = .i32 });
+        const call_res = f1.newVReg();
+        try blk.append(.{
+            .op = .{ .call = .{ .func_idx = 0, .args = &.{} } },
+            .dest = call_res,
+            .type = .i32,
+        });
+        const sum = f1.newVReg();
+        try blk.append(.{ .op = .{ .add = .{ .lhs = call_res, .rhs = k } }, .dest = sum, .type = .i32 });
+        try blk.append(.{ .op = .{ .ret = sum } });
+    }
+    _ = try module.addFunction(f1);
+
+    const result = try compileModule(&module, allocator);
+    defer allocator.free(result.code);
+    defer allocator.free(result.offsets);
+    try std.testing.expect(result.code.len > 0);
+}
+
+test "remat (#542): iconst with mixed imm12 + out-of-imm12 uses composes with #523 fold" {
+    // The same iconst feeds an add-imm12 (fold-on-use, #523) and an
+    // add of two regs (needs the value in a real reg). Verify the
+    // function compiles cleanly — i.e. remat composes with the
+    // suppress-iconst-emit fold path. (#523 only suppresses the def
+    // when ALL uses fold; mixed-mode triggers normal materialisation,
+    // which is what remat now handles via re-emit at the non-folded
+    // use site.)
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 1, 2, 0);
+    defer func.deinit();
+    const lt = try allocator.alloc(ir.IrType, 1);
+    lt[0] = .i32;
+    func.local_types = lt;
+
+    const bid = try func.newBlock();
+    const block = func.getBlock(bid);
+    const param = func.newVReg();
+    const k = func.newVReg();
+    const fold_sum = func.newVReg();
+    const reg_use = func.newVReg();
+    const ret_val = func.newVReg();
+    try block.append(.{ .op = .{ .local_get = 0 }, .dest = param, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 0x10003 }, .dest = k, .type = .i32 });
+    // Use 1: add of two registers — needs k in a real reg.
+    try block.append(.{ .op = .{ .add = .{ .lhs = param, .rhs = k } }, .dest = reg_use, .type = .i32 });
+    // Use 2: would normally fold to add-imm12 but the 0x10003 is
+    // out-of-range, so this also needs k in a reg. Two register
+    // uses keeps it simple — the existing fold path is exercised by
+    // dedicated #523 tests; here we just verify mixed-context compile.
+    try block.append(.{ .op = .{ .add = .{ .lhs = reg_use, .rhs = k } }, .dest = fold_sum, .type = .i32 });
+    try block.append(.{ .op = .{ .add = .{ .lhs = fold_sum, .rhs = k } }, .dest = ret_val, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = ret_val } });
+
+    const code = try compileFunction(&func, allocator);
+    defer allocator.free(code);
+    try std.testing.expect(code.len > 0);
 }

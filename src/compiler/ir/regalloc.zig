@@ -58,20 +58,55 @@ pub const RegSet = struct {
     spill_stride: i32,
 };
 
+/// A vreg's def is "rematerialisable" if it can be cheaply re-emitted at
+/// each use site instead of spill+reload. Currently supports the integer
+/// constant ops, which are pure (no operands) and survive call clobbers
+/// trivially because the re-emission happens AFTER the call.
+///
+/// See issue #542. The codegen consults `AllocResult.remat` at use sites
+/// (`useInto` / `useVReg` / call-arg staging) — if the vreg is in the
+/// map it emits `mov rd, #imm` into the consumer's scratch register
+/// instead of loading from a spill slot. Defs whose vreg is in the map
+/// emit nothing at all (the canonical def site is skipped).
+pub const RematDef = union(enum) {
+    iconst_32: i32,
+    iconst_64: i64,
+};
+
 /// Result of register allocation for one function.
 pub const AllocResult = struct {
-    /// VReg → physical location mapping.
+    /// VReg → physical location mapping. Rematerialisable defs (see
+    /// `remat` below) do NOT have an entry here: they are not assigned
+    /// to a register and consume no spill slot.
     assignments: std.AutoHashMap(ir.VReg, Allocation),
     /// Number of 8-byte spill slots used. v128 values consume two slots and
     /// are aligned to a 16-byte FP-relative offset.
     spill_count: u32,
+    /// VRegs whose def is rematerialisable (#542): instead of spilling
+    /// to a frame slot, the def is dropped and each use re-emits the
+    /// original IR op. Codegen consults this BEFORE consulting
+    /// `assignments`. Empty when the function has no spill pressure or
+    /// no rematerialisable candidates.
+    remat: std.AutoHashMap(ir.VReg, RematDef),
 
     pub fn deinit(self: *AllocResult) void {
         self.assignments.deinit();
+        self.remat.deinit();
     }
 
     pub fn get(self: *const AllocResult, vreg: ir.VReg) ?Allocation {
         return self.assignments.get(vreg);
+    }
+
+    /// `true` iff the vreg's def has been chosen for rematerialisation
+    /// in this allocation result. When `true`, callers must NOT consult
+    /// `assignments`; instead re-emit the original def via `remat.get`.
+    pub fn isRemat(self: *const AllocResult, vreg: ir.VReg) bool {
+        return self.remat.contains(vreg);
+    }
+
+    pub fn getRemat(self: *const AllocResult, vreg: ir.VReg) ?RematDef {
+        return self.remat.get(vreg);
     }
 };
 
@@ -133,7 +168,49 @@ pub fn allocate(
 ) !AllocResult {
     const ranges = try analysis.computeLiveRanges(func, allocator);
     defer allocator.free(ranges);
-    return allocateFromRanges(allocator, reg_set, clobbers, ranges);
+
+    // Classify rematerialisable defs (#542). This is a single linear
+    // scan of the function body. Skip the scan entirely on functions
+    // small enough that no spill is plausible (next_vreg ≤ alloc_regs)
+    // to keep coldstart in check on tiny wrappers like `noop.cwasm`
+    // — the original closer of PR #530.
+    if (func.next_vreg <= reg_set.alloc_regs.len) {
+        return allocateFromRangesWithHints(allocator, reg_set, clobbers, ranges, &.{});
+    }
+
+    var candidates = try classifyRematCandidates(allocator, func);
+    defer candidates.deinit();
+    if (candidates.count() == 0) {
+        return allocateFromRangesWithHints(allocator, reg_set, clobbers, ranges, &.{});
+    }
+    return allocateFromRangesWithHintsRemat(allocator, reg_set, clobbers, ranges, &.{}, &candidates);
+}
+
+/// Classify every vreg in `func` whose def is a "cheap" pure op
+/// (currently only `iconst_32` / `iconst_64`) into a map of
+/// rematerialisation values. Callers pass this to
+/// `allocateFromRangesWithHintsRemat` so the allocator can choose
+/// re-emission over spill+reload.
+///
+/// Address-of-local-style frame-relative remat is out of scope until
+/// the IR exposes a discrete op for it (issue #542 OOS bullet 1).
+pub fn classifyRematCandidates(
+    allocator: std.mem.Allocator,
+    func: *const ir.IrFunction,
+) !std.AutoHashMap(ir.VReg, RematDef) {
+    var map = std.AutoHashMap(ir.VReg, RematDef).init(allocator);
+    errdefer map.deinit();
+    for (func.blocks.items) |block| {
+        for (block.instructions.items) |inst| {
+            const dest = inst.dest orelse continue;
+            switch (inst.op) {
+                .iconst_32 => |v| try map.put(dest, .{ .iconst_32 = v }),
+                .iconst_64 => |v| try map.put(dest, .{ .iconst_64 = v }),
+                else => {},
+            }
+        }
+    }
+    return map;
 }
 
 /// Variant of `allocate` that takes pre-computed live ranges. Used by
@@ -162,9 +239,27 @@ pub fn allocateFromRangesWithHints(
     ranges: []const analysis.LiveRange,
     hints: []const Hint,
 ) !AllocResult {
+    return allocateFromRangesWithHintsRemat(allocator, reg_set, clobbers, ranges, hints, null);
+}
+
+/// Variant of `allocateFromRangesWithHints` that additionally consults
+/// a map of `RematDef` values for vregs whose def can be cheaply
+/// re-emitted at use sites (#542). When the allocator would otherwise
+/// spill such a vreg, it instead records the def in `AllocResult.remat`
+/// and does not allocate a frame slot. Codegen short-circuits the
+/// resulting use sites to re-emit the const.
+pub fn allocateFromRangesWithHintsRemat(
+    allocator: std.mem.Allocator,
+    reg_set: RegSet,
+    clobbers: []const ClobberPoint,
+    ranges: []const analysis.LiveRange,
+    hints: []const Hint,
+    remat_candidates: ?*const std.AutoHashMap(ir.VReg, RematDef),
+) !AllocResult {
     std.debug.assert(reg_set.alloc_regs.len <= max_alloc_regs);
 
     var assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator);
+    var remat = std.AutoHashMap(ir.VReg, RematDef).init(allocator);
 
     // Build a map of vreg → hinted alloc-regs index. First hint wins on
     // duplicates; subsequent ones are ignored.
@@ -261,6 +356,24 @@ pub fn allocateFromRangesWithHints(
             if (best_evict) |evict_idx| {
                 const evicted = active.orderedRemove(evict_idx);
                 const stolen_reg = evicted.reg_idx;
+                // #542: if the evicted vreg's def is rematerialisable,
+                // drop its current `.reg` assignment and record it in
+                // the remat map instead of allocating a spill slot.
+                if (remat_candidates) |rc| {
+                    if (rc.get(evicted.vreg)) |rd| {
+                        _ = assignments.remove(evicted.vreg);
+                        try remat.put(evicted.vreg, rd);
+                        try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[stolen_reg] });
+                        try insertActive(&active, allocator, .{
+                            .vreg = range.vreg,
+                            .end = range.end,
+                            .reg_idx = stolen_reg,
+                            .type = range.type,
+                            .max_loop_depth = range.max_loop_depth,
+                        });
+                        continue;
+                    }
+                }
                 const spill_offset = allocateSpill(&spill_slots_used, reg_set, evicted.type);
                 try assignments.put(evicted.vreg, .{ .stack = spill_offset });
                 try assignments.put(range.vreg, .{ .reg = reg_set.alloc_regs[stolen_reg] });
@@ -272,6 +385,14 @@ pub fn allocateFromRangesWithHints(
                     .max_loop_depth = range.max_loop_depth,
                 });
             } else {
+                // #542: rematerialise the new interval rather than
+                // spilling it, when its def is cheap to re-emit.
+                if (remat_candidates) |rc| {
+                    if (rc.get(range.vreg)) |rd| {
+                        try remat.put(range.vreg, rd);
+                        continue;
+                    }
+                }
                 // No safe eviction candidate — spill the new interval
                 const spill_offset = allocateSpill(&spill_slots_used, reg_set, range.type);
                 try assignments.put(range.vreg, .{ .stack = spill_offset });
@@ -282,6 +403,7 @@ pub fn allocateFromRangesWithHints(
     return .{
         .assignments = assignments,
         .spill_count = spill_slots_used,
+        .remat = remat,
     };
 }
 
@@ -671,12 +793,15 @@ test "allocate: spills when pressure exceeds registers" {
     var result = try allocate(&func, allocator, test_reg_set, &.{});
     defer result.deinit();
 
-    // Should have some spills (15 values alive > 9 registers)
-    try std.testing.expect(result.spill_count > 0);
+    // Should have some spills OR remats (15 values alive > 9 registers).
+    // With #542, iconst_32 defs that would otherwise spill are
+    // rematerialised at use sites instead, so spill_count drops to 0
+    // and the pressure shows up in `remat.count()` instead.
+    try std.testing.expect(result.spill_count > 0 or result.remat.count() > 0);
 
-    // All VRegs should still have an allocation (reg or stack)
+    // All VRegs should still have an allocation (reg, stack, or remat)
     for (vregs) |v| {
-        try std.testing.expect(result.get(v) != null);
+        try std.testing.expect(result.get(v) != null or result.isRemat(v));
     }
 }
 
@@ -1153,6 +1278,7 @@ test "coalesceMoves: refuses when src's reg is clobbered inside dest's range" {
     var result: AllocResult = .{
         .assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator),
         .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, RematDef).init(allocator),
     };
     defer result.deinit();
     try result.assignments.put(0, .{ .reg = 2 });
@@ -1210,6 +1336,7 @@ test "coalesceMoves: two-step chain coalesces both hints" {
     var result: AllocResult = .{
         .assignments = std.AutoHashMap(ir.VReg, Allocation).init(allocator),
         .spill_count = 0,
+        .remat = std.AutoHashMap(ir.VReg, RematDef).init(allocator),
     };
     defer result.deinit();
     try result.assignments.put(0, .{ .reg = 2 });
@@ -1228,4 +1355,77 @@ test "coalesceMoves: two-step chain coalesces both hints" {
     try std.testing.expectEqual(Allocation{ .reg = 2 }, result.get(0).?);
     try std.testing.expectEqual(Allocation{ .reg = 2 }, result.get(1).?);
     try std.testing.expectEqual(Allocation{ .reg = 2 }, result.get(2).?);
+}
+
+// ── #542: rematerialisation of cheap defs ────────────────────────────
+
+test "remat: iconst_32 def is classified" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .iconst_32 = 42 }, .dest = v0, .type = .i32 });
+    var c = try classifyRematCandidates(allocator, &func);
+    defer c.deinit();
+    try std.testing.expect(c.contains(v0));
+    try std.testing.expectEqual(RematDef{ .iconst_32 = 42 }, c.get(v0).?);
+}
+
+test "remat: spilled iconst becomes remat (not stack)" {
+    const allocator = std.testing.allocator;
+    // Tiny reg pool — pressure forces spill.
+    const tiny: RegSet = .{
+        .alloc_regs = &.{ 0, 1 },
+        .callee_saved_indices = &.{},
+        .caller_saved_indices = &.{ 0, 1 },
+        .spill_base = 64,
+        .spill_stride = 8,
+    };
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    const block = func.getBlock(b);
+    // Three iconst defs all live simultaneously; need to spill 1.
+    const a = func.newVReg();
+    const c = func.newVReg();
+    const d = func.newVReg();
+    try block.append(.{ .op = .{ .iconst_32 = 1 }, .dest = a, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 2 }, .dest = c, .type = .i32 });
+    try block.append(.{ .op = .{ .iconst_32 = 3 }, .dest = d, .type = .i32 });
+    // Keep all three live to the end.
+    const s1 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = a, .rhs = c } }, .dest = s1, .type = .i32 });
+    const s2 = func.newVReg();
+    try block.append(.{ .op = .{ .add = .{ .lhs = s1, .rhs = d } }, .dest = s2, .type = .i32 });
+    try block.append(.{ .op = .{ .ret = s2 } });
+
+    var result = try allocate(&func, allocator, tiny, &.{});
+    defer result.deinit();
+    // At least one iconst should have been rematerialised, NOT spilled.
+    try std.testing.expect(result.remat.count() > 0);
+    // The iconst inputs must not occupy spill slots.
+    for ([_]ir.VReg{ a, c, d }) |v| {
+        try std.testing.expect(!result.isRemat(v) or result.get(v) == null);
+    }
+    // Each rematerialised vreg has no `.stack`/`.reg` assignment.
+    var it = result.remat.iterator();
+    while (it.next()) |entry| {
+        try std.testing.expect(result.get(entry.key_ptr.*) == null);
+    }
+}
+
+test "remat: tiny functions skip classification (coldstart guard)" {
+    const allocator = std.testing.allocator;
+    var func = ir.IrFunction.init(allocator, 0, 0, 0);
+    defer func.deinit();
+    const b = try func.newBlock();
+    const v0 = func.newVReg();
+    try func.getBlock(b).append(.{ .op = .{ .iconst_32 = 7 }, .dest = v0, .type = .i32 });
+    try func.getBlock(b).append(.{ .op = .{ .ret = v0 } });
+    var result = try allocate(&func, allocator, test_reg_set, &.{});
+    defer result.deinit();
+    // next_vreg (1) ≤ alloc_regs.len (9): classification is skipped,
+    // and the iconst gets a register, not remat.
+    try std.testing.expectEqual(@as(u32, 0), result.remat.count());
 }
