@@ -277,6 +277,65 @@ pub fn build(b: *std.Build) void {
     );
     wasi_p3_testsuite_step.dependOn(&wasi_p3_runner.step);
 
+    // ── Wasmtime parity gate (#583 C1, original #489 proposal) ────────
+    // Runs the *same* `wasm32-wasip3` fixtures through upstream Wasmtime
+    // (CI pin: v44.0.1, the first release with `-Sp3` support — see the
+    // `component-examples-wasmtime` job in `.github/workflows/ci.yml`).
+    // The wasm test corpus is identical, so a wamr regression that
+    // Wasmtime *also* exhibits flags as a fixture bug rather than a
+    // wamr bug (see `scripts/diff-testsuite-reports.py`).
+    //
+    // Resolves the Wasmtime binary from the `WASMTIME` env var (set by
+    // CI; defaults to `wasmtime` on `PATH`). The `WASMTIME` env var is
+    // intentionally not pinned in-tree so a developer can point the
+    // step at a locally-built wasmtime for triage. The CI workflow at
+    // `.github/workflows/wasi-p3-parity.yml` is the source of truth
+    // for the pinned version.
+    const wasi_p3_runner_wasmtime = b.addSystemCommand(&.{
+        "python3",
+        "tests/wasi-testsuite-runner-patch/wasi_test_runner.py",
+        "--test-suite",
+        "tests/wasi-testsuite/tests/rust/testsuite/wasm32-wasip3",
+        "--runtime-adapter",
+        "tests/wasi-testsuite-adapter/wasmtime.py",
+        "--exclude-filter",
+        "tests/wasi-p3-testsuite-skip.json",
+    });
+    // No `WAMR` env var needed here; the wasmtime adapter reads
+    // `WASMTIME` instead (the test binaries themselves are the same
+    // `*.wasm` files that the wamr-side gate exercises).
+    const wasi_p3_testsuite_wasmtime_step = b.step(
+        "wasi-p3-testsuite-wasmtime",
+        "Run the WASI Preview 3 fixtures through Wasmtime (#583 C1 parity gate)",
+    );
+    wasi_p3_testsuite_wasmtime_step.dependOn(&wasi_p3_runner_wasmtime.step);
+
+    // ── Wasmtime parity diff ──────────────────────────────────────────
+    // Convenience step that runs both runtimes through
+    // `scripts/wasi-p3-parity.py` (which writes JSON reports + a
+    // classifier summary, then forwards the diff exit code). The
+    // orchestrator is a Python script because Wasmtime can exit
+    // non-zero on its own (e.g. v44.0.1 fails 4 / 40 fixtures —
+    // `http-service`, `sockets-tcp-{connect,listen}`,
+    // `sockets-udp-send`); we need to keep going through the diff
+    // step to classify the deltas as regressions vs fixture/runtime
+    // bugs. Output JSONs live under `zig-out/test-reports/` so CI
+    // can upload them as artifacts on failure.
+    const reports_dir = b.pathJoin(&.{ b.install_path, "test-reports" });
+    const parity_orchestrator = b.addSystemCommand(&.{
+        "python3",
+        "scripts/wasi-p3-parity.py",
+        "--output-dir",
+        reports_dir,
+    });
+    parity_orchestrator.setEnvironmentVariable("WAMR", b.getInstallPath(.bin, "wamr"));
+    parity_orchestrator.step.dependOn(b.getInstallStep());
+    const wasi_p3_parity_step = b.step(
+        "wasi-p3-parity",
+        "Run wamr + Wasmtime against wasm32-wasip3 fixtures and diff (#583 C1)",
+    );
+    wasi_p3_parity_step.dependOn(&parity_orchestrator.step);
+
     // ── Tests ──────────────────────────────────────────────────────────
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
