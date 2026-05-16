@@ -16703,6 +16703,38 @@ pub const WasiCliAdapter = struct {
         /// When `is_ok` is true this is the response handle; when
         /// false it is the `error-code` enum discriminant.
         payload: u32,
+
+        /// Decode a canonical-ABI flat result tuple deposited on a
+        /// task by `canon task.return` into a typed `HandleP3Outcome`.
+        ///
+        /// The flat representation produced by wit-bindgen ≥ 0.45 for
+        /// `result<own<response>, error-code>` is `[disc, payload, ...]`:
+        ///
+        ///   * `disc`: 0 for Ok, 1 for Err.
+        ///   * `payload`: for Ok, the canon-ABI wire-encoded
+        ///     `own<response>` handle (`slot + 1`, see #562); for Err,
+        ///     the `error-code` variant discriminant (plain i32).
+        ///
+        /// Any trailing slots are the variant-join padding for the
+        /// (much wider) `error-code` arm — ignored by this decoder
+        /// since the relevant data is always in the first two slots.
+        /// Defensive fallbacks: empty `flat` → `(is_ok=false,
+        /// internal_error)`; len==1 → `(is_ok=disc==0, internal_error)`.
+        /// Factored out of `dispatchHttpHandlerP3` so the decode is
+        /// unit-testable in isolation (#570).
+        pub fn fromTaskReturnValues(flat: []const u32) HandleP3Outcome {
+            const disc: u32 = if (flat.len > 0) flat[0] else 1;
+            const raw_payload: u32 = if (flat.len > 1)
+                flat[1]
+            else
+                @intFromEnum(HttpErrorCode.internal_error);
+            const is_ok = disc == 0;
+            const payload: u32 = if (is_ok)
+                executor_root.decodeResourceWire(raw_payload)
+            else
+                raw_payload;
+            return .{ .is_ok = is_ok, .payload = payload };
+        }
     };
 
     /// Drive a guest-exported `wasi:http/incoming-handler@0.3.0.handle:
@@ -16742,15 +16774,7 @@ pub const WasiCliAdapter = struct {
 
         if (task_handle >= task_mgr.tasks.items.len) return error.NoHandleExport;
         const task = &task_mgr.tasks.items[task_handle];
-
-        // Lowered `result<own<response>, error-code>` is two i32s:
-        // discriminant + payload (response handle or err-code disc).
-        const disc: u32 = if (task.return_values.len > 0) task.return_values[0] else 1;
-        const payload: u32 = if (task.return_values.len > 1)
-            task.return_values[1]
-        else
-            @intFromEnum(HttpErrorCode.internal_error);
-        return .{ .is_ok = disc == 0, .payload = payload };
+        return HandleP3Outcome.fromTaskReturnValues(task.return_values);
     }
 
     /// Build a `HttpRequestP3` from a complete HTTP/1.1 request byte
@@ -30185,5 +30209,100 @@ test "wasi:http@0.3 (#570): cleanupHttpResourcesAllVersions clears P3 + P2 handl
     try testing.expectEqual(@as(?*HttpRequestP3, null), adapter.http_requests_p3.items[1]);
     try testing.expectEqual(@as(?*HttpResponseP3, null), adapter.http_responses_p3.items[0]);
     try testing.expectEqual(@as(?*HttpResponseP3, null), adapter.http_responses_p3.items[1]);
+}
+
+test "wasi:http@0.3 (#570): HandleP3Outcome.fromTaskReturnValues decodes Ok branch (disc=0 → wire-decoded handle)" {
+    // Round-trip the dispatch-glue's `task.return_values` shape. The
+    // guest pushes `[disc, wire_handle, ... padding ...]` for the Ok
+    // arm of `result<own<response>, error-code>`. The wire handle is
+    // canon-ABI `slot + 1` (#562 / `encodeResourceWireAbi`); the
+    // outcome decoder must `decodeResourceWire` it back to the
+    // 0-based slot before the host writes the response.
+    const testing = std.testing;
+    const HandleP3Outcome = WasiCliAdapter.HandleP3Outcome;
+
+    // Ok branch with wire-encoded slot 1 → decoded payload 1.
+    const flat_ok = [_]u32{ 0, 2 };
+    const out_ok = HandleP3Outcome.fromTaskReturnValues(&flat_ok);
+    try testing.expect(out_ok.is_ok);
+    try testing.expectEqual(@as(u32, 1), out_ok.payload);
+
+    // Wire 0 (sentinel "no resource") stays 0 after decode — the
+    // host's `lookupHttpResponseP3(0)` then surfaces "invalid response
+    // handle" cleanly rather than crashing.
+    const flat_ok_zero = [_]u32{ 0, 0 };
+    const out_ok_zero = HandleP3Outcome.fromTaskReturnValues(&flat_ok_zero);
+    try testing.expect(out_ok_zero.is_ok);
+    try testing.expectEqual(@as(u32, 0), out_ok_zero.payload);
+
+    // Trailing variant-join padding (wit-bindgen 0.45 produces 7 i32s
+    // + 1 i64 = 8 slots for the joined `error-code` arm) is ignored —
+    // only `flat[0..2]` is consulted.
+    const flat_ok_padded = [_]u32{ 0, 4, 0, 0, 0, 0, 0, 0 };
+    const out_ok_padded = HandleP3Outcome.fromTaskReturnValues(&flat_ok_padded);
+    try testing.expect(out_ok_padded.is_ok);
+    try testing.expectEqual(@as(u32, 3), out_ok_padded.payload); // wire 4 → slot 3
+}
+
+test "wasi:http@0.3 (#570): HandleP3Outcome.fromTaskReturnValues decodes Err branch (disc=1 → raw error-code disc)" {
+    // The Err arm payload is an `error-code` variant discriminant —
+    // a plain i32 with no resource-wire offset. The decoder must NOT
+    // wire-decode it; otherwise a guest-returned `HTTP_request_denied`
+    // (disc 15) would silently surface as `14` to the host.
+    const testing = std.testing;
+    const HandleP3Outcome = WasiCliAdapter.HandleP3Outcome;
+
+    const flat_err = [_]u32{ 1, @intFromEnum(HttpErrorCode.HTTP_request_denied) };
+    const out = HandleP3Outcome.fromTaskReturnValues(&flat_err);
+    try testing.expect(!out.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+        out.payload,
+    );
+
+    // Defensive fallbacks: missing payload → internal_error.
+    const flat_err_short = [_]u32{1};
+    const out_short = HandleP3Outcome.fromTaskReturnValues(&flat_err_short);
+    try testing.expect(!out_short.is_ok);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.internal_error)),
+        out_short.payload,
+    );
+
+    // Empty return_values → empty task (task.return never invoked,
+    // e.g. the guest trapped before completing) → reported as Err.
+    const out_empty = HandleP3Outcome.fromTaskReturnValues(&.{});
+    try testing.expect(!out_empty.is_ok);
+}
+
+test "wasi:http@0.3 (#570): readIncomingRequestP3FromStream parses an HTTP/1.1 request off a buffered stream" {
+    // End-to-end variant of the `createIncomingRequestP3FromHttpBytes`
+    // tests above: drives the same wire bytes through
+    // `InputStream.fromBuffer` to confirm the stream-read framing
+    // (header-end detection, body-length read) keeps the parser
+    // happy. Mirrors the live TCP-accept path used by
+    // `serveOneHttpConnectionP3` without standing up a real socket.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const wire = "GET /probe HTTP/1.1\r\nHost: example.com\r\nUser-Agent: probe/1\r\n\r\n";
+    var input = streams.InputStream.fromBuffer(wire);
+    const rh = try adapter.readIncomingRequestP3FromStream(&ci, &input);
+    try testing.expectEqual(@as(u32, 1), rh);
+
+    const req = adapter.lookupHttpRequestP3(rh).?;
+    try testing.expectEqual(@as(u8, 0), req.method_disc); // GET
+    try testing.expectEqualStrings("/probe", req.path_with_query.?);
+    try testing.expectEqualStrings("example.com", req.authority.?);
+
+    // Body stream is allocated even for an empty body — write_closed
+    // ensures the guest's first read observes EOF without blocking.
+    const body_h = req.body_stream_handle.?;
+    const body = ci.streams.getPtr(body_h).?;
+    try testing.expect(body.write_closed);
+    try testing.expectEqual(@as(usize, 0), body.buffer.items.len);
 }
 
