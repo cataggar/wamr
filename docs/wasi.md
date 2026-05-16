@@ -307,6 +307,9 @@ additions (one PR per interface, gated behind the existing
 `populateWasiProviders` version-multiplex):
 
 * **`wasi:threads@0.3.x`** — [#583 B3](https://github.com/cataggar/wamr/issues/583).
+  Design doc: [`docs/design/wasi-threads.md`](design/wasi-threads.md)
+  (multi-threaded interpreter state isolation; upstream-survey +
+  multi-wave implementation plan).
 * **`wasi:keyvalue@0.2.x`** — [#583 B4](https://github.com/cataggar/wamr/issues/583).
 * ~~**`wasi:logging@0.1.x`**~~ — host adapter shipped (#583 B5); see the
   Preview-2 detail table for the registered methods.
