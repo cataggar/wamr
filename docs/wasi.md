@@ -42,7 +42,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:io`          | ✅ | ✅ | `poll` / `error` / `streams`; P3 stream/future plumbing lives in the canonical ABI. |
 | `wasi:random`      | ✅ | ✅ | OS CSPRNG (`std.crypto.random`) + insecure variants + 128-bit seed. |
 | `wasi:sockets`     | ✅ | ✅ | TCP + UDP + DNS; allow-list gated; SO_REUSEADDR; Windows + POSIX parity. |
-| `wasi:keyvalue`    | — | — | Not implemented (#583 B4). |
+| `wasi:keyvalue`    | ✅ | — | Memory-store host adapter — `store` + `atomics` + `batch` (#583 B4). |
 | `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
 | `wasi:config`      | — | — | Not implemented (#583 B6). |
 | `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
@@ -87,6 +87,9 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:http/types`                  | 56 | `wasi-p2-testsuite` (`zig-http`) | Fields + outgoing/incoming request/response + bodies + futures. |
 | `wasi:http/outgoing-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real `std.http.Client.fetch` for `http://` + `https://`. |
 | `wasi:http/incoming-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real TCP-listener-backed dispatch (#580). |
+| `wasi:keyvalue/store@0.2.0-draft2`     |  7 | unit tests (`#583 B4`) | Memory-store `bucket`: `open`, `get`, `set`, `delete`, `exists`, `list-keys`, `[resource-drop]`. |
+| `wasi:keyvalue/atomics@0.2.0-draft2`   |  5 | unit tests (`#583 B4`) | `increment` (real); `cas` resource + `swap` registered as `error::other` stubs. |
+| `wasi:keyvalue/batch@0.2.0-draft2`     |  3 | unit tests (`#583 B4`) | `get-many`, `set-many`, `delete-many` over the same bucket table. |
 | `wasi:logging/logging@0.1.0-draft` |  1 | unit tests | Host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`. No structured-logging backends yet (#583 B5). |
 
 ### WASI Preview 3 (0.3.0)
@@ -175,7 +178,8 @@ either added a new interface family or closed a tracker issue.
 | `wasi:sockets` Windows `bindAndGetsockname` parity              | [#587](https://github.com/cataggar/wamr/pull/587) | #583 A6 |
 | Sockets allow-list consultation at kernel-I/O                   | [#588](https://github.com/cataggar/wamr/pull/588) | #583 A1 |
 | Outbound HTTP client async state machine                        | [#590](https://github.com/cataggar/wamr/pull/590) | #583 A2 |
-| `wasi:logging@0.1.x` host adapter                               | this PR | #583 B5 |
+| `wasi:logging@0.1.x` host adapter                               | [#598](https://github.com/cataggar/wamr/pull/598) | #583 B5 |
+| `wasi:keyvalue@0.2.0-draft2` memory-store host adapter          | (this PR) | #583 B4 |
 
 ## Known limitations
 
@@ -209,8 +213,17 @@ in that tracker.
   wasmtime). ([#583 B2](https://github.com/cataggar/wamr/issues/583))
 * **`wasi:threads@0.3.x`** (preemptive threads) — not implemented;
   upstream WIT still draft. ([#583 B3](https://github.com/cataggar/wamr/issues/583))
-* **`wasi:keyvalue@0.2.x`** — not implemented; a `memory`-backed default
-  impl would let the keyvalue testsuite run. ([#583 B4](https://github.com/cataggar/wamr/issues/583))
+* **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped.
+  Limitations: in-process `std.StringHashMapUnmanaged` only; no disk
+  persistence and no cross-process / replicated consistency. The
+  `cas` resource (`atomics.cas.new` / `cas.current` / `atomics.swap`)
+  is registered as `error::other("…")` stubs — guests link cleanly
+  but a real CAS round-trip is rejected with a typed error. Disk-
+  backed stores and CAS are intentionally out of scope for
+  [#583 B4](https://github.com/cataggar/wamr/issues/583); upstream
+  WIT pinned at `wasi:keyvalue@0.2.0-draft2`
+  ([commit `fb6e23d`](https://github.com/WebAssembly/wasi-keyvalue/tree/fb6e23d11d41d0704b41cdd6362536c5750e0329)
+  — vendored under [`docs/wasi-keyvalue-wit-vendored/`](wasi-keyvalue-wit-vendored/)).
 * **`wasi:logging@0.1.x`** — host adapter shipped. Routes guest
   `log(level, context, message)` calls to host stderr + Zig's
   `std.log.scoped(.wasi_guest)`. Level filter: `--log-level=<name>` CLI
