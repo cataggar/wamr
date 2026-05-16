@@ -208,11 +208,23 @@ in that tracker.
   for `wasi:clocks/wait-for`; extend to `wasi:sockets/tcp-socket.start-connect`,
   `udp-socket.receive`, `wasi:filesystem` async ops, and
   `wasi:http/handler.handle` host-side. ([#583 B1](https://github.com/cataggar/wamr/issues/583))
-* **Caller-supplied-buffer / zero-copy `stream` specialisations.** Today
-  every `stream.read` / `stream.write` goes through host scratch buffers.
-  Spec allows the lifted call to peek at the guest's destination linmem
-  and write directly when alignment + length permit ("borrowed mode" in
-  wasmtime). ([#583 B2](https://github.com/cataggar/wamr/issues/583))
+* **Caller-supplied-buffer / zero-copy `stream` specialisations.**
+  Done for the hot-spot rendezvous paths:
+  * `stream.read` (TCP receive) — opt-in `host_driver.on_read_into`
+    callback skips the `stream.buffer` FIFO scratch alloc + the
+    second `@memcpy` into guest linmem. 60–73% wall-clock saved at
+    16/64 KiB chunks (`zig build wasi-streams-bench`).
+  * `stream.write` (TCP send + FS write-via-stream) — opt-in
+    `host_driver.on_write_from` callback with a thinner signature
+    (drops the unused `*AsyncStream` / `Allocator` params). The
+    write path was already memcpy-free via
+    `comp_inst.readGuestBytes` — drivers operate on a borrowed
+    guest linmem slice — so the win here is API hygiene, not
+    memcpy elimination; the microbench confirms parity (±0.3%).
+  Both paths validate `ptr + len ≤ memory.size` synchronously
+  before the host call, and the executor never yields to a
+  `memory.grow` between the bounds check and the driver return.
+  ([#583 B2](https://github.com/cataggar/wamr/issues/583))
 * **`wasi:threads@0.3.x`** (preemptive threads) — not implemented;
   upstream WIT still draft. ([#583 B3](https://github.com/cataggar/wamr/issues/583))
 * **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped, with

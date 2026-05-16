@@ -1854,8 +1854,39 @@ fn dispatchAsyncCanon(
             // accumulating in the FIFO. We only invoke the driver after
             // confirming there's no parked reader, since the reader path
             // is the canonical wakeup mechanism for in-component pairs.
+            //
+            // #583 B2 follow-up — when the driver exposes
+            // `on_write_from`, we prefer it over the legacy `on_write`.
+            // The bounds check has already happened above
+            // (`readGuestBytes(guest_ptr, byte_len)` validated
+            // `ptr + len <= memory.size`), and the executor never
+            // yields to a `memory.grow` between that check and the
+            // driver return — the borrowed slice stays valid for the
+            // call duration. The thinner signature drops the unused
+            // `*AsyncStream` / `Allocator` parameters; semantics are
+            // otherwise identical to `on_write`.
             if (s.host_driver) |drv| {
-                if (drv.on_write) |cb| {
+                if (drv.on_write_from) |cb| {
+                    const action = cb(drv.context, src);
+                    switch (action) {
+                        .progressed => {
+                            env.pushI32(@bitCast(async_canon.packStatus(.completed, count))) catch
+                                return error.StackOverflow;
+                            return;
+                        },
+                        .eof, .err => {
+                            s.read_closed = true;
+                            env.pushI32(@bitCast(async_canon.packStatus(.dropped, 0))) catch
+                                return error.StackOverflow;
+                            return;
+                        },
+                        .would_block => {
+                            // Fall through to FIFO buffering — a later
+                            // driver invocation (or `cancel_write`) can
+                            // drain it.
+                        },
+                    }
+                } else if (drv.on_write) |cb| {
                     const action = cb(drv.context, s, src, comp_inst.allocator);
                     switch (action) {
                         .progressed => {
@@ -4753,6 +4784,232 @@ test "stream.read zero-copy: dst extending past memory.size falls back (no UAF o
 
     const written = inst.writableGuestBytes(dst_ptr, 2).?;
     try testing.expectEqualStrings("ok", written);
+}
+
+// ── #583 B2 follow-up: zero-copy `on_write_from` host_driver specialisation ──
+
+/// Synthetic driver state shared by the zero-copy `stream.write`
+/// tests below: an arena for the bytes the driver "consumes" and a
+/// per-invocation counter so the tests can assert which callback was
+/// invoked.
+const ZeroCopyWriteTestDriver = struct {
+    sink: std.ArrayListUnmanaged(u8) = .empty,
+    on_write_from_calls: u32 = 0,
+    on_write_calls: u32 = 0,
+    next_action: async_mod.HostStreamAction = .progressed,
+
+    fn fromCb(
+        opaque_ctx: ?*anyopaque,
+        src: []const u8,
+    ) async_mod.HostStreamAction {
+        const self: *ZeroCopyWriteTestDriver = @ptrCast(@alignCast(opaque_ctx.?));
+        self.on_write_from_calls += 1;
+        if (self.next_action != .progressed) return self.next_action;
+        self.sink.appendSlice(std.testing.allocator, src) catch return .err;
+        return .progressed;
+    }
+
+    fn legacyCb(
+        opaque_ctx: ?*anyopaque,
+        _: *async_mod.AsyncStream,
+        bytes: []const u8,
+        _: std.mem.Allocator,
+    ) async_mod.HostStreamAction {
+        const self: *ZeroCopyWriteTestDriver = @ptrCast(@alignCast(opaque_ctx.?));
+        self.on_write_calls += 1;
+        if (self.next_action != .progressed) return self.next_action;
+        self.sink.appendSlice(std.testing.allocator, bytes) catch return .err;
+        return .progressed;
+    }
+
+    fn deinit(self: *ZeroCopyWriteTestDriver) void {
+        self.sink.deinit(std.testing.allocator);
+    }
+};
+
+test "stream.write zero-copy: driver receives borrowed guest linmem slice via on_write_from (#583 B2 follow-up)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU8Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Seed the guest source bytes into linmem at src_ptr.
+    const src_ptr: u32 = 32;
+    const payload = "hello-write-zc";
+    const src_bytes = inst.writableGuestBytes(src_ptr, payload.len).?;
+    @memcpy(src_bytes, payload);
+
+    // Install zero-copy driver (only `on_write_from` set so the test
+    // can assert which callback fired and that the executor uses the
+    // thinner shape when only it is present).
+    var driver_state = ZeroCopyWriteTestDriver{};
+    defer driver_state.deinit();
+    {
+        const s = inst.streams.getPtr(handle).?;
+        s.host_driver = .{
+            .context = &driver_state,
+            .on_write_from = &ZeroCopyWriteTestDriver.fromCb,
+        };
+    }
+
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, payload.len)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.completed, payload.len), status);
+
+    // Zero-copy callback fired exactly once; legacy `on_write` never
+    // ran (and the FIFO never grew because the driver consumed all
+    // bytes synchronously).
+    try testing.expectEqual(@as(u32, 1), driver_state.on_write_from_calls);
+    try testing.expectEqual(@as(u32, 0), driver_state.on_write_calls);
+    try testing.expectEqual(@as(usize, 0), inst.streams.getPtr(handle).?.buffer.items.len);
+    try testing.expectEqualStrings(payload, driver_state.sink.items);
+}
+
+test "stream.write zero-copy: on_write_from preferred over on_write when both installed (#583 B2 follow-up)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU8Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    const src_ptr: u32 = 64;
+    const payload = "prefer-zc";
+    const src_bytes = inst.writableGuestBytes(src_ptr, payload.len).?;
+    @memcpy(src_bytes, payload);
+
+    // Install BOTH callbacks. The executor must prefer the zero-copy
+    // `on_write_from` and never invoke the legacy `on_write`. This
+    // pins the preference contract — installing both shapes is the
+    // production pattern (matches `tcpSendStream` / `fsWriteViaStream`
+    // after this PR).
+    var driver_state = ZeroCopyWriteTestDriver{};
+    defer driver_state.deinit();
+    {
+        const s = inst.streams.getPtr(handle).?;
+        s.host_driver = .{
+            .context = &driver_state,
+            .on_write = &ZeroCopyWriteTestDriver.legacyCb,
+            .on_write_from = &ZeroCopyWriteTestDriver.fromCb,
+        };
+    }
+
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, payload.len)));
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const status: u32 = @bitCast(try env.popI32());
+    try testing.expectEqual(async_canon.packStatus(.completed, payload.len), status);
+
+    try testing.expectEqual(@as(u32, 1), driver_state.on_write_from_calls);
+    try testing.expectEqual(@as(u32, 0), driver_state.on_write_calls);
+    try testing.expectEqualStrings(payload, driver_state.sink.items);
+}
+
+test "stream.write: cross-page write (ptr + len > memory.size) is rejected before any host_driver call (#583 B2 follow-up)" {
+    const testing = std.testing;
+    const core_types_mod = @import("../runtime/common/types.zig");
+    const inst_mod_core = @import("../runtime/interpreter/instance.zig");
+
+    var module = core_types_mod.WasmModule{};
+    const core_inst = try inst_mod_core.instantiate(&module, testing.allocator);
+    defer inst_mod_core.destroy(core_inst);
+    const env = try ExecEnv.create(core_inst, 64, testing.allocator);
+    defer env.destroy();
+
+    const inst = try newStreamU8Inst(testing.allocator);
+    defer destroyStreamInst(inst);
+
+    try dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_new = .{ .type_idx = 0 } } },
+        env,
+        null,
+        testing.allocator,
+    );
+    const handle: u32 = @truncate(@as(u64, @bitCast(try env.popI64())) >> 32);
+
+    // Install both callbacks. Neither should fire — `readGuestBytes`
+    // rejects the (ptr, len) pair before the executor consults the
+    // driver.
+    var driver_state = ZeroCopyWriteTestDriver{};
+    defer driver_state.deinit();
+    {
+        const s = inst.streams.getPtr(handle).?;
+        s.host_driver = .{
+            .context = &driver_state,
+            .on_write = &ZeroCopyWriteTestDriver.legacyCb,
+            .on_write_from = &ZeroCopyWriteTestDriver.fromCb,
+        };
+    }
+
+    // `src_ptr = 4090` + `count = 64` overshoots the 4096-byte
+    // test_mem; the executor's `readGuestBytes` returns null and we
+    // trap with `error.MemoryNotAvailable` — the safety guarantee
+    // mirrors PR #599's read-side cross-page test (the borrowed
+    // slice must NEVER extend past `memory.size` before reaching
+    // a host driver).
+    const src_ptr: u32 = 4090;
+    try env.pushI32(@bitCast(handle));
+    try env.pushI32(@bitCast(src_ptr));
+    try env.pushI32(@bitCast(@as(u32, 64)));
+    try testing.expectError(error.MemoryNotAvailable, dispatchCanonBuiltin(
+        inst,
+        .{ .async_canon = .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } } },
+        env,
+        null,
+        testing.allocator,
+    ));
+    try testing.expectEqual(@as(u32, 0), driver_state.on_write_from_calls);
+    try testing.expectEqual(@as(u32, 0), driver_state.on_write_calls);
+    try testing.expectEqual(@as(usize, 0), driver_state.sink.items.len);
 }
 
 // ── #550: waitable.join + waitable-set.{wait,poll} event delivery ─────────
