@@ -1433,14 +1433,20 @@ fn mapSocketBindError(err: anyerror) SocketErrorCode {
 /// Open a kernel socket, bind to `address`, and getsockname for the
 /// kernel-resolved local address. Wraps the result in the same
 /// `std.Io.net.Socket` shape that `IpAddress.bind` returns so existing
-/// `close`/`send`/`receive` paths work transparently. POSIX-only:
-/// Windows falls back to `IpAddress.bind` because the WIT cases the
-/// custom path serves (port-0 readback already works via stdlib on
-/// Windows; Windows SO_REUSEADDR has SO_REUSEPORT-like hijack
-/// semantics that we explicitly do not want). (#569, #575)
+/// `close`/`send`/`receive` paths work transparently.
 ///
-/// The reason for not just calling `std.Io.net.IpAddress.bind` on POSIX
-/// is twofold:
+/// Two parallel implementations, kept in sync by the unit tests
+/// further down:
+///   - POSIX (`linux`, `macos`, …): raw `socket(2)` / `setsockopt(2)` /
+///     `bind(2)` / `getsockname(2)` syscalls via `std.posix.system`.
+///   - Windows: raw `socket` / `setsockopt` / `bind` / `getsockname`
+///     calls via the `ws2_32.dll` Winsock 2 API
+///     (`bindAndGetsocknameWindows`). Mirrors the POSIX flow so
+///     `sockets-tcp-bind::test_reuseaddr` passes when a Windows CI
+///     worker eventually runs the p3 suite. (#583 A6)
+///
+/// The reason for not just calling `std.Io.net.IpAddress.bind` is
+/// twofold:
 ///   1. A per-socket setsockopt phase between socket(2) and bind(2) is
 ///      required to mirror wasmtime's host-managed bind: we set
 ///      `SO_REUSEADDR=1` so a host that closed its first socket can
@@ -1453,7 +1459,12 @@ fn mapSocketBindError(err: anyerror) SocketErrorCode {
 ///      `sockets-tcp-connect::test_explicit_bind_addrinuse` /
 ///      `sockets-udp-connect::test_explicit_bind_addrinuse` cases
 ///      (see wasmtime
-///      `crates/wasi/src/sockets/util.rs::tcp_bind`).
+///      `crates/wasi/src/sockets/util.rs::tcp_bind`). On Windows,
+///      `SO_REUSEADDR` has SO_REUSEPORT-like semantics (it lets a
+///      second socket *steal* an actively-bound port), but the host's
+///      `bindWouldConflict` already gates active-bind reuse at the
+///      adapter layer so the two `test_explicit_bind_addrinuse`
+///      fixtures still surface `AddressInUse` correctly.
 ///   2. Centralising the `getsockname` step ensures the returned
 ///      `Socket.address` always carries the kernel-resolved ephemeral
 ///      port — defensive against stdlib drift where some
@@ -1470,11 +1481,7 @@ fn bindAndGetsockname(
 ) BindWithReuseError!std.Io.net.Socket {
     const native_os = @import("builtin").os.tag;
     if (native_os == .windows) {
-        const io = std.Io.Threaded.global_single_threaded.io();
-        return std.Io.net.IpAddress.bind(&address, io, .{
-            .mode = mode,
-            .protocol = protocol,
-        });
+        return bindAndGetsocknameWindows(address, mode, protocol);
     }
     // POSIX path — raw syscalls so we can interleave setsockopt
     // between socket(2) and bind(2).
@@ -1615,6 +1622,237 @@ fn bindAndGetsockname(
             } };
         },
     };
+    return .{ .handle = fd, .address = local };
+}
+
+// ── Windows direct-Winsock externs (#583 A6) ────────────────────────
+//
+// `std.os.windows.ws2_32` in Zig 0.16.0 is a *types-and-constants*
+// namespace — it intentionally exposes none of the actual `ws2_32.dll`
+// procedure exports (`socket`, `bind`, `setsockopt`, `getsockname`,
+// `closesocket`, `WSAStartup`, `WSAGetLastError`) because the stdlib
+// `std.Io.Threaded` Windows socket backend bypasses Winsock entirely
+// and talks to the AFD endpoint (\Device\Afd\Endpoint) via
+// `NtCreateFile`/`NtDeviceIoControlFile`. That AFD path doesn't
+// permit interleaving a `SO_REUSEADDR` `setsockopt` between socket
+// creation and bind in the way `bindAndGetsockname` needs.
+//
+// We therefore declare the small set of Winsock 2 entry points we
+// need here as private externs against `ws2_32.dll`. The set mirrors
+// what wasmtime's `crates/wasi/src/sockets/util.rs::tcp_bind` reaches
+// for on Windows (`socket2::Socket::new` + `set_reuse_address` +
+// `bind` + `local_addr`).
+//
+// Calling these without a prior `WSAStartup` returns `WSANOTINITIALISED`
+// (10093). `ensureWsaStartup` is a refcount-leaking idempotent
+// initialiser — repeat calls are documented as safe by MSDN. We never
+// call `WSACleanup` because the kernel reclaims the per-process
+// Winsock state at process exit anyway.
+const ws2_32_extern = struct {
+    pub const SOCKET = usize;
+    pub const INVALID_SOCKET: SOCKET = ~@as(usize, 0);
+    pub const SOCKET_ERROR: c_int = -1;
+
+    extern "ws2_32" fn WSAStartup(
+        wVersionRequested: u16,
+        lpWSAData: *anyopaque,
+    ) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+    extern "ws2_32" fn socket(
+        af: c_int,
+        type_: c_int,
+        protocol: c_int,
+    ) callconv(.winapi) SOCKET;
+    extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) c_int;
+    extern "ws2_32" fn bind(
+        s: SOCKET,
+        name: *const anyopaque,
+        namelen: c_int,
+    ) callconv(.winapi) c_int;
+    extern "ws2_32" fn setsockopt(
+        s: SOCKET,
+        level: c_int,
+        optname: c_int,
+        optval: [*]const u8,
+        optlen: c_int,
+    ) callconv(.winapi) c_int;
+    extern "ws2_32" fn getsockname(
+        s: SOCKET,
+        name: *anyopaque,
+        namelen: *c_int,
+    ) callconv(.winapi) c_int;
+};
+
+/// Selected `WSAGetLastError` codes that `bindAndGetsocknameWindows`
+/// classifies. Numbered per MSDN; not exhaustive — anything else
+/// collapses to `error.SystemResources` and is then mapped to
+/// `unknown` by `mapSocketBindError`.
+const WSAE = struct {
+    pub const INTR: c_int = 10004;
+    pub const ACCES: c_int = 10013;
+    pub const FAULT: c_int = 10014;
+    pub const INVAL: c_int = 10022;
+    pub const MFILE: c_int = 10024;
+    pub const NOBUFS: c_int = 10055;
+    pub const ADDRINUSE: c_int = 10048;
+    pub const ADDRNOTAVAIL: c_int = 10049;
+    pub const AFNOSUPPORT: c_int = 10047;
+    pub const SOCKTNOSUPPORT: c_int = 10044;
+    pub const PROTONOSUPPORT: c_int = 10043;
+};
+
+/// Idempotent `WSAStartup(2.2)`. Safe to call concurrently — MSDN
+/// guarantees repeated `WSAStartup` calls increment an internal
+/// refcount and return immediately on subsequent calls. We never
+/// pair them with `WSACleanup`; per-process Winsock state is
+/// reclaimed at process exit.
+var wsa_started: std.atomic.Value(u32) = .init(0);
+fn ensureWsaStartup() void {
+    if (wsa_started.load(.acquire) != 0) return;
+    // `WSADATA` is 408 bytes on x86_64 (LPWSADATA in the SDK). The
+    // 512-byte stack buffer is a deliberate over-allocation — we
+    // never read the fields.
+    var data: [512]u8 = undefined;
+    _ = ws2_32_extern.WSAStartup(0x0202, @ptrCast(&data));
+    wsa_started.store(1, .release);
+}
+
+/// Windows arm of `bindAndGetsockname`. Mirrors the POSIX flow via
+/// direct `ws2_32.dll` calls so a `SO_REUSEADDR` `setsockopt` can be
+/// interleaved between socket creation and `bind`. The returned
+/// `std.Io.net.Socket.Handle` is the raw Winsock `SOCKET` cast to
+/// `windows.HANDLE` (`?*anyopaque`) — `Socket.close` on the
+/// `Threaded` backend forwards it to `CloseHandle`, which Windows
+/// documents as a valid close for SOCKET handles (it delegates to
+/// the kernel-mode AFD driver under the hood). (#583 A6)
+fn bindAndGetsocknameWindows(
+    address: std.Io.net.IpAddress,
+    mode: std.Io.net.Socket.Mode,
+    protocol: ?std.Io.net.Protocol,
+) BindWithReuseError!std.Io.net.Socket {
+    const windows = std.os.windows;
+    const ws2_32 = windows.ws2_32;
+
+    ensureWsaStartup();
+
+    const family: c_int = switch (address) {
+        .ip4 => ws2_32.AF.INET,
+        .ip6 => ws2_32.AF.INET6,
+    };
+    const sock_type: c_int = switch (mode) {
+        .stream => ws2_32.SOCK.STREAM,
+        .dgram => ws2_32.SOCK.DGRAM,
+        else => return error.SocketModeUnsupported,
+    };
+    const proto: c_int = if (protocol) |p| switch (p) {
+        .tcp => ws2_32.IPPROTO.TCP,
+        .udp => ws2_32.IPPROTO.UDP,
+        else => 0,
+    } else 0;
+
+    const sock = ws2_32_extern.socket(family, sock_type, proto);
+    if (sock == ws2_32_extern.INVALID_SOCKET) {
+        return switch (ws2_32_extern.WSAGetLastError()) {
+            WSAE.ACCES => error.AccessDenied,
+            WSAE.AFNOSUPPORT => error.AddressFamilyUnsupported,
+            WSAE.MFILE => error.ProcessFdQuotaExceeded,
+            WSAE.NOBUFS => error.SystemResources,
+            WSAE.PROTONOSUPPORT,
+            WSAE.SOCKTNOSUPPORT,
+            WSAE.INVAL,
+            => error.ProtocolUnsupportedBySystem,
+            else => error.SystemResources,
+        };
+    }
+    errdefer _ = ws2_32_extern.closesocket(sock);
+
+    // SO_REUSEADDR — required by `sockets-tcp-bind::test_reuseaddr`
+    // (see `bindAndGetsockname` doc comment). Winsock semantics
+    // differ from POSIX (it permits a *second* active bind to steal
+    // the port), but the host's `bindWouldConflict` gate filters
+    // those cases at the adapter layer, so the TIME_WAIT-rebind case
+    // remains the one this option enables. Mirrors wasmtime's POSIX
+    // `set_reuse_address(true)` call.
+    const one: u32 = 1;
+    const one_bytes = std.mem.toBytes(one);
+    _ = ws2_32_extern.setsockopt(
+        sock,
+        ws2_32.SOL.SOCKET,
+        ws2_32.SO.REUSEADDR,
+        &one_bytes,
+        @sizeOf(u32),
+    );
+
+    // Build the Winsock sockaddr_in / sockaddr_in6 and call bind.
+    var storage: ws2_32.sockaddr.storage = std.mem.zeroes(ws2_32.sockaddr.storage);
+    var addr_len: c_int = 0;
+    switch (address) {
+        .ip4 => |v4| {
+            const sa_in: *ws2_32.sockaddr.in = @ptrCast(@alignCast(&storage));
+            sa_in.* = .{
+                .family = ws2_32.AF.INET,
+                .port = std.mem.nativeToBig(u16, v4.port),
+                .addr = @bitCast(v4.bytes),
+            };
+            addr_len = @sizeOf(ws2_32.sockaddr.in);
+        },
+        .ip6 => |v6| {
+            const sa_in6: *ws2_32.sockaddr.in6 = @ptrCast(@alignCast(&storage));
+            sa_in6.* = .{
+                .family = ws2_32.AF.INET6,
+                .port = std.mem.nativeToBig(u16, v6.port),
+                .flowinfo = v6.flow,
+                .addr = v6.bytes,
+                .scope_id = 0,
+            };
+            addr_len = @sizeOf(ws2_32.sockaddr.in6);
+        },
+    }
+    if (ws2_32_extern.bind(sock, @ptrCast(&storage), addr_len) == ws2_32_extern.SOCKET_ERROR) {
+        return switch (ws2_32_extern.WSAGetLastError()) {
+            WSAE.ACCES => error.AccessDenied,
+            WSAE.ADDRINUSE => error.AddressInUse,
+            WSAE.ADDRNOTAVAIL => error.AddressUnavailable,
+            WSAE.AFNOSUPPORT => error.AddressFamilyUnsupported,
+            WSAE.NOBUFS => error.SystemResources,
+            WSAE.INVAL => error.AddressInUse,
+            else => error.SystemResources,
+        };
+    }
+
+    // getsockname — resolve the kernel-assigned ephemeral port for
+    // the port-0 case (and confirm the bind for the explicit-port
+    // case).
+    var got_storage: ws2_32.sockaddr.storage = std.mem.zeroes(ws2_32.sockaddr.storage);
+    var got_len: c_int = @sizeOf(ws2_32.sockaddr.storage);
+    if (ws2_32_extern.getsockname(sock, @ptrCast(&got_storage), &got_len) == ws2_32_extern.SOCKET_ERROR) {
+        return error.SystemResources;
+    }
+
+    const local: std.Io.net.IpAddress = switch (address) {
+        .ip4 => blk: {
+            const sa: *const ws2_32.sockaddr.in = @ptrCast(@alignCast(&got_storage));
+            break :blk .{ .ip4 = .{
+                .bytes = @bitCast(sa.addr),
+                .port = std.mem.bigToNative(u16, sa.port),
+            } };
+        },
+        .ip6 => blk: {
+            const sa: *const ws2_32.sockaddr.in6 = @ptrCast(@alignCast(&got_storage));
+            break :blk .{ .ip6 = .{
+                .bytes = sa.addr,
+                .port = std.mem.bigToNative(u16, sa.port),
+                .flow = sa.flowinfo,
+            } };
+        },
+    };
+
+    // Cast the Winsock SOCKET (an opaque integer) to the
+    // `std.posix.fd_t` shape Zig uses for socket handles on Windows
+    // (`windows.HANDLE` = `?*anyopaque`). `Socket.close` →
+    // `Threaded.netClose` → `windows.CloseHandle` correctly disposes
+    // of the underlying AFD endpoint.
+    const fd: std.Io.net.Socket.Handle = @ptrFromInt(sock);
     return .{ .handle = fd, .address = local };
 }
 
@@ -30286,10 +30524,9 @@ test "sockets (#520 wave 2): socketCodeToP3Disc maps internal enum to WIT 0.3 va
     try testing.expectEqual(@as(u32, 14), WasiCliAdapter.socketCodeToP3Disc(.new_socket_limit));
 }
 
-test "sockets #575: bindAndGetsockname SO_REUSEADDR lets immediate rebind to TIME_WAIT port succeed" {
-    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
-
+test "sockets #575/#583 A6: bindAndGetsockname SO_REUSEADDR lets immediate rebind to TIME_WAIT port succeed" {
     const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     // First bind: wildcard:0 — kernel assigns an ephemeral port.
     const wildcard: std.Io.net.IpAddress = .{ .ip4 = .{
@@ -30306,25 +30543,77 @@ test "sockets #575: bindAndGetsockname SO_REUSEADDR lets immediate rebind to TIM
     // Close the first socket — the kernel may leave the 4-tuple in
     // TIME_WAIT. Without SO_REUSEADDR on the new socket below the
     // rebind would fail with `error.AddressInUse` for that window.
-    // With the setsockopt added in #575 it succeeds.
-    _ = std.posix.system.close(first.handle);
+    // With the setsockopt added in #575 (POSIX) / #583 A6 (Windows)
+    // it succeeds on every supported platform.
+    first.close(io);
 
     // Second bind: same port, fresh socket. With SO_REUSEADDR set by
     // `bindAndGetsockname` this must succeed even if the first tuple
     // is still in TIME_WAIT — the symptom that broke
-    // `sockets-tcp-bind::test_reuseaddr` before #575.
+    // `sockets-tcp-bind::test_reuseaddr` before #575 on POSIX (and
+    // would break it on MinGW CI once Windows runs the p3 suite,
+    // absent #583 A6).
     const rebind_addr: std.Io.net.IpAddress = .{ .ip4 = .{
         .bytes = [4]u8{ 127, 0, 0, 1 },
         .port = assigned_port,
     } };
     const second = try bindAndGetsockname(rebind_addr, .stream, .tcp);
-    defer _ = std.posix.system.close(second.handle);
+    defer second.close(io);
 
     const got_port = switch (second.address) {
         .ip4 => |v4| v4.port,
         .ip6 => |v6| v6.port,
     };
     try testing.expectEqual(assigned_port, got_port);
+}
+
+test "sockets #583 A6: bindAndGetsockname wildcard:0 round-trip is portable across POSIX/Windows" {
+    // Smoke-test the same `bindAndGetsockname` entry point on every
+    // platform — on POSIX it exercises the raw-syscall path, on
+    // Windows it exercises the ws2_32 path added by #583 A6. Both
+    // arms must:
+    //   1. Open a socket and bind to 127.0.0.1:0 successfully.
+    //   2. Receive a non-zero kernel-assigned ephemeral port via
+    //      getsockname.
+    //   3. Allow an immediate rebind on the resolved port using a
+    //      fresh socket (SO_REUSEADDR coverage — same expectation as
+    //      `sockets-tcp-bind::test_reuseaddr`).
+    //   4. Repeat the round trip for UDP/.dgram so the non-stream
+    //      branch of the `mode` switch is hit too.
+    const testing = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    inline for (.{
+        .{ std.Io.net.Socket.Mode.stream, std.Io.net.Protocol.tcp },
+        .{ std.Io.net.Socket.Mode.dgram, std.Io.net.Protocol.udp },
+    }) |pair| {
+        const mode = pair[0];
+        const proto = pair[1];
+
+        const wildcard: std.Io.net.IpAddress = .{ .ip4 = .{
+            .bytes = [4]u8{ 127, 0, 0, 1 },
+            .port = 0,
+        } };
+        const first = try bindAndGetsockname(wildcard, mode, proto);
+        const assigned_port = switch (first.address) {
+            .ip4 => |v4| v4.port,
+            .ip6 => |v6| v6.port,
+        };
+        try testing.expect(assigned_port != 0);
+        first.close(io);
+
+        const rebind_addr: std.Io.net.IpAddress = .{ .ip4 = .{
+            .bytes = [4]u8{ 127, 0, 0, 1 },
+            .port = assigned_port,
+        } };
+        const second = try bindAndGetsockname(rebind_addr, mode, proto);
+        defer second.close(io);
+        const got_port = switch (second.address) {
+            .ip4 => |v4| v4.port,
+            .ip6 => |v6| v6.port,
+        };
+        try testing.expectEqual(assigned_port, got_port);
+    }
 }
 
 test "main (#520 wave 2): runComponent applies --map-dir flags via addPreopen" {
