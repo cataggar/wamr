@@ -2445,12 +2445,20 @@ fn canResolveOuterTypeAlias(a: ctypes.Alias, component: *const ctypes.Component)
 /// Resolve a single-hop `.alias outer 1 M (type)` against the parent
 /// component's `type_indexspace`. Returns the parent's `TypeDef` or
 /// `null` when the alias shape is unsupported (multi-level outer,
-/// non-type sort, target slot still unresolved). The returned TypeDef
-/// is structurally shared with the parent — callers MUST NOT deep-free
-/// it when tearing the extension down. Limited to `TypeDef.val` for
-/// now (#534 scope; primitives like `type duration = u64` cover the
-/// clock fixtures). A future slice may extend this to record / variant
-/// payloads with proper deep-copy + type_idx rewriting.
+/// non-type sort, target slot still unresolved).
+///
+/// `#534` originally limited the return shape to `TypeDef.val` because
+/// that covers `type duration = u64` (the clock fixtures). `#571`
+/// (filesystem-stat) requires the same path for `.record` / `.variant`
+/// / `.tuple` / `.flags` / `.enum_` / `.option` / `.result` / `.list`
+/// because wit-bindgen emits the `wasi:filesystem/types` instance-type
+/// body with `(alias outer 1 M (type))` decls pointing at top-level
+/// records (`datetime`) and variants (`new-timestamp` references
+/// `datetime` via this alias). The returned `TypeDef` is structurally
+/// shared with the parent — `buildInstanceTypeExtension` deep-copies
+/// it through `rewriteTypeDefAbsolute(allocator, 0, ...)` so the
+/// extension owns its own field/case/tuple slice and `deinit` can free
+/// safely without double-freeing the parent's slices.
 fn resolveOuterTypeAliasToParent(
     a: ctypes.Alias,
     component: *const ctypes.Component,
@@ -2468,7 +2476,7 @@ fn resolveOuterTypeAliasToParent(
     if (local >= component.types.len) return null;
     const td = component.types[local];
     return switch (td) {
-        .val => td,
+        .val, .record, .variant, .tuple, .flags, .enum_, .option, .result, .list => td,
         else => null,
     };
 }
@@ -2539,14 +2547,31 @@ fn buildInstanceTypeExtension(
             // `.alias outer count=1 idx=M (type)` — when M points at a
             // parent type-indexspace slot that has been resolved (e.g.
             // by the loader's #534 top-level type-alias resolution),
-            // copy that TypeDef into the extension so canon-ABI
-            // lift/lower of values whose declared type goes through this
-            // slot can look up the concrete shape. Deep-copy is not
-            // needed for the `TypeDef.val` case currently handled by
-            // the loader resolver; nested type_idx refs would require
-            // rewriting and are out of scope here.
+            // materialize the parent's TypeDef in the extension so
+            // canon-ABI lift/lower of values whose declared type goes
+            // through this slot can look up the concrete shape.
+            //
+            // For `.record` / `.tuple` / `.variant` we deep-copy via
+            // `rewriteTypeDefAbsolute(allocator, 0, ...)` so the
+            // extension owns its own fields/cases slice (`deinit`
+            // would otherwise double-free shared parent slices). The
+            // `base=0` argument leaves nested `.type_idx` refs at the
+            // parent's absolute index, which is correct: those refs
+            // are < `ext_base`, so the registry's `get()` falls into
+            // the parent-component lookup path. (`#571`.)
+            //
+            // For leaf shapes (`.val` / `.flags` / `.enum_` / `.list`
+            // / `.option` / `.result`) deinit doesn't free heap
+            // payload, so shallow sharing is safe.
             if (resolveOuterTypeAliasToParent(a, component)) |parent_td| {
-                types_buf[type_i] = parent_td;
+                const copied: ctypes.TypeDef = switch (parent_td) {
+                    .record, .tuple, .variant => rewriteTypeDefAbsolute(allocator, 0, parent_td) catch {
+                        rewrite_failed = true;
+                        break;
+                    },
+                    else => parent_td,
+                };
+                types_buf[type_i] = copied;
                 idxspace_buf[slot_i] = type_i;
                 type_i += 1;
             } else {
