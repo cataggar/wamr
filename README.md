@@ -94,10 +94,15 @@ client — system root certificates are loaded via
 non-empty; the empty allow-list still surfaces
 `error-code::HTTP_request_denied`.
 
-Transport, TLS handshake, and parse failures collapse into
-`error-code::internal_error` — finer-grained diagnostic mapping is left to
-follow-up work. Response headers are not yet surfaced (a `std.http.Client`
-limitation: `FetchResult` only exposes the status line) and incoming-handler
+Transport, TLS handshake, DNS resolution, and HTTP/1.1 framing failures
+are mapped onto specific `error-code` variants per the 0.3 WIT
+(`connection-refused`, `connection-terminated`, `TLS-protocol-error`,
+`TLS-certificate-error`, `DNS-error`, `HTTP-protocol-error`,
+`HTTP-response-header-section-size`, etc.); only genuinely
+unclassified failures fall through to `error-code::internal-error`
+(see [#583](https://github.com/cataggar/wamr/issues/583) A3). Response
+headers are not yet surfaced (a `std.http.Client` limitation:
+`FetchResult` only exposes the status line) and incoming-handler
 server semantics remain a stub.
 
 The earlier `error-code::HTTP_protocol_error` short-circuit on `https://`
