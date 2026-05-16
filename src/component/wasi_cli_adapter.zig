@@ -1231,6 +1231,108 @@ pub const PendingUdpReceive = struct {
     sock_handle: u32,
 };
 
+/// Outcome captured by an outbound HTTP worker thread (#583 A2). Shared
+/// across the worker thread and the adapter's drain side via a heap-
+/// allocated `PendingHttpFetchShared`. The two threads coordinate
+/// through `done` (worker → adapter signal) and `cancelled` (adapter →
+/// worker advisory); the heap struct is freed only after the thread
+/// has been joined, so a slow `std.http.Client.fetch` can never UAF
+/// even if the guest cancels or the adapter tears down mid-flight.
+pub const HttpFetchOutcome = union(enum) {
+    /// Successful `std.http.Client.fetch` response. `body` is owned
+    /// host-allocated bytes consumed into an `IncomingResponse` on
+    /// settle; `status` is the numeric HTTP response status.
+    success: struct {
+        status: u16,
+        body: []u8,
+    },
+    /// Transport / TLS / parse failure mapped to a
+    /// `wasi:http/types.error-code` discriminant.
+    failure: HttpErrorCode,
+};
+
+/// Heap-allocated state shared between the host's outbound-HTTP worker
+/// thread and the adapter's drain side. The worker writes `outcome`
+/// then publishes via `done.store(true, .release)`; the adapter checks
+/// `done.load(.acquire)` from `drainPendingHttpFetches` and only frees
+/// the struct after `thread.join()` returns, guaranteeing no UAF even
+/// when the worker is still mid-`std.http.Client.fetch`.
+///
+/// `cancelled` is an adapter → worker advisory: today's blocking
+/// `std.http.Client.fetch` can't observe it mid-fetch, but the drain
+/// side checks it on completion so a guest `task.cancel` issued
+/// before the worker returns is still honoured by the future the
+/// guest awaits (#488 cancel-propagation pattern). (#583 A2)
+pub const PendingHttpFetchShared = struct {
+    done: std.atomic.Value(bool) = .{ .raw = false },
+    cancelled: std.atomic.Value(bool) = .{ .raw = false },
+    /// Worker fetches into this slot once before flipping `done`.
+    /// Adapter takes ownership of `success.body` on settle and frees
+    /// it after the guest consumes the incoming-response.
+    outcome: HttpFetchOutcome = .{ .failure = .internal_error },
+};
+
+/// One in-flight outbound HTTP fetch driven by a dedicated worker
+/// thread. The future-incoming-response handle is settled by the
+/// adapter's `drainPendingHttpFetches` driver once `shared.done` is
+/// observed; the worker thread is `join()`ed at that point so the
+/// shared heap struct can be safely freed. (#583 A2)
+///
+/// Mirrors the deferred-completion shape of `PendingUdpReceive`
+/// (#576) but with a thread-driven completion source — Zig 0.16's
+/// `std.http.Client.fetch` is blocking, and the spec-compliant
+/// shape is a `.pending` future the guest can poll on.
+pub const PendingHttpFetch = struct {
+    /// Handle into `WasiCliAdapter.http_future_responses` of the
+    /// future-incoming-response the guest is awaiting.
+    future_handle: u32,
+    /// Worker thread executing the blocking `std.http.Client.fetch`.
+    /// Joined exactly once by the adapter — either at drain time
+    /// when `shared.done` is observed, or at adapter teardown.
+    thread: std.Thread,
+    /// Heap-allocated coordination block — outlives both threads up
+    /// to the post-join free in `drainPendingHttpFetches` / `deinit`.
+    shared: *PendingHttpFetchShared,
+    /// Set when the guest calls `[resource-drop]future-incoming-response`
+    /// while the worker is still in flight. The slot is kept
+    /// reserved (with a `.pending` `FutureIncomingResponse` parked
+    /// in it) so `pushFutureResponse` cannot reuse the slot for an
+    /// unrelated future; once the drainer settles the entry it
+    /// nulls the slot and frees the parked `FutureIncomingResponse`
+    /// itself. (#583 A2)
+    guest_dropped: bool = false,
+};
+
+/// Snapshot of an `OutgoingRequest` plus body bytes that the worker
+/// thread needs to perform a `std.http.Client.fetch` independently
+/// of the adapter (so the adapter is free to mutate / drop the
+/// request resource without racing). Owned by the worker; freed
+/// in `httpFetchWorker` after the fetch returns. (#583 A2)
+const HttpFetchRequest = struct {
+    allocator: Allocator,
+    url: []u8,
+    method: std.http.Method,
+    /// Header name/value slices, dupe'd into worker-owned memory.
+    headers_buf: []std.http.Header,
+    headers_names: [][]u8,
+    headers_values: [][]u8,
+    /// Optional request body bytes, owned host-allocated.
+    payload: ?[]u8,
+    /// The `PendingHttpFetchShared` slot the worker will publish
+    /// its outcome through.
+    shared: *PendingHttpFetchShared,
+
+    fn deinit(self: *HttpFetchRequest) void {
+        self.allocator.free(self.url);
+        for (self.headers_names) |n| self.allocator.free(n);
+        for (self.headers_values) |v| self.allocator.free(v);
+        self.allocator.free(self.headers_names);
+        self.allocator.free(self.headers_values);
+        self.allocator.free(self.headers_buf);
+        if (self.payload) |p| self.allocator.free(p);
+    }
+};
+
 /// Map a `std.Io.net.HostName.LookupError` to the closest
 /// `wasi:sockets/network.error-code` variant. Most parse / nameserver
 /// failures funnel into `permanent-resolver-failure`; transient errors
@@ -2836,12 +2938,18 @@ pub const OutgoingBody = struct {
     stream: ?*streams.OutputStream = null,
 };
 
-/// `wasi:http/types.future-incoming-response`. Default-deny resolves
-/// every future immediately to `error-code.HTTP-request-denied`.
+/// `wasi:http/types.future-incoming-response` (#149, #583 A2).
 ///
-/// TODO(#149 follow-up): replace `state` with an actual async result
-/// once `std.http.Client` (with TLS) is wired through a capability
-/// allow-list.
+/// The guest awaits this future via `[method]future-incoming-response.subscribe`
+/// (producing a `pollable`) and `[method]future-incoming-response.get`
+/// (which consumes the result on the first ready call). The adapter
+/// resolves the future asynchronously through `PendingHttpFetch`: the
+/// real `std.http.Client.fetch` runs on a worker thread, and the
+/// adapter's `drainPendingHttpFetches` driver transitions `state`
+/// from `.pending` to `.ready_ok` / `.ready_err` once the worker
+/// publishes its outcome. Synchronous denial paths (empty allow-list,
+/// malformed request, invalid URL) still settle the future to
+/// `.ready_err` immediately — only the actual fetch is deferred.
 pub const FutureIncomingResponse = struct {
     pub const State = union(enum) {
         pending,
@@ -3180,6 +3288,16 @@ pub const WasiCliAdapter = struct {
     /// datagram lands in the kernel queue (#576).
     pending_udp_receives: std.ArrayListUnmanaged(PendingUdpReceive) = .empty,
 
+    /// Pending outbound `wasi:http/outgoing-handler.handle` fetches
+    /// (#583 A2). Each entry owns a worker thread driving the
+    /// blocking `std.http.Client.fetch` plus a shared heap struct
+    /// the worker publishes its outcome through. Drained by
+    /// `drainPendingHttpFetches` on every `driveAsyncEvents` tick
+    /// and at the top of `anyPollableReady` so the guest's
+    /// `pollable.poll` / `pollable.block` over a
+    /// `future-incoming-response` resolves once the fetch finishes.
+    pending_http_fetches: std.ArrayListUnmanaged(PendingHttpFetch) = .empty,
+
     /// `wasi:http/types` resource tables (#149). Each slot owns a
     /// heap-allocated rep struct; resource-drop nulls the slot and
     /// frees the underlying allocation. `deinit` mops up any slots
@@ -3373,6 +3491,33 @@ pub const WasiCliAdapter = struct {
         self.timer_futures.deinit(self.allocator);
         self.timer_future_ready.deinit(self.allocator);
         self.pending_udp_receives.deinit(self.allocator);
+        // Drain any outbound HTTP worker threads still in flight
+        // (#583 A2). Each entry is joined so we can safely free the
+        // shared heap struct — a still-running `std.http.Client.fetch`
+        // cannot UAF the slot from under us. Entries whose guest had
+        // dropped the future-incoming-response (slot kept reserved
+        // by `httpFutureDrop` to defeat slot-reuse races) get their
+        // slot nulled here as well so the post-deinit
+        // `http_future_responses` teardown doesn't double-free.
+        for (self.pending_http_fetches.items) |entry| {
+            entry.shared.cancelled.store(true, .release);
+            entry.thread.join();
+            switch (entry.shared.outcome) {
+                .success => |s| self.allocator.free(s.body),
+                .failure => {},
+            }
+            self.allocator.destroy(entry.shared);
+            if (entry.guest_dropped) {
+                const fh = entry.future_handle;
+                if (fh < self.http_future_responses.items.len) {
+                    if (self.http_future_responses.items[fh]) |f| {
+                        self.allocator.destroy(f);
+                        self.http_future_responses.items[fh] = null;
+                    }
+                }
+            }
+        }
+        self.pending_http_fetches.deinit(self.allocator);
         self.stream_table.deinit(self.allocator);
         self.input_stream_table.deinit(self.allocator);
 
@@ -4453,6 +4598,11 @@ pub const WasiCliAdapter = struct {
     }
 
     fn anyPollableReady(self: *WasiCliAdapter, handles: []const u32) !bool {
+        // Settle any outbound HTTP fetches whose worker thread has
+        // finished — observed transition (`.pending` → `.ready_*`)
+        // is what the `.http_future_response` pollable variant
+        // checks via `pollableIsReady`. (#583 A2)
+        self.drainPendingHttpFetches();
         for (handles) |handle| {
             const pollable = self.lookupPollable(handle) orelse return error.InvalidHandle;
             if (self.pollableIsReady(pollable)) return true;
@@ -5503,17 +5653,281 @@ pub const WasiCliAdapter = struct {
         settleFutureDeferred(ci, fut, payload_bytes, allocator);
     }
 
+    /// Worker thread body for an outbound HTTP fetch (#583 A2).
+    /// Executes the blocking `std.http.Client.fetch` on a snapshot of
+    /// the guest's request, then publishes the outcome to the shared
+    /// heap struct so the adapter's drain side can pick it up. The
+    /// worker owns `req` (deinit on return) but only borrows
+    /// `req.shared` — the adapter holds the other reference and frees
+    /// it once `thread.join()` has returned.
+    ///
+    /// Errors from `std.http.Client.fetch` are mapped onto their
+    /// specific `wasi:http/types.error-code` variant by
+    /// `mapHttpFetchError` (#583 A3 — connect-refused, TLS, DNS,
+    /// framing, URI-parse, etc. each get a dedicated arm; only truly-
+    /// unclassified failures fall through to `internal_error`). The
+    /// `httpClientSendP3` synchronous path uses the same helper, so
+    /// both surfaces produce identical discriminants.
+    fn httpFetchWorker(req: *HttpFetchRequest) void {
+        // Worker owns its *HttpFetchRequest — free both the inner
+        // resources and the heap struct itself before returning.
+        const alloc = req.allocator;
+        defer alloc.destroy(req);
+        defer req.deinit();
+        const shared = req.shared;
+
+        // Honor a pre-fetch cancel before doing any network work.
+        if (shared.cancelled.load(.acquire)) {
+            shared.outcome = .{ .failure = .HTTP_request_denied };
+            shared.done.store(true, .release);
+            return;
+        }
+
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var client: std.http.Client = .{
+            .allocator = req.allocator,
+            .io = io,
+        };
+        defer client.deinit();
+
+        var aw: std.Io.Writer.Allocating = .init(req.allocator);
+        defer aw.deinit();
+
+        const fetch_result = client.fetch(.{
+            .location = .{ .url = req.url },
+            .method = req.method,
+            .payload = req.payload,
+            .extra_headers = req.headers_buf,
+            .response_writer = &aw.writer,
+            .keep_alive = false,
+        }) catch |err| {
+            // Funnel through the same error-mapping table the
+            // synchronous P3 `client.send` path uses (#583 A3) so the
+            // worker and the in-thread `httpClientSendP3` produce
+            // identical `error-code` discriminants.
+            shared.outcome = .{ .failure = mapHttpFetchError(err) };
+            shared.done.store(true, .release);
+            return;
+        };
+
+        var resp_al = aw.toArrayList();
+        const body = resp_al.toOwnedSlice(req.allocator) catch {
+            shared.outcome = .{ .failure = .internal_error };
+            shared.done.store(true, .release);
+            return;
+        };
+        shared.outcome = .{ .success = .{
+            .status = @intFromEnum(fetch_result.status),
+            .body = body,
+        } };
+        shared.done.store(true, .release);
+    }
+
+    /// Drain any pending outbound HTTP fetches whose worker thread has
+    /// published an outcome. Settles each `FutureIncomingResponse` via
+    /// the standard `state = .ready_ok` / `state = .ready_err`
+    /// transition the P2 `future-incoming-response.get` path consumes,
+    /// then joins the worker thread and frees the shared heap struct.
+    ///
+    /// Entries whose guest dropped the future-incoming-response while
+    /// the worker was still mid-fetch (the `guest_dropped` flag) get
+    /// their slot nulled here too, after the worker outcome is
+    /// discarded — `httpFutureDrop` left the slot reserved to keep
+    /// `pushFutureResponse` from racing into the same slot before
+    /// the drainer caught up. (#583 A2)
+    pub fn drainPendingHttpFetches(self: *WasiCliAdapter) void {
+        var i: usize = 0;
+        while (i < self.pending_http_fetches.items.len) {
+            const entry = self.pending_http_fetches.items[i];
+            if (!entry.shared.done.load(.acquire)) {
+                i += 1;
+                continue;
+            }
+            // Worker has published — join is non-blocking.
+            entry.thread.join();
+            self.settlePendingHttpFetch(entry);
+            self.allocator.destroy(entry.shared);
+            // Slot-reuse protection: if the guest had dropped the
+            // future while the worker was in flight,
+            // `httpFutureDrop` deferred slot teardown to the drainer
+            // (see comment there). The settle path above has either
+            // discarded the outcome or settled a now-orphan future;
+            // either way the slot is no longer needed.
+            if (entry.guest_dropped) {
+                const fh = entry.future_handle;
+                if (fh < self.http_future_responses.items.len) {
+                    if (self.http_future_responses.items[fh]) |f| {
+                        self.allocator.destroy(f);
+                        self.http_future_responses.items[fh] = null;
+                    }
+                }
+            }
+            _ = self.pending_http_fetches.swapRemove(i);
+        }
+    }
+
+    /// Translate a worker-published `HttpFetchOutcome` into the
+    /// matching `FutureIncomingResponse.state` transition. If the
+    /// future's slot has already been dropped (resource-drop on the
+    /// guest side) the outcome is discarded — `.success.body` is
+    /// freed here, otherwise it transfers ownership to the freshly
+    /// allocated `IncomingResponse`.
+    fn settlePendingHttpFetch(self: *WasiCliAdapter, entry: PendingHttpFetch) void {
+        const fut = self.lookupFutureResponse(entry.future_handle);
+        // Guest dropped the future — free outcome resources and bail.
+        if (fut == null) {
+            switch (entry.shared.outcome) {
+                .success => |s| self.allocator.free(s.body),
+                .failure => {},
+            }
+            return;
+        }
+        // Guest issued `task.cancel` mid-fetch (or adapter signalled
+        // cancellation). Surface the cancel as `HTTP_request_denied`
+        // — the closest WIT discriminant for "the request was not
+        // delivered" without inventing new error-code variants.
+        if (entry.shared.cancelled.load(.acquire)) {
+            switch (entry.shared.outcome) {
+                .success => |s| self.allocator.free(s.body),
+                .failure => {},
+            }
+            fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.HTTP_request_denied) };
+            return;
+        }
+        switch (entry.shared.outcome) {
+            .success => |s| {
+                const resp_fields = self.allocator.create(HttpFields) catch {
+                    self.allocator.free(s.body);
+                    fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) };
+                    return;
+                };
+                resp_fields.* = .{};
+                const resp_fields_handle = self.pushHttpFields(resp_fields) catch {
+                    self.allocator.free(s.body);
+                    self.allocator.destroy(resp_fields);
+                    fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) };
+                    return;
+                };
+                const ir = self.allocator.create(IncomingResponse) catch {
+                    self.allocator.free(s.body);
+                    fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) };
+                    return;
+                };
+                ir.* = .{
+                    .status = s.status,
+                    .headers_handle = resp_fields_handle,
+                    .body_data = s.body,
+                };
+                const ir_handle = self.pushIncomingResponse(ir) catch {
+                    self.allocator.free(s.body);
+                    ir.body_data = null;
+                    self.allocator.destroy(ir);
+                    fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) };
+                    return;
+                };
+                fut.?.state = .{ .ready_ok = ir_handle };
+            },
+            .failure => |code| {
+                fut.?.state = .{ .ready_err = @intFromEnum(code) };
+            },
+        }
+    }
+
+    /// Mint a `.pending` `FutureIncomingResponse`, snapshot the
+    /// outgoing request into worker-owned memory, and spawn a worker
+    /// thread that drives `std.http.Client.fetch` to completion.
+    /// Returns the future handle the guest observes via
+    /// `result<own<future-incoming-response>, error-code>`.
+    /// (#583 A2)
+    fn spawnHttpFetchPending(
+        self: *WasiCliAdapter,
+        url: []const u8,
+        method: std.http.Method,
+        headers: []const std.http.Header,
+        payload: ?[]const u8,
+    ) !u32 {
+        const url_copy = try self.allocator.dupe(u8, url);
+        errdefer self.allocator.free(url_copy);
+
+        const names = try self.allocator.alloc([]u8, headers.len);
+        errdefer self.allocator.free(names);
+        const values = try self.allocator.alloc([]u8, headers.len);
+        errdefer self.allocator.free(values);
+        const header_buf = try self.allocator.alloc(std.http.Header, headers.len);
+        errdefer self.allocator.free(header_buf);
+
+        var dup_filled: usize = 0;
+        errdefer {
+            for (names[0..dup_filled]) |n| self.allocator.free(n);
+            for (values[0..dup_filled]) |v| self.allocator.free(v);
+        }
+        while (dup_filled < headers.len) : (dup_filled += 1) {
+            names[dup_filled] = try self.allocator.dupe(u8, headers[dup_filled].name);
+            values[dup_filled] = try self.allocator.dupe(u8, headers[dup_filled].value);
+            header_buf[dup_filled] = .{
+                .name = names[dup_filled],
+                .value = values[dup_filled],
+            };
+        }
+
+        const payload_copy: ?[]u8 = if (payload) |p|
+            try self.allocator.dupe(u8, p)
+        else
+            null;
+        errdefer if (payload_copy) |p| self.allocator.free(p);
+
+        const shared = try self.allocator.create(PendingHttpFetchShared);
+        errdefer self.allocator.destroy(shared);
+        shared.* = .{};
+
+        const req = try self.allocator.create(HttpFetchRequest);
+        errdefer self.allocator.destroy(req);
+        req.* = .{
+            .allocator = self.allocator,
+            .url = url_copy,
+            .method = method,
+            .headers_buf = header_buf,
+            .headers_names = names,
+            .headers_values = values,
+            .payload = payload_copy,
+            .shared = shared,
+        };
+
+        // Mint the `.pending` future first so a thread-spawn failure
+        // doesn't strand the shared struct on a non-existent slot.
+        const fut = try self.allocator.create(FutureIncomingResponse);
+        errdefer self.allocator.destroy(fut);
+        fut.* = .{ .state = .pending };
+        const fh = try self.pushFutureResponse(fut);
+        errdefer if (fh < self.http_future_responses.items.len) {
+            self.http_future_responses.items[fh] = null;
+        };
+
+        const thread = std.Thread.spawn(.{}, httpFetchWorker, .{req}) catch |err| {
+            return err;
+        };
+        try self.pending_http_fetches.append(self.allocator, .{
+            .future_handle = fh,
+            .thread = thread,
+            .shared = shared,
+        });
+        return fh;
+    }
+
     /// `ComponentInstance.async_event_driver` hook (#551). Advances the
     /// host monotonic clock (honoring `monotonic_clock_override` so unit
     /// tests stay deterministic) and drains any due timer-futures into
     /// the WaitableSet they were joined to via `waitable.join`. Also
     /// drives any pending `udp-socket.receive` futures via
     /// `completeReadyPendingUdpReceives` so a datagram landing in the
-    /// kernel queue resolves the guest's awaited `.receive()` (#576).
-    /// When the caller is blocking on `waitable-set.wait` and
-    /// `wait_for_ns_hint` is non-null, this routine sleeps the host
-    /// thread until the earliest pending deadline or the hint,
-    /// whichever comes first.
+    /// kernel queue resolves the guest's awaited `.receive()` (#576),
+    /// and any pending outbound HTTP fetches via
+    /// `drainPendingHttpFetches` so an awaited
+    /// `future-incoming-response` settles once the worker thread
+    /// publishes its outcome (#583 A2). When the caller is blocking on
+    /// `waitable-set.wait` and `wait_for_ns_hint` is non-null, this
+    /// routine sleeps the host thread until the earliest pending
+    /// deadline or the hint, whichever comes first.
     ///
     /// The sleep is bounded by the hint so tests with mocked clocks
     /// (override set) don't actually block on host time. Returns whether
@@ -5537,16 +5951,31 @@ pub const WasiCliAdapter = struct {
         if (self.completeReadyPendingUdpReceives(ci, allocator)) fired = true;
 
         // Caller asked us not to block (poll variant); return immediately.
-        const hint_ns = wait_for_ns_hint orelse return fired;
-        if (fired) return fired;
+        const hint_ns = wait_for_ns_hint orelse {
+            // Drain pending HTTP fetches whose worker has finished —
+            // the poll-variant caller wants any already-settled
+            // futures observed before it returns. (#583 A2)
+            self.drainPendingHttpFetches();
+            return fired;
+        };
+        if (fired) {
+            self.drainPendingHttpFetches();
+            return fired;
+        }
 
         // Determine the soonest pending deadline so we can sleep just
         // long enough to fire it. If `monotonic_clock_override` is set
         // (tests), don't sleep — the test mutates the override manually
         // and re-enters `driveAsyncEvents` to deliver.
-        if (self.monotonic_clock_override != null) return false;
+        if (self.monotonic_clock_override != null) {
+            self.drainPendingHttpFetches();
+            return false;
+        }
         const have_udp_pending = self.pending_udp_receives.items.len > 0;
-        if (self.timer_futures.items.len == 0 and !have_udp_pending) return false;
+        const have_http_pending = self.pending_http_fetches.items.len > 0;
+        if (self.timer_futures.items.len == 0 and !have_udp_pending and !have_http_pending) {
+            return false;
+        }
 
         const now = self.monotonicNs();
         var soonest: u64 = std.math.maxInt(u64);
@@ -5559,13 +5988,18 @@ pub const WasiCliAdapter = struct {
         // readiness from `sleep`, so we re-enter to call
         // `fdPollReady` again.
         const udp_repoll_ns: u64 = 1 * std.time.ns_per_ms;
+        // Pending HTTP fetches use the same re-poll cadence: the
+        // worker thread will publish via the shared atomic flag, so
+        // we wake briefly to observe it. (#583 A2)
+        const http_repoll_ns: u64 = 1 * std.time.ns_per_ms;
         var cap_ns: u64 = hint_ns;
         if (soonest != std.math.maxInt(u64)) {
             const delta_ns: u64 = if (soonest > now) soonest - now else 0;
             cap_ns = @min(cap_ns, delta_ns);
         }
         if (have_udp_pending) cap_ns = @min(cap_ns, udp_repoll_ns);
-        if (cap_ns == 0 and soonest == std.math.maxInt(u64) and !have_udp_pending) return false;
+        if (have_http_pending) cap_ns = @min(cap_ns, http_repoll_ns);
+        if (cap_ns == 0 and soonest == std.math.maxInt(u64) and !have_udp_pending and !have_http_pending) return false;
 
         if (cap_ns > 0) {
             const io = std.Io.Threaded.global_single_threaded.io();
@@ -5577,6 +6011,9 @@ pub const WasiCliAdapter = struct {
         }
         var post = self.completeDueTimerFutures(ci, allocator);
         if (self.completeReadyPendingUdpReceives(ci, allocator)) post = true;
+        // Drain HTTP last so worker outcomes published during the
+        // sleep window are observed on this same tick. (#583 A2)
+        self.drainPendingHttpFetches();
         return post;
     }
 
@@ -15493,6 +15930,30 @@ pub const WasiCliAdapter = struct {
             else => return error.InvalidArgs,
         };
         if (handle >= self.http_future_responses.items.len) return;
+        // (#583 A2) Drop is the guest's signal that they're no longer
+        // awaiting this future. If a worker thread is still mid-
+        // fetch we cannot null the slot here: `pushFutureResponse`
+        // would happily reuse the slot for an unrelated future, and
+        // `drainPendingHttpFetches` would then settle that wrong
+        // resource on the worker's completion. Instead: mark the
+        // entry cancelled, leave the slot reserved (state stays
+        // pending), and let the drainer null + free the slot once
+        // it has joined the worker. The cancel path inside
+        // `settlePendingHttpFetch` discards the outcome and then
+        // we clean up here in a follow-up sweep.
+        var has_pending = false;
+        for (self.pending_http_fetches.items) |*entry| {
+            if (entry.future_handle == handle) {
+                entry.shared.cancelled.store(true, .release);
+                entry.guest_dropped = true;
+                has_pending = true;
+            }
+        }
+        if (has_pending) {
+            // Drainer will settle .ready_err on next tick; the slot
+            // is freed at that point — see `dropSettledFutureSlot`.
+            return;
+        }
         if (self.http_future_responses.items[handle]) |f| {
             self.allocator.destroy(f);
             self.http_future_responses.items[handle] = null;
@@ -15676,11 +16137,25 @@ pub const WasiCliAdapter = struct {
     /// non-empty. TLS is delegated to `std.crypto.tls` (#521 — the
     /// earlier `HTTP_protocol_error` short-circuit added by #477 /
     /// #501 has been removed now that Zig 0.16 ships a working TLS
-    /// client). The empty allow-list path still returns
-    /// `HTTP_request_denied`; transport / TLS / DNS / parse failures
-    /// are mapped onto their specific `error-code` variant by
-    /// `mapHttpFetchError` (#583 A3), with `internal_error` reserved
-    /// for genuinely unclassified errors.
+    /// client).
+    ///
+    /// (#583 A2) The host mints a `.pending` `FutureIncomingResponse`
+    /// and dispatches the blocking fetch onto a worker thread; the
+    /// adapter's `drainPendingHttpFetches` driver (invoked from
+    /// `driveAsyncEvents` and `anyPollableReady`) settles the future
+    /// once the worker publishes its outcome. The guest's
+    /// `pollable.block` over `future-incoming-response.subscribe` is
+    /// no longer a no-op. The empty allow-list / malformed-request /
+    /// invalid-URL paths still settle the future to `.ready_err`
+    /// synchronously — only the actual network round-trip is deferred.
+    ///
+    /// (#583 A3) Transport / TLS / DNS / parse failures returned by
+    /// the worker thread are routed through `mapHttpFetchError` so
+    /// each classified `std.http.Client.FetchError` member lands on
+    /// its specific `wasi:http/types.error-code` variant
+    /// (`connection_refused`, `TLS_protocol_error`, `DNS_error`, …),
+    /// with `internal_error` reserved for genuinely unclassified
+    /// errors. See `mapHttpFetchError` for the full table.
     fn httpOutgoingHandlerHandle(
         ctx_opaque: ?*anyopaque,
         _: *ComponentInstance,
@@ -15699,7 +16174,7 @@ pub const WasiCliAdapter = struct {
 
         const req = self.lookupOutgoingRequest(req_handle);
 
-        // Deny when allow-list is empty
+        // Deny when allow-list is empty — synchronous ready-err.
         if (self.sockets_allow_list_template.len == 0) {
             return httpHandlerDeny(self, results, allocator, .HTTP_request_denied);
         }
@@ -15711,7 +16186,7 @@ pub const WasiCliAdapter = struct {
         // Build scheme string. `std.http.Client.fetch` handles `http`
         // and `https` natively (TLS via `std.crypto.tls`, #521). Any
         // other scheme value falls through to `Uri.parse`, which will
-        // reject it and surface as `internal_error` below.
+        // reject it in the worker and surface as `internal_error`.
         const scheme: []const u8 = if (r.scheme_disc) |d| switch (d) {
             0 => "http",
             1 => "https",
@@ -15756,7 +16231,8 @@ pub const WasiCliAdapter = struct {
             }
         }
 
-        // Get body payload bytes (if any)
+        // Get body payload bytes (if any). Borrowed slice — the
+        // worker spawns with its own duped copy below.
         var payload: ?[]const u8 = null;
         if (r.body_handle) |bh| {
             if (self.lookupOutgoingBody(bh)) |body| {
@@ -15767,77 +16243,15 @@ pub const WasiCliAdapter = struct {
             }
         }
 
-        // Perform the HTTP request
-        const io = std.Io.Threaded.global_single_threaded.io();
-        var client: std.http.Client = .{
-            .allocator = self.allocator,
-            .io = io,
-        };
-        // `client.deinit()` releases the connection pool AND the
-        // lazily-populated TLS CA bundle (#521). The earlier
-        // `connection_pool.deinit(io)`-only path leaked the bundle
-        // on every `https://` request.
-        defer client.deinit();
-
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        const fetch_result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = method,
-            .payload = payload,
-            .extra_headers = extra_hdrs.items,
-            .response_writer = &aw.writer,
-            .keep_alive = false,
-        }) catch |err| {
-            return httpHandlerDeny(self, results, allocator, mapHttpFetchError(err));
-        };
-
-        // Extract response body
-        var resp_al = aw.toArrayList();
-        const resp_body = resp_al.toOwnedSlice(self.allocator) catch {
-            return httpHandlerDeny(self, results, allocator, .internal_error);
-        };
-        errdefer self.allocator.free(resp_body);
-
-        // Create response headers (empty — std.http.Client.fetch
-        // does not expose response headers in FetchResult)
-        const resp_fields = self.allocator.create(HttpFields) catch {
-            self.allocator.free(resp_body);
-            return httpHandlerDeny(self, results, allocator, .internal_error);
-        };
-        resp_fields.* = .{};
-        const resp_fields_handle = self.pushHttpFields(resp_fields) catch {
-            self.allocator.free(resp_body);
-            resp_fields.deinit(self.allocator);
-            self.allocator.destroy(resp_fields);
-            return httpHandlerDeny(self, results, allocator, .internal_error);
-        };
-
-        // Create IncomingResponse
-        const ir = self.allocator.create(IncomingResponse) catch {
-            self.allocator.free(resp_body);
-            return httpHandlerDeny(self, results, allocator, .internal_error);
-        };
-        ir.* = .{
-            .status = @intFromEnum(fetch_result.status),
-            .headers_handle = resp_fields_handle,
-            .body_data = resp_body,
-        };
-        const ir_handle = self.pushIncomingResponse(ir) catch {
-            self.allocator.free(resp_body);
-            ir.body_data = null;
-            self.allocator.destroy(ir);
-            return httpHandlerDeny(self, results, allocator, .internal_error);
-        };
-
-        // Create FutureIncomingResponse in ready_ok state
-        const fut = self.allocator.create(FutureIncomingResponse) catch {
-            return httpHandlerDeny(self, results, allocator, .internal_error);
-        };
-        fut.* = .{ .state = .{ .ready_ok = ir_handle } };
-        const fh = self.pushFutureResponse(fut) catch {
-            self.allocator.destroy(fut);
+        // Spawn worker that drives the fetch off-thread. Returns the
+        // freshly minted `.pending` future handle the guest will
+        // poll on via `future-incoming-response.subscribe`. Worker
+        // failures (alloc, thread spawn) collapse to a synchronous
+        // ready-err future so the caller always observes a usable
+        // handle. The blocking `std.http.Client.fetch` itself runs
+        // on the worker thread and routes its classified errors
+        // through `mapHttpFetchError` (#583 A3) before publishing.
+        const fh = self.spawnHttpFetchPending(url, method, extra_hdrs.items, payload) catch {
             return httpHandlerDeny(self, results, allocator, .internal_error);
         };
         results[0] = try httpResultOk(allocator, .{ .handle = fh });
@@ -27453,6 +27867,11 @@ test "wasi:http #521: https outgoing-handler proceeds past the TLS gate" {
     // remains: `HTTP_protocol_error` must never again be produced by a
     // well-formed `https://` request.
     //
+    // (#583 A2) The outbound fetch now runs on a worker thread and
+    // the future is `.pending` on return; we drive it via
+    // `drainPendingHttpFetches` until the worker publishes its
+    // outcome through `mapHttpFetchError`.
+    //
     // Skipped on Windows: `std.http.Client.fetch` over WinSock surfaces
     // `WSAECONNREFUSED` as `error.Unexpected` (or occasionally
     // `ConnectionResetByPeer`) rather than the POSIX
@@ -27497,6 +27916,20 @@ test "wasi:http #521: https outgoing-handler proceeds past the TLS gate" {
     try testing.expect(results[0].result_val.is_ok);
     const fut_handle = results[0].result_val.payload.?.handle;
     const fut = adapter.http_future_responses.items[fut_handle].?;
+
+    // Drive the worker thread to completion. The fetch fails fast
+    // because the destination has no listener.
+    var drive_attempts: usize = 0;
+    while (drive_attempts < 50_000 and fut.state == .pending) : (drive_attempts += 1) {
+        adapter.drainPendingHttpFetches();
+        if (fut.state != .pending) break;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(io) catch {};
+    }
     try testing.expect(fut.state == .ready_err);
     // The gate is gone — `HTTP_protocol_error` must never be the
     // result of a scheme check on `https://`.
@@ -27507,6 +27940,375 @@ test "wasi:http #521: https outgoing-handler proceeds past the TLS gate" {
         @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
         fut.state.ready_err,
     );
+}
+
+/// Block-poll an `outgoing-handler` future until its worker thread
+/// publishes a settled state (`.ready_ok` / `.ready_err`) or the
+/// iteration budget is exhausted. Mirrors how `pollable.block` /
+/// `poll.poll` would drive the future in real component execution.
+/// (#583 A2)
+fn p3DrainPendingHttpUntilSettled(
+    adapter: *WasiCliAdapter,
+    fut: *FutureIncomingResponse,
+    iters: usize,
+) void {
+    var i: usize = 0;
+    while (i < iters and fut.state == .pending) : (i += 1) {
+        adapter.drainPendingHttpFetches();
+        if (fut.state != .pending) return;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(io) catch {};
+    }
+}
+
+/// Spin up a one-shot HTTP/1.1 server bound to 127.0.0.1 on an
+/// arbitrary port, serve a single `GET /` request with the provided
+/// body, then close. The server runs on a dedicated thread so the
+/// test thread can issue a fetch concurrently. Used by the #583 A2
+/// happy-path round-trip test below.
+const TestHttpServer = struct {
+    thread: std.Thread,
+    port: u16,
+
+    fn serveLoopback(allocator: Allocator, body: []const u8) !TestHttpServer {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var any: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+        const server = try std.Io.net.IpAddress.listen(&any, io, .{
+            .kernel_backlog = 1,
+        });
+        const bound = switch (server.socket.address) {
+            .ip4 => |v4| v4.port,
+            else => {
+                var srv_mut = server;
+                srv_mut.deinit(io);
+                return error.SkipZigTest;
+            },
+        };
+        const body_copy = try allocator.dupe(u8, body);
+        const ctx = try allocator.create(TestHttpServerCtx);
+        ctx.* = .{
+            .allocator = allocator,
+            .server = server,
+            .body = body_copy,
+        };
+        const t = try std.Thread.spawn(.{}, TestHttpServerCtx.run, .{ctx});
+        return .{ .thread = t, .port = bound };
+    }
+};
+
+const TestHttpServerCtx = struct {
+    allocator: Allocator,
+    server: std.Io.net.Server,
+    body: []u8,
+
+    fn run(self: *TestHttpServerCtx) void {
+        defer {
+            self.allocator.free(self.body);
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var srv = self.server;
+            srv.deinit(io);
+            self.allocator.destroy(self);
+        }
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const stream = self.server.accept(io) catch return;
+        defer stream.close(io);
+
+        // Drain request bytes until end-of-headers. The client is
+        // `std.http.Client.fetch` with no body, so we don't parse
+        // `Content-Length`.
+        var req_buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < req_buf.len) {
+            var dests = [_][]u8{req_buf[total..]};
+            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            if (n == 0) break;
+            total += n;
+            if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
+        }
+
+        var resp_buf: [256]u8 = undefined;
+        const resp_head = std.fmt.bufPrint(&resp_buf,
+            "HTTP/1.1 200 OK\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: close\r\n" ++
+                "\r\n", .{self.body.len}) catch return;
+        const head_slices = [_][]const u8{resp_head};
+        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        const body_slices = [_][]const u8{self.body};
+        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+    }
+};
+
+test "wasi:http #583 A2: outgoing-handler defers fetch and resolves via worker thread" {
+    // Happy-path round-trip exercising the #583 A2 deferred-completion
+    // path end to end:
+    //   * mint an outgoing-request bound to a loopback test server,
+    //   * call `outgoing-handler.handle` — observe a `.pending` future,
+    //   * drive `drainPendingHttpFetches` until the worker publishes,
+    //   * assert the future settles `.ready_ok(incoming-response)` with
+    //     the expected 200 status and body bytes.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var server = TestHttpServer.serveLoopback(testing.allocator, "hello-583-A2") catch
+        return error.SkipZigTest;
+
+    // 127.0.0.0/8 allow-list — required to leave the empty-list deny path.
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0, // GET
+        .scheme_disc = 0, // http
+        .authority = try std.fmt.allocPrint(testing.allocator, "127.0.0.1:{d}", .{server.port}),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .result_val);
+    try testing.expect(results[0].result_val.is_ok);
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    // First observation: future is `.pending` and a worker entry is
+    // registered. The empty-allow-list / invalid-URL deny paths
+    // would have settled synchronously, so seeing `.pending` here
+    // is exactly what the spec calls for.
+    try testing.expect(fut.state == .pending);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_http_fetches.items.len);
+
+    p3DrainPendingHttpUntilSettled(&adapter, fut, 10_000);
+    // Make sure the server thread has fully exited before we tear
+    // down the test allocator (the body copy lives on the server
+    // context).
+    server.thread.join();
+
+    try testing.expect(fut.state == .ready_ok);
+    const ir = adapter.http_incoming_responses.items[fut.state.ready_ok].?;
+    try testing.expectEqual(@as(u16, 200), ir.status);
+    try testing.expect(ir.body_data != null);
+    try testing.expectEqualStrings("hello-583-A2", ir.body_data.?);
+    // Pending list drained — entry was consumed by the settle.
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches.items.len);
+}
+
+test "wasi:http #583 A2: outgoing-handler settles connect-refused as connection_refused" {
+    // Negative-path coverage: a fetch against a closed loopback port
+    // must surface through the deferred-completion worker and resolve
+    // the future to `.ready_err(.connection_refused)` — the historic
+    // synchronous handler always returned `internal_error`. The
+    // #583 A3 `mapHttpFetchError` table now drives both the worker
+    // and the synchronous P3 path to the same classified result. The
+    // test also pins the *absence* of `HTTP_protocol_error` (the
+    // #477 / #501 scheme gate was retired in #521 — this is the
+    // regression keeper for the 0.2 outbound path).
+    //
+    // Skipped on Windows for the same reason as the sibling #521
+    // tests: WinSock's `WSAECONNREFUSED` does not round-trip through
+    // `std.http.Client.FetchError` as POSIX `error.ConnectionRefused`,
+    // so the asserted variant is platform-dependent. The pure-helper
+    // `mapHttpFetchError` tests (#583 A3) cover the deterministic
+    // WIT mapping on every target.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    // 127.0.0.1:1 is the canonical "no listener" target on UNIX.
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0,
+        .scheme_disc = 0, // http
+        .authority = try testing.allocator.dupe(u8, "127.0.0.1:1"),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    try testing.expect(fut.state == .pending);
+    p3DrainPendingHttpUntilSettled(&adapter, fut, 10_000);
+    try testing.expect(fut.state == .ready_err);
+    try testing.expect(fut.state.ready_err != @as(u32, @intFromEnum(HttpErrorCode.HTTP_protocol_error)));
+    // POSIX `error.ConnectionRefused` → `connection_refused` via the
+    // #583 A3 mapping; deterministic on Linux / macOS.
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        fut.state.ready_err,
+    );
+}
+
+test "wasi:http #583 A2: adapter teardown joins in-flight workers cleanly (no UAF)" {
+    // Cancellation / cleanup correctness: even if the host adapter
+    // is torn down while a worker thread is still running its
+    // `std.http.Client.fetch`, the shared heap struct must remain
+    // valid until the worker is joined — otherwise the worker
+    // UAFs on the publish-to-`shared.outcome` step. This test
+    // exercises the path by issuing a fetch and immediately
+    // dropping the adapter without draining; `deinit` is the cancel
+    // edge that joins outstanding threads.
+    //
+    // It also covers the cancel sentinel path: `deinit` marks
+    // `shared.cancelled = true` before joining, so even if the
+    // worker raced ahead with a success, the post-join free path
+    // discards the response body cleanly.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    var ci: ComponentInstance = undefined;
+
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    // Target an unbound loopback port so the worker returns quickly
+    // with ECONNREFUSED — the join in `deinit` then completes
+    // promptly. (We can't unblock a mid-fetch
+    // `std.http.Client.fetch` on Zig 0.16, so the cancel test
+    // relies on a fast-failing destination; the UAF-safety check
+    // is the invariant.)
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0,
+        .scheme_disc = 0, // http
+        .authority = try testing.allocator.dupe(u8, "127.0.0.1:1"),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    try testing.expect(fut.state == .pending);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_http_fetches.items.len);
+
+    // Tear down without ever draining. `deinit` must:
+    //   * set `cancelled` on every pending entry,
+    //   * join the worker thread (this is the UAF-safety check),
+    //   * free the success.body if the worker won the race, then
+    //   * free the shared heap struct.
+    adapter.deinit();
+}
+
+test "wasi:http #583 A2: future-response.drop while worker in flight defers slot reuse" {
+    // Slot-reuse race regression: if the guest drops the
+    // future-incoming-response *while* the worker thread is still
+    // mid-fetch, the slot must stay reserved (with the parked
+    // FutureIncomingResponse intact) until the drainer can join the
+    // worker — otherwise `pushFutureResponse` could reuse the slot
+    // for a different future and the worker's completion would
+    // settle the wrong resource. (#583 A2)
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    const req = try testing.allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0,
+        .scheme_disc = 0,
+        .authority = try testing.allocator.dupe(u8, "127.0.0.1:1"),
+        .path_with_query = try testing.allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    const fut_handle = results[0].result_val.payload.?.handle;
+    try testing.expectEqual(@as(usize, 1), adapter.pending_http_fetches.items.len);
+
+    // Guest drops the future BEFORE the drainer has a chance to
+    // settle. Slot must remain non-null (the parked
+    // FutureIncomingResponse stays in place) so slot reuse can't
+    // race; `guest_dropped` is flagged on the pending entry.
+    const drop_args = [_]InterfaceValue{.{ .handle = fut_handle }};
+    var drop_results: [0]InterfaceValue = .{};
+    try WasiCliAdapter.httpFutureDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
+
+    try testing.expect(adapter.http_future_responses.items[fut_handle] != null);
+    try testing.expect(adapter.pending_http_fetches.items[0].guest_dropped);
+    try testing.expect(adapter.pending_http_fetches.items[0].shared.cancelled.load(.acquire));
+
+    // Drive the drainer. Once the worker publishes (the fast
+    // ECONNREFUSED path), `drainPendingHttpFetches` must both
+    // discard the outcome AND null the slot — at which point
+    // `pushFutureResponse` is free to reuse it.
+    var attempts: usize = 0;
+    while (attempts < 10_000 and adapter.http_future_responses.items[fut_handle] != null) : (attempts += 1) {
+        adapter.drainPendingHttpFetches();
+        if (adapter.http_future_responses.items[fut_handle] == null) break;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(io) catch {};
+    }
+    try testing.expect(adapter.http_future_responses.items[fut_handle] == null);
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches.items.len);
 }
 
 test "wasi:http #521: opt-in real HTTPS outgoing-handler against example.com" {
@@ -27551,6 +28353,9 @@ test "wasi:http #521: opt-in real HTTPS outgoing-handler against example.com" {
     try testing.expect(results[0].result_val.is_ok);
     const fut_handle = results[0].result_val.payload.?.handle;
     const fut = adapter.http_future_responses.items[fut_handle].?;
+    // (#583 A2) Drive the deferred-completion worker — real network
+    // round-trips routinely take 100s of ms.
+    p3DrainPendingHttpUntilSettled(&adapter, fut, 30_000);
     try testing.expect(fut.state == .ready_ok);
     const ir = adapter.http_incoming_responses.items[fut.state.ready_ok].?;
     // example.com canonically returns 200 (or 30x to https itself).
@@ -30399,6 +31204,11 @@ test "wasi:http #583 A3: connect-refused end-to-end (P2 outgoing-handler, http)"
     // `error.ConnectionRefused`; with the #583 A3 refinement the
     // future surfaces `connection_refused` instead of `internal_error`.
     //
+    // (#583 A2) The P2 outbound handler now runs the blocking fetch
+    // on a worker thread and returns a `.pending` future; this test
+    // drives `drainPendingHttpFetches` until the worker publishes
+    // its outcome through `mapHttpFetchError`.
+    //
     // Skipped on Windows: WinSock's `WSAECONNREFUSED` does not surface
     // as `error.ConnectionRefused` through `std.http.Client.fetch`
     // (it appears as `error.Unexpected` / `ConnectionResetByPeer` /
@@ -30441,6 +31251,10 @@ test "wasi:http #583 A3: connect-refused end-to-end (P2 outgoing-handler, http)"
     try testing.expect(results[0] == .result_val);
     try testing.expect(results[0].result_val.is_ok);
     const fut = adapter.http_future_responses.items[results[0].result_val.payload.?.handle].?;
+    // (#583 A2) Drive the deferred worker. `error.ConnectionRefused`
+    // happens fast on a closed loopback port; the worker publishes
+    // and the drainer settles `.ready_err(.connection_refused)`.
+    p3DrainPendingHttpUntilSettled(&adapter, fut, 10_000);
     try testing.expect(fut.state == .ready_err);
     try testing.expectEqual(
         @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
