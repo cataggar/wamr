@@ -3762,6 +3762,20 @@ pub const KeyvalueErrorTag = enum(u32) {
 /// boundaries.
 const KEYVALUE_LIST_KEYS_PAGE_SIZE: usize = 128;
 
+/// `(string, string)` pair forwarded to
+/// `wasi:config/store@0.2.0-rc.1.{get, get-all}` (#583 B6). Same lifetime
+/// rules as `EnvVar` — the adapter borrows both slices and the caller
+/// owns the storage for as long as the adapter is in use.
+///
+/// Keys are matched verbatim (case-sensitive) in `configStoreGet`; key
+/// normalisation (e.g. stripping the `WAMR_CONFIG_` env-var prefix and
+/// lower-casing) is the embedder's responsibility — `main.zig`'s
+/// `runComponent` does this before calling `setConfigStore`.
+pub const ConfigEntry = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
 pub const WasiCliAdapter = struct {
     allocator: Allocator,
     stdout: streams.OutputStream,
@@ -3782,6 +3796,13 @@ pub const WasiCliAdapter = struct {
     /// envvars passed to the component via `wasi:cli/environment.get-environment`.
     /// Borrowed — caller keeps slices alive for the run. Default empty.
     env: []const EnvVar = &.{},
+
+    /// `wasi:config/store@0.2.0-rc.1` backing data (#583 B6). Borrowed
+    /// slices: caller (typically `main.zig`'s `runComponent`) owns the
+    /// underlying storage and must keep entries alive for the entire run.
+    /// Set via `setConfigStore`; empty when neither `--config-store=`
+    /// nor `WAMR_CONFIG_*` env vars are present.
+    config_store: []const ConfigEntry = &.{},
 
     /// `HostInstance` registered for the simple test interface name
     /// (e.g. `"wasi:hello/world"`). Stored inline so the adapter owns its
@@ -3827,6 +3848,12 @@ pub const WasiCliAdapter = struct {
     keyvalue_store_iface: HostInstance = .{},
     keyvalue_atomics_iface: HostInstance = .{},
     keyvalue_batch_iface: HostInstance = .{},
+
+    /// `wasi:config/store@0.2.0-rc.1` host instance (#583 B6). Members
+    /// (`get`, `get-all`) registered by `populateWasiConfigStore`. Backed
+    /// by the borrowed `config_store` slice; an empty slice yields
+    /// `Ok(None)` for `get` and `Ok([])` for `get-all`.
+    config_store_iface: HostInstance = .{},
 
     // ── WASIp3 stub host instances (#481 wave A) ─────────────────────
     // These fields exist so wave B/C PRs (#482-#487) only need to add
@@ -4188,6 +4215,9 @@ pub const WasiCliAdapter = struct {
         self.keyvalue_atomics_iface.deinit(self.allocator);
         self.keyvalue_batch_iface.deinit(self.allocator);
 
+        // wasi:config/store@0.2.0-rc.1 (#583 B6).
+        self.config_store_iface.deinit(self.allocator);
+
         // P3 stub interfaces (#481).
         self.cli_stdout_p3_iface.deinit(self.allocator);
         self.cli_stderr_p3_iface.deinit(self.allocator);
@@ -4468,6 +4498,16 @@ pub const WasiCliAdapter = struct {
     /// are borrowed — caller must keep them alive for the run.
     pub fn setEnvironment(self: *WasiCliAdapter, env: []const EnvVar) void {
         self.env = env;
+    }
+
+    /// Forward configuration to `wasi:config/store@0.2.0-rc.1.{get, get-all}`
+    /// (#583 B6). Lookup is verbatim (case-sensitive) on the `name`
+    /// field. The slices are borrowed — caller must keep them alive for
+    /// the run. Passing `&.{}` (or never calling this) leaves the store
+    /// empty: `get` always returns `Ok(None)` and `get-all` returns
+    /// `Ok([])`.
+    pub fn setConfigStore(self: *WasiCliAdapter, entries: []const ConfigEntry) void {
+        self.config_store = entries;
     }
 
     /// Configure the sockets CIDR allow-list (#180, #583 A1). Each entry
@@ -21308,6 +21348,158 @@ pub const WasiCliAdapter = struct {
         }
         results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
     }
+
+    // ── wasi:config/store@0.2.0-rc.1 — adapter (#583 B6) ────────────────
+    //
+    // Layered configuration source for guest components. The interface
+    // is two methods: `get(key) -> result<option<string>, error>` and
+    // `get-all() -> result<list<tuple<string, string>>, error>`.
+    //
+    // The backing slice (`self.config_store`) is populated by the
+    // embedder (e.g. `main.zig`'s `runComponent`) via `setConfigStore`.
+    // wamr's CLI assembles it from two layers, in order:
+    //
+    //   1. Environment variables prefixed with `WAMR_CONFIG_` — the
+    //      prefix is stripped and the remainder lower-cased
+    //      (e.g. `WAMR_CONFIG_API_KEY=…` → `api_key=…`).
+    //   2. A JSON file passed via `--config-store=<path>` containing a
+    //      flat `{ "key": "value", … }` object.
+    //
+    // Precedence: **file overrides env** (the more deliberate
+    // per-invocation override wins over a global default). The merge is
+    // done in `main.zig` before calling `setConfigStore`; this adapter
+    // only sees the final flat list.
+    //
+    // The host returns the `Ok` arm exclusively — every key is treated
+    // as a successful lookup whose value is `Some/None`. The `error`
+    // variant arms (`upstream(string)`, `io(string)`) are reserved for
+    // future backends (Vault / Kubernetes / etc.) and are never
+    // surfaced by the in-memory store. Documented in `docs/wasi.md`.
+    //
+    // WIT version pinned: `wasi:config@0.2.0-rc.1` (the only currently
+    // published version — see `https://github.com/WebAssembly/wasi-config`).
+    // The version-multiplex in `populateWasiProviders` routes any
+    // `wasi:config/store@…` import (regardless of `@x.y.z` suffix) onto
+    // this same host instance, so future 0.3.x / 0.4.x revisions that
+    // keep the same method shape will continue to work without code
+    // changes here. If a future revision breaks `result<option<string>,
+    // error>` / `result<list<tuple<...>>, error>` we'll split the
+    // populator like `populateWasiCliEnvironmentP3`.
+
+    /// Register `wasi:config/store@0.2.0-rc.1.{get, get-all}` (#583 B6).
+    pub fn populateWasiConfigStore(
+        self: *WasiCliAdapter,
+        providers: *std.StringHashMapUnmanaged(ImportBinding),
+        interface_name: []const u8,
+    ) !void {
+        try self.config_store_iface.members.put(self.allocator, "get", .{
+            .func = .{ .context = self, .call = &configStoreGet },
+        });
+        try self.config_store_iface.members.put(self.allocator, "get-all", .{
+            .func = .{ .context = self, .call = &configStoreGetAll },
+        });
+        try providers.put(self.allocator, interface_name, .{
+            .host_instance = &self.config_store_iface,
+        });
+    }
+
+    /// Pure data-layer lookup for `wasi:config/store.get` — walks
+    /// `self.config_store` in registration order and returns the value
+    /// for the first entry whose `name` matches `key` verbatim
+    /// (case-sensitive). Returns `null` for missing keys. Exposed so
+    /// unit tests can exercise the layered-precedence merge without
+    /// constructing a `ComponentInstance`.
+    pub fn lookupConfig(self: *const WasiCliAdapter, key: []const u8) ?[]const u8 {
+        for (self.config_store) |entry| {
+            if (std.mem.eql(u8, entry.name, key)) return entry.value;
+        }
+        return null;
+    }
+
+    /// `wasi:config/store.get: (key: string) -> result<option<string>, error>`.
+    /// The in-memory store never errors — every lookup is `Ok(Some)` or
+    /// `Ok(None)`. Caller-trampoline owns the returned value and
+    /// deinits via the same allocator.
+    fn configStoreGet(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const key_pl = switch (args[0]) {
+            .string => |pl| pl,
+            else => return error.InvalidArgs,
+        };
+        const key_bytes = ci.readGuestBytes(key_pl.ptr, key_pl.len) orelse
+            return error.OutOfBoundsMemory;
+
+        if (self.lookupConfig(key_bytes)) |value| {
+            const value_ptr = ci.hostAllocAndWrite(value) orelse
+                return error.OutOfMemory;
+            const str_iv = try allocator.create(InterfaceValue);
+            errdefer allocator.destroy(str_iv);
+            str_iv.* = .{ .string = .{ .ptr = value_ptr, .len = @intCast(value.len) } };
+            const some_iv = try allocator.create(InterfaceValue);
+            errdefer allocator.destroy(some_iv);
+            some_iv.* = .{ .option_val = .{ .is_some = true, .payload = str_iv } };
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = some_iv } };
+            return;
+        }
+
+        const none_iv = try allocator.create(InterfaceValue);
+        errdefer allocator.destroy(none_iv);
+        none_iv.* = .{ .option_val = .{ .is_some = false, .payload = null } };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = none_iv } };
+    }
+
+    /// `wasi:config/store.get-all: () -> result<list<tuple<string, string>>, error>`.
+    /// Returns the merged store in registration order (env entries
+    /// followed by file overrides, with file winning per the precedence
+    /// rule documented above). The in-memory store never errors.
+    fn configStoreGetAll(
+        ctx_opaque: ?*anyopaque,
+        ci: *ComponentInstance,
+        _: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (results.len == 0) return error.InvalidArgs;
+
+        const n = self.config_store.len;
+        const list_iv = try allocator.create(InterfaceValue);
+        errdefer allocator.destroy(list_iv);
+
+        if (n == 0) {
+            list_iv.* = .{ .list = .{ .ptr = 0, .len = 0 } };
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = list_iv } };
+            return;
+        }
+
+        // Each tuple<string, string>: name.ptr@0:u32, name.len@4:u32,
+        // value.ptr@8:u32, value.len@12:u32. Stride = 16, align = 4.
+        // Same layout as `getEnvironment`'s tuple list.
+        const stride: usize = 16;
+        const scratch = try allocator.alloc(u8, n * stride);
+        defer allocator.free(scratch);
+
+        for (self.config_store, 0..) |e, i| {
+            const name_ptr = ci.hostAllocAndWrite(e.name) orelse return error.OutOfMemory;
+            const value_ptr = ci.hostAllocAndWrite(e.value) orelse return error.OutOfMemory;
+            const off = i * stride;
+            std.mem.writeInt(u32, scratch[off..][0..4], name_ptr, .little);
+            std.mem.writeInt(u32, scratch[off + 4 ..][0..4], @intCast(e.name.len), .little);
+            std.mem.writeInt(u32, scratch[off + 8 ..][0..4], value_ptr, .little);
+            std.mem.writeInt(u32, scratch[off + 12 ..][0..4], @intCast(e.value.len), .little);
+        }
+
+        const list_ptr = ci.hostAllocAndWrite(scratch) orelse return error.OutOfMemory;
+        list_iv.* = .{ .list = .{ .ptr = list_ptr, .len = @intCast(n) } };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = list_iv } };
+    }
 };
 
 /// `wasi:clocks/wall-clock.datetime`: a record of `(seconds: u64, nanoseconds: u32)`.
@@ -21737,6 +21929,11 @@ pub fn populateWasiProviders(
     var matched_keyvalue_store: ?[]const u8 = null;
     var matched_keyvalue_atomics: ?[]const u8 = null;
     var matched_keyvalue_batch: ?[]const u8 = null;
+    // #583 B6: wasi:config/store@0.2.0-rc.1. Single interface, single
+    // host instance — the version-multiplex accepts any `@x.y.z` suffix
+    // since the only published WIT (0.2.0-rc.1) and any near-future
+    // revisions all share the same `get` / `get-all` method shape.
+    var matched_config_store: ?[]const u8 = null;
     for (component.imports) |imp| {
         if (imp.desc != .instance) continue;
         // wasi:cli/* — version-multiplex onto either the 0.2 (P2) or
@@ -21947,6 +22144,11 @@ pub fn populateWasiProviders(
             matched_keyvalue_batch = imp.name;
         if (matched_keyvalue_store == null and matchesWasiPrefix(imp.name, "wasi:keyvalue/store"))
             matched_keyvalue_store = imp.name;
+        // wasi:config/store@0.2.0-rc.1 (#583 B6). All versions route
+        // to the same single host instance — the interface shape is
+        // stable across 0.2.x and (if it ships) 0.3.x.
+        if (matched_config_store == null and matchesWasiPrefix(imp.name, "wasi:config/store"))
+            matched_config_store = imp.name;
     }
     // Always populate every interface's members so the adapter's
     // HostInstance maps are well-formed; only register providers for
@@ -22257,6 +22459,12 @@ pub fn populateWasiProviders(
     }
     if (matched_keyvalue_batch) |name| {
         try adapter.populateWasiKeyvalueBatch(providers, name);
+    }
+
+    // wasi:config/store@0.2.0-rc.1 (#583 B6). Conditionally bind only
+    // when the component imports it — same pattern as wasi:random@0.3.0.
+    if (matched_config_store) |name| {
+        try adapter.populateWasiConfigStore(providers, name);
     }
 }
 
@@ -29188,6 +29396,206 @@ test "populateWasiProviders: binds wasi:http/* (#149)" {
     try testing.expect(adapter.http_types_iface.members.contains("[resource-drop]future-incoming-response"));
     try testing.expect(adapter.http_outgoing_handler_iface.members.contains("handle"));
     try testing.expect(adapter.http_incoming_handler_iface.members.contains("handle"));
+}
+
+// ── wasi:config@0.2.0-rc.1 tests (#583 B6) ────────────────────────────
+
+test "populateWasiProviders: binds wasi:config/store@0.2.0-rc.1 only when imported (#583 B6)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:config/store@0.2.0-rc.1", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    const cfg_binding = providers.get("wasi:config/store@0.2.0-rc.1") orelse
+        return error.MissingConfigStore;
+    try testing.expect(cfg_binding.host_instance == &adapter.config_store_iface);
+    try testing.expect(adapter.config_store_iface.members.contains("get"));
+    try testing.expect(adapter.config_store_iface.members.contains("get-all"));
+    // Bare name (no @-suffix) must not show up when the component only
+    // imports the versioned form.
+    try testing.expect(!providers.contains("wasi:config/store"));
+
+    // A second adapter with no config import — `config_store_iface`
+    // stays empty (no `get` member registered) and no provider entry
+    // is created.
+    var adapter2 = WasiCliAdapter.init(testing.allocator);
+    defer adapter2.deinit();
+    var providers2: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers2.deinit(testing.allocator);
+    const empty_component = ctypes_root.Component{
+        .core_modules = &.{},  .core_instances = &.{}, .core_types = &.{},
+        .components = &.{},     .instances = &.{},      .aliases = &.{},
+        .types = &.{},          .canons = &.{},         .imports = &.{},
+        .exports = &.{},
+    };
+    try populateWasiProviders(&adapter2, &empty_component, &providers2);
+    try testing.expect(!providers2.contains("wasi:config/store@0.2.0-rc.1"));
+    try testing.expect(!providers2.contains("wasi:config/store"));
+    try testing.expectEqual(@as(usize, 0), adapter2.config_store_iface.members.count());
+}
+
+test "wasi:config/store.get: file-only store returns Some(value) for known key, None otherwise (#583 B6)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Simulates layer 1 (file) populated by `main.zig` from a
+    // `--config-store=foo.json` of `{ "foo": "bar", "answer": "42" }`.
+    const entries = [_]ConfigEntry{
+        .{ .name = "foo", .value = "bar" },
+        .{ .name = "answer", .value = "42" },
+    };
+    adapter.setConfigStore(&entries);
+
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try adapter.populateWasiConfigStore(&providers, "wasi:config/store@0.2.0-rc.1");
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    // get("foo") -> Ok(Some("bar"))
+    const foo_key_ptr = ci.hostAllocAndWrite("foo") orelse return error.OutOfMemory;
+    const get_args_foo = [_]InterfaceValue{
+        .{ .string = .{ .ptr = foo_key_ptr, .len = 3 } },
+    };
+    var get_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.configStoreGet(&adapter, &ci, &get_args_foo, &get_results, testing.allocator);
+    defer get_results[0].deinit(testing.allocator);
+
+    try testing.expect(get_results[0] == .result_val);
+    try testing.expect(get_results[0].result_val.is_ok);
+    const ok_payload = get_results[0].result_val.payload.?;
+    try testing.expect(ok_payload.* == .option_val);
+    try testing.expect(ok_payload.option_val.is_some);
+    try expectInterfaceBytes(&ci, ok_payload.option_val.payload.?.*, "bar");
+
+    // get("missing") -> Ok(None)
+    const miss_key_ptr = ci.hostAllocAndWrite("missing") orelse return error.OutOfMemory;
+    const get_args_miss = [_]InterfaceValue{
+        .{ .string = .{ .ptr = miss_key_ptr, .len = 7 } },
+    };
+    var miss_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.configStoreGet(&adapter, &ci, &get_args_miss, &miss_results, testing.allocator);
+    defer miss_results[0].deinit(testing.allocator);
+
+    try testing.expect(miss_results[0].result_val.is_ok);
+    const none_payload = miss_results[0].result_val.payload.?;
+    try testing.expect(none_payload.* == .option_val);
+    try testing.expect(!none_payload.option_val.is_some);
+
+    // Confirm pure data-layer lookup matches the lowered behaviour.
+    try testing.expectEqualStrings("bar", adapter.lookupConfig("foo").?);
+    try testing.expectEqualStrings("42", adapter.lookupConfig("answer").?);
+    try testing.expect(adapter.lookupConfig("missing") == null);
+}
+
+test "wasi:config/store: env-only store with WAMR_CONFIG_ normalisation (#583 B6)" {
+    // Mirrors the `main.zig`-side mapping `WAMR_CONFIG_FOO=baz` →
+    // ConfigEntry{ name = "foo", value = "baz" }. The adapter itself is
+    // case-sensitive on `name`; main.zig owns the lowercase rule. Keys
+    // are stored verbatim — both `api_key` (underscored from the env
+    // var) and the value survive unchanged.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const entries = [_]ConfigEntry{
+        .{ .name = "foo", .value = "baz" },
+        .{ .name = "api_key", .value = "s3cr3t" },
+    };
+    adapter.setConfigStore(&entries);
+
+    try testing.expectEqualStrings("baz", adapter.lookupConfig("foo").?);
+    try testing.expectEqualStrings("s3cr3t", adapter.lookupConfig("api_key").?);
+    // Adapter lookup is case-sensitive — uppercase form must miss so
+    // the embedder's lowercase-on-ingest contract stays observable.
+    try testing.expect(adapter.lookupConfig("FOO") == null);
+    try testing.expect(adapter.lookupConfig("API_KEY") == null);
+
+    // get-all must surface every registered entry, in registration
+    // order, on the result Ok arm.
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+    try adapter.populateWasiConfigStore(&providers, "wasi:config/store@0.2.0-rc.1");
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    var get_all_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.configStoreGetAll(&adapter, &ci, &.{}, &get_all_results, testing.allocator);
+    defer get_all_results[0].deinit(testing.allocator);
+
+    try testing.expect(get_all_results[0] == .result_val);
+    try testing.expect(get_all_results[0].result_val.is_ok);
+    const list_iv = get_all_results[0].result_val.payload.?;
+    try testing.expect(list_iv.* == .list);
+    try testing.expectEqual(@as(u32, 2), list_iv.list.len);
+
+    // Decode the (string, string) tuple list in test_mem. Stride = 16.
+    const buf = ci.test_mem.?.buffer;
+    const base = list_iv.list.ptr;
+    inline for (.{ .{ "foo", "baz", 0 }, .{ "api_key", "s3cr3t", 16 } }) |spec| {
+        const expect_name: []const u8 = spec[0];
+        const expect_value: []const u8 = spec[1];
+        const off: usize = base + spec[2];
+        const name_ptr = std.mem.readInt(u32, buf[off..][0..4], .little);
+        const name_len = std.mem.readInt(u32, buf[off + 4 ..][0..4], .little);
+        const value_ptr = std.mem.readInt(u32, buf[off + 8 ..][0..4], .little);
+        const value_len = std.mem.readInt(u32, buf[off + 12 ..][0..4], .little);
+        try testing.expectEqualStrings(expect_name, buf[name_ptr..][0..name_len]);
+        try testing.expectEqualStrings(expect_value, buf[value_ptr..][0..value_len]);
+    }
+}
+
+test "wasi:config/store: layered precedence — file overrides env (#583 B6)" {
+    // The CLI assembles `setConfigStore` input as:
+    //   1. env layer (WAMR_CONFIG_*),
+    //   2. file layer (--config-store=*.json) appended AFTER env.
+    // `configStoreGet`'s walk returns the FIRST match, which on
+    // duplicate keys means the env value would win. To make the file
+    // override semantically, main.zig drops env entries whose key
+    // appears in the file before concatenating. This test pins the
+    // contract from the adapter's side: with file entries listed
+    // before duplicate env entries, the file wins.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Simulates the post-merge slice main.zig hands to setConfigStore:
+    // file entries first (overriding), then env-only leftovers. The
+    // env-only `host=localhost` survives; the file's `port=8080`
+    // overrides the env's `port=9999`.
+    const merged = [_]ConfigEntry{
+        .{ .name = "port", .value = "8080" }, // file
+        .{ .name = "host", .value = "localhost" }, // env-only
+    };
+    adapter.setConfigStore(&merged);
+
+    try testing.expectEqualStrings("8080", adapter.lookupConfig("port").?);
+    try testing.expectEqualStrings("localhost", adapter.lookupConfig("host").?);
+    try testing.expectEqual(@as(usize, 2), adapter.config_store.len);
 }
 
 fn expectInterfaceBytes(ci: *const ComponentInstance, value: InterfaceValue, expected: []const u8) !void {

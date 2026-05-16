@@ -84,6 +84,11 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
     // loopback-bind paths. (#520 wave 2)
     var allow_net: std.ArrayListUnmanaged([]const u8) = .empty;
     defer allow_net.deinit(allocator);
+    // `--config-store=<path>` (#583 B6): path to a JSON file whose flat
+    // `{ "key": "value", ... }` object becomes the `wasi:config/store`
+    // layer-1 backing. Combined with the `WAMR_CONFIG_*` env vars (layer
+    // 2) in `runComponent`. Null when not provided.
+    var config_store_path: ?[]const u8 = null;
     var listen_address: ?std.Io.net.IpAddress = null;
     var stack_size: u32 = 64 * 1024;
     // `--log-level=<name>` (#583 B5). Sets the host-side
@@ -177,6 +182,24 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                     );
                     return 2;
                 };
+            } else if (std.mem.eql(u8, arg, "--config-store") or std.mem.startsWith(u8, arg, "--config-store=")) {
+                if (config_store_path != null) {
+                    std.debug.print("error: --config-store specified more than once\n", .{});
+                    return 2;
+                }
+                const spec = if (std.mem.eql(u8, arg, "--config-store")) blk: {
+                    i += 1;
+                    if (i >= run_args.len) {
+                        std.debug.print("error: --config-store requires a path to a JSON file\n", .{});
+                        return 2;
+                    }
+                    break :blk run_args[i];
+                } else arg["--config-store=".len..];
+                if (spec.len == 0) {
+                    std.debug.print("error: --config-store path is empty\n", .{});
+                    return 2;
+                }
+                config_store_path = spec;
             } else if (std.mem.eql(u8, arg, "--")) {
                 past_options = true;
             } else {
@@ -248,10 +271,24 @@ fn runRun(init: std.process.Init, allocator: std.mem.Allocator, run_args: []cons
                 };
                 break :blk parsed;
             };
+            // #583 B6: assemble `wasi:config/store` from layered sources.
+            // The arena owns the JSON-parsed strings and lower-cased env
+            // keys; the resulting slice's lifetime equals the arena's
+            // (we hand it to runComponent and tear down on return).
+            var cfg_arena = std.heap.ArenaAllocator.init(allocator);
+            defer cfg_arena.deinit();
+            const cfg_entries = loadComponentConfigStore(
+                cfg_arena.allocator(),
+                init.environ_map,
+                config_store_path,
+            ) catch |err| {
+                std.debug.print("Error: --config-store '{s}': {}\n", .{ config_store_path orelse "", err });
+                return 2;
+            };
             if (listen_address) |addr| {
                 return runHttpComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, addr, effective_log_level);
             }
-            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level);
+            return runComponent(wasm_data, allocator, path, wasm_args.items, env_list.items, map_dirs.items, allow_net.items, effective_log_level, cfg_entries);
         }
     }
 
@@ -300,6 +337,98 @@ fn parseListenAddress(spec: []const u8) !std.Io.net.IpAddress {
     return std.Io.net.IpAddress.parse(host, port);
 }
 
+/// Assemble the merged `wasi:config/store@0.2.0-rc.1` backing slice
+/// from two layered sources (#583 B6):
+///
+///   1. **Env-var layer** — every host process env var whose name
+///      begins with `WAMR_CONFIG_`. The prefix is stripped and the
+///      remainder is **lower-cased ASCII-only** (so
+///      `WAMR_CONFIG_API_KEY=secret` becomes
+///      `ConfigEntry{ name = "api_key", value = "secret" }`). The
+///      value is taken verbatim. Empty keys (`WAMR_CONFIG_=`) are
+///      skipped.
+///   2. **File layer** — if `config_path` is non-null, the JSON file
+///      at that path is parsed as a flat `{ "key": "value", ... }`
+///      object. Non-string values are rejected with
+///      `error.ConfigStoreInvalidValueType`. Nested objects / arrays
+///      are also rejected — the wasi:config WIT only models flat
+///      `string → string` pairs.
+///
+/// Precedence: **file overrides env**. Env entries whose lower-cased
+/// key matches a file-layer key are dropped before concatenation, so
+/// `configStoreGet`'s first-match walk in the adapter returns the
+/// file value. The file entries are listed first in the returned
+/// slice and the surviving env entries are appended afterwards;
+/// `lookupConfig`'s walk semantics preserve the precedence regardless.
+///
+/// Lifetimes: all string storage is allocated through `arena`. Caller
+/// owns the arena and is responsible for tearing it down after the
+/// adapter has finished its run.
+fn loadComponentConfigStore(
+    arena: std.mem.Allocator,
+    environ_map: *const std.process.Environ.Map,
+    config_path: ?[]const u8,
+) ![]wamr.wasi_cli_adapter.ConfigEntry {
+    const prefix = "WAMR_CONFIG_";
+
+    // ── Layer 2 (file) — parsed first so we know which env entries
+    //    to drop. Build a small key-set keyed by file entries.
+    var file_entries: std.ArrayListUnmanaged(wamr.wasi_cli_adapter.ConfigEntry) = .empty;
+    var file_keys: std.StringHashMapUnmanaged(void) = .empty;
+    if (config_path) |p| {
+        const cwd = std.Io.Dir.cwd();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const bytes = cwd.readFileAlloc(io, p, arena, @enumFromInt(8 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return error.ConfigStoreNotFound,
+            else => return err,
+        };
+        var parsed = std.json.parseFromSlice(std.json.Value, arena, bytes, .{}) catch {
+            return error.ConfigStoreInvalidJson;
+        };
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .object => |obj| {
+                var it = obj.iterator();
+                while (it.next()) |kv| {
+                    const value_str = switch (kv.value_ptr.*) {
+                        .string => |s| s,
+                        else => return error.ConfigStoreInvalidValueType,
+                    };
+                    const name_dup = try arena.dupe(u8, kv.key_ptr.*);
+                    const value_dup = try arena.dupe(u8, value_str);
+                    try file_entries.append(arena, .{ .name = name_dup, .value = value_dup });
+                    try file_keys.put(arena, name_dup, {});
+                }
+            },
+            else => return error.ConfigStoreInvalidRoot,
+        }
+    }
+
+    // ── Layer 1 (env) — scan host env, lowercase keys, drop entries
+    //    whose key collides with the file layer.
+    var env_entries: std.ArrayListUnmanaged(wamr.wasi_cli_adapter.ConfigEntry) = .empty;
+    var it = environ_map.array_hash_map.iterator();
+    while (it.next()) |kv| {
+        const name = kv.key_ptr.*;
+        const value = kv.value_ptr.*;
+        if (!std.mem.startsWith(u8, name, prefix)) continue;
+        const tail = name[prefix.len..];
+        if (tail.len == 0) continue;
+        const lowered = try std.ascii.allocLowerString(arena, tail);
+        if (file_keys.contains(lowered)) continue;
+        const value_dup = try arena.dupe(u8, value);
+        try env_entries.append(arena, .{ .name = lowered, .value = value_dup });
+    }
+
+    // ── Merge: file entries first (so first-match wins matches the
+    //    documented precedence), env-only leftovers second.
+    var merged: std.ArrayListUnmanaged(wamr.wasi_cli_adapter.ConfigEntry) = .empty;
+    try merged.ensureTotalCapacity(arena, file_entries.items.len + env_entries.items.len);
+    try merged.appendSlice(arena, file_entries.items);
+    try merged.appendSlice(arena, env_entries.items);
+    return merged.items;
+}
+
 fn runComponent(
     data: []const u8,
     allocator: std.mem.Allocator,
@@ -309,6 +438,7 @@ fn runComponent(
     map_dirs: []const MapDir,
     allow_net_cidrs: []const []const u8,
     log_level: ?wamr.wasi_cli_adapter.WasiLogLevel,
+    config_store: []const wamr.wasi_cli_adapter.ConfigEntry,
 ) u8 {
     const adapter_mod = wamr.wasi_cli_adapter;
     // Wire the adapter's stdio directly to the host process's
@@ -329,6 +459,11 @@ fn runComponent(
     for (wasm_args, 0..) |a, i| argv_buf[i + 1] = a;
     adapter.setArguments(argv_buf);
     adapter.setEnvironment(env_vars);
+    // Seed `wasi:config/store@0.2.0-rc.1` (#583 B6). Caller assembles
+    // the merged env-then-file layered slice in `runRun`; an empty
+    // slice means no config source was provided and the guest sees
+    // an empty store.
+    adapter.setConfigStore(config_store);
 
     // `--log-level=<name>` / `WAMR_LOG_LEVEL=<name>` host-side
     // `wasi:logging/logging.log` severity filter (#583 B5). Default
@@ -805,6 +940,12 @@ const run_usage =
     \\                           error|critical (default: trace = admit all).
     \\                           Falls back to the WAMR_LOG_LEVEL env var
     \\                           when this flag is absent.
+    \\  --config-store PATH      For components: load layered `wasi:config/store`
+    \\                           values from a JSON file with a flat
+    \\                           {"key":"value",...} object. Combined with
+    \\                           env vars matching `WAMR_CONFIG_<KEY>=<value>`
+    \\                           (key lower-cased, prefix stripped). File
+    \\                           overrides env when a key is set by both.
     \\
 ;
 
@@ -865,4 +1006,148 @@ test "version line second whitespace token is the version (parsable by wasi-test
     _ = it.next().?; // "wamr"
     const version_token = it.next().?;
     try std.testing.expectEqualStrings(wamr.version.string, version_token);
+}
+
+test "loadComponentConfigStore: env-only picks up WAMR_CONFIG_* with lowercase keys (#583 B6)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env_map = std.process.Environ.Map.init(arena.allocator());
+    try env_map.put("WAMR_CONFIG_FOO", "bar");
+    try env_map.put("WAMR_CONFIG_API_KEY", "s3cr3t");
+    try env_map.put("PATH", "/usr/bin"); // not prefixed → ignored
+    try env_map.put("WAMR_CONFIG_", "empty-key"); // empty tail → skipped
+
+    const entries = try loadComponentConfigStore(arena.allocator(), &env_map, null);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    var saw_foo = false;
+    var saw_api = false;
+    for (entries) |e| {
+        if (std.mem.eql(u8, e.name, "foo")) {
+            try std.testing.expectEqualStrings("bar", e.value);
+            saw_foo = true;
+        } else if (std.mem.eql(u8, e.name, "api_key")) {
+            try std.testing.expectEqualStrings("s3cr3t", e.value);
+            saw_api = true;
+        } else {
+            return error.UnexpectedKey;
+        }
+    }
+    try std.testing.expect(saw_foo);
+    try std.testing.expect(saw_api);
+}
+
+test "loadComponentConfigStore: file-only loads flat JSON object (#583 B6)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env_map = std.process.Environ.Map.init(arena.allocator());
+
+    // Write a JSON file under .zig-cache to avoid polluting the
+    // repository working tree. The path is relative to the cwd the
+    // `zig build test` step runs in — typically the repo root.
+    const cwd = std.Io.Dir.cwd();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tmp_dir = cwd.openDir(io, ".zig-cache", .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    const file_name = "wasi-config-test-store.json";
+    var file = try tmp_dir.createFile(io, file_name, .{ .truncate = true });
+    defer {
+        file.close(io);
+        tmp_dir.deleteFile(io, file_name) catch {};
+    }
+    try file.writeStreamingAll(io, "{\"foo\":\"bar\",\"answer\":\"42\"}");
+
+    const path = ".zig-cache/" ++ file_name;
+    const entries = try loadComponentConfigStore(arena.allocator(), &env_map, path);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    // File entries are emitted in JSON-source order.
+    try std.testing.expectEqualStrings("foo", entries[0].name);
+    try std.testing.expectEqualStrings("bar", entries[0].value);
+    try std.testing.expectEqualStrings("answer", entries[1].name);
+    try std.testing.expectEqualStrings("42", entries[1].value);
+}
+
+test "loadComponentConfigStore: file overrides env on duplicate key (#583 B6)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env_map = std.process.Environ.Map.init(arena.allocator());
+    try env_map.put("WAMR_CONFIG_PORT", "9999"); // env layer
+    try env_map.put("WAMR_CONFIG_HOST", "localhost"); // env-only, survives
+
+    const cwd = std.Io.Dir.cwd();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tmp_dir = cwd.openDir(io, ".zig-cache", .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    const file_name = "wasi-config-test-override.json";
+    var file = try tmp_dir.createFile(io, file_name, .{ .truncate = true });
+    defer {
+        file.close(io);
+        tmp_dir.deleteFile(io, file_name) catch {};
+    }
+    try file.writeStreamingAll(io, "{\"port\":\"8080\"}");
+
+    const path = ".zig-cache/" ++ file_name;
+    const entries = try loadComponentConfigStore(arena.allocator(), &env_map, path);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    // Layout: file entries first (so first-match walk in
+    // configStoreGet returns the file value), env-only leftovers
+    // appended afterwards.
+    try std.testing.expectEqualStrings("port", entries[0].name);
+    try std.testing.expectEqualStrings("8080", entries[0].value);
+    try std.testing.expectEqualStrings("host", entries[1].name);
+    try std.testing.expectEqualStrings("localhost", entries[1].value);
+}
+
+test "loadComponentConfigStore: rejects non-string values and non-object roots (#583 B6)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var env_map = std.process.Environ.Map.init(arena.allocator());
+
+    const cwd = std.Io.Dir.cwd();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tmp_dir = cwd.openDir(io, ".zig-cache", .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // Non-string value (int).
+    {
+        const fname = "wasi-config-test-bad-value.json";
+        var file = try tmp_dir.createFile(io, fname, .{ .truncate = true });
+        defer {
+            file.close(io);
+            tmp_dir.deleteFile(io, fname) catch {};
+        }
+        try file.writeStreamingAll(io, "{\"port\":8080}");
+        try std.testing.expectError(
+            error.ConfigStoreInvalidValueType,
+            loadComponentConfigStore(arena.allocator(), &env_map, ".zig-cache/" ++ fname),
+        );
+    }
+
+    // Non-object root.
+    {
+        const fname = "wasi-config-test-bad-root.json";
+        var file = try tmp_dir.createFile(io, fname, .{ .truncate = true });
+        defer {
+            file.close(io);
+            tmp_dir.deleteFile(io, fname) catch {};
+        }
+        try file.writeStreamingAll(io, "[\"not\", \"an\", \"object\"]");
+        try std.testing.expectError(
+            error.ConfigStoreInvalidRoot,
+            loadComponentConfigStore(arena.allocator(), &env_map, ".zig-cache/" ++ fname),
+        );
+    }
+
+    // Missing file.
+    try std.testing.expectError(
+        error.ConfigStoreNotFound,
+        loadComponentConfigStore(arena.allocator(), &env_map, ".zig-cache/wasi-config-test-does-not-exist.json"),
+    );
 }
