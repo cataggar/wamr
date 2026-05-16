@@ -4216,6 +4216,20 @@ pub const WasiCliAdapter = struct {
     /// stable until the guest calls `future.drop`.
     timer_future_ready: std.AutoHashMapUnmanaged(u32, bool) = .empty,
 
+    /// `wasi:io/error.error` handles that originated from a wasi:http
+    /// operation, with the specific `wasi:http/types.error-code` variant
+    /// they should downcast to. Populated whenever HTTP code synthesises
+    /// an io-error handle (e.g. a stream backed by an HTTP body that
+    /// faulted partway through). Consulted by `httpErrorCodeFreeFn`
+    /// (`wasi:http/types.http-error-code`) to decide between
+    /// `some(error-code)` and `none`. Today wamr's HTTP pipeline
+    /// surfaces failures directly through `error-code`-typed result
+    /// returns rather than the io-error stream channel, so the map is
+    /// typically empty — the registration exists for guest binding
+    /// completeness and for direct host injection from tests / future
+    /// stream plumbing.
+    http_io_errors: std.AutoHashMapUnmanaged(u32, HttpErrorCode) = .empty,
+
     /// State for the insecure PRNG. When `null`, init-time auto-seed runs
     /// on first use. Tests can overwrite this before invoking the component
     /// to get deterministic output.
@@ -4364,6 +4378,7 @@ pub const WasiCliAdapter = struct {
         self.logging_p2_iface.deinit(self.allocator);
         self.timer_futures.deinit(self.allocator);
         self.timer_future_ready.deinit(self.allocator);
+        self.http_io_errors.deinit(self.allocator);
         self.pending_udp_receives.deinit(self.allocator);
         // Drain any outbound HTTP worker threads still in flight
         // (#583 A2). Each entry is joined so we can safely free the
@@ -16009,6 +16024,10 @@ pub const WasiCliAdapter = struct {
         try self.http_request_options.append(self.allocator, r);
         return idx;
     }
+    fn lookupRequestOptions(self: *WasiCliAdapter, h: u32) ?*RequestOptions {
+        if (h >= self.http_request_options.items.len) return null;
+        return self.http_request_options.items[h];
+    }
     fn pushResponseOutparam(self: *WasiCliAdapter, r: *ResponseOutparam) !u32 {
         try self.reserveZeroSlot(*ResponseOutparam, &self.http_response_outparams);
         for (self.http_response_outparams.items[1..], 1..) |slot, i| {
@@ -17915,6 +17934,167 @@ pub const WasiCliAdapter = struct {
             self.allocator.destroy(r);
             self.http_request_options.items[handle] = null;
         }
+    }
+
+    // ── wasi:http/types@0.2.x request-options timeout accessors ────
+    //
+    // Six getters/setters on the three `option<duration>` fields of
+    // the 0.2 `request-options` resource. The 0.2 WIT uses the
+    // unprefixed getter names (`connect-timeout` rather than
+    // `get-connect-timeout`); the 0.3 surface registers the same
+    // logic under the `get-*` names via the parallel `*P3` helpers
+    // (`httpRequestOptionsGetConnectTimeoutP3` etc.). Both surfaces
+    // share the `RequestOptions` rep struct but live in disjoint
+    // resource tables (`http_request_options` vs
+    // `http_request_options_p3`) so handles never alias across
+    // surfaces.
+    //
+    // Values are stored unmodified in nanoseconds (the canonical
+    // representation of `wasi:clocks/monotonic-clock.duration`). They
+    // are advisory today: `std.http.Client.fetch` in
+    // `httpOutgoingHandlerHandle` does not yet thread them through
+    // to the underlying TCP/TLS handshake (#583 A5 follow-up); the
+    // host honours its built-in `std.http.Client.fetch` defaults.
+
+    fn requestOptionsGetTimeoutP2(
+        self: *WasiCliAdapter,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+        comptime field: []const u8,
+    ) !void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupRequestOptions(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const v = @field(r, field) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const inner = try allocator.create(InterfaceValue);
+        inner.* = .{ .u64 = v };
+        results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
+    }
+
+    fn requestOptionsSetTimeoutP2(
+        self: *WasiCliAdapter,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        comptime field: []const u8,
+    ) !void {
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const r = self.lookupRequestOptions(handle) orelse {
+            results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+            return;
+        };
+        const new_val: ?u64 = switch (args[1]) {
+            .option_val => |opt| if (opt.is_some and opt.payload != null) blk: {
+                break :blk switch (opt.payload.?.*) {
+                    .u64 => |v| v,
+                    .s64 => |v| @intCast(v),
+                    .u32 => |v| v,
+                    else => null,
+                };
+            } else null,
+            .u64 => |v| v,
+            else => null,
+        };
+        @field(r, field) = new_val;
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    fn httpRequestOptionsGetConnectTimeout(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsGetTimeoutP2(self, args, results, allocator, "connect_timeout_ns");
+    }
+    fn httpRequestOptionsSetConnectTimeout(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsSetTimeoutP2(self, args, results, "connect_timeout_ns");
+    }
+    fn httpRequestOptionsGetFirstByteTimeout(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsGetTimeoutP2(self, args, results, allocator, "first_byte_timeout_ns");
+    }
+    fn httpRequestOptionsSetFirstByteTimeout(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsSetTimeoutP2(self, args, results, "first_byte_timeout_ns");
+    }
+    fn httpRequestOptionsGetBetweenBytesTimeout(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsGetTimeoutP2(self, args, results, allocator, "between_bytes_timeout_ns");
+    }
+    fn httpRequestOptionsSetBetweenBytesTimeout(
+        ctx_opaque: ?*anyopaque, _: *ComponentInstance,
+        args: []const InterfaceValue, results: []InterfaceValue, _: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        try requestOptionsSetTimeoutP2(self, args, results, "between_bytes_timeout_ns");
+    }
+
+    /// `wasi:http/types.http-error-code(err: borrow<io-error>)
+    ///   -> option<error-code>` (#583 A5).
+    ///
+    /// Downcasts a borrowed `wasi:io/error.error` handle to the HTTP
+    /// `error-code` variant it originated from, if any. The host
+    /// keeps a separate `http_io_errors` map (handle → `HttpErrorCode`)
+    /// that HTTP code can register into when it surfaces a failure as
+    /// an io-error rather than as a typed `result<_, error-code>`.
+    ///
+    /// Returns `some(code)` if the handle is registered in the map,
+    /// `none` otherwise — the spec is explicit that "not all
+    /// io-errors are http-related errors", so an unknown handle
+    /// (including the synthetic null handle 0) is a successful `none`,
+    /// not a fault. The variant payload is `null`: payload-bearing
+    /// arms (DNS-error, internal-error, etc.) zero-fill in the
+    /// canonical-ABI lower (see the comment on
+    /// `http_p3_error_code_cases`), giving a valid all-`none` payload.
+    fn httpErrorCodeFreeFn(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            .u32 => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const code = self.http_io_errors.get(handle) orelse {
+            results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
+            return;
+        };
+        const inner = try allocator.create(InterfaceValue);
+        inner.* = .{
+            .variant_val = .{ .discriminant = @intFromEnum(code), .payload = null },
+        };
+        results[0] = .{ .option_val = .{ .is_some = true, .payload = inner } };
     }
 
     /// `[static]response-outparam.set(own<response-outparam>,
@@ -20724,9 +20904,19 @@ pub const WasiCliAdapter = struct {
             .{ .name = "[resource-drop]future-trailers", .call = &httpFutureTrailersDrop },
             // request-options / response-outparam
             .{ .name = "[constructor]request-options", .call = &httpRequestOptionsConstructor },
+            // 0.2 spec uses unprefixed getter names (`connect-timeout`,
+            // not `get-connect-timeout` as in 0.3). #583 A5 follow-up.
+            .{ .name = "[method]request-options.connect-timeout", .call = &httpRequestOptionsGetConnectTimeout },
+            .{ .name = "[method]request-options.set-connect-timeout", .call = &httpRequestOptionsSetConnectTimeout },
+            .{ .name = "[method]request-options.first-byte-timeout", .call = &httpRequestOptionsGetFirstByteTimeout },
+            .{ .name = "[method]request-options.set-first-byte-timeout", .call = &httpRequestOptionsSetFirstByteTimeout },
+            .{ .name = "[method]request-options.between-bytes-timeout", .call = &httpRequestOptionsGetBetweenBytesTimeout },
+            .{ .name = "[method]request-options.set-between-bytes-timeout", .call = &httpRequestOptionsSetBetweenBytesTimeout },
             .{ .name = "[resource-drop]request-options", .call = &httpRequestOptionsDrop },
             .{ .name = "[static]response-outparam.set", .call = &httpResponseOutparamSet },
             .{ .name = "[resource-drop]response-outparam", .call = &httpResponseOutparamDrop },
+            // wasi:http/types free fn (#583 A5).
+            .{ .name = "http-error-code", .call = &httpErrorCodeFreeFn },
         };
         for (members) |m| {
             try self.http_types_iface.members.put(self.allocator, m.name, .{
@@ -30173,8 +30363,323 @@ test "populateWasiProviders: binds wasi:http/* (#149)" {
     try testing.expect(adapter.http_types_iface.members.contains("[resource-drop]fields"));
     try testing.expect(adapter.http_types_iface.members.contains("[resource-drop]outgoing-request"));
     try testing.expect(adapter.http_types_iface.members.contains("[resource-drop]future-incoming-response"));
+    // #583 A5: 7 missing P2 audit arms now bound (http-error-code free
+    // fn + six request-options timeout getters/setters; 0.2 spec uses
+    // unprefixed getter names).
+    try testing.expect(adapter.http_types_iface.members.contains("http-error-code"));
+    try testing.expect(adapter.http_types_iface.members.contains("[method]request-options.connect-timeout"));
+    try testing.expect(adapter.http_types_iface.members.contains("[method]request-options.set-connect-timeout"));
+    try testing.expect(adapter.http_types_iface.members.contains("[method]request-options.first-byte-timeout"));
+    try testing.expect(adapter.http_types_iface.members.contains("[method]request-options.set-first-byte-timeout"));
+    try testing.expect(adapter.http_types_iface.members.contains("[method]request-options.between-bytes-timeout"));
+    try testing.expect(adapter.http_types_iface.members.contains("[method]request-options.set-between-bytes-timeout"));
     try testing.expect(adapter.http_outgoing_handler_iface.members.contains("handle"));
     try testing.expect(adapter.http_incoming_handler_iface.members.contains("handle"));
+}
+
+// ── wasi:http/types@0.2.x audit arms (#583 A5) ────────────────────────
+//
+// Seven WIT methods that the 0.3 surface already shipped but the 0.2
+// surface left unbound. See `populateWasiHttpTypes` for the binding;
+// the per-call tests below verify both round-tripping behaviour and
+// edge cases (unknown handle, none-payload reset).
+
+test "wasi:http/types@0.2 request-options.connect-timeout: set + get + reset roundtrip (#583 A5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpRequestOptionsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const h = ctor_results[0].handle;
+    try testing.expect(h != 0);
+
+    // Initial state — getter returns option::none.
+    {
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        const args = [_]InterfaceValue{.{ .handle = h }};
+        try WasiCliAdapter.httpRequestOptionsGetConnectTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0] == .option_val);
+        try testing.expect(!results[0].option_val.is_some);
+    }
+
+    // Set to some(2_500_000_000).
+    {
+        const inner = InterfaceValue{ .u64 = 2_500_000_000 };
+        const args = [_]InterfaceValue{
+            .{ .handle = h },
+            .{ .option_val = .{ .is_some = true, .payload = &inner } },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.httpRequestOptionsSetConnectTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0] == .result_val);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+
+    // Verify rep struct holds the value.
+    try testing.expectEqual(@as(?u64, 2_500_000_000), adapter.http_request_options.items[h].?.connect_timeout_ns);
+
+    // Get returns some(2_500_000_000).
+    {
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        const args = [_]InterfaceValue{.{ .handle = h }};
+        try WasiCliAdapter.httpRequestOptionsGetConnectTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0] == .option_val);
+        try testing.expect(results[0].option_val.is_some);
+        try testing.expectEqual(@as(u64, 2_500_000_000), results[0].option_val.payload.?.u64);
+    }
+
+    // Reset via set(none) — getter goes back to none.
+    {
+        const args = [_]InterfaceValue{
+            .{ .handle = h },
+            .{ .option_val = .{ .is_some = false, .payload = null } },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.httpRequestOptionsSetConnectTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(?u64, null), adapter.http_request_options.items[h].?.connect_timeout_ns);
+    {
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        const args = [_]InterfaceValue{.{ .handle = h }};
+        try WasiCliAdapter.httpRequestOptionsGetConnectTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(!results[0].option_val.is_some);
+    }
+
+    const drop_args = [_]InterfaceValue{.{ .handle = h }};
+    try WasiCliAdapter.httpRequestOptionsDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
+}
+
+test "wasi:http/types@0.2 request-options.first-byte-timeout: set + get + reset roundtrip (#583 A5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpRequestOptionsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const h = ctor_results[0].handle;
+
+    {
+        const inner = InterfaceValue{ .u64 = 750_000_000 };
+        const args = [_]InterfaceValue{
+            .{ .handle = h },
+            .{ .option_val = .{ .is_some = true, .payload = &inner } },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.httpRequestOptionsSetFirstByteTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(?u64, 750_000_000), adapter.http_request_options.items[h].?.first_byte_timeout_ns);
+    // Other two fields stay untouched.
+    try testing.expectEqual(@as(?u64, null), adapter.http_request_options.items[h].?.connect_timeout_ns);
+    try testing.expectEqual(@as(?u64, null), adapter.http_request_options.items[h].?.between_bytes_timeout_ns);
+
+    {
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        const args = [_]InterfaceValue{.{ .handle = h }};
+        try WasiCliAdapter.httpRequestOptionsGetFirstByteTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].option_val.is_some);
+        try testing.expectEqual(@as(u64, 750_000_000), results[0].option_val.payload.?.u64);
+    }
+
+    // Reset.
+    {
+        const args = [_]InterfaceValue{
+            .{ .handle = h },
+            .{ .option_val = .{ .is_some = false, .payload = null } },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.httpRequestOptionsSetFirstByteTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(?u64, null), adapter.http_request_options.items[h].?.first_byte_timeout_ns);
+
+    const drop_args = [_]InterfaceValue{.{ .handle = h }};
+    try WasiCliAdapter.httpRequestOptionsDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
+}
+
+test "wasi:http/types@0.2 request-options.between-bytes-timeout: set + get + reset roundtrip (#583 A5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpRequestOptionsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const h = ctor_results[0].handle;
+
+    {
+        const inner = InterfaceValue{ .u64 = 60_000_000_000 };
+        const args = [_]InterfaceValue{
+            .{ .handle = h },
+            .{ .option_val = .{ .is_some = true, .payload = &inner } },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.httpRequestOptionsSetBetweenBytesTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(?u64, 60_000_000_000), adapter.http_request_options.items[h].?.between_bytes_timeout_ns);
+
+    {
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        const args = [_]InterfaceValue{.{ .handle = h }};
+        try WasiCliAdapter.httpRequestOptionsGetBetweenBytesTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].option_val.is_some);
+        try testing.expectEqual(@as(u64, 60_000_000_000), results[0].option_val.payload.?.u64);
+    }
+
+    // Reset.
+    {
+        const args = [_]InterfaceValue{
+            .{ .handle = h },
+            .{ .option_val = .{ .is_some = false, .payload = null } },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.httpRequestOptionsSetBetweenBytesTimeout(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    try testing.expectEqual(@as(?u64, null), adapter.http_request_options.items[h].?.between_bytes_timeout_ns);
+
+    const drop_args = [_]InterfaceValue{.{ .handle = h }};
+    try WasiCliAdapter.httpRequestOptionsDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
+}
+
+test "wasi:http/types@0.2 request-options: three timeouts are independent (#583 A5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    var ctor_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpRequestOptionsConstructor(&adapter, &ci, &.{}, &ctor_results, testing.allocator);
+    const h = ctor_results[0].handle;
+
+    // Set all three to distinct values via the WIT-bound setters.
+    const a = InterfaceValue{ .u64 = 1_000 };
+    const b = InterfaceValue{ .u64 = 2_000 };
+    const c = InterfaceValue{ .u64 = 3_000 };
+    inline for (.{
+        .{ "set_connect", &a, "connect_timeout_ns" },
+        .{ "set_first_byte", &b, "first_byte_timeout_ns" },
+        .{ "set_between", &c, "between_bytes_timeout_ns" },
+    }) |triple| {
+        const setter: *const fn (?*anyopaque, *ComponentInstance, []const InterfaceValue, []InterfaceValue, std.mem.Allocator) anyerror!void = comptime if (std.mem.eql(u8, triple[0], "set_connect"))
+            &WasiCliAdapter.httpRequestOptionsSetConnectTimeout
+        else if (std.mem.eql(u8, triple[0], "set_first_byte"))
+            &WasiCliAdapter.httpRequestOptionsSetFirstByteTimeout
+        else
+            &WasiCliAdapter.httpRequestOptionsSetBetweenBytesTimeout;
+        const args = [_]InterfaceValue{
+            .{ .handle = h },
+            .{ .option_val = .{ .is_some = true, .payload = triple[1] } },
+        };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try setter(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+    }
+    // All three fields hold their respective values — no field
+    // aliasing between accessor wrappers.
+    const r = adapter.http_request_options.items[h].?;
+    try testing.expectEqual(@as(?u64, 1_000), r.connect_timeout_ns);
+    try testing.expectEqual(@as(?u64, 2_000), r.first_byte_timeout_ns);
+    try testing.expectEqual(@as(?u64, 3_000), r.between_bytes_timeout_ns);
+
+    const drop_args = [_]InterfaceValue{.{ .handle = h }};
+    try WasiCliAdapter.httpRequestOptionsDrop(&adapter, &ci, &drop_args, &.{}, testing.allocator);
+}
+
+test "wasi:http/types@0.2 http-error-code: unknown io-error handle returns none (#583 A5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    // 42 was never registered with `http_io_errors` — the spec says
+    // "not all io-errors are http-related errors", so the host-bound
+    // adapter must return option::none rather than fault.
+    const args = [_]InterfaceValue{.{ .handle = 42 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpErrorCodeFreeFn(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0] == .option_val);
+    try testing.expect(!results[0].option_val.is_some);
+}
+
+test "wasi:http/types@0.2 http-error-code: HTTP-origin io-error downcasts to typed code (#583 A5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Host-side: register io-error handle 7 as an HTTP-origin error
+    // with the `connection-refused` code. This is how future stream
+    // plumbing will mark io-errors emerging from a faulted HTTP body.
+    try adapter.http_io_errors.put(testing.allocator, 7, .connection_refused);
+
+    var ci: ComponentInstance = undefined;
+    const args = [_]InterfaceValue{.{ .handle = 7 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpErrorCodeFreeFn(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+    try testing.expect(results[0] == .option_val);
+    try testing.expect(results[0].option_val.is_some);
+    // 0.2 and 0.3 share the same WIT-declaration order for error-code
+    // variants (see `HttpErrorCode` doc-comment at line ~730).
+    // `connection-refused` is discriminant 6.
+    try testing.expect(results[0].option_val.payload.?.* == .variant_val);
+    try testing.expectEqual(
+        @as(u32, @intFromEnum(HttpErrorCode.connection_refused)),
+        results[0].option_val.payload.?.variant_val.discriminant,
+    );
+    try testing.expectEqual(@as(u32, 6), results[0].option_val.payload.?.variant_val.discriminant);
+    // Payload-bearing arms zero-fill in the canonical-ABI lower
+    // (see `http_p3_error_code_cases` comment); host emits null here.
+    try testing.expectEqual(@as(?*const InterfaceValue, null), results[0].option_val.payload.?.variant_val.payload);
+}
+
+test "wasi:http/types@0.2 http-error-code: distinct HTTP-origin codes round-trip (#583 A5)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    // Register a sampling of variants that hit both no-payload and
+    // payload-bearing arms in the WIT (the host emits no payload for
+    // either — payload-bearing variants zero-fill at lower time).
+    try adapter.http_io_errors.put(testing.allocator, 1, .DNS_timeout); // disc 0, no payload
+    try adapter.http_io_errors.put(testing.allocator, 2, .HTTP_request_denied); // disc 15, no payload
+    try adapter.http_io_errors.put(testing.allocator, 3, .HTTP_response_timeout); // disc 33, no payload
+    try adapter.http_io_errors.put(testing.allocator, 4, .internal_error); // disc 38, payload-bearing
+    try adapter.http_io_errors.put(testing.allocator, 5, .DNS_error); // disc 1, payload-bearing
+
+    var ci: ComponentInstance = undefined;
+    inline for (.{
+        .{ @as(u32, 1), @as(u32, 0) },
+        .{ @as(u32, 2), @as(u32, 15) },
+        .{ @as(u32, 3), @as(u32, 33) },
+        .{ @as(u32, 4), @as(u32, 38) },
+        .{ @as(u32, 5), @as(u32, 1) },
+    }) |pair| {
+        const args = [_]InterfaceValue{.{ .handle = pair[0] }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.httpErrorCodeFreeFn(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].option_val.is_some);
+        try testing.expectEqual(pair[1], results[0].option_val.payload.?.variant_val.discriminant);
+    }
 }
 
 // ── wasi:config@0.2.0-rc.1 tests (#583 B6) ────────────────────────────
