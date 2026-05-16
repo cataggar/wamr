@@ -1,6 +1,9 @@
 {
+    "_comment": "Skip-list for `zig build wasi-testsuite`. Currently empty — all `wasm32-wasip1` C, Rust, and AssemblyScript fixtures pass. Re-add an entry only with a one-line rationale and a tracking issue. Suite keys match the `name` field in each `tests/wasi-testsuite/tests/<lang>/testsuite/wasm32-wasip1/manifest.json` (note the double space in the AssemblyScript suite name — that's upstream). No `wasm32-wasip2` corpus exists upstream (the suite went P1 → P3 directly; see `tests/wasi-testsuite/tests/c/build.py:23` and `doc/writing-tests.md:102`). P3 has its own gate at `tests/wasi-p3-testsuite-skip.json`. See `tests/wasi-conformance-audit.md` for the audit log.",
     "WASI C tests [wasm32-wasip1]": {
     },
     "WASI Rust tests [wasm32-wasip1]": {
+    },
+    "WASI Assemblyscript  tests [wasm32-wasip1]": {
     }
 }
