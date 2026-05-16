@@ -1236,20 +1236,75 @@ pub const PendingUdpReceive = struct {
 /// allocated `PendingHttpFetchShared`. The two threads coordinate
 /// through `done` (worker → adapter signal) and `cancelled` (adapter →
 /// worker advisory); the heap struct is freed only after the thread
-/// has been joined, so a slow `std.http.Client.fetch` can never UAF
-/// even if the guest cancels or the adapter tears down mid-flight.
+/// has been joined, so a slow outbound fetch can never UAF even if
+/// the guest cancels or the adapter tears down mid-flight.
 pub const HttpFetchOutcome = union(enum) {
-    /// Successful `std.http.Client.fetch` response. `body` is owned
-    /// host-allocated bytes consumed into an `IncomingResponse` on
-    /// settle; `status` is the numeric HTTP response status.
+    /// Successful HTTP response. `body` is owned host-allocated bytes
+    /// consumed into an `IncomingResponse` on settle; `status` is the
+    /// numeric HTTP response status; `headers` is the wire-order list
+    /// of `(name, value)` pairs the server emitted, with transport-
+    /// managed headers (Content-Length, Transfer-Encoding, Connection,
+    /// Keep-Alive, Trailer, Upgrade, TE, Host) stripped per the
+    /// wasi:http WIT spec (#583 A4). Each entry's `name` and `value`
+    /// are independently owned `[]u8` slices.
     success: struct {
         status: u16,
         body: []u8,
+        headers: []HttpFieldEntry,
     },
     /// Transport / TLS / parse failure mapped to a
     /// `wasi:http/types.error-code` discriminant.
     failure: HttpErrorCode,
 };
+
+/// Free an owned `[]HttpFieldEntry` produced by the low-level outbound
+/// HTTP path (`httpClientLowLevelFetch` / worker). Frees each entry's
+/// name + value plus the backing slice. Used both on the worker side
+/// when the guest has already dropped the future-incoming-response and
+/// on the settle side once entries transfer into a `HttpFields`. The
+/// helper exists so the lifetime contract is centralised — anywhere
+/// that owns a `HttpFetchOutcome.success.headers` slice can free it
+/// without re-deriving the layout. (#583 A4)
+fn freeOwnedHttpHeaders(allocator: Allocator, headers: []HttpFieldEntry) void {
+    for (headers) |e| {
+        allocator.free(e.name);
+        allocator.free(e.value);
+    }
+    allocator.free(headers);
+}
+
+/// Returns `true` for HTTP headers the host manages on behalf of the
+/// guest and must therefore strip from the lifted `incoming-response`
+/// header set per the wasi:http WIT spec (#583 A4):
+///
+///   * `Content-Length` — body framing; recomputable from the body
+///     stream. The host owns the wire framing; the guest sees a
+///     `stream<u8>`, not byte counts.
+///   * `Transfer-Encoding` — likewise body framing (chunked, etc.).
+///   * `Connection`, `Keep-Alive` — hop-by-hop connection lifecycle.
+///   * `Trailer`, `TE` — hop-by-hop trailer negotiation. wasi:http
+///     surfaces trailers via the `future-trailers` resource instead.
+///   * `Upgrade` — protocol upgrade hop-by-hop.
+///   * `Host` — request-only target authority (only relevant on the
+///     outgoing side, kept here defensively for symmetry).
+///
+/// Comparison is ASCII case-insensitive per RFC 9110 §5.1.
+fn isTransportManagedHeader(name: []const u8) bool {
+    const managed = [_][]const u8{
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "trailer",
+        "te",
+        "upgrade",
+        "host",
+    };
+    for (managed) |m| {
+        if (std.ascii.eqlIgnoreCase(name, m)) return true;
+    }
+    return false;
+}
 
 /// Heap-allocated state shared between the host's outbound-HTTP worker
 /// thread and the adapter's drain side. The worker writes `outcome`
@@ -2536,6 +2591,144 @@ fn mapHttpFetchError(err: anyerror) HttpErrorCode {
         // `error.Canceled`, `error.Unexpected`, and anything Zig adds to
         // `FetchError` after this audit.
         else => .internal_error,
+    };
+}
+
+/// Successful low-level outbound HTTP fetch result. All three fields are
+/// owned host-allocated slices: the caller takes ownership and is
+/// responsible for freeing them (`freeOwnedHttpHeaders` for `headers`,
+/// `allocator.free` for `body`). (#583 A4)
+const HttpLowLevelFetchResult = struct {
+    status: u16,
+    headers: []HttpFieldEntry,
+    body: []u8,
+};
+
+/// Drive a single outbound HTTP request through the lower-level
+/// `std.http.Client.request` / `Request.receiveHead` /
+/// `Response.readerDecompressing` API and capture the full
+/// `(status, headers, body)` triple — the equivalent of
+/// `std.http.Client.fetch` but without the `FetchResult.status`-only
+/// projection that discards the response header list.
+///
+/// Both the worker thread (`httpFetchWorker`) and the synchronous P3
+/// `client.send` path call this helper so the two outbound surfaces
+/// produce byte-identical lifted `incoming-response` resources. Errors
+/// flow back through `mapHttpFetchError` for `error-code` mapping
+/// (#583 A3 — the error set is the same union the old `fetch` path
+/// returned, transitively).
+///
+/// On success the caller owns the returned `headers` (free with
+/// `freeOwnedHttpHeaders`) and `body` (`allocator.free`). Headers
+/// listed in `isTransportManagedHeader` (Content-Length,
+/// Transfer-Encoding, Connection, Keep-Alive, Trailer, TE, Upgrade,
+/// Host) are stripped so the lifted `incoming-response` exposes only
+/// the application-level headers per the wasi:http WIT spec (#583 A4).
+fn httpClientLowLevelFetch(
+    allocator: Allocator,
+    io: std.Io,
+    url: []const u8,
+    method: std.http.Method,
+    extra_headers: []const std.http.Header,
+    payload: ?[]const u8,
+) anyerror!HttpLowLevelFetchResult {
+    var client: std.http.Client = .{
+        .allocator = allocator,
+        .io = io,
+    };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(url);
+
+    var req = try client.request(method, uri, .{
+        .extra_headers = extra_headers,
+        .keep_alive = false,
+        // Mirror `std.http.Client.fetch`: when there is no payload the
+        // request is repeatable so we follow up to 3 redirects; with a
+        // payload we surface the redirect to the caller as
+        // `error.RedirectRequiresResend` so they can act on it.
+        .redirect_behavior = if (payload == null)
+            @as(std.http.Client.Request.RedirectBehavior, @enumFromInt(3))
+        else
+            .unhandled,
+    });
+    defer req.deinit();
+
+    if (payload) |p| {
+        req.transfer_encoding = .{ .content_length = p.len };
+        var body_writer = try req.sendBodyUnflushed(&.{});
+        try body_writer.writer.writeAll(p);
+        try body_writer.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    // RFC 9110 recommends ≥ 8000 bytes for the redirect / merged-URI
+    // buffer; the spec ceiling on a header section is `max_http_header_bytes`.
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+
+    // Snapshot headers BEFORE invoking `response.reader(...)` — that
+    // call invalidates `response.head.bytes`, which the iterator
+    // points into.
+    var hdr_list: std.ArrayListUnmanaged(HttpFieldEntry) = .empty;
+    errdefer {
+        for (hdr_list.items) |e| {
+            allocator.free(e.name);
+            allocator.free(e.value);
+        }
+        hdr_list.deinit(allocator);
+    }
+    {
+        var hit = response.head.iterateHeaders();
+        while (hit.next()) |h| {
+            // Trailers are not surfaced through `incoming-response.headers`
+            // per the WIT spec — they have their own `future-trailers`
+            // resource. Stop at the trailer boundary.
+            if (hit.is_trailer) break;
+            if (isTransportManagedHeader(h.name)) continue;
+            const name_copy = try allocator.dupe(u8, h.name);
+            errdefer allocator.free(name_copy);
+            const value_copy = try allocator.dupe(u8, h.value);
+            errdefer allocator.free(value_copy);
+            try hdr_list.append(allocator, .{ .name = name_copy, .value = value_copy });
+        }
+    }
+
+    const status_code: u16 = @intFromEnum(response.head.status);
+
+    // Drain the body. HEAD / 1xx / 204 / 304 responses have no body
+    // per RFC 9110; `Request.receiveHead` leaves the reader in `.ready`
+    // for those and `response.reader(...)` short-circuits to `.ending`.
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+
+    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
+        .identity => &.{},
+        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
+        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
+        .compress => return error.UnsupportedCompressionMethod,
+    };
+    defer if (decompress_buffer.len != 0) allocator.free(decompress_buffer);
+
+    var transfer_buffer: [64]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    const body_reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+
+    _ = body_reader.streamRemaining(&aw.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+
+    var body_al = aw.toArrayList();
+    const body = try body_al.toOwnedSlice(allocator);
+    errdefer allocator.free(body);
+
+    return .{
+        .status = status_code,
+        .headers = try hdr_list.toOwnedSlice(allocator),
+        .body = body,
     };
 }
 
@@ -5654,20 +5847,23 @@ pub const WasiCliAdapter = struct {
     }
 
     /// Worker thread body for an outbound HTTP fetch (#583 A2).
-    /// Executes the blocking `std.http.Client.fetch` on a snapshot of
-    /// the guest's request, then publishes the outcome to the shared
-    /// heap struct so the adapter's drain side can pick it up. The
-    /// worker owns `req` (deinit on return) but only borrows
-    /// `req.shared` — the adapter holds the other reference and frees
-    /// it once `thread.join()` has returned.
+    /// Drives the lower-level `std.http.Client.request` /
+    /// `Request.receiveHead` / body-reader path via
+    /// `httpClientLowLevelFetch` so the response header list is
+    /// captured alongside the status line (#583 A4 — the previous
+    /// `std.http.Client.fetch` projection discarded headers). Publishes
+    /// the outcome to the shared heap struct so the adapter's drain
+    /// side can pick it up. The worker owns `req` (deinit on return)
+    /// but only borrows `req.shared` — the adapter holds the other
+    /// reference and frees it once `thread.join()` has returned.
     ///
-    /// Errors from `std.http.Client.fetch` are mapped onto their
+    /// Errors from the underlying client are mapped onto their
     /// specific `wasi:http/types.error-code` variant by
     /// `mapHttpFetchError` (#583 A3 — connect-refused, TLS, DNS,
     /// framing, URI-parse, etc. each get a dedicated arm; only truly-
     /// unclassified failures fall through to `internal_error`). The
     /// `httpClientSendP3` synchronous path uses the same helper, so
-    /// both surfaces produce identical discriminants.
+    /// both surfaces produce identical discriminants AND header sets.
     fn httpFetchWorker(req: *HttpFetchRequest) void {
         // Worker owns its *HttpFetchRequest — free both the inner
         // resources and the heap struct itself before returning.
@@ -5684,23 +5880,15 @@ pub const WasiCliAdapter = struct {
         }
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        var client: std.http.Client = .{
-            .allocator = req.allocator,
-            .io = io,
-        };
-        defer client.deinit();
 
-        var aw: std.Io.Writer.Allocating = .init(req.allocator);
-        defer aw.deinit();
-
-        const fetch_result = client.fetch(.{
-            .location = .{ .url = req.url },
-            .method = req.method,
-            .payload = req.payload,
-            .extra_headers = req.headers_buf,
-            .response_writer = &aw.writer,
-            .keep_alive = false,
-        }) catch |err| {
+        const result = httpClientLowLevelFetch(
+            alloc,
+            io,
+            req.url,
+            req.method,
+            req.headers_buf,
+            req.payload,
+        ) catch |err| {
             // Funnel through the same error-mapping table the
             // synchronous P3 `client.send` path uses (#583 A3) so the
             // worker and the in-thread `httpClientSendP3` produce
@@ -5710,15 +5898,10 @@ pub const WasiCliAdapter = struct {
             return;
         };
 
-        var resp_al = aw.toArrayList();
-        const body = resp_al.toOwnedSlice(req.allocator) catch {
-            shared.outcome = .{ .failure = .internal_error };
-            shared.done.store(true, .release);
-            return;
-        };
         shared.outcome = .{ .success = .{
-            .status = @intFromEnum(fetch_result.status),
-            .body = body,
+            .status = result.status,
+            .body = result.body,
+            .headers = result.headers,
         } };
         shared.done.store(true, .release);
     }
@@ -5769,15 +5952,19 @@ pub const WasiCliAdapter = struct {
     /// Translate a worker-published `HttpFetchOutcome` into the
     /// matching `FutureIncomingResponse.state` transition. If the
     /// future's slot has already been dropped (resource-drop on the
-    /// guest side) the outcome is discarded — `.success.body` is
-    /// freed here, otherwise it transfers ownership to the freshly
-    /// allocated `IncomingResponse`.
+    /// guest side) the outcome is discarded — `.success.body` and
+    /// `.success.headers` are freed here, otherwise they transfer
+    /// ownership to the freshly allocated `IncomingResponse` /
+    /// `HttpFields`.
     fn settlePendingHttpFetch(self: *WasiCliAdapter, entry: PendingHttpFetch) void {
         const fut = self.lookupFutureResponse(entry.future_handle);
         // Guest dropped the future — free outcome resources and bail.
         if (fut == null) {
             switch (entry.shared.outcome) {
-                .success => |s| self.allocator.free(s.body),
+                .success => |s| {
+                    self.allocator.free(s.body);
+                    freeOwnedHttpHeaders(self.allocator, s.headers);
+                },
                 .failure => {},
             }
             return;
@@ -5788,7 +5975,10 @@ pub const WasiCliAdapter = struct {
         // delivered" without inventing new error-code variants.
         if (entry.shared.cancelled.load(.acquire)) {
             switch (entry.shared.outcome) {
-                .success => |s| self.allocator.free(s.body),
+                .success => |s| {
+                    self.allocator.free(s.body);
+                    freeOwnedHttpHeaders(self.allocator, s.headers);
+                },
                 .failure => {},
             }
             fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.HTTP_request_denied) };
@@ -5798,18 +5988,30 @@ pub const WasiCliAdapter = struct {
             .success => |s| {
                 const resp_fields = self.allocator.create(HttpFields) catch {
                     self.allocator.free(s.body);
+                    freeOwnedHttpHeaders(self.allocator, s.headers);
                     fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) };
                     return;
                 };
-                resp_fields.* = .{};
+                // Transfer ownership of the worker-allocated header
+                // entries into the `HttpFields` resource (#583 A4).
+                // The slice backing `s.headers` was allocated with
+                // `self.allocator` by `httpClientLowLevelFetch`, so it
+                // is safe to splice in as the field's backing storage.
+                resp_fields.* = .{
+                    .entries = std.ArrayListUnmanaged(HttpFieldEntry).fromOwnedSlice(s.headers),
+                };
                 const resp_fields_handle = self.pushHttpFields(resp_fields) catch {
                     self.allocator.free(s.body);
+                    resp_fields.deinit(self.allocator);
                     self.allocator.destroy(resp_fields);
                     fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) };
                     return;
                 };
                 const ir = self.allocator.create(IncomingResponse) catch {
                     self.allocator.free(s.body);
+                    // `resp_fields` is now owned by the resource slot
+                    // — null it out so it doesn't leak through the
+                    // headerless `IncomingResponse` we never mint.
                     fut.?.state = .{ .ready_err = @intFromEnum(HttpErrorCode.internal_error) };
                     return;
                 };
@@ -17708,11 +17910,13 @@ pub const WasiCliAdapter = struct {
     // --- client.send (P3) — host-provided outbound HTTP ---
 
     /// `wasi:http/client.send: async func(request) -> result<response, error-code>` (#487).
-    /// Synchronous HTTP/1.1 implementation via `std.http.Client.fetch`.
-    /// The async lift on the guest side observes a value-ready return.
-    /// Both `http://` and `https://` are accepted — TLS is provided by
-    /// `std.crypto.tls` (#521 — replaces the `HTTP_protocol_error`
-    /// gate originally added in #477 / #501).
+    /// Synchronous HTTP/1.1 implementation via the lower-level
+    /// `std.http.Client.request` / `Request.receiveHead` API (#583 A4
+    /// — formerly `std.http.Client.fetch`, which discarded the response
+    /// header list). The async lift on the guest side observes a
+    /// value-ready return. Both `http://` and `https://` are accepted
+    /// — TLS is provided by `std.crypto.tls` (#521 — replaces the
+    /// `HTTP_protocol_error` gate originally added in #477 / #501).
     fn httpClientSendP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -17735,7 +17939,7 @@ pub const WasiCliAdapter = struct {
         }
 
         // Scheme — `http` and `https` are both supported (#521).
-        // `std.http.Client.fetch` handles TLS via `std.crypto.tls`.
+        // `std.http.Client` handles TLS via `std.crypto.tls`.
         const scheme: []const u8 = if (r.scheme_disc) |d| switch (d) {
             0 => "http",
             1 => "https",
@@ -17775,24 +17979,32 @@ pub const WasiCliAdapter = struct {
         const payload: ?[]const u8 = if (body_buf) |b| (if (b.len > 0) b else null) else null;
 
         const io = std.Io.Threaded.global_single_threaded.io();
-        var client: std.http.Client = .{ .allocator = self.allocator, .io = io };
-        // `client.deinit()` covers both the connection pool and the
-        // lazily-allocated TLS CA bundle (#521).
-        defer client.deinit();
 
-        var aw: std.Io.Writer.Allocating = .init(self.allocator);
-        defer aw.deinit();
-
-        const fetch_result = client.fetch(.{
-            .location = .{ .url = url },
-            .method = method,
-            .payload = payload,
-            .extra_headers = extra_hdrs.items,
-            .response_writer = &aw.writer,
-            .keep_alive = false,
-        }) catch |err| {
+        // Drive the lower-level request/response API so we capture the
+        // response headers alongside the status line (#583 A4). The
+        // worker thread used by the P2 `outgoing-handler.handle` path
+        // calls the same helper, so the two outbound surfaces produce
+        // identical lifted `incoming-response` resources.
+        const fetched = httpClientLowLevelFetch(
+            self.allocator,
+            io,
+            url,
+            method,
+            extra_hdrs.items,
+            payload,
+        ) catch |err| {
             return httpClientDenyP3(results, allocator, mapHttpFetchError(err));
         };
+        // From here on, `fetched.headers` / `fetched.body` are owned
+        // by us until they are spliced into the response resources
+        // below. Use `errdefer` so an OOM during resource construction
+        // doesn't leak.
+        var fetched_headers = fetched.headers;
+        var fetched_body = fetched.body;
+        errdefer {
+            freeOwnedHttpHeaders(self.allocator, fetched_headers);
+            self.allocator.free(fetched_body);
+        }
 
         // Mark transmission future as ready (request was sent).
         if (ci.futures.getPtr(r.transmission_future_handle)) |tx| {
@@ -17800,33 +18012,38 @@ pub const WasiCliAdapter = struct {
             tx.write_closed = true;
         }
 
-        var resp_al = aw.toArrayList();
-        const resp_body = resp_al.toOwnedSlice(self.allocator) catch {
-            return httpClientDenyP3(results, allocator, .internal_error);
-        };
-
         // Build response body stream prefilled + write-closed (EOF).
         const body_stream_h = ci.allocAsyncHandle();
         var body_stream: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
-        body_stream.buffer = std.ArrayListUnmanaged(u8).fromOwnedSlice(resp_body);
+        body_stream.buffer = std.ArrayListUnmanaged(u8).fromOwnedSlice(fetched_body);
+        // Ownership of `fetched_body` has been transferred into the
+        // body stream's buffer — clear the errdefer'd guard.
+        fetched_body = &.{};
         body_stream.write_closed = true;
         try ci.streams.put(ci.allocator, body_stream_h, body_stream);
 
-        // Trailers future: ready with `ok(none)` — std.http.Client.fetch
-        // does not surface trailers on this path. Unit-payload fast-path
-        // in executor.future_read drains it.
+        // Trailers future: ready with `ok(none)` — the lower-level
+        // outbound path does not surface trailers yet. Unit-payload
+        // fast-path in executor.future_read drains it.
         const trailers_h = try allocReadyUnitFuture(ci);
 
-        // Empty response headers (FetchResult does not expose them).
+        // Lift response headers into a `HttpFields` resource (#583 A4).
+        // `fetched_headers` was allocated with `self.allocator`, so we
+        // can splice it directly as the field's backing storage.
         const resp_fields = try self.allocator.create(HttpFields);
-        resp_fields.* = .{};
+        resp_fields.* = .{
+            .entries = std.ArrayListUnmanaged(HttpFieldEntry).fromOwnedSlice(fetched_headers),
+        };
+        // Ownership of `fetched_headers` has been transferred into the
+        // HttpFields resource — clear the errdefer'd guard.
+        fetched_headers = &.{};
         const resp_fields_h = try self.pushHttpFields(resp_fields);
 
         const tx_h_resp = try allocReadyUnitFuture(ci);
 
         const resp = try self.allocator.create(HttpResponseP3);
         resp.* = .{
-            .status = @intFromEnum(fetch_result.status),
+            .status = fetched.status,
             .headers_handle = resp_fields_h,
             .body_stream_handle = body_stream_h,
             .trailers_future_handle = trailers_h,
@@ -28110,6 +28327,323 @@ test "wasi:http #583 A2: outgoing-handler defers fetch and resolves via worker t
     try testing.expectEqualStrings("hello-583-A2", ir.body_data.?);
     // Pending list drained — entry was consumed by the settle.
     try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches.items.len);
+}
+
+/// Spin up a one-shot HTTP/1.1 server bound to 127.0.0.1 on an arbitrary
+/// port whose response head is fully caller-supplied. Used by the
+/// #583 A4 response-header tests below — the existing
+/// `TestHttpServer.serveLoopback` is locked to a minimal
+/// `Content-Length`/`Connection: close` response shape, so a second
+/// helper sits alongside that lets the test specify the exact set of
+/// (name, value) response headers (and accompanying body) the lifted
+/// `incoming-response` should reflect back through
+/// `incoming-response.headers`. The server runs on a dedicated thread
+/// so the test thread can issue a fetch concurrently.
+const TestHttpHeaderServer = struct {
+    thread: std.Thread,
+    port: u16,
+
+    /// `response_head` is the full response head including the status
+    /// line and trailing `\r\n\r\n` (caller-supplied). `body` is the
+    /// response body bytes that follow the head; both slices are
+    /// duped into context-owned memory and freed after the server
+    /// finishes.
+    fn serveLoopback(
+        allocator: Allocator,
+        response_head: []const u8,
+        body: []const u8,
+    ) !TestHttpHeaderServer {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var any: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+        const server = try std.Io.net.IpAddress.listen(&any, io, .{
+            .kernel_backlog = 1,
+        });
+        const bound = switch (server.socket.address) {
+            .ip4 => |v4| v4.port,
+            else => {
+                var srv_mut = server;
+                srv_mut.deinit(io);
+                return error.SkipZigTest;
+            },
+        };
+        const head_copy = try allocator.dupe(u8, response_head);
+        errdefer allocator.free(head_copy);
+        const body_copy = try allocator.dupe(u8, body);
+        errdefer allocator.free(body_copy);
+        const ctx = try allocator.create(TestHttpHeaderServerCtx);
+        ctx.* = .{
+            .allocator = allocator,
+            .server = server,
+            .head = head_copy,
+            .body = body_copy,
+        };
+        const t = try std.Thread.spawn(.{}, TestHttpHeaderServerCtx.run, .{ctx});
+        return .{ .thread = t, .port = bound };
+    }
+};
+
+const TestHttpHeaderServerCtx = struct {
+    allocator: Allocator,
+    server: std.Io.net.Server,
+    head: []u8,
+    body: []u8,
+
+    fn run(self: *TestHttpHeaderServerCtx) void {
+        defer {
+            self.allocator.free(self.head);
+            self.allocator.free(self.body);
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var srv = self.server;
+            srv.deinit(io);
+            self.allocator.destroy(self);
+        }
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const stream = self.server.accept(io) catch return;
+        defer stream.close(io);
+
+        // Drain request bytes until end-of-headers. The client side
+        // sends a bodyless GET so we don't need to parse
+        // `Content-Length`.
+        var req_buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < req_buf.len) {
+            var dests = [_][]u8{req_buf[total..]};
+            const n = io.vtable.netRead(io.userdata, stream.socket.handle, &dests) catch return;
+            if (n == 0) break;
+            total += n;
+            if (std.mem.indexOf(u8, req_buf[0..total], "\r\n\r\n") != null) break;
+        }
+
+        const head_slices = [_][]const u8{self.head};
+        _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &head_slices, 1) catch return;
+        if (self.body.len > 0) {
+            const body_slices = [_][]const u8{self.body};
+            _ = io.vtable.netWrite(io.userdata, stream.socket.handle, &.{}, &body_slices, 1) catch return;
+        }
+    }
+};
+
+/// Drive an outbound P2 outgoing-handler call against a caller-supplied
+/// `TestHttpHeaderServer` and return the lifted `IncomingResponse` so
+/// the test can inspect its lifted `headers_handle`. Shared scaffolding
+/// for the #583 A4 response-header tests. Caller owns the returned
+/// `IncomingResponse` (still owned by the adapter — freed on
+/// `adapter.deinit()`).
+fn p3HttpFetchAndAwaitResponse(
+    adapter: *WasiCliAdapter,
+    ci: *ComponentInstance,
+    allocator: Allocator,
+    port: u16,
+) !*IncomingResponse {
+    const fields = try allocator.create(HttpFields);
+    fields.* = .{};
+    const fh = try adapter.pushHttpFields(fields);
+
+    const req = try allocator.create(OutgoingRequest);
+    req.* = .{
+        .method_disc = 0, // GET
+        .scheme_disc = 0, // http
+        .authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port}),
+        .path_with_query = try allocator.dupe(u8, "/"),
+        .headers_handle = fh,
+    };
+    const rh = try adapter.pushOutgoingRequest(req);
+
+    const args = [_]InterfaceValue{
+        .{ .handle = rh },
+        .{ .option_val = .{ .is_some = false, .payload = null } },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.httpOutgoingHandlerHandle(adapter, ci, &args, &results, allocator);
+    defer results[0].deinit(allocator);
+
+    if (results[0] != .result_val or !results[0].result_val.is_ok)
+        return error.UnexpectedHandlerResult;
+    const fut_handle = results[0].result_val.payload.?.handle;
+    const fut = adapter.http_future_responses.items[fut_handle].?;
+    p3DrainPendingHttpUntilSettled(adapter, fut, 10_000);
+    if (fut.state != .ready_ok) return error.HttpFetchFailed;
+    return adapter.http_incoming_responses.items[fut.state.ready_ok].?;
+}
+
+test "wasi:http #583 A4: outgoing-handler surfaces single response header" {
+    // Round-trip: GET against a local listener that echoes a single
+    // custom `X-Wamr-Test` header. The lifted `incoming-response`
+    // must report that header through `incoming-response.headers`.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var server = TestHttpHeaderServer.serveLoopback(
+        testing.allocator,
+        "HTTP/1.1 200 OK\r\n" ++
+            "X-Wamr-Test: hello-headers\r\n" ++
+            "Content-Length: 5\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+        "body!",
+    ) catch return error.SkipZigTest;
+
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const ir = try p3HttpFetchAndAwaitResponse(&adapter, &ci, testing.allocator, server.port);
+    server.thread.join();
+
+    try testing.expectEqual(@as(u16, 200), ir.status);
+    try testing.expectEqualStrings("body!", ir.body_data.?);
+
+    // Inspect lifted headers via the public `incoming-response.headers`
+    // accessor (#583 A4) — exactly the path a guest would observe.
+    const hdr_args = [_]InterfaceValue{.{ .handle = 0 }};
+    _ = hdr_args; // shape filled in below
+    var hdr_results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ir_handle: u32 = 0;
+    for (adapter.http_incoming_responses.items, 0..) |maybe, i| {
+        if (maybe == ir) {
+            ir_handle = @intCast(i);
+            break;
+        }
+    }
+    try testing.expect(ir_handle != 0);
+    const get_args = [_]InterfaceValue{.{ .handle = ir_handle }};
+    try WasiCliAdapter.httpIncomingResponseHeaders(&adapter, &ci, &get_args, &hdr_results, testing.allocator);
+    const hf_handle = hdr_results[0].handle;
+    const hf = adapter.lookupHttpFields(hf_handle).?;
+    // Exactly one application-level header survives the
+    // transport-managed strip (`X-Wamr-Test`).
+    try testing.expectEqual(@as(usize, 1), hf.entries.items.len);
+    try testing.expectEqualStrings("X-Wamr-Test", hf.entries.items[0].name);
+    try testing.expectEqualStrings("hello-headers", hf.entries.items[0].value);
+}
+
+test "wasi:http #583 A4: outgoing-handler surfaces multiple response headers in order" {
+    // Multi-header: a listener returning three distinct headers must
+    // round-trip all three through `incoming-response.headers` in the
+    // server's emit order.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var server = TestHttpHeaderServer.serveLoopback(
+        testing.allocator,
+        "HTTP/1.1 201 Created\r\n" ++
+            "X-First: alpha\r\n" ++
+            "Content-Type: text/plain\r\n" ++
+            "X-Second: beta\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+        "",
+    ) catch return error.SkipZigTest;
+
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const ir = try p3HttpFetchAndAwaitResponse(&adapter, &ci, testing.allocator, server.port);
+    server.thread.join();
+
+    try testing.expectEqual(@as(u16, 201), ir.status);
+
+    const hf = adapter.lookupHttpFields(ir.headers_handle).?;
+    // Three application-level headers survive the strip; the two
+    // transport-managed entries (`Content-Length`, `Connection`) are
+    // gone. Wire order is preserved.
+    try testing.expectEqual(@as(usize, 3), hf.entries.items.len);
+    try testing.expectEqualStrings("X-First", hf.entries.items[0].name);
+    try testing.expectEqualStrings("alpha", hf.entries.items[0].value);
+    try testing.expectEqualStrings("Content-Type", hf.entries.items[1].name);
+    try testing.expectEqualStrings("text/plain", hf.entries.items[1].value);
+    try testing.expectEqualStrings("X-Second", hf.entries.items[2].name);
+    try testing.expectEqualStrings("beta", hf.entries.items[2].value);
+}
+
+test "wasi:http #583 A4: outgoing-handler strips transport-managed response headers" {
+    // The WIT spec requires the host to strip transport-managed
+    // headers (Content-Length, Transfer-Encoding, Connection,
+    // Keep-Alive, Trailer, TE, Upgrade, Host) from the lifted
+    // `incoming-response.headers`. Build a response that mixes one
+    // application header with a full set of transport-managed
+    // headers — only the application header must survive.
+    if (!build_options.network_tests) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    var server = TestHttpHeaderServer.serveLoopback(
+        testing.allocator,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Content-Length: 3\r\n" ++
+            "Connection: close\r\n" ++
+            "Keep-Alive: timeout=5\r\n" ++
+            "X-App: kept\r\n" ++
+            "Trailer: X-Foo\r\n" ++
+            "\r\n",
+        "ok!",
+    ) catch return error.SkipZigTest;
+
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = try IpCidr.parse("127.0.0.0/8");
+    adapter.sockets_allow_list_template = allow;
+
+    const ir = try p3HttpFetchAndAwaitResponse(&adapter, &ci, testing.allocator, server.port);
+    server.thread.join();
+
+    try testing.expectEqual(@as(u16, 200), ir.status);
+    try testing.expectEqualStrings("ok!", ir.body_data.?);
+
+    const hf = adapter.lookupHttpFields(ir.headers_handle).?;
+    // Only `X-App` survives — all four transport-managed entries are
+    // stripped by `isTransportManagedHeader`.
+    try testing.expectEqual(@as(usize, 1), hf.entries.items.len);
+    try testing.expectEqualStrings("X-App", hf.entries.items[0].name);
+    try testing.expectEqualStrings("kept", hf.entries.items[0].value);
+    // Sanity-check the strip predicate is case-insensitive — the
+    // server emitted mixed-case headers; case must not affect the
+    // match.
+    for (hf.entries.items) |e| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(e.name, "content-length"));
+        try testing.expect(!std.ascii.eqlIgnoreCase(e.name, "connection"));
+        try testing.expect(!std.ascii.eqlIgnoreCase(e.name, "keep-alive"));
+        try testing.expect(!std.ascii.eqlIgnoreCase(e.name, "trailer"));
+    }
+}
+
+// Pure-helper test for `isTransportManagedHeader` — no network
+// required. Exercises the case-insensitive match and the full set of
+// transport-managed names the WIT spec mandates the host strip.
+// (#583 A4)
+test "wasi:http #583 A4: isTransportManagedHeader matches the spec set case-insensitively" {
+    const testing = std.testing;
+    inline for ([_][]const u8{
+        "content-length", "Content-Length", "CONTENT-LENGTH",
+        "transfer-encoding", "Transfer-Encoding",
+        "connection", "Connection",
+        "keep-alive", "Keep-Alive",
+        "trailer", "Trailer",
+        "te", "TE",
+        "upgrade", "Upgrade",
+        "host", "Host",
+    }) |name| {
+        try testing.expect(isTransportManagedHeader(name));
+    }
+    inline for ([_][]const u8{
+        "content-type",
+        "x-app",
+        "X-Wamr-Test",
+        "authorization",
+        "accept",
+        "",
+    }) |name| {
+        try testing.expect(!isTransportManagedHeader(name));
+    }
 }
 
 test "wasi:http #583 A2: outgoing-handler settles connect-refused as connection_refused" {
