@@ -2789,6 +2789,20 @@ const max_http_header_bytes: usize = 64 * 1024;
 const max_http_body_bytes: usize = 16 * 1024 * 1024;
 const max_http_target_bytes: usize = 8192;
 
+/// HTTP/1.1 incoming-handler limits (#583 A5). The header-section limit
+/// matches Wasmtime's default `max-header-size = 16384` and is enforced
+/// per-request on the live TCP accept path. The body limit aliases
+/// `max_http_body_bytes` so a single 0.3 surface knob covers both.
+const max_http_p3_header_section_bytes: usize = 16 * 1024;
+const max_http_p3_body_bytes: usize = max_http_body_bytes;
+
+/// Keep-alive idle timeout (#583 A5). When a connection is held open
+/// between requests, the next request must arrive within this window
+/// or the server closes the socket. Set just above the WASI testsuite's
+/// own 5s request timeout so a healthy round-trip is never starved by
+/// our own idle cap.
+const http_p3_keep_alive_idle_seconds: i64 = 5;
+
 /// `wasi:http/types.fields`: a multi-map of header name -> value bytes.
 /// Each entry's name and value are owned host-allocated slices, freed
 /// when the slot is dropped or the adapter deinits.
@@ -16770,6 +16784,191 @@ pub const WasiCliAdapter = struct {
         return content_length orelse 0;
     }
 
+    /// Framing info derived from a parsed HTTP/1.1 request header
+    /// block — used by the 0.3 incoming-handler path (#583 A5) to
+    /// decide between Content-Length framing, chunked decoding, and
+    /// whether the connection should stay open for another round trip.
+    const HttpRequestBodyKind = union(enum) {
+        /// No body declared — treat as a zero-length body.
+        none,
+        /// `Content-Length: N` — read exactly N bytes for the body.
+        content_length: usize,
+        /// `Transfer-Encoding: chunked` — stream-decode chunks until
+        /// the terminating `0\r\n\r\n`. Body length is unknown
+        /// up-front and bounded by `max_http_p3_body_bytes`.
+        chunked,
+    };
+    const HttpRequestHeaderInfo = struct {
+        body_kind: HttpRequestBodyKind,
+        /// Connection-scoped keep-alive after this round-trip. HTTP/1.1
+        /// defaults to true (RFC 7230 §6.3) unless `Connection: close`
+        /// is set; HTTP/1.0 defaults to false unless `Connection:
+        /// keep-alive` is set.
+        keep_alive: bool,
+    };
+
+    /// Parse the request-line + headers for framing & keep-alive
+    /// info. Used by `readIncomingRequestP3FromStream` (#583 A5) to
+    /// honor chunked transfer-encoding requests and keep the TCP
+    /// connection alive across multiple round-trips. The mirror
+    /// `httpContentLengthFromHeaderBlock` stays for the 0.2 surface
+    /// where chunked is still unsupported.
+    pub fn httpRequestHeaderInfoFromBlock(header_block: []const u8) !HttpRequestHeaderInfo {
+        var lines = std.mem.splitSequence(u8, header_block, "\r\n");
+        const request_line = lines.next() orelse return error.HttpBadRequest;
+        const is_http_10 = std.mem.endsWith(u8, request_line, " HTTP/1.0");
+
+        var content_length: ?usize = null;
+        var transfer_chunked = false;
+        var seen_other_transfer_coding = false;
+        var keep_alive_hint: ?bool = null;
+
+        while (lines.next()) |line| {
+            if (line.len == 0) break;
+            if (line[0] == ' ' or line[0] == '\t') return error.HttpBadRequest;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.HttpBadRequest;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (name.len == 0) return error.HttpBadRequest;
+            if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                var tokens = std.mem.tokenizeAny(u8, value, ", \t");
+                while (tokens.next()) |tok| {
+                    if (std.ascii.eqlIgnoreCase(tok, "chunked")) {
+                        transfer_chunked = true;
+                    } else if (!std.ascii.eqlIgnoreCase(tok, "identity")) {
+                        seen_other_transfer_coding = true;
+                    }
+                }
+            } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                const parsed = std.fmt.parseInt(usize, value, 10) catch return error.HttpBadRequest;
+                if (content_length) |prev| {
+                    if (prev != parsed) return error.HttpBadRequest;
+                } else {
+                    content_length = parsed;
+                }
+            } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+                var tokens = std.mem.tokenizeAny(u8, value, ", \t");
+                while (tokens.next()) |tok| {
+                    if (std.ascii.eqlIgnoreCase(tok, "close")) {
+                        keep_alive_hint = false;
+                    } else if (std.ascii.eqlIgnoreCase(tok, "keep-alive")) {
+                        keep_alive_hint = true;
+                    }
+                }
+            }
+        }
+        if (seen_other_transfer_coding) return error.HttpUnsupportedTransferCoding;
+
+        // RFC 7230 §3.3.3 rule 3: when both Transfer-Encoding and
+        // Content-Length are present, the latter is ignored (and the
+        // sender is treated as a smuggling attempt). We honor chunked.
+        const body_kind: HttpRequestBodyKind = if (transfer_chunked)
+            .chunked
+        else if (content_length) |n|
+            .{ .content_length = n }
+        else
+            .none;
+
+        const keep_alive = if (keep_alive_hint) |h| h else !is_http_10;
+        return .{ .body_kind = body_kind, .keep_alive = keep_alive };
+    }
+
+    /// Buffered line + exact-bytes reader over an `InputStream`
+    /// (#583 A5). Keep-alive and chunked transfer-encoding need to
+    /// read line-delimited framing then a body whose length depends
+    /// on those lines; this shim absorbs any over-read tail so we
+    /// don't lose bytes between framing and body phases.
+    pub const BufferedLineReader = struct {
+        allocator: Allocator,
+        stream: *streams.InputStream,
+        buf: std.ArrayListUnmanaged(u8) = .empty,
+        pos: usize = 0,
+        /// True once at least one byte has been consumed for the
+        /// current request — used by the keep-alive loop to detect
+        /// "client closed cleanly before sending a new request" vs
+        /// "client tore the connection mid-request".
+        any_bytes_consumed: bool = false,
+
+        fn deinit(self: *BufferedLineReader) void {
+            self.buf.deinit(self.allocator);
+        }
+
+        fn refill(self: *BufferedLineReader) !bool {
+            var tmp: [4096]u8 = undefined;
+            switch (self.stream.read(&tmp)) {
+                .ok => |n| {
+                    if (n == 0) return false;
+                    try self.buf.appendSlice(self.allocator, tmp[0..n]);
+                    return true;
+                },
+                .closed => return false,
+                .err => return error.IoError,
+            }
+        }
+
+        /// Read a single CRLF-terminated line (excluding the CRLF).
+        /// Returns `error.HttpConnectionIdleClose` if the stream
+        /// closes before any byte of this line is read; bubbles
+        /// `error.HttpBadRequest` if it closes mid-line.
+        fn readLine(self: *BufferedLineReader, max_total: usize) ![]const u8 {
+            const start_consumed = self.any_bytes_consumed;
+            while (true) {
+                if (std.mem.indexOfPos(u8, self.buf.items, self.pos, "\r\n")) |idx| {
+                    const line = self.buf.items[self.pos..idx];
+                    self.pos = idx + 2;
+                    self.any_bytes_consumed = true;
+                    return line;
+                }
+                if (self.buf.items.len - self.pos > max_total) return error.HttpRequestHeaderTooLarge;
+                const got = try self.refill();
+                if (!got) {
+                    if (!start_consumed and self.buf.items.len == self.pos) {
+                        return error.HttpConnectionIdleClose;
+                    }
+                    return error.HttpBadRequest;
+                }
+            }
+        }
+
+        /// Read exactly `n` bytes, appending into `dst`.
+        fn readExactAppend(
+            self: *BufferedLineReader,
+            dst: *std.ArrayListUnmanaged(u8),
+            n: usize,
+            max_total: usize,
+        ) !void {
+            var remaining = n;
+            while (remaining > 0) {
+                const avail = self.buf.items.len - self.pos;
+                if (avail > 0) {
+                    const take = @min(avail, remaining);
+                    if (dst.items.len + take > max_total) return error.HttpRequestBodyTooLarge;
+                    try dst.appendSlice(self.allocator, self.buf.items[self.pos..][0..take]);
+                    self.pos += take;
+                    remaining -= take;
+                    self.any_bytes_consumed = true;
+                    continue;
+                }
+                const got = try self.refill();
+                if (!got) return error.HttpBadRequest;
+            }
+        }
+
+        /// Compact the internal buffer (drop already-consumed bytes).
+        /// Called between requests on a keep-alive connection so the
+        /// next round-trip starts from offset 0.
+        fn compact(self: *BufferedLineReader) void {
+            if (self.pos == 0) return;
+            const tail = self.buf.items.len - self.pos;
+            if (tail > 0) {
+                std.mem.copyForwards(u8, self.buf.items[0..tail], self.buf.items[self.pos..]);
+            }
+            self.buf.shrinkRetainingCapacity(tail);
+            self.pos = 0;
+            self.any_bytes_consumed = false;
+        }
+    };
+
     /// Read one complete HTTP/1.1 request from `stream` and create an
     /// `incoming-request` resource. First-slice server mode supports
     /// Content-Length bodies and closes after one response.
@@ -16932,7 +17131,9 @@ pub const WasiCliAdapter = struct {
             405 => "Method Not Allowed",
             413 => "Payload Too Large",
             414 => "URI Too Long",
+            431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
+            501 => "Not Implemented",
             502 => "Bad Gateway",
             503 => "Service Unavailable",
             else => "OK",
@@ -18381,24 +18582,70 @@ pub const WasiCliAdapter = struct {
     /// `http-service` fixture's handler does not surface trailers.
     /// Mirrors `createIncomingRequestFromHttpBytes` for the unified
     /// 0.3 resource. (#570)
+    ///
+    /// Content-Length framing only: a `Transfer-Encoding: chunked`
+    /// request must come through `readIncomingRequestP3FromStream`
+    /// which stream-decodes the chunks into a contiguous body buffer
+    /// before calling the shared `buildHttpRequestP3FromHeaderAndBody`
+    /// builder (#583 A5).
     pub fn createIncomingRequestP3FromHttpBytes(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
         request_bytes: []const u8,
     ) !u32 {
         const header_end = httpHeaderEnd(request_bytes) orelse return error.HttpBadRequest;
-        if (header_end > max_http_header_bytes) return error.HttpRequestHeaderTooLarge;
+        if (header_end > max_http_p3_header_section_bytes) return error.HttpRequestHeaderTooLarge;
         const header_block = request_bytes[0..header_end];
-        const body_len = try httpContentLengthFromHeaderBlock(header_block);
-        if (body_len > max_http_body_bytes) return error.HttpRequestBodyTooLarge;
+        const info = try httpRequestHeaderInfoFromBlock(header_block);
+        const body_len: usize = switch (info.body_kind) {
+            .none => 0,
+            .content_length => |n| n,
+            // Chunked framing requires streaming decode; this
+            // entrypoint only sees flattened bodies.
+            .chunked => return error.HttpUnsupportedTransferCoding,
+        };
+        if (body_len > max_http_p3_body_bytes) return error.HttpRequestBodyTooLarge;
         const total_len = std.math.add(usize, header_end, body_len) catch return error.HttpRequestBodyTooLarge;
         if (request_bytes.len < total_len) return error.HttpBadRequest;
+        const built = try self.buildHttpRequestP3FromHeaderAndBody(
+            ci,
+            header_block,
+            request_bytes[header_end..total_len],
+        );
+        return built.request_handle;
+    }
+
+    /// Outcome of `buildHttpRequestP3FromHeaderAndBody` /
+    /// `readIncomingRequestP3FromStreamWithInfo`. Splits the resource
+    /// handle from the connection-scoped keep-alive flag so the
+    /// caller (`serveOneHttpConnectionP3Stream`) can decide whether
+    /// to loop for another request or close the socket (#583 A5).
+    pub const HttpRequestP3Read = struct {
+        request_handle: u32,
+        keep_alive: bool,
+    };
+
+    /// Build a P3 incoming-request from already-separated header /
+    /// body slices. Shared between the Content-Length and chunked
+    /// request decode paths — the chunked path passes a freshly
+    /// reassembled `body_bytes` slice that no longer carries
+    /// `Transfer-Encoding: chunked` semantics on the wire.
+    fn buildHttpRequestP3FromHeaderAndBody(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        header_block: []const u8,
+        body_bytes: []const u8,
+    ) !HttpRequestP3Read {
+        if (header_block.len < 4 or !std.mem.endsWith(u8, header_block, "\r\n\r\n")) {
+            return error.HttpBadRequest;
+        }
+        const info = try httpRequestHeaderInfoFromBlock(header_block);
 
         // The header block (everything up through the final `\r\n\r\n`)
         // is `header_block`; strip the trailing blank line before
         // splitting so the headers loop doesn't observe an empty
         // sentinel entry. Mirrors `createIncomingRequestFromHttpBytes`.
-        var lines = std.mem.splitSequence(u8, header_block[0 .. header_end - 4], "\r\n");
+        var lines = std.mem.splitSequence(u8, header_block[0 .. header_block.len - 4], "\r\n");
         const request_line = lines.next() orelse return error.HttpBadRequest;
         var tokens = std.mem.tokenizeScalar(u8, request_line, ' ');
         const method = tokens.next() orelse return error.HttpBadRequest;
@@ -18407,7 +18654,9 @@ pub const WasiCliAdapter = struct {
         if (tokens.next() != null) return error.HttpBadRequest;
         if (method.len == 0 or target.len == 0) return error.HttpBadRequest;
         if (target.len > max_http_target_bytes) return error.HttpRequestUriTooLong;
-        if (!std.mem.eql(u8, version, "HTTP/1.1")) return error.HttpBadRequest;
+        if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) {
+            return error.HttpBadRequest;
+        }
 
         const target_parts = splitHttpTarget(target);
         var host_header: ?[]const u8 = null;
@@ -18427,6 +18676,10 @@ pub const WasiCliAdapter = struct {
             const name = std.mem.trim(u8, line[0..colon], " \t");
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
             if (name.len == 0) return error.HttpBadRequest;
+            // Drop transport-managed framing headers from the guest's
+            // view so chunked-decoded requests look identical to a
+            // Content-Length-framed body of the same length (#583 A5).
+            if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) continue;
             const name_copy = try self.allocator.dupe(u8, name);
             const value_copy = self.allocator.dupe(u8, value) catch |err| {
                 self.allocator.free(name_copy);
@@ -18474,8 +18727,8 @@ pub const WasiCliAdapter = struct {
         // = true signals EOF so the first read returns 0 bytes.
         const body_handle = ci.allocAsyncHandle();
         var body_stream: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
-        if (body_len > 0) {
-            body_stream.buffer.appendSlice(ci.allocator, request_bytes[header_end..total_len]) catch |e| {
+        if (body_bytes.len > 0) {
+            body_stream.buffer.appendSlice(ci.allocator, body_bytes) catch |e| {
                 body_stream.deinit(ci.allocator);
                 return e;
             };
@@ -18504,19 +18757,62 @@ pub const WasiCliAdapter = struct {
         method_other = null;
         path_owned = null;
         authority_copy = null;
-        return try self.pushHttpRequestP3(r);
+        const handle = try self.pushHttpRequestP3(r);
+        return .{ .request_handle = handle, .keep_alive = info.keep_alive };
+    }
+
+    /// Stream-decode a `Transfer-Encoding: chunked` body off
+    /// `reader` into `dst`. Each chunk is `<hex-size>[;<ext>]\r\n
+    /// <bytes>\r\n` repeated until the terminating `0\r\n
+    /// [<trailers>]\r\n`. Trailers (if any) are silently consumed —
+    /// the P3 incoming-request resource pre-allocates a unit-ready
+    /// trailers future today so guest-side trailer reads return
+    /// none. (#583 A5)
+    fn readChunkedBody(
+        _: *WasiCliAdapter,
+        reader: *BufferedLineReader,
+        dst: *std.ArrayListUnmanaged(u8),
+        max_total: usize,
+    ) !void {
+        const chunk_size_max_line: usize = 256;
+        while (true) {
+            const size_line = try reader.readLine(chunk_size_max_line);
+            const semi = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+            const size_hex = std.mem.trim(u8, size_line[0..semi], " \t");
+            if (size_hex.len == 0) return error.HttpBadRequest;
+            const chunk_size = std.fmt.parseInt(usize, size_hex, 16) catch return error.HttpBadRequest;
+            if (chunk_size == 0) {
+                // Drain optional trailer field lines until the final
+                // CRLF. We currently discard them — the P3 resource
+                // exposes a ready unit-trailers future to the guest.
+                while (true) {
+                    const tl = try reader.readLine(max_http_p3_header_section_bytes);
+                    if (tl.len == 0) return;
+                }
+            }
+            if (chunk_size > max_total or dst.items.len + chunk_size > max_total) {
+                return error.HttpRequestBodyTooLarge;
+            }
+            try reader.readExactAppend(dst, chunk_size, max_total);
+            const crlf = try reader.readLine(2);
+            if (crlf.len != 0) return error.HttpBadRequest;
+        }
     }
 
     /// Serialize an `HttpResponseP3` (handle) as HTTP/1.1 over the
     /// given output stream. Drains the body `stream<u8>` (if any) into
-    /// a contiguous Content-Length response. Trailers are not yet
-    /// emitted on the wire — the wasi-testsuite `http-service`
-    /// fixture's responses don't carry any. (#570)
+    /// a contiguous response body, then emits either a
+    /// `Content-Length`-framed response (when the guest set
+    /// `Content-Length` in `headers`) or a `Transfer-Encoding: chunked`
+    /// response (when the body length is unknown pre-write). Trailers
+    /// supplied via the guest's `future<option<trailers>>` are lifted
+    /// into the chunked trailer block. (#570 / #583 A5)
     pub fn writeHttpResponseP3FromHandle(
         self: *WasiCliAdapter,
         out: *streams.OutputStream,
         ci: *ComponentInstance,
         response_handle: u32,
+        keep_alive: bool,
     ) !void {
         const response = self.lookupHttpResponseP3(response_handle) orelse {
             return self.writeHttpSimpleResponse(out, 500, "invalid response handle\n");
@@ -18535,14 +18831,16 @@ pub const WasiCliAdapter = struct {
         const body: []const u8 = if (body_owned) |b| b else "";
 
         // Validate response header name/value bytes before emitting.
-        // Skip transport-managed headers (we set Content-Length and
-        // Connection: close ourselves).
+        // Skip transport-managed headers (we set Content-Length /
+        // Transfer-Encoding / Connection / Trailer ourselves).
         const response_fields = self.lookupHttpFields(response.headers_handle);
+        var guest_set_content_length = false;
         if (response_fields) |fields| {
             for (fields.entries.items) |entry| {
-                if (std.ascii.eqlIgnoreCase(entry.name, "content-length") or
-                    std.ascii.eqlIgnoreCase(entry.name, "connection"))
-                {
+                if (isHopByHopOrFramingHeader(entry.name)) {
+                    if (std.ascii.eqlIgnoreCase(entry.name, "content-length")) {
+                        guest_set_content_length = true;
+                    }
                     continue;
                 }
                 if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) {
@@ -18550,6 +18848,24 @@ pub const WasiCliAdapter = struct {
                 }
             }
         }
+
+        // Extract optional guest-supplied trailer fields out of the
+        // trailers future payload. `payload == null` (the ready-unit
+        // future from `allocReadyUnitFuture`) is the no-trailers fast
+        // path; a `some(<fields_handle>)` payload lifts into the
+        // chunked trailer block.
+        const trailer_fields = self.lookupTrailerFieldsFromFuture(ci, response.trailers_future_handle);
+        const has_trailer_entries = if (trailer_fields) |tf| tf.entries.items.len > 0 else false;
+        const has_body_stream = response.body_stream_handle != null;
+
+        // Frame selection: prefer identity framing when the guest's
+        // headers carry a Content-Length, or when there is no body
+        // stream and no trailers to emit. Switch to chunked when the
+        // body length is unknown pre-write (no Content-Length) or
+        // when guest-supplied trailers need to be carried in the
+        // trailer block (RFC 7230 §4.1.2 forbids trailers on
+        // identity-framed responses). (#583 A5)
+        const use_chunked = has_trailer_entries or (has_body_stream and !guest_set_content_length);
 
         const status_line = try std.fmt.allocPrint(
             self.allocator,
@@ -18561,11 +18877,7 @@ pub const WasiCliAdapter = struct {
 
         if (response_fields) |fields| {
             for (fields.entries.items) |entry| {
-                if (std.ascii.eqlIgnoreCase(entry.name, "content-length") or
-                    std.ascii.eqlIgnoreCase(entry.name, "connection"))
-                {
-                    continue;
-                }
+                if (isHopByHopOrFramingHeader(entry.name)) continue;
                 const line = try std.fmt.allocPrint(
                     self.allocator,
                     "{s}: {s}\r\n",
@@ -18576,59 +18888,182 @@ pub const WasiCliAdapter = struct {
             }
         }
 
-        const trailer = try std.fmt.allocPrint(
-            self.allocator,
-            "Content-Length: {d}\r\nConnection: close\r\n\r\n",
-            .{body.len},
-        );
-        defer self.allocator.free(trailer);
-        try self.writeAllOutputStream(out, trailer);
-        try self.writeAllOutputStream(out, body);
+        // Per RFC 7230 §4.4, a `Trailer:` header must declare the
+        // names that will appear after the body. Generate one
+        // listing every trailer key so downstream caches can decide
+        // whether they need to keep them.
+        if (trailer_fields) |tf| {
+            if (tf.entries.items.len > 0) {
+                var trailer_decl: std.ArrayListUnmanaged(u8) = .empty;
+                defer trailer_decl.deinit(self.allocator);
+                try trailer_decl.appendSlice(self.allocator, "Trailer: ");
+                var first = true;
+                for (tf.entries.items) |entry| {
+                    if (isHopByHopOrFramingHeader(entry.name)) continue;
+                    if (!first) try trailer_decl.appendSlice(self.allocator, ", ");
+                    try trailer_decl.appendSlice(self.allocator, entry.name);
+                    first = false;
+                }
+                try trailer_decl.appendSlice(self.allocator, "\r\n");
+                if (!first) try self.writeAllOutputStream(out, trailer_decl.items);
+            }
+        }
+
+        const framing = if (use_chunked) "Transfer-Encoding: chunked\r\n" else "";
+        const connection_header = if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n";
+
+        if (use_chunked) {
+            try self.writeAllOutputStream(out, framing);
+            try self.writeAllOutputStream(out, connection_header);
+            try self.writeAllOutputStream(out, "\r\n");
+            if (body.len > 0) {
+                const size_line = try std.fmt.allocPrint(self.allocator, "{x}\r\n", .{body.len});
+                defer self.allocator.free(size_line);
+                try self.writeAllOutputStream(out, size_line);
+                try self.writeAllOutputStream(out, body);
+                try self.writeAllOutputStream(out, "\r\n");
+            }
+            try self.writeAllOutputStream(out, "0\r\n");
+            if (trailer_fields) |tf| {
+                for (tf.entries.items) |entry| {
+                    if (isHopByHopOrFramingHeader(entry.name)) continue;
+                    if (!httpHeaderNameValid(entry.name) or !httpHeaderValueValid(entry.value)) continue;
+                    const tl = try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}: {s}\r\n",
+                        .{ entry.name, entry.value },
+                    );
+                    defer self.allocator.free(tl);
+                    try self.writeAllOutputStream(out, tl);
+                }
+            }
+            try self.writeAllOutputStream(out, "\r\n");
+        } else {
+            const trailer = try std.fmt.allocPrint(
+                self.allocator,
+                "Content-Length: {d}\r\n{s}\r\n",
+                .{ body.len, connection_header },
+            );
+            defer self.allocator.free(trailer);
+            try self.writeAllOutputStream(out, trailer);
+            try self.writeAllOutputStream(out, body);
+        }
+    }
+
+    /// Names that the HTTP/1.1 transport layer manages itself —
+    /// guests must not be allowed to set these directly on a
+    /// `wasi:http/types.fields` and have us emit them on the wire,
+    /// or smuggling / framing-confusion bugs become possible (#583
+    /// A5). Trailers passing through `writeHttpResponseP3FromHandle`
+    /// are filtered through the same predicate so a guest can't
+    /// stuff a `Content-Length` into the trailer block.
+    fn isHopByHopOrFramingHeader(name: []const u8) bool {
+        const names = [_][]const u8{
+            "connection",         "keep-alive",
+            "transfer-encoding",  "content-length",
+            "trailer",            "upgrade",
+            "proxy-authenticate", "proxy-authorization",
+            "te",                 "host",
+        };
+        for (names) |n| {
+            if (std.ascii.eqlIgnoreCase(name, n)) return true;
+        }
+        return false;
+    }
+
+    /// Decode the trailers `future<option<own<trailers>>>`'s
+    /// canonical-ABI payload into a borrowed `*HttpFields` pointer
+    /// when the guest wrote `some(<fields_handle>)`. Returns `null`
+    /// for the no-trailers fast path (no payload set, or `none`
+    /// discriminant). Mirrors the canon-ABI layout of `option<T>`:
+    /// 1-byte discriminant + 3 bytes of padding + 4-byte handle.
+    fn lookupTrailerFieldsFromFuture(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        future_handle: u32,
+    ) ?*HttpFields {
+        const fut = ci.futures.getPtr(future_handle) orelse return null;
+        const payload = fut.payload orelse return null;
+        if (payload.len < 8) return null;
+        if (payload[0] != 1) return null; // none
+        const handle = std.mem.readInt(u32, payload[4..8], .little);
+        return self.lookupHttpFields(handle);
     }
 
     /// Read a complete HTTP request from `stream`, build an
     /// `HttpRequestP3`, and return its handle. Used by both the live
     /// accept loop (`serveOneHttpConnectionP3`) and unit tests.
-    /// Bounded by `max_http_header_bytes` / `max_http_body_bytes` —
-    /// oversized requests trap with the corresponding error so the
-    /// caller can lower a 413/431 response without dispatching the
-    /// guest. (#570)
+    /// Bounded by `max_http_p3_header_section_bytes` /
+    /// `max_http_p3_body_bytes` — oversized requests trap with the
+    /// corresponding error so the caller can lower a 413 / 431
+    /// response without dispatching the guest. Honors chunked
+    /// transfer-encoding and the Connection header so the
+    /// `serveOneHttpConnectionP3Stream` keep-alive loop knows
+    /// whether to read another request after the response. (#570 /
+    /// #583 A5)
     pub fn readIncomingRequestP3FromStream(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
         stream: *streams.InputStream,
-    ) !u32 {
-        var bytes: std.ArrayListUnmanaged(u8) = .empty;
-        defer bytes.deinit(self.allocator);
+    ) !HttpRequestP3Read {
+        var reader: BufferedLineReader = .{ .allocator = self.allocator, .stream = stream };
+        defer reader.deinit();
+        return self.readIncomingRequestP3FromBufferedReader(ci, &reader);
+    }
 
-        var header_end: ?usize = null;
-        var tmp: [4096]u8 = undefined;
-        while (header_end == null) {
-            const n = switch (stream.read(&tmp)) {
-                .ok => |count| count,
-                .closed => return error.HttpBadRequest,
-                .err => return error.IoError,
-            };
-            try bytes.appendSlice(self.allocator, tmp[0..n]);
-            if (bytes.items.len > max_http_header_bytes) return error.HttpRequestHeaderTooLarge;
-            header_end = httpHeaderEnd(bytes.items);
+    /// Sibling of `readIncomingRequestP3FromStream` that reuses a
+    /// caller-owned `BufferedLineReader` so any over-read tail
+    /// (pipelined requests, residual chunked trailers) carries
+    /// across keep-alive round-trips. Internal to
+    /// `serveOneHttpConnectionP3Stream`.
+    pub fn readIncomingRequestP3FromBufferedReader(
+        self: *WasiCliAdapter,
+        ci: *ComponentInstance,
+        reader: *BufferedLineReader,
+    ) !HttpRequestP3Read {
+        // Reset the per-request "have we consumed any bytes yet"
+        // flag so the very-first `readLine` can surface a clean
+        // idle-close to the keep-alive caller when the client
+        // closes between requests (#583 A5).
+        reader.any_bytes_consumed = false;
+
+        // Accumulate header block lines into a fresh buffer so the
+        // parser can run against contiguous `\r\n`-delimited bytes
+        // ending in the conventional blank-line terminator.
+        var hdr_bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer hdr_bytes.deinit(self.allocator);
+
+        // First line — surface idle-close cleanly so the keep-alive
+        // loop can exit without writing a response.
+        const first_line = try reader.readLine(max_http_p3_header_section_bytes);
+        try hdr_bytes.appendSlice(self.allocator, first_line);
+        try hdr_bytes.appendSlice(self.allocator, "\r\n");
+
+        while (true) {
+            const line = try reader.readLine(max_http_p3_header_section_bytes);
+            try hdr_bytes.appendSlice(self.allocator, line);
+            try hdr_bytes.appendSlice(self.allocator, "\r\n");
+            if (line.len == 0) break;
+            if (hdr_bytes.items.len > max_http_p3_header_section_bytes) return error.HttpRequestHeaderTooLarge;
+        }
+        if (hdr_bytes.items.len > max_http_p3_header_section_bytes) return error.HttpRequestHeaderTooLarge;
+
+        const info = try httpRequestHeaderInfoFromBlock(hdr_bytes.items);
+
+        var body_bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_bytes.deinit(self.allocator);
+        switch (info.body_kind) {
+            .none => {},
+            .content_length => |n| {
+                if (n > max_http_p3_body_bytes) return error.HttpRequestBodyTooLarge;
+                try reader.readExactAppend(&body_bytes, n, max_http_p3_body_bytes);
+            },
+            .chunked => {
+                try self.readChunkedBody(reader, &body_bytes, max_http_p3_body_bytes);
+            },
         }
 
-        const end = header_end.?;
-        const body_len = try httpContentLengthFromHeaderBlock(bytes.items[0..end]);
-        if (body_len > max_http_body_bytes) return error.HttpRequestBodyTooLarge;
-        const total_len = std.math.add(usize, end, body_len) catch return error.HttpRequestBodyTooLarge;
-        while (bytes.items.len < total_len) {
-            const n = switch (stream.read(&tmp)) {
-                .ok => |count| count,
-                .closed => return error.HttpBadRequest,
-                .err => return error.IoError,
-            };
-            try bytes.appendSlice(self.allocator, tmp[0..n]);
-            if (bytes.items.len > total_len) break;
-        }
-        if (bytes.items.len < total_len) return error.HttpBadRequest;
-        return self.createIncomingRequestP3FromHttpBytes(ci, bytes.items[0..total_len]);
+        return self.buildHttpRequestP3FromHeaderAndBody(ci, hdr_bytes.items, body_bytes.items);
     }
 
     /// Free every per-connection P3 resource (`HttpRequestP3`,
@@ -18669,11 +19104,13 @@ pub const WasiCliAdapter = struct {
     }
 
     /// Drive a single accepted connection through the P3 incoming
-    /// handler. Parses the HTTP/1.1 request bytes into an
-    /// `HttpRequestP3`, dispatches `incoming-handler.handle` via
-    /// the async-lifted ABI, then serializes the resulting
-    /// `result<response, error-code>` back to the socket and closes
-    /// it. (#570)
+    /// handler. Loops while `Connection: keep-alive` semantics allow,
+    /// parsing each HTTP/1.1 request into an `HttpRequestP3`,
+    /// dispatching `incoming-handler.handle` via the async-lifted
+    /// ABI, then serializing the resulting `result<response,
+    /// error-code>` back to the socket. Closes the socket on
+    /// `Connection: close`, idle-stream close, parse error, or
+    /// dispatch trap (graceful 503). (#570 / #583 A5)
     pub fn serveOneHttpConnectionP3Stream(
         self: *WasiCliAdapter,
         ci: *ComponentInstance,
@@ -18681,25 +19118,50 @@ pub const WasiCliAdapter = struct {
         input: *streams.InputStream,
         output: *streams.OutputStream,
     ) void {
-        defer self.cleanupHttpResourcesAllVersions();
+        var reader: BufferedLineReader = .{ .allocator = self.allocator, .stream = input };
+        defer reader.deinit();
 
-        const request_handle = self.readIncomingRequestP3FromStream(ci, input) catch |err| {
-            self.writeHttpSimpleResponse(output, statusForRequestReadError(err), "bad request\n") catch {};
-            return;
-        };
+        while (true) {
+            const parsed = self.readIncomingRequestP3FromBufferedReader(ci, &reader) catch |err| {
+                if (err == error.HttpConnectionIdleClose) {
+                    // Client closed cleanly between requests — no
+                    // response, just exit.
+                    return;
+                }
+                self.writeHttpSimpleResponse(
+                    output,
+                    statusForRequestReadError(err),
+                    "bad request\n",
+                ) catch {};
+                return;
+            };
 
-        const outcome = self.dispatchHttpHandlerP3(ci, handler_name, request_handle, self.allocator) catch {
-            self.writeHttpSimpleResponse(output, 500, "handler trapped\n") catch {};
-            return;
-        };
+            const outcome = self.dispatchHttpHandlerP3(ci, handler_name, parsed.request_handle, self.allocator) catch {
+                // Dispatch trapped — graceful 503 instead of
+                // propagating up to the accept loop (#583 A5).
+                self.writeHttpSimpleResponse(output, 503, "service unavailable\n") catch {};
+                return;
+            };
 
-        if (!outcome.is_ok) {
-            const code: u16 = httpStatusFromError(outcome.payload);
-            self.writeHttpSimpleResponse(output, code, "handler returned error\n") catch {};
-            return;
+            if (!outcome.is_ok) {
+                const code: u16 = httpStatusFromError(outcome.payload);
+                // Errored responses always close — the error code
+                // semantics imply the connection state is suspect.
+                self.writeHttpSimpleResponse(output, code, "handler returned error\n") catch {};
+                return;
+            }
+
+            self.writeHttpResponseP3FromHandle(output, ci, outcome.payload, parsed.keep_alive) catch {};
+
+            // Per-request resource tables are owned by the handler
+            // dispatch — reset them so the next round-trip starts
+            // from clean handle tables. Streams/futures registered
+            // on the component instance persist for the connection;
+            // each request allocates fresh ones.
+            self.cleanupHttpResourcesAllVersions();
+            if (!parsed.keep_alive) return;
+            reader.compact();
         }
-
-        self.writeHttpResponseP3FromHandle(output, ci, outcome.payload) catch {};
     }
 
     /// Register `wasi:http/types@0.3.0-*` (#487).
@@ -20223,16 +20685,31 @@ fn serveOneHttpConnection(
 /// canonical ABI and writes the resulting `result<response,
 /// error-code>` back to the socket. Connection is closed by the
 /// caller (`defer accepted.close(io)` in `serveLoadedHttpComponent`)
-/// once this function returns. (#570)
+/// once this function returns. Honors HTTP/1.1 keep-alive — the
+/// inner `serveOneHttpConnectionP3Stream` loops over multiple
+/// requests until a `Connection: close` is negotiated, the client
+/// closes cleanly, or `SO_RCVTIMEO` fires. (#570 / #583 A5)
 fn serveOneHttpConnectionP3(
     adapter: *WasiCliAdapter,
     inst: *ComponentInstance,
     handler_name: []const u8,
     accepted: std.Io.net.Stream,
 ) void {
+    setKeepAliveIdleTimeout(accepted.socket.handle, http_p3_keep_alive_idle_seconds);
     var input = streams.InputStream.fromTcpStream(accepted.socket.handle);
     var output = streams.OutputStream.toTcpStream(accepted.socket.handle);
     adapter.serveOneHttpConnectionP3Stream(inst, handler_name, &input, &output);
+}
+
+/// Set a per-socket `SO_RCVTIMEO` so the keep-alive read between
+/// requests doesn't park forever (#583 A5). Linux/POSIX-only — on
+/// Windows the listener path is gated behind the same builtin
+/// check, and the conformance suite isn't run there.
+fn setKeepAliveIdleTimeout(fd: std.posix.fd_t, seconds: i64) void {
+    if (builtin.target.os.tag == .windows) return;
+    const tv = std.posix.timeval{ .sec = seconds, .usec = 0 };
+    const bytes = std.mem.asBytes(&tv);
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, bytes) catch {};
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -33356,15 +33833,19 @@ test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle emits status line + he
     var out = streams.OutputStream.toBuffer();
     defer out.deinit(testing.allocator);
 
-    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle);
+    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle, false);
 
     const written = out.getBufferContents();
-    // Status-line + standard headers + body.
+    // Status-line + standard headers + chunked-framed body. The
+    // guest did not set Content-Length, so the writer falls back
+    // to Transfer-Encoding: chunked (#583 A5).
     try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.indexOf(u8, written, "content-type: text/plain\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, written, "Content-Length: 4\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, written, "Connection: close\r\n") != null);
-    try testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhey\n"));
+    // One non-zero chunk + the terminating 0-chunk with no trailers.
+    try testing.expect(std.mem.indexOf(u8, written, "\r\n4\r\nhey\n\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, written, "0\r\n\r\n"));
 }
 
 test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle handles 404 + empty body" {
@@ -33404,7 +33885,7 @@ test "wasi:http@0.3 (#570): writeHttpResponseP3FromHandle handles 404 + empty bo
     var out = streams.OutputStream.toBuffer();
     defer out.deinit(testing.allocator);
 
-    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle);
+    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle, false);
 
     const written = out.getBufferContents();
     try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 404 Not Found\r\n"));
@@ -33626,8 +34107,13 @@ test "wasi:http@0.3 (#570): readIncomingRequestP3FromStream parses an HTTP/1.1 r
 
     const wire = "GET /probe HTTP/1.1\r\nHost: example.com\r\nUser-Agent: probe/1\r\n\r\n";
     var input = streams.InputStream.fromBuffer(wire);
-    const rh = try adapter.readIncomingRequestP3FromStream(&ci, &input);
+    const parsed = try adapter.readIncomingRequestP3FromStream(&ci, &input);
+    const rh = parsed.request_handle;
     try testing.expectEqual(@as(u32, 1), rh);
+    // HTTP/1.1 default is keep-alive (#583 A5) — the request line
+    // bears no `Connection: close` so the keep-alive loop should
+    // expect another round-trip.
+    try testing.expect(parsed.keep_alive);
 
     const req = adapter.lookupHttpRequestP3(rh).?;
     try testing.expectEqual(@as(u8, 0), req.method_disc); // GET
@@ -33640,5 +34126,371 @@ test "wasi:http@0.3 (#570): readIncomingRequestP3FromStream parses an HTTP/1.1 r
     const body = ci.streams.getPtr(body_h).?;
     try testing.expect(body.write_closed);
     try testing.expectEqual(@as(usize, 0), body.buffer.items.len);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// wasi:http@0.3.0 incoming-handler robustness (#583 A5) unit tests
+// ───────────────────────────────────────────────────────────────────
+
+test "wasi:http@0.3 (#583 A5): keep-alive serves two sequential GETs off one stream" {
+    // Two HTTP/1.1 GETs concatenated on the same buffered InputStream
+    // — the keep-alive path must parse them as two independent
+    // requests without losing any bytes between them. The "live"
+    // counterpart of this is `serveOneHttpConnectionP3Stream` running
+    // on top of an accepted TCP socket; here we drive
+    // `readIncomingRequestP3FromStream` directly across the same
+    // underlying stream so the test stays hermetic.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const wire =
+        "GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n" ++
+        "GET /two HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    var input = streams.InputStream.fromBuffer(wire);
+    var reader: WasiCliAdapter.BufferedLineReader = .{ .allocator = adapter.allocator, .stream = &input };
+    defer reader.deinit();
+
+    const first = try adapter.readIncomingRequestP3FromBufferedReader(&ci, &reader);
+    try testing.expect(first.keep_alive); // default for HTTP/1.1
+    const r1 = adapter.lookupHttpRequestP3(first.request_handle).?;
+    try testing.expectEqualStrings("/one", r1.path_with_query.?);
+
+    // The keep-alive loop calls `compact` between rounds — exercise
+    // the same surface so over-read bytes survive into the next
+    // request parse.
+    reader.compact();
+
+    const second = try adapter.readIncomingRequestP3FromBufferedReader(&ci, &reader);
+    try testing.expect(!second.keep_alive); // honored `Connection: close`
+    const r2 = adapter.lookupHttpRequestP3(second.request_handle).?;
+    try testing.expectEqualStrings("/two", r2.path_with_query.?);
+
+    // After the second request, the buffer is exhausted — the next
+    // attempt must surface as a clean idle-close so the keep-alive
+    // loop exits without writing a response.
+    const err = adapter.readIncomingRequestP3FromBufferedReader(&ci, &reader);
+    try testing.expectError(error.HttpConnectionIdleClose, err);
+}
+
+test "wasi:http@0.3 (#583 A5): chunked request body lifts into a single contiguous guest stream" {
+    // RFC 7230 §4.1: each chunk is `<hex>\r\n<bytes>\r\n` with a
+    // terminating `0\r\n\r\n`. The chunked decoder reassembles the
+    // chunks into a contiguous body buffer, then hands the bytes to
+    // the guest via the same `stream<u8>` rendezvous a
+    // Content-Length-framed body would use. (#583 A5)
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const wire =
+        "POST /upload HTTP/1.1\r\n" ++
+        "Host: api.example\r\n" ++
+        "Transfer-Encoding: chunked\r\n" ++
+        "\r\n" ++
+        "5\r\nhello\r\n" ++
+        "1\r\n \r\n" ++
+        "7\r\nworld!\n\r\n" ++
+        "0\r\n\r\n";
+    var input = streams.InputStream.fromBuffer(wire);
+    const parsed = try adapter.readIncomingRequestP3FromStream(&ci, &input);
+    const r = adapter.lookupHttpRequestP3(parsed.request_handle).?;
+    try testing.expectEqual(@as(u32, 2), r.method_disc); // POST
+    try testing.expectEqualStrings("/upload", r.path_with_query.?);
+    const body = ci.streams.getPtr(r.body_stream_handle.?).?;
+    try testing.expectEqualStrings("hello world!\n", body.buffer.items);
+    try testing.expect(body.write_closed);
+
+    // `Transfer-Encoding` header is transport-managed and must be
+    // stripped from the guest-visible field set so the guest can't
+    // tell whether the request was chunked-framed or
+    // Content-Length-framed.
+    const fields = adapter.lookupHttpFields(r.headers_handle).?;
+    for (fields.entries.items) |entry| {
+        try testing.expect(!std.ascii.eqlIgnoreCase(entry.name, "transfer-encoding"));
+    }
+}
+
+test "wasi:http@0.3 (#583 A5): response with no Content-Length emits Transfer-Encoding: chunked" {
+    // Guest writes a `stream<u8>` body without setting a
+    // `Content-Length` header — the writer must fall back to chunked
+    // encoding (RFC 7230 §3.3.1) so the receiver can parse the body
+    // without an explicit length up-front. (#583 A5)
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const ct_name = try testing.allocator.dupe(u8, "content-type");
+    const ct_value = try testing.allocator.dupe(u8, "application/octet-stream");
+    try fields.entries.append(testing.allocator, .{ .name = ct_name, .value = ct_value });
+    const fields_handle = try adapter.pushHttpFields(fields);
+
+    const body_handle = ci.allocAsyncHandle();
+    var body: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+    try body.buffer.appendSlice(testing.allocator, "streamed payload");
+    body.write_closed = true;
+    try ci.streams.put(testing.allocator, body_handle, body);
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+    const tx_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, tx_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const resp = try testing.allocator.create(HttpResponseP3);
+    resp.* = .{
+        .status = 200,
+        .headers_handle = fields_handle,
+        .body_stream_handle = body_handle,
+        .trailers_future_handle = trailers_h,
+        .transmission_future_handle = tx_h,
+    };
+    const resp_handle = try adapter.pushHttpResponseP3(resp);
+
+    var out = streams.OutputStream.toBuffer();
+    defer out.deinit(testing.allocator);
+
+    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle, true);
+
+    const written = out.getBufferContents();
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "Connection: keep-alive\r\n") != null);
+    // No `Content-Length` is emitted when the body is chunked.
+    try testing.expect(std.mem.indexOf(u8, written, "Content-Length:") == null);
+    // Single chunk for "streamed payload" (16 bytes = 0x10).
+    try testing.expect(std.mem.indexOf(u8, written, "\r\n10\r\nstreamed payload\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, written, "0\r\n\r\n"));
+}
+
+test "wasi:http@0.3 (#583 A5): guest trailers ride through the chunked trailer block" {
+    // The trailers future's payload encodes `some(<fields_handle>)`
+    // as canon-ABI `option<own<trailers>>` — 1-byte discriminant +
+    // 3 bytes padding + 4 byte handle. When non-empty, the writer
+    // emits each trailer entry after the terminating `0\r\n` chunk.
+    // (#583 A5)
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    // Response headers (no Content-Length → chunked path will fire
+    // automatically). The trailer field set sits in a separate
+    // `HttpFields` slot referenced by the trailers future payload.
+    const headers_fields = try testing.allocator.create(HttpFields);
+    headers_fields.* = .{};
+    const headers_handle = try adapter.pushHttpFields(headers_fields);
+
+    const trailer_fields = try testing.allocator.create(HttpFields);
+    trailer_fields.* = .{};
+    const t_name = try testing.allocator.dupe(u8, "x-custom");
+    const t_value = try testing.allocator.dupe(u8, "foo");
+    try trailer_fields.entries.append(testing.allocator, .{ .name = t_name, .value = t_value });
+    const trailer_fields_handle = try adapter.pushHttpFields(trailer_fields);
+
+    const body_handle = ci.allocAsyncHandle();
+    var body: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+    try body.buffer.appendSlice(testing.allocator, "abc");
+    body.write_closed = true;
+    try ci.streams.put(testing.allocator, body_handle, body);
+
+    // Simulate what a `future.write` of `some(<handle>)` would have
+    // deposited in the trailers future's `payload` (8 bytes:
+    // 1-byte discriminant `1` for `some`, 3 padding bytes, then
+    // the u32 handle in little-endian).
+    const trailers_payload = try testing.allocator.alloc(u8, 8);
+    trailers_payload[0] = 1;
+    trailers_payload[1] = 0;
+    trailers_payload[2] = 0;
+    trailers_payload[3] = 0;
+    std.mem.writeInt(u32, trailers_payload[4..8], trailer_fields_handle, .little);
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0,
+        .state = .ready,
+        .write_closed = true,
+        .payload = trailers_payload,
+    });
+    const tx_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, tx_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const resp = try testing.allocator.create(HttpResponseP3);
+    resp.* = .{
+        .status = 200,
+        .headers_handle = headers_handle,
+        .body_stream_handle = body_handle,
+        .trailers_future_handle = trailers_h,
+        .transmission_future_handle = tx_h,
+    };
+    const resp_handle = try adapter.pushHttpResponseP3(resp);
+
+    var out = streams.OutputStream.toBuffer();
+    defer out.deinit(testing.allocator);
+
+    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle, false);
+
+    const written = out.getBufferContents();
+    // `Trailer:` declaration header announces the names that will
+    // appear in the trailer block (RFC 7230 §4.4).
+    try testing.expect(std.mem.indexOf(u8, written, "Trailer: x-custom\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding: chunked\r\n") != null);
+    // Single chunk for "abc" (3 = 0x3), then the trailer block.
+    try testing.expect(std.mem.indexOf(u8, written, "\r\n3\r\nabc\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, written, "0\r\nx-custom: foo\r\n\r\n"));
+}
+
+test "wasi:http@0.3 (#583 A5): oversize header section short-circuits with 431 without dispatch" {
+    // RFC 7230 §3.2.5 doesn't mandate a limit, but in practice 16
+    // KiB matches Wasmtime's default. The wamr server returns 431
+    // before consulting the guest dispatcher so a hostile client
+    // can't trigger expensive lifting of an attacker-supplied
+    // header section. (#583 A5)
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    // Build a request whose header block alone is ~24 KiB — well
+    // past `max_http_p3_header_section_bytes` (16 KiB) but still
+    // small enough that the test stays under the std.testing
+    // allocator's bookkeeping bound.
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    try wire.appendSlice(testing.allocator, "GET / HTTP/1.1\r\nHost: example.com\r\n");
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var name_buf: [40]u8 = undefined;
+        const line = try std.fmt.bufPrint(&name_buf, "X-Pad-{d:0>4}: ", .{i});
+        try wire.appendSlice(testing.allocator, line);
+        try wire.appendSlice(testing.allocator, "A" ** 100);
+        try wire.appendSlice(testing.allocator, "\r\n");
+    }
+    try wire.appendSlice(testing.allocator, "\r\n");
+    try testing.expect(wire.items.len > max_http_p3_header_section_bytes);
+
+    var input = streams.InputStream.fromBuffer(wire.items);
+    const err = adapter.readIncomingRequestP3FromStream(&ci, &input);
+    try testing.expectError(error.HttpRequestHeaderTooLarge, err);
+
+    // No P3 request resource may have been registered — the slot-0
+    // reservation only happens on a successful push, so the table
+    // is still empty after a parse short-circuit.
+    var nonzero_request_slots: usize = 0;
+    for (adapter.http_requests_p3.items) |slot| {
+        if (slot != null) nonzero_request_slots += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), nonzero_request_slots);
+
+    // statusForRequestReadError maps the parse error onto 431 so the
+    // accept loop emits `HTTP/1.1 431 Request Header Fields Too
+    // Large` without dispatching the guest.
+    try testing.expectEqual(@as(u16, 431), statusForRequestReadError(error.HttpRequestHeaderTooLarge));
+}
+
+test "wasi:http@0.3 (#583 A5): chunked response with Content-Length header still uses identity framing" {
+    // When the guest sets `Content-Length`, the writer must keep
+    // identity framing — chunked is only the fallback for
+    // unknown-length bodies. Mirrors the wasi-testsuite
+    // `http-service` `GET /` arm which sets content-length
+    // explicitly for the `hey\n` body.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci = p3HttpTestCi(testing.allocator);
+    defer p3HttpTestCiDeinit(&ci);
+
+    const fields = try testing.allocator.create(HttpFields);
+    fields.* = .{};
+    const cl_name = try testing.allocator.dupe(u8, "content-length");
+    const cl_value = try testing.allocator.dupe(u8, "5");
+    try fields.entries.append(testing.allocator, .{ .name = cl_name, .value = cl_value });
+    const fields_handle = try adapter.pushHttpFields(fields);
+
+    const body_handle = ci.allocAsyncHandle();
+    var body: async_mod.AsyncStream = .{ .elem_type_idx = 0 };
+    try body.buffer.appendSlice(testing.allocator, "hello");
+    body.write_closed = true;
+    try ci.streams.put(testing.allocator, body_handle, body);
+
+    const trailers_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, trailers_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+    const tx_h = ci.allocAsyncHandle();
+    try ci.futures.put(testing.allocator, tx_h, .{
+        .elem_type_idx = 0, .state = .ready, .write_closed = true,
+    });
+
+    const resp = try testing.allocator.create(HttpResponseP3);
+    resp.* = .{
+        .status = 200,
+        .headers_handle = fields_handle,
+        .body_stream_handle = body_handle,
+        .trailers_future_handle = trailers_h,
+        .transmission_future_handle = tx_h,
+    };
+    const resp_handle = try adapter.pushHttpResponseP3(resp);
+
+    var out = streams.OutputStream.toBuffer();
+    defer out.deinit(testing.allocator);
+
+    try adapter.writeHttpResponseP3FromHandle(&out, &ci, resp_handle, true);
+
+    const written = out.getBufferContents();
+    try testing.expect(std.mem.startsWith(u8, written, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, written, "Content-Length: 5\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "Transfer-Encoding:") == null);
+    try testing.expect(std.mem.indexOf(u8, written, "Connection: keep-alive\r\n") != null);
+    try testing.expect(std.mem.endsWith(u8, written, "\r\n\r\nhello"));
+}
+
+test "wasi:http@0.3 (#583 A5): httpRequestHeaderInfoFromBlock detects keep-alive default and Connection: close" {
+    // Unit-tests the small header-info helper so the upstream
+    // parsing surface stays orthogonal to the streaming reader.
+    const testing = std.testing;
+
+    const default_keepalive = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    const info1 = try WasiCliAdapter.httpRequestHeaderInfoFromBlock(default_keepalive);
+    try testing.expect(info1.keep_alive);
+
+    const explicit_close = "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+    const info2 = try WasiCliAdapter.httpRequestHeaderInfoFromBlock(explicit_close);
+    try testing.expect(!info2.keep_alive);
+
+    const explicit_keepalive = "GET / HTTP/1.1\r\nConnection: keep-alive\r\nHost: x\r\n\r\n";
+    const info3 = try WasiCliAdapter.httpRequestHeaderInfoFromBlock(explicit_keepalive);
+    try testing.expect(info3.keep_alive);
+
+    const http10_default = "GET / HTTP/1.0\r\nHost: x\r\n\r\n";
+    const info4 = try WasiCliAdapter.httpRequestHeaderInfoFromBlock(http10_default);
+    try testing.expect(!info4.keep_alive);
+
+    const http10_opt_in = "GET / HTTP/1.0\r\nHost: x\r\nConnection: keep-alive\r\n\r\n";
+    const info5 = try WasiCliAdapter.httpRequestHeaderInfoFromBlock(http10_opt_in);
+    try testing.expect(info5.keep_alive);
+
+    const chunked = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const info6 = try WasiCliAdapter.httpRequestHeaderInfoFromBlock(chunked);
+    try testing.expect(info6.body_kind == .chunked);
+
+    const cl = "POST / HTTP/1.1\r\nContent-Length: 7\r\n\r\n";
+    const info7 = try WasiCliAdapter.httpRequestHeaderInfoFromBlock(cl);
+    try testing.expectEqual(@as(usize, 7), info7.body_kind.content_length);
 }
 
