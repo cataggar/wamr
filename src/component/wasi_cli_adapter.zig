@@ -1138,12 +1138,13 @@ fn matchPrefix(cidr_bytes: []const u8, addr_bytes: []const u8, prefix: u8) bool 
 /// CIDR blocks snapshotted from `WasiCliAdapter.sockets_allow_list_template`
 /// at `instance-network` time; the snapshot is owned by the Network and
 /// freed in `[resource-drop]network` / adapter `deinit`. Empty list = the
-/// default deny-all capability.
+/// default deny-all capability for the 0.2 surface.
 ///
-/// TODO(#178): bind/connect handlers will call `allows()` before issuing
-/// real `std.Io.net.Socket` I/O. Today the handlers are still
-/// default-deny stubs, so the allow-list is stored but not yet consulted
-/// from the WIT call sites.
+/// Note: the 0.3 sockets path does not go through a `Network` resource
+/// (the 0.3 WIT dropped `network` entirely). It consults
+/// `WasiCliAdapter.sockets_allow_list_template` directly via
+/// `templateAllows` — see that helper for the empty-template semantics
+/// (allow-all for raw sockets, deny-all for DNS / outbound HTTP). (#583 A1)
 pub const Network = struct {
     allow_list: []const IpCidr = &.{},
 
@@ -3130,9 +3131,19 @@ pub const WasiCliAdapter = struct {
     /// Slots are nulled on `[resource-drop]network`.
     network_table: std.ArrayListUnmanaged(?Network) = .empty,
     /// Adapter-level template for the per-`network` CIDR allow-list (#180).
-    /// Each `instance-network` snapshots this slice into the new
-    /// `Network.allow_list`. Empty = deny-all (the default). Owned by the
-    /// adapter and replaced atomically by `setSocketsAllowList`.
+    /// Each 0.2 `instance-network` snapshots this slice into the new
+    /// `Network.allow_list`; the 0.3 sockets path consults this template
+    /// directly via `templateAllows` (#583 A1). Owned by the adapter and
+    /// replaced atomically by `setSocketsAllowList`.
+    ///
+    /// Empty-template semantics differ per consumer:
+    ///   * 0.2 `Network.allows()` → deny-all (legacy capability gate).
+    ///   * 0.3 raw-socket `templateAllows` (tcp-connect, udp-connect,
+    ///     udp-send) → allow-all. Embedders that don't seed the
+    ///     allow-list get unrestricted raw sockets; the kernel still
+    ///     enforces routability / bindability.
+    ///   * 0.3 DNS (`resolveAddressesP3`) → `name-unresolvable`.
+    ///   * Outbound HTTP (0.2 + 0.3) → `HTTP_request_denied`.
     sockets_allow_list_template: []IpCidr = &.{},
     /// `wasi:sockets/{tcp,udp}` socket resource table. Slot index = guest
     /// handle (shared across both kinds — `Socket.kind` discriminates).
@@ -3542,20 +3553,25 @@ pub const WasiCliAdapter = struct {
         self.env = env;
     }
 
-    /// Configure the per-`network` CIDR allow-list (#180). Each entry is
-    /// parsed by `IpCidr.parse` (e.g. `"127.0.0.0/8"`, `"::1/128"`,
-    /// `"fe80::/10"`). The slice is snapshotted into every `Network`
+    /// Configure the sockets CIDR allow-list (#180, #583 A1). Each entry
+    /// is parsed by `IpCidr.parse` (e.g. `"127.0.0.0/8"`, `"::1/128"`,
+    /// `"fe80::/10"`). The slice is snapshotted into every 0.2 `Network`
     /// returned by `instance-network` from this point onward; previously
-    /// created `Network` resources keep their own snapshot.
+    /// created `Network` resources keep their own snapshot. The 0.3
+    /// sockets path consults this template directly (no `network` rep).
     ///
-    /// Default is deny-all (empty list). Calling with an empty slice
-    /// resets to deny-all. Replaces (and frees) any prior template.
-    /// On parse failure the previous template is preserved.
+    /// Empty-list semantics (see `sockets_allow_list_template` for the
+    /// full table):
+    ///   * 0.2 raw sockets — deny-all (legacy).
+    ///   * 0.3 raw sockets — allow-all. `tcp-connect`, `udp-connect`
+    ///     and `udp-send` skip the allow-list gate when the template
+    ///     is empty; the kernel still enforces routability.
+    ///   * DNS and outbound HTTP — deny (`name-unresolvable` /
+    ///     `HTTP_request_denied`).
     ///
-    /// TODO(#178): once `tcp-socket.start-bind` / `start-connect` issue
-    /// real `std.Io.net.Socket` calls, they will gate destinations via
-    /// `Network.allows()` before performing I/O. Today the bind/connect
-    /// handlers remain default-deny stubs.
+    /// Calling with an empty slice resets the template, freeing any
+    /// prior allocation. On parse failure the previous template is
+    /// preserved (the partially-filled buffer is freed).
     pub fn setSocketsAllowList(self: *WasiCliAdapter, cidrs: []const []const u8) !void {
         if (cidrs.len == 0) {
             if (self.sockets_allow_list_template.len != 0)
@@ -12030,9 +12046,11 @@ pub const WasiCliAdapter = struct {
         // 0.3 dropped the per-network allow-list at bind: the kernel
         // already enforces what's bindable (returns AddressNotBindable
         // for RFC 5737 test addresses, etc.) and the capability model
-        // is enforced on the outbound `connect` path instead. Skipping
-        // the allow-list here matches the wasi-p3-testsuite
-        // `test_not_bindable` expectation. (#563)
+        // is enforced on the outbound `connect` / `send` paths instead
+        // via `templateAllows`. Skipping the allow-list here matches
+        // the wasi-p3-testsuite `test_not_bindable` expectation, which
+        // expects `address-not-bindable` from the kernel rather than
+        // a pre-syscall `access-denied`. (#563, #583 A1)
         // Real kernel bind so port=0 yields ephemeral assignment and
         // `local-address` returns the kernel-chosen port. The bound
         // fd is held on the rep — `tcpListenP3` transitions it to
@@ -12100,7 +12118,7 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErrP3WithDiag(ci, allocator, .address_in_use, "address_in_use");
             return;
         }
-        // See `tcpBindP3` (#563): no allow-list at bind in 0.3.
+        // See `tcpBindP3` (#563, #583 A1): no allow-list at bind in 0.3.
         // SO_REUSEADDR preset so a subsequent UDP bind to a port
         // that just transitioned through `disconnect`/drop succeeds —
         // mirrors the TCP path so cross-family behavior is consistent. (#569, #575)
@@ -12161,6 +12179,9 @@ pub const WasiCliAdapter = struct {
             results[0] = try socketResultErrP3(allocator, .invalid_argument);
             return;
         }
+        // Allow-list gate (#583 A1). Empty template = allow-all; a
+        // non-empty template must contain the remote address or this
+        // returns `access-denied` before the kernel `connect(2)`.
         if (!templateAllows(self.sockets_allow_list_template, remote)) {
             results[0] = try socketResultErrP3(allocator, .access_denied);
             return;
@@ -12252,12 +12273,26 @@ pub const WasiCliAdapter = struct {
         results[0] = try socketResultErr(allocator, .access_denied);
     }
 
-    /// Adapter-level allow-list match. The 0.2 path consults a
-    /// per-`network` allow-list snapshot; the 0.3 path has no network
-    /// rep and consults the adapter-level template directly. Empty
-    /// template = deny-all (the default).
+    /// Adapter-level allow-list match for the 0.3 sockets path. The 0.2
+    /// surface still consults a per-`network` allow-list snapshot via
+    /// `Network.allows()`; 0.3 dropped the `network` resource so this
+    /// helper reads the adapter-level template directly. (#583 A1)
+    ///
+    /// Semantics:
+    ///   * Empty template → allow-all. The embedder has not opted into
+    ///     a capability restriction, so kernel I/O is unrestricted (the
+    ///     kernel still enforces routability / bindability separately).
+    ///   * Non-empty template → only addresses contained in at least
+    ///     one CIDR are permitted; everything else returns
+    ///     `error-code::access-denied` before the syscall.
+    ///
+    /// Discrete service surfaces (`resolveAddressesP3`,
+    /// `httpOutgoingHandlerHandle`, the 0.3 HTTP client) still gate
+    /// "empty template = deny-all" explicitly — DNS and outbound HTTP
+    /// require an explicit opt-in even when raw sockets are
+    /// unrestricted.
     fn templateAllows(template: []const IpCidr, addr: std.Io.net.IpAddress) bool {
-        if (template.len == 0) return false;
+        if (template.len == 0) return true;
         for (template) |cidr| if (cidr.containsAddr(addr)) return true;
         return false;
     }
@@ -12710,7 +12745,10 @@ pub const WasiCliAdapter = struct {
     ///   - unspecified dest      → invalid-argument
     ///   - port == 0             → invalid-argument
     ///   - socket already connecting/connected/listening → invalid-state
-    ///   - allow-list deny       → access-denied
+    ///   - allow-list deny       → access-denied (non-empty template
+    ///                              not containing the destination —
+    ///                              empty template is allow-all per
+    ///                              `templateAllows`, #583 A1)
     fn tcpConnectP3(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
@@ -12755,6 +12793,9 @@ pub const WasiCliAdapter = struct {
                 return;
             },
         }
+        // Allow-list gate (#583 A1). Empty template = allow-all; a
+        // non-empty template must contain the remote address or this
+        // returns `access-denied` synchronously into the future.
         if (!templateAllows(self.sockets_allow_list_template, remote)) {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .access_denied) };
             return;
@@ -13157,6 +13198,9 @@ pub const WasiCliAdapter = struct {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .invalid_argument) };
             return;
         });
+        // Allow-list gate (#583 A1). Re-checked per datagram so a
+        // connected socket's pre-cleared remote still cannot escape
+        // a tightened allow-list mid-run. Empty template = allow-all.
         if (!templateAllows(self.sockets_allow_list_template, dest)) {
             results[0] = .{ .handle = try socketReadyResultFuture(ci, false, .access_denied) };
             return;
@@ -23274,11 +23318,16 @@ test "sockets P3: tcp-socket.connect rejects port-0 with invalid-argument (#519)
     try testing.expectEqual(SocketState.unbound, adapter.socket_table.items[0].?.state);
 }
 
-test "sockets P3: tcp-socket.connect denies non-allow-listed targets (#519)" {
+test "sockets P3: tcp-socket.connect denies non-allow-listed targets (#519, #583 A1)" {
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
-    // Note: empty allow-list — default deny-all.
+    // Seed an allow-list that excludes the target so the gate fires.
+    // (Post-#583 A1: empty allow-list is allow-all, not deny-all — a
+    // non-matching CIDR is the precise way to exercise the gate.)
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 0 }, .prefix = 8 } };
+    adapter.sockets_allow_list_template = allow;
 
     var ci: ComponentInstance = undefined;
     try ci.enableTestMem(testing.allocator, 4096);
@@ -23425,11 +23474,17 @@ test "sockets P3: tcp loopback bind/listen/connect/send round-trip (#519)" {
     try testing.expectEqualStrings(send_data, srv_buf[0..n]);
 }
 
-test "sockets P3: udp-socket.send returns access-denied without allow-list (#519)" {
+test "sockets P3: udp-socket.send returns access-denied for non-matching allow-list (#519, #583 A1)" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const testing = std.testing;
     var adapter = WasiCliAdapter.init(testing.allocator);
     defer adapter.deinit();
+    // Seed an allow-list that excludes loopback so the gate fires.
+    // (Post-#583 A1: empty allow-list is allow-all — to assert the
+    // gate, configure a non-empty template that doesn't cover the dest.)
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 0 }, .prefix = 8 } };
+    adapter.sockets_allow_list_template = allow;
 
     var ci: ComponentInstance = undefined;
     try ci.enableTestMem(testing.allocator, 4096);
@@ -23455,7 +23510,7 @@ test "sockets P3: udp-socket.send returns access-denied without allow-list (#519
     // host_socket is owned by the Socket rep and closed by
     // `adapter.deinit() → closeAll`; no manual close needed here.
 
-    // udp.send with an explicit remote → allow-list deny (template is empty).
+    // udp.send to 127.0.0.1:9999 with allow-list = 10.0.0.0/8 → denied.
     const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 9999);
     defer p3FreeIpv4SockAddr(testing.allocator, dest);
     const remote_inner = try testing.allocator.create(InterfaceValue);
@@ -25434,6 +25489,207 @@ test "sockets allow-list: resource-drop frees snapshot (#180)" {
     try WasiCliAdapter.networkResourceDrop(&adapter, &ci, &drop_args, &drop_results, testing.allocator);
     try testing.expect(adapter.network_table.items[handle] == null);
     // testing.allocator's leak detector flags us if the snapshot wasn't freed.
+}
+
+// ── #583 A1: kernel-I/O allow-list gating (templateAllows) ─────────────
+//
+// The 0.3 sockets surface routes raw kernel I/O (`tcp-connect`,
+// `udp-connect`, `udp-send`) through `templateAllows` against the
+// adapter-level `sockets_allow_list_template`. These tests pin the
+// three-way semantics:
+//   * empty template       → allow-all (kernel still enforces routing)
+//   * non-empty + match    → allow, gate passes
+//   * non-empty + no match → `error-code::access-denied` before syscall
+//
+// Each kernel-I/O site (tcp-connect, udp-connect, udp-send) gets its
+// own deny test; the allow-all path is covered at the helper level
+// (no real syscall) so the test stays portable across CI matrices.
+
+test "sockets allow-list (#583 A1): templateAllows empty template = allow-all" {
+    const testing = std.testing;
+    // Pure-helper test: empty template returns true for any address.
+    try testing.expect(WasiCliAdapter.templateAllows(&.{}, .{ .ip4 = .{ .bytes = .{ 1, 2, 3, 4 }, .port = 0 } }));
+    try testing.expect(WasiCliAdapter.templateAllows(&.{}, .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 1 }, .port = 0 } }));
+    var v6: [16]u8 = @splat(0);
+    v6[0] = 0xfe;
+    v6[1] = 0x80;
+    v6[15] = 1;
+    try testing.expect(WasiCliAdapter.templateAllows(&.{}, .{ .ip6 = .{ .bytes = v6, .port = 0, .flow = 0 } }));
+}
+
+test "sockets allow-list (#583 A1): templateAllows non-empty matches inside CIDR" {
+    const testing = std.testing;
+    const loopback = try IpCidr.parse("127.0.0.0/8");
+    const cidrs = [_]IpCidr{loopback};
+    // Inside 127.0.0.0/8 → allowed.
+    try testing.expect(WasiCliAdapter.templateAllows(&cidrs, .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }));
+    try testing.expect(WasiCliAdapter.templateAllows(&cidrs, .{ .ip4 = .{ .bytes = .{ 127, 255, 255, 254 }, .port = 0 } }));
+    // Outside → denied.
+    try testing.expect(!WasiCliAdapter.templateAllows(&cidrs, .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 1 }, .port = 0 } }));
+    try testing.expect(!WasiCliAdapter.templateAllows(&cidrs, .{ .ip4 = .{ .bytes = .{ 192, 168, 1, 1 }, .port = 0 } }));
+}
+
+test "sockets allow-list (#583 A1): tcp-connect with empty template passes the gate" {
+    // Pre-#583 A1 this returned `access-denied` (empty = deny-all). Post
+    // -#583 A1 the gate is skipped for empty templates, so the call
+    // proceeds to the real `connect(2)` against 127.0.0.1:1 (no listener).
+    // We assert that whatever error we get back is NOT `access-denied` —
+    // a kernel `ECONNREFUSED` (`.connection-refused`) is the expected
+    // shape on Linux/macOS.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    // Empty template — no `setSocketsAllowList` call.
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+
+    // 127.0.0.1:1 — almost certainly unbound on a dev host; the kernel
+    // returns ECONNREFUSED → `.connection-refused`. The salient bit is
+    // that we don't short-circuit with `access-denied` from the gate.
+    const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 1);
+    defer p3FreeIpv4SockAddr(testing.allocator, dest);
+
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, dest };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpConnectP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    // Connect may succeed (if a listener happens to exist on :1, unlikely)
+    // or fail; either way the failure variant must NOT be access-denied.
+    if (fut.payload.?[0] == 1) {
+        const code = fut.payload.?[4];
+        try testing.expect(code != @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.access_denied))));
+    }
+}
+
+test "sockets allow-list (#583 A1): tcp-connect with matching CIDR passes the gate" {
+    // Non-empty allow-list covering the target → connect must proceed
+    // past `templateAllows`. We use 127.0.0.1:1 and assert we don't
+    // short-circuit with `access-denied`. Mirrors the empty-template
+    // test for the matching-CIDR branch.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.tcpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+
+    const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 1);
+    defer p3FreeIpv4SockAddr(testing.allocator, dest);
+
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, dest };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpConnectP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    const fut = ci.futures.getPtr(results[0].handle).?;
+    try testing.expectEqual(async_mod.Future.State.ready, fut.state);
+    try testing.expect(fut.payload != null);
+    if (fut.payload.?[0] == 1) {
+        const code = fut.payload.?[4];
+        try testing.expect(code != @as(u8, @intCast(WasiCliAdapter.socketCodeToP3Disc(.access_denied))));
+    }
+}
+
+test "sockets allow-list (#583 A1): udp-connect denies non-matching destination" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    // Allow-list excludes the target.
+    const allow = try testing.allocator.alloc(IpCidr, 1);
+    allow[0] = .{ .ip4 = .{ .bytes = .{ 192, 168, 0, 0 }, .prefix = 16 } };
+    adapter.sockets_allow_list_template = allow;
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+
+    const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 9999);
+    defer p3FreeIpv4SockAddr(testing.allocator, dest);
+
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, dest };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpConnectP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    // udp-connect P3 is sync (returns `result_val`, not a future).
+    try testing.expect(results[0] == .result_val);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(!results[0].result_val.is_ok);
+    // The err payload is a variant carrying the 0.3 mapped discriminant.
+    const err_disc = results[0].result_val.payload.?.variant_val.discriminant;
+    try testing.expectEqual(WasiCliAdapter.socketCodeToP3Disc(.access_denied), err_disc);
+    // Socket must remain unbound: no host_socket should have been opened.
+    try testing.expect(adapter.socket_table.items[0].?.host_socket == null);
+}
+
+test "sockets allow-list (#583 A1): udp-connect with empty template passes the gate" {
+    // Empty allow-list = allow-all. udp-connect proceeds to implicit
+    // bind + record the remote; the call settles ok (no real I/O).
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    // No setSocketsAllowList — template stays empty.
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    {
+        const args = [_]InterfaceValue{.{ .enum_val = 0 }};
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        try WasiCliAdapter.udpCreateP3(&adapter, &ci, &args, &results, testing.allocator);
+        defer testing.allocator.destroy(results[0].result_val.payload.?);
+    }
+
+    const dest = try p3MakeIpv4SockAddr(testing.allocator, .{ 127, 0, 0, 1 }, 9999);
+    defer p3FreeIpv4SockAddr(testing.allocator, dest);
+
+    const args = [_]InterfaceValue{ .{ .handle = 0 }, dest };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    WasiCliAdapter.udpConnectP3(&adapter, &ci, &args, &results, testing.allocator) catch return error.SkipZigTest;
+
+    try testing.expect(results[0] == .result_val);
+    defer testing.allocator.destroy(results[0].result_val.payload.?);
+    try testing.expect(results[0].result_val.is_ok);
+    // Remote was recorded and an implicit bind opened a host_socket.
+    try testing.expect(adapter.socket_table.items[0].?.remote_addr != null);
+    try testing.expect(adapter.socket_table.items[0].?.host_socket != null);
 }
 
 test "http: liftFieldEntries lifts canonical layout (#174)" {
