@@ -65,6 +65,7 @@ $ git submodule update --init tests/wasi-testsuite
 $ pip install -r tests/wasi-testsuite/test-runner/requirements.txt
 $ zig build wasi-testsuite      # WASI Preview 1 + Preview 2 — passing
 $ zig build wasi-p3-testsuite   # WASI Preview 3 (wasm32-wasip3) — 40 / 40 passing
+$ zig build wasi-p3-parity      # Same fixtures via wamr + wasmtime, diff the reports
 ```
 
 The upstream `do_wait` timeout is 5s; that matches GitHub Actions runner
@@ -83,6 +84,20 @@ and [`tests/wasi-p3-testsuite-skip.json`](tests/wasi-p3-testsuite-skip.json)
 in either skiplist must carry a one-line rationale and a follow-up issue number.
 When a previously-skipped test starts passing, delete the entry — the suite is
 the gate against regressions in already-shipped WASI host functions.
+
+`zig build wasi-p3-parity` is the cross-runtime gate ([#583
+C1](https://github.com/cataggar/wamr/issues/583)): it runs the same
+`wasm32-wasip3` corpus through wamr **and** upstream
+[Wasmtime](https://wasmtime.dev/) (CI pin `v44.0.1`, the first stable
+release with `-Sp3` support) and diffs the JSON reports via
+[`scripts/diff-testsuite-reports.py`](scripts/diff-testsuite-reports.py).
+The classifier exits non-zero only on *regressions* (wamr fails a
+fixture that Wasmtime still passes); deltas in the other direction
+(Wasmtime fails a fixture wamr passes) are downgraded to fixture /
+runtime-bug warnings so a wamr regression that Wasmtime also exhibits
+doesn't masquerade as a wamr bug. The CI workflow at
+[`.github/workflows/wasi-p3-parity.yml`](.github/workflows/wasi-p3-parity.yml)
+runs the gate on push to `main` and nightly.
 
 [wts]: https://github.com/WebAssembly/wasi-testsuite
 
