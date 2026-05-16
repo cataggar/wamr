@@ -1,0 +1,7 @@
+{
+  "_comment": "Per-scenario median-wall budgets for the wasi-microbench host-path regression detector (#583, W11-6). The bench fails CI when median_ns > median_ns_budget * (1 + threshold_pct/100); threshold defaults to 10. Calibrated 1.5x over the median observed on the Azure D16pds_v6 AArch64 dev VM at 2025-11-23 (commit f15be260). Updating: see docs/wasi.md § 'Updating the wasi-microbench budget'.",
+  "http-service-keepalive-100rt": { "median_ns_budget": 35000,  "samples": 10 },
+  "udp-receive-1mb":              { "median_ns_budget": 36000,  "samples": 10 },
+  "fs-write-via-stream-1mb":      { "median_ns_budget": 366000, "samples": 10 },
+  "fs-read-via-stream-1mb":       { "median_ns_budget": 23000,  "samples": 10 }
+}
