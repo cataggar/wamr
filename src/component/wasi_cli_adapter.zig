@@ -1420,6 +1420,48 @@ pub const FsWriteStreamCtx = struct {
     /// `on_write` callback stats the file each call and writes at
     /// end-of-file instead of `offset + bytes_written`.
     append: bool,
+    /// Flipped by the adapter's `cancelAllPendingAsyncOps` driver when
+    /// the guest issues `canon task.cancel` (#583 B1). The drain loop
+    /// in `fsWriteViaStreamOnWrite` checks this on every chunk and
+    /// short-circuits with `.err` so the executor flips
+    /// `read_closed = true` and the guest's next `stream.write` sees
+    /// `DROPPED`. Cancel is observed at the **next** chunk boundary —
+    /// any pwrite already in flight runs to completion.
+    cancelled: bool = false,
+};
+
+/// `AsyncStream` created by `descriptor.read-via-stream` (#573,
+/// #583 B1). Today's `fsDescriptorReadViaStreamP3` eagerly pre-buffers
+/// up to `FS_STREAM_BUFFER_CAP` bytes during the trampoline call and
+/// closes the writable end before returning, so there is no in-flight
+/// drain loop the host can interrupt. This ctx exists so the
+/// `cancelAllPendingAsyncOps` driver still has a uniform place to
+/// observe cancellation for read streams: the `cancelled` flag is
+/// flipped on `canon task.cancel`, and the (currently rarely-fired)
+/// `fsReadViaStreamOnRead` callback short-circuits with `.eof` once
+/// cancel is observed. If a future PR refactors read-via-stream into
+/// a chunked lazy drain (so files > 64 MiB stream rather than
+/// truncate), the existing wire-up automatically delivers cancel
+/// propagation through the same callback.
+pub const FsReadStreamCtx = struct {
+    adapter: *WasiCliAdapter,
+    /// Guest-visible `descriptor` handle for the source file. Kept
+    /// for symmetry with `FsWriteStreamCtx` and so a future lazy
+    /// re-fill can `pread(2)` further chunks without re-lookup
+    /// races on a dropped descriptor.
+    desc_handle: u32,
+    /// Base offset captured at `read-via-stream` call time. Today
+    /// only used for the eager pre-buffer; the lazy on_read path
+    /// would add it to `bytes_read` for the next pread.
+    offset: u64,
+    /// Running byte counter — sum of all bytes pread'd so far. The
+    /// next on_read call (if the eager mode is ever relaxed) would
+    /// read at `offset + bytes_read`.
+    bytes_read: u64 = 0,
+    /// Set by `cancelAllPendingAsyncOps` (#583 B1). Read by
+    /// `fsReadViaStreamOnRead` to surface `.eof` and close the
+    /// stream cleanly.
+    cancelled: bool = false,
 };
 
 /// A `udp-socket.receive` call that found no datagram waiting on its
@@ -1439,6 +1481,17 @@ pub const FsWriteStreamCtx = struct {
 pub const PendingUdpReceive = struct {
     future_handle: u32,
     sock_handle: u32,
+    /// Flipped by `cancelAllPendingAsyncOps` when the guest issues
+    /// `canon task.cancel` while this receive is parked (#583 B1).
+    /// `completeReadyPendingUdpReceives` observes the flag on its
+    /// next tick and settles the future with
+    /// `STATUS_STARTED_CANCELLED` instead of waiting for a datagram.
+    /// We do not pre-settle from the cancel driver itself so all
+    /// future settlement (incl. memcpy into `async_lower_retptr`)
+    /// stays funnelled through the same `settleFutureDeferred`
+    /// helper used by the success path — race-free even if a
+    /// datagram lands between cancel signal and next drive tick.
+    cancelled: bool = false,
 };
 
 /// Outcome captured by an outbound HTTP worker thread (#583 A2). Shared
@@ -3715,6 +3768,15 @@ pub const WasiCliAdapter = struct {
     /// valid for the lifetime of the stream — the executor frees the
     /// `AsyncStream` itself but not the host context.
     fs_write_stream_ctxs: std.ArrayListUnmanaged(*FsWriteStreamCtx) = .empty,
+    /// Lifetimes for `host_driver` contexts attached to `AsyncStream`
+    /// slots produced by `descriptor.read-via-stream` (#583 B1). Today
+    /// the read-via-stream trampoline pre-buffers the file synchronously
+    /// and closes the writable end, so the ctx mostly exists to receive
+    /// the `cancelled` flag from `cancelAllPendingAsyncOps` and to
+    /// support direct invocation of `fsReadViaStreamOnRead` from unit
+    /// tests. A future PR (lazy chunked drain) will start firing the
+    /// driver in steady-state and naturally honor cancel.
+    fs_read_stream_ctxs: std.ArrayListUnmanaged(*FsReadStreamCtx) = .empty,
 
     /// Pending `udp-socket.receive` async-futures that found no datagram
     /// waiting on their first non-blocking `recvfrom(2)`. Drained by
@@ -4057,6 +4119,8 @@ pub const WasiCliAdapter = struct {
         self.sockets_p3_stream_ctxs.deinit(self.allocator);
         for (self.fs_write_stream_ctxs.items) |ctx| self.allocator.destroy(ctx);
         self.fs_write_stream_ctxs.deinit(self.allocator);
+        for (self.fs_read_stream_ctxs.items) |ctx| self.allocator.destroy(ctx);
+        self.fs_read_stream_ctxs.deinit(self.allocator);
 
         // wasi:http resource tables (#149). Each slot owns its heap
         // rep; HttpFields and OutgoingRequest also own inner string
@@ -6042,6 +6106,21 @@ pub const WasiCliAdapter = struct {
                 _ = self.pending_udp_receives.swapRemove(i);
                 continue;
             };
+            // (#583 B1) `canon task.cancel` was issued while the
+            // receive was parked. Settle the future with the cancel
+            // disposition and drop the entry — the cancel driver
+            // usually clears the list itself, but defense-in-depth
+            // here handles any cancel observed between drive ticks.
+            if (entry.cancelled) {
+                fut.pending_read = null;
+                fut.state = .closed;
+                fut.write_closed = true;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+                _ = self.pending_udp_receives.swapRemove(i);
+                fired = true;
+                continue;
+            }
             // Socket torn down — settle err(invalid_state).
             const sock = self.lookupSocket(entry.sock_handle);
             if (sock == null or sock.?.kind != .udp or sock.?.host_socket == null) {
@@ -6821,21 +6900,44 @@ pub const WasiCliAdapter = struct {
         return post;
     }
 
-    /// `ComponentInstance.async_cancel_driver` hook (#551). Invoked from
-    /// the `task.cancel` canon-builtin path when the guest cancels the
-    /// currently-executing task. Aborts every pending timer future and
-    /// settles the backing future with `state = .closed`,
-    /// `write_closed = true` so the next `waitable-set.{wait,poll}`
-    /// surfaces `STATUS_STARTED_CANCELLED` for the corresponding
-    /// subtask. Mirrors the cancellation semantics described by the
-    /// component-model spec's `canon.lower (async)` table.
+    /// `ComponentInstance.async_cancel_driver` hook (#551, #583 B1).
+    /// Invoked from the `task.cancel` canon-builtin path when the
+    /// guest cancels the currently-executing task. Cancels every
+    /// host-side async operation the adapter owns:
+    ///
+    ///   * **Timer futures** — settle `state = .closed`,
+    ///     `write_closed = true` and fire `STATUS_STARTED_CANCELLED`.
+    ///     (#551, original landing for `wasi:clocks/wait-for`.)
+    ///   * **Pending UDP receives** — settle the parked
+    ///     `udp-socket.receive` future with `STATUS_STARTED_CANCELLED`
+    ///     and remove the entry so the next `driveAsyncEvents` tick
+    ///     does not try to `recvfrom(2)` again.
+    ///   * **FS write-via-stream / append-via-stream contexts** —
+    ///     flip `cancelled` so the next `fsWriteViaStreamOnWrite`
+    ///     chunk returns `.err` and the executor closes the read
+    ///     end with DROPPED.
+    ///   * **FS read-via-stream contexts** — flip `cancelled` so the
+    ///     (currently armed-but-dormant) `fsReadViaStreamOnRead`
+    ///     short-circuits with `.eof` if ever invoked.
+    ///   * **Pending outbound HTTP fetches** — flip the per-fetch
+    ///     `shared.cancelled` atomic. Cancel is *best-effort*: the
+    ///     blocking `std.http.Client.fetch` running on the worker
+    ///     thread cannot be interrupted from another thread cleanly,
+    ///     so the worker observes cancel at its next synchronisation
+    ///     point (today: only the pre-fetch check). On fetch return
+    ///     the drainer (`settlePendingHttpFetch`) sees `cancelled =
+    ///     true` and surfaces `HTTP_request_denied` to the guest
+    ///     regardless of the wire outcome. A follow-up will switch
+    ///     to the lower-level `std.http.Client.Request` API so the
+    ///     worker can poll cancellation between connect, send-head,
+    ///     and read-body phases.
     ///
     /// The `task_handle` argument is reserved for a future per-task
-    /// owner-tracking refactor; today we cancel every pending timer the
+    /// owner-tracking refactor; today we cancel every pending op the
     /// adapter owns. Single-task guests (which is what every fixture
     /// driven by `wasi:cli@0.3.x.run` is) hit the same behaviour either
     /// way.
-    pub fn cancelAllPendingTimers(
+    pub fn cancelAllPendingAsyncOps(
         ctx_opaque: ?*anyopaque,
         ci: *ComponentInstance,
         task_handle: ?u32,
@@ -6843,6 +6945,8 @@ pub const WasiCliAdapter = struct {
     ) void {
         _ = task_handle;
         const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+
+        // ── Timer futures (#551) ──────────────────────────────────
         var i: usize = 0;
         while (i < self.timer_futures.items.len) : (i += 1) {
             const tf = self.timer_futures.items[i];
@@ -6865,7 +6969,58 @@ pub const WasiCliAdapter = struct {
         }
         // Now clear the pending list — we settled every entry above.
         self.timer_futures.clearRetainingCapacity();
+
+        // ── Pending UDP receives (#583 B1) ────────────────────────
+        // Settle each parked `udp-socket.receive` future with the
+        // cancel disposition. We do not lower a result payload (the
+        // guest's awaited Subtask sees `STATUS_STARTED_CANCELLED`
+        // before the payload is consumed); we just close the future
+        // and fire the waitable. Note: future may be subtask-managed
+        // or plain-future depending on the call-site shape — flipping
+        // both state + write_closed handles both decoder paths.
+        i = 0;
+        while (i < self.pending_udp_receives.items.len) : (i += 1) {
+            self.pending_udp_receives.items[i].cancelled = true;
+            const fh = self.pending_udp_receives.items[i].future_handle;
+            if (ci.futures.getPtr(fh)) |fut| {
+                fut.pending_read = null;
+                fut.state = .closed;
+                fut.write_closed = true;
+                if (fut.waitable_set) |ws| if (fut.read_waitable_idx) |idx|
+                    ws.setReady(idx, allocator, executor_root.STATUS_STARTED_CANCELLED);
+            }
+        }
+        // Drop the settled entries so `driveAsyncEvents` does not
+        // re-poll their fds; we already published the cancel.
+        self.pending_udp_receives.clearRetainingCapacity();
+
+        // ── Filesystem stream contexts (#583 B1) ─────────────────
+        // Flip the cancel flag on every adapter-owned FS stream ctx.
+        // The on_read / on_write callbacks check the flag and short-
+        // circuit on the next executor invocation.
+        for (self.fs_write_stream_ctxs.items) |ctx| ctx.cancelled = true;
+        for (self.fs_read_stream_ctxs.items) |ctx| ctx.cancelled = true;
+
+        // ── Outbound HTTP fetches (#583 B1) ───────────────────────
+        // `shared.cancelled` is an `Atomic.Value(bool)` so the worker
+        // thread can read it lock-free at its next synchronisation
+        // point. The pre-fetch check at the top of `httpFetchWorker`
+        // already honours this for cancels issued before the fetch
+        // begins; the drainer (`settlePendingHttpFetch`) honours it
+        // on every worker completion. Note: an in-flight blocking
+        // `std.http.Client.fetch` can NOT observe this — see the
+        // doc-comment caveat at the top of this function.
+        for (self.pending_http_fetches.items) |entry| {
+            entry.shared.cancelled.store(true, .release);
+        }
     }
+
+    /// Backwards-compatibility alias. The cancel driver used to only
+    /// cover timer futures (#551); broader subsystems were added in
+    /// #583 B1 via `cancelAllPendingAsyncOps`. Callers that pinned
+    /// the old symbol (third-party host integrations, tests) keep
+    /// working.
+    pub const cancelAllPendingTimers = cancelAllPendingAsyncOps;
 
     fn allocStreamHandle(self: *WasiCliAdapter, stream: *streams.OutputStream) !u32 {
         // Linear scan for a free slot before extending; output streams are
@@ -9884,6 +10039,22 @@ pub const WasiCliAdapter = struct {
         const n: usize = fs_file.file.readPositional(io, &.{buf}, offset) catch 0;
         if (n > 0) try slot.buffer.appendSlice(ci.allocator, buf[0..n]);
 
+        // (#583 B1) Install a cancel-aware host_driver so the
+        // adapter-wide `cancelAllPendingAsyncOps` driver has a uniform
+        // place to surface `canon task.cancel` for read streams. Today
+        // `write_closed = true` is set above, so the executor only
+        // drains the buffered bytes and never re-enters the driver —
+        // the wiring is "armed but dormant", primed for the lazy-
+        // chunked drain refactor (which will leave `write_closed`
+        // false and dispatch the driver on FIFO exhaustion).
+        const read_ctx = try self.allocFsReadStreamCtx(handle, offset);
+        read_ctx.bytes_read = n;
+        slot.elem_size_hint = 1;
+        slot.host_driver = .{
+            .context = read_ctx,
+            .on_read = &fsReadViaStreamOnRead,
+        };
+
         try ci.streams.put(ci.allocator, stream_handle, slot);
 
         const future_handle = try spawnReadyOkFsFuture(ci);
@@ -9891,6 +10062,52 @@ pub const WasiCliAdapter = struct {
         fields[0] = .{ .handle = stream_handle };
         fields[1] = .{ .handle = future_handle };
         results[0] = .{ .tuple_val = fields };
+    }
+
+    /// Allocate a heap-stable `FsReadStreamCtx` and stash it on
+    /// `fs_read_stream_ctxs` so the executor's `*AsyncStream` can
+    /// hold a stable `host_driver.context` pointer for the lifetime
+    /// of the stream. Mirrors `allocFsWriteStreamCtx`. (#583 B1)
+    fn allocFsReadStreamCtx(
+        self: *WasiCliAdapter,
+        desc_handle: u32,
+        offset: u64,
+    ) !*FsReadStreamCtx {
+        const ctx = try self.allocator.create(FsReadStreamCtx);
+        ctx.* = .{
+            .adapter = self,
+            .desc_handle = desc_handle,
+            .offset = offset,
+            .bytes_read = 0,
+            .cancelled = false,
+        };
+        self.fs_read_stream_ctxs.append(self.allocator, ctx) catch {
+            self.allocator.destroy(ctx);
+            return error.OutOfMemory;
+        };
+        return ctx;
+    }
+
+    /// `host_driver.on_read` for a `descriptor.read-via-stream`
+    /// `stream<u8>` slot (#583 B1). Today's eager pre-buffer leaves
+    /// `write_closed = true`, so the executor never actually fires
+    /// this callback in steady state — but it is the cancel
+    /// observation point for the read path, so when
+    /// `cancelAllPendingAsyncOps` flips `ctx.cancelled` the next
+    /// `stream.read` (should the writable end ever be re-opened) will
+    /// see `.eof` and close the read end cleanly. Returning `.eof`
+    /// triggers `s.write_closed = true` in the executor.
+    fn fsReadViaStreamOnRead(
+        opaque_ctx: ?*anyopaque,
+        _: *async_mod.AsyncStream,
+        _: Allocator,
+    ) async_mod.HostStreamAction {
+        const ctx: *FsReadStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (ctx.cancelled) return .eof;
+        // No lazy refill yet — pre-buffer fully filled by the
+        // trampoline. Treat as EOF so the executor closes the
+        // writable end naturally.
+        return .eof;
     }
 
     /// `[method]descriptor.write-via-stream: func(data: stream<u8>,
@@ -10075,6 +10292,12 @@ pub const WasiCliAdapter = struct {
         _: Allocator,
     ) async_mod.HostStreamAction {
         const ctx: *FsWriteStreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        // (#583 B1) `canon task.cancel` flipped the cancel flag — bail
+        // before issuing any further pwrite(2). Returning `.err` makes
+        // the executor flip `read_closed = true` so the guest's next
+        // `stream.write` returns DROPPED, matching the wit-bindgen
+        // `Subtask` "cancelled mid-stream" decoder path.
+        if (ctx.cancelled) return .err;
         if (bytes.len == 0) return .progressed;
         const d = ctx.adapter.lookupFsDescriptor(ctx.desc_handle) orelse return .err;
         const fs_file: FsDescriptor.FsFile = switch (d.*) {
@@ -31337,6 +31560,281 @@ test "WasiCliAdapter.cancelAllPendingTimers: aborts in-flight waits with cancel 
     // Pending list is drained; subsequent timer-wheel drives are no-ops.
     try testing.expectEqual(@as(usize, 0), adapter.timer_futures.items.len);
     try testing.expect(!adapter.completeDueTimerFutures(&ci, testing.allocator));
+}
+
+test "WasiCliAdapter.cancelAllPendingAsyncOps: UDP receive cancel mid-pending settles future with cancel sentinel (#583 B1)" {
+    // Mirrors the timer-future cancel test but for the
+    // `udp-socket.receive` deferred-completion path (#576). A guest
+    // that issues `task.cancel` while parked on a `recvfrom` must
+    // observe the future settling with the cancel disposition
+    // (`STATUS_STARTED_CANCELLED` published to the waitable) instead
+    // of waiting forever for a datagram that never arrives.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    _ = try p3UdpReceiveTestSetup(&adapter, &ci);
+
+    // Call receive on the receiver — no datagram waiting yet so the
+    // future parks on `pending_udp_receives`.
+    const args = [_]InterfaceValue{.{ .handle = 1 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.udpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+    const fh = results[0].handle;
+    const fut = ci.futures.getPtr(fh).?;
+    try testing.expectEqual(async_mod.Future.State.pending, fut.state);
+    try testing.expectEqual(@as(usize, 1), adapter.pending_udp_receives.items.len);
+
+    // Wire up a waitable so we can verify the cancel sentinel reaches it.
+    var ws: async_mod.WaitableSet = .{};
+    defer ws.deinit(testing.allocator);
+    const idx = try ws.register(.{
+        .kind = .future_read,
+        .handle = fh,
+    }, testing.allocator);
+    fut.waitable_set = &ws;
+    fut.read_waitable_idx = idx;
+
+    // Guest issues `canon task.cancel`. The adapter's cancel driver
+    // must reap the pending receive.
+    WasiCliAdapter.cancelAllPendingAsyncOps(&adapter, &ci, null, testing.allocator);
+
+    // Future is now settled in the cancel disposition.
+    try testing.expectEqual(async_mod.Future.State.closed, fut.state);
+    try testing.expectEqual(true, fut.write_closed);
+    // Waitable carries the wit-bindgen `STATUS_STARTED_CANCELLED`
+    // discriminant for the EVENT_SUBTASK pop.
+    try testing.expectEqual(@as(usize, 1), ws.items.items.len);
+    try testing.expect(ws.items.items[0].ready);
+    try testing.expectEqual(executor_root.STATUS_STARTED_CANCELLED, ws.items.items[0].code);
+    // Pending entry was reaped — `driveAsyncEvents` will not re-poll
+    // the fd looking for a datagram the guest no longer wants.
+    try testing.expectEqual(@as(usize, 0), adapter.pending_udp_receives.items.len);
+}
+
+test "WasiCliAdapter.cancelAllPendingAsyncOps: FS write-via-stream drain loop short-circuits with .err (#583 B1)" {
+    // The host-driver `on_write` callback for a
+    // `descriptor.write-via-stream` slot must observe the cancel
+    // flag flipped by the cancel driver and return `.err` so the
+    // executor closes the read end and the guest's next
+    // `stream.write` returns DROPPED — no further pwrite(2) syscalls
+    // happen after cancel.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-cancel-w.txt", .data = "" });
+    const file = try tmp.dir.openFile(io, "p3-cancel-w.txt", .{ .mode = .read_write });
+    const desc_handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true, .write = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Seed an empty stream then call write-via-stream so the adapter
+    // installs the host_driver.
+    const stream_handle = ci.allocAsyncHandle();
+    try ci.streams.put(testing.allocator, stream_handle, .{});
+
+    var args = [_]InterfaceValue{
+        .{ .handle = desc_handle },
+        .{ .handle = stream_handle },
+        .{ .u64 = 0 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorWriteViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+
+    // One ctx was registered — keep a pointer to it for direct
+    // invocation of the on_write callback.
+    try testing.expectEqual(@as(usize, 1), adapter.fs_write_stream_ctxs.items.len);
+    const slot = ci.streams.getPtr(stream_handle).?;
+    try testing.expect(slot.host_driver != null);
+
+    // First chunk pre-cancel: `on_write` must `pwrite(2)` and return
+    // `.progressed`, advancing the running offset.
+    var stream_for_cb: async_mod.AsyncStream = .{};
+    defer stream_for_cb.deinit(testing.allocator);
+    const before = adapter.fs_write_stream_ctxs.items[0].bytes_written;
+    const action_ok = slot.host_driver.?.on_write.?(
+        slot.host_driver.?.context,
+        &stream_for_cb,
+        "abc",
+        ci.allocator,
+    );
+    try testing.expectEqual(async_mod.HostStreamAction.progressed, action_ok);
+    try testing.expectEqual(before + 3, adapter.fs_write_stream_ctxs.items[0].bytes_written);
+
+    // Cancel — flips the per-ctx flag on every registered FS stream.
+    WasiCliAdapter.cancelAllPendingAsyncOps(&adapter, &ci, null, testing.allocator);
+    try testing.expect(adapter.fs_write_stream_ctxs.items[0].cancelled);
+
+    // Post-cancel chunk: drain loop short-circuits with `.err`. The
+    // running offset must NOT advance — no further pwrite happened.
+    const cancelled_offset = adapter.fs_write_stream_ctxs.items[0].bytes_written;
+    const action_cancel = slot.host_driver.?.on_write.?(
+        slot.host_driver.?.context,
+        &stream_for_cb,
+        "xyz",
+        ci.allocator,
+    );
+    try testing.expectEqual(async_mod.HostStreamAction.err, action_cancel);
+    try testing.expectEqual(cancelled_offset, adapter.fs_write_stream_ctxs.items[0].bytes_written);
+
+    // File still only contains the pre-cancel chunk.
+    var buf: [16]u8 = undefined;
+    const n = try file.readPositional(io, &.{&buf}, 0);
+    try testing.expectEqualStrings("abc", buf[0..n]);
+}
+
+test "WasiCliAdapter.cancelAllPendingAsyncOps: FS read-via-stream on_read short-circuits with .eof after cancel (#583 B1)" {
+    // `read-via-stream` pre-buffers the file synchronously and sets
+    // `write_closed = true`, so the executor never invokes the
+    // host-driver callback in steady state. The cancel hook still
+    // matters for the lazy-drain refactor and is verified by direct
+    // invocation here: after cancel, `fsReadViaStreamOnRead` must
+    // return `.eof` so the executor closes the writable end and the
+    // guest's next `stream.read` sees DROPPED with zero bytes
+    // transferred.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try tmp.dir.writeFile(io, .{ .sub_path = "p3-cancel-r.txt", .data = "cancel-bytes" });
+    const file = try tmp.dir.openFile(io, "p3-cancel-r.txt", .{ .mode = .read_only });
+    const desc_handle = try adapter.pushFsDescriptor(.{ .file = .{ .file = file, .flags = .{ .read = true } } });
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    var args = [_]InterfaceValue{ .{ .handle = desc_handle }, .{ .u64 = 0 } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.fsDescriptorReadViaStreamP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    const stream_handle = results[0].tuple_val[0].handle;
+    const slot = ci.streams.getPtr(stream_handle).?;
+
+    // Pre-buffer is intact and the cancel-aware host_driver is wired up.
+    try testing.expectEqualStrings("cancel-bytes", slot.buffer.items);
+    try testing.expect(slot.host_driver != null);
+    try testing.expectEqual(@as(usize, 1), adapter.fs_read_stream_ctxs.items.len);
+    const ctx = adapter.fs_read_stream_ctxs.items[0];
+    try testing.expect(!ctx.cancelled);
+
+    // Snapshot the buffer length so we can prove cancel doesn't
+    // mutate it.
+    const buffered_before = slot.buffer.items.len;
+
+    // Cancel — flips the per-ctx flag on every registered FS read stream.
+    WasiCliAdapter.cancelAllPendingAsyncOps(&adapter, &ci, null, testing.allocator);
+    try testing.expect(ctx.cancelled);
+
+    // Direct invocation of on_read post-cancel: `.eof`, no bytes
+    // appended. The pre-buffered FIFO content is untouched.
+    var stream_for_cb: async_mod.AsyncStream = .{};
+    defer stream_for_cb.deinit(testing.allocator);
+    const action = slot.host_driver.?.on_read.?(
+        slot.host_driver.?.context,
+        &stream_for_cb,
+        ci.allocator,
+    );
+    try testing.expectEqual(async_mod.HostStreamAction.eof, action);
+    try testing.expectEqual(@as(usize, 0), stream_for_cb.buffer.items.len);
+    try testing.expectEqual(buffered_before, slot.buffer.items.len);
+}
+
+test "WasiCliAdapter.cancelAllPendingAsyncOps: outbound HTTP fetch flips shared.cancelled and drainer settles HTTP_request_denied (#583 B1)" {
+    // The blocking `std.http.Client.fetch` cannot be interrupted
+    // from another thread, but the per-fetch `shared.cancelled`
+    // atomic flag IS observed by the drainer
+    // (`settlePendingHttpFetch`) once the worker publishes its
+    // outcome. The cancel driver flips that flag for every entry on
+    // `pending_http_fetches`, so a guest-issued `task.cancel`
+    // surfaces as `HTTP_request_denied` regardless of the wire
+    // outcome — best-effort, observed at the worker's next
+    // synchronisation point.
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    var ci: ComponentInstance = undefined;
+
+    // Mint a `.pending` FutureIncomingResponse + a heap-allocated
+    // shared block, and register a fake `PendingHttpFetch` entry as
+    // if a worker thread were in flight. We use a synthetic worker
+    // (a no-op thread that immediately publishes `done`) so the
+    // drainer's `thread.join()` returns instantly without invoking
+    // the real `std.http.Client.fetch`. Mirrors the unit-test pattern
+    // used elsewhere in this module to avoid network dependency.
+    const fut = try testing.allocator.create(FutureIncomingResponse);
+    fut.* = .{ .state = .pending };
+    const fh = try adapter.pushFutureResponse(fut);
+
+    const shared = try adapter.allocator.create(PendingHttpFetchShared);
+    shared.* = .{};
+
+    const Worker = struct {
+        fn run(s: *PendingHttpFetchShared) void {
+            // Simulate worker that's already finished its fetch
+            // with a success outcome, so the cancel-vs-success race
+            // is observable: cancel must override the success.
+            s.outcome = .{ .success = .{ .status = 200, .headers = &.{}, .body = &.{} } };
+            s.done.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Worker.run, .{shared});
+    try adapter.pending_http_fetches.append(adapter.allocator, .{
+        .future_handle = fh,
+        .thread = t,
+        .shared = shared,
+    });
+
+    // Cancel — flips `shared.cancelled` for every pending fetch.
+    WasiCliAdapter.cancelAllPendingAsyncOps(&adapter, &ci, null, testing.allocator);
+    try testing.expect(adapter.pending_http_fetches.items[0].shared.cancelled.load(.acquire));
+
+    // Drain. The drainer sees `cancelled = true` and overrides the
+    // success outcome with `HTTP_request_denied` per the documented
+    // cancel arm of `settlePendingHttpFetch`.
+    var attempts: usize = 0;
+    while (attempts < 10_000 and adapter.pending_http_fetches.items.len > 0) : (attempts += 1) {
+        adapter.drainPendingHttpFetches();
+        if (adapter.pending_http_fetches.items.len == 0) break;
+        const drv_io = std.Io.Threaded.global_single_threaded.io();
+        const dur: std.Io.Clock.Duration = .{
+            .raw = .{ .nanoseconds = 1 * std.time.ns_per_ms },
+            .clock = .awake,
+        };
+        dur.sleep(drv_io) catch {};
+    }
+    try testing.expectEqual(@as(usize, 0), adapter.pending_http_fetches.items.len);
+
+    // Future settled to the cancel sentinel (HTTP_request_denied).
+    const settled = adapter.lookupFutureResponse(fh).?;
+    switch (settled.state) {
+        .ready_err => |code| try testing.expectEqual(
+            @as(u32, @intFromEnum(HttpErrorCode.HTTP_request_denied)),
+            code,
+        ),
+        else => return error.UnexpectedHttpFutureState,
+    }
 }
 
 test "wasi:clocks/monotonic-clock@0.3 polyfill: subscribe-duration pollable fires via P3 timer (#483)" {
