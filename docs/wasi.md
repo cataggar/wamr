@@ -43,7 +43,7 @@ seam where each interface name is version-multiplexed onto the matching
 | `wasi:io`          | ✅ | ✅ | `poll` / `error` / `streams`; P3 stream/future plumbing lives in the canonical ABI. |
 | `wasi:random`      | ✅ | ✅ | OS CSPRNG (`std.crypto.random`) + insecure variants + 128-bit seed. |
 | `wasi:sockets`     | ✅ | ✅ | TCP + UDP + DNS; allow-list gated; SO_REUSEADDR; Windows + POSIX parity. |
-| `wasi:keyvalue`    | ✅ | — | Memory-store host adapter — `store` + `atomics` + `batch` (#583 B4). |
+| `wasi:keyvalue`    | ✅ | — | Memory-store host adapter — `store` + `atomics` (real CAS) + `batch`; optional file-backed persistence via `--keyvalue-store=<path>` (#583 B4). |
 | `wasi:logging`     | ✅ | — | `wasi:logging@0.1.0-draft`: routes guest log calls to host stderr + `std.log.scoped(.wasi_guest)`. Level filter via `--log-level` / `WAMR_LOG_LEVEL`. |
 | `wasi:config`      | ✅ (rc.1) | — | Layered env (`WAMR_CONFIG_*`) + `--config-store=PATH.json` host adapter (#583 B6). |
 | `wasi:blobstore`   | — | — | Not implemented (#583 B7). |
@@ -88,9 +88,9 @@ correspond 1:1 with the WIT functions / methods / `[constructor]` /
 | `wasi:http/types`                  | 56 | `wasi-p2-testsuite` (`zig-http`) | Fields + outgoing/incoming request/response + bodies + futures. |
 | `wasi:http/outgoing-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real `std.http.Client.fetch` for `http://` + `https://`. |
 | `wasi:http/incoming-handler`       |  1 | `wasi-p2-testsuite` (`zig-http`) | Real TCP-listener-backed dispatch (#580). |
-| `wasi:keyvalue/store@0.2.0-draft2`     |  7 | unit tests (`#583 B4`) | Memory-store `bucket`: `open`, `get`, `set`, `delete`, `exists`, `list-keys`, `[resource-drop]`. |
-| `wasi:keyvalue/atomics@0.2.0-draft2`   |  5 | unit tests (`#583 B4`) | `increment` (real); `cas` resource + `swap` registered as `error::other` stubs. |
-| `wasi:keyvalue/batch@0.2.0-draft2`     |  3 | unit tests (`#583 B4`) | `get-many`, `set-many`, `delete-many` over the same bucket table. |
+| `wasi:keyvalue/store@0.2.0-draft2`     |  7 | unit tests (`#583 B4`) | Memory-store `bucket`: `open`, `get`, `set`, `delete`, `exists`, `list-keys`, `[resource-drop]`. Hydrated from `--keyvalue-store=PATH.json` on startup when set. |
+| `wasi:keyvalue/atomics@0.2.0-draft2`   |  5 | unit tests (`#583 B4`) | `increment` + real CAS: `[static]cas.new` snapshots `(bucket, key)`, `[method]cas.current` lifts the snapshot, `swap` is the atomic test-and-set (`cas-error::cas-failed(cas)` on mismatch, re-snapshotted handle for retry). |
+| `wasi:keyvalue/batch@0.2.0-draft2`     |  3 | unit tests (`#583 B4`) | `get-many`, `set-many`, `delete-many` over the same bucket table; mutations flush through to `--keyvalue-store` when set. |
 | `wasi:logging/logging@0.1.0-draft` |  1 | unit tests | Host stderr + `std.log.scoped(.wasi_guest)`; level filter via `--log-level` / `WAMR_LOG_LEVEL`. No structured-logging backends yet (#583 B5). |
 | `wasi:config/store@0.2.0-rc.1`     |  2 | Adapter unit tests (#583 B6) | `get` / `get-all`. Layered backing: env vars matching `WAMR_CONFIG_<KEY>=<value>` (prefix stripped, key lower-cased ASCII) plus an optional `--config-store=PATH.json` flat object. **File overrides env** on duplicate keys. In-memory store never surfaces the `error` arms (`upstream` / `io`) — reserved for future Vault / Kubernetes / etc. backends. Pinned to upstream `wasi:config@0.2.0-rc.1` ([WebAssembly/wasi-config](https://github.com/WebAssembly/wasi-config)); the version-multiplex in `populateWasiProviders` accepts any `wasi:config/store@…` import so future revisions that keep the method shape work without code changes. |
 
@@ -215,15 +215,23 @@ in that tracker.
   wasmtime). ([#583 B2](https://github.com/cataggar/wamr/issues/583))
 * **`wasi:threads@0.3.x`** (preemptive threads) — not implemented;
   upstream WIT still draft. ([#583 B3](https://github.com/cataggar/wamr/issues/583))
-* **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped.
-  Limitations: in-process `std.StringHashMapUnmanaged` only; no disk
-  persistence and no cross-process / replicated consistency. The
-  `cas` resource (`atomics.cas.new` / `cas.current` / `atomics.swap`)
-  is registered as `error::other("…")` stubs — guests link cleanly
-  but a real CAS round-trip is rejected with a typed error. Disk-
-  backed stores and CAS are intentionally out of scope for
-  [#583 B4](https://github.com/cataggar/wamr/issues/583); upstream
-  WIT pinned at `wasi:keyvalue@0.2.0-draft2`
+* **`wasi:keyvalue@0.2.x`** — memory-store host adapter shipped, with
+  optional file-backed persistence and real compare-and-swap.
+  Limitations: in-process `std.StringHashMapUnmanaged` only; no
+  cross-process / replicated consistency beyond the file-backed
+  snapshot. Persistence is opt-in via `--keyvalue-store=<path>` —
+  the file holds a JSON object whose top-level keys are bucket
+  identifiers and whose inner objects map keys to base64-encoded
+  value bytes (e.g. `{"primary":{"alpha":"dmFsdWU="}}`). Reads on
+  startup, rewrites synchronously on every mutation (`set` /
+  `delete` / successful `swap` / `increment` / batch.{set,delete}-many).
+  The flush is a plain `writeFile` — atomic-rename (`<path>.tmp` →
+  `rename`) is documented as a follow-up hardening. The `cas`
+  resource is now a real atomic test-and-set (`[static]cas.new` /
+  `[method]cas.current` / `swap` / `[resource-drop]cas`); mismatches
+  surface `cas-error::cas-failed(cas)` with a re-snapshotted handle
+  so guests can retry without re-issuing `cas.new`. Upstream WIT
+  pinned at `wasi:keyvalue@0.2.0-draft2`
   ([commit `fb6e23d`](https://github.com/WebAssembly/wasi-keyvalue/tree/fb6e23d11d41d0704b41cdd6362536c5750e0329)
   — vendored under [`docs/wasi-keyvalue-wit-vendored/`](wasi-keyvalue-wit-vendored/)).
 * **`wasi:logging@0.1.x`** — host adapter shipped. Routes guest
