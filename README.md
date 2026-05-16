@@ -91,13 +91,35 @@ C1](https://github.com/cataggar/wamr/issues/583)): it runs the same
 [Wasmtime](https://wasmtime.dev/) (CI pin `v44.0.1`, the first stable
 release with `-Sp3` support) and diffs the JSON reports via
 [`scripts/diff-testsuite-reports.py`](scripts/diff-testsuite-reports.py).
-The classifier exits non-zero only on *regressions* (wamr fails a
-fixture that Wasmtime still passes); deltas in the other direction
-(Wasmtime fails a fixture wamr passes) are downgraded to fixture /
-runtime-bug warnings so a wamr regression that Wasmtime also exhibits
-doesn't masquerade as a wamr bug. The CI workflow at
+The classifier exits non-zero on:
+
+* *Regressions* — wamr fails a fixture that Wasmtime still passes
+  (a true wamr regression).
+* *Stale skip-list entries* — a fixture listed in
+  [`tests/wasi-p3-parity-skip.json`](tests/wasi-p3-parity-skip.json)
+  is no longer in the wamr-pass / Wasmtime-fail shape (e.g. the
+  upstream Wasmtime / wasi-testsuite fix has landed and the entry
+  must be retired).
+* *Undocumented Wasmtime-side bugs* under `--strict` — a fixture
+  wamr passes but Wasmtime fails for which the skip-list has no
+  tracking entry.
+
+The skip-list at
+[`tests/wasi-p3-parity-skip.json`](tests/wasi-p3-parity-skip.json)
+maps each known Wasmtime-side or fixture-side bug to an upstream
+tracking issue. Entries listed there are *documented* deltas — they
+are reported on stderr but never fail the parity gate, so a Wasmtime
+v44.0.1 fixture failure (currently `http-service`,
+`sockets-tcp-connect`, `sockets-tcp-listen`, `sockets-udp-send`)
+does not masquerade as a wamr bug. To document a new Wasmtime delta,
+file an upstream issue at `bytecodealliance/wasmtime` (or
+`WebAssembly/wasi-testsuite` for fixture bugs) and add an entry
+keyed by fixture name with the tracking URL as the value. The CI
+workflow at
 [`.github/workflows/wasi-p3-parity.yml`](.github/workflows/wasi-p3-parity.yml)
-runs the gate on push to `main` and nightly.
+runs the gate on push to `main` and nightly and is *required* — a
+new wamr regression or new undocumented Wasmtime delta blocks the
+merge queue.
 
 [wts]: https://github.com/WebAssembly/wasi-testsuite
 
