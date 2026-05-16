@@ -1386,10 +1386,42 @@ pub const ResolveAddressStream = struct {
 /// consult the fd, and (for accept) push new sockets through the
 /// adapter. Owned by `WasiCliAdapter.sockets_p3_stream_ctxs`, lives
 /// until adapter teardown.
+///
+/// ## Cancel observation (#583 follow-up to #607)
+///
+/// `cancelled` is flipped by `cancelAllPendingAsyncOps` when the
+/// guest issues `canon task.cancel`. The TCP receive drivers
+/// (`tcpReceiveStreamOnRead` and the zero-copy
+/// `tcpReceiveStreamOnReadInto`, #583 B2) poll it with
+/// `.load(.acquire)` at entry and short-circuit with `.err` so the
+/// executor's `stream.read` rendezvous closes the writable end and
+/// the guest's next `stream.read` observes the natural DROPPED status.
+///
+/// Per-chunk cancel granularity: the executor's zero-copy
+/// `stream.read` arm loops `on_read_into` up to 32 iterations per
+/// guest-visible `stream.read`, and each driver invocation is capped
+/// at 64 KiB by `tcpReceiveStreamOnReadInto`. A `task.cancel` issued
+/// mid-multi-MiB receive is therefore observed within at most one
+/// chunk's `recv(2)` latency, mirroring the per-chunk cadence
+/// established by the FS drivers in #607 and the HTTP body-read
+/// loop in #602. The kernel `recv(2)` syscall itself is atomic
+/// from cancel's POV — a 64 KiB recv that already entered the
+/// kernel runs to completion; any bytes it lands in the borrowed
+/// guest-linmem slice are accounted to the executor's running
+/// `total_bytes` counter and surfaced to the guest as
+/// `.completed(partial_count)` before `s.write_closed` flips.
+///
+/// Atomic so a multi-threaded host can flip the flag mid-loop from
+/// a separate cancel driver thread without UB. The flag lives on
+/// every socket-stream ctx (receive, send, accept) but is observed
+/// only by the receive drivers today; tcp-send / tcp-accept ignore
+/// it and are tracked for a future PR if their executor loops grow
+/// the same multi-chunk shape.
 pub const SocketsP3StreamCtx = struct {
     adapter: *WasiCliAdapter,
     fd: std.posix.fd_t,
     family: IpAddressFamily,
+    cancelled: std.atomic.Value(bool) = .{ .raw = false },
 };
 
 /// Lifetime-stable context for a `host_driver` attached to an
@@ -4087,7 +4119,10 @@ pub const WasiCliAdapter = struct {
     /// `*AsyncStream`'s `host_driver.context` pointer stays valid until
     /// the adapter tears down — the executor frees the `AsyncStream`
     /// itself but not the host context. Each entry is a small struct
-    /// (fd + adapter pointer + family).
+    /// (fd + adapter pointer + family + cancel flag). The
+    /// `cancelAllPendingAsyncOps` driver (#583 follow-up to #607)
+    /// flips `cancelled` on every entry so the tcp-receive drivers
+    /// observe `task.cancel` at the next chunk boundary.
     sockets_p3_stream_ctxs: std.ArrayListUnmanaged(*SocketsP3StreamCtx) = .empty,
     /// Lifetimes for `host_driver` contexts attached to `AsyncStream`
     /// slots produced by `descriptor.write-via-stream` /
@@ -7552,6 +7587,16 @@ pub const WasiCliAdapter = struct {
     ///   * **FS read-via-stream contexts** — flip `cancelled` so the
     ///     (currently armed-but-dormant) `fsReadViaStreamOnRead`
     ///     short-circuits with `.eof` if ever invoked.
+    ///   * **TCP-receive stream contexts** (#583 follow-up to #607) —
+    ///     flip `cancelled` so the next `tcpReceiveStreamOnRead` /
+    ///     `tcpReceiveStreamOnReadInto` chunk returns `.err` and the
+    ///     executor closes the writable end of the receive stream.
+    ///     The flag is per-`SocketsP3StreamCtx`, shared with the
+    ///     tcp-send / tcp-accept driver shapes but observed only by
+    ///     the receive drivers today. Each guest-visible `stream.read`
+    ///     loops the driver up to 32 times (each call ≤ 64 KiB), so
+    ///     cancel is observed within at most one chunk's `recv(2)`
+    ///     latency — matching the FS / HTTP cadence.
     ///   * **Pending outbound HTTP fetches** — flip the per-fetch
     ///     `shared.cancelled` atomic. The worker polls this flag at
     ///     every `std.http.Client.Request` phase boundary
@@ -7643,6 +7688,21 @@ pub const WasiCliAdapter = struct {
         // latency — mirrors the HTTP body-read cadence from #602.
         for (self.fs_write_stream_ctxs.items) |ctx| ctx.cancelled.store(true, .release);
         for (self.fs_read_stream_ctxs.items) |ctx| ctx.cancelled.store(true, .release);
+
+        // ── Socket-stream contexts (#583 follow-up to #607) ───────
+        // Flip the cancel flag on every adapter-owned socket stream
+        // ctx. Observed today by the tcp-receive drivers
+        // (`tcpReceiveStreamOnRead` / `tcpReceiveStreamOnReadInto`)
+        // which poll it at entry and short-circuit with `.err`. The
+        // executor's zero-copy `stream.read` arm loops the driver up
+        // to 32 times per guest call, each invocation bounded at 64
+        // KiB — so cancel is observed within at most one chunk's
+        // `recv(2)` latency, matching the FS / HTTP cadence. The
+        // tcp-send / tcp-accept drivers ignore the flag today (each
+        // does a single bounded syscall per call); they're tracked
+        // for a future PR if their executor loops grow the same
+        // multi-chunk shape.
+        for (self.sockets_p3_stream_ctxs.items) |ctx| ctx.cancelled.store(true, .release);
 
         // ── Outbound HTTP fetches (#583 B1) ───────────────────────
         // `shared.cancelled` is an `Atomic.Value(bool)` so the worker
@@ -14808,12 +14868,23 @@ pub const WasiCliAdapter = struct {
     /// below: the executor reaches this path when the guest destination
     /// can't be addressed as a contiguous slice (`u32` overflow on
     /// `max_count * elem_size`, out-of-bounds `(ptr, len)`).
+    ///
+    /// (#583 follow-up to #607) Polls `ctx.cancelled.load(.acquire)`
+    /// at entry and short-circuits with `.err` so the executor
+    /// closes the writable end and the guest's next `stream.read`
+    /// observes the `STATUS_STARTED_CANCELLED` / DROPPED disposition.
+    /// The legacy `on_read` executor loop breaks after the first
+    /// successful `.progressed` (FIFO becomes non-empty), so cancel
+    /// observation at entry is per-call here — but symmetry with the
+    /// zero-copy `on_read_into` path (where the executor loops up to
+    /// 32 chunks per `stream.read`) keeps the two callbacks aligned.
     fn tcpReceiveStreamOnRead(
         opaque_ctx: ?*anyopaque,
         stream: *async_mod.AsyncStream,
         allocator: Allocator,
     ) async_mod.HostStreamAction {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (ctx.cancelled.load(.acquire)) return .err;
         if (!fdPollReady(ctx.fd, pollInEvents())) return .would_block;
         const io = std.Io.Threaded.global_single_threaded.io();
         var buf: [64 * 1024]u8 = undefined;
@@ -14834,11 +14905,45 @@ pub const WasiCliAdapter = struct {
     /// Caps the per-call read at `min(dst.len, 64 KiB)` to mirror the
     /// production `tcpReceiveStreamOnRead` ceiling — keeps a single
     /// non-blocking syscall bounded so the executor stays responsive.
+    ///
+    /// ## Per-chunk cancel polling (#583 follow-up to #607)
+    ///
+    /// The executor's zero-copy `stream.read` arm calls this driver up
+    /// to 32 times per guest-visible `stream.read`, each call bounded
+    /// at 64 KiB above — i.e. the executor itself is the multi-chunk
+    /// drain loop, with this driver supplying one chunk per
+    /// invocation. Polling `ctx.cancelled.load(.acquire)` at entry
+    /// therefore IS the per-chunk cancel poll: a `task.cancel` issued
+    /// mid-multi-MiB receive is observed within at most one chunk's
+    /// `recv(2)` latency, matching the cadence the FS drivers (#607)
+    /// and HTTP outbound body-read (#602) settled on.
+    ///
+    /// On cancel: return `.{ .action = .err }` with the default
+    /// `bytes_written = 0`. The executor's loop then:
+    ///   * sets `s.write_closed = true`,
+    ///   * breaks out of the chunk loop,
+    ///   * if any prior iteration of the same `stream.read` already
+    ///     deposited bytes into the guest slice, the executor's
+    ///     `if (total_bytes > 0)` branch surfaces them as
+    ///     `completed(partial_count)` — partial-byte accounting is
+    ///     handled by the executor's running `total_bytes`, the
+    ///     driver does not need to thread it.
+    ///   * the NEXT guest `stream.read` finds `s.write_closed` and
+    ///     receives `dropped(0)` — i.e. the wit-bindgen `Subtask`
+    ///     "cancelled mid-stream" decoder path.
+    ///
+    /// Zero-copy safety: the borrowed guest slice is only ever
+    /// written-to by an in-flight kernel `recv(2)`. Since we short-
+    /// circuit BEFORE the syscall, no kernel write races the cancel
+    /// observation — the bytes the executor sees in the guest slice
+    /// are exactly the ones the prior iterations' `recv(2)` calls
+    /// landed there.
     fn tcpReceiveStreamOnReadInto(
         opaque_ctx: ?*anyopaque,
         dst: []u8,
     ) async_mod.HostStreamReadInto {
         const ctx: *SocketsP3StreamCtx = @ptrCast(@alignCast(opaque_ctx.?));
+        if (ctx.cancelled.load(.acquire)) return .{ .action = .err };
         if (dst.len == 0) return .{ .action = .would_block };
         if (!fdPollReady(ctx.fd, pollInEvents())) return .{ .action = .would_block };
         const cap = @min(dst.len, 64 * 1024);
@@ -29162,6 +29267,254 @@ test "sockets P3 #535: tcp-receive stream driver yields multiple read cycles" {
     // Drop the tcp_stream we stashed on the socket slot so closeAll
     // doesn't double-close the fd (server_side is owned by the test).
     adapter.socket_table.items[sock_idx].?.tcp_stream = null;
+}
+
+test "sockets P3 (#583 follow-up): tcp-receive zero-copy driver short-circuits with .err when cancel observed pre-recv" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Build a real loopback TCP pair via std.Io.net. The pair is the
+    // cheapest way to get a writable fd with no bytes pending; the
+    // driver under test never reaches the `netRead` syscall in this
+    // test (the cancel pre-check short-circuits before `fdPollReady`).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var bind_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var server = std.Io.net.IpAddress.listen(&bind_addr, io, .{ .kernel_backlog = 8 }) catch
+        return error.SkipZigTest;
+    defer server.deinit(io);
+    const listen_addr = server.socket.address;
+    const listen_port: u16 = switch (listen_addr) {
+        .ip4 => |v4| v4.port,
+        else => unreachable,
+    };
+
+    var connect_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = listen_port } };
+    var client = std.Io.net.IpAddress.connect(&connect_addr, io, .{ .mode = .stream }) catch
+        return error.SkipZigTest;
+    defer client.close(io);
+    var server_side = server.accept(io) catch return error.SkipZigTest;
+    defer server_side.close(io);
+
+    const sock_idx = try adapter.pushSocket(.{
+        .kind = .tcp,
+        .family = .ipv4,
+        .state = .connected,
+        .tcp_stream = server_side,
+        .remote_addr = client.socket.address,
+        .local_addr = listen_addr,
+    });
+    defer {
+        // Detach so closeAll doesn't double-close the test-owned fd.
+        adapter.socket_table.items[sock_idx].?.tcp_stream = null;
+    }
+
+    // Install the driver via the production trampoline.
+    const args = [_]InterfaceValue{.{ .handle = sock_idx }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer {
+        const fields = results[0].tuple_val;
+        testing.allocator.free(fields);
+    }
+    const stream_h = results[0].tuple_val[0].handle;
+    const slot = ci.streams.getPtr(stream_h).?;
+    try testing.expect(slot.host_driver != null);
+    try testing.expect(slot.host_driver.?.on_read_into != null);
+
+    const ctx: *SocketsP3StreamCtx =
+        @ptrCast(@alignCast(slot.host_driver.?.context.?));
+
+    // Baseline: no data pending, cancel NOT set → driver returns
+    // `.would_block` (the `fdPollReady` arm fires). Proves the
+    // difference between baseline and the cancel-asserted call below
+    // is the cancel pre-check, not a syscall failure or empty socket.
+    var dst: [256]u8 = undefined;
+    const baseline = slot.host_driver.?.on_read_into.?(ctx, dst[0..]);
+    try testing.expectEqual(async_mod.HostStreamAction.would_block, baseline.action);
+    try testing.expectEqual(@as(u32, 0), baseline.bytes_written);
+
+    // Flip the cancel flag (as `cancelAllPendingAsyncOps` would on
+    // `canon task.cancel`) and re-invoke. The driver MUST return
+    // `.err` from the pre-check, BEFORE either `fdPollReady` or
+    // `netRead` is invoked — i.e. no host-side syscall is issued
+    // against the borrowed guest slice.
+    ctx.cancelled.store(true, .release);
+    const after = slot.host_driver.?.on_read_into.?(ctx, dst[0..]);
+    try testing.expectEqual(async_mod.HostStreamAction.err, after.action);
+    try testing.expectEqual(@as(u32, 0), after.bytes_written);
+
+    // Sanity: the legacy `on_read` fallback (used when the zero-copy
+    // preconditions fail in the executor) honours the same cancel
+    // flag — the two callbacks must agree so the executor's
+    // fast/slow path choice never gates cancel observability.
+    const action = slot.host_driver.?.on_read.?(ctx, slot, testing.allocator);
+    try testing.expectEqual(async_mod.HostStreamAction.err, action);
+    try testing.expectEqual(@as(usize, 0), slot.buffer.items.len);
+}
+
+test "sockets P3 (#583 follow-up): tcp-receive zero-copy driver returns .err mid-loop after cancel; prior chunk's bytes preserved" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var bind_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var server = std.Io.net.IpAddress.listen(&bind_addr, io, .{ .kernel_backlog = 8 }) catch
+        return error.SkipZigTest;
+    defer server.deinit(io);
+    const listen_addr = server.socket.address;
+    const listen_port: u16 = switch (listen_addr) {
+        .ip4 => |v4| v4.port,
+        else => unreachable,
+    };
+
+    var connect_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = listen_port } };
+    var client = std.Io.net.IpAddress.connect(&connect_addr, io, .{ .mode = .stream }) catch
+        return error.SkipZigTest;
+    defer client.close(io);
+    var server_side = server.accept(io) catch return error.SkipZigTest;
+    defer server_side.close(io);
+
+    const sock_idx = try adapter.pushSocket(.{
+        .kind = .tcp,
+        .family = .ipv4,
+        .state = .connected,
+        .tcp_stream = server_side,
+        .remote_addr = client.socket.address,
+        .local_addr = listen_addr,
+    });
+    defer {
+        adapter.socket_table.items[sock_idx].?.tcp_stream = null;
+    }
+
+    const args = [_]InterfaceValue{.{ .handle = sock_idx }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.tcpReceiveP3(&adapter, &ci, &args, &results, testing.allocator);
+    defer {
+        const fields = results[0].tuple_val;
+        testing.allocator.free(fields);
+    }
+    const stream_h = results[0].tuple_val[0].handle;
+    const slot = ci.streams.getPtr(stream_h).?;
+    const ctx: *SocketsP3StreamCtx =
+        @ptrCast(@alignCast(slot.host_driver.?.context.?));
+
+    // First chunk: client sends bytes, driver successfully drains them
+    // into the borrowed guest slice. This simulates iteration #1 of
+    // the executor's zero-copy `stream.read` chunk loop.
+    const first_chunk = "first-tcp-chunk";
+    {
+        const slices = [_][]const u8{first_chunk};
+        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+    }
+    var attempt: usize = 0;
+    while (attempt < 10_000) : (attempt += 1) {
+        if (WasiCliAdapter.fdPollReady(server_side.socket.handle, WasiCliAdapter.pollInEvents())) break;
+    }
+
+    // Simulate the executor's borrowed-guest-slice: a stack buffer
+    // wide enough for both chunks. The executor passes successive
+    // sub-slices `dst[total_bytes..]` per iteration; we mirror that
+    // by sliding the offset manually.
+    var dst: [4096]u8 = undefined;
+    @memset(dst[0..], 0xAA);
+    var total_bytes: u32 = 0;
+
+    const iter1 = slot.host_driver.?.on_read_into.?(ctx, dst[total_bytes..]);
+    try testing.expectEqual(async_mod.HostStreamAction.progressed, iter1.action);
+    try testing.expect(iter1.bytes_written > 0);
+    try testing.expectEqualSlices(u8, first_chunk, dst[total_bytes..][0..iter1.bytes_written]);
+    const first_n = iter1.bytes_written;
+    total_bytes += first_n;
+
+    // Mid-loop: send more bytes the driver COULD legally drain on
+    // the next iteration, then flip the cancel flag — simulating
+    // `cancelAllPendingAsyncOps` firing while the executor sits
+    // between two chunks of the same `stream.read`.
+    const second_chunk = "second-tcp-chunk-would-be-drained";
+    {
+        const slices = [_][]const u8{second_chunk};
+        _ = try io.vtable.netWrite(io.userdata, client.socket.handle, &.{}, &slices, 1);
+    }
+    attempt = 0;
+    while (attempt < 10_000) : (attempt += 1) {
+        if (WasiCliAdapter.fdPollReady(server_side.socket.handle, WasiCliAdapter.pollInEvents())) break;
+    }
+    ctx.cancelled.store(true, .release);
+
+    // Iteration #2: driver MUST short-circuit with `.err` and
+    // `bytes_written = 0` even though loopback bytes are sitting in
+    // the socket buffer ready to read. The kernel `recv(2)` is
+    // never invoked, so the in-kernel pending bytes stay pending
+    // (test cleanup drops the fd; they'd just be discarded).
+    const iter2 = slot.host_driver.?.on_read_into.?(ctx, dst[total_bytes..]);
+    try testing.expectEqual(async_mod.HostStreamAction.err, iter2.action);
+    try testing.expectEqual(@as(u32, 0), iter2.bytes_written);
+
+    // The prior iteration's bytes in `dst[0..first_n]` are
+    // untouched: the cancel branch took zero-copy through the
+    // guest slice without overwriting earlier successful writes.
+    // This is what makes the executor's `if (total_bytes > 0)`
+    // partial-completion arm correct — the driver promises that
+    // `.err` leaves the destination prefix intact.
+    try testing.expectEqualSlices(u8, first_chunk, dst[0..first_n]);
+    // The bytes the executor would have iterated INTO next remain
+    // their pre-call sentinel — the driver did not overwrite them.
+    try testing.expectEqual(@as(u8, 0xAA), dst[total_bytes]);
+}
+
+test "sockets P3 (#583 follow-up): cancelAllPendingAsyncOps flips cancel flag on every adapter-owned socket stream ctx" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+    try p3SocketsAllowLoopback(&adapter);
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+    p3TestInitAsyncTables(&ci);
+    defer p3TestDeinitAsyncTables(&ci, testing.allocator);
+
+    // Allocate two socket-stream ctxs directly (no real fd needed —
+    // this test exercises only the cancel-flag wire-up, not the
+    // drivers themselves). The bogus fds never get poll'd here.
+    const ctx_a = try adapter.allocSocketsP3StreamCtx(-1, .ipv4);
+    const ctx_b = try adapter.allocSocketsP3StreamCtx(-1, .ipv6);
+
+    // Pre-cancel: every flag starts false (the struct's default).
+    try testing.expect(!ctx_a.cancelled.load(.acquire));
+    try testing.expect(!ctx_b.cancelled.load(.acquire));
+
+    // Fire the cancel driver as `canon task.cancel` would.
+    WasiCliAdapter.cancelAllPendingAsyncOps(&adapter, &ci, null, testing.allocator);
+
+    // Post-cancel: every adapter-owned socket-stream ctx observes
+    // the flip — no per-stream tagging or kind-discrimination
+    // needed; the receive drivers consult the flag, the send /
+    // accept drivers ignore it harmlessly.
+    try testing.expect(ctx_a.cancelled.load(.acquire));
+    try testing.expect(ctx_b.cancelled.load(.acquire));
 }
 
 test "sockets P3 #535: tcp-accept stream driver pushes 3 connections through one listener" {
