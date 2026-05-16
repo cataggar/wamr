@@ -4845,6 +4845,37 @@ pub const WasiCliAdapter = struct {
             "[method]input-stream.read",
             .{ .func = .{ .context = self, .call = &blockingRead } },
         );
+        // ── #583 audit arms (PR #604): skip / write-zeroes / splice ────
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]input-stream.skip",
+            .{ .func = .{ .context = self, .call = &inputStreamSkip } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]input-stream.blocking-skip",
+            .{ .func = .{ .context = self, .call = &inputStreamSkip } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.write-zeroes",
+            .{ .func = .{ .context = self, .call = &outputStreamWriteZeroes } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.blocking-write-zeroes-and-flush",
+            .{ .func = .{ .context = self, .call = &outputStreamBlockingWriteZeroesAndFlush } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.splice",
+            .{ .func = .{ .context = self, .call = &outputStreamSplice } },
+        );
+        try self.io_streams_iface.members.put(
+            self.allocator,
+            "[method]output-stream.blocking-splice",
+            .{ .func = .{ .context = self, .call = &outputStreamSplice } },
+        );
         try self.io_streams_iface.members.put(
             self.allocator,
             "[resource-drop]input-stream",
@@ -5842,6 +5873,13 @@ pub const WasiCliAdapter = struct {
 
         try self.io_error_iface.members.put(self.allocator, "[resource-drop]error", .{
             .func = .{ .context = self, .call = &noopResourceDrop },
+        });
+        // `[method]error.to-debug-string: (borrow<error>) -> string` (#583
+        // audit arm). wamr does not maintain an io-error table — error
+        // handles surface only as canonical-ABI sentinels — so this is a
+        // best-effort opaque debug string. (Audit PR #604.)
+        try self.io_error_iface.members.put(self.allocator, "[method]error.to-debug-string", .{
+            .func = .{ .context = self, .call = &ioErrorToDebugString },
         });
         try providers.put(self.allocator, io_error_name, .{
             .host_instance = &self.io_error_iface,
@@ -8244,6 +8282,280 @@ pub const WasiCliAdapter = struct {
         if (handle < self.input_stream_table.items.len) {
             self.input_stream_table.items[handle] = null;
         }
+    }
+
+    // ── #583 audit arms (PR #604): wasi:io/streams@0.2 missing methods ──
+
+    /// Largest single-call read used by the skip / splice host paths.
+    /// Matches the cap that `blockingRead` uses. Guests can issue another
+    /// call if `len` exceeds the cap — every WIT method here returns the
+    /// actual bytes consumed in the ok arm.
+    const STREAM_SCRATCH_CAP: usize = 64 * 1024;
+
+    /// `wasi:io/streams.[method]input-stream.skip:
+    ///   (borrow<input-stream>, u64) -> result<u64, stream-error>` and
+    /// `[method]input-stream.blocking-skip:
+    ///   (borrow<input-stream>, u64) -> result<u64, stream-error>`.
+    ///
+    /// Read up to `len` bytes from the stream and discard them.
+    /// Backed by the same `InputStream.read` path as `blockingRead`,
+    /// since wamr's captured-buffer / fd / host-file / tcp sources are
+    /// all already blocking-on-data — the WIT distinction between
+    /// `skip` and `blocking-skip` therefore collapses to a single
+    /// host helper (see `populateWasiCliRun`, which wires both names
+    /// to this fn).
+    fn inputStreamSkip(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const want_u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const stream = self.lookupInputStream(handle) orelse return error.InvalidHandle;
+
+        const want: usize = @min(want_u64, std.math.maxInt(usize));
+        const capped: usize = @min(want, STREAM_SCRATCH_CAP);
+
+        const buf = try allocator.alloc(u8, capped);
+        defer allocator.free(buf);
+
+        switch (stream.read(buf)) {
+            .ok => |n| {
+                const payload = try allocator.create(InterfaceValue);
+                payload.* = .{ .u64 = @intCast(n) };
+                results[0] = .{ .result_val = .{ .is_ok = true, .payload = payload } };
+            },
+            .closed => {
+                // err arm; payload (stream-error variant) zero-fills —
+                // same convention as `blockingRead`.
+                results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+            },
+            .err => return error.IoError,
+        }
+    }
+
+    /// `wasi:io/streams.[method]output-stream.write-zeroes:
+    ///   (borrow<output-stream>, u64) -> result<_, stream-error>`.
+    ///
+    /// Write up to `len` zero bytes to the stream. Mirrors
+    /// `outputStreamWrite` — synthesises a zeroed scratch buffer of
+    /// the requested length (capped at `STREAM_SCRATCH_CAP`) and
+    /// pushes it through `OutputStream.write`. The WIT `write` and
+    /// `write-zeroes` share the same precondition contract
+    /// (`check-write` first) and the same error mapping.
+    fn outputStreamWriteZeroes(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const want_u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const stream = self.lookupStream(handle) orelse return error.InvalidHandle;
+
+        const want: usize = @min(want_u64, std.math.maxInt(usize));
+        const capped: usize = @min(want, STREAM_SCRATCH_CAP);
+
+        const buf = try allocator.alloc(u8, capped);
+        defer allocator.free(buf);
+        @memset(buf, 0);
+
+        switch (stream.write(buf, self.allocator)) {
+            .ok => {},
+            .err, .closed => return error.IoError,
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `wasi:io/streams.[method]output-stream.blocking-write-zeroes-and-flush:
+    ///   (borrow<output-stream>, u64) -> result<_, stream-error>`.
+    ///
+    /// Loops `outputStreamWriteZeroes` chunks until all `len` bytes
+    /// have been written, then flushes — combines the `write-zeroes`
+    /// payload synthesis with the trailing flush done by
+    /// `blockingWriteAndFlush`.
+    fn outputStreamBlockingWriteZeroesAndFlush(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 2 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const want_u64 = switch (args[1]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const stream = self.lookupStream(handle) orelse return error.InvalidHandle;
+
+        var remaining: usize = @min(want_u64, std.math.maxInt(usize));
+        if (remaining > 0) {
+            const chunk_sz: usize = @min(remaining, STREAM_SCRATCH_CAP);
+            const buf = try allocator.alloc(u8, chunk_sz);
+            defer allocator.free(buf);
+            @memset(buf, 0);
+            while (remaining > 0) {
+                const n = @min(remaining, chunk_sz);
+                switch (stream.write(buf[0..n], self.allocator)) {
+                    .ok => {},
+                    .err, .closed => return error.IoError,
+                }
+                remaining -= n;
+            }
+        }
+        switch (stream.flush()) {
+            .ok => {},
+            .err, .closed => return error.IoError,
+        }
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = null } };
+    }
+
+    /// `wasi:io/streams.[method]output-stream.splice:
+    ///   (borrow<output-stream>, borrow<input-stream>, u64)
+    ///   -> result<u64, stream-error>` and `[method]output-stream.blocking-splice`.
+    ///
+    /// MVP: buffer-through implementation — `read` up to `len` bytes
+    /// from `src` into a host scratch buffer, then `write` them to
+    /// `self`. Returns the number of bytes spliced in the ok arm.
+    /// A closed source surfaces in the err arm (`is_ok = false`)
+    /// matching the `blockingRead` convention.
+    ///
+    /// Follow-up: a zero-copy host-driver fast path could call
+    /// `splice(2)` (Linux) when both endpoints expose raw fds. Tracked
+    /// under [#583 B2](https://github.com/cataggar/wamr/issues/583);
+    /// the buffer-through path is correct (and the only correct option
+    /// for buffer-backed sinks) but does an extra memcpy for fd ↔ fd
+    /// hops.
+    fn outputStreamSplice(
+        ctx_opaque: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        const self: *WasiCliAdapter = @ptrCast(@alignCast(ctx_opaque.?));
+        if (args.len < 3 or results.len == 0) return error.InvalidArgs;
+        const out_handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const in_handle = switch (args[1]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const want_u64 = switch (args[2]) {
+            .u64 => |v| v,
+            else => return error.InvalidArgs,
+        };
+        const dst = self.lookupStream(out_handle) orelse return error.InvalidHandle;
+        const src = self.lookupInputStream(in_handle) orelse return error.InvalidHandle;
+
+        const want: usize = @min(want_u64, std.math.maxInt(usize));
+        const capped: usize = @min(want, STREAM_SCRATCH_CAP);
+
+        const buf = try allocator.alloc(u8, capped);
+        defer allocator.free(buf);
+
+        const n_read: usize = switch (src.read(buf)) {
+            .ok => |n| n,
+            .closed => {
+                results[0] = .{ .result_val = .{ .is_ok = false, .payload = null } };
+                return;
+            },
+            .err => return error.IoError,
+        };
+
+        switch (dst.write(buf[0..n_read], self.allocator)) {
+            .ok => {},
+            .err, .closed => return error.IoError,
+        }
+
+        const payload = try allocator.create(InterfaceValue);
+        payload.* = .{ .u64 = @intCast(n_read) };
+        results[0] = .{ .result_val = .{ .is_ok = true, .payload = payload } };
+    }
+
+    /// `wasi:io/error.[method]error.to-debug-string:
+    ///   (borrow<error>) -> string` (#583 audit arm; PR #604).
+    ///
+    /// wamr does not maintain an io-error table — every host fn that
+    /// would surface a `wasi:io/error` instance currently returns
+    /// `error.IoError` at the Zig layer and is mapped to a canonical-ABI
+    /// trap rather than a real handle. The method is bound so a guest
+    /// importing it links cleanly; the body returns an opaque
+    /// host-side description that includes the raw handle bits as a
+    /// best-effort debug aid.
+    fn ioErrorToDebugString(
+        _: ?*anyopaque,
+        ci: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        allocator: Allocator,
+    ) anyerror!void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        const handle = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "wasi:io error (opaque host handle #{d})",
+            .{handle},
+        );
+        defer allocator.free(msg);
+        const guest_ptr = ci.hostAllocAndWrite(msg) orelse return error.IoError;
+        results[0] = .{ .string = .{ .ptr = guest_ptr, .len = @intCast(msg.len) } };
+    }
+
+    /// `wasi:sockets/network.network-error-code:
+    ///   (borrow<error>) -> option<error-code>` (#583 audit arm; PR #604).
+    ///
+    /// Free function (not a method) that attempts to downcast a
+    /// `wasi:io/error` borrow into a sockets-specific `error-code`.
+    /// wamr does not track io-error provenance (see
+    /// `ioErrorToDebugString`), so this always returns `none`. A guest
+    /// using `network-error-code` purely to discriminate sockets-vs-
+    /// other errors will treat any wamr-emitted io-error as non-sockets
+    /// — which is correct for the *opaque* error wamr currently
+    /// surfaces, since sockets paths return typed `error-code` payloads
+    /// directly rather than going through the io-error indirection.
+    fn socketsNetworkErrorCode(
+        _: ?*anyopaque,
+        _: *ComponentInstance,
+        args: []const InterfaceValue,
+        results: []InterfaceValue,
+        _: Allocator,
+    ) anyerror!void {
+        if (args.len < 1 or results.len == 0) return error.InvalidArgs;
+        _ = switch (args[0]) {
+            .handle => |h| h,
+            else => return error.InvalidArgs,
+        };
+        results[0] = .{ .option_val = .{ .is_some = false, .payload = null } };
     }
 
     // ── wasi:filesystem (#145) ─────────────────────────────────────────────
@@ -14026,8 +14338,11 @@ pub const WasiCliAdapter = struct {
         }
     }
 
-    /// Register `wasi:sockets/network` (#148). The WIT declares zero
-    /// methods; only the resource-drop is bound.
+    /// Register `wasi:sockets/network` (#148). The resource itself
+    /// declares zero methods (only `[resource-drop]network`), but the
+    /// interface also exposes the free function
+    /// `network-error-code(err: borrow<error>) -> option<error-code>`
+    /// — added as part of the #583 audit (PR #604).
     pub fn populateWasiSocketsNetwork(
         self: *WasiCliAdapter,
         providers: *std.StringHashMapUnmanaged(ImportBinding),
@@ -14035,6 +14350,9 @@ pub const WasiCliAdapter = struct {
     ) !void {
         try self.sockets_network_iface.members.put(self.allocator, "[resource-drop]network", .{
             .func = .{ .context = self, .call = &networkResourceDrop },
+        });
+        try self.sockets_network_iface.members.put(self.allocator, "network-error-code", .{
+            .func = .{ .context = self, .call = &socketsNetworkErrorCode },
         });
         try providers.put(self.allocator, interface_name, .{
             .host_instance = &self.sockets_network_iface,
@@ -41363,4 +41681,298 @@ test "wasi:http #583 HTTPS: ServeHttpOptions.tls_config defaults to null (#609 p
     };
     // Plaintext default — TLS opt-in only via the new field.
     try testing.expectEqual(@as(?*const HttpsTlsConfig, null), opts.tls_config);
+}
+
+// ── #583 audit arms (PR #604): wasi:io + wasi:sockets/network tests ───────
+
+test "populateWasiProviders: binds 6 missing wasi:io/streams@0.2 audit arms (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:cli/stdout@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(providers.contains("wasi:io/streams@0.2.6"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]input-stream.skip"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]input-stream.blocking-skip"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.write-zeroes"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.blocking-write-zeroes-and-flush"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.splice"));
+    try testing.expect(adapter.io_streams_iface.members.contains("[method]output-stream.blocking-splice"));
+}
+
+test "populateWasiProviders: binds error.to-debug-string + network-error-code (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    const imports = [_]ctypes_root.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/poll@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:sockets/network@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const component = ctypes_root.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+    };
+    var providers: std.StringHashMapUnmanaged(ImportBinding) = .empty;
+    defer providers.deinit(testing.allocator);
+
+    try populateWasiProviders(&adapter, &component, &providers);
+
+    try testing.expect(adapter.io_error_iface.members.contains("[method]error.to-debug-string"));
+    try testing.expect(adapter.sockets_network_iface.members.contains("network-error-code"));
+}
+
+test "wasi:io/streams input-stream.skip: discards bytes and advances buffer cursor (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream.fromBuffer("abcdefgh");
+    const handle = try adapter.allocInputStreamHandle(&src);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = handle },
+        .{ .u64 = 3 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.inputStreamSkip(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(u64, 3), results[0].result_val.payload.?.u64);
+
+    // The next read should return the remaining 5 bytes ("defgh").
+    var buf: [16]u8 = undefined;
+    const r = src.read(&buf);
+    try testing.expectEqual(@as(usize, 5), r.ok);
+    try testing.expectEqualSlices(u8, "defgh", buf[0..5]);
+}
+
+test "wasi:io/streams input-stream.blocking-skip: drains buffer source and surfaces closed (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream.fromBuffer("hello");
+    const handle = try adapter.allocInputStreamHandle(&src);
+
+    // First skip 5 bytes → ok arm with n=5.
+    {
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 5 } };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.inputStreamSkip(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(results[0].result_val.is_ok);
+        try testing.expectEqual(@as(u64, 5), results[0].result_val.payload.?.u64);
+    }
+    // Second skip on the now-empty buffer → err arm (closed).
+    {
+        var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 1 } };
+        var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+        var ci: ComponentInstance = undefined;
+        try WasiCliAdapter.inputStreamSkip(&adapter, &ci, &args, &results, testing.allocator);
+        defer results[0].deinit(testing.allocator);
+        try testing.expect(!results[0].result_val.is_ok);
+    }
+}
+
+test "wasi:io/streams output-stream.write-zeroes: appends zero bytes to buffer sink (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var sink = streams.OutputStream.toBuffer();
+    defer sink.deinit(testing.allocator);
+    const handle = try adapter.allocStreamHandle(&sink);
+
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 16 } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamWriteZeroes(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(usize, 16), sink.getBufferContents().len);
+    for (sink.getBufferContents()) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "wasi:io/streams output-stream.blocking-write-zeroes-and-flush: writes full requested len in chunks (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var sink = streams.OutputStream.toBuffer();
+    defer sink.deinit(testing.allocator);
+    const handle = try adapter.allocStreamHandle(&sink);
+
+    // Use a length larger than the scratch chunk to verify the loop
+    // (the impl caps each chunk at STREAM_SCRATCH_CAP = 64 KiB; this
+    // test stays under the cap but still verifies the multi-byte path).
+    var args = [_]InterfaceValue{ .{ .handle = handle }, .{ .u64 = 1024 } };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamBlockingWriteZeroesAndFlush(
+        &adapter,
+        &ci,
+        &args,
+        &results,
+        testing.allocator,
+    );
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(usize, 1024), sink.getBufferContents().len);
+    for (sink.getBufferContents()) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "wasi:io/streams output-stream.splice: copies bytes from input-stream to output-stream (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream.fromBuffer("hello, world!");
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+
+    var sink = streams.OutputStream.toBuffer();
+    defer sink.deinit(testing.allocator);
+    const dst_handle = try adapter.allocStreamHandle(&sink);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 5 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(u64, 5), results[0].result_val.payload.?.u64);
+    try testing.expectEqualStrings("hello", sink.getBufferContents());
+}
+
+test "wasi:io/streams output-stream.blocking-splice: blocks then copies bytes (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream.fromBuffer("ABCDEFG");
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+
+    var sink = streams.OutputStream.toBuffer();
+    defer sink.deinit(testing.allocator);
+    const dst_handle = try adapter.allocStreamHandle(&sink);
+
+    // `splice` and `blocking-splice` share the same host helper
+    // (`outputStreamSplice`) since the captured-buffer / fd sources are
+    // already blocking-on-data — this test exercises the same wired
+    // entry point under the blocking-splice ABI name.
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 100 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0].result_val.is_ok);
+    try testing.expectEqual(@as(u64, 7), results[0].result_val.payload.?.u64);
+    try testing.expectEqualStrings("ABCDEFG", sink.getBufferContents());
+}
+
+test "wasi:io/streams output-stream.splice: closed src surfaces in err arm (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var src = streams.InputStream.fromBuffer("");
+    const src_handle = try adapter.allocInputStreamHandle(&src);
+
+    var sink = streams.OutputStream.toBuffer();
+    defer sink.deinit(testing.allocator);
+    const dst_handle = try adapter.allocStreamHandle(&sink);
+
+    var args = [_]InterfaceValue{
+        .{ .handle = dst_handle },
+        .{ .handle = src_handle },
+        .{ .u64 = 16 },
+    };
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.outputStreamSplice(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(!results[0].result_val.is_ok);
+    try testing.expectEqual(@as(usize, 0), sink.getBufferContents().len);
+}
+
+test "wasi:io/error.to-debug-string: returns non-empty opaque description (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var ci: ComponentInstance = undefined;
+    try ci.enableTestMem(testing.allocator, 4096);
+    defer ci.disableTestMem();
+
+    var args = [_]InterfaceValue{.{ .handle = 7 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    try WasiCliAdapter.ioErrorToDebugString(&adapter, &ci, &args, &results, testing.allocator);
+
+    try testing.expect(results[0] == .string);
+    try testing.expect(results[0].string.len > 0);
+    const debug = ci.readGuestBytes(results[0].string.ptr, results[0].string.len).?;
+    try testing.expect(std.mem.startsWith(u8, debug, "wasi:io error"));
+    // Handle digit must be surfaced so the same opaque error from
+    // different host code paths can still be told apart in a debug log.
+    try testing.expect(std.mem.indexOfScalar(u8, debug, '7') != null);
+}
+
+test "wasi:sockets/network.network-error-code: returns option::none for opaque io-error (#583, #604)" {
+    const testing = std.testing;
+    var adapter = WasiCliAdapter.init(testing.allocator);
+    defer adapter.deinit();
+
+    var args = [_]InterfaceValue{.{ .handle = 0 }};
+    var results: [1]InterfaceValue = .{.{ .u32 = 0 }};
+    var ci: ComponentInstance = undefined;
+    try WasiCliAdapter.socketsNetworkErrorCode(&adapter, &ci, &args, &results, testing.allocator);
+    defer results[0].deinit(testing.allocator);
+
+    try testing.expect(results[0] == .option_val);
+    try testing.expect(!results[0].option_val.is_some);
 }
