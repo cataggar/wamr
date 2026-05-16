@@ -1806,7 +1806,6 @@ test "computeLiveRanges: call with explicit args" {
     const v1 = func.newVReg();
     const v2 = func.newVReg();
     const args = try allocator.alloc(ir.VReg, 2);
-    defer allocator.free(args);
     args[0] = v0;
     args[1] = v1;
     try block0.append(.{ .op = .{ .iconst_32 = 10 }, .dest = v0 }); // pos 0
